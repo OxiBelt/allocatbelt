@@ -25,8 +25,13 @@ For the conclusions and recommendations see [docs/research/README.md](docs/resea
 ## Verification
 
 ```sh
-cargo test --release                                            # model tests + global-allocator integration tests
+cargo fmt --all --check
+cargo clippy --all-targets --all-features --locked -- -D warnings
+cargo test --release --locked                                   # model tests + global-allocator integration tests
+cargo audit && cargo deny check                                 # RustSec advisories, licenses, bans, sources
 MIRIFLAGS=-Zmiri-disable-isolation cargo +nightly miri test -p allocatbelt-core
-cargo clippy --all-targets -- -D warnings
+scripts/run-mutation-testing.sh                                 # mewt campaign over `allocatbelt-core` bits/classes
 cargo run --release -p allocatbelt-bench --bin bench-allocatbelt   # also bench-system, bench-mimalloc
 ```
+
+Code style, pinned tool versions and the commit-message format follow OxiBelt; see [CONTRIBUTING.md](CONTRIBUTING.md).
