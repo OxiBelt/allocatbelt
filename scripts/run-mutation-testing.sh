@@ -65,9 +65,9 @@ readonly equivalent_filter='
   ($equivalent[0].mutants | map([.path, .slug, .old_text])) as $allowed
   | {
       unexpected: [.results[] | select(.outcome.status != "TestFail")
-        | select((.outcome.status == "Uncaught" and (key as $k | $allowed | index([$k]))) | not)],
+        | select((.outcome.status == "Uncaught" and (key as $k | any($allowed[]; . == $k))) | not)],
       stale: [$allowed[] as $a
-        | select([$root.results[] | select(.outcome.status == "Uncaught") | key] | index([$a]) | not)
+        | select(any($root.results[] | select(.outcome.status == "Uncaught") | key; . == $a) | not)
         | $a]
     }
 '
