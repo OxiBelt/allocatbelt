@@ -19,7 +19,9 @@ use std::ptr::{self, NonNull};
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
-use allocatbelt_core::{ARENA_SIZE, Heap, MAX_SEGMENTS, META_WORDS, Os, SEGMENT_SIZE, SHARDS};
+use allocatbelt_core::{
+    ARENA_SIZE, Block, Heap, MAX_SEGMENTS, META_WORDS, Os, SEGMENT_SIZE, SHARDS,
+};
 use allocatbelt_sys::{MetaArena, Region};
 
 struct Arena {
@@ -61,21 +63,21 @@ impl Os for LinuxOs {
         self.arena().user.commit(offset, len)
     }
 
-    fn decommit(&self, offset: usize, len: usize) {
+    fn decommit(&self, offset: usize, len: usize) -> bool {
         // SAFETY: the `Os` contract of allocatbelt-core guarantees the heap
         // only decommits ranges holding no live allocation, so no pointer we
         // handed out refers into the range.
         #[expect(unsafe_code, reason = "returning unused memory to the kernel")]
         unsafe {
-            self.arena().user.decommit(offset, len);
+            self.arena().user.decommit(offset, len)
         }
     }
 
-    fn purge(&self, offset: usize, len: usize) {
+    fn purge(&self, offset: usize, len: usize) -> bool {
         // SAFETY: as for `decommit`, the range holds no live allocation.
         #[expect(unsafe_code, reason = "returning unused memory to the kernel")]
         unsafe {
-            self.arena().user.purge(offset, len);
+            self.arena().user.purge(offset, len)
         }
     }
 
@@ -150,10 +152,17 @@ impl Allocatbelt {
     /// Safe: it only hands out fresh memory.
     #[must_use]
     pub fn allocate(self, layout: Layout) -> Option<NonNull<u8>> {
+        self.allocate_block(layout).map(|(p, _)| p)
+    }
+
+    /// As [`Allocatbelt::allocate`], also reporting whether the block is
+    /// already known to read as zero.
+    fn allocate_block(self, layout: Layout) -> Option<(NonNull<u8>, bool)> {
         guarded(|| {
             let a = arena()?;
-            let off = HEAP.alloc(shard_hint(), layout.size(), layout.align())?;
-            a.user.ptr(off)
+            let Block { offset, zeroed } =
+                HEAP.alloc_block(shard_hint(), layout.size(), layout.align())?;
+            Some((a.user.ptr(offset)?, zeroed))
         })
     }
 
@@ -201,9 +210,14 @@ unsafe impl GlobalAlloc for Allocatbelt {
 
     #[expect(unsafe_code, reason = "GlobalAlloc method")]
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
-        let Some(p) = self.allocate(layout) else {
+        let Some((p, zeroed)) = self.allocate_block(layout) else {
             return ptr::null_mut();
         };
+        // Fresh or purged memory already reads as zero; skipping the memset
+        // also keeps untouched pages of a large `calloc` out of RSS.
+        if zeroed {
+            return p.as_ptr();
+        }
         // SAFETY: `p` is a fresh allocation valid for `layout.size()` bytes
         // that nothing else references yet.
         #[expect(unsafe_code, reason = "zero-fill of a fresh block")]

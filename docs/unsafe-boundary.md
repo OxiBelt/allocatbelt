@@ -12,7 +12,7 @@ Regenerate: `grep -rn "unsafe" crates/*/src | grep -E "unsafe (\{|fn|impl)"`
 | `Region::reserve` | block | `mmap_anonymous(null, …, PROT_NONE, PRIVATE\|NORESERVE)` | A null hint without MAP_FIXED yields a fresh range, so it aliases nothing. |
 | `Region::reserve` | block ×2 | `munmap` of the head/tail slack left after alignment | Trims only the unused ends of the mapping created just above. |
 | `Region::commit` | block | `mprotect(RW)` | Range checked; it only adds permissions, so it cannot invalidate any existing reference. |
-| `Region::purge` | **`unsafe fn`** + block | `madvise(MADV_DONTNEED)` | The contents are discarded, so the caller guarantees "no live references or concurrent access in the range". |
+| `Region::purge` | **`unsafe fn`** + block | `madvise(MADV_DONTNEED)` | The contents are discarded, so the caller guarantees "no live references or concurrent access in the range". Returns whether the kernel accepted it, i.e. whether the range now reads as zero. |
 | `Region::decommit` | **`unsafe fn`** + block ×2 | `purge` + `mprotect(NONE)` | Same contract, plus no access until the range is committed again. |
 | `MetaArena::slot` | block | `slice::from_raw_parts` → `&[AtomicU64]` | Published only after commit (READY, Acquire). Never unmapped or purged. Zero-filled by the kernel, so every bit pattern is valid, and only atomic access follows. |
 
@@ -24,7 +24,7 @@ The sys crate **does not use** `rustix::param::page_size()`: reading auxv may al
 |---|---|---|---|
 | `LinuxOs::purge/decommit` | block ×2 | calls `Region::purge/decommit` | The core's `Os` contract: it only purges or decommits ranges with no live allocations (see below). |
 | `impl GlobalAlloc` | `unsafe impl` + 4 `unsafe fn` | — | Required by the trait. Unwinding is blocked by `AbortOnUnwind`. |
-| `alloc_zeroed` | block | `write_bytes(0, size)` | A fresh block that nobody references yet. |
+| `alloc_zeroed` | block | `write_bytes(0, size)` | A fresh block that nobody references yet. Skipped when the core reports the block as already zero (trust assumption 4). |
 | `realloc` | block | `copy_nonoverlapping` | The old block is live (caller contract); the new block is a separate fresh block. |
 
 ## Trust assumptions (the part the boundary does not cover)
@@ -34,8 +34,9 @@ The narrow boundary makes each *operation* auditable, but soundness still depend
 1. The heap never hands out an offset that is live twice (non-overlap).
 2. It never calls `purge`/`decommit` on a range that holds a live allocation.
 3. It never hands out an offset that has not been committed.
+4. It only reports a block as `zeroed` if every page of it was never handed out, or was purged/decommitted with success (`Os::purge`/`Os::decommit` returned `true`) since it was last handed out. Otherwise `calloc` would return stale bytes.
 
-Current verification: shadow-map checks against the mock `Os` (non-overlap, commit state, purge overlap), proptest random sequences, multi-threaded cross-thread-free tests, and Miri on the core tests.
+Current verification: shadow-map checks against the mock `Os` (non-overlap, commit state, purge overlap, and a written-pages shadow that every `zeroed` claim is checked against, including with failing purges), proptest random sequences, multi-threaded cross-thread-free tests, and Miri on the core tests.
 Before production, add loom models and fuzzing (cargo-fuzz against `Heap<MockOs>`).
 
 Other caveats:

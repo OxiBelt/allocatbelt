@@ -21,7 +21,7 @@ pub mod class;
 pub mod heap;
 mod lock;
 
-pub use heap::{Heap, Os};
+pub use heap::{Block, Heap, Os};
 
 /// log2 of [`PAGE_SIZE`].
 pub const PAGE_SHIFT: u32 = 16;

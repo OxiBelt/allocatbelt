@@ -6,7 +6,9 @@
 //! [0] SEG_HDR    kind | shard << 8 | segment count << 16
 //! [1] SEG_PAGES  occupancy bitmap of the 64 pages (1 = in use)
 //! [2] SEG_NEXT   next segment of the owning shard (index + 1, 0 = end)
-//! [3] SEG_DIRTY  free pages whose memory has not been purged yet
+//! [3] SEG_DIRTY  free pages whose memory has not been purged yet; while
+//!                the segment is not owned, non-zero if its memory may hold
+//!                non-zero bytes
 //! then per page (PAGE_META_WORDS each):
 //!   [0] P_INFO   kind | class << 8 | run length << 16
 //!                (span tail pages: kind | distance to the head << 16)
@@ -30,6 +32,11 @@
 //! free pages of every segment (as if allocating them), `madvise`s them and
 //! releases them again. Purging on every free costs an `mmap_lock` round trip
 //! and a TLB shootdown per call, which dominated multi-threaded profiles.
+//!
+//! Zero tracking: memory that was never handed out, or that was purged or
+//! decommitted successfully, reads as zero. Free pages that are not dirty are
+//! such memory, so a page run or segment run claimed without dirty pages is
+//! reported as zeroed ([`Block::zeroed`]) and `calloc` can skip the memset.
 
 use core::sync::atomic::{AtomicIsize, AtomicU32, AtomicU64, Ordering};
 
@@ -50,16 +57,21 @@ use Ordering::{AcqRel, Acquire, Relaxed, Release};
 /// [`Os::decommit`] and [`Os::purge`] on ranges that contain no live
 /// allocation, and that it never hands out an offset that has not been
 /// committed.
+///
+/// The heap relies on arena memory reading as zero until it is first handed
+/// out, and again after a [`Os::purge`] or [`Os::decommit`] that returned
+/// `true`, and reports such blocks as [`Block::zeroed`].
 pub trait Os: Sync {
     /// Makes `offset..offset + len` readable and writable. Returns `false` if
-    /// the memory cannot be provided.
+    /// the memory cannot be provided. Never changes the contents.
     fn commit(&self, offset: usize, len: usize) -> bool;
     /// Returns the physical memory of the range to the OS and makes it
-    /// inaccessible.
-    fn decommit(&self, offset: usize, len: usize);
+    /// inaccessible. Returns `true` if the range will read as zero once it is
+    /// committed again.
+    fn decommit(&self, offset: usize, len: usize) -> bool;
     /// Returns the physical memory of the range to the OS but keeps it
-    /// accessible.
-    fn purge(&self, offset: usize, len: usize);
+    /// accessible. Returns `true` if the range now reads as zero.
+    fn purge(&self, offset: usize, len: usize) -> bool;
     /// Commits (once) and returns the [`crate::META_WORDS`] metadata words of
     /// `segment`. Words are zero the first time they are returned.
     fn commit_meta(&self, segment: usize) -> Option<&[AtomicU64]>;
@@ -148,8 +160,23 @@ const fn unpack(cursor: u64) -> (usize, usize) {
     )
 }
 
+/// A fresh allocation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Block {
+    /// Arena offset of the first byte.
+    pub offset: usize,
+    /// The whole block already reads as zero.
+    pub zeroed: bool,
+}
+
+impl Block {
+    const fn new(offset: usize, zeroed: bool) -> Self {
+        Self { offset, zeroed }
+    }
+}
+
 /// What an allocated offset refers to.
-enum Block<'a> {
+enum Target<'a> {
     /// A class block `in_span` bytes into the span whose head page is `head`.
     Small {
         in_span: usize,
@@ -230,18 +257,28 @@ impl<O: Os> Heap<O> {
     /// value). Returns `None` when out of memory or when `align` is not a
     /// power of two no larger than [`MAX_ALIGN`].
     pub fn alloc(&self, shard_hint: usize, size: usize, align: usize) -> Option<usize> {
+        self.alloc_block(shard_hint, size, align).map(|b| b.offset)
+    }
+
+    /// As [`Heap::alloc`], but also reports whether the block is known to
+    /// read as zero, so a zeroing allocation can skip clearing it.
+    pub fn alloc_block(&self, shard_hint: usize, size: usize, align: usize) -> Option<Block> {
         if !align.is_power_of_two() || align > MAX_ALIGN || size > ARENA_SIZE / 2 {
             return None;
         }
         if align <= MIN_ALIGN && size <= SMALL_MAX {
-            return self.alloc_small(shard_hint, class::class_of(size));
+            return self
+                .alloc_small(shard_hint, class::class_of(size))
+                .map(|o| Block::new(o, false));
         }
         if align > MIN_ALIGN && align <= PAGE_SIZE {
             // Power-of-two classes are aligned to their own size, up to the
             // page alignment of their span.
             let p = size.max(align).next_power_of_two();
             if p <= SMALL_MAX {
-                return self.alloc_small(shard_hint, class::class_of(p));
+                return self
+                    .alloc_small(shard_hint, class::class_of(p))
+                    .map(|o| Block::new(o, false));
             }
         }
         if align <= PAGE_SIZE && size <= SEGMENT_SIZE {
@@ -257,9 +294,9 @@ impl<O: Os> Heap<O> {
             offset,
             "allocatbelt: invalid or double free (pointer is not allocated)",
         ) {
-            Block::Small { in_span, pm, c } => self.free_small(in_span, pm, c),
-            Block::Large { page, m, pm, info } => self.free_large(page, m, pm, info),
-            Block::Huge { seg, m, hdr } => self.free_huge(seg, m, hdr),
+            Target::Small { in_span, pm, c } => self.free_small(in_span, pm, c),
+            Target::Large { page, m, pm, info } => self.free_large(page, m, pm, info),
+            Target::Huge { seg, m, hdr } => self.free_huge(seg, m, hdr),
         }
     }
 
@@ -269,15 +306,15 @@ impl<O: Os> Heap<O> {
             offset,
             "allocatbelt: size query for a pointer that is not allocated",
         ) {
-            Block::Small { c, .. } => class::size(c),
-            Block::Large { info, .. } => ((info >> 16) & 0xFF) as usize * PAGE_SIZE,
-            Block::Huge { hdr, .. } => (hdr >> 16) as usize * SEGMENT_SIZE,
+            Target::Small { c, .. } => class::size(c),
+            Target::Large { info, .. } => ((info >> 16) & 0xFF) as usize * PAGE_SIZE,
+            Target::Huge { hdr, .. } => (hdr >> 16) as usize * SEGMENT_SIZE,
         }
     }
 
     /// Resolves `offset` to the block it starts, or reports `bad` if it does
     /// not start an allocated block.
-    fn block(&self, offset: usize, bad: &'static str) -> Block<'_> {
+    fn block(&self, offset: usize, bad: &'static str) -> Target<'_> {
         let (seg, m, hdr) = self.lookup(offset);
         match hdr & 0xFF {
             SEG_OWNED => {
@@ -286,7 +323,7 @@ impl<O: Os> Heap<O> {
                 let pm = PageMeta::new(m, in_seg);
                 let info = pm.info().load(Acquire);
                 match info & 0xFF {
-                    PAGE_SMALL => Block::Small {
+                    PAGE_SMALL => Target::Small {
                         in_span: offset % PAGE_SIZE,
                         pm,
                         c: ((info >> 8) & 0xFF) as usize,
@@ -301,19 +338,19 @@ impl<O: Os> Heap<O> {
                         if hinfo & 0xFF != PAGE_SMALL {
                             self.os.fatal(bad);
                         }
-                        Block::Small {
+                        Target::Small {
                             in_span: offset - ((page - back) << PAGE_SHIFT),
                             pm: head,
                             c: ((hinfo >> 8) & 0xFF) as usize,
                         }
                     }
                     PAGE_LARGE if offset.is_multiple_of(PAGE_SIZE) => {
-                        Block::Large { page, m, pm, info }
+                        Target::Large { page, m, pm, info }
                     }
                     _ => self.os.fatal(bad),
                 }
             }
-            SEG_HUGE if offset.is_multiple_of(SEGMENT_SIZE) => Block::Huge { seg, m, hdr },
+            SEG_HUGE if offset.is_multiple_of(SEGMENT_SIZE) => Target::Huge { seg, m, hdr },
             _ => self.os.fatal(bad),
         }
     }
@@ -450,7 +487,7 @@ impl<O: Os> Heap<O> {
 
     fn new_small_page(&self, s: usize, sh: &Shard, cs: &ClassState, c: usize) -> Option<usize> {
         let span = class::span(c);
-        let p = self.alloc_pages(s, sh, span)?;
+        let (p, _) = self.alloc_pages(s, sh, span)?;
         let m = self.seg_meta(p / PAGES_PER_SEGMENT);
         for t in 1..span {
             PageMeta::new(m, p % PAGES_PER_SEGMENT + t)
@@ -504,9 +541,9 @@ impl<O: Os> Heap<O> {
 
     // ---- page runs -----------------------------------------------------
 
-    fn alloc_large(&self, hint: usize, n: usize) -> Option<usize> {
+    fn alloc_large(&self, hint: usize, n: usize) -> Option<Block> {
         self.with_shard(hint, |s, sh| {
-            let p = self.alloc_pages(s, sh, n)?;
+            let (p, zeroed) = self.alloc_pages(s, sh, n)?;
             let m = self.seg_meta(p / PAGES_PER_SEGMENT);
             for t in 1..n {
                 PageMeta::new(m, p % PAGES_PER_SEGMENT + t)
@@ -516,7 +553,7 @@ impl<O: Os> Heap<O> {
             PageMeta::new(m, p % PAGES_PER_SEGMENT)
                 .info()
                 .store(PAGE_LARGE | (n as u64) << 16, Release);
-            Some(p << PAGE_SHIFT)
+            Some(Block::new(p << PAGE_SHIFT, zeroed))
         })
     }
 
@@ -537,31 +574,41 @@ impl<O: Os> Heap<O> {
         self.release_pages(page, n);
     }
 
-    /// Claims `n` contiguous pages from a segment owned by shard `s`.
-    fn alloc_pages(&self, s: usize, sh: &Shard, n: usize) -> Option<usize> {
+    /// Claims `n` contiguous pages from a segment owned by shard `s`. Also
+    /// returns whether the pages read as zero.
+    fn alloc_pages(&self, s: usize, sh: &Shard, n: usize) -> Option<(usize, bool)> {
         let mut cur = sh.segs.load(Relaxed);
         while cur != 0 {
             let seg = cur as usize - 1;
             let m = self.seg_meta(seg);
-            if let Some(start) = self.claim_run(m, n) {
-                return Some(seg * PAGES_PER_SEGMENT + start);
+            if let Some((start, zeroed)) = self.claim_run(m, n) {
+                return Some((seg * PAGES_PER_SEGMENT + start, zeroed));
             }
             cur = m[SEG_NEXT].load(Relaxed) as u32;
         }
         let seg = self.alloc_segments(1)?;
         let m = self.seg_meta(seg);
-        m[SEG_PAGES].store(0, Relaxed);
-        m[SEG_DIRTY].store(0, Relaxed);
+        // A segment whose memory may hold stale bytes starts fully dirty, so
+        // it is neither reported as zeroed nor kept resident forever. Dirty
+        // is written before the pages are opened up so a concurrent purge
+        // pass never sees clean-looking free pages.
+        if m[SEG_DIRTY].load(Relaxed) != 0 {
+            m[SEG_DIRTY].store(u64::MAX, Relaxed);
+            self.dirty_pages
+                .fetch_add(PAGES_PER_SEGMENT as isize, Relaxed);
+        }
+        m[SEG_PAGES].store(0, Release);
         m[SEG_NEXT].store(u64::from(sh.segs.load(Relaxed)), Relaxed);
         m[SEG_HDR].store(SEG_OWNED | (s as u64) << 8 | 1 << 16, Release);
         sh.segs.store(seg as u32 + 1, Relaxed);
         self.claim_run(m, n)
-            .map(|start| seg * PAGES_PER_SEGMENT + start)
+            .map(|(start, zeroed)| (seg * PAGES_PER_SEGMENT + start, zeroed))
     }
 
-    /// Atomically claims a run of `n` free pages in a segment. Reusing dirty
-    /// pages is free: they simply stop being dirty.
-    fn claim_run(&self, m: &[AtomicU64], n: usize) -> Option<usize> {
+    /// Atomically claims a run of `n` free pages in a segment and reports
+    /// whether it reads as zero. Reusing dirty pages is free: they simply stop
+    /// being dirty (and are not zero).
+    fn claim_run(&self, m: &[AtomicU64], n: usize) -> Option<(usize, bool)> {
         let mut used = m[SEG_PAGES].load(Acquire);
         loop {
             let start = find_run(!used, n as u32)?;
@@ -573,7 +620,7 @@ impl<O: Os> Heap<O> {
                         self.dirty_pages
                             .fetch_sub(was_dirty.count_ones() as isize, Relaxed);
                     }
-                    return Some(start as usize);
+                    return Some((start as usize, was_dirty == 0));
                 }
                 Err(now) => used = now,
             }
@@ -634,14 +681,20 @@ impl<O: Os> Heap<O> {
             }
         };
         let mut rest = dirty;
+        let mut purged = 0;
         while rest != 0 {
             let start = rest.trailing_zeros();
             let len = (rest >> start).trailing_ones();
             let page = seg * PAGES_PER_SEGMENT + start as usize;
-            self.os.purge(page << PAGE_SHIFT, len as usize * PAGE_SIZE);
-            rest &= !run_mask(start, len);
+            let run = run_mask(start, len);
+            // Pages that could not be purged keep their dirty mark: they are
+            // not known to be zero.
+            if self.os.purge(page << PAGE_SHIFT, len as usize * PAGE_SIZE) {
+                purged |= run;
+            }
+            rest &= !run;
         }
-        let cleared = m[SEG_DIRTY].fetch_and(!dirty, AcqRel) & dirty;
+        let cleared = m[SEG_DIRTY].fetch_and(!purged, AcqRel) & purged;
         self.dirty_pages
             .fetch_sub(cleared.count_ones() as isize, Relaxed);
         m[SEG_PAGES].fetch_and(!dirty, Release);
@@ -649,17 +702,20 @@ impl<O: Os> Heap<O> {
 
     // ---- segments ------------------------------------------------------
 
-    fn alloc_huge(&self, k: usize) -> Option<usize> {
+    fn alloc_huge(&self, k: usize) -> Option<Block> {
         let first = self.alloc_segments(k)?;
+        let mut zeroed = true;
         for i in (0..k).rev() {
             let hdr = if i == 0 {
                 SEG_HUGE | (k as u64) << 16
             } else {
                 SEG_HUGE_TAIL
             };
-            self.seg_meta(first + i)[SEG_HDR].store(hdr, Release);
+            let m = self.seg_meta(first + i);
+            zeroed &= m[SEG_DIRTY].load(Relaxed) == 0;
+            m[SEG_HDR].store(hdr, Release);
         }
-        Some(first << SEGMENT_SHIFT)
+        Some(Block::new(first << SEGMENT_SHIFT, zeroed))
     }
 
     fn free_huge(&self, seg: usize, m: &[AtomicU64], hdr: u64) {
@@ -676,8 +732,9 @@ impl<O: Os> Heap<O> {
         self.free_segments(seg, k);
     }
 
-    /// Takes `k` contiguous segments from the arena, commits their memory and
-    /// metadata, and returns the first index.
+    /// Takes `k` contiguous segments from the arena, commits their metadata
+    /// and memory, and returns the first index. The segments' `SEG_DIRTY`
+    /// word tells whether their memory may hold non-zero bytes.
     fn alloc_segments(&self, k: usize) -> Option<usize> {
         if k == 0 || k > MAX_SEGMENTS {
             return None;
@@ -688,17 +745,30 @@ impl<O: Os> Heap<O> {
             self.mark_segments(first, k, true);
             first
         };
-        let committed = self.os.commit(first << SEGMENT_SHIFT, k << SEGMENT_SHIFT)
-            && (first..first + k).all(|s| self.os.commit_meta(s).is_some());
-        if !committed {
+        // Metadata first: until it exists, nothing records whether the
+        // memory is zero, so the memory must not be touched before.
+        if !(first..first + k).all(|s| self.os.commit_meta(s).is_some()) {
+            let _g = self.seg_lock.lock(|| self.os.yield_now());
+            self.mark_segments(first, k, false);
+            return None;
+        }
+        if !self.os.commit(first << SEGMENT_SHIFT, k << SEGMENT_SHIFT) {
             self.free_segments(first, k);
             return None;
         }
         Some(first)
     }
 
+    /// Decommits `k` segments and returns them to the arena, recording
+    /// whether their memory reads as zero. No page of them may be claimable.
     fn free_segments(&self, first: usize, k: usize) {
-        self.os.decommit(first << SEGMENT_SHIFT, k << SEGMENT_SHIFT);
+        let zeroed = self.os.decommit(first << SEGMENT_SHIFT, k << SEGMENT_SHIFT);
+        for s in first..first + k {
+            let m = self.seg_meta(s);
+            // All pages "used": a stale purge pass cannot claim any of them.
+            m[SEG_PAGES].store(u64::MAX, Relaxed);
+            m[SEG_DIRTY].store(if zeroed { 0 } else { u64::MAX }, Relaxed);
+        }
         let _g = self.seg_lock.lock(|| self.os.yield_now());
         self.mark_segments(first, k, false);
     }

@@ -1,20 +1,26 @@
 //! Model tests: the heap runs on a mock [`Os`] that never backs user memory
 //! but checks the heap's promises (offsets are committed, purged ranges hold
-//! no live allocation) against a shadow map of live allocations.
+//! no live allocation, blocks reported as zeroed were not written since they
+//! were last purged) against shadow maps.
 
 use std::boxed::Box;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::vec::Vec;
 
-use crate::{ARENA_SIZE, Heap, MAX_SEGMENTS, META_WORDS, Os, PAGE_SIZE, SEGMENT_SIZE};
+use crate::{ARENA_SIZE, Block, Heap, MAX_SEGMENTS, META_WORDS, Os, PAGE_SIZE, SEGMENT_SIZE};
 
 struct MockOs {
     meta: Vec<OnceLock<&'static [AtomicU64]>>,
     committed: Vec<AtomicBool>,
     live: Mutex<BTreeMap<usize, usize>>,
+    /// Pages the "program" wrote to since they were last purged.
+    written: Mutex<BTreeSet<usize>>,
     purged: AtomicUsize,
+    /// Makes `purge` and `decommit` report failure, as `madvise` does on
+    /// `mlock`ed memory.
+    purge_fails: AtomicBool,
 }
 
 impl MockOs {
@@ -23,8 +29,26 @@ impl MockOs {
             meta: (0..MAX_SEGMENTS).map(|_| OnceLock::new()).collect(),
             committed: (0..MAX_SEGMENTS).map(|_| AtomicBool::new(false)).collect(),
             live: Mutex::new(BTreeMap::new()),
+            written: Mutex::new(BTreeSet::new()),
             purged: AtomicUsize::new(0),
+            purge_fails: AtomicBool::new(false),
         }
+    }
+
+    /// Clears the written marks of the range unless purging fails.
+    fn zero(&self, offset: usize, len: usize) -> bool {
+        if self.purge_fails.load(Ordering::Relaxed) {
+            return false;
+        }
+        let mut w = self.written.lock().unwrap();
+        let pages: Vec<_> = w
+            .range(offset / PAGE_SIZE..(offset + len).div_ceil(PAGE_SIZE))
+            .copied()
+            .collect();
+        for p in pages {
+            w.remove(&p);
+        }
+        true
     }
 
     fn assert_no_live(&self, offset: usize, len: usize, what: &str) {
@@ -46,15 +70,17 @@ impl Os for MockOs {
         }
         true
     }
-    fn decommit(&self, offset: usize, len: usize) {
+    fn decommit(&self, offset: usize, len: usize) -> bool {
         self.assert_no_live(offset, len, "decommit");
         for s in offset / SEGMENT_SIZE..(offset + len) / SEGMENT_SIZE {
             self.committed[s].store(false, Ordering::Relaxed);
         }
+        self.zero(offset, len)
     }
-    fn purge(&self, offset: usize, len: usize) {
+    fn purge(&self, offset: usize, len: usize) -> bool {
         self.assert_no_live(offset, len, "purge");
         self.purged.fetch_add(len, Ordering::Relaxed);
+        self.zero(offset, len)
     }
     fn commit_meta(&self, segment: usize) -> Option<&[AtomicU64]> {
         Some(self.meta[segment].get_or_init(|| {
@@ -84,7 +110,26 @@ fn heap() -> &'static Heap<MockOs> {
 /// Allocates and records the block in the shadow map, checking the
 /// allocator's post-conditions.
 fn alloc(h: &Heap<MockOs>, shard: usize, size: usize, align: usize) -> usize {
-    let off = h.alloc(shard, size, align).expect("out of memory");
+    alloc_block(h, shard, size, align).offset
+}
+
+/// As [`alloc`], returning the whole [`Block`]. The block is then treated as
+/// written, like a program would.
+fn alloc_block(h: &Heap<MockOs>, shard: usize, size: usize, align: usize) -> Block {
+    let b = h.alloc_block(shard, size, align).expect("out of memory");
+    let off = b.offset;
+    {
+        let mut w = h.os().written.lock().unwrap();
+        let pages = off / PAGE_SIZE..(off + size.max(1)).div_ceil(PAGE_SIZE);
+        if b.zeroed {
+            let dirty = w.range(pages.clone()).next();
+            assert!(
+                dirty.is_none(),
+                "{b:?} claims zero but page {dirty:?} was written"
+            );
+        }
+        w.extend(pages);
+    }
     assert_eq!(off % align, 0, "size {size} align {align} -> {off:#x}");
     assert!(off + size <= ARENA_SIZE);
     let usable = h.usable_size(off);
@@ -104,7 +149,7 @@ fn alloc(h: &Heap<MockOs>, shard: usize, size: usize, align: usize) -> usize {
         );
     }
     live.insert(off, end);
-    off
+    b
 }
 
 fn free(h: &Heap<MockOs>, off: usize) {
@@ -379,4 +424,58 @@ proptest::proptest! {
             free(h, o);
         }
     }
+}
+
+#[test]
+fn zeroed_blocks_are_reported() {
+    let h = heap();
+    // Fresh memory reads as zero.
+    let big = alloc_block(h, 0, 10 << 20, 8);
+    assert!(big.zeroed);
+    let run = alloc_block(h, 0, 5 * PAGE_SIZE, 8);
+    assert!(run.zeroed);
+    // Class blocks are recycled without tracking, so never claimed zero.
+    let small = alloc_block(h, 0, 64, 8);
+    assert!(!small.zeroed);
+    free(h, run.offset);
+    // Dirty pages are reused as they are: not zero.
+    let again = alloc_block(h, 0, 5 * PAGE_SIZE, 8);
+    assert_eq!(again.offset, run.offset);
+    assert!(!again.zeroed);
+    free(h, again.offset);
+    h.purge();
+    assert!(alloc_block(h, 0, 5 * PAGE_SIZE, 8).zeroed);
+    // Huge segments are decommitted on free, so they come back zeroed.
+    free(h, big.offset);
+    assert!(alloc_block(h, 0, 10 << 20, 8).zeroed);
+}
+
+#[test]
+fn failed_purges_are_not_zeroed() {
+    let h = heap();
+    h.os().purge_fails.store(true, Ordering::Relaxed);
+    let big = alloc(h, 0, 10 << 20, 8);
+    free(h, big);
+    let huge = alloc_block(h, 0, 10 << 20, 8);
+    assert!(!huge.zeroed);
+    let run = alloc(h, 0, 5 * PAGE_SIZE, 8);
+    free(h, run);
+    h.purge();
+    // The pages stay dirty and are reported as such.
+    assert_eq!(h.dirty_pages(), 5);
+    let again = alloc_block(h, 0, 5 * PAGE_SIZE, 8);
+    assert_eq!(again.offset, run);
+    assert!(!again.zeroed);
+    // A segment whose decommit failed starts fully dirty when a shard takes
+    // it (first fit picks the lowest segment, freed here).
+    assert_eq!(huge.offset, 0);
+    free(h, huge.offset);
+    let owned = alloc_block(h, 1, 5 * PAGE_SIZE, 8);
+    assert!(owned.offset < SEGMENT_SIZE && !owned.zeroed);
+    assert_eq!(h.dirty_pages(), 64 - 5);
+    // Once purging works again, the pages are clean and reported zeroed.
+    h.os().purge_fails.store(false, Ordering::Relaxed);
+    h.purge();
+    assert_eq!(h.dirty_pages(), 0);
+    assert!(alloc_block(h, 1, 5 * PAGE_SIZE, 8).zeroed);
 }

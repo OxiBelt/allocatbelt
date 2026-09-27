@@ -90,3 +90,24 @@ fn producer_consumer_threads() {
     }
     assert!(total > 0);
 }
+
+#[test]
+fn reused_memory_is_zeroed() {
+    // Huge blocks are decommitted on free and page runs are purged, after
+    // which `alloc_zeroed` skips the memset; the memory must really be zero.
+    for &size in &[300_000usize, 5 << 20, 20 << 20] {
+        let layout = Layout::from_size_align(size, 8).unwrap();
+        for _ in 0..3 {
+            // SAFETY: non-zero layout; freed below with the same layout.
+            let p = unsafe { GLOBAL.alloc_zeroed(layout) };
+            assert!(!p.is_null());
+            // SAFETY: `p` is valid for `size` bytes.
+            let s = unsafe { std::slice::from_raw_parts_mut(p, size) };
+            assert!(s.iter().all(|&x| x == 0), "size {size}");
+            s.fill(0xCD);
+            // SAFETY: `p` came from `alloc_zeroed` with `layout`.
+            unsafe { GLOBAL.dealloc(p, layout) };
+            GLOBAL.purge();
+        }
+    }
+}

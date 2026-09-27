@@ -140,43 +140,46 @@ impl Region {
     }
 
     /// Returns the physical pages of the range to the kernel. The range stays
-    /// accessible and reads back as zeroes.
+    /// accessible. Returns `true` if it now reads back as zeroes; `false` if
+    /// the kernel refused (e.g. `EINVAL` for `mlock`ed pages), in which case
+    /// the contents are unchanged.
     ///
     /// # Safety
     ///
     /// No reference to, and no concurrent access of, any byte of
     /// `offset..offset + len` may exist: its contents are discarded.
     #[expect(unsafe_code, reason = "contract: caller owns the range")]
-    pub unsafe fn purge(&self, offset: usize, len: usize) {
+    pub unsafe fn purge(&self, offset: usize, len: usize) -> bool {
         let Some(p) = self.range(offset, len) else {
-            return;
+            return false;
         };
         // SAFETY: the span is inside our mapping (checked by `range`) and the
         // caller guarantees nothing observes its contents being zeroed.
         #[expect(unsafe_code, reason = "madvise syscall")]
-        let _ = unsafe { mm::madvise(p, len, Advice::LinuxDontNeed) };
+        let r = unsafe { mm::madvise(p, len, Advice::LinuxDontNeed) };
+        r.is_ok()
     }
 
     /// Returns the physical pages of the range and makes it inaccessible.
+    /// Returns `true` if the range will read as zeroes once committed again.
     ///
     /// # Safety
     ///
     /// As for [`Region::purge`]; additionally nothing may access the range
     /// until it is committed again.
     #[expect(unsafe_code, reason = "contract: caller owns the range")]
-    pub unsafe fn decommit(&self, offset: usize, len: usize) {
+    pub unsafe fn decommit(&self, offset: usize, len: usize) -> bool {
         let Some(p) = self.range(offset, len) else {
-            return;
+            return false;
         };
         // SAFETY: forwarded caller contract; the span is inside our mapping.
         #[expect(unsafe_code, reason = "purge contract is identical")]
-        unsafe {
-            self.purge(offset, len);
-        }
+        let zeroed = unsafe { self.purge(offset, len) };
         // SAFETY: the span is inside our mapping and, per the caller
         // contract, unused, so revoking access cannot fault a live user.
         #[expect(unsafe_code, reason = "mprotect syscall")]
         let _ = unsafe { mm::mprotect(p, len, MprotectFlags::empty()) };
+        zeroed
     }
 }
 
