@@ -14,6 +14,11 @@
 #![forbid(unsafe_code)]
 #![cfg_attr(not(test), deny(clippy::expect_used, clippy::unwrap_used))]
 
+#[cfg(not(all(target_pointer_width = "64", target_has_atomic = "64")))]
+compile_error!(
+  "allocatbelt needs a 64-bit target with 64-bit atomics (e.g. x86_64, aarch64, riscv64)"
+);
+
 #[cfg(test)]
 extern crate std;
 

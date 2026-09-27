@@ -1,6 +1,9 @@
 //! Bit-twiddling helpers. They compile to `tzcnt`/`popcnt`/`lzcnt` where the
 //! target supports them (e.g. `-C target-feature=+bmi1,+popcnt,+lzcnt` or
-//! `-C target-cpu=x86-64-v3`) and stay entirely in safe Rust.
+//! `-C target-cpu=x86-64-v3`) and stay entirely in safe Rust. On riscv64 the
+//! baseline `gc` target has no bit-manipulation instructions, so these fall
+//! back to multi-instruction sequences; `-C target-feature=+zbb` (part of
+//! RVA22) turns them into `ctz`/`cpop`/`clz`.
 
 /// Index of the first run of `n` consecutive set bits in `free`, if any.
 #[must_use]
