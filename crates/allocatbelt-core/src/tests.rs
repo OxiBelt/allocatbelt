@@ -501,3 +501,16 @@ fn page_aligned_runs_stay_inside_segments() {
         free(h, o);
     }
 }
+
+#[test]
+fn aligned_requests_use_the_tightest_class() {
+    let h = heap();
+    // 5120 is a multiple of 32, so it serves 5000 bytes aligned to 32
+    // (rounding to a power of two would take 8192).
+    let a = alloc(h, 0, 5000, 32);
+    assert_eq!(h.usable_size(a), 5120);
+    let b = alloc(h, 0, 40_000, 8192);
+    assert_eq!(h.usable_size(b), 40_960);
+    free(h, a);
+    free(h, b);
+}

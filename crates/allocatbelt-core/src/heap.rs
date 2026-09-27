@@ -271,15 +271,10 @@ impl<O: Os> Heap<O> {
                 .alloc_small(shard_hint, class::class_of(size))
                 .map(|o| Block::new(o, false));
         }
-        if align > MIN_ALIGN && align <= PAGE_SIZE {
-            // Power-of-two classes are aligned to their own size, up to the
-            // page alignment of their span.
-            let p = size.max(align).next_power_of_two();
-            if p <= SMALL_MAX {
-                return self
-                    .alloc_small(shard_hint, class::class_of(p))
-                    .map(|o| Block::new(o, false));
-            }
+        if let Some(c) = class::class_for(size, align) {
+            return self
+                .alloc_small(shard_hint, c)
+                .map(|o| Block::new(o, false));
         }
         if size <= SEGMENT_SIZE {
             // Alignments above a page place the run at a multiple of
