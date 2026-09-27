@@ -4,5 +4,5 @@
 static GLOBAL: allocatbelt::Allocatbelt = allocatbelt::Allocatbelt;
 
 fn main() {
-    allocatbelt_bench::run("allocatbelt");
+  allocatbelt_bench::run("allocatbelt");
 }

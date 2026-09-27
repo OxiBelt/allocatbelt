@@ -4,5 +4,5 @@
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 fn main() {
-    allocatbelt_bench::run("mimalloc-secure");
+  allocatbelt_bench::run("mimalloc-secure");
 }
