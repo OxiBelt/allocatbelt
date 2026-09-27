@@ -154,6 +154,45 @@ fn alloc_block(h: &Heap<MockOs>, shard: usize, size: usize, align: usize) -> Blo
     b
 }
 
+/// Resizes in place, updating the shadow maps and checking that a grown
+/// block stays committed and overlaps nothing.
+fn resize(h: &Heap<MockOs>, off: usize, new_size: usize) -> bool {
+    // While shrinking, only the first `new_size` bytes must stay intact.
+    let old_end = h.os().live.lock().unwrap()[&off];
+    h.os()
+        .live
+        .lock()
+        .unwrap()
+        .insert(off, old_end.min(off + new_size));
+    if !h.resize_in_place(off, new_size) {
+        h.os().live.lock().unwrap().insert(off, old_end);
+        return false;
+    }
+    assert!(h.usable_size(off) >= new_size);
+    let end = off + new_size;
+    for s in off / SEGMENT_SIZE..end.div_ceil(SEGMENT_SIZE) {
+        assert!(
+            h.os().committed[s].load(Ordering::Relaxed),
+            "segment {s} not committed"
+        );
+    }
+    let mut live = h.os().live.lock().unwrap();
+    live.remove(&off);
+    if let Some((&s, &e)) = live.range(..end).next_back() {
+        assert!(
+            e <= off,
+            "resized {off:#x}..{end:#x} overlaps live {s:#x}..{e:#x}"
+        );
+    }
+    live.insert(off, end);
+    h.os()
+        .written
+        .lock()
+        .unwrap()
+        .extend(off / PAGE_SIZE..end.div_ceil(PAGE_SIZE));
+    true
+}
+
 fn free(h: &Heap<MockOs>, off: usize) {
     h.os().live.lock().unwrap().remove(&off);
     h.dealloc(off);
@@ -426,13 +465,18 @@ fn cross_thread_frees() {
 proptest::proptest! {
     #![proptest_config(proptest::prelude::ProptestConfig::with_cases(if cfg!(miri) { 2 } else { 64 }))]
     #[test]
-    fn random_sequences(ops in proptest::collection::vec((0usize..40_000, 0u32..8, proptest::bool::ANY), 1..300)) {
+    fn random_sequences(ops in proptest::collection::vec((0usize..40_000, 0u32..8, 0u8..3), 1..300)) {
         let h = heap();
         let mut live = Vec::new();
-        for (size, align_shift, do_free) in ops {
-            if do_free && !live.is_empty() {
+        for (size, align_shift, op) in ops {
+            if op == 1 && !live.is_empty() {
                 let o = live.swap_remove(size % live.len());
                 free(h, o);
+            } else if op == 2 && !live.is_empty() {
+                // Resize a live block to a size spanning all block kinds.
+                let o = live[size % live.len()];
+                let new_size = size * (1 << (align_shift * 2)) / 4 + 1;
+                resize(h, o, new_size);
             } else {
                 live.push(alloc(h, size % 3, size, 1 << (align_shift * 2)));
             }
@@ -556,4 +600,60 @@ fn empty_segments_are_returned() {
     }
     h.purge();
     assert_eq!(h.segments_in_use(), base + 1);
+}
+
+#[test]
+fn resizing_in_place() {
+    let h = heap();
+    // Class blocks stay while the new size uses at least half of them.
+    let small = alloc(h, 5, 64, 8);
+    assert!(resize(h, small, 40));
+    assert!(!resize(h, small, 16));
+    assert!(!resize(h, small, 65));
+    free(h, small);
+
+    // A page run at the end of what its segment uses grows into free pages.
+    let run = alloc(h, 6, 5 * PAGE_SIZE, 8);
+    assert!(resize(h, run, 8 * PAGE_SIZE - 1));
+    assert_eq!(h.usable_size(run), 8 * PAGE_SIZE);
+    // Once a neighbour follows it, it cannot.
+    let next = alloc(h, 6, 5 * PAGE_SIZE, 8);
+    assert_eq!(next, run + 8 * PAGE_SIZE);
+    assert!(!resize(h, run, 9 * PAGE_SIZE));
+    // Shrinking hands the tail back as dirty pages, which are then reused.
+    let dirty = h.dirty_pages();
+    assert!(resize(h, run, 6 * PAGE_SIZE));
+    assert_eq!(h.usable_size(run), 6 * PAGE_SIZE);
+    assert_eq!(h.dirty_pages(), dirty + 2);
+    // Down to class sizes it moves instead.
+    assert!(!resize(h, run, 1000));
+    free(h, run);
+    free(h, next);
+
+    // Huge blocks grow into free segments and give back their tail.
+    let base = h.segments_in_use();
+    let huge = alloc(h, 0, 5 << 20, 8);
+    assert_eq!(h.segments_in_use(), base + 2);
+    assert!(resize(h, huge, 11 << 20));
+    assert_eq!(h.usable_size(huge), 3 * SEGMENT_SIZE);
+    assert_eq!(h.segments_in_use(), base + 3);
+    assert!(resize(h, huge, 5 << 20));
+    assert_eq!(h.segments_in_use(), base + 2);
+    assert!(!resize(h, huge, 1 << 20));
+    // A block right after it stops growth.
+    let wall = alloc(h, 0, 5 << 20, 8);
+    assert_eq!(wall, huge + 2 * SEGMENT_SIZE);
+    assert!(!resize(h, huge, 9 << 20));
+    free(h, huge);
+    free(h, wall);
+    assert_eq!(h.segments_in_use(), base);
+}
+
+#[test]
+#[should_panic(expected = "realloc of a pointer that is not allocated")]
+fn resize_of_freed_block() {
+    let h = heap();
+    let a = h.alloc(0, 300_000, 8).unwrap();
+    h.dealloc(a);
+    h.resize_in_place(a, 400_000);
 }

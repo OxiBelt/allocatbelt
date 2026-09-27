@@ -235,10 +235,9 @@ unsafe impl GlobalAlloc for Allocatbelt {
     #[expect(unsafe_code, reason = "GlobalAlloc method")]
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
         let off = offset_of(ptr);
-        let usable = guarded(|| HEAP.usable_size(off));
-        // Keep the block when it still fits and would not waste more than
-        // half of a large block.
-        if new_size <= usable && (usable <= 8192 || new_size > usable / 2) {
+        // Keeps a block that still fits, and grows or trims page and segment
+        // runs where they are.
+        if guarded(|| HEAP.resize_in_place(off, new_size)) {
             return ptr;
         }
         // The caller guarantees `new_size` rounded to `layout.align()` does

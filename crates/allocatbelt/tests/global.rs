@@ -111,3 +111,36 @@ fn reused_memory_is_zeroed() {
         }
     }
 }
+
+#[test]
+fn realloc_grows_and_shrinks() {
+    // Page runs and huge blocks resize in place where they can; either way
+    // the contents must survive.
+    let mut layout = Layout::from_size_align(100_000, 8).unwrap();
+    // SAFETY: non-zero layout.
+    let mut p = unsafe { GLOBAL.alloc(layout) };
+    assert!(!p.is_null());
+    // SAFETY: `p` is valid for `layout.size()` bytes.
+    unsafe { p.write_bytes(0x5A, layout.size()) };
+    for &size in &[
+        300_000usize,
+        1 << 20,
+        6 << 20,
+        40 << 20,
+        9 << 20,
+        500_000,
+        20_000,
+    ] {
+        let keep = layout.size().min(size);
+        // SAFETY: `p` is live with `layout`; `size` is non-zero.
+        p = unsafe { GLOBAL.realloc(p, layout, size) };
+        assert!(!p.is_null());
+        // SAFETY: the first `keep` bytes were preserved.
+        let s = unsafe { std::slice::from_raw_parts_mut(p, size) };
+        assert!(s[..keep].iter().all(|&x| x == 0x5A), "size {size}");
+        s.fill(0x5A);
+        layout = Layout::from_size_align(size, 8).unwrap();
+    }
+    // SAFETY: `p` is live with `layout`.
+    unsafe { GLOBAL.dealloc(p, layout) };
+}

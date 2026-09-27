@@ -313,6 +313,57 @@ impl<O: Os> Heap<O> {
         }
     }
 
+    /// Tries to make the live block at `offset` hold `new_size` bytes without
+    /// moving it. Returns `false` when the caller should move it instead
+    /// (allocate, copy, free).
+    ///
+    /// A block is kept when it still fits and would not waste more than half
+    /// of itself. Page and segment runs also grow into free neighbours and
+    /// hand their unused tail back, so they only move when the neighbours are
+    /// taken or when a size class would fit the new size much better.
+    pub fn resize_in_place(&self, offset: usize, new_size: usize) -> bool {
+        match self.block(
+            offset,
+            "allocatbelt: realloc of a pointer that is not allocated",
+        ) {
+            Target::Small { c, .. } => {
+                let size = class::size(c);
+                new_size <= size && new_size >= size / 2
+            }
+            Target::Large { page, m, pm, info } => {
+                let n = ((info >> 16) & 0xFF) as usize;
+                if new_size > SEGMENT_SIZE {
+                    return false;
+                }
+                let n2 = new_size.div_ceil(PAGE_SIZE).max(1);
+                if n2 > n {
+                    return self.grow_large(page, m, pm, n, n2);
+                }
+                if new_size <= SMALL_MAX && new_size < n * PAGE_SIZE / 2 {
+                    return false;
+                }
+                if n2 < n {
+                    self.shrink_large(page, m, pm, n, n2);
+                }
+                true
+            }
+            Target::Huge { seg, m, hdr } => {
+                let k = (hdr >> 16) as usize;
+                let k2 = new_size.div_ceil(SEGMENT_SIZE).max(1);
+                if k2 > k {
+                    return self.grow_huge(seg, m, k, k2);
+                }
+                if new_size <= SEGMENT_SIZE && new_size < k * SEGMENT_SIZE / 2 {
+                    return false;
+                }
+                if k2 < k {
+                    self.shrink_huge(seg, m, k, k2);
+                }
+                true
+            }
+        }
+    }
+
     /// Resolves `offset` to the block it starts, or reports `bad` if it does
     /// not start an allocated block.
     fn block(&self, offset: usize, bad: &'static str) -> Target<'_> {
@@ -575,6 +626,57 @@ impl<O: Os> Heap<O> {
         self.release_pages(page, n);
     }
 
+    /// Extends the live run of `n` pages at `page` to `n2` pages if the pages
+    /// after it are free. Any thread may do this for a block it owns: the
+    /// claim is a compare-exchange like every other page claim.
+    fn grow_large(
+        &self,
+        page: usize,
+        m: &[AtomicU64],
+        pm: PageMeta<'_>,
+        n: usize,
+        n2: usize,
+    ) -> bool {
+        let in_seg = page % PAGES_PER_SEGMENT;
+        if in_seg + n2 > PAGES_PER_SEGMENT {
+            return false;
+        }
+        let mask = run_mask((in_seg + n) as u32, (n2 - n) as u32);
+        let mut used = m[SEG_PAGES].load(Acquire);
+        loop {
+            if used & mask != 0 {
+                return false;
+            }
+            match m[SEG_PAGES].compare_exchange_weak(used, used | mask, AcqRel, Acquire) {
+                Ok(_) => break,
+                Err(now) => used = now,
+            }
+        }
+        let was_dirty = m[SEG_DIRTY].fetch_and(!mask, AcqRel) & mask;
+        if was_dirty != 0 {
+            self.dirty_pages
+                .fetch_sub(was_dirty.count_ones() as isize, Relaxed);
+        }
+        for t in n..n2 {
+            PageMeta::new(m, in_seg + t)
+                .info()
+                .store(PAGE_LARGE_TAIL, Relaxed);
+        }
+        pm.info().store(PAGE_LARGE | (n2 as u64) << 16, Release);
+        true
+    }
+
+    /// Cuts the live run of `n` pages at `page` down to `n2` pages.
+    fn shrink_large(&self, page: usize, m: &[AtomicU64], pm: PageMeta<'_>, n: usize, n2: usize) {
+        pm.info().store(PAGE_LARGE | (n2 as u64) << 16, Release);
+        for t in n2..n {
+            PageMeta::new(m, page % PAGES_PER_SEGMENT + t)
+                .info()
+                .store(PAGE_FREE, Relaxed);
+        }
+        self.release_pages(page + n2, n - n2);
+    }
+
     /// Claims `n` contiguous pages starting at a multiple of `step` pages from
     /// a segment owned by shard `s`. Also returns whether the pages read as
     /// zero.
@@ -786,6 +888,43 @@ impl<O: Os> Heap<O> {
         self.free_segments(seg, k);
     }
 
+    /// Extends the huge block of `k` segments at `seg` to `k2` segments if
+    /// the segments after it are free.
+    fn grow_huge(&self, seg: usize, m: &[AtomicU64], k: usize, k2: usize) -> bool {
+        let (first, extra) = (seg + k, k2 - k);
+        if seg + k2 > MAX_SEGMENTS {
+            return false;
+        }
+        {
+            let _g = self.seg_lock.lock(|| self.os.yield_now());
+            let free = (first..first + extra)
+                .all(|s| self.seg_used[s / 64].load(Relaxed) & 1 << (s % 64) == 0);
+            if !free {
+                return false;
+            }
+            self.mark_segments(first, extra, true);
+        }
+        if !self.commit_segments(first, extra) {
+            return false;
+        }
+        for s in first..first + extra {
+            let t = self.seg_meta(s);
+            t[SEG_PAGES].store(u64::MAX, Relaxed);
+            t[SEG_HDR].store(SEG_HUGE_TAIL, Release);
+        }
+        m[SEG_HDR].store(SEG_HUGE | (k2 as u64) << 16, Release);
+        true
+    }
+
+    /// Cuts the huge block of `k` segments at `seg` down to `k2` segments.
+    fn shrink_huge(&self, seg: usize, m: &[AtomicU64], k: usize, k2: usize) {
+        m[SEG_HDR].store(SEG_HUGE | (k2 as u64) << 16, Release);
+        for s in seg + k2..seg + k {
+            self.seg_meta(s)[SEG_HDR].store(SEG_FREE, Relaxed);
+        }
+        self.free_segments(seg + k2, k - k2);
+    }
+
     /// Takes `k` contiguous segments from the arena, commits their metadata
     /// and memory, and returns the first index. The segments' `SEG_DIRTY`
     /// word tells whether their memory may hold non-zero bytes.
@@ -799,18 +938,24 @@ impl<O: Os> Heap<O> {
             self.mark_segments(first, k, true);
             first
         };
+        self.commit_segments(first, k).then_some(first)
+    }
+
+    /// Commits metadata and memory of `k` segments marked used by the
+    /// caller. On failure the segments are returned to the arena.
+    fn commit_segments(&self, first: usize, k: usize) -> bool {
         // Metadata first: until it exists, nothing records whether the
         // memory is zero, so the memory must not be touched before.
         if !(first..first + k).all(|s| self.os.commit_meta(s).is_some()) {
             let _g = self.seg_lock.lock(|| self.os.yield_now());
             self.mark_segments(first, k, false);
-            return None;
+            return false;
         }
         if !self.os.commit(first << SEGMENT_SHIFT, k << SEGMENT_SHIFT) {
             self.free_segments(first, k);
-            return None;
+            return false;
         }
-        Some(first)
+        true
     }
 
     /// Decommits `k` segments and returns them to the arena, recording
