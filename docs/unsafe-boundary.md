@@ -36,7 +36,12 @@ The narrow boundary makes each *operation* auditable, but soundness still depend
 3. It never hands out an offset that has not been committed.
 4. It only reports a block as `zeroed` if every page of it was never handed out, or was purged/decommitted with success (`Os::purge`/`Os::decommit` returned `true`) since it was last handed out. Otherwise `calloc` would return stale bytes.
 
-Current verification: shadow-map checks against the mock `Os` (non-overlap, commit state, purge overlap, and a written-pages shadow that every `zeroed` claim is checked against, including with failing purges), proptest random sequences, multi-threaded cross-thread-free tests, and Miri on the core tests.
+Current verification: shadow-map checks against the mock `Os` (non-overlap, commit state, purge overlap, and a written-pages shadow that every `zeroed` claim is checked against, including with failing purges), proptest random sequences, multi-threaded cross-thread-free tests, and a partial Miri run on the core tests (below).
+
+Miri result (**run on commit 0271678**, i.e. before the later follow-up commits, nightly 2026-09-26, `-Zmiri-disable-isolation`, 90-minute limit): **8/17 tests passed with no UB detected**:
+`bits::{masks, run_matches_naive}`, `class::{table_shape, class_of_is_tight}`, `tests::{alignments, cross_thread_frees, double_free_small, double_free_large}`.
+The other 9 (proptest-based ones, `every_size_round_trips`, `random_sequences`, etc.) **did not finish** within the limit. Miri has not been run on the current head. To run all of them under Miri, the mock's `MAX_SEGMENTS`-sized tables and the iteration counts need to shrink under `cfg(miri)`.
+Since the core has no `unsafe`, Miri mainly checks panics/overflow and data races in the atomic logic here, not memory safety.
 Before production, add loom models and fuzzing (cargo-fuzz against `Heap<MockOs>`).
 
 Other caveats:
