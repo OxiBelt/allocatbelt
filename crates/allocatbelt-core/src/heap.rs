@@ -508,11 +508,7 @@ impl<O: Os> Heap<O> {
             // subtracted. It can transiently read low (even negative).
             let free = pm.free().load(Acquire) as i64;
             if free >= cap && found.is_some() {
-                match prev {
-                    None => cs.head.store(next, Relaxed),
-                    Some(q) => self.page_meta(q).next().store(u64::from(next), Relaxed),
-                }
-                self.release_small_page(p, pm);
+                self.unlink_and_release(cs, prev, p, pm);
                 cur = next;
                 continue;
             }
@@ -523,6 +519,43 @@ impl<O: Os> Heap<O> {
             cur = next;
         }
         found
+    }
+
+    /// Releases every page of class `c` whose blocks are all free. Caller
+    /// holds the shard lock.
+    fn release_empty_pages(&self, cs: &ClassState, c: usize) {
+        // Without claimed bits the cursor is only a scan position; dropping
+        // it makes the next allocation start from the list.
+        if cs.bits.load(Relaxed) == 0 {
+            cs.cursor.store(0, Relaxed);
+        }
+        let cursor = cs.cursor.load(Relaxed);
+        let cursor_page = (cursor != 0).then(|| unpack(cursor).0);
+        let cap = class::capacity(c) as i64;
+        let mut prev: Option<usize> = None;
+        let mut cur = cs.head.load(Relaxed);
+        while cur != 0 {
+            let p = cur as usize - 1;
+            let pm = self.page_meta(p);
+            let next = pm.next().load(Relaxed) as u32;
+            if Some(p) != cursor_page && pm.free().load(Acquire) as i64 >= cap {
+                self.unlink_and_release(cs, prev, p, pm);
+            } else {
+                prev = Some(p);
+            }
+            cur = next;
+        }
+    }
+
+    /// Unlinks page `p` (preceded by `prev`) from its class list and returns
+    /// it to its segment.
+    fn unlink_and_release(&self, cs: &ClassState, prev: Option<usize>, p: usize, pm: PageMeta<'_>) {
+        let next = pm.next().load(Relaxed);
+        match prev {
+            None => cs.head.store(next as u32, Relaxed),
+            Some(q) => self.page_meta(q).next().store(next, Relaxed),
+        }
+        self.release_small_page(p, pm);
     }
 
     fn new_small_page(&self, s: usize, sh: &Shard, cs: &ClassState, c: usize) -> Option<usize> {
@@ -749,14 +782,18 @@ impl<O: Os> Heap<O> {
         }
     }
 
-    /// Unlinks and frees the empty segments of each idle shard, except the
-    /// first, that were already empty at the previous pass. Caller holds
-    /// `purge_lock`, so no purge pass races the claim.
+    /// Releases the fully free small pages of each idle shard, then unlinks
+    /// and frees its empty segments, except the first, that were already
+    /// empty at the previous pass. Caller holds `purge_lock`, so no purge
+    /// pass races the claim.
     fn trim_shards(&self) {
         for sh in &self.shards {
             let Some(_g) = sh.lock.try_lock() else {
                 continue;
             };
+            for (c, cs) in sh.classes.iter().enumerate() {
+                self.release_empty_pages(cs, c);
+            }
             let mut kept_empty = false;
             let mut prev: Option<&[AtomicU64]> = None;
             let mut cur = sh.segs.load(Relaxed);

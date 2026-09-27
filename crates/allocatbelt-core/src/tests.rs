@@ -628,3 +628,28 @@ fn resize_of_freed_block() {
     h.dealloc(a);
     h.resize_in_place(a, 400_000);
 }
+
+#[test]
+fn freed_small_pages_leave_their_segments() {
+    let h = heap();
+    let base = h.segments_in_use();
+    // Enough 16-byte blocks for three segments, then free them all.
+    let n = 3 * SEGMENT_SIZE / 16;
+    let offs: Vec<_> = (0..n).map(|_| h.alloc(6, 16, 8).unwrap()).collect();
+    assert_eq!(h.segments_in_use(), base + 3);
+    // Keep one block so its page stays behind.
+    for &o in &offs[1..] {
+        h.dealloc(o);
+    }
+    // Pages go back on the first pass, segments on the second. What stays:
+    // the survivor's segment and one empty segment the shard keeps.
+    h.purge();
+    h.purge();
+    assert_eq!(h.segments_in_use(), base + 2);
+    // The survivor is intact and the class keeps working.
+    assert_eq!(h.usable_size(offs[0]), 16);
+    let again: Vec<_> = (0..1000).map(|_| h.alloc(6, 16, 8).unwrap()).collect();
+    for o in again.into_iter().chain([offs[0]]) {
+        h.dealloc(o);
+    }
+}
