@@ -29,8 +29,10 @@
 //! free pages of every segment (as if allocating them), `madvise`s them and
 //! releases them again. Purging on every free costs an `mmap_lock` round trip
 //! and a TLB shootdown per call, which dominated multi-threaded profiles.
-//! The same pass returns segments whose pages are all free to the arena,
-//! keeping one empty segment per shard to absorb churn.
+//! The same pass returns segments whose pages have all been free since the
+//! previous pass to the arena, keeping one empty segment per shard; both
+//! damp the decommit/recommit churn of a workload that empties and refills
+//! segments.
 //!
 //! Zero tracking: memory that was never handed out, or that was purged or
 //! decommitted successfully, reads as zero. Free pages that are not dirty are
@@ -228,6 +230,9 @@ pub struct Heap<O> {
     /// Pages marked dirty and not yet purged or reused (may transiently lag).
     dirty_pages: AtomicIsize,
     purge_lock: SpinLock,
+    /// Owned segments found empty (and not kept) by the last purge pass.
+    /// Only touched under `purge_lock`.
+    seg_idle: [AtomicU64; MAX_SEGMENTS / 64],
     shards: [Shard; SHARDS],
 }
 
@@ -240,6 +245,7 @@ impl<O: Os> Heap<O> {
             seg_used: [const { AtomicU64::new(0) }; MAX_SEGMENTS / 64],
             dirty_pages: AtomicIsize::new(0),
             purge_lock: SpinLock::new(),
+            seg_idle: [const { AtomicU64::new(0) }; MAX_SEGMENTS / 64],
             shards: [const { Shard::new() }; SHARDS],
         }
     }
@@ -743,8 +749,9 @@ impl<O: Os> Heap<O> {
         }
     }
 
-    /// Unlinks and frees every empty segment of each idle shard except the
-    /// first. Caller holds `purge_lock`, so no purge pass races the claim.
+    /// Unlinks and frees the empty segments of each idle shard, except the
+    /// first, that were already empty at the previous pass. Caller holds
+    /// `purge_lock`, so no purge pass races the claim.
     fn trim_shards(&self) {
         for sh in &self.shards {
             let Some(_g) = sh.lock.try_lock() else {
@@ -758,14 +765,21 @@ impl<O: Os> Heap<O> {
                 let m = self.seg_meta(seg);
                 let next = m[SEG_NEXT].load(Relaxed);
                 let empty = m[SEG_PAGES].load(Acquire) == 0;
+                let (idle, bit) = (&self.seg_idle[seg / 64], 1u64 << (seg % 64));
+                let was_idle = if empty && kept_empty {
+                    idle.fetch_or(bit, Relaxed) & bit != 0
+                } else {
+                    idle.fetch_and(!bit, Relaxed);
+                    false
+                };
                 // Claiming every page shuts out the only other claimers:
                 // in-place growth, which needs a live block in the segment.
-                if empty
-                    && kept_empty
+                if was_idle
                     && m[SEG_PAGES]
                         .compare_exchange(0, u64::MAX, AcqRel, Relaxed)
                         .is_ok()
                 {
+                    idle.fetch_and(!bit, Relaxed);
                     match prev {
                         None => sh.segs.store(next as u32, Relaxed),
                         Some(p) => p[SEG_NEXT].store(next, Relaxed),

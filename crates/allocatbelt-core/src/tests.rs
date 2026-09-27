@@ -553,8 +553,11 @@ fn empty_segments_are_returned() {
     for o in runs {
         free(h, o);
     }
+    // The first pass only notes the empty segments; a segment that is still
+    // empty at the next one goes back. One stays with the shard as a cache.
     h.purge();
-    // One empty segment stays with the shard as a cache.
+    assert_eq!(h.segments_in_use(), base + 5);
+    h.purge();
     assert_eq!(h.segments_in_use(), base + 1);
     assert_eq!(h.dirty_pages(), 0);
     // Returned segments are reused, by shards and by huge blocks alike.
@@ -565,6 +568,7 @@ fn empty_segments_are_returned() {
     for o in again.into_iter().chain([big.offset]) {
         free(h, o);
     }
+    h.purge();
     h.purge();
     assert_eq!(h.segments_in_use(), base + 1);
 }
