@@ -58,6 +58,52 @@ jobs:
       - name: Cargo test
         run: cargo test --release --all-features --locked
 
+  riscv64-qemu-tests:
+    name: riscv64 tests under qemu-user (${{ matrix.name }})
+    runs-on: ubuntu-26.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: rv64gc
+            rustflags: ""
+          - name: rv64gc + Zbb
+            rustflags: "-C target-feature=+zbb"
+    env:
+      RUSTFLAGS: ${{ matrix.rustflags }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # 7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install 1.98.1 --profile minimal --target riscv64gc-unknown-linux-gnu
+          rustup default 1.98.1
+
+      # qemu-user 8.2 intermittently crashes with "QEMU internal SIGSEGV" on
+      # the multithreaded tests; 10.2.1 is the oldest release verified clean.
+      - name: Install qemu-user and the riscv64 cross toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            qemu-user gcc-riscv64-linux-gnu libc6-dev-riscv64-cross
+          qemu_version="$(dpkg-query -W -f='${Version}' qemu-user)"
+          qemu-riscv64 --version
+          dpkg --compare-versions "${qemu_version}" ge "1:10.2.1" \
+            || { echo "qemu-user ${qemu_version} is older than 10.2.1" >&2; exit 1; }
+
+      - name: Fetch locked Cargo dependency graph
+        run: cargo fetch --locked
+
+      # The runner in `.cargo/config.toml` emulates a Zbb-capable CPU.
+      - name: Cargo test
+        run: cargo test --release --locked --target riscv64gc-unknown-linux-gnu -p allocatbelt-core -p allocatbelt
+
   rust-advisory-checks:
     name: Rust dependency admission
     runs-on: ubuntu-26.04

@@ -19,7 +19,7 @@ docs/                     Research reports, benchmark results, unsafe inventory.
 static GLOBAL: allocatbelt::Allocatbelt = allocatbelt::Allocatbelt;
 ```
 
-Status: **research prototype**. Only 64-bit Linux is supported: x86_64, aarch64 and riscv64. x86_64 and aarch64 are tested natively in CI (`ubuntu-26.04` and `ubuntu-26.04-arm` runners); riscv64 was tested under qemu-user and is not in CI. 32-bit targets (including riscv32) are rejected at compile time. Not recommended for production.
+Status: **research prototype**. Only 64-bit Linux is supported: x86_64, aarch64 and riscv64. x86_64 and aarch64 are tested natively in CI (`ubuntu-26.04` and `ubuntu-26.04-arm` runners); riscv64 is tested in CI under qemu-user, with and without Zbb. 32-bit targets (including riscv32) are rejected at compile time. Not recommended for production.
 For the conclusions and recommendations see [docs/research/README.md](docs/research/README.md), for measurements see [docs/research/benchmarks.md](docs/research/benchmarks.md), and for the unsafe inventory see [docs/unsafe-boundary.md](docs/unsafe-boundary.md).
 
 ## Verification
@@ -38,7 +38,7 @@ Code style, pinned tool versions and the commit-message format follow OxiBelt; s
 
 ### RISC-V (riscv64)
 
-`.cargo/config.toml` sets the linker and a qemu-user runner for `riscv64gc-unknown-linux-gnu`, so the tests can run on an x86_64 host. The runner emulates a CPU with Zbb (`-cpu rv64,zbb=true`), so both commands below run:
+`.cargo/config.toml` sets the linker and a qemu-user runner for `riscv64gc-unknown-linux-gnu`, so the tests can run on an x86_64 host. The runner emulates a CPU with Zbb (`-cpu rv64,zbb=true`), so both commands below run. Use qemu 10.2.1 or later (Ubuntu 26.04's `qemu-user`): qemu 8.2 intermittently crashes with `QEMU internal SIGSEGV` on the multithreaded tests.
 
 ```sh
 sudo apt-get install qemu-user gcc-riscv64-linux-gnu libc6-dev-riscv64-cross
