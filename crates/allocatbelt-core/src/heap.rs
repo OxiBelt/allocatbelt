@@ -361,7 +361,9 @@ impl<O: Os> Heap<O> {
     }
 
     /// Resolves `offset` to the block it starts, or reports `bad` if it does
-    /// not start an allocated block.
+    /// not start an allocated block. Inlined so that the free path matches
+    /// on the page kind directly instead of returning a `Target`.
+    #[inline(always)]
     fn block(&self, offset: usize, bad: &'static str) -> Target<'_> {
         let (seg, m, hdr) = self.lookup(offset);
         match hdr & 0xFF {

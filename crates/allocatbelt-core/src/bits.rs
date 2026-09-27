@@ -11,6 +11,7 @@ pub const fn find_run(free: u64, n: u32) -> Option<u32> {
 /// Index of the first run of `n` consecutive set bits in `free` that starts
 /// at a multiple of `step` (a power of two in `1..=64`), if any.
 #[must_use]
+#[inline]
 pub const fn find_run_aligned(free: u64, n: u32, step: u32) -> Option<u32> {
     first(run_starts(free, n) & stride_mask(step))
 }
@@ -44,9 +45,19 @@ const fn run_starts(free: u64, n: u32) -> u64 {
     m
 }
 
-/// Bits `0, step, 2 * step, ...` (`step` a power of two in `1..=64`).
+/// Bits `0, step, 2 * step, ...` (`step` a power of two in `1..=64`). A
+/// table lookup: this sits on the page-claim path.
 const fn stride_mask(step: u32) -> u64 {
-    (u64::MAX as u128 / ((1u128 << step) - 1)) as u64
+    const MASKS: [u64; 7] = [
+        u64::MAX,
+        0x5555_5555_5555_5555,
+        0x1111_1111_1111_1111,
+        0x0101_0101_0101_0101,
+        0x0001_0001_0001_0001,
+        0x0000_0001_0000_0001,
+        1,
+    ];
+    MASKS[step.trailing_zeros() as usize]
 }
 
 /// Mask with bits `start..start + n` set (`n` in `1..=64`).
@@ -84,10 +95,11 @@ mod tests {
 
     #[test]
     fn strides() {
-        assert_eq!(stride_mask(1), u64::MAX);
-        assert_eq!(stride_mask(2), 0x5555_5555_5555_5555);
-        assert_eq!(stride_mask(32), 0x0000_0001_0000_0001);
-        assert_eq!(stride_mask(64), 1);
+        for shift in 0..=6 {
+            let step = 1u32 << shift;
+            let naive = (0..64).step_by(step as usize).fold(0u64, |m, i| m | 1 << i);
+            assert_eq!(stride_mask(step), naive, "step {step}");
+        }
     }
 
     #[test]
