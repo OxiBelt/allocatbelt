@@ -127,7 +127,12 @@ const SIZES: &[usize] = &[
     8192,
     8193,
     20_000,
+    40_000,
     65_536,
+    100_000,
+    200_000,
+    262_144,
+    262_145,
     300_000,
     1 << 21,
     (1 << 22) - 1,
@@ -217,8 +222,10 @@ fn empty_pages_are_recycled_across_classes() {
 #[test]
 fn purging_is_deferred_until_budget() {
     let h = heap();
+    // Five-page runs: larger than every size class.
+    const RUN: usize = 5;
     let n = crate::heap::DIRTY_BUDGET_PAGES as usize / 4 + 8;
-    let big: Vec<_> = (0..n).map(|_| alloc(h, 0, 4 * PAGE_SIZE, 8)).collect();
+    let big: Vec<_> = (0..n).map(|_| alloc(h, 0, RUN * PAGE_SIZE, 8)).collect();
     // The newest segment is searched first, so free runs from it.
     let (rest, last) = big.split_at(n - 4);
     for &o in last {
@@ -229,9 +236,9 @@ fn purging_is_deferred_until_budget() {
         0,
         "small frees must not purge"
     );
-    assert_eq!(h.dirty_pages(), 16);
+    assert_eq!(h.dirty_pages(), 4 * RUN);
     // Dirty pages are reused without a purge.
-    let again: Vec<_> = (0..4).map(|_| alloc(h, 0, 4 * PAGE_SIZE, 8)).collect();
+    let again: Vec<_> = (0..4).map(|_| alloc(h, 0, RUN * PAGE_SIZE, 8)).collect();
     assert_eq!(h.dirty_pages(), 0);
     for &o in rest.iter().chain(&again) {
         free(h, o);
@@ -259,7 +266,7 @@ fn double_free_small() {
 #[should_panic(expected = "double free")]
 fn double_free_large() {
     let h = heap();
-    let a = h.alloc(0, 100_000, 8).unwrap();
+    let a = h.alloc(0, 300_000, 8).unwrap();
     h.dealloc(a);
     h.dealloc(a);
 }
@@ -268,8 +275,40 @@ fn double_free_large() {
 #[should_panic(expected = "invalid or double free")]
 fn interior_pointer_free() {
     let h = heap();
-    let a = h.alloc(0, 200_000, 8).unwrap();
+    let a = h.alloc(0, 300_000, 8).unwrap();
     h.dealloc(a + PAGE_SIZE);
+}
+
+#[test]
+fn medium_blocks_share_spans() {
+    let h = heap();
+    // 24 KiB blocks: five to a two-page span, so some start in the tail page.
+    let offs: Vec<_> = (0..10).map(|_| alloc(h, 2, 24 * 1024, 8)).collect();
+    let spans: std::collections::BTreeSet<_> = offs.iter().map(|o| o / (2 * PAGE_SIZE)).collect();
+    assert_eq!(spans.len(), 2, "{offs:x?}");
+    assert!(offs.iter().any(|o| o % (2 * PAGE_SIZE) >= PAGE_SIZE));
+    for &o in &offs {
+        assert_eq!(h.usable_size(o), 24 * 1024);
+    }
+    for o in offs {
+        free(h, o);
+    }
+    // 9 KiB lands in the 10 KiB class instead of a whole 64 KiB page.
+    let a = alloc(h, 2, 9 * 1024, 8);
+    assert_eq!(h.usable_size(a), 10 * 1024);
+    free(h, a);
+}
+
+#[test]
+#[should_panic(expected = "misaligned")]
+fn misaligned_medium_free_in_tail_page() {
+    let h = heap();
+    let offs: Vec<_> = (0..5).map(|_| h.alloc(0, 24 * 1024, 8).unwrap()).collect();
+    let tail = offs
+        .iter()
+        .find(|&&o| o % (2 * PAGE_SIZE) >= PAGE_SIZE)
+        .unwrap();
+    h.dealloc(tail + 16);
 }
 
 #[test]
