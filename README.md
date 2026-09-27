@@ -19,7 +19,7 @@ docs/                     Research reports, benchmark results, unsafe inventory.
 static GLOBAL: allocatbelt::Allocatbelt = allocatbelt::Allocatbelt;
 ```
 
-Status: **research prototype**. Only 64-bit Linux is supported: x86_64, aarch64 and riscv64. x86_64 was tested natively and riscv64 under qemu-user; aarch64 is supported in principle but untested. 32-bit targets (including riscv32) are rejected at compile time. Not recommended for production.
+Status: **research prototype**. Only 64-bit Linux is supported: x86_64, aarch64 and riscv64. x86_64 and aarch64 are tested natively in CI (`ubuntu-26.04` and `ubuntu-26.04-arm` runners); riscv64 was tested under qemu-user and is not in CI. 32-bit targets (including riscv32) are rejected at compile time. Not recommended for production.
 For the conclusions and recommendations see [docs/research/README.md](docs/research/README.md), for measurements see [docs/research/benchmarks.md](docs/research/benchmarks.md), and for the unsafe inventory see [docs/unsafe-boundary.md](docs/unsafe-boundary.md).
 
 ## Verification
