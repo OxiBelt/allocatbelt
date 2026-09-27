@@ -40,7 +40,7 @@
 
 use core::sync::atomic::{AtomicIsize, AtomicU32, AtomicU64, Ordering};
 
-use crate::bits::{find_run, run_mask};
+use crate::bits::{find_run_aligned, run_mask};
 use crate::class::{self, MIN_ALIGN, NUM_CLASSES, SMALL_MAX};
 use crate::lock::SpinLock;
 use crate::{
@@ -281,8 +281,12 @@ impl<O: Os> Heap<O> {
                     .map(|o| Block::new(o, false));
             }
         }
-        if align <= PAGE_SIZE && size <= SEGMENT_SIZE {
-            return self.alloc_large(shard_hint, size.div_ceil(PAGE_SIZE).max(1));
+        if size <= SEGMENT_SIZE {
+            // Alignments above a page place the run at a multiple of
+            // `align / PAGE_SIZE` pages; the segment itself is aligned.
+            let n = size.div_ceil(PAGE_SIZE).max(1);
+            let step = (align / PAGE_SIZE).max(1);
+            return self.alloc_large(shard_hint, n, step);
         }
         self.alloc_huge(size.div_ceil(SEGMENT_SIZE).max(1))
     }
@@ -487,7 +491,7 @@ impl<O: Os> Heap<O> {
 
     fn new_small_page(&self, s: usize, sh: &Shard, cs: &ClassState, c: usize) -> Option<usize> {
         let span = class::span(c);
-        let (p, _) = self.alloc_pages(s, sh, span)?;
+        let (p, _) = self.alloc_pages(s, sh, span, 1)?;
         let m = self.seg_meta(p / PAGES_PER_SEGMENT);
         for t in 1..span {
             PageMeta::new(m, p % PAGES_PER_SEGMENT + t)
@@ -541,9 +545,9 @@ impl<O: Os> Heap<O> {
 
     // ---- page runs -----------------------------------------------------
 
-    fn alloc_large(&self, hint: usize, n: usize) -> Option<Block> {
+    fn alloc_large(&self, hint: usize, n: usize, step: usize) -> Option<Block> {
         self.with_shard(hint, |s, sh| {
-            let (p, zeroed) = self.alloc_pages(s, sh, n)?;
+            let (p, zeroed) = self.alloc_pages(s, sh, n, step)?;
             let m = self.seg_meta(p / PAGES_PER_SEGMENT);
             for t in 1..n {
                 PageMeta::new(m, p % PAGES_PER_SEGMENT + t)
@@ -574,14 +578,15 @@ impl<O: Os> Heap<O> {
         self.release_pages(page, n);
     }
 
-    /// Claims `n` contiguous pages from a segment owned by shard `s`. Also
-    /// returns whether the pages read as zero.
-    fn alloc_pages(&self, s: usize, sh: &Shard, n: usize) -> Option<(usize, bool)> {
+    /// Claims `n` contiguous pages starting at a multiple of `step` pages from
+    /// a segment owned by shard `s`. Also returns whether the pages read as
+    /// zero.
+    fn alloc_pages(&self, s: usize, sh: &Shard, n: usize, step: usize) -> Option<(usize, bool)> {
         let mut cur = sh.segs.load(Relaxed);
         while cur != 0 {
             let seg = cur as usize - 1;
             let m = self.seg_meta(seg);
-            if let Some((start, zeroed)) = self.claim_run(m, n) {
+            if let Some((start, zeroed)) = self.claim_run(m, n, step) {
                 return Some((seg * PAGES_PER_SEGMENT + start, zeroed));
             }
             cur = m[SEG_NEXT].load(Relaxed) as u32;
@@ -601,17 +606,17 @@ impl<O: Os> Heap<O> {
         m[SEG_NEXT].store(u64::from(sh.segs.load(Relaxed)), Relaxed);
         m[SEG_HDR].store(SEG_OWNED | (s as u64) << 8 | 1 << 16, Release);
         sh.segs.store(seg as u32 + 1, Relaxed);
-        self.claim_run(m, n)
+        self.claim_run(m, n, step)
             .map(|(start, zeroed)| (seg * PAGES_PER_SEGMENT + start, zeroed))
     }
 
-    /// Atomically claims a run of `n` free pages in a segment and reports
-    /// whether it reads as zero. Reusing dirty pages is free: they simply stop
-    /// being dirty (and are not zero).
-    fn claim_run(&self, m: &[AtomicU64], n: usize) -> Option<(usize, bool)> {
+    /// Atomically claims a run of `n` free pages starting at a multiple of
+    /// `step` in a segment and reports whether it reads as zero. Reusing dirty
+    /// pages is free: they simply stop being dirty (and are not zero).
+    fn claim_run(&self, m: &[AtomicU64], n: usize, step: usize) -> Option<(usize, bool)> {
         let mut used = m[SEG_PAGES].load(Acquire);
         loop {
-            let start = find_run(!used, n as u32)?;
+            let start = find_run_aligned(!used, n as u32, step as u32)?;
             let mask = run_mask(start, n as u32);
             match m[SEG_PAGES].compare_exchange_weak(used, used | mask, AcqRel, Acquire) {
                 Ok(_) => {

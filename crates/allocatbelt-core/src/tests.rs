@@ -479,3 +479,25 @@ fn failed_purges_are_not_zeroed() {
     assert_eq!(h.dirty_pages(), 0);
     assert!(alloc_block(h, 1, 5 * PAGE_SIZE, 8).zeroed);
 }
+
+#[test]
+fn page_aligned_runs_stay_inside_segments() {
+    let h = heap();
+    let base = h.segments_in_use();
+    // Up to segment alignment, over-aligned blocks are page runs placed at an
+    // aligned page, not whole segments.
+    let offs: Vec<_> = [17, 18, 19, 20, 21]
+        .iter()
+        .map(|&shift| {
+            let o = alloc(h, 0, 100, 1 << shift);
+            assert_eq!(h.usable_size(o), PAGE_SIZE);
+            o
+        })
+        .collect();
+    assert_eq!(h.segments_in_use(), base + 1);
+    let whole = alloc(h, 0, SEGMENT_SIZE, SEGMENT_SIZE);
+    assert_eq!(h.usable_size(whole), SEGMENT_SIZE);
+    for o in offs.into_iter().chain([whole]) {
+        free(h, o);
+    }
+}
