@@ -19,7 +19,7 @@ docs/                     Research reports, benchmark results, unsafe inventory.
 static GLOBAL: allocatbelt::Allocatbelt = allocatbelt::Allocatbelt;
 ```
 
-Status: **research prototype**. Only Linux (x86_64 and aarch64 in principle; only x86_64 was tested) is supported. Not recommended for production.
+Status: **research prototype**. Only 64-bit Linux is supported: x86_64, aarch64 and riscv64. x86_64 was tested natively and riscv64 under qemu-user; aarch64 is supported in principle but untested. 32-bit targets (including riscv32) are rejected at compile time. Not recommended for production.
 For the conclusions and recommendations see [docs/research/README.md](docs/research/README.md), for measurements see [docs/research/benchmarks.md](docs/research/benchmarks.md), and for the unsafe inventory see [docs/unsafe-boundary.md](docs/unsafe-boundary.md).
 
 ## Verification
@@ -30,3 +30,18 @@ MIRIFLAGS=-Zmiri-disable-isolation cargo +nightly miri test -p allocatbelt-core
 cargo clippy --all-targets -- -D warnings
 cargo run --release -p allocatbelt-bench --bin bench-allocatbelt   # also bench-system, bench-mimalloc
 ```
+
+### RISC-V (riscv64)
+
+`.cargo/config.toml` sets the linker and a qemu-user runner for `riscv64gc-unknown-linux-gnu`, so the tests can run on an x86_64 host:
+
+```sh
+sudo apt-get install qemu-user gcc-riscv64-linux-gnu libc6-dev-riscv64-cross
+rustup target add riscv64gc-unknown-linux-gnu
+cargo test --release --target riscv64gc-unknown-linux-gnu -p allocatbelt-core -p allocatbelt
+RUSTFLAGS="-C target-feature=+zbb" cargo test --release --target riscv64gc-unknown-linux-gnu -p allocatbelt-core -p allocatbelt
+```
+
+- Build with `-C target-feature=+zbb` (part of the RVA22 profile) when the hardware has it. Without Zbb, the bitmap scans' `trailing_zeros`/`count_ones`/`leading_zeros` compile to multi-instruction sequences instead of `ctz`/`cpop`/`clz`.
+- RISC-V Linux uses 4 KiB pages, which the fixed 64 KiB granule already covers. Under Sv39 the user address space is 256 GiB, so the 64 GiB arena reservation (`PROT_NONE`, `MAP_NORESERVE`, no RSS) takes a quarter of it. Sv48/Sv57 leave plenty of room.
+- The `bench` crate builds secure mimalloc from C, so cross-building it needs a riscv64 C compiler (`CC_riscv64gc_unknown_linux_gnu=riscv64-linux-gnu-gcc`). Throughput on riscv64 has not been measured, since qemu numbers are meaningless.
