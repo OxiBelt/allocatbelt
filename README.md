@@ -38,7 +38,7 @@ Code style, pinned tool versions and the commit-message format follow OxiBelt; s
 
 ### RISC-V (riscv64)
 
-`.cargo/config.toml` sets the linker and a qemu-user runner for `riscv64gc-unknown-linux-gnu`, so the tests can run on an x86_64 host:
+`.cargo/config.toml` sets the linker and a qemu-user runner for `riscv64gc-unknown-linux-gnu`, so the tests can run on an x86_64 host. The runner emulates a CPU with Zbb (`-cpu rv64,zbb=true`), so both commands below run:
 
 ```sh
 sudo apt-get install qemu-user gcc-riscv64-linux-gnu libc6-dev-riscv64-cross
@@ -48,5 +48,5 @@ RUSTFLAGS="-C target-feature=+zbb" cargo test --release --target riscv64gc-unkno
 ```
 
 - Build with `-C target-feature=+zbb` (part of the RVA22 profile) when the hardware has it. Without Zbb, the bitmap scans' `trailing_zeros`/`count_ones`/`leading_zeros` compile to multi-instruction sequences instead of `ctz`/`cpop`/`clz`.
-- RISC-V Linux uses 4 KiB pages, which the fixed 64 KiB granule already covers. Under Sv39 the user address space is 256 GiB, so the 64 GiB arena reservation (`PROT_NONE`, `MAP_NORESERVE`, no RSS) takes a quarter of it. Sv48/Sv57 leave plenty of room.
+- The fixed 64 KiB granule is a multiple of every Linux page size (4, 16 and 64 KiB), so the kernel's page size does not matter. Under Sv39 the user address space is 256 GiB, so the 64 GiB arena reservation (`PROT_NONE`, `MAP_NORESERVE`, no RSS) takes a quarter of it. Sv48/Sv57 leave plenty of room.
 - The `bench` crate builds secure mimalloc from C, so cross-building it needs a riscv64 C compiler (`CC_riscv64gc_unknown_linux_gnu=riscv64-linux-gnu-gcc`). Throughput on riscv64 has not been measured, since qemu numbers are meaningless.

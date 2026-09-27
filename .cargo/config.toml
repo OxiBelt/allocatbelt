@@ -1,4 +1,5 @@
 # Cross-testing on riscv64 (see README). Only applies when building for that target.
+# The emulated CPU enables Zbb so builds with `-C target-feature=+zbb` also run.
 [target.riscv64gc-unknown-linux-gnu]
 linker = "riscv64-linux-gnu-gcc"
-runner = "qemu-riscv64 -L /usr/riscv64-linux-gnu"
+runner = "qemu-riscv64 -cpu rv64,zbb=true -L /usr/riscv64-linux-gnu"
