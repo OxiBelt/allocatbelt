@@ -15,8 +15,12 @@ license = "Apache-2.0"
 publish = false
 
 [workspace.dependencies]
+allocatbelt = { path = "crates/allocatbelt" }
 allocatbelt-core = { path = "crates/allocatbelt-core" }
 allocatbelt-sys = { path = "crates/allocatbelt-sys" }
+# Baseline only: OxiBelt currently ships secure mimalloc on x86_64 Linux.
+mimalloc = { version = "0.1.52", default-features = false, features = ["secure"] }
+proptest = { version = "1.11.0", default-features = false, features = ["std"] }
 rustix = { version = "1.1.5", default-features = false, features = ["mm", "rand", "thread"] }
 
 # Mirrors the OxiBelt workspace lint baseline so the crates can be dropped in unchanged.
@@ -25,9 +29,17 @@ unsafe_code = "deny"
 unsafe_op_in_unsafe_fn = "deny"
 
 [workspace.lints.clippy]
+chunks_exact_to_as_chunks = "allow"
+manual_contains = "deny"
+manual_find = "deny"
+manual_is_ascii_check = "deny"
+manual_memcpy = "deny"
+manual_slice_fill = "deny"
 missing_safety_doc = "deny"
-undocumented_unsafe_blocks = "deny"
 multiple_unsafe_ops_per_block = "deny"
+needless_range_loop = "deny"
+result_large_err = "allow"
+undocumented_unsafe_blocks = "deny"
 
 [profile.bench]
 debug = true

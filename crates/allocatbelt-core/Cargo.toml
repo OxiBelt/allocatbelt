@@ -8,7 +8,7 @@ license.workspace = true
 publish.workspace = true
 
 [dev-dependencies]
-proptest = { version = "1", default-features = false, features = ["std"] }
+proptest.workspace = true
 
 [lints]
 workspace = true

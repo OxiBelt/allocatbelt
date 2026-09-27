@@ -1,0 +1,122 @@
+name: Check allocatbelt
+
+on:
+  push:
+    branches:
+      - "**"
+  pull_request:
+  schedule:
+    - cron: "0 0 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.event_name == 'pull_request' && format('{0}-pr-{1}', github.workflow, github.event.pull_request.number) || format('{0}-run-{1}', github.workflow, github.run_id) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_NET_RETRY: "10"
+
+jobs:
+  rust-checks:
+    name: Rust checks (${{ matrix.runner }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        rust_version:
+          - 1.98.1
+        runner:
+          - ubuntu-26.04
+          - ubuntu-26.04-arm
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # 7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install ${{ matrix.rust_version }} --profile minimal
+          rustup default ${{ matrix.rust_version }}
+          rustup component add rustfmt clippy --toolchain ${{ matrix.rust_version }}
+
+      - name: Fetch locked Cargo dependency graph
+        run: cargo fetch --locked
+
+      - name: Cargo fmt
+        run: cargo fmt --all --check
+
+      - name: Cargo clippy
+        run: cargo clippy --all-targets --all-features --locked -- -D warnings
+
+      - name: Cargo test
+        run: cargo test --release --all-features --locked
+
+  rust-advisory-checks:
+    name: Rust dependency admission
+    runs-on: ubuntu-26.04
+    if: github.actor != 'dependabot[bot]'
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # 7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install 1.98.1 --profile minimal
+          rustup default 1.98.1
+
+      - name: Install pinned Rust dependency tools
+        run: |
+          cargo install cargo-audit --version 0.22.2 --locked
+          cargo install cargo-deny --version 0.20.2 --locked
+
+      - name: Cargo audit
+        run: cargo audit
+
+      - name: Cargo deny complete policy
+        run: cargo deny check
+
+  mutation-testing:
+    name: Core mutation testing (mewt 4.0.0)
+    runs-on: ubuntu-26.04
+    timeout-minutes: 120
+    if: github.actor != 'dependabot[bot]'
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # 7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install 1.98.1 --profile minimal
+          rustup default 1.98.1
+
+      - name: Install pinned mewt
+        run: |
+          cargo +1.98.1 install mewt --version 4.0.0 --locked
+          test "$(mewt --version)" = "mewt 4.0.0"
+
+      - name: Run mutation campaign
+        run: scripts/run-mutation-testing.sh
+
+      - name: Upload mutation evidence
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # 7.0.1
+        with:
+          name: allocatbelt-mutation-testing-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/allocatbelt-mutation-testing
+          if-no-files-found: warn
+          retention-days: 30
