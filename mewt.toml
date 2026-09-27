@@ -1,0 +1,26 @@
+db = "target/mewt.sqlite"
+
+[log]
+level = "info"
+color = false
+
+[targets]
+# Bound the required campaign to the pure bitmap and size-class logic in
+# `allocatbelt-core`, whose unit and property tests are expected to catch
+# every mutant. The heap state machine is better suited to scheduled runs.
+# Mutants proven equivalent are listed with a reason in
+# `scripts/mutation-equivalent-mutants.json`.
+include = [
+  "crates/allocatbelt-core/src/bits.rs",
+  "crates/allocatbelt-core/src/class.rs",
+]
+ignore = ["target", "bench", "tests.rs"]
+
+[run]
+mutations = ["CR", "ER", "IF", "IT", "NR", "RBR"]
+comprehensive = true
+
+[test]
+# Mutated runs must not write `proptest-regressions/` into the tree.
+cmd = "PROPTEST_DISABLE_FAILURE_PERSISTENCE=1 cargo test -p allocatbelt-core --lib --locked"
+timeout = 602
