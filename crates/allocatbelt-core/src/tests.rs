@@ -372,6 +372,14 @@ fn misaligned_small_free() {
   h.dealloc(a + 8);
 }
 
+struct SetOnDrop<'a>(&'a AtomicBool);
+
+impl Drop for SetOnDrop<'_> {
+  fn drop(&mut self) {
+    self.0.store(true, Ordering::Relaxed);
+  }
+}
+
 #[test]
 fn cross_thread_frees() {
   let h = heap();
@@ -389,6 +397,9 @@ fn cross_thread_frees() {
         std::thread::yield_now();
       }
     });
+    // Stops the purger even when a worker panics, so a failure ends the
+    // test instead of leaving the scope waiting on the purge loop.
+    let _stop = SetOnDrop(done);
     let mut workers = Vec::new();
     for t in 0..threads {
       let tx = tx.clone();
@@ -417,7 +428,6 @@ fn cross_thread_frees() {
     for w in workers {
       w.join().unwrap();
     }
-    done.store(true, Ordering::Relaxed);
   });
   drop(tx);
   for v in rx.lock().unwrap().iter() {
