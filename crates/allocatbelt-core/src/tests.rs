@@ -17,6 +17,7 @@ struct MockOs {
     live: Mutex<BTreeMap<usize, usize>>,
     /// Pages the "program" wrote to since they were last purged.
     written: Mutex<BTreeSet<usize>>,
+    /// Bytes handed back to the OS by `purge` or `decommit`.
     purged: AtomicUsize,
     /// Makes `purge` and `decommit` report failure, as `madvise` does on
     /// `mlock`ed memory.
@@ -75,6 +76,7 @@ impl Os for MockOs {
         for s in offset / SEGMENT_SIZE..(offset + len) / SEGMENT_SIZE {
             self.committed[s].store(false, Ordering::Relaxed);
         }
+        self.purged.fetch_add(len, Ordering::Relaxed);
         self.zero(offset, len)
     }
     fn purge(&self, offset: usize, len: usize) -> bool {
@@ -288,7 +290,8 @@ fn purging_is_deferred_until_budget() {
     for &o in rest.iter().chain(&again) {
         free(h, o);
     }
-    // Crossing the budget purged everything that was dirty at that point.
+    // Crossing the budget purged everything that was dirty at that point
+    // (or returned whole empty segments).
     assert!(
         h.os().purged.load(Ordering::Relaxed)
             >= crate::heap::DIRTY_BUDGET_PAGES as usize * PAGE_SIZE
@@ -371,11 +374,21 @@ fn cross_thread_frees() {
     let rounds = if cfg!(miri) { 50 } else { 20_000 };
     let (tx, rx) = std::sync::mpsc::channel::<Vec<usize>>();
     let rx = std::sync::Arc::new(Mutex::new(rx));
+    let done = AtomicBool::new(false);
     std::thread::scope(|sc| {
+        // Purge passes (and segment trimming) race the allocating threads.
+        let done = &done;
+        sc.spawn(move || {
+            while !done.load(Ordering::Relaxed) {
+                h.purge();
+                std::thread::yield_now();
+            }
+        });
+        let mut workers = Vec::new();
         for t in 0..threads {
             let tx = tx.clone();
             let rx = rx.clone();
-            sc.spawn(move || {
+            workers.push(sc.spawn(move || {
                 let mut batch = Vec::new();
                 for i in 0..rounds {
                     let size = SIZES[(i * 7 + t) % 12];
@@ -394,8 +407,12 @@ fn cross_thread_frees() {
                 for o in batch {
                     free(h, o);
                 }
-            });
+            }));
         }
+        for w in workers {
+            w.join().unwrap();
+        }
+        done.store(true, Ordering::Relaxed);
     });
     drop(tx);
     for v in rx.lock().unwrap().iter() {
@@ -513,4 +530,30 @@ fn aligned_requests_use_the_tightest_class() {
     assert_eq!(h.usable_size(b), 40_960);
     free(h, a);
     free(h, b);
+}
+
+#[test]
+fn empty_segments_are_returned() {
+    let h = heap();
+    let base = h.segments_in_use();
+    // Twelve five-page runs per segment: 60 runs fill five segments.
+    let runs: Vec<_> = (0..60).map(|_| alloc(h, 4, 5 * PAGE_SIZE, 8)).collect();
+    assert_eq!(h.segments_in_use(), base + 5);
+    for o in runs {
+        free(h, o);
+    }
+    h.purge();
+    // One empty segment stays with the shard as a cache.
+    assert_eq!(h.segments_in_use(), base + 1);
+    assert_eq!(h.dirty_pages(), 0);
+    // Returned segments are reused, by shards and by huge blocks alike.
+    let big = alloc_block(h, 0, 12 << 20, 8);
+    assert!(big.zeroed);
+    let again: Vec<_> = (0..24).map(|_| alloc(h, 4, 5 * PAGE_SIZE, 8)).collect();
+    assert_eq!(h.segments_in_use(), base + 1 + 3 + 1);
+    for o in again.into_iter().chain([big.offset]) {
+        free(h, o);
+    }
+    h.purge();
+    assert_eq!(h.segments_in_use(), base + 1);
 }

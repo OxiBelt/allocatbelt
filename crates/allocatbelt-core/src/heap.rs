@@ -32,6 +32,8 @@
 //! free pages of every segment (as if allocating them), `madvise`s them and
 //! releases them again. Purging on every free costs an `mmap_lock` round trip
 //! and a TLB shootdown per call, which dominated multi-threaded profiles.
+//! The same pass returns segments whose pages are all free to the arena,
+//! keeping one empty segment per shard to absorb churn.
 //!
 //! Zero tracking: memory that was never handed out, or that was purged or
 //! decommitted successfully, reads as zero. Free pages that are not dirty are
@@ -642,16 +644,21 @@ impl<O: Os> Heap<O> {
         }
     }
 
-    /// Returns the memory of every free, dirty page to the OS.
+    /// Returns the memory of every free, dirty page to the OS, and empty
+    /// segments (beyond one per shard) to the arena.
     ///
     /// Embedders may call this from a maintenance task (e.g. when idle); it is
-    /// also run automatically once the dirty budget is exceeded.
+    /// also run automatically once the dirty budget is exceeded. Shards that
+    /// are allocating at that moment keep their empty segments until the next
+    /// pass.
     pub fn purge(&self) {
         let _g = self.purge_lock.lock(|| self.os.yield_now());
         self.purge_segments();
     }
 
+    /// Caller holds `purge_lock`.
     fn purge_segments(&self) {
+        self.trim_shards();
         for (wi, word) in self.seg_used.iter().enumerate() {
             let mut used_segs = word.load(Relaxed);
             while used_segs != 0 {
@@ -664,6 +671,53 @@ impl<O: Os> Heap<O> {
                 }
             }
         }
+    }
+
+    /// Unlinks and frees every empty segment of each idle shard except the
+    /// first. Caller holds `purge_lock`, so no purge pass races the claim.
+    fn trim_shards(&self) {
+        for sh in &self.shards {
+            let Some(_g) = sh.lock.try_lock() else {
+                continue;
+            };
+            let mut kept_empty = false;
+            let mut prev: Option<&[AtomicU64]> = None;
+            let mut cur = sh.segs.load(Relaxed);
+            while cur != 0 {
+                let seg = cur as usize - 1;
+                let m = self.seg_meta(seg);
+                let next = m[SEG_NEXT].load(Relaxed);
+                let empty = m[SEG_PAGES].load(Acquire) == 0;
+                // Claiming every page shuts out the only other claimers:
+                // in-place growth, which needs a live block in the segment.
+                if empty
+                    && kept_empty
+                    && m[SEG_PAGES]
+                        .compare_exchange(0, u64::MAX, AcqRel, Relaxed)
+                        .is_ok()
+                {
+                    match prev {
+                        None => sh.segs.store(next as u32, Relaxed),
+                        Some(p) => p[SEG_NEXT].store(next, Relaxed),
+                    }
+                    self.free_owned_segment(seg, m);
+                } else {
+                    kept_empty |= empty;
+                    prev = Some(m);
+                }
+                cur = next as u32;
+            }
+        }
+    }
+
+    /// Returns an unlinked owned segment whose pages have all been claimed
+    /// by the caller to the arena.
+    fn free_owned_segment(&self, seg: usize, m: &[AtomicU64]) {
+        m[SEG_HDR].store(SEG_FREE, Release);
+        let dirty = m[SEG_DIRTY].swap(0, AcqRel);
+        self.dirty_pages
+            .fetch_sub(dirty.count_ones() as isize, Relaxed);
+        self.free_segments(seg, 1);
     }
 
     fn purge_segment(&self, seg: usize, m: &[AtomicU64]) {
