@@ -11,6 +11,7 @@
 //! itself requires: the trait impl, zero-filling and the `realloc` copy.
 
 #![cfg(target_os = "linux")]
+#![cfg_attr(not(test), deny(clippy::expect_used, clippy::unwrap_used))]
 
 use std::alloc::{GlobalAlloc, Layout};
 use std::cell::Cell;

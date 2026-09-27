@@ -11,6 +11,7 @@
 
 #![no_std]
 #![cfg(target_os = "linux")]
+#![cfg_attr(not(test), deny(clippy::expect_used, clippy::unwrap_used))]
 
 use core::ffi::c_void;
 use core::ptr::NonNull;
