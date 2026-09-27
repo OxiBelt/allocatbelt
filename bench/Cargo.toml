@@ -1,0 +1,16 @@
+[package]
+name = "allocatbelt-bench"
+description = "Throughput and RSS comparison of allocatbelt against the system allocator and secure mimalloc."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+allocatbelt = { path = "../crates/allocatbelt" }
+# Baseline only: OxiBelt currently ships secure mimalloc on x86_64 Linux.
+mimalloc = { version = "0.1.52", default-features = false, features = ["secure"] }
+
+[lints]
+workspace = true

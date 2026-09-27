@@ -1,0 +1,15 @@
+[package]
+name = "allocatbelt"
+description = "A Rust global allocator whose allocation logic is safe Rust; unsafe is confined to allocatbelt-sys and this adapter."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+allocatbelt-core.workspace = true
+allocatbelt-sys.workspace = true
+
+[lints]
+workspace = true

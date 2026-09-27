@@ -1,0 +1,14 @@
+[package]
+name = "allocatbelt-sys"
+description = "The unsafe boundary of allocatbelt: address-space reservation, commit/purge syscalls and metadata slabs."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+rustix.workspace = true
+
+[lints]
+workspace = true
