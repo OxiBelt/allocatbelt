@@ -308,7 +308,6 @@ fn empty_pages_are_recycled_across_classes() {
 #[test]
 fn purging_is_deferred_until_budget() {
     let h = heap();
-    // Five-page runs: larger than every size class.
     const RUN: usize = 5;
     let n = crate::heap::DIRTY_BUDGET_PAGES as usize / 4 + 8;
     let big: Vec<_> = (0..n).map(|_| alloc(h, 0, RUN * PAGE_SIZE, 8)).collect();
@@ -364,38 +363,6 @@ fn interior_pointer_free() {
     let h = heap();
     let a = h.alloc(0, 300_000, 8).unwrap();
     h.dealloc(a + PAGE_SIZE);
-}
-
-#[test]
-fn medium_blocks_share_spans() {
-    let h = heap();
-    // 24 KiB blocks: five to a two-page span, so some start in the tail page.
-    let offs: Vec<_> = (0..10).map(|_| alloc(h, 2, 24 * 1024, 8)).collect();
-    let spans: std::collections::BTreeSet<_> = offs.iter().map(|o| o / (2 * PAGE_SIZE)).collect();
-    assert_eq!(spans.len(), 2, "{offs:x?}");
-    assert!(offs.iter().any(|o| o % (2 * PAGE_SIZE) >= PAGE_SIZE));
-    for &o in &offs {
-        assert_eq!(h.usable_size(o), 24 * 1024);
-    }
-    for o in offs {
-        free(h, o);
-    }
-    // 9 KiB lands in the 10 KiB class instead of a whole 64 KiB page.
-    let a = alloc(h, 2, 9 * 1024, 8);
-    assert_eq!(h.usable_size(a), 10 * 1024);
-    free(h, a);
-}
-
-#[test]
-#[should_panic(expected = "misaligned")]
-fn misaligned_medium_free_in_tail_page() {
-    let h = heap();
-    let offs: Vec<_> = (0..5).map(|_| h.alloc(0, 24 * 1024, 8).unwrap()).collect();
-    let tail = offs
-        .iter()
-        .find(|&&o| o % (2 * PAGE_SIZE) >= PAGE_SIZE)
-        .unwrap();
-    h.dealloc(tail + 16);
 }
 
 #[test]
@@ -570,8 +537,8 @@ fn aligned_requests_use_the_tightest_class() {
     // (rounding to a power of two would take 8192).
     let a = alloc(h, 0, 5000, 32);
     assert_eq!(h.usable_size(a), 5120);
-    let b = alloc(h, 0, 40_000, 8192);
-    assert_eq!(h.usable_size(b), 40_960);
+    let b = alloc(h, 0, 3000, 1024);
+    assert_eq!(h.usable_size(b), 3072);
     free(h, a);
     free(h, b);
 }

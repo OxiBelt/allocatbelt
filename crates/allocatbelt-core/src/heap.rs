@@ -11,14 +11,11 @@
 //!                non-zero bytes
 //! then per page (PAGE_META_WORDS each):
 //!   [0] P_INFO   kind | class << 8 | run length << 16
-//!                (span tail pages: kind | distance to the head << 16)
 //!   [1] P_FREE   number of set bits in the bitmap (may transiently lag)
-//!   [2] P_NEXT   next span of the same class in the shard (index + 1)
+//!   [2] P_NEXT   next page of the same class in the shard (index + 1)
 //!   [3] reserved
 //!   [4..68]      free bitmap (1 = free block)
 //! ```
-//!
-//! Only the head page of a span or run uses words 1.. of its record.
 //!
 //! Locking: each shard has a spin lock that serialises *allocation* from its
 //! pages. Frees never take a lock: a small free is one `fetch_or` on the
@@ -105,7 +102,6 @@ const PAGE_FREE: u64 = 0;
 const PAGE_SMALL: u64 = 1;
 const PAGE_LARGE: u64 = 2;
 const PAGE_LARGE_TAIL: u64 = 3;
-const PAGE_SMALL_TAIL: u64 = 4;
 
 /// Dirty (freed, unpurged) pages tolerated before a purge pass (32 MiB).
 pub const DIRTY_BUDGET_PAGES: isize = 512;
@@ -179,9 +175,9 @@ impl Block {
 
 /// What an allocated offset refers to.
 enum Target<'a> {
-    /// A class block `in_span` bytes into the span whose head page is `head`.
+    /// A class block `in_page` bytes into its page.
     Small {
-        in_span: usize,
+        in_page: usize,
         pm: PageMeta<'a>,
         c: usize,
     },
@@ -295,7 +291,7 @@ impl<O: Os> Heap<O> {
             offset,
             "allocatbelt: invalid or double free (pointer is not allocated)",
         ) {
-            Target::Small { in_span, pm, c } => self.free_small(in_span, pm, c),
+            Target::Small { in_page, pm, c } => self.free_small(in_page, pm, c),
             Target::Large { page, m, pm, info } => self.free_large(page, m, pm, info),
             Target::Huge { seg, m, hdr } => self.free_huge(seg, m, hdr),
         }
@@ -376,26 +372,10 @@ impl<O: Os> Heap<O> {
                 let info = pm.info().load(Acquire);
                 match info & 0xFF {
                     PAGE_SMALL => Target::Small {
-                        in_span: offset % PAGE_SIZE,
+                        in_page: offset % PAGE_SIZE,
                         pm,
                         c: ((info >> 8) & 0xFF) as usize,
                     },
-                    PAGE_SMALL_TAIL => {
-                        let back = ((info >> 16) & 0xFF) as usize;
-                        if back == 0 || back > in_seg {
-                            self.os.fatal(bad);
-                        }
-                        let head = PageMeta::new(m, in_seg - back);
-                        let hinfo = head.info().load(Acquire);
-                        if hinfo & 0xFF != PAGE_SMALL {
-                            self.os.fatal(bad);
-                        }
-                        Target::Small {
-                            in_span: offset - ((page - back) << PAGE_SHIFT),
-                            pm: head,
-                            c: ((hinfo >> 8) & 0xFF) as usize,
-                        }
-                    }
                     PAGE_LARGE if offset.is_multiple_of(PAGE_SIZE) => {
                         Target::Large { page, m, pm, info }
                     }
@@ -524,7 +504,7 @@ impl<O: Os> Heap<O> {
                     None => cs.head.store(next, Relaxed),
                     Some(q) => self.page_meta(q).next().store(u64::from(next), Relaxed),
                 }
-                self.release_small_page(p, pm, c);
+                self.release_small_page(p, pm);
                 cur = next;
                 continue;
             }
@@ -538,15 +518,8 @@ impl<O: Os> Heap<O> {
     }
 
     fn new_small_page(&self, s: usize, sh: &Shard, cs: &ClassState, c: usize) -> Option<usize> {
-        let span = class::span(c);
-        let (p, _) = self.alloc_pages(s, sh, span, 1)?;
-        let m = self.seg_meta(p / PAGES_PER_SEGMENT);
-        for t in 1..span {
-            PageMeta::new(m, p % PAGES_PER_SEGMENT + t)
-                .info()
-                .store(PAGE_SMALL_TAIL | (t as u64) << 16, Relaxed);
-        }
-        let pm = PageMeta::new(m, p % PAGES_PER_SEGMENT);
+        let (p, _) = self.alloc_pages(s, sh, 1, 1)?;
+        let pm = self.page_meta(p);
         let cap = class::capacity(c);
         for w in 0..class::MAX_BITMAP_WORDS {
             let v = if (w + 1) * 64 <= cap {
@@ -565,22 +538,15 @@ impl<O: Os> Heap<O> {
         Some(p)
     }
 
-    fn release_small_page(&self, page: usize, pm: PageMeta<'_>, c: usize) {
-        let span = class::span(c);
+    fn release_small_page(&self, page: usize, pm: PageMeta<'_>) {
         pm.info().store(PAGE_FREE, Release);
-        let m = self.seg_meta(page / PAGES_PER_SEGMENT);
-        for t in 1..span {
-            PageMeta::new(m, page % PAGES_PER_SEGMENT + t)
-                .info()
-                .store(PAGE_FREE, Relaxed);
-        }
-        self.release_pages(page, span);
+        self.release_pages(page, 1);
     }
 
-    fn free_small(&self, in_span: usize, pm: PageMeta<'_>, c: usize) {
+    fn free_small(&self, in_page: usize, pm: PageMeta<'_>, c: usize) {
         let size = class::size(c);
-        let idx = in_span / size;
-        if !in_span.is_multiple_of(size) || idx >= class::capacity(c) {
+        let idx = in_page / size;
+        if !in_page.is_multiple_of(size) || idx >= class::capacity(c) {
             self.os
                 .fatal("allocatbelt: free of a misaligned small pointer");
         }
