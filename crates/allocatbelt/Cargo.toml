@@ -53,6 +53,10 @@ required-features = ["maintenance"]
 name = "policy"
 required-features = ["maintenance"]
 
+[[test]]
+name = "fork_maintenance"
+required-features = ["maintenance"]
+
 [dev-dependencies]
 libc.workspace = true
 

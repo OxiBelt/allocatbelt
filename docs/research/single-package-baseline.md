@@ -126,3 +126,14 @@ Directive §20 Phase D added the run-time policy within the compiled capabilitie
 - **API migration (pre-1.0, deliberate).** `set_io_uring(bool)` sets `io_uring` to `Prefer`/`Auto` and returns `Result<(), PolicyError>` (`Frozen` after the thread started, where it used to be ignored). `RseqPolicy` is an alias of `FeaturePolicy`; `set_rseq_policy` sets the policy's `rseq`. `sys::set_batch_scheduling` returns the errno. No other signature changed.
 - **Tests.** `tests/policy.rs` (feature `maintenance`): `Require` of what is not compiled, a thread built with `scheduler = Disable` and `io_uring = Require` (or, where the ring is refused, the error, no thread, and a retry with `Prefer`), freezing, `rseq` after the freeze, and the report. `tests/platform.rs::policy_moves_only_within_the_build` runs in every feature combination. Unit tests check the policy word and the `Availability` encoding, and that every failure step the ring and the rseq probe report can be recorded.
 - **unsafe.** Unchanged: no new site.
+
+## 9. Phase E: sandbox and virtualization qualification
+
+Directive §20 Phase E added behaviour checks for containers and VMs ([docs/sandbox.md](../sandbox.md)); no allocator code changed.
+
+- **Hardened container.** `scripts/check-sandbox.sh` builds every test binary of `allocatbelt` (default features + `io-uring`) statically for musl and runs it in Docker with user 10001, `--cap-drop ALL`, a read-only root, no network, `no-new-privileges` and Docker's default seccomp profile, from an empty image. All pass: baseline correctness needs no extra privilege.
+- **Fallbacks and errors** (`tests/sandbox.rs`, one process per scenario): io_uring denied by the default profile (`Require` fails with `Unavailable { setup, errno 1 }` and leaves no thread; `Prefer` falls back to `madvise`), allowed (`Require` gets the ring), and killed on use (`Disable` and `Auto` never call `io_uring_setup`); `sched_setscheduler` denied (`Require` fails, `Auto` keeps the default policy). Seccomp profiles in `scripts/seccomp/`.
+- **Visible ISA.** Under qemu-user CPU models the detected features are the model's, not the host's: x86_64 `Haswell-noTSX` shows x86-64-v3 and AVX2 without AVX-512 on an AVX-512 host; aarch64 `cortex-a72`, `neoverse-v1` and `neoverse-n2` show no SVE, SVE and SVE2.
+- **No hidden host.** `no_hidden_host_probes` checks the sources for host topology files, hypervisor `cpuid` leaves and CPU-count sizing.
+- **fork.** `tests/fork_maintenance.rs`: a child forked after the maintenance thread started has none, keeps the policy, and starts its own, which chooses its backend again.
+- CI job "Sandbox and virtualization" on x86_64 and arm64 runners (VMs, so Docker in a VM). Not automated: full system VMs, nested VMs and vNUMA guests.

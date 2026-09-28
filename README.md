@@ -83,6 +83,7 @@ What it does, in the terms of mimalloc (details in [docs/research/README.md](doc
 Status: **research prototype**. Not recommended for production.
 
 **Platform contract** ([docs/platform.md](docs/platform.md)): Linux 7.0 or newer, 64-bit little-endian userspace, on x86_64 (**x86-64-v3 or newer**), aarch64 or riscv64 (RV64GC, Zbb optional). Every other target, and any x86_64 build below x86-64-v3, fails at compile time with a message saying why. Inside this repository `.cargo/config.toml` builds x86_64 with `-C target-cpu=x86-64-v3`; a `RUSTFLAGS` variable replaces it and must carry that flag too, and crates depending on allocatbelt (OxiBelt) must set it in their own build ([above](#using-it-from-another-crate)). At start-up the allocator probes the kernel facilities it cannot run without (reservation, commit, `MADV_DONTNEED` zeroing) and aborts with a message if one is missing. x86_64 and aarch64 are tested natively in CI (`ubuntu-26.04` and `ubuntu-26.04-arm` runners); riscv64 is tested in CI under qemu-user, with and without Zbb; the `platform-gates` job checks that the supported targets build and the others are rejected. Every supported CPU runs the same scalar code: none of the SIMD candidates measured in `bench/simd` qualified ([docs/research/simd-benchmarks.md](docs/research/simd-benchmarks.md)).
+Containers and VMs are first-class: the allocator needs no Linux capability, writable filesystem or `seccomp=unconfined`, falls back when a sandbox refuses io_uring or `SCHED_BATCH`, and uses only the ISA the guest exposes ([docs/sandbox.md](docs/sandbox.md)).
 For the conclusions and recommendations see [docs/research/README.md](docs/research/README.md), for measurements see [docs/research/benchmarks.md](docs/research/benchmarks.md), and for the unsafe inventory see [docs/unsafe-boundary.md](docs/unsafe-boundary.md).
 
 ## Verification
@@ -93,6 +94,7 @@ cargo clippy --all-targets --all-features --locked -- -D warnings
 cargo test --release --locked                                   # core tests (allocatbelt-core-check) + global-allocator integration tests
 scripts/check-features.sh                                       # clippy and tests for each supported feature combination
 scripts/check-package.sh                                        # cargo package/publish --dry-run, package contents, clean-consumer builds
+scripts/check-sandbox.sh                                        # hardened container, seccomp fallbacks, visible ISA under qemu (docs/sandbox.md)
 scripts/check-platform-gates.sh                                 # supported targets build, others are rejected (needs `rustup target add`, see the script)
 scripts/check-scalar-isa.sh                                     # bit scans lower to tzcnt/popcnt/lzcnt (x86-64-v3) and ctz/cpop/clz (riscv64 + Zbb)
 cargo audit && cargo deny check                                 # RustSec advisories, licenses, bans, sources

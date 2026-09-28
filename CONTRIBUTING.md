@@ -16,6 +16,7 @@ cargo clippy --all-targets --all-features --locked -- -D warnings
 cargo test --release --all-features --locked
 scripts/check-features.sh    # each supported Cargo feature combination
 scripts/check-package.sh     # the crates.io package and a clean consumer
+scripts/check-sandbox.sh     # hardened container and VM behaviour (docker, qemu-user)
 cargo audit
 cargo deny check
 ```

@@ -178,6 +178,48 @@ jobs:
       - name: Clippy and tests per feature combination
         run: scripts/check-features.sh
 
+  # Directive Phase E: a hardened container (no capabilities, read-only,
+  # no-new-privileges, Docker's default seccomp) runs every test; seccomp
+  # profiles deny or allow io_uring and sched_setscheduler to check the
+  # fallbacks and `Require` errors; qemu-user CPU models check that only
+  # the ISA visible to the process is detected. The runner is itself a VM,
+  # so this is Docker in a VM (docs/sandbox.md).
+  sandbox:
+    name: Sandbox and virtualization (${{ matrix.runner }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        runner:
+          - ubuntu-26.04
+          - ubuntu-26.04-arm
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # 7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install 1.98.1 --profile minimal --target "$(uname -m)-unknown-linux-musl"
+          rustup default 1.98.1
+
+      - name: Install qemu-user
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends qemu-user
+          docker version --format '{{.Server.Version}}'
+          uname -r
+
+      - name: Fetch locked Cargo dependency graph
+        run: cargo fetch --locked
+
+      - name: Hardened container, fallbacks and visible ISA
+        run: scripts/check-sandbox.sh
+
   # Plan phase 3: the bit scans lower to tzcnt/popcnt/lzcnt on x86-64-v3
   # and to ctz/cpop/clz on riscv64 with Zbb (assembly only, no qemu).
   scalar-isa:
