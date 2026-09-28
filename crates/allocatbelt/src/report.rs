@@ -352,7 +352,7 @@ impl fmt::Display for Report {
       ("rseq", c.rseq, Some(e.policy.rseq), d.rseq, e.rseq),
       (
         "experimental_isa",
-        c.experimental_aarch64_sve,
+        c.experimental_aarch64_sve || c.experimental_riscv_rvv,
         Some(e.policy.experimental_isa),
         d.experimental_isa,
         e.kernel_set != KernelSet::Baseline,

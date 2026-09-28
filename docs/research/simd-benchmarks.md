@@ -92,7 +92,7 @@ Median ns per operation, and the ratio to the baseline (higher is faster):
 
 ## Phase 5: promotion decision (2026-09-28)
 
-**Decision: no kernel is promoted.** `KernelSet` keeps only `Baseline`, `allocatbelt-arch` gains no kernel, and no allocator code changes. (Later, the single-package directive's Phase F added SVE and SVE2 versions of the purge-age scan as experimental opt-ins, off by default and not measured; this decision is unchanged: `Baseline` stays the default everywhere. See docs/features.md.) The plan admits a kernel only if it materially improves a measured allocator bottleneck (§13, Phase 5). Gate B below shows that none of the candidate operations is one. The purge-age scan, the one candidate Phase 4 left open, also loses most of its kernel-level advantage on the allocator's real data layout.
+**Decision: no kernel is promoted.** `KernelSet` keeps only `Baseline`, `allocatbelt-arch` gains no kernel, and no allocator code changes. (Later, the single-package directive's Phases F and G added SVE, SVE2 and RVV versions of the purge-age scan as experimental opt-ins, off by default and not measured; this decision is unchanged: `Baseline` stays the default everywhere. See docs/features.md.) The plan admits a kernel only if it materially improves a measured allocator bottleneck (§13, Phase 5). Gate B below shows that none of the candidate operations is one. The purge-age scan, the one candidate Phase 4 left open, also loses most of its kernel-level advantage on the allocator's real data layout.
 
 ### Environment
 

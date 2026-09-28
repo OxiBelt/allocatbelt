@@ -23,6 +23,7 @@ combos=(
   "--features experimental-rseq"
   "--no-default-features --features experimental-aarch64-sve"
   "--features experimental-aarch64-sve2"
+  "--features experimental-riscv-rvv"
   "--all-features"
 )
 

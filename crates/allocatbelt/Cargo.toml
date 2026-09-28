@@ -46,6 +46,13 @@ experimental-rseq = []
 # See docs/features.md.
 experimental-aarch64-sve = []
 experimental-aarch64-sve2 = ["experimental-aarch64-sve"]
+# Experimental (directive Phase G): the same age scan compiled for the
+# RISC-V V extension, selected only with `Policy::experimental_isa` on a
+# CPU whose `riscv_hwprobe` reports V and whose kernel lets this process
+# use it. On riscv64 it needs nightly Rust: the `v` target feature is
+# unstable in Rust 1.98 (`riscv_target_feature`). Nothing is compiled on
+# other architectures, which stay on stable. Not measured, never default.
+experimental-riscv-rvv = []
 
 # The tests of an optional part run only when it is compiled in.
 [[test]]

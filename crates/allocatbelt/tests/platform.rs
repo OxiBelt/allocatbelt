@@ -56,6 +56,13 @@ fn compiled_capabilities_follow_the_features() {
     c.experimental_aarch64_sve2,
     aarch64 && cfg!(feature = "experimental-aarch64-sve2")
   );
+  assert_eq!(
+    c.experimental_riscv_rvv,
+    cfg!(all(
+      target_arch = "riscv64",
+      feature = "experimental-riscv-rvv"
+    ))
+  );
   // Features that imply others.
   assert!(!c.scheduler || c.maintenance);
   assert!(!c.io_uring || c.maintenance);

@@ -257,6 +257,40 @@ jobs:
       - name: Kernels and selection under qemu CPU models
         run: scripts/check-experimental-isa.sh
 
+  # Single-package directive Phase G: the experimental RVV kernel. The `v`
+  # target feature is unstable in Rust 1.98, so this is the one job on a
+  # (pinned) nightly; every other job stays on stable 1.98.1.
+  experimental-rvv:
+    name: Experimental riscv64 RVV kernel (nightly)
+    runs-on: ubuntu-26.04
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # 7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Install the pinned nightly toolchain
+        run: |
+          rustup toolchain install nightly-2026-09-27 --profile minimal --component clippy \
+            --target riscv64gc-unknown-linux-gnu
+
+      - name: Install qemu-user, the riscv64 cross toolchain and llvm-objdump
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            qemu-user gcc-riscv64-linux-gnu libc6-dev-riscv64-cross llvm
+          qemu-riscv64 --version
+          command -v llvm-objdump || sudo ln -s "$(ls /usr/bin/llvm-objdump-* | sort -V | tail -1)" /usr/local/bin/llvm-objdump
+
+      - name: Fetch locked Cargo dependency graph
+        run: cargo +nightly-2026-09-27 fetch --locked
+
+      - name: Lint, isolation and kernel checks under qemu
+        run: scripts/check-experimental-rvv.sh
+
   # Plan phase 3: the bit scans lower to tzcnt/popcnt/lzcnt on x86-64-v3
   # and to ctz/cpop/clz on riscv64 with Zbb (assembly only, no qemu).
   scalar-isa:

@@ -11,6 +11,11 @@ const NR_RISCV_HWPROBE: libc::c_long = 244 + 14;
 const RISCV_HWPROBE_KEY_IMA_EXT_0: i64 = 4;
 const RISCV_HWPROBE_IMA_V: u64 = 1 << 2;
 const RISCV_HWPROBE_EXT_ZBB: u64 = 1 << 4;
+/// `prctl` options and values from Linux `include/uapi/linux/prctl.h` and
+/// `Documentation/arch/riscv/vector.rst`.
+const PR_RISCV_V_GET_CONTROL: libc::c_int = 70;
+const PR_RISCV_V_VSTATE_CTRL_CUR_MASK: libc::c_int = 0x3;
+const PR_RISCV_V_VSTATE_CTRL_OFF: libc::c_int = 1;
 
 /// `struct riscv_hwprobe`.
 #[repr(C)]
@@ -46,7 +51,32 @@ pub(crate) fn detect() -> CpuFeatures {
   }
   CpuFeatures::empty()
     .with_if(CpuFeatures::ZBB, pair.value & RISCV_HWPROBE_EXT_ZBB != 0)
-    .with_if(CpuFeatures::RVV, pair.value & RISCV_HWPROBE_IMA_V != 0)
+    .with_if(
+      CpuFeatures::RVV,
+      pair.value & RISCV_HWPROBE_IMA_V != 0 && !vector_turned_off(),
+    )
+}
+
+/// Whether the kernel refuses V to this thread although the CPUs have it:
+/// with `sysctl abi.riscv_v_default_allow = 0`, or a parent's
+/// `PR_RISCV_V_SET_CONTROL`, the first vector instruction raises `SIGILL`.
+/// `EINVAL` means no V state control: a kernel without V support (whose
+/// `riscv_hwprobe` does not report V either), or qemu-user, which always
+/// allows it.
+fn vector_turned_off() -> bool {
+  // SAFETY: `PR_RISCV_V_GET_CONTROL` reads the calling thread's vector
+  // control word and takes no pointer; the other arguments are ignored.
+  #[expect(unsafe_code, reason = "prctl FFI call")]
+  let r = unsafe {
+    libc::prctl(
+      PR_RISCV_V_GET_CONTROL,
+      0 as libc::c_ulong,
+      0 as libc::c_ulong,
+      0 as libc::c_ulong,
+      0 as libc::c_ulong,
+    )
+  };
+  r >= 0 && r & PR_RISCV_V_VSTATE_CTRL_CUR_MASK == PR_RISCV_V_VSTATE_CTRL_OFF
 }
 
 #[cfg(test)]

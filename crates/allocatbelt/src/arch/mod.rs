@@ -19,7 +19,8 @@
 //! kernel becomes a default only with benchmark evidence that it speeds up
 //! a measured allocator cost, and none has (plan phase 5, see
 //! `docs/research/simd-benchmarks.md`), so the default is always
-//! [`KernelSet::Baseline`]. The experimental sets (directive Phase F) are
+//! [`KernelSet::Baseline`]. The experimental sets (directive Phases F
+//! and G) are
 //! compiled only with their Cargo feature and selected only when
 //! [`crate::Policy::experimental_isa`] is `Prefer` or `Require` and the
 //! process sees the extension:
@@ -45,8 +46,18 @@ mod allocation_free;
 
 #[cfg(target_arch = "aarch64")]
 mod aarch64;
+#[cfg(all(
+  test,
+  any(
+    all(target_arch = "aarch64", feature = "experimental-aarch64-sve"),
+    all(target_arch = "riscv64", feature = "experimental-riscv-rvv")
+  )
+))]
+mod kernel_tests;
 #[cfg(target_arch = "riscv64")]
 mod riscv64;
+#[cfg(all(target_arch = "riscv64", feature = "experimental-riscv-rvv"))]
+mod rvv;
 #[cfg(all(target_arch = "aarch64", feature = "experimental-aarch64-sve"))]
 mod sve;
 #[cfg(target_arch = "x86_64")]
@@ -71,6 +82,9 @@ pub enum KernelSet {
   /// Experimental (feature `experimental-aarch64-sve2`): as `Sve`, compiled
   /// for SVE2. Not measured.
   Sve2,
+  /// Experimental (feature `experimental-riscv-rvv`, nightly): the decay
+  /// pass's age scan compiled for the RISC-V V extension. Not measured.
+  Rvv,
 }
 
 /// Detection result, with [`DETECTED`] set once it is valid.
@@ -136,15 +150,22 @@ pub(crate) fn experimental(features: CpuFeatures) -> Option<KernelSet> {
   if features.contains(CpuFeatures::SVE) {
     return Some(KernelSet::Sve);
   }
+  #[cfg(all(target_arch = "riscv64", feature = "experimental-riscv-rvv"))]
+  if features.contains(CpuFeatures::RVV) {
+    return Some(KernelSet::Rvv);
+  }
   let _ = features;
   None
 }
 
 /// Whether an experimental kernel set is compiled into this build for this
 /// architecture.
-pub(crate) const EXPERIMENTAL_COMPILED: bool = cfg!(all(
-  target_arch = "aarch64",
-  feature = "experimental-aarch64-sve"
+pub(crate) const EXPERIMENTAL_COMPILED: bool = cfg!(any(
+  all(
+    target_arch = "aarch64",
+    feature = "experimental-aarch64-sve"
+  ),
+  all(target_arch = "riscv64", feature = "experimental-riscv-rvv")
 ));
 
 /// The age kernel of the kernel set in use, if it has one (see
@@ -152,7 +173,12 @@ pub(crate) const EXPERIMENTAL_COMPILED: bool = cfg!(all(
 pub(crate) fn age_kernel() -> Option<AgeKernel> {
   #[cfg(all(target_arch = "aarch64", feature = "experimental-aarch64-sve"))]
   return sve::age_kernel();
-  #[cfg(not(all(target_arch = "aarch64", feature = "experimental-aarch64-sve")))]
+  #[cfg(all(target_arch = "riscv64", feature = "experimental-riscv-rvv"))]
+  return rvv::age_kernel();
+  #[cfg(not(any(
+    all(target_arch = "aarch64", feature = "experimental-aarch64-sve"),
+    all(target_arch = "riscv64", feature = "experimental-riscv-rvv")
+  )))]
   None
 }
 
@@ -211,6 +237,7 @@ mod tests {
         .with_if(CpuFeatures::SVE, true)
         .with_if(CpuFeatures::SVE2, true),
       CpuFeatures::empty().with_if(CpuFeatures::SVE2, true),
+      CpuFeatures::empty().with_if(CpuFeatures::RVV, true),
     ];
     for f in all {
       for p in [FeaturePolicy::Auto, FeaturePolicy::Disable] {
@@ -240,5 +267,10 @@ mod tests {
     );
     // SVE2 without SVE is not a state Linux reports; nothing is selected.
     assert_eq!(experimental(all[3]), None);
+    let rvv = cfg!(all(
+      target_arch = "riscv64",
+      feature = "experimental-riscv-rvv"
+    ));
+    assert_eq!(experimental(all[4]), rvv.then_some(KernelSet::Rvv));
   }
 }

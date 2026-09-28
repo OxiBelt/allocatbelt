@@ -31,7 +31,8 @@
 //!
 //! Features decide which optional parts are compiled in; what a process
 //! then uses is chosen at run time, within what was compiled
-//! ([`CompiledCapabilities`]). All build on stable Rust. Allocator
+//! ([`CompiledCapabilities`]). All build on stable Rust, except
+//! `experimental-riscv-rvv` on riscv64. Allocator
 //! correctness and hardening (out-of-band metadata, double-free detection,
 //! guard pages, fork handling, the platform probes) are not features.
 //!
@@ -43,6 +44,7 @@
 //! | `experimental-rseq` | no | experimental, off at run time until `set_rseq_policy` | shard selection by the rseq `mm_cid`, glibc 2.35+ (`RseqPolicy`, `RseqStatus`) |
 //! | `experimental-aarch64-sve` | no | experimental, off at run time until `Policy::experimental_isa` selects it | on aarch64, the decay pass's age scan compiled for SVE ([`KernelSet::Sve`]) |
 //! | `experimental-aarch64-sve2` | no | as above; implies `experimental-aarch64-sve` | the same compiled for SVE2 ([`KernelSet::Sve2`]) |
+//! | `experimental-riscv-rvv` | no | as above; **nightly Rust on riscv64** (the `v` target feature is unstable), stable elsewhere, where it compiles nothing | on riscv64, the same compiled for the V extension ([`KernelSet::Rvv`]) |
 //!
 //! Within what was compiled, [`Allocatbelt::configure`] sets the run-time
 //! [`Policy`] ([`FeaturePolicy`] `Auto`, `Prefer`, `Require` or `Disable`
@@ -57,6 +59,12 @@
 // missing `std` prelude would stop the build before the gates' messages.
 #![cfg_attr(not(target_os = "linux"), no_std)]
 #![cfg_attr(not(test), deny(clippy::expect_used, clippy::unwrap_used))]
+// The one nightly requirement, only for the experimental RVV kernel on
+// riscv64 (directive §5.5): the `v` target feature is unstable in Rust 1.98.
+#![cfg_attr(
+  all(target_arch = "riscv64", feature = "experimental-riscv-rvv"),
+  feature(riscv_target_feature)
+)]
 
 mod arch;
 mod capabilities;

@@ -10,7 +10,8 @@ use crate::Allocatbelt;
 ///
 /// Only parts with an implementation have a field, and an ISA backend
 /// counts as compiled only on the architecture it is for: the SVE features
-/// compile nothing on x86_64 or riscv64. Fields may be added as features
+/// compile nothing on x86_64 or riscv64, the RVV feature nothing on x86_64
+/// or aarch64. Fields may be added as features
 /// are.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -35,6 +36,10 @@ pub struct CompiledCapabilities {
   /// ([`crate::KernelSet::Sve2`]; experimental, off unless selected at run
   /// time).
   pub experimental_aarch64_sve2: bool,
+  /// Feature `experimental-riscv-rvv` on riscv64: the V kernel
+  /// ([`crate::KernelSet::Rvv`]; experimental, needs nightly Rust, off
+  /// unless selected at run time).
+  pub experimental_riscv_rvv: bool,
 }
 
 impl CompiledCapabilities {
@@ -51,6 +56,10 @@ impl CompiledCapabilities {
     experimental_aarch64_sve2: cfg!(all(
       target_arch = "aarch64",
       feature = "experimental-aarch64-sve2"
+    )),
+    experimental_riscv_rvv: cfg!(all(
+      target_arch = "riscv64",
+      feature = "experimental-riscv-rvv"
     )),
   };
 }

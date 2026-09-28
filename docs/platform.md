@@ -40,7 +40,7 @@ The probe also reads the kernel release from `uname(2)`. `Allocatbelt::platform(
 
 ## RISC-V
 
-The baseline is RV64GC, as before. Zbb is optional: building with `-C target-feature=+zbb` turns the bitmap scans' `trailing_zeros`/`count_ones`/`leading_zeros` into single `ctz`/`cpop`/`clz` instructions, and CI tests both builds under qemu-user. The V extension is not required and not used yet. Feature detection with `riscv_hwprobe` belongs to the architecture capability layer (phase 2), not to this contract.
+The baseline is RV64GC, as before. Zbb is optional: building with `-C target-feature=+zbb` turns the bitmap scans' `trailing_zeros`/`count_ones`/`leading_zeros` into single `ctz`/`cpop`/`clz` instructions, and CI tests both builds under qemu-user. The V extension is not required. It is used only by the experimental RVV kernel (`experimental-riscv-rvv`, nightly), selected at run time; the build itself never enables V. `CpuFeatures::RVV` means V is usable by this process: `riscv_hwprobe` reports it on all online CPUs and `PR_RISCV_V_GET_CONTROL` does not report it turned off (for example by `sysctl abi.riscv_v_default_allow = 0`, where the first vector instruction would raise `SIGILL`). Feature detection with `riscv_hwprobe` belongs to the architecture capability layer (phase 2), not to this contract.
 
 ## CPU features and kernel dispatch (the `arch` module)
 
@@ -65,11 +65,12 @@ afterwards                                -> kernel_set(): Baseline, or an exper
 
 The adapter calls `initialize_dispatch()` while it initialises the arena, right after the kernel probe. Detection issues only `cpuid`/`xgetbv`, reads libc's saved auxiliary vector, or makes one syscall; it never allocates, which `crates/allocatbelt/src/arch/allocation_free.rs` checks with a counting global allocator (the global allocator of the library's unit-test binary). The result is cached in an `AtomicU32`, with no `OnceLock` or lazy framework; `kernel_set()` derives the set from it and the policy word (two atomic loads), so a policy change takes effect at once and never races with a separate published value. `Allocatbelt::cpu_features()` and `Allocatbelt::kernel_set()` expose both for diagnostics.
 
-A detected feature does not mean a kernel exists for it. A kernel becomes a default only with benchmark evidence that it speeds up a measured allocator cost, and the Phase 5 qualification admitted none ([research/simd-benchmarks.md](research/simd-benchmarks.md#phase-5-promotion-decision-2026-09-28)). So the default is `KernelSet::Baseline`, and every CPU runs the same code as before. The experimental `Sve` and `Sve2` sets (Cargo features `experimental-aarch64-sve` and `-sve2`, directive Phase F) are selected only when compiled in, reported by `AT_HWCAP`/`AT_HWCAP2`, and asked for with `Policy::experimental_isa` `Prefer` or `Require`; they compute the same results as the baseline ([features.md](features.md#experimental-isa-kernels)).
+A detected feature does not mean a kernel exists for it. A kernel becomes a default only with benchmark evidence that it speeds up a measured allocator cost, and the Phase 5 qualification admitted none ([research/simd-benchmarks.md](research/simd-benchmarks.md#phase-5-promotion-decision-2026-09-28)). So the default is `KernelSet::Baseline`, and every CPU runs the same code as before. The experimental `Sve` and `Sve2` sets (Cargo features `experimental-aarch64-sve` and `-sve2`, directive Phase F) and `Rvv` (`experimental-riscv-rvv`, Phase G, nightly) are selected only when compiled in, reported by `AT_HWCAP`/`AT_HWCAP2` or `riscv_hwprobe`, and asked for with `Policy::experimental_isa` `Prefer` or `Require`; they compute the same results as the baseline ([features.md](features.md#experimental-isa-kernels)).
 
 | Capability | Compiled feature | Probe | Default policy | Fallback | `Require` failure |
 |---|---|---|---|---|---|
 | SVE/SVE2 age-scan kernels | `experimental-aarch64-sve`, `experimental-aarch64-sve2` (aarch64) | `getauxval(AT_HWCAP)`, `getauxval(AT_HWCAP2)` | `Auto`: baseline | baseline kernels | `configure` returns `NotCompiled` or `Unavailable { step: "cpu features" }` |
+| RVV age-scan kernel | `experimental-riscv-rvv` (riscv64, nightly) | `riscv_hwprobe` (`IMA_V` on all online CPUs), `prctl(PR_RISCV_V_GET_CONTROL)` | `Auto`: baseline | baseline kernels | as above |
 
 ## Scalar bit instructions
 

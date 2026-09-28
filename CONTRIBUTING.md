@@ -18,6 +18,7 @@ scripts/check-features.sh    # each supported Cargo feature combination
 scripts/check-package.sh     # the crates.io package and a clean consumer
 scripts/check-sandbox.sh     # hardened container and VM behaviour (docker, qemu-user)
 scripts/check-experimental-isa.sh  # experimental SVE/SVE2 kernels (qemu-user, aarch64 target)
+scripts/check-experimental-rvv.sh  # experimental RVV kernel (pinned nightly, qemu-user, riscv64 target)
 cargo audit
 cargo deny check
 ```

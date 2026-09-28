@@ -83,7 +83,7 @@ impl fmt::Display for FeaturePolicy {
 /// | `scheduler` | feature `scheduler` | `Prefer`: ask for `SCHED_BATCH`, keep the default policy if refused | when the maintenance thread starts |
 /// | `io_uring` | feature `io-uring` | off: purge with `madvise` (the ring has not won in measurements) | when the maintenance thread starts |
 /// | `rseq` | feature `experimental-rseq` | off (experimental, not qualified) | at once, switchable at any time |
-/// | `experimental_isa` | feature `experimental-aarch64-sve` or `-sve2`, on aarch64 | off: the baseline kernels (the experimental ones are not measured) | at once, switchable at any time |
+/// | `experimental_isa` | feature `experimental-aarch64-sve` or `-sve2` on aarch64, `experimental-riscv-rvv` on riscv64 | off: the baseline kernels (the experimental ones are not measured) | at once, switchable at any time |
 ///
 /// The maintenance thread itself has no field: the application starts it
 /// with [`Allocatbelt::start_maintenance_thread`], or not. The purge delay
@@ -102,8 +102,8 @@ pub struct Policy {
   pub rseq: FeaturePolicy,
   /// Whether experimental architecture kernels are used where compiled in
   /// and supported by the CPU ([`crate::KernelSet`]): `Prefer` and
-  /// `Require` select the best one (SVE2 over SVE), `Auto` and `Disable`
-  /// keep the baseline.
+  /// `Require` select the best one (SVE2 over SVE on aarch64, RVV on
+  /// riscv64), `Auto` and `Disable` keep the baseline.
   pub experimental_isa: FeaturePolicy,
 }
 
@@ -132,7 +132,8 @@ pub enum Capability {
   /// Shard selection by the rseq `mm_cid` (feature `experimental-rseq`).
   Rseq,
   /// Experimental architecture kernels (features
-  /// `experimental-aarch64-sve` and `experimental-aarch64-sve2`).
+  /// `experimental-aarch64-sve` and `experimental-aarch64-sve2` on aarch64,
+  /// `experimental-riscv-rvv` on riscv64).
   ExperimentalIsa,
 }
 
@@ -149,7 +150,8 @@ impl Capability {
     }
   }
 
-  /// The Cargo feature that compiles it in.
+  /// The Cargo feature that compiles it in (for `ExperimentalIsa`, the one
+  /// for the architecture of this build).
   #[must_use]
   pub const fn feature(self) -> &'static str {
     match self {
@@ -157,6 +159,7 @@ impl Capability {
       Self::Scheduler => "scheduler",
       Self::IoUring => "io-uring",
       Self::Rseq => "experimental-rseq",
+      Self::ExperimentalIsa if cfg!(target_arch = "riscv64") => "experimental-riscv-rvv",
       Self::ExperimentalIsa => "experimental-aarch64-sve",
     }
   }

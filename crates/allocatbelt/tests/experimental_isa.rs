@@ -3,7 +3,7 @@
 //! extension, and the policy asks for it; the allocator behaves the same
 //! with it.
 //!
-//! `ALLOCATBELT_EXPECT_KERNEL` (`Baseline`, `Sve` or `Sve2`), set by
+//! `ALLOCATBELT_EXPECT_KERNEL` (`Baseline`, `Sve`, `Sve2` or `Rvv`), set by
 //! `scripts/check-experimental-isa.sh` for each emulated CPU, names the set
 //! `Prefer` must select, so that a detection failure cannot make these
 //! checks pass by selecting nothing.
@@ -26,6 +26,8 @@ fn selectable() -> KernelSet {
     KernelSet::Sve2
   } else if c.experimental_aarch64_sve && sve {
     KernelSet::Sve
+  } else if c.experimental_riscv_rvv && f.contains(CpuFeatures::RVV) {
+    KernelSet::Rvv
   } else {
     KernelSet::Baseline
   }
@@ -83,10 +85,11 @@ fn experimental_kernels_need_compile_time_cpu_and_policy() {
   assert_eq!(GLOBAL.kernel_set(), expected);
   assert_eq!(GLOBAL.effective_profile().kernel_set, expected);
   let report = GLOBAL.report();
+  let compiled = report.compiled.experimental_aarch64_sve || report.compiled.experimental_riscv_rvv;
   assert_eq!(
     report.detected.experimental_isa,
     match expected {
-      _ if !report.compiled.experimental_aarch64_sve => Availability::NotCompiled,
+      _ if !compiled => Availability::NotCompiled,
       KernelSet::Baseline => Availability::Unavailable {
         step: "cpu features",
         errno: 0,
@@ -114,7 +117,7 @@ fn experimental_kernels_need_compile_time_cpu_and_policy() {
     Err(e) => {
       assert_eq!(expected, KernelSet::Baseline);
       let capability = Capability::ExperimentalIsa;
-      if report.compiled.experimental_aarch64_sve {
+      if compiled {
         assert_eq!(
           e,
           PolicyError::Unavailable {

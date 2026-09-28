@@ -58,7 +58,7 @@ The `sys` module **does not use** `rustix::param::page_size()`: reading auxv may
 
 ## `arch` (`crates/allocatbelt/src/arch/`)
 
-CPU feature detection, and the experimental SVE/SVE2 kernels (features `experimental-aarch64-sve` and `-sve2`, docs/features.md). Every detection site runs during `initialize_dispatch()` (or the first `detected_features()` call) and only reads CPU or kernel state.
+CPU feature detection, and the experimental SVE/SVE2 and RVV kernels (features `experimental-aarch64-sve`, `-sve2` and `experimental-riscv-rvv`, docs/features.md). Every detection site runs during `initialize_dispatch()` (or the first `detected_features()` call) and only reads CPU or kernel state.
 
 | Location | Kind | Operation | Why it is sound |
 |---|---|---|---|
@@ -66,6 +66,8 @@ CPU feature detection, and the experimental SVE/SVE2 kernels (features `experime
 | `aarch64::detect` | block ×2 | `libc::getauxval(AT_HWCAP)`, `libc::getauxval(AT_HWCAP2)` | Accepts any key and returns 0 for unknown ones; it only reads libc's saved copy of the auxiliary vector, without syscalls or allocation (glibc and musl). |
 | `sve::aged_pages_sve` | block | calls the `#[target_feature(enable = "sve")]` function `aged_pages_sve_body` | The function is private and only returned by `sve::age_kernel` for `KernelSet::Sve`, which `kernel_set()` reports only when `AT_HWCAP` has `HWCAP_SVE` (the CPU implements SVE and the kernel enabled it for the process). The body is safe code on a borrowed array (the core's private snapshot). |
 | `sve::aged_pages_sve2` | block | calls the `#[target_feature(enable = "sve2")]` function `aged_pages_sve2_body` | As above, for `KernelSet::Sve2`, reported only when `AT_HWCAP` has SVE and `AT_HWCAP2` has `HWCAP2_SVE2`. |
+| `rvv::aged_pages_rvv` | block | calls the `#[target_feature(enable = "v")]` function `aged_pages_rvv_body` | Private and only returned by `rvv::age_kernel` for `KernelSet::Rvv`, which `kernel_set()` reports only when `riscv_hwprobe` reports V for all online CPUs and `PR_RISCV_V_GET_CONTROL` does not report V turned off for the thread, so V instructions execute. The body is safe code on the core's private snapshot. |
+| `riscv64::vector_turned_off` | block | `libc::prctl(PR_RISCV_V_GET_CONTROL, 0, 0, 0, 0)` | Reads the calling thread's vector control word; takes no pointer and writes no memory. Runs only when `riscv_hwprobe` reported V. |
 | `riscv64::detect` | block | `libc::syscall(riscv_hwprobe, &mut pair, 1, 0, null, 0)` | The kernel writes only into the one `Pair` passed, a live exclusive local with the UAPI `struct riscv_hwprobe` layout (`#[repr(C)]` `i64` + `u64`). A null CPU set of size 0 means all online CPUs and the flags are 0, as the hwprobe documentation requires. |
 
 ## `global` (`crates/allocatbelt/src/global.rs`, the adapter)
