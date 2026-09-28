@@ -42,8 +42,11 @@
 //! | `io-uring` | no | stable, off at run time until `set_io_uring(true)` | batched purges through a restricted io_uring, falling back to `madvise` (`set_io_uring`, `io_uring_error`, `RingError`); implies `maintenance` |
 //! | `experimental-rseq` | no | experimental, off at run time until `set_rseq_policy` | shard selection by the rseq `mm_cid`, glibc 2.35+ (`RseqPolicy`, `RseqStatus`) |
 //!
-//! Details, and what happens where the system lacks a facility, are in
-//! `docs/features.md` in the repository.
+//! Within what was compiled, [`Allocatbelt::configure`] sets the run-time
+//! [`Policy`] ([`FeaturePolicy`] `Auto`, `Prefer`, `Require` or `Disable`
+//! per capability), and [`Allocatbelt::report`] shows what was compiled,
+//! detected and selected. Details, and what happens where the system lacks
+//! a facility, are in `docs/features.md` in the repository.
 //!
 //! Every `unsafe` site is listed in `docs/unsafe-boundary.md`.
 
@@ -59,6 +62,8 @@ mod core;
 mod global;
 #[cfg(feature = "maintenance")]
 mod maintenance;
+mod policy;
+mod report;
 #[cfg(feature = "experimental-rseq")]
 mod rseq;
 mod sys;
@@ -67,8 +72,10 @@ pub use crate::arch::{CpuFeatures, KernelSet};
 pub use crate::capabilities::CompiledCapabilities;
 pub use crate::core::MaintenanceStats;
 pub use crate::global::Allocatbelt;
-#[cfg(feature = "maintenance")]
-pub use crate::maintenance::PurgeBackend;
+pub use crate::policy::{Capability, FeaturePolicy, Policy, PolicyError};
+pub use crate::report::{
+  Availability, DetectedCapabilities, EffectiveProfile, PurgeBackend, Report,
+};
 #[cfg(feature = "experimental-rseq")]
 pub use crate::rseq::{RseqPolicy, RseqStatus, RseqUnavailable};
 #[cfg(feature = "io-uring")]

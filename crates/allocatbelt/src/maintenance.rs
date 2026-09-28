@@ -1,13 +1,16 @@
 //! The maintenance thread (feature `maintenance`): runs the heap's
 //! housekeeping passes in the background, as `SCHED_BATCH` with the feature
 //! `scheduler`, and purging through a restricted io_uring with the feature
-//! `io-uring`. Without the feature the allocating threads run the same
-//! passes inline, and the methods below do not exist.
+//! `io-uring`, as the [`Policy`](crate::Policy) selects. Without the
+//! feature the allocating threads run the same passes inline, and the
+//! methods below do not exist.
 
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::mpsc;
 
 use crate::Allocatbelt;
 use crate::global::{HEAP, arena, guarded};
+use crate::policy::{self, Policy, PolicyError};
+use crate::report::{self, Availability, PurgeBackend};
 
 impl Allocatbelt {
   /// Starts the maintenance thread, which from then on runs the
@@ -16,52 +19,83 @@ impl Allocatbelt {
   /// purge delay (also while the program is idle), and requested purges
   /// ([`Allocatbelt::request_purge`]). Allocating threads then only record
   /// the work, which keeps `madvise` off the allocation path; they still
-  /// purge themselves if 64 MiB pile up. With the feature `scheduler` the
-  /// thread runs as `SCHED_BATCH` ([`Allocatbelt::maintenance_is_batch`],
-  /// docs/platform.md); it is not pinned to a CPU. It purges with
-  /// `madvise`, or, with the feature `io-uring`, in batches through
-  /// io_uring after `Allocatbelt::set_io_uring`
-  /// ([`Allocatbelt::purge_backend`]).
+  /// purge themselves if 64 MiB pile up. It is not pinned to a CPU.
+  ///
+  /// The thread is built from the current [`Policy`], whose `scheduler`
+  /// and `io_uring` are frozen from then on: with the feature `scheduler`
+  /// it asks for `SCHED_BATCH` unless `scheduler` is `Disable`
+  /// ([`Allocatbelt::maintenance_is_batch`], docs/platform.md), and with the
+  /// feature `io-uring` it purges in batches through io_uring if `io_uring`
+  /// is `Prefer` or `Require` ([`Allocatbelt::purge_backend`]); `madvise`
+  /// otherwise.
   ///
   /// Call it from ordinary code (not from inside an allocation). Returns
-  /// `Ok(false)` if the thread is already running.
+  /// once the thread has applied the policy, or `Ok(false)` if it is
+  /// already running or starting.
   ///
   /// # Errors
   ///
-  /// Returns the error of [`std::thread::Builder::spawn`], or an error if
-  /// the arena could not be reserved.
+  /// The error of [`std::thread::Builder::spawn`]; an error if the arena
+  /// could not be reserved; or, if a `Require`d capability could not be
+  /// made effective, an error of kind [`std::io::ErrorKind::Unsupported`]
+  /// that wraps the [`PolicyError`] (`err.get_ref()` and `downcast_ref`).
+  /// No thread runs after an error, and the policy stays changeable.
   pub fn start_maintenance_thread(self) -> std::io::Result<bool> {
-    if MAINT_THREAD.swap(true, Ordering::AcqRel) {
+    let Some(policy) = policy::begin_start() else {
       return Ok(false);
-    }
+    };
+    let failed = |e: std::io::Error| {
+      policy::set_phase(policy::IDLE);
+      Err(e)
+    };
     if arena().is_none() {
-      MAINT_THREAD.store(false, Ordering::Release);
-      return Err(std::io::Error::other("allocatbelt: no arena"));
+      return failed(std::io::Error::other("allocatbelt: no arena"));
     }
     // Attached before the thread runs, so that frees record work from now
     // on; the recorded work waits until the thread's first round.
     HEAP.attach_maintenance();
+    // The thread says whether it could apply the policy before it starts
+    // its rounds. Called from ordinary code, so the channel may allocate.
+    let (tx, rx) = mpsc::sync_channel::<Result<(), PolicyError>>(1);
     let spawned = std::thread::Builder::new()
       .name("allocatbelt-mnt".into())
-      .spawn(|| {
-        #[cfg(feature = "scheduler")]
-        SCHED_BATCH.store(crate::sys::set_batch_scheduling(), Ordering::Relaxed);
-        // Returns only if the thread has no ring.
-        #[cfg(feature = "io-uring")]
-        uring::maintain();
-        BACKEND.store(BACKEND_MADVISE, Ordering::Relaxed);
-        loop {
-          guarded(|| {
-            let _ = HEAP.maintain();
-          });
+      .spawn(move || match set_up(policy) {
+        Ok(purger) => {
+          let _ = tx.send(Ok(()));
+          run(purger);
+        }
+        Err(e) => {
+          let _ = tx.send(Err(e));
         }
       });
-    match spawned {
-      Ok(_) => Ok(true),
+    let applied = match spawned {
+      Ok(thread) => match rx.recv() {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(e)) => {
+          let _ = thread.join();
+          Err(std::io::Error::new(std::io::ErrorKind::Unsupported, e))
+        }
+        Err(_) => Err(std::io::Error::other(
+          "allocatbelt: maintenance thread lost",
+        )),
+      },
+      Err(e) => {
+        report::MAINTENANCE.record(Availability::Unavailable {
+          step: "spawn",
+          errno: e.raw_os_error().unwrap_or(0),
+        });
+        Err(e)
+      }
+    };
+    match applied {
+      Ok(()) => {
+        report::MAINTENANCE.record(Availability::Available);
+        policy::set_phase(policy::RUNNING);
+        Ok(true)
+      }
       Err(e) => {
         HEAP.detach_maintenance();
-        MAINT_THREAD.store(false, Ordering::Release);
-        Err(e)
+        failed(e)
       }
     }
   }
@@ -78,99 +112,131 @@ impl Allocatbelt {
   /// How the maintenance thread returns memory.
   #[must_use]
   pub fn purge_backend(self) -> PurgeBackend {
-    match BACKEND.load(Ordering::Relaxed) {
-      BACKEND_MADVISE => PurgeBackend::Madvise,
-      BACKEND_URING => PurgeBackend::IoUring { sq_rewind: false },
-      BACKEND_URING_REWIND => PurgeBackend::IoUring { sq_rewind: true },
-      _ => PurgeBackend::NotStarted,
-    }
+    report::purge_backend()
   }
 
   /// Whether the maintenance thread runs as `SCHED_BATCH`: `false` before
-  /// it starts, if the kernel refused (e.g. a seccomp filter), or if the
-  /// feature `scheduler` is not compiled in.
+  /// it starts, if the kernel refused (e.g. a seccomp filter), if the
+  /// policy disables it, or if the feature `scheduler` is not compiled in.
   #[must_use]
   pub fn maintenance_is_batch(self) -> bool {
-    SCHED_BATCH.load(Ordering::Relaxed)
+    self.effective_profile().scheduler
   }
 }
 
-/// How the maintenance thread returns memory to the kernel.
-///
-/// `IoUring` exists in every build, so that matching on it does not depend
-/// on the features another crate turns on; without the feature `io-uring`
-/// it is never reported.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PurgeBackend {
-  /// No maintenance thread runs: allocating threads purge with `madvise`.
-  NotStarted,
-  /// The maintenance thread purges page run by page run with `madvise`:
-  /// io_uring was not compiled in, turned off or unavailable
-  /// (`Allocatbelt::io_uring_error`), or a submission failed.
-  Madvise,
-  /// The maintenance thread purges in batches through its io_uring;
-  /// `sq_rewind` if the kernel took `IORING_SETUP_SQ_REWIND` (Linux 7.0).
-  IoUring {
-    /// Whether the ring rewinds its submission queue.
-    sq_rewind: bool,
-  },
+/// On the new thread: applies the scheduler and io_uring policies, and
+/// returns the ring to purge with, if any.
+fn set_up(policy: Policy) -> Result<Purger, PolicyError> {
+  #[cfg(feature = "scheduler")]
+  if policy.scheduler != crate::FeaturePolicy::Disable {
+    // `Auto` asks too: `SCHED_BATCH` is the qualified default (plan
+    // Phase 7), and a refusal only keeps the default policy.
+    let r = crate::sys::set_batch_scheduling();
+    report::SCHEDULER.record(match r {
+      Ok(()) => Availability::Available,
+      Err(errno) => Availability::Unavailable {
+        step: "sched_setscheduler",
+        errno,
+      },
+    });
+    if let Err(errno) = r
+      && policy.scheduler == crate::FeaturePolicy::Require
+    {
+      return Err(PolicyError::Unavailable {
+        capability: crate::Capability::Scheduler,
+        step: "sched_setscheduler",
+        errno,
+      });
+    }
+  }
+  #[cfg(feature = "io-uring")]
+  return uring::set_up(policy);
+  #[cfg(not(feature = "io-uring"))]
+  {
+    let _ = policy;
+    Ok(())
+  }
 }
 
-const BACKEND_NONE: u8 = 0;
-const BACKEND_MADVISE: u8 = 1;
-const BACKEND_URING: u8 = 2;
-const BACKEND_URING_REWIND: u8 = 3;
+#[cfg(feature = "io-uring")]
+type Purger = Option<uring::RingPurger>;
+#[cfg(not(feature = "io-uring"))]
+type Purger = ();
 
-/// [`PurgeBackend`] of the running maintenance thread.
-static BACKEND: AtomicU8 = AtomicU8::new(BACKEND_NONE);
-/// Whether the maintenance thread has been started.
-static MAINT_THREAD: AtomicBool = AtomicBool::new(false);
-/// Whether the maintenance thread runs as `SCHED_BATCH`.
-static SCHED_BATCH: AtomicBool = AtomicBool::new(false);
+/// The thread's rounds, never returning.
+fn run(purger: Purger) -> ! {
+  #[cfg(feature = "io-uring")]
+  if let Some(purger) = purger {
+    uring::run(purger);
+  }
+  #[cfg(not(feature = "io-uring"))]
+  let () = purger;
+  report::BACKEND.store(
+    report::BACKEND_MADVISE,
+    std::sync::atomic::Ordering::Relaxed,
+  );
+  loop {
+    guarded(|| {
+      let _ = HEAP.maintain();
+    });
+  }
+}
 
 /// In the child after `fork`: the maintenance thread did not survive it.
 pub(crate) fn fork_child() {
-  MAINT_THREAD.store(false, Ordering::Release);
-  SCHED_BATCH.store(false, Ordering::Relaxed);
-  BACKEND.store(BACKEND_NONE, Ordering::Relaxed);
+  policy::set_phase(policy::IDLE);
+  report::fork_child();
 }
 
 /// Batched purges through a restricted io_uring (feature `io-uring`).
 #[cfg(feature = "io-uring")]
 mod uring {
-  use std::sync::OnceLock;
-  use std::sync::atomic::{AtomicBool, Ordering};
+  use std::sync::atomic::Ordering;
 
-  use super::{BACKEND, BACKEND_MADVISE, BACKEND_URING, BACKEND_URING_REWIND};
-  use crate::Allocatbelt;
   use crate::core::{Os as _, PURGE_BATCH, Purger};
   use crate::global::{HEAP, LinuxOs, guarded};
+  use crate::policy::{self, FeaturePolicy, Policy, PolicyError};
+  use crate::report::{self, Availability, BACKEND_MADVISE, BACKEND_URING, BACKEND_URING_REWIND};
   use crate::sys::{PurgeRing, RingError};
+  use crate::{Allocatbelt, Capability};
 
   impl Allocatbelt {
-    /// Whether the maintenance thread purges in batches through a
-    /// restricted io_uring (`IORING_OP_MADVISE`), or with one `madvise` per
-    /// page run, the default. Takes effect when the thread starts. Off by
-    /// default because it has not won yet: on the kernels measured so far
-    /// each purge takes a detour through a kernel worker thread
-    /// (docs/research/benchmarks.md, Phase 8).
-    pub fn set_io_uring(self, on: bool) {
-      USE_IO_URING.store(on, Ordering::Relaxed);
+    /// Shorthand for setting only the `io_uring` field of the
+    /// [`Policy`](crate::Policy): `true` is `Prefer` (use the ring where
+    /// it can be set up, `madvise` elsewhere), `false` is `Auto`, which
+    /// purges with `madvise` because the ring has not won in measurements
+    /// yet (docs/research/benchmarks.md, Phase 8).
+    ///
+    /// # Errors
+    ///
+    /// [`PolicyError::Frozen`] once the maintenance thread has started; the
+    /// policy is then unchanged. (Before the policy API, this was ignored
+    /// silently.)
+    pub fn set_io_uring(self, on: bool) -> Result<(), PolicyError> {
+      let mut p = policy::current().1;
+      p.io_uring = if on {
+        FeaturePolicy::Prefer
+      } else {
+        FeaturePolicy::Auto
+      };
+      self.configure(p)
     }
 
-    /// Why the maintenance thread has no io_uring (`step` is "turned off"
-    /// unless [`Allocatbelt::set_io_uring`] asked for one).
+    /// Why the maintenance thread has no io_uring: the failed step and
+    /// errno, or `step` "turned off" when the policy did not ask for one.
+    /// `None` before the thread started, or while it uses the ring.
     #[must_use]
     pub fn io_uring_error(self) -> Option<RingError> {
-      RING_ERROR.get().copied()
+      match report::IO_URING.get(true) {
+        Availability::Unavailable { step, errno } => Some(RingError { step, errno }),
+        Availability::NotTried if self.effective_profile().maintenance => Some(RingError {
+          step: "turned off",
+          errno: 0,
+        }),
+        _ => None,
+      }
     }
   }
-
-  /// Whether the maintenance thread tries io_uring
-  /// ([`Allocatbelt::set_io_uring`]).
-  static USE_IO_URING: AtomicBool = AtomicBool::new(false);
-  /// Why the maintenance thread has no ring.
-  static RING_ERROR: OnceLock<RingError> = OnceLock::new();
 
   /// Ring slots: the most page runs one `io_uring_enter` carries (a pass
   /// batches at most [`PURGE_BATCH`]).
@@ -179,37 +245,46 @@ mod uring {
   /// (`ring_benchmark`): parallel purges of one address space contend.
   const RING_WORKERS: u32 = 1;
 
-  /// Runs the maintenance loop with a ring if one was asked for and can be
-  /// set up; returns (having recorded why) if not.
-  pub(super) fn maintain() {
-    // Created here: the thread that enables the ring is its only
-    // submitter.
-    let ring = if USE_IO_URING.load(Ordering::Relaxed) {
-      PurgeRing::new(RING_ENTRIES, RING_WORKERS, true)
-    } else {
-      Err(RingError {
-        step: "turned off",
-        errno: 0,
-      })
-    };
-    match ring {
+  /// Sets up the ring if the policy asks for one. Created here: the thread
+  /// that enables the ring is its only submitter.
+  pub(super) fn set_up(policy: Policy) -> Result<Option<RingPurger>, PolicyError> {
+    if !policy.io_uring.wanted() {
+      return Ok(None);
+    }
+    match PurgeRing::new(RING_ENTRIES, RING_WORKERS, true) {
       Ok(ring) => {
-        let mut purger = RingPurger(ring);
-        loop {
-          purger.publish();
-          guarded(|| {
-            let _ = HEAP.maintain_with(&mut purger);
-          });
-        }
+        report::IO_URING.record(Availability::Available);
+        Ok(Some(RingPurger(ring)))
       }
       Err(e) => {
-        let _ = RING_ERROR.set(e);
+        report::IO_URING.record(Availability::Unavailable {
+          step: e.step,
+          errno: e.errno,
+        });
+        if policy.io_uring == FeaturePolicy::Require {
+          return Err(PolicyError::Unavailable {
+            capability: Capability::IoUring,
+            step: e.step,
+            errno: e.errno,
+          });
+        }
+        Ok(None)
       }
     }
   }
 
+  /// The rounds with the ring.
+  pub(super) fn run(mut purger: RingPurger) -> ! {
+    loop {
+      purger.publish();
+      guarded(|| {
+        let _ = HEAP.maintain_with(&mut purger);
+      });
+    }
+  }
+
   /// The maintenance thread's purger: batches through its own io_uring.
-  struct RingPurger(PurgeRing);
+  pub(super) struct RingPurger(PurgeRing);
 
   impl RingPurger {
     /// Publishes the backend for [`Allocatbelt::purge_backend`].
@@ -219,7 +294,7 @@ mod uring {
         (false, false) => BACKEND_URING,
         (false, true) => BACKEND_URING_REWIND,
       };
-      BACKEND.store(b, Ordering::Relaxed);
+      report::BACKEND.store(b, Ordering::Relaxed);
     }
   }
 

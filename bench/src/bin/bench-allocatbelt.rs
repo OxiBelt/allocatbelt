@@ -7,8 +7,8 @@ fn main() {
   // `ALLOCATBELT_BENCH_IO_URING=0` or `=1` picks the maintenance thread's
   // purge backend (default: the allocator's).
   match std::env::var("ALLOCATBELT_BENCH_IO_URING").as_deref() {
-    Ok("0") => GLOBAL.set_io_uring(false),
-    Ok("1") => GLOBAL.set_io_uring(true),
+    Ok("0") => GLOBAL.set_io_uring(false).expect("set the io_uring policy"),
+    Ok("1") => GLOBAL.set_io_uring(true).expect("set the io_uring policy"),
     _ => {}
   }
   // The recommended setup: housekeeping runs on a background thread, which

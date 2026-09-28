@@ -49,6 +49,8 @@ Cargo features pick which optional parts are compiled in; which of them a proces
 
 `allocatbelt = { version = "0.1", default-features = false }` builds the allocator without the maintenance thread.
 
+Features are the ceiling; `Allocatbelt::configure(Policy)` chooses within it at run time (`FeaturePolicy::Auto`, `Prefer`, `Require` or `Disable` per capability), and `Allocatbelt::report()` shows what was compiled, detected and selected ([docs/features.md](docs/features.md#run-time-policy)).
+
 ```rust
 #[global_allocator]
 static GLOBAL: allocatbelt::Allocatbelt = allocatbelt::Allocatbelt;
@@ -58,7 +60,14 @@ fn main() -> std::io::Result<()> {
     // background thread instead of the allocating threads, and tune how
     // long freed memory stays.
     GLOBAL.set_purge_delay(std::time::Duration::from_secs(1));
+    // Optional: choose among the compiled capabilities before the thread
+    // starts (here: the io_uring purge ring where available, which needs
+    // the `io-uring` feature).
+    let mut policy = allocatbelt::Policy::DEFAULT;
+    policy.io_uring = allocatbelt::FeaturePolicy::Prefer;
+    GLOBAL.configure(policy).map_err(std::io::Error::other)?;
     GLOBAL.start_maintenance_thread()?;
+    eprintln!("{}", GLOBAL.report());
     Ok(())
 }
 ```

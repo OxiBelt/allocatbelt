@@ -44,7 +44,7 @@ fn maintenance_thread_does_the_housekeeping() {
   // Opt-in (off by default); falls back to `madvise` where io_uring is
   // unavailable.
   #[cfg(feature = "io-uring")]
-  GLOBAL.set_io_uring(true);
+  GLOBAL.set_io_uring(true).unwrap();
   assert!(GLOBAL.start_maintenance_thread().unwrap());
   assert!(!GLOBAL.start_purge_thread().unwrap(), "started twice");
   assert!(wait_for(

@@ -29,6 +29,18 @@ pub enum RseqUnavailable {
   NoMmCid,
 }
 
+impl RseqUnavailable {
+  /// The reason as a short step name, for reports.
+  #[must_use]
+  pub const fn step(self) -> &'static str {
+    match self {
+      Self::NotGlibc => "not glibc",
+      Self::NotRegistered => "not registered",
+      Self::NoMmCid => "no mm_cid",
+    }
+  }
+}
+
 /// Offset of `cpu_id` in `struct rseq` (`uapi/linux/rseq.h`).
 const CPU_ID: isize = 4;
 /// Offset of `mm_cid` in `struct rseq`.

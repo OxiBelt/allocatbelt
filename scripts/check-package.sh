@@ -108,6 +108,8 @@ fn main() {
   GLOBAL.purge();
   println!("consumer ok: {:?}", GLOBAL.platform());
   println!("{:?}", GLOBAL.compiled_capabilities());
+  GLOBAL.configure(allocatbelt::Policy::DEFAULT).unwrap();
+  println!("{}", GLOBAL.report());
 }
 EOF
 # The same dependency versions as this workspace.

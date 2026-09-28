@@ -386,9 +386,9 @@ struct SchedParam {
 /// Moves the calling thread to `SCHED_BATCH` (nice value unchanged):
 /// the scheduler treats it as CPU-bound and never lets it preempt
 /// interactive threads on wake-up, which suits allocator housekeeping
-/// (plan §11.2). Returns whether the kernel accepted it.
+/// (plan §11.2). Returns the kernel's error code if it refused.
 #[cfg(feature = "scheduler")]
-pub fn set_batch_scheduling() -> bool {
+pub fn set_batch_scheduling() -> Result<(), i32> {
   let param = SchedParam { sched_priority: 0 };
   // SAFETY: `sched_setscheduler(0 = this thread, SCHED_BATCH, &param)`
   // only reads `param`, a live `repr(C)` struct with the kernel's layout,
@@ -402,7 +402,12 @@ pub fn set_batch_scheduling() -> bool {
       &raw const param,
     )
   };
-  r == 0
+  if r == 0 {
+    Ok(())
+  } else {
+    // `last_os_error` only reads `errno`; it does not allocate.
+    Err(std::io::Error::last_os_error().raw_os_error().unwrap_or(0))
+  }
 }
 
 /// Registers `fork` handlers with `pthread_atfork(3)`: `prepare` runs in

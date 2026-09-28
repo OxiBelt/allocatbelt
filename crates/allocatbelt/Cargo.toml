@@ -49,6 +49,10 @@ required-features = ["maintenance"]
 name = "purge_thread"
 required-features = ["maintenance"]
 
+[[test]]
+name = "policy"
+required-features = ["maintenance"]
+
 [dev-dependencies]
 libc.workspace = true
 

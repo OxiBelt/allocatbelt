@@ -75,6 +75,8 @@ extern "C" fn fork_child() {
   // should not share the parent's placement secret.
   #[cfg(feature = "maintenance")]
   crate::maintenance::fork_child();
+  #[cfg(not(feature = "maintenance"))]
+  crate::report::fork_child();
   HEAP.set_seed(seed());
 }
 

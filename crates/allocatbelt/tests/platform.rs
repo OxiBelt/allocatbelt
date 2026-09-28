@@ -50,3 +50,28 @@ fn compiled_capabilities_follow_the_features() {
   assert!(!c.scheduler || c.maintenance);
   assert!(!c.io_uring || c.maintenance);
 }
+
+#[test]
+fn policy_moves_only_within_the_build() {
+  let c = GLOBAL.compiled_capabilities();
+  let mut p = allocatbelt::Policy::DEFAULT;
+  p.io_uring = allocatbelt::FeaturePolicy::Require;
+  let r = GLOBAL.configure(p);
+  if c.io_uring {
+    assert_eq!(r, Ok(()));
+  } else {
+    assert_eq!(
+      r,
+      Err(allocatbelt::PolicyError::NotCompiled {
+        capability: allocatbelt::Capability::IoUring
+      })
+    );
+  }
+  GLOBAL.configure(allocatbelt::Policy::DEFAULT).unwrap();
+  let d = GLOBAL.detected_capabilities();
+  if !c.maintenance {
+    assert_eq!(d.maintenance, allocatbelt::Availability::NotCompiled);
+  }
+  let text = GLOBAL.report().to_string();
+  assert!(text.contains("policy_frozen: false"), "{text}");
+}
