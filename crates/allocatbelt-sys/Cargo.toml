@@ -9,8 +9,8 @@ publish.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # Linux-only (the crate itself rejects other targets; see `src/platform.rs`).
-# Only for what rustix does not cover: guard-marker `madvise` advice and
-# `pthread_atfork`.
+# Only for what rustix does not cover: guard-marker `madvise` advice,
+# `pthread_atfork` and `sched_setscheduler`.
 libc.workspace = true
 rustix.workspace = true
 

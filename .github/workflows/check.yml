@@ -64,6 +64,15 @@ jobs:
       - name: SIMD benchmark smoke run
         run: cargo run --release --locked -p allocatbelt-simd-bench --bin bench-simd -- --quick
 
+      # Reports the runner's kernel, whether the maintenance thread's
+      # io_uring (and Linux 7.0's SQ_REWIND) can be set up there, and batched
+      # purges against one madvise per run (docs/research/benchmarks.md).
+      # Informational: hosted-runner timings are not evidence.
+      - name: io_uring purge ring report
+        run: |
+          uname -r
+          cargo test --release --locked -p allocatbelt-sys --lib ring_benchmark -- --ignored --nocapture
+
   # The platform contract (docs/platform.md): x86_64 builds need x86-64-v3,
   # and unsupported architectures, ABIs, byte orders and operating systems
   # fail at compile time with the gates' own messages.

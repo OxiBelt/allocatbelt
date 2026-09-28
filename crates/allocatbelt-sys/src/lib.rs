@@ -25,8 +25,10 @@ use rustix::mm::{self, Advice, MapFlags, MprotectFlags, ProtFlags};
 use rustix::thread::futex;
 
 mod platform;
+mod ring;
 
 pub use platform::{Capabilities, KernelVersion, ProbeError, probe};
+pub use ring::{CompletionLost, PurgeRing, RingError};
 
 /// A reserved, never-unmapped range of virtual address space.
 ///
