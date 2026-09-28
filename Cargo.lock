@@ -15,8 +15,16 @@ dependencies = [
 name = "allocatbelt"
 version = "0.1.0"
 dependencies = [
+ "allocatbelt-arch",
  "allocatbelt-core",
  "allocatbelt-sys",
+ "libc",
+]
+
+[[package]]
+name = "allocatbelt-arch"
+version = "0.1.0"
+dependencies = [
  "libc",
 ]
 

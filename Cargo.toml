@@ -1,6 +1,7 @@
 [workspace]
 resolver = "3"
 members = [
+  "crates/allocatbelt-arch",
   "crates/allocatbelt-core",
   "crates/allocatbelt-sys",
   "crates/allocatbelt",
@@ -16,6 +17,7 @@ publish = false
 
 [workspace.dependencies]
 allocatbelt = { path = "crates/allocatbelt" }
+allocatbelt-arch = { path = "crates/allocatbelt-arch" }
 allocatbelt-core = { path = "crates/allocatbelt-core" }
 allocatbelt-sys = { path = "crates/allocatbelt-sys" }
 libc = { version = "0.2.189", default-features = false }

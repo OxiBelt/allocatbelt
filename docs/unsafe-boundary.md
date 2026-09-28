@@ -25,6 +25,16 @@ Regenerate: `grep -rn "unsafe" crates/*/src | grep -E "unsafe (\{|fn|impl)"`
 
 The sys crate **does not use** `rustix::param::page_size()`: reading auxv may allocate when rustix's `alloc` feature gets unified in, which would re-enter the allocator. Instead every range uses a fixed 64 KiB granule, a multiple of all Linux page sizes.
 
+## allocatbelt-arch
+
+CPU feature detection only; no architecture kernel exists yet. Every site runs during `initialize_dispatch()` (or the first `detected_features()` call) and only reads CPU or kernel state.
+
+| Location | Kind | Operation | Why it is sound |
+|---|---|---|---|
+| `x86_64::xcr0` | block | `_xgetbv(0)` | `xgetbv` faults unless the OS enabled XSAVE; the only caller checks `CPUID.1:ECX.OSXSAVE` first. The `xsave` target feature is on for every build (x86-64-v3), and register 0 (`XCR0`) always exists. `cpuid` itself is a safe intrinsic. |
+| `aarch64::detect` | block ×2 | `libc::getauxval(AT_HWCAP)`, `libc::getauxval(AT_HWCAP2)` | Accepts any key and returns 0 for unknown ones; it only reads libc's saved copy of the auxiliary vector, without syscalls or allocation (glibc and musl). |
+| `riscv64::detect` | block | `libc::syscall(riscv_hwprobe, &mut pair, 1, 0, null, 0)` | The kernel writes only into the one `Pair` passed, a live exclusive local with the UAPI `struct riscv_hwprobe` layout (`#[repr(C)]` `i64` + `u64`). A null CPU set of size 0 means all online CPUs and the flags are 0, as the hwprobe documentation requires. |
+
 ## allocatbelt (adapter)
 
 | Location | Kind | Operation | Why it is sound |
