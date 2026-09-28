@@ -202,7 +202,16 @@ impl Region {
     #[expect(unsafe_code, reason = "madvise syscall")]
     let r = unsafe { libc::madvise(p, len, MADV_GUARD_INSTALL) };
     if r == 0 {
-      return true;
+      // Emulators (qemu-user) and some sandboxes accept advice they do not
+      // implement. Populating a real guard region fails with `EFAULT`.
+      // SAFETY: the span is inside our mapping; populating only faults in
+      // pages for reading and changes no contents.
+      #[expect(unsafe_code, reason = "madvise syscall")]
+      let probe = unsafe { mm::madvise(p, len, Advice::LinuxPopulateRead) };
+      if probe == Err(rustix::io::Errno::FAULT) {
+        return true;
+      }
+      self.unguard(offset, len);
     }
     // SAFETY: as above; revoking access cannot fault a live user.
     #[expect(unsafe_code, reason = "mprotect syscall")]
