@@ -21,6 +21,8 @@ combos=(
   ""
   "--features io-uring"
   "--features experimental-rseq"
+  "--no-default-features --features experimental-aarch64-sve"
+  "--features experimental-aarch64-sve2"
   "--all-features"
 )
 

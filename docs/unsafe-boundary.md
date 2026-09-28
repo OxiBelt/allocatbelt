@@ -58,12 +58,14 @@ The `sys` module **does not use** `rustix::param::page_size()`: reading auxv may
 
 ## `arch` (`crates/allocatbelt/src/arch/`)
 
-CPU feature detection only; no architecture kernel exists yet. Every site runs during `initialize_dispatch()` (or the first `detected_features()` call) and only reads CPU or kernel state.
+CPU feature detection, and the experimental SVE/SVE2 kernels (features `experimental-aarch64-sve` and `-sve2`, docs/features.md). Every detection site runs during `initialize_dispatch()` (or the first `detected_features()` call) and only reads CPU or kernel state.
 
 | Location | Kind | Operation | Why it is sound |
 |---|---|---|---|
 | `x86_64::xcr0` | block | `_xgetbv(0)` | `xgetbv` faults unless the OS enabled XSAVE; the only caller checks `CPUID.1:ECX.OSXSAVE` first. The `xsave` target feature is on for every build (x86-64-v3), and register 0 (`XCR0`) always exists. `cpuid` itself is a safe intrinsic. |
 | `aarch64::detect` | block ×2 | `libc::getauxval(AT_HWCAP)`, `libc::getauxval(AT_HWCAP2)` | Accepts any key and returns 0 for unknown ones; it only reads libc's saved copy of the auxiliary vector, without syscalls or allocation (glibc and musl). |
+| `sve::aged_pages_sve` | block | calls the `#[target_feature(enable = "sve")]` function `aged_pages_sve_body` | The function is private and only returned by `sve::age_kernel` for `KernelSet::Sve`, which `kernel_set()` reports only when `AT_HWCAP` has `HWCAP_SVE` (the CPU implements SVE and the kernel enabled it for the process). The body is safe code on a borrowed array (the core's private snapshot). |
+| `sve::aged_pages_sve2` | block | calls the `#[target_feature(enable = "sve2")]` function `aged_pages_sve2_body` | As above, for `KernelSet::Sve2`, reported only when `AT_HWCAP` has SVE and `AT_HWCAP2` has `HWCAP2_SVE2`. |
 | `riscv64::detect` | block | `libc::syscall(riscv_hwprobe, &mut pair, 1, 0, null, 0)` | The kernel writes only into the one `Pair` passed, a live exclusive local with the UAPI `struct riscv_hwprobe` layout (`#[repr(C)]` `i64` + `u64`). A null CPU set of size 0 means all online CPUs and the flags are 0, as the hwprobe documentation requires. |
 
 ## `global` (`crates/allocatbelt/src/global.rs`, the adapter)

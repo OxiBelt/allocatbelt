@@ -175,6 +175,10 @@ impl Os for LinuxOs {
     crate::rseq::shard_hint()
   }
 
+  fn age_kernel(&self) -> Option<crate::core::AgeKernel> {
+    crate::arch::age_kernel()
+  }
+
   fn fatal(&self, msg: &'static str) -> ! {
     // `Stderr` is unbuffered; writing a `&str` does not allocate.
     let _ = std::io::stderr().write_all(msg.as_bytes());
@@ -314,8 +318,10 @@ impl Allocatbelt {
   }
 
   /// The architecture kernels in use: [`KernelSet::Baseline`] until the
-  /// first allocation has initialised the allocator, and for now also
-  /// afterwards, since no architecture kernel has been admitted yet.
+  /// first allocation has initialised the allocator, and afterwards unless
+  /// [`crate::Policy::experimental_isa`] selects an experimental set that
+  /// is compiled in and supported here. No kernel set other than the
+  /// baseline has been measured or is selected by default.
   #[must_use]
   pub fn kernel_set(self) -> KernelSet {
     crate::arch::kernel_set()

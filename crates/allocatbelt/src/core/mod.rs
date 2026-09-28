@@ -47,8 +47,8 @@ mod sync;
 
 #[cfg(not(loom))]
 pub use heap::{
-  Block, DIRTY_HARD_LIMIT_PAGES, Heap, MaintenanceStats, Os, PURGE_BATCH, Purger, SyncPurger, Task,
-  ThreadCache,
+  AgeKernel, Block, DIRTY_HARD_LIMIT_PAGES, Heap, MaintenanceStats, Os, PURGE_BATCH, Purger,
+  SyncPurger, Task, ThreadCache, aged_pages,
 };
 
 /// log2 of [`PAGE_SIZE`].

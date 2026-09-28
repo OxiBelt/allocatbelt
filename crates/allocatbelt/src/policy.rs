@@ -12,7 +12,8 @@
 //! allocation-free, never blocks, and is fork-safe: the maintenance thread's
 //! start freezes the parts it is built from (`scheduler`, `io_uring`) by
 //! moving the word's phase, and `rseq`, whose shard hints are only a
-//! preference, stays switchable at any time.
+//! preference, and `experimental_isa`, whose kernels compute the same
+//! results as the baseline, stay switchable at any time.
 
 use core::fmt;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -49,7 +50,7 @@ impl FeaturePolicy {
   }
 
   const fn from_bits(bits: u32) -> Self {
-    match bits & 0xff {
+    match bits & FIELD {
       1 => Self::Prefer,
       2 => Self::Require,
       3 => Self::Disable,
@@ -82,6 +83,7 @@ impl fmt::Display for FeaturePolicy {
 /// | `scheduler` | feature `scheduler` | `Prefer`: ask for `SCHED_BATCH`, keep the default policy if refused | when the maintenance thread starts |
 /// | `io_uring` | feature `io-uring` | off: purge with `madvise` (the ring has not won in measurements) | when the maintenance thread starts |
 /// | `rseq` | feature `experimental-rseq` | off (experimental, not qualified) | at once, switchable at any time |
+/// | `experimental_isa` | feature `experimental-aarch64-sve` or `-sve2`, on aarch64 | off: the baseline kernels (the experimental ones are not measured) | at once, switchable at any time |
 ///
 /// The maintenance thread itself has no field: the application starts it
 /// with [`Allocatbelt::start_maintenance_thread`], or not. The purge delay
@@ -98,6 +100,11 @@ pub struct Policy {
   /// Whether cache refills pick shards by the rseq `mm_cid`
   /// (experimental).
   pub rseq: FeaturePolicy,
+  /// Whether experimental architecture kernels are used where compiled in
+  /// and supported by the CPU ([`crate::KernelSet`]): `Prefer` and
+  /// `Require` select the best one (SVE2 over SVE), `Auto` and `Disable`
+  /// keep the baseline.
+  pub experimental_isa: FeaturePolicy,
 }
 
 impl Policy {
@@ -108,6 +115,7 @@ impl Policy {
     scheduler: FeaturePolicy::Auto,
     io_uring: FeaturePolicy::Auto,
     rseq: FeaturePolicy::Auto,
+    experimental_isa: FeaturePolicy::Auto,
   };
 }
 
@@ -123,6 +131,9 @@ pub enum Capability {
   IoUring,
   /// Shard selection by the rseq `mm_cid` (feature `experimental-rseq`).
   Rseq,
+  /// Experimental architecture kernels (features
+  /// `experimental-aarch64-sve` and `experimental-aarch64-sve2`).
+  ExperimentalIsa,
 }
 
 impl Capability {
@@ -134,6 +145,7 @@ impl Capability {
       Self::Scheduler => "scheduler",
       Self::IoUring => "io_uring",
       Self::Rseq => "rseq",
+      Self::ExperimentalIsa => "experimental_isa",
     }
   }
 
@@ -145,6 +157,7 @@ impl Capability {
       Self::Scheduler => "scheduler",
       Self::IoUring => "io-uring",
       Self::Rseq => "experimental-rseq",
+      Self::ExperimentalIsa => "experimental-aarch64-sve",
     }
   }
 }
@@ -219,11 +232,14 @@ pub(crate) const STARTING: u32 = 1;
 pub(crate) const RUNNING: u32 = 2;
 
 const SCHEDULER: u32 = 8;
-const IO_URING: u32 = 16;
-const RSEQ: u32 = 24;
+const IO_URING: u32 = 10;
+const RSEQ: u32 = 12;
+const ISA: u32 = 14;
+/// Each [`FeaturePolicy`] takes two bits.
+const FIELD: u32 = 0b11;
 
-/// Phase, then one byte per [`FeaturePolicy`]: all `Auto` and `IDLE` at
-/// start-up.
+/// Phase in the low byte, then two bits per [`FeaturePolicy`]: all `Auto`
+/// and `IDLE` at start-up.
 static WORD: AtomicU32 = AtomicU32::new(0);
 
 const fn pack(phase: u32, p: Policy) -> u32 {
@@ -231,6 +247,7 @@ const fn pack(phase: u32, p: Policy) -> u32 {
     | p.scheduler.to_bits() << SCHEDULER
     | p.io_uring.to_bits() << IO_URING
     | p.rseq.to_bits() << RSEQ
+    | p.experimental_isa.to_bits() << ISA
 }
 
 const fn unpack(word: u32) -> (u32, Policy) {
@@ -240,6 +257,7 @@ const fn unpack(word: u32) -> (u32, Policy) {
       scheduler: FeaturePolicy::from_bits(word >> SCHEDULER),
       io_uring: FeaturePolicy::from_bits(word >> IO_URING),
       rseq: FeaturePolicy::from_bits(word >> RSEQ),
+      experimental_isa: FeaturePolicy::from_bits(word >> ISA),
     },
   )
 }
@@ -310,15 +328,27 @@ pub(crate) fn set_rseq(rseq: FeaturePolicy) {
   let _ = update(|phase, policy| Ok((phase, Policy { rseq, ..policy })));
 }
 
+/// The `experimental_isa` policy, for the kernel dispatch.
+#[inline]
+pub(crate) fn experimental_isa() -> FeaturePolicy {
+  FeaturePolicy::from_bits(WORD.load(Ordering::Relaxed) >> ISA)
+}
+
 /// Checks `Require` against what is compiled in, and what can be checked
-/// now: whether `mm_cid` can be read. `scheduler` and `io_uring` are
-/// checked when the maintenance thread starts.
+/// now: whether `mm_cid` can be read and whether the CPU exposes an
+/// extension an experimental kernel is compiled for. `scheduler` and
+/// `io_uring` are checked when the maintenance thread starts.
 fn validate(p: Policy) -> Result<(), PolicyError> {
   let compiled = crate::CompiledCapabilities::CURRENT;
   for (capability, policy, compiled) in [
     (Capability::Scheduler, p.scheduler, compiled.scheduler),
     (Capability::IoUring, p.io_uring, compiled.io_uring),
     (Capability::Rseq, p.rseq, compiled.rseq),
+    (
+      Capability::ExperimentalIsa,
+      p.experimental_isa,
+      crate::arch::EXPERIMENTAL_COMPILED,
+    ),
   ] {
     if policy == FeaturePolicy::Require && !compiled {
       return Err(PolicyError::NotCompiled { capability });
@@ -334,8 +364,21 @@ fn validate(p: Policy) -> Result<(), PolicyError> {
       errno: 0,
     });
   }
+  if p.experimental_isa == FeaturePolicy::Require
+    && crate::arch::experimental(crate::arch::detected_features()).is_none()
+  {
+    return Err(PolicyError::Unavailable {
+      capability: Capability::ExperimentalIsa,
+      step: ISA_STEP,
+      errno: 0,
+    });
+  }
   Ok(())
 }
+
+/// The step of an unavailable experimental kernel: the CPU or kernel does
+/// not expose the extension (`AT_HWCAP`).
+pub(crate) const ISA_STEP: &str = "cpu features";
 
 impl Allocatbelt {
   /// Sets the run-time policy of the optional capabilities, after the
@@ -345,14 +388,17 @@ impl Allocatbelt {
   ///
   /// `scheduler` and `io_uring` take effect when the maintenance thread
   /// starts, and are frozen from then on; `rseq` takes effect at each
-  /// thread's next cache refill and may change at any time.
+  /// thread's next cache refill, `experimental_isa` at once, and both may
+  /// change at any time.
   ///
   /// # Errors
   ///
   /// - [`PolicyError::NotCompiled`]: `Require` of a capability this build
   ///   does not contain.
   /// - [`PolicyError::Unavailable`]: `rseq` is `Require`d but `mm_cid`
-  ///   cannot be read here.
+  ///   cannot be read here, or `experimental_isa` is `Require`d but the
+  ///   CPU does not expose an extension an experimental kernel is compiled
+  ///   for.
   /// - [`PolicyError::Frozen`]: `scheduler` or `io_uring` differ from the
   ///   policy the maintenance thread was started with.
   pub fn configure(self, policy: Policy) -> Result<(), PolicyError> {
@@ -398,13 +444,16 @@ mod tests {
     for scheduler in all {
       for io_uring in all {
         for rseq in all {
-          let p = Policy {
-            scheduler,
-            io_uring,
-            rseq,
-          };
-          for phase in [IDLE, STARTING, RUNNING] {
-            assert_eq!(unpack(pack(phase, p)), (phase, p));
+          for experimental_isa in all {
+            let p = Policy {
+              scheduler,
+              io_uring,
+              rseq,
+              experimental_isa,
+            };
+            for phase in [IDLE, STARTING, RUNNING] {
+              assert_eq!(unpack(pack(phase, p)), (phase, p));
+            }
           }
         }
       }

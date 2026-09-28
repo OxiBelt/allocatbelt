@@ -22,8 +22,8 @@ use std::sync::{Mutex, OnceLock};
 use std::vec::Vec;
 
 use crate::core::{
-  ARENA_SIZE, Block, Heap, MAX_SEGMENTS, META_WORDS, Os, PAGE_SIZE, PURGE_BATCH, Purger,
-  SEGMENT_SIZE, ThreadCache,
+  ARENA_SIZE, AgeKernel, Block, Heap, MAX_SEGMENTS, META_WORDS, Os, PAGE_SIZE, PURGE_BATCH, Purger,
+  SEGMENT_SIZE, ThreadCache, aged_pages,
 };
 
 /// An [`Os`] that records what the heap does and checks it.
@@ -53,6 +53,9 @@ pub struct MockOs {
   /// Makes every [`Os::shard_hint`] report the next shard, as if the
   /// thread moved to another CPU between any two slow-path calls.
   pub(crate) migrate: AtomicBool,
+  /// Makes [`Os::age_kernel`] return the portable [`aged_pages`], so that
+  /// decay passes take the snapshot path that architecture kernels use.
+  pub(crate) age_kernel: AtomicBool,
 }
 
 impl MockOs {
@@ -72,6 +75,7 @@ impl MockOs {
       last_wait_ms: AtomicU64::new(0),
       hint: AtomicUsize::new(usize::MAX),
       migrate: AtomicBool::new(false),
+      age_kernel: AtomicBool::new(false),
     }
   }
 
@@ -187,6 +191,13 @@ impl Os for MockOs {
       self.hint.load(Ordering::Relaxed)
     };
     (hint != usize::MAX).then_some(hint)
+  }
+
+  fn age_kernel(&self) -> Option<AgeKernel> {
+    self
+      .age_kernel
+      .load(Ordering::Relaxed)
+      .then_some(aged_pages as AgeKernel)
   }
 
   fn fatal(&self, msg: &'static str) -> ! {

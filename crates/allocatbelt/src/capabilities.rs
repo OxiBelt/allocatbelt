@@ -8,9 +8,10 @@ use crate::Allocatbelt;
 /// running system supports is [`Allocatbelt::platform`], and what is in use
 /// is reported by the methods of each part.
 ///
-/// Only parts with an implementation have a field: no SIMD or other ISA
-/// backend is compiled into any build yet ([`crate::KernelSet`]). Fields
-/// may be added as features are.
+/// Only parts with an implementation have a field, and an ISA backend
+/// counts as compiled only on the architecture it is for: the SVE features
+/// compile nothing on x86_64 or riscv64. Fields may be added as features
+/// are.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CompiledCapabilities {
@@ -26,6 +27,14 @@ pub struct CompiledCapabilities {
   /// Feature `experimental-rseq`: shard selection by the rseq `mm_cid`
   /// (experimental, off unless selected at run time).
   pub rseq: bool,
+  /// Feature `experimental-aarch64-sve` on aarch64: the SVE kernels
+  /// ([`crate::KernelSet::Sve`]; experimental, off unless selected at run
+  /// time).
+  pub experimental_aarch64_sve: bool,
+  /// Feature `experimental-aarch64-sve2` on aarch64: the SVE2 kernels
+  /// ([`crate::KernelSet::Sve2`]; experimental, off unless selected at run
+  /// time).
+  pub experimental_aarch64_sve2: bool,
 }
 
 impl CompiledCapabilities {
@@ -35,6 +44,14 @@ impl CompiledCapabilities {
     scheduler: cfg!(feature = "scheduler"),
     io_uring: cfg!(feature = "io-uring"),
     rseq: cfg!(feature = "experimental-rseq"),
+    experimental_aarch64_sve: cfg!(all(
+      target_arch = "aarch64",
+      feature = "experimental-aarch64-sve"
+    )),
+    experimental_aarch64_sve2: cfg!(all(
+      target_arch = "aarch64",
+      feature = "experimental-aarch64-sve2"
+    )),
   };
 }
 

@@ -39,6 +39,13 @@ io-uring = ["maintenance", "rustix/io_uring"]
 # `__rseq_offset` and `__rseq_size` (glibc 2.35 or newer). See
 # docs/platform.md.
 experimental-rseq = []
+# Experimental (directive Phase F): the decay pass's page-age scan compiled
+# for SVE (and SVE2), selected only with `Policy::experimental_isa` set to
+# `Prefer` or `Require` on a CPU that exposes the extension. Stable Rust;
+# nothing is compiled on other architectures. Not measured, never default.
+# See docs/features.md.
+experimental-aarch64-sve = []
+experimental-aarch64-sve2 = ["experimental-aarch64-sve"]
 
 # The tests of an optional part run only when it is compiled in.
 [[test]]

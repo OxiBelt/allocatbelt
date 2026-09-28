@@ -732,6 +732,66 @@ fn decay_waits_for_the_purge_delay() {
   assert_eq!(h.dirty_pages(), 0);
 }
 
+/// The definition every age kernel is checked against, on the edges.
+#[test]
+fn aged_pages_compares_each_page() {
+  let mut since = [0u64; 64];
+  for (i, t) in since.iter_mut().enumerate() {
+    *t = i as u64;
+  }
+  assert_eq!(crate::core::aged_pages(&since, 0), 1);
+  assert_eq!(crate::core::aged_pages(&since, 31), u64::from(u32::MAX));
+  assert_eq!(crate::core::aged_pages(&since, 63), u64::MAX);
+  since[63] = u64::MAX;
+  assert_eq!(crate::core::aged_pages(&since, u64::MAX - 1), u64::MAX >> 1);
+  assert_eq!(crate::core::aged_pages(&since, u64::MAX), u64::MAX);
+  assert_eq!(crate::core::aged_pages(&[u64::MAX; 64], 0), 0);
+}
+
+/// Decay passes that compare ages on a snapshot, as architecture kernels
+/// do ([`crate::core::Os::age_kernel`]), purge exactly what the portable
+/// scan purges, step by step.
+#[test]
+fn decay_with_an_age_kernel_purges_the_same_pages() {
+  let plain = heap();
+  let kernel = heap();
+  kernel.os().age_kernel.store(true, Ordering::Relaxed);
+  let mut held: [Vec<usize>; 2] = [Vec::new(), Vec::new()];
+  let mut x = 0x9E37_79B9_7F4A_7C15u64;
+  for step in 0..3000 {
+    x ^= x << 13;
+    x ^= x >> 7;
+    x ^= x << 17;
+    for (h, held) in [plain, kernel].into_iter().zip(held.iter_mut()) {
+      match x % 8 {
+        0..=3 => {
+          let pages = 1 + (x >> 8) as usize % 6;
+          let shard = (x >> 16) as usize % 4;
+          held.push(alloc(h, shard, pages * PAGE_SIZE, 8));
+        }
+        4..=6 if !held.is_empty() => {
+          let o = held.swap_remove((x >> 24) as usize % held.len());
+          free(h, o);
+        }
+        _ => {
+          h.os().advance(h.decay_interval_ms());
+          h.decay();
+        }
+      }
+    }
+    assert_eq!(held[0], held[1], "placement differs at step {step}");
+    assert_eq!(plain.dirty_pages(), kernel.dirty_pages(), "step {step}");
+    assert_eq!(
+      plain.os().purged.load(Ordering::Relaxed),
+      kernel.os().purged.load(Ordering::Relaxed),
+      "step {step}"
+    );
+    assert_eq!(plain.segments_in_use(), kernel.segments_in_use());
+  }
+  assert!(kernel.os().purged.load(Ordering::Relaxed) > 0);
+  assert_eq!(kernel.dirty_pages(), kernel.dirty_pages_recounted());
+}
+
 #[test]
 fn empty_segments_decay_after_the_delay() {
   let h = heap();

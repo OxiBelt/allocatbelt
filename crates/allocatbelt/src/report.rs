@@ -181,6 +181,9 @@ pub struct DetectedCapabilities {
   pub io_uring: Availability,
   /// Whether this process can read its rseq `mm_cid` (probed on demand).
   pub rseq: Availability,
+  /// Whether the CPU exposes an extension an experimental kernel set is
+  /// compiled for (from `cpu_features`).
+  pub experimental_isa: Availability,
 }
 
 /// What is in use now, after the policy was applied.
@@ -200,7 +203,8 @@ pub struct EffectiveProfile {
   pub purge_backend: PurgeBackend,
   /// Whether cache refills pick shards by `mm_cid`.
   pub rseq: bool,
-  /// The architecture kernels in use.
+  /// The architecture kernels in use: [`KernelSet::Baseline`] unless the
+  /// `experimental_isa` policy selected an experimental set.
   pub kernel_set: KernelSet,
 }
 
@@ -231,6 +235,7 @@ impl Allocatbelt {
       scheduler: SCHEDULER.get(compiled.scheduler),
       io_uring: IO_URING.get(compiled.io_uring),
       rseq: rseq_availability(),
+      experimental_isa: isa_availability(),
     }
   }
 
@@ -259,6 +264,19 @@ impl Allocatbelt {
       detected: self.detected_capabilities(),
       effective: self.effective_profile(),
     }
+  }
+}
+
+fn isa_availability() -> Availability {
+  if !crate::arch::EXPERIMENTAL_COMPILED {
+    return Availability::NotCompiled;
+  }
+  match crate::arch::experimental(crate::arch::detected_features()) {
+    Some(_) => Availability::Available,
+    None => Availability::Unavailable {
+      step: policy::ISA_STEP,
+      errno: 0,
+    },
   }
 }
 
@@ -332,6 +350,13 @@ impl fmt::Display for Report {
         matches!(e.purge_backend, PurgeBackend::IoUring { .. }),
       ),
       ("rseq", c.rseq, Some(e.policy.rseq), d.rseq, e.rseq),
+      (
+        "experimental_isa",
+        c.experimental_aarch64_sve,
+        Some(e.policy.experimental_isa),
+        d.experimental_isa,
+        e.kernel_set != KernelSet::Baseline,
+      ),
     ];
     for (name, compiled, policy, detected, effective) in rows {
       write!(f, "{name}: compiled={compiled}")?;

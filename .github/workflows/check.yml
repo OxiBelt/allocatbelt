@@ -220,6 +220,43 @@ jobs:
       - name: Hardened container, fallbacks and visible ISA
         run: scripts/check-sandbox.sh
 
+  # Single-package directive Phase F: the experimental SVE/SVE2 kernels,
+  # checked against the portable loop and for their selection, natively and
+  # under qemu CPU models and SVE vector lengths. Stable toolchain.
+  experimental-sve:
+    name: Experimental aarch64 SVE/SVE2 kernels
+    runs-on: ubuntu-26.04-arm
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # 7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install 1.98.1 --profile minimal --component clippy
+          rustup default 1.98.1
+
+      - name: Install qemu-user
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends qemu-user
+          grep -m1 -o 'Features.*' /proc/cpuinfo || true
+
+      - name: Fetch locked Cargo dependency graph
+        run: cargo fetch --locked
+
+      - name: Cargo clippy (SVE features)
+        run: |
+          cargo clippy -p allocatbelt --all-targets --locked --features experimental-aarch64-sve -- -D warnings
+          cargo clippy -p allocatbelt --all-targets --locked --features experimental-aarch64-sve2 -- -D warnings
+
+      - name: Kernels and selection under qemu CPU models
+        run: scripts/check-experimental-isa.sh
+
   # Plan phase 3: the bit scans lower to tzcnt/popcnt/lzcnt on x86-64-v3
   # and to ctz/cpop/clz on riscv64 with Zbb (assembly only, no qemu).
   scalar-isa:

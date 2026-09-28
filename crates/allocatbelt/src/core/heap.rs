@@ -81,6 +81,26 @@ pub use maint::{DIRTY_HARD_LIMIT_PAGES, MaintenanceStats, Task};
 use purge::Pass;
 pub use purge::{PURGE_BATCH, Purger, SyncPurger};
 
+/// The age scan of a decay pass over one segment: see [`aged_pages`].
+pub type AgeKernel = fn(&[u64; PAGES_PER_SEGMENT], u64) -> u64;
+
+const _: () = assert!(PAGES_PER_SEGMENT == 64);
+
+/// Which pages of a segment are old enough to purge: bit `i` is set if page
+/// `i` was last marked dirty in decay epoch `since[i]` or earlier
+/// (`since[i] <= cutoff`). The portable [`AgeKernel`] and the definition
+/// every architecture kernel must match. Inlined into each kernel, so that
+/// the kernel's target features apply to the loop.
+#[inline(always)]
+#[must_use]
+pub fn aged_pages(since: &[u64; PAGES_PER_SEGMENT], cutoff: u64) -> u64 {
+  let mut aged = 0u64;
+  for (i, &t) in since.iter().enumerate() {
+    aged |= u64::from(t <= cutoff) << i;
+  }
+  aged
+}
+
 /// Services the heap needs from its environment.
 ///
 /// Offsets are relative to the start of a [`ARENA_SIZE`]-byte arena whose base
@@ -153,6 +173,14 @@ pub trait Os: Sync {
   /// another CPU) costs locality, never correctness. The default returns
   /// `None`.
   fn shard_hint(&self) -> Option<usize> {
+    None
+  }
+  /// An architecture kernel for the age scan of decay passes, or `None`
+  /// for the portable loop over the candidate pages. Asked once per decay
+  /// pass. A kernel must return exactly what [`aged_pages`] returns, and
+  /// only sees a private snapshot of the pages' ages, never the shared
+  /// metadata. The default returns `None`.
+  fn age_kernel(&self) -> Option<AgeKernel> {
     None
   }
   /// Reports heap corruption or misuse (invalid or double free). Must not

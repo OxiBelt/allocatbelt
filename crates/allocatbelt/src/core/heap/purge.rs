@@ -201,6 +201,12 @@ impl<O: Os> Heap<O> {
       segs: [(0, 0); PURGE_BATCH],
       nsegs: 0,
     };
+    // Only decay passes compare ages.
+    let kernel = if cutoff == u64::MAX {
+      None
+    } else {
+      self.os.age_kernel()
+    };
     let batch_size = purger.batch_size().clamp(1, PURGE_BATCH);
     for (wi, word) in self.seg_used.iter().enumerate() {
       let mut used_segs = word.load(Relaxed);
@@ -210,7 +216,7 @@ impl<O: Os> Heap<O> {
         if let Some(m) = self.os.meta(seg)
           && m[SEG_HDR].load(Acquire) & 0xFF == SEG_OWNED
         {
-          self.claim_segment(seg, m, cutoff, &mut batch, purger);
+          self.claim_segment(seg, m, cutoff, kernel, &mut batch, purger);
           if batch.len >= batch_size {
             self.purge_claimed(&mut batch, purger);
           }
@@ -312,29 +318,47 @@ impl<O: Os> Heap<O> {
 
   /// Claims the free pages of a segment that have been dirty since epoch
   /// `cutoff` or earlier and adds their runs to `batch`, purging it first
-  /// if they do not fit.
+  /// if they do not fit. `kernel` compares the ages if given.
   fn claim_segment<P: Purger>(
     &self,
     seg: usize,
     m: &[AtomicU64],
     cutoff: u64,
+    kernel: Option<AgeKernel>,
     batch: &mut Batch,
     purger: &mut P,
   ) {
     let mut eligible = u64::MAX;
     if cutoff != u64::MAX {
-      let mut d = m[SEG_DIRTY].load(Acquire) & !m[SEG_PAGES].load(Acquire);
-      if d == 0 {
+      let candidates = m[SEG_DIRTY].load(Acquire) & !m[SEG_PAGES].load(Acquire);
+      if candidates == 0 {
         return;
       }
-      eligible = 0;
-      while d != 0 {
-        let i = d.trailing_zeros() as usize;
-        d &= d - 1;
-        if PageMeta::new(m, i).since().load(Relaxed) <= cutoff {
-          eligible |= 1 << i;
+      eligible = match kernel {
+        None => {
+          let mut d = candidates;
+          let mut aged = 0;
+          while d != 0 {
+            let i = d.trailing_zeros() as usize;
+            d &= d - 1;
+            if PageMeta::new(m, i).since().load(Relaxed) <= cutoff {
+              aged |= 1 << i;
+            }
+          }
+          aged
         }
-      }
+        Some(kernel) => {
+          // A snapshot taken with one atomic load per page: the kernel
+          // works on this private copy, never with vector loads of the
+          // shared words. Ages of pages that are not candidates are
+          // masked off.
+          let mut since = [0; PAGES_PER_SEGMENT];
+          for (i, t) in since.iter_mut().enumerate() {
+            *t = PageMeta::new(m, i).since().load(Relaxed);
+          }
+          kernel(&since, cutoff) & candidates
+        }
+      };
     }
     // Claim the dirty free pages like an allocation would, so nobody can
     // hand them out while their contents are being discarded.

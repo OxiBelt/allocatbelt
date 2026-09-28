@@ -58,13 +58,18 @@ Dispatch follows the plan's reentrancy rule:
 
 ```text
 allocations before initialize_dispatch()  -> KernelSet::Baseline (always correct)
-initialize_dispatch()                     -> probe once (allocation-free), publish in an atomic
-allocations afterwards                    -> the published KernelSet
+initialize_dispatch()                     -> probe once (allocation-free), cache in an atomic
+afterwards                                -> kernel_set(): Baseline, or an experimental
+                                             set if compiled, detected and selected
 ```
 
-The adapter calls `initialize_dispatch()` while it initialises the arena, right after the kernel probe. Detection issues only `cpuid`/`xgetbv`, reads libc's saved auxiliary vector, or makes one syscall; it never allocates, which `crates/allocatbelt/src/arch/allocation_free.rs` checks with a counting global allocator (the global allocator of the library's unit-test binary). The result is cached in an `AtomicU32` and the kernel set in an `AtomicU8`, with no `OnceLock` or lazy framework. `Allocatbelt::cpu_features()` and `Allocatbelt::kernel_set()` expose both for diagnostics.
+The adapter calls `initialize_dispatch()` while it initialises the arena, right after the kernel probe. Detection issues only `cpuid`/`xgetbv`, reads libc's saved auxiliary vector, or makes one syscall; it never allocates, which `crates/allocatbelt/src/arch/allocation_free.rs` checks with a counting global allocator (the global allocator of the library's unit-test binary). The result is cached in an `AtomicU32`, with no `OnceLock` or lazy framework; `kernel_set()` derives the set from it and the policy word (two atomic loads), so a policy change takes effect at once and never races with a separate published value. `Allocatbelt::cpu_features()` and `Allocatbelt::kernel_set()` expose both for diagnostics.
 
-A detected feature does not mean a kernel exists for it. A kernel is admitted only with benchmark evidence that it speeds up a measured allocator cost, and the Phase 5 qualification admitted none ([research/simd-benchmarks.md](research/simd-benchmarks.md#phase-5-promotion-decision-2026-09-28)). So `KernelSet` has only `Baseline`, and every CPU runs the same code as before.
+A detected feature does not mean a kernel exists for it. A kernel becomes a default only with benchmark evidence that it speeds up a measured allocator cost, and the Phase 5 qualification admitted none ([research/simd-benchmarks.md](research/simd-benchmarks.md#phase-5-promotion-decision-2026-09-28)). So the default is `KernelSet::Baseline`, and every CPU runs the same code as before. The experimental `Sve` and `Sve2` sets (Cargo features `experimental-aarch64-sve` and `-sve2`, directive Phase F) are selected only when compiled in, reported by `AT_HWCAP`/`AT_HWCAP2`, and asked for with `Policy::experimental_isa` `Prefer` or `Require`; they compute the same results as the baseline ([features.md](features.md#experimental-isa-kernels)).
+
+| Capability | Compiled feature | Probe | Default policy | Fallback | `Require` failure |
+|---|---|---|---|---|---|
+| SVE/SVE2 age-scan kernels | `experimental-aarch64-sve`, `experimental-aarch64-sve2` (aarch64) | `getauxval(AT_HWCAP)`, `getauxval(AT_HWCAP2)` | `Auto`: baseline | baseline kernels | `configure` returns `NotCompiled` or `Unavailable { step: "cpu features" }` |
 
 ## Scalar bit instructions
 

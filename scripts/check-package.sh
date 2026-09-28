@@ -94,6 +94,7 @@ default = ["allocatbelt-default"]
 allocatbelt-default = ["allocatbelt/default"]
 io-uring = ["allocatbelt/io-uring"]
 rseq = ["allocatbelt/experimental-rseq"]
+sve2 = ["allocatbelt/experimental-aarch64-sve2"]
 
 [workspace]
 EOF
@@ -145,10 +146,17 @@ run() {
   echo "ok: consumer builds and runs (${*:-default features})"
 }
 caps() {
-  echo "CompiledCapabilities { maintenance: $1, scheduler: $2, io_uring: $3, rseq: $4 }"
+  # caps <maintenance> <scheduler> <io_uring> <rseq> [<sve> <sve2>]
+  echo "CompiledCapabilities { maintenance: $1, scheduler: $2, io_uring: $3, rseq: $4," \
+    "experimental_aarch64_sve: ${5:-false}, experimental_aarch64_sve2: ${6:-false} }"
 }
 run "$(caps true true false false)"
 run "$(caps false false false false)" --no-default-features
 run "$(caps true true true false)" --features io-uring
 run "$(caps true false true false)" --no-default-features --features io-uring
 run "$(caps true true false true)" --features rseq
+# The SVE kernels are compiled only for aarch64; elsewhere the feature
+# builds and compiles nothing.
+sve=false
+[[ "$(uname -m)" == aarch64 ]] && sve=true
+run "$(caps true true false false "${sve}" "${sve}")" --features sve2
