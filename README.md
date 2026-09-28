@@ -12,6 +12,7 @@ crates/allocatbelt-sys    Arena reservation/commit/purge and the metadata slab. 
 crates/allocatbelt-arch   CPU feature detection (cpuid, getauxval, riscv_hwprobe) and kernel dispatch. The architecture unsafe boundary.
 crates/allocatbelt        #[global_allocator] adapter (Allocatbelt).
 bench/                    Comparison against system and secure mimalloc.
+bench/simd/               SIMD candidate kernels and their benchmark (not linked into the allocator).
 docs/                     Research reports, benchmark results, unsafe inventory.
 ```
 
@@ -55,6 +56,7 @@ scripts/run-mutation-testing.sh                                 # mewt campaign 
 RUSTFLAGS="--cfg loom" cargo test --release -p allocatbelt-core --lib loom   # loom models of the lock-free protocols
 (cd fuzz && cargo +nightly fuzz run heap_ops)                   # cargo-fuzz over the checked heap model; see fuzz/README.md
 cargo run --release -p allocatbelt-bench --bin bench-allocatbelt   # also bench-system, bench-mimalloc (built for x86-64-v3)
+cargo run --release -p allocatbelt-simd-bench --bin bench-simd  # SIMD candidates vs scalar; see docs/research/simd-benchmarks.md
 ```
 
 Code style, pinned tool versions and the commit-message format follow OxiBelt; see [CONTRIBUTING.md](CONTRIBUTING.md).
@@ -66,7 +68,7 @@ Code style, pinned tool versions and the commit-message format follow OxiBelt; s
 ```sh
 sudo apt-get install qemu-user gcc-riscv64-linux-gnu libc6-dev-riscv64-cross
 rustup target add riscv64gc-unknown-linux-gnu
-cargo test --release --target riscv64gc-unknown-linux-gnu -p allocatbelt-arch -p allocatbelt-core -p allocatbelt
+cargo test --release --target riscv64gc-unknown-linux-gnu -p allocatbelt-arch -p allocatbelt-core -p allocatbelt -p allocatbelt-simd-bench
 RUSTFLAGS="-C target-feature=+zbb" cargo test --release --target riscv64gc-unknown-linux-gnu -p allocatbelt-arch -p allocatbelt-core -p allocatbelt
 ```
 

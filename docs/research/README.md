@@ -6,6 +6,7 @@ Date: 2026-09-27. Detailed reports (with sources and verification tags):
 - [designs.md](designs.md): design analysis of mimalloc, snmalloc, jemalloc, Scudo, hardened_malloc and PartitionAlloc (English)
 - [boundary.md](boundary.md): unsafe boundary, reentrancy, provenance, hardware acceleration (English)
 - [benchmarks.md](benchmarks.md): prototype measurements
+- [simd-benchmarks.md](simd-benchmarks.md): SIMD candidate kernels measured against scalar code (plan Phase 4)
 
 > The three detailed reports were written by Claude subagents from web sources. Every claim is tagged
 > **[V]** (checked against a primary source), **[S]**/(secondary) or **[U]/[UNVERIFIED]**; check the tag before relying on a claim.
@@ -162,4 +163,4 @@ allocatbelt is being evolved into a Linux-only allocator for a fixed set of CPUs
 
 **What must not regress.** Per-thread caches, bitmap words consumed without shared atomics, batched frees, two-level summary bitmaps, out-of-band `AtomicU64` metadata, delayed purging under a dirty budget, guard pages and randomized placement, fork handling, and the verification around the core (model tests, proptest and fuzzing, loom, Miri-compatible paths, mutation testing, integration tests). SIMD or kernel-API work that weakens any of these is not adopted.
 
-**Phases.** 1: platform contract and build matrix (done: [docs/platform.md](../platform.md)). 2: architecture capability layer (done: `allocatbelt-arch`, see [docs/platform.md](../platform.md)). 3: scalar ISA verification (done: `scripts/check-scalar-isa.sh`, see [docs/platform.md](../platform.md)). 4: SIMD benchmark harness. 5: promote proven SIMD kernels. 6: adaptive lock and futex work. 7: maintenance micro-scheduler. 8: io_uring purge backend. 9: rseq/mm_cid research. Each phase is a separate, independently tested change.
+**Phases.** 1: platform contract and build matrix (done: [docs/platform.md](../platform.md)). 2: architecture capability layer (done: `allocatbelt-arch`, see [docs/platform.md](../platform.md)). 3: scalar ISA verification (done: `scripts/check-scalar-isa.sh`, see [docs/platform.md](../platform.md)). 4: SIMD benchmark harness (done: `bench/simd`, see [simd-benchmarks.md](simd-benchmarks.md); nothing promoted). 5: promote proven SIMD kernels. 6: adaptive lock and futex work. 7: maintenance micro-scheduler. 8: io_uring purge backend. 9: rseq/mm_cid research. Each phase is a separate, independently tested change.
