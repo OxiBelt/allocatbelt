@@ -84,7 +84,10 @@ jobs:
             i686-unknown-linux-gnu \
             armv7-unknown-linux-gnueabihf \
             x86_64-unknown-linux-gnux32 \
+            riscv32imac-unknown-none-elf \
+            wasm32-unknown-unknown \
             powerpc64le-unknown-linux-gnu \
+            loongarch64-unknown-linux-gnu \
             s390x-unknown-linux-gnu \
             x86_64-unknown-freebsd
 

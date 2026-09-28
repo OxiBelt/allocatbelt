@@ -60,7 +60,10 @@ bits='needs a 64-bit target with 64-bit atomics'
 check i686-unknown-linux-gnu "${bits}"
 check armv7-unknown-linux-gnueabihf "${bits}"
 check x86_64-unknown-linux-gnux32 "${bits}"
+check riscv32imac-unknown-none-elf "${bits}"
+check wasm32-unknown-unknown "${bits}"
 check powerpc64le-unknown-linux-gnu "${arch}"
+check loongarch64-unknown-linux-gnu "${arch}"
 check s390x-unknown-linux-gnu 'supports only little-endian targets'
 check x86_64-unknown-freebsd 'supports only Linux'
 
