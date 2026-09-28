@@ -220,6 +220,39 @@ jobs:
       - name: Hardened container, fallbacks and visible ISA
         run: scripts/check-sandbox.sh
 
+  # Single-package directive Phase H: the experimental rseq `mm_cid` shard
+  # selection with glibc's registration, with it turned off by a glibc
+  # tunable, and on musl (no registration); fork, a one-CPU cpuset, a
+  # seccomp filter refusing rseq and policy switching under load.
+  experimental-rseq:
+    name: Experimental rseq mm_cid (${{ matrix.runner }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        runner:
+          - ubuntu-26.04
+          - ubuntu-26.04-arm
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # 7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install 1.98.1 --profile minimal --target "$(uname -m)-unknown-linux-musl"
+          rustup default 1.98.1
+
+      - name: Fetch locked Cargo dependency graph
+        run: cargo fetch --locked
+
+      - name: glibc, glibc with rseq off, musl
+        run: scripts/check-rseq.sh
+
   # Single-package directive Phase F: the experimental SVE/SVE2 kernels,
   # checked against the portable loop and for their selection, natively and
   # under qemu CPU models and SVE vector lengths. Stable toolchain.
@@ -360,9 +393,12 @@ jobs:
 
       # The runner in `.cargo/config.toml` uses `-cpu max`: Zbb for the +zbb
       # build, and RVA23 for Ubuntu 26.04's riscv64 cross glibc. With
-      # `io-uring`, whose fallback qemu-user's ENOSYS exercises.
+      # `io-uring` and `experimental-rseq`, whose fallbacks qemu-user's
+      # ENOSYS exercises (glibc registers no rseq area there).
       - name: Cargo test
-        run: cargo test --release --locked --target riscv64gc-unknown-linux-gnu -p allocatbelt -p allocatbelt-core-check -p allocatbelt-simd-bench --features allocatbelt/io-uring
+        env:
+          ALLOCATBELT_EXPECT_RSEQ: not registered
+        run: cargo test --release --locked --target riscv64gc-unknown-linux-gnu -p allocatbelt -p allocatbelt-core-check -p allocatbelt-simd-bench --features allocatbelt/io-uring,allocatbelt/experimental-rseq
 
       # The experimental RVV candidates: the auto-vectorized kernels built
       # with V (an unstable target feature, hence rustc's warning).

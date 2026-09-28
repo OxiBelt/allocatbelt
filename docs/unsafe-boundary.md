@@ -50,6 +50,8 @@ Compiled only with the feature `experimental-rseq`. It reads the calling thread'
 | `thread_pointer` | block (one per architecture) | `mov fs:[0]` (x86_64), `mrs tpidr_el0` (aarch64), `mv tp` (riscv64) | Reads the thread pointer that `__rseq_offset` is relative to; no other effect. |
 | `field` | block | `&*(tp + __rseq_offset + off) as &AtomicU32` | glibc keeps every thread's rseq area (32 bytes, 32-aligned, in its TCB) at that address for the thread's lifetime, registered or not; `off` names an aligned `u32` (`cpu_id` or `mm_cid`). Only the kernel writes the area, and only while this thread is in the kernel, so the loads never race. A negative `cpu_id` (registration failed for this thread) makes the read return `None`. |
 
+The directive's Phase H added no `unsafe` site to the library: the tests it added (`tests/rseq_process.rs`) call `fork`, `sched_setaffinity`, `alarm`, `waitpid`, `_exit` and install a seccomp filter with `prctl` in test code only. On musl, `MmCid::probe` is safe code that returns `NotGlibc`: nothing reads the thread pointer there.
+
 `futex_wait`/`futex_wake` (the heap locks' sleep and wake-up, and the maintenance thread's timed sleep) use rustix's safe futex functions and add no `unsafe` site.
 
 `libc` is used only for what rustix does not cover: the guard-marker advice values (not in rustix's `Advice` enum), `pthread_atfork`, `sched_setscheduler` (feature `scheduler`) and, with `experimental-rseq`, `getauxval`.

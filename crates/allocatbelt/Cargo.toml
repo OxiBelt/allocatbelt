@@ -71,6 +71,10 @@ required-features = ["maintenance"]
 name = "fork_maintenance"
 required-features = ["maintenance"]
 
+[[test]]
+name = "rseq_process"
+required-features = ["experimental-rseq"]
+
 [dev-dependencies]
 libc.workspace = true
 

@@ -19,6 +19,19 @@ fn oversubscribed_threads_share_shards_by_mm_cid() {
     "rseq: {status:?}, mm_cid of this thread {:?}",
     GLOBAL.mm_cid()
   );
+  // musl registers no rseq area, and allocatbelt does not register one
+  // for it (docs/platform.md).
+  #[cfg(not(target_env = "gnu"))]
+  assert_eq!(
+    status.available,
+    Err(allocatbelt::RseqUnavailable::NotGlibc)
+  );
+  // What the environment should allow, when the caller knows
+  // (scripts/check-rseq.sh): `available`, or the step that failed.
+  if let Ok(expect) = std::env::var("ALLOCATBELT_EXPECT_RSEQ") {
+    let found = status.available.map_or_else(|e| e.step(), |()| "available");
+    assert_eq!(found, expect, "{status:?}");
+  }
   // Nothing is selected by default.
   assert_eq!(status.policy, RseqPolicy::Auto);
   assert!(!status.active);
