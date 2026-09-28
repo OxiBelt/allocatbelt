@@ -167,4 +167,16 @@ pub fn run(name: &str) {
     "{name}\tidle\tVmRSS after 3 s idle {} KiB",
     rss_kib("VmRSS:")
   );
+  // The local churn's work spread over four times as many threads as
+  // CPUs, so lock holders get preempted and waiters must get out of the
+  // way (docs/research/benchmarks.md, lock contention). Last, so that it
+  // does not change the peak and idle figures above.
+  time(
+    &format!(
+      "{}-thread local churn 250k each (oversubscribed)",
+      4 * threads
+    ),
+    name,
+    || threads_local(4 * threads, 250_000),
+  );
 }
