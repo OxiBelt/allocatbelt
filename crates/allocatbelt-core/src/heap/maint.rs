@@ -16,10 +16,11 @@
 //! | P3 | empty-segment retirement | part of every pass above (`trim_shards`) |
 //! | P4 | statistics | [`Heap::maintenance_stats`], kept by the passes |
 //!
-//! The engine uses the existing synchronous backend: each pass takes
-//! `purge_lock` and calls [`Os::purge`] and [`Os::decommit`] as before,
-//! so the protocols the passes rely on are unchanged; only who runs them
-//! and when differs. Two safety valves keep memory bounded if the thread
+//! Each pass takes `purge_lock` as before. The thread may bring its own
+//! [`Purger`] ([`Heap::maintain_with`]), such as the adapter's io_uring
+//! ring, which purges a pass's page runs in batches; passes on allocating
+//! threads purge through [`Os::purge`] ([`SyncPurger`]). Returning
+//! segments ([`Os::decommit`]) stays synchronous. Two safety valves keep memory bounded if the thread
 //! falls behind (it runs as a batch task, see the adapter): a free that
 //! finds more than [`DIRTY_HARD_LIMIT_PAGES`] dirty pages runs the budget
 //! pass inline as before, and a forked child, which has no maintenance
@@ -65,6 +66,10 @@ pub struct MaintenanceStats {
   pub inline_decay_passes: u64,
   /// Times a freeing thread woke the maintenance thread.
   pub wakeups: u64,
+  /// Purge batches, by any pass (one per segment for [`SyncPurger`]).
+  pub purge_batches: u64,
+  /// Page runs purged (or attempted) by those batches.
+  pub purged_runs: u64,
 }
 
 /// Indices into `Heap::maint_stats`.
@@ -76,10 +81,12 @@ pub(super) enum Stat {
   InlineBudget,
   InlineDecay,
   Wakeup,
+  Batch,
+  Run,
 }
 
 /// Number of [`Stat`]s.
-pub(super) const STATS: usize = 6;
+pub(super) const STATS: usize = 8;
 
 impl<O: Os> Heap<O> {
   /// Hands housekeeping to the calling thread, which must then call
@@ -106,12 +113,17 @@ impl<O: Os> Heap<O> {
 
   /// One round of the maintenance thread: runs the most urgent pending
   /// work, or, with none, sleeps until the next decay pass is due or a
-  /// request wakes it. Returns what it ran.
+  /// request wakes it. Returns what it ran. Purges through [`Os::purge`].
   pub fn maintain(&self) -> Option<Task> {
+    self.maintain_with(&mut SyncPurger(&self.os))
+  }
+
+  /// [`Heap::maintain`], with the passes purging through `purger`.
+  pub fn maintain_with<P: Purger>(&self, purger: &mut P) -> Option<Task> {
     let now = self.os.now_ms();
     match self.next_task(now) {
       Some(task) => {
-        self.run_task(task, now);
+        self.run_task(task, now, purger);
         Some(task)
       }
       None => {
@@ -140,7 +152,7 @@ impl<O: Os> Heap<O> {
     }
   }
 
-  fn run_task(&self, task: Task, now: u64) {
+  fn run_task<P: Purger>(&self, task: Task, now: u64, purger: &mut P) {
     // Requests are taken before the pass reads what caused them, so one
     // that arrives during it is served by this pass or by another one
     // (`proto::take_work`).
@@ -148,7 +160,7 @@ impl<O: Os> Heap<O> {
       Task::Force => {
         proto::take_work(&self.maint_work, WORK_FORCE);
         let _g = self.purge_lock.lock(&self.os);
-        self.pass(Pass::Force);
+        self.pass(Pass::Force, purger);
         self.count(Stat::Force);
       }
       Task::Budget => {
@@ -156,14 +168,14 @@ impl<O: Os> Heap<O> {
         let _g = self.purge_lock.lock(&self.os);
         // An inline pass (hard limit) may have done it meanwhile.
         if self.dirty_pages.load(Relaxed) > DIRTY_BUDGET_PAGES {
-          self.pass(Pass::Budget);
+          self.pass(Pass::Budget, purger);
           self.count(Stat::Budget);
         }
       }
       Task::Decay => {
         let _g = self.purge_lock.lock(&self.os);
         self.last_decay_ms.store(now, Relaxed);
-        self.pass(Pass::Decay);
+        self.pass(Pass::Decay, purger);
         self.count(Stat::Decay);
       }
     }
@@ -186,7 +198,7 @@ impl<O: Os> Heap<O> {
     if self.maintenance_attached() && dirty <= DIRTY_HARD_LIMIT_PAGES {
       self.request(WORK_BUDGET);
     } else if let Some(_g) = self.purge_lock.try_lock(&self.os) {
-      self.pass(Pass::Budget);
+      self.pass(Pass::Budget, &mut SyncPurger(&self.os));
       self.count(Stat::InlineBudget);
     }
   }
@@ -218,7 +230,11 @@ impl<O: Os> Heap<O> {
   }
 
   pub(super) fn count(&self, stat: Stat) {
-    self.maint_stats[stat as usize].fetch_add(1, Relaxed);
+    self.count_n(stat, 1);
+  }
+
+  pub(super) fn count_n(&self, stat: Stat, n: u64) {
+    self.maint_stats[stat as usize].fetch_add(n, Relaxed);
   }
 
   /// The housekeeping counters so far.
@@ -231,6 +247,8 @@ impl<O: Os> Heap<O> {
       inline_budget_passes: s(Stat::InlineBudget),
       inline_decay_passes: s(Stat::InlineDecay),
       wakeups: s(Stat::Wakeup),
+      purge_batches: s(Stat::Batch),
+      purged_runs: s(Stat::Run),
     }
   }
 }

@@ -22,7 +22,8 @@ use std::sync::{Mutex, OnceLock};
 use std::vec::Vec;
 
 use crate::{
-  ARENA_SIZE, Block, Heap, MAX_SEGMENTS, META_WORDS, Os, PAGE_SIZE, SEGMENT_SIZE, ThreadCache,
+  ARENA_SIZE, Block, Heap, MAX_SEGMENTS, META_WORDS, Os, PAGE_SIZE, PURGE_BATCH, Purger,
+  SEGMENT_SIZE, ThreadCache,
 };
 
 /// An [`Os`] that records what the heap does and checks it.
@@ -177,6 +178,70 @@ impl Os for MockOs {
   }
 }
 
+/// A [`Purger`] standing in for an asynchronous backend such as io_uring.
+/// It checks each batch when it is "submitted", runs [`MockPurger::during`]
+/// while the purges are "in flight", then completes them in reverse order,
+/// checking again that nothing was handed out meanwhile. Every
+/// `fail_every`-th run fails (0: none), as a failed completion would.
+pub struct MockPurger<'a> {
+  /// The environment whose shadow maps the purges update.
+  pub os: &'a MockOs,
+  /// Runs per batch the purger asks for.
+  pub batch: usize,
+  /// Fail every n-th run (counted across batches); 0 never fails.
+  pub fail_every: usize,
+  /// Runs seen so far.
+  pub runs: usize,
+  /// Batches seen so far.
+  pub batches: usize,
+  /// Run while a batch is in flight: other threads' allocations and frees.
+  pub during: Option<&'a dyn Fn()>,
+}
+
+impl<'a> MockPurger<'a> {
+  /// A purger with batches of `batch` runs that never fails.
+  pub fn new(os: &'a MockOs, batch: usize) -> Self {
+    Self {
+      os,
+      batch,
+      fail_every: 0,
+      runs: 0,
+      batches: 0,
+      during: None,
+    }
+  }
+}
+
+impl Purger for MockPurger<'_> {
+  fn batch_size(&self) -> usize {
+    self.batch
+  }
+  fn purge_batch(&mut self, ranges: &[(usize, usize)], purged: &mut [bool]) {
+    assert!(ranges.len() <= PURGE_BATCH);
+    assert_eq!(ranges.len(), purged.len());
+    for &(offset, len) in ranges {
+      assert!(len > 0 && offset.is_multiple_of(PAGE_SIZE) && len.is_multiple_of(PAGE_SIZE));
+      self.os.assert_no_live(offset, len, "submitted purge");
+      self.os.assert_unguarded(offset, len, "submitted purge");
+    }
+    if let Some(during) = self.during {
+      during();
+    }
+    self.batches += 1;
+    for (i, &(offset, len)) in ranges.iter().enumerate().rev() {
+      let n = self.runs + i + 1;
+      purged[i] = if self.fail_every != 0 && n.is_multiple_of(self.fail_every) {
+        // Nothing handed out the pages meanwhile, even when it fails.
+        self.os.assert_no_live(offset, len, "failed purge");
+        false
+      } else {
+        self.os.purge(offset, len)
+      };
+    }
+    self.runs += ranges.len();
+  }
+}
+
 /// Allocates (uncached) and records the block in the shadow maps, checking
 /// the allocator's post-conditions.
 pub fn alloc(h: &Heap<MockOs>, shard: usize, size: usize, align: usize) -> usize {
@@ -319,8 +384,9 @@ fn size_of(hi: u8, lo: u8) -> usize {
 /// uncached paths through a cache) and the uncached API, so frees routinely
 /// cross "threads". The program also flushes and retires caches, purges,
 /// runs decay passes, advances the clock, changes the purge delay, hands
-/// housekeeping to a maintenance "thread" and back, runs its rounds and
-/// requests purges from it; the
+/// housekeeping to a maintenance "thread" and back, runs its rounds (also
+/// with a batching [`MockPurger`] that fails some runs) and requests purges
+/// from it; the
 /// first byte seeds randomized placement (or not). At the end everything is
 /// freed and a forced purge must leave nothing dirty.
 pub fn run(data: &[u8]) {
@@ -379,6 +445,12 @@ pub fn run(data: &[u8]) {
         let _ = h.maintain();
       }
       30 => h.request_purge(),
+      31 => {
+        let mut p = MockPurger::new(h.os(), usize::from(byte()) % (PURGE_BATCH + 2));
+        p.fail_every = usize::from(byte() % 4);
+        let _ = h.maintain_with(&mut p);
+        assert_eq!(h.dirty_pages(), h.dirty_pages_recounted());
+      }
       _ => {}
     }
   }
@@ -389,7 +461,9 @@ pub fn run(data: &[u8]) {
     h.retire(tc);
   }
   assert!(h.os().live.lock().unwrap().is_empty());
+  assert_eq!(h.dirty_pages(), h.dirty_pages_recounted());
   h.purge();
+  assert_eq!(h.dirty_pages(), h.dirty_pages_recounted());
   if !h.os().purge_fails.load(Ordering::Relaxed) {
     assert_eq!(h.dirty_pages(), 0, "a forced purge left dirty pages");
   }

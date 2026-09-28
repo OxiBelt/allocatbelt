@@ -21,11 +21,66 @@
 //! them into dirty free pages that the time rule then handles. Each shard
 //! keeps one empty segment, so a shard that drains and refills does not
 //! decommit and recommit a segment every time.
+//!
+//! A pass hands the dirty page runs it claims to a [`Purger`] in batches.
+//! Passes on allocating threads use [`SyncPurger`], one [`Os::purge`] per
+//! run as it is claimed; a maintenance thread may batch them instead
+//! ([`Heap::maintain_with`]), e.g. through io_uring. The claim is what makes
+//! that safe: from `proto::claim_dirty` until `proto::finish_purge`, the
+//! claimed pages are allocated as far as every other thread can tell, so
+//! nothing hands them out while their purge is in flight, however long the
+//! batch takes. A run the purger reports as failed stays dirty and is not
+//! reported as zero.
 
 use super::*;
 
 /// Decay passes per purge delay.
 const DECAY_STEPS: u64 = 4;
+
+/// The most page runs one [`Purger::purge_batch`] call carries.
+pub const PURGE_BATCH: usize = 64;
+
+/// Returns the memory of batches of dirty page runs for purge passes.
+///
+/// The heap's side of the contract is that of [`Os::purge`]: every range
+/// holds only free pages, which the pass has claimed, so no live allocation
+/// is in them and none of their pages is handed out until
+/// [`Purger::purge_batch`] returns.
+pub trait Purger {
+  /// Runs worth collecting before a call, at most [`PURGE_BATCH`]. A call
+  /// follows the segment that reaches it, so it may carry a few more.
+  fn batch_size(&self) -> usize;
+  /// Purges each range (byte offset and length, as [`Os::purge`]) and sets
+  /// `purged[i]` to whether range `i` now reads as zero. Must not return
+  /// before every purge has completed: the heap hands the pages out again
+  /// right afterwards. `purged` has the length of `ranges`.
+  fn purge_batch(&mut self, ranges: &[(usize, usize)], purged: &mut [bool]);
+}
+
+/// Purges run by run through [`Os::purge`], as each segment's runs are
+/// claimed: the purger of passes on allocating threads.
+pub struct SyncPurger<'a, O>(pub &'a O);
+
+impl<O: Os> Purger for SyncPurger<'_, O> {
+  fn batch_size(&self) -> usize {
+    1
+  }
+  fn purge_batch(&mut self, ranges: &[(usize, usize)], purged: &mut [bool]) {
+    for (&(offset, len), p) in ranges.iter().zip(purged) {
+      *p = self.0.purge(offset, len);
+    }
+  }
+}
+
+/// Runs claimed by a pass and not yet purged.
+struct Batch {
+  ranges: [(usize, usize); PURGE_BATCH],
+  purged: [bool; PURGE_BATCH],
+  len: usize,
+  /// Per segment in the batch: its index and the pages claimed in it.
+  segs: [(usize, u64); PURGE_BATCH],
+  nsegs: usize,
+}
 
 /// What a pass returns.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -49,7 +104,7 @@ impl<O: Os> Heap<O> {
   /// the calling thread's cache first with [`Heap::flush`].
   pub fn purge(&self) {
     let _g = self.purge_lock.lock(&self.os);
-    self.pass(Pass::Force);
+    self.pass(Pass::Force, &mut SyncPurger(&self.os));
   }
 
   /// Runs a decay pass: purges the pages that have been dirty for the purge
@@ -59,7 +114,7 @@ impl<O: Os> Heap<O> {
   pub fn decay(&self) {
     let _g = self.purge_lock.lock(&self.os);
     self.last_decay_ms.store(self.os.now_ms(), Relaxed);
-    self.pass(Pass::Decay);
+    self.pass(Pass::Decay, &mut SyncPurger(&self.os));
   }
 
   /// Sets how long freed pages stay resident and empty segments stay owned
@@ -116,13 +171,13 @@ impl<O: Os> Heap<O> {
     }
     if let Some(_g) = self.purge_lock.try_lock(&self.os) {
       self.last_decay_ms.store(now, Relaxed);
-      self.pass(Pass::Decay);
+      self.pass(Pass::Decay, &mut SyncPurger(&self.os));
       self.count(maint::Stat::InlineDecay);
     }
   }
 
   /// Caller holds `purge_lock`.
-  pub(super) fn pass(&self, kind: Pass) {
+  pub(super) fn pass<P: Purger>(&self, kind: Pass, purger: &mut P) {
     // Only decay passes age pages and segments.
     let epoch = if kind == Pass::Decay {
       self.epoch.fetch_add(1, Relaxed) + 1
@@ -139,6 +194,14 @@ impl<O: Os> Heap<O> {
     let Some(cutoff) = cutoff else {
       return;
     };
+    let mut batch = Batch {
+      ranges: [(0, 0); PURGE_BATCH],
+      purged: [false; PURGE_BATCH],
+      len: 0,
+      segs: [(0, 0); PURGE_BATCH],
+      nsegs: 0,
+    };
+    let batch_size = purger.batch_size().clamp(1, PURGE_BATCH);
     for (wi, word) in self.seg_used.iter().enumerate() {
       let mut used_segs = word.load(Relaxed);
       while used_segs != 0 {
@@ -147,10 +210,14 @@ impl<O: Os> Heap<O> {
         if let Some(m) = self.os.meta(seg)
           && m[SEG_HDR].load(Acquire) & 0xFF == SEG_OWNED
         {
-          self.purge_segment(seg, m, cutoff);
+          self.claim_segment(seg, m, cutoff, &mut batch, purger);
+          if batch.len >= batch_size {
+            self.purge_claimed(&mut batch, purger);
+          }
         }
       }
     }
+    self.purge_claimed(&mut batch, purger);
   }
 
   /// Releases the fully free small pages of each idle shard, then unlinks
@@ -223,9 +290,37 @@ impl<O: Os> Heap<O> {
     self.free_segments(seg, 1);
   }
 
-  /// Purges the free pages of a segment that have been dirty since epoch
-  /// `cutoff` or earlier.
-  fn purge_segment(&self, seg: usize, m: &[AtomicU64], cutoff: u64) {
+  /// The dirty page count recomputed from the segments' dirty marks, which
+  /// must equal [`Heap::dirty_pages`] whenever no pass or free is running.
+  #[cfg(any(test, feature = "model"))]
+  pub fn dirty_pages_recounted(&self) -> usize {
+    let mut n = 0;
+    for (wi, word) in self.seg_used.iter().enumerate() {
+      let mut used_segs = word.load(Relaxed);
+      while used_segs != 0 {
+        let seg = wi * 64 + used_segs.trailing_zeros() as usize;
+        used_segs &= used_segs - 1;
+        if let Some(m) = self.os.meta(seg)
+          && m[SEG_HDR].load(Acquire) & 0xFF == SEG_OWNED
+        {
+          n += m[SEG_DIRTY].load(Relaxed).count_ones() as usize;
+        }
+      }
+    }
+    n
+  }
+
+  /// Claims the free pages of a segment that have been dirty since epoch
+  /// `cutoff` or earlier and adds their runs to `batch`, purging it first
+  /// if they do not fit.
+  fn claim_segment<P: Purger>(
+    &self,
+    seg: usize,
+    m: &[AtomicU64],
+    cutoff: u64,
+    batch: &mut Batch,
+    purger: &mut P,
+  ) {
     let mut eligible = u64::MAX;
     if cutoff != u64::MAX {
       let mut d = m[SEG_DIRTY].load(Acquire) & !m[SEG_PAGES].load(Acquire);
@@ -247,24 +342,56 @@ impl<O: Os> Heap<O> {
     if dirty == 0 {
       return;
     }
+    // A segment has at most 32 runs (63 pages), so they fit an empty batch.
+    let runs = (dirty & !(dirty << 1)).count_ones() as usize;
+    if batch.len + runs > PURGE_BATCH {
+      self.purge_claimed(batch, purger);
+    }
     let mut rest = dirty;
-    let mut purged = 0;
     while rest != 0 {
       let start = rest.trailing_zeros();
       let len = (rest >> start).trailing_ones();
       let page = seg * PAGES_PER_SEGMENT + start as usize;
-      let run = run_mask(start, len);
-      // Pages that could not be purged keep their dirty mark: they are
-      // not known to be zero.
-      if self.os.purge(page << PAGE_SHIFT, len as usize * PAGE_SIZE) {
-        purged |= run;
-      }
-      rest &= !run;
+      batch.ranges[batch.len] = (page << PAGE_SHIFT, len as usize * PAGE_SIZE);
+      batch.len += 1;
+      rest &= !run_mask(start, len);
     }
-    let cleared = proto::finish_purge(&m[SEG_PAGES], &m[SEG_DIRTY], dirty, purged);
-    self
-      .dirty_pages
-      .fetch_sub(cleared.count_ones() as isize, Relaxed);
+    batch.segs[batch.nsegs] = (seg, dirty);
+    batch.nsegs += 1;
+  }
+
+  /// Purges the runs in `batch` and ends the claims on their segments.
+  /// Pages that could not be purged keep their dirty mark: they are not
+  /// known to be zero.
+  fn purge_claimed<P: Purger>(&self, batch: &mut Batch, purger: &mut P) {
+    if batch.len == 0 {
+      return;
+    }
+    let (ranges, purged) = (&batch.ranges[..batch.len], &mut batch.purged[..batch.len]);
+    purged.fill(false);
+    purger.purge_batch(ranges, purged);
+    self.count(maint::Stat::Batch);
+    self.count_n(maint::Stat::Run, batch.len as u64);
+    // Ranges are in segment order, so each segment's are contiguous.
+    let mut r = 0;
+    for &(seg, claimed) in &batch.segs[..batch.nsegs] {
+      let mut done = 0;
+      while r < batch.len && batch.ranges[r].0 >> PAGE_SHIFT < (seg + 1) * PAGES_PER_SEGMENT {
+        let (offset, len) = batch.ranges[r];
+        if batch.purged[r] {
+          let start = ((offset >> PAGE_SHIFT) % PAGES_PER_SEGMENT) as u32;
+          done |= run_mask(start, (len / PAGE_SIZE) as u32);
+        }
+        r += 1;
+      }
+      let m = self.seg_meta(seg);
+      let cleared = proto::finish_purge(&m[SEG_PAGES], &m[SEG_DIRTY], claimed, done);
+      self
+        .dirty_pages
+        .fetch_sub(cleared.count_ones() as isize, Relaxed);
+    }
+    batch.len = 0;
+    batch.nsegs = 0;
   }
 
   /// Releases every page of class `c` whose blocks are all free. Caller

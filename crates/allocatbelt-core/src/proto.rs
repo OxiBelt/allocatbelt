@@ -396,6 +396,60 @@ mod loom_tests {
     });
   }
 
+  /// A purge whose completion comes later, as with io_uring, and fails for
+  /// one page: while the purge is in flight an allocator claims pages and
+  /// a thread frees one; no claimed page may be handed out before the
+  /// purge ends, and the failed page keeps its dirty mark.
+  #[test]
+  fn async_purge_with_failure() {
+    let mut model = loom::model::Builder::new();
+    model.preemption_bound = Some(3);
+    model.check(|| {
+      // Page 0 is live, page 1 free and clean, pages 2 and 3 free and
+      // dirty; the rest of the segment is taken.
+      let pages = Arc::new(AtomicU64::new(!0b1110));
+      let dirty = Arc::new(AtomicU64::new(0b1100));
+      let in_flight = Arc::new(AtomicU64::new(0));
+      let (p1, d1) = (pages.clone(), dirty.clone());
+      let freer = thread::spawn(move || release_run(&p1, &d1, 0b0001));
+      let (p2, d2, f2) = (pages.clone(), dirty.clone(), in_flight.clone());
+      let purger = thread::spawn(move || {
+        let c = claim_dirty(&p2, &d2, u64::MAX);
+        f2.store(c, Release);
+        // Submitted; the completion arrives later. Page 3 fails.
+        thread::yield_now();
+        let purged = c & 0b0100;
+        f2.store(0, Release);
+        finish_purge(&p2, &d2, c, purged);
+        (c, purged)
+      });
+      let mut mine = 0;
+      for _ in 0..2 {
+        if let Some((start, _)) = claim_run(&pages, &dirty, 1, 1) {
+          let bit = 1u64 << start;
+          assert_eq!(
+            in_flight.load(Acquire) & bit,
+            0,
+            "handed out a page in flight"
+          );
+          mine |= bit;
+        }
+      }
+      freer.join().unwrap();
+      let (claimed, purged) = purger.join().unwrap();
+      let (used, d) = (pages.load(Relaxed), dirty.load(Relaxed));
+      assert_eq!(mine & !0b1111, 0, "claimed a taken page");
+      assert_eq!(used, !0b1111 | mine);
+      assert_eq!(d & used, 0, "held page left dirty");
+      // A failed page the allocator did not take is still dirty.
+      if claimed & 0b1000 != 0 && mine & 0b1000 == 0 {
+        assert_ne!(d & 0b1000, 0, "a failed purge lost the dirty mark");
+      }
+      // A page is clean only if it was purged or never dirtied.
+      assert_eq!(!used & !d & 0b1101 & !purged, 0);
+    });
+  }
+
   #[test]
   fn grow_races_trim() {
     loom::model(|| {

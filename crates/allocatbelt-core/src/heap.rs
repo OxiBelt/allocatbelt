@@ -79,6 +79,7 @@ mod purge;
 pub use cache::ThreadCache;
 pub use maint::{DIRTY_HARD_LIMIT_PAGES, MaintenanceStats, Task};
 use purge::Pass;
+pub use purge::{PURGE_BATCH, Purger, SyncPurger};
 
 /// Services the heap needs from its environment.
 ///

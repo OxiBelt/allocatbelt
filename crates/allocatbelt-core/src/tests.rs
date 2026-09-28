@@ -10,8 +10,10 @@ use std::vec::Vec;
 
 use crate::heap::DIRTY_BUDGET_PAGES;
 use crate::heap::MAX_RUN_PAGES;
-use crate::model::{MockOs, alloc, alloc_block, alloc_c, cache, free, free_c, resize};
-use crate::{DIRTY_HARD_LIMIT_PAGES, Heap, PAGE_SIZE, SEGMENT_SIZE, Task, ThreadCache};
+use crate::model::{MockOs, MockPurger, alloc, alloc_block, alloc_c, cache, free, free_c, resize};
+use crate::{
+  Block, DIRTY_HARD_LIMIT_PAGES, Heap, PAGE_SIZE, PURGE_BATCH, SEGMENT_SIZE, Task, ThreadCache,
+};
 
 fn heap() -> &'static Heap<MockOs> {
   Box::leak(Box::new(Heap::new(MockOs::new())))
@@ -982,6 +984,147 @@ fn forked_child_takes_housekeeping_back() {
 }
 
 // ---- hardening -----------------------------------------------------------------
+
+// ---- batched (asynchronous) purges -------------------------------------------------
+
+/// Shards whose segments [`dirty_everywhere`] uses.
+const SPREAD: usize = 8;
+
+/// Separate dirty runs in `SPREAD` segments, under the dirty budget: in
+/// each, six runs of `RUN` pages, every other one freed. Returns the dirty
+/// pages and the runs still held.
+fn dirty_everywhere(h: &Heap<MockOs>) -> (usize, Vec<usize>) {
+  let mut held = Vec::new();
+  let mut dirty = 0;
+  for shard in 0..SPREAD {
+    let runs: Vec<usize> = (0..6)
+      .map(|_| alloc(h, shard, RUN * PAGE_SIZE, 8))
+      .collect();
+    for (i, o) in runs.into_iter().enumerate() {
+      if i % 2 == 0 {
+        free(h, o);
+        dirty += RUN;
+      } else {
+        held.push(o);
+      }
+    }
+  }
+  assert!(dirty < DIRTY_BUDGET_PAGES as usize);
+  (dirty, held)
+}
+
+#[test]
+fn batched_purges_complete_and_clean() {
+  let h = heap();
+  h.attach_maintenance();
+  let (dirty, _held) = dirty_everywhere(h);
+  assert_eq!(h.dirty_pages(), dirty);
+  assert_eq!(h.dirty_pages(), h.dirty_pages_recounted());
+  h.request_purge();
+  let mut p = MockPurger::new(h.os(), PURGE_BATCH);
+  assert_eq!(h.maintain_with(&mut p), Some(Task::Force));
+  assert_eq!(h.dirty_pages(), 0);
+  assert_eq!(h.dirty_pages_recounted(), 0);
+  // One call for the runs of every segment.
+  assert_eq!(p.runs, dirty / RUN);
+  assert!(p.batches == 1, "{} batches for {} runs", p.batches, p.runs);
+  let stats = h.maintenance_stats();
+  assert_eq!(stats.purged_runs, p.runs as u64);
+  assert_eq!(stats.purge_batches, p.batches as u64);
+  // Everything purged reads as zero again.
+  let o = alloc_block(h, 0, RUN * PAGE_SIZE, 8);
+  assert!(o.zeroed);
+}
+
+#[test]
+fn failed_runs_in_a_batch_stay_dirty() {
+  let h = heap();
+  h.attach_maintenance();
+  let (_, held) = dirty_everywhere(h);
+  h.request_purge();
+  let mut p = MockPurger::new(h.os(), PURGE_BATCH);
+  p.fail_every = 3;
+  h.maintain_with(&mut p);
+  // A partial failure: some runs are clean, the failed ones stay dirty and
+  // are counted.
+  let left = h.dirty_pages();
+  assert!(left > 0);
+  assert_eq!(left, h.dirty_pages_recounted());
+  // Their pages are handed out as not zero (the model checks every
+  // `zeroed` claim against what was written), then purged by the next
+  // pass once freed.
+  let reused: Vec<Block> = (0..SPREAD * 3)
+    .map(|i| alloc_block(h, i % SPREAD, RUN * PAGE_SIZE, 8))
+    .collect();
+  assert!(reused.iter().any(|b| !b.zeroed));
+  for o in reused.iter().map(|b| b.offset).chain(held) {
+    free(h, o);
+  }
+  h.request_purge();
+  h.maintain_with(&mut MockPurger::new(h.os(), PURGE_BATCH));
+  assert_eq!(h.dirty_pages(), 0);
+  assert_eq!(h.dirty_pages_recounted(), 0);
+}
+
+/// Other threads allocate, grow and free while a batch is in flight; none of
+/// them may get a page whose purge is pending ([`MockPurger`] checks the
+/// ranges again at completion, and the model checks every allocation).
+#[test]
+fn allocations_during_a_batch_never_get_its_pages() {
+  let h = heap();
+  h.attach_maintenance();
+  let (_, before) = dirty_everywhere(h);
+  let tc = cache(h);
+  let held = Mutex::new(before);
+  let during = || {
+    let mut held = held.lock().unwrap();
+    for i in 0..SPREAD * 2 {
+      held.push(alloc(h, i, RUN * PAGE_SIZE, 8));
+      held.push(alloc(h, i, 3 * PAGE_SIZE, 8));
+      held.push(alloc_c(h, &tc, 100, 8));
+    }
+    // Frees during the batch make new dirty pages, left for a later pass.
+    for o in held.drain(..SPREAD * 3) {
+      free(h, o);
+    }
+  };
+  h.request_purge();
+  let mut p = MockPurger::new(h.os(), PURGE_BATCH);
+  p.during = Some(&during);
+  h.maintain_with(&mut p);
+  assert!(p.batches > 0);
+  assert_eq!(h.dirty_pages(), h.dirty_pages_recounted());
+  for o in held.into_inner().unwrap() {
+    free(h, o);
+  }
+  h.retire(&tc);
+  h.purge();
+  assert_eq!(h.dirty_pages(), 0);
+}
+
+/// A decay pass through a batching purger returns only aged pages.
+#[test]
+fn batched_decay_purges_only_aged_pages() {
+  let h = heap();
+  h.attach_maintenance();
+  let (old, mut held) = dirty_everywhere(h);
+  let mut p = MockPurger::new(h.os(), 16);
+  // Age the first runs past the purge delay with decay rounds.
+  for _ in 0..6 {
+    h.os().advance(h.decay_interval_ms());
+    assert_eq!(h.maintain_with(&mut p), Some(Task::Decay));
+  }
+  assert_eq!(h.dirty_pages(), 0, "{old} old pages");
+  // Freed now: too young for the next decay pass.
+  let young = held.len() * RUN;
+  for o in held.drain(..) {
+    free(h, o);
+  }
+  h.os().advance(h.decay_interval_ms());
+  assert_eq!(h.maintain_with(&mut p), Some(Task::Decay));
+  assert_eq!(h.dirty_pages(), young);
+  assert_eq!(h.dirty_pages(), h.dirty_pages_recounted());
+}
 
 #[test]
 fn owned_segments_end_in_a_guard_page() {
