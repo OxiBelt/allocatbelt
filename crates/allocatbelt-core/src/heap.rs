@@ -57,7 +57,7 @@
 //! such memory, so a page run or segment run claimed without dirty pages is
 //! reported as zeroed ([`Block::zeroed`]) and `calloc` can skip the memset.
 
-use core::sync::atomic::{AtomicIsize, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use crate::bits::run_mask;
 use crate::class::{self, MIN_ALIGN, NUM_CLASSES, SMALL_MAX};
@@ -74,6 +74,7 @@ mod cache;
 mod purge;
 
 pub use cache::ThreadCache;
+use purge::Pass;
 
 /// Services the heap needs from its environment.
 ///
@@ -104,6 +105,12 @@ pub trait Os: Sync {
   fn meta(&self, segment: usize) -> Option<&[AtomicU64]>;
   /// Called while spinning on a contended lock.
   fn yield_now(&self) {}
+  /// Milliseconds on a monotonic clock, for delaying purges (see
+  /// [`Heap::decay`]). A clock that never advances, like this default,
+  /// leaves purging to the dirty budget and explicit [`Heap::purge`] calls.
+  fn now_ms(&self) -> u64 {
+    0
+  }
   /// Reports heap corruption or misuse (invalid or double free). Must not
   /// return.
   fn fatal(&self, msg: &'static str) -> !;
@@ -113,6 +120,9 @@ const SEG_HDR: usize = 0;
 const SEG_PAGES: usize = 1;
 const SEG_NEXT: usize = 2;
 const SEG_DIRTY: usize = 3;
+/// Decay epoch (+ 1) in which a purge pass first found the owned segment
+/// empty, or 0.
+const SEG_IDLE: usize = 4;
 const SEG_CLS: usize = 8;
 const SEG_AVAIL: usize = SEG_CLS + NUM_CLASSES;
 
@@ -126,6 +136,8 @@ const SEG_HUGE_TAIL: u64 = 3;
 const P_INFO: usize = 0;
 const P_FREE: usize = 1;
 const P_SUMMARY: usize = 2;
+/// Free pages: the decay epoch in which the page was last marked dirty.
+const P_SINCE: usize = 3;
 const P_BITMAP: usize = 4;
 
 const PAGE_FREE: u64 = 0;
@@ -135,6 +147,9 @@ const PAGE_LARGE_TAIL: u64 = 3;
 
 /// Dirty (freed, unpurged) pages tolerated before a purge pass (32 MiB).
 pub const DIRTY_BUDGET_PAGES: isize = 512;
+/// How long freed pages stay resident, and empty segments stay owned,
+/// before a decay pass returns them (see [`Heap::set_purge_delay_ms`]).
+pub const DEFAULT_PURGE_DELAY_MS: u64 = 1000;
 /// Shards tried with `try_lock` before blocking on the preferred one.
 const SHARD_PROBES: usize = 4;
 
@@ -243,6 +258,9 @@ impl<'a> PageMeta<'a> {
   fn summary(self) -> &'a AtomicU64 {
     &self.0[P_SUMMARY]
   }
+  fn since(self) -> &'a AtomicU64 {
+    &self.0[P_SINCE]
+  }
   fn bitmap(self, w: usize) -> &'a AtomicU64 {
     &self.0[P_BITMAP + w]
   }
@@ -260,9 +278,15 @@ pub struct Heap<O> {
   /// Pages marked dirty and not yet purged or reused (may transiently lag).
   dirty_pages: AtomicIsize,
   purge_lock: SpinLock,
-  /// Owned segments found empty (and not kept) by the last purge pass.
-  /// Only touched under `purge_lock`.
-  seg_idle: [AtomicU64; MAX_SEGMENTS / 64],
+  purge_delay_ms: AtomicU64,
+  /// Clock reading of the last decay pass.
+  last_decay_ms: AtomicU64,
+  /// Decay passes so far. Freed pages and empty segments are stamped with
+  /// it, so freeing never reads the clock.
+  epoch: AtomicU64,
+  /// Allocation slow paths run decay passes when they are due (unless a
+  /// background thread does, see [`Heap::set_auto_decay`]).
+  auto_decay: AtomicBool,
   /// Round-robin shard assignment for attached thread caches.
   next_shard: AtomicUsize,
   shards: [Shard; SHARDS],
@@ -277,7 +301,10 @@ impl<O: Os> Heap<O> {
       seg_used: [const { AtomicU64::new(0) }; MAX_SEGMENTS / 64],
       dirty_pages: AtomicIsize::new(0),
       purge_lock: SpinLock::new(),
-      seg_idle: [const { AtomicU64::new(0) }; MAX_SEGMENTS / 64],
+      purge_delay_ms: AtomicU64::new(DEFAULT_PURGE_DELAY_MS),
+      last_decay_ms: AtomicU64::new(0),
+      epoch: AtomicU64::new(0),
+      auto_decay: AtomicBool::new(true),
       next_shard: AtomicUsize::new(0),
       shards: [const { Shard::new() }; SHARDS],
     }
@@ -739,6 +766,7 @@ impl<O: Os> Heap<O> {
       m[SEG_CLS + c].store(0, Relaxed);
       m[SEG_AVAIL + c].store(0, Relaxed);
     }
+    m[SEG_IDLE].store(0, Relaxed);
     m[SEG_PAGES].store(0, Release);
     m[SEG_NEXT].store(u64::from(sh.segs.load(Relaxed)), Relaxed);
     m[SEG_HDR].store(SEG_OWNED | (s as u64) << 8 | 1 << 16, Release);
@@ -764,13 +792,24 @@ impl<O: Os> Heap<O> {
   /// Marks `n` pages dirty and returns them to their segment.
   fn release_pages(&self, page: usize, n: usize) {
     let m = self.seg_meta(page / PAGES_PER_SEGMENT);
-    let mask = run_mask((page % PAGES_PER_SEGMENT) as u32, n as u32);
-    proto::release_run(&m[SEG_PAGES], &m[SEG_DIRTY], mask);
+    let in_seg = page % PAGES_PER_SEGMENT;
+    // Stamped before the pages are marked dirty, so a purge pass that sees
+    // the mark also sees the stamp (or a later one, if the pages are reused
+    // and freed again meanwhile).
+    let epoch = self.epoch.load(Relaxed);
+    for t in in_seg..in_seg + n {
+      PageMeta::new(m, t).since().store(epoch, Relaxed);
+    }
+    proto::release_run(
+      &m[SEG_PAGES],
+      &m[SEG_DIRTY],
+      run_mask(in_seg as u32, n as u32),
+    );
     let dirty = self.dirty_pages.fetch_add(n as isize, Relaxed) + n as isize;
     if dirty > DIRTY_BUDGET_PAGES
       && let Some(_g) = self.purge_lock.try_lock()
     {
-      self.purge_segments();
+      self.pass(Pass::Budget);
     }
   }
 

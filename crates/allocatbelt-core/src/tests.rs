@@ -24,6 +24,8 @@ struct MockOs {
   /// Makes `purge` and `decommit` report failure, as `madvise` does on
   /// `mlock`ed memory.
   purge_fails: AtomicBool,
+  /// The clock `now_ms` reports; tests advance it by hand.
+  clock: AtomicU64,
 }
 
 impl MockOs {
@@ -35,7 +37,12 @@ impl MockOs {
       written: Mutex::new(BTreeSet::new()),
       purged: AtomicUsize::new(0),
       purge_fails: AtomicBool::new(false),
+      clock: AtomicU64::new(0),
     }
+  }
+
+  fn advance(&self, ms: u64) {
+    self.clock.fetch_add(ms, Ordering::Relaxed);
   }
 
   /// Clears the written marks of the range unless purging fails.
@@ -101,6 +108,9 @@ impl Os for MockOs {
   }
   fn yield_now(&self) {
     std::thread::yield_now();
+  }
+  fn now_ms(&self) -> u64 {
+    self.clock.load(Ordering::Relaxed)
   }
   fn fatal(&self, msg: &'static str) -> ! {
     panic!("{msg}")
@@ -592,10 +602,8 @@ fn empty_segments_are_returned() {
   for o in runs {
     free(h, o);
   }
-  // The first pass only notes the empty segments; a segment that is still
-  // empty at the next one goes back. One stays with the shard as a cache.
-  h.purge();
-  assert_eq!(h.segments_in_use(), base + 5);
+  // An explicit purge returns them right away, but for one that stays with
+  // the shard as a cache.
   h.purge();
   assert_eq!(h.segments_in_use(), base + 1);
   assert_eq!(h.dirty_pages(), 0);
@@ -896,4 +904,137 @@ proptest::proptest! {
             h.retire(tc);
         }
     }
+}
+
+// ---- time-based purging ------------------------------------------------------
+
+/// Decay passes a page waits before a decay pass purges it (with a delay).
+const DECAY_AGE: usize = 5;
+
+#[test]
+fn decay_waits_for_the_purge_delay() {
+  let h = heap();
+  let runs: Vec<_> = (0..8).map(|_| alloc(h, 2, 5 * PAGE_SIZE, 8)).collect();
+  for &o in &runs[..4] {
+    free(h, o);
+  }
+  // Freshly freed pages stay resident for the delay (in decay passes).
+  for _ in 0..2 {
+    h.decay();
+  }
+  // Pages freed later are purged later.
+  for &o in &runs[4..] {
+    free(h, o);
+  }
+  for _ in 2..DECAY_AGE - 1 {
+    h.decay();
+  }
+  assert_eq!(h.dirty_pages(), 40);
+  assert_eq!(h.os().purged.load(Ordering::Relaxed), 0);
+  h.decay();
+  assert_eq!(h.dirty_pages(), 20, "only the first four runs expired");
+  assert_eq!(h.os().purged.load(Ordering::Relaxed), 20 * PAGE_SIZE);
+  h.decay();
+  assert_eq!(h.dirty_pages(), 20);
+  h.decay();
+  assert_eq!(h.dirty_pages(), 0);
+}
+
+#[test]
+fn empty_segments_decay_after_the_delay() {
+  let h = heap();
+  let base = h.segments_in_use();
+  let runs: Vec<_> = (0..36).map(|_| alloc(h, 5, 5 * PAGE_SIZE, 8)).collect();
+  assert_eq!(h.segments_in_use(), base + 3);
+  for o in runs {
+    free(h, o);
+  }
+  // The first pass notes that the segments are empty ...
+  for _ in 0..DECAY_AGE {
+    h.decay();
+    assert_eq!(h.segments_in_use(), base + 3);
+  }
+  // ... and they go back once they have been empty for the delay, but for
+  // the one the shard keeps.
+  h.decay();
+  assert_eq!(h.segments_in_use(), base + 1);
+  assert_eq!(h.dirty_pages(), 0);
+  // Reuse resets the idle time.
+  let a = alloc(h, 5, 5 * PAGE_SIZE, 8);
+  for _ in 0..DECAY_AGE + 2 {
+    h.decay();
+  }
+  assert_eq!(h.segments_in_use(), base + 1);
+  free(h, a);
+}
+
+#[test]
+fn allocation_runs_due_decay_passes() {
+  let h = heap();
+  // With no delay, a pass purges everything dirty; passes are due every
+  // millisecond.
+  h.set_purge_delay_ms(0);
+  assert_eq!(h.decay_interval_ms(), 1);
+  let tc = cache(h);
+  let run = alloc_c(h, &tc, 5 * PAGE_SIZE, 8);
+  free_c(h, &tc, run);
+  let purged = h.os().purged.load(Ordering::Relaxed);
+  // Page-run allocations and frees are slow paths that check for a due
+  // pass (sampling the clock every 16th time) ...
+  let churn = |n| {
+    for _ in 0..n {
+      let o = alloc_c(h, &tc, 3 * PAGE_SIZE, 8);
+      free_c(h, &tc, o);
+    }
+  };
+  churn(8);
+  assert_eq!(
+    h.os().purged.load(Ordering::Relaxed),
+    purged,
+    "no pass is due yet"
+  );
+  h.os().advance(1);
+  churn(8);
+  assert!(h.os().purged.load(Ordering::Relaxed) > purged);
+  // ... unless automatic decay is off (a background thread's job).
+  h.set_auto_decay(false);
+  h.os().advance(1);
+  let purged = h.os().purged.load(Ordering::Relaxed);
+  churn(16);
+  assert_eq!(h.os().purged.load(Ordering::Relaxed), purged);
+  h.retire(&tc);
+}
+
+#[test]
+fn small_refills_run_due_decay_passes() {
+  let h = heap();
+  h.set_purge_delay_ms(0);
+  let tc = cache(h);
+  let run = alloc_c(h, &tc, 5 * PAGE_SIZE, 8);
+  free_c(h, &tc, run);
+  h.os().advance(1);
+  // Enough 16-byte refills (64 blocks each) to sample the clock.
+  let blocks: Vec<_> = (0..64 * 40).map(|_| alloc_c(h, &tc, 16, 8)).collect();
+  assert_eq!(h.dirty_pages(), 0);
+  for o in blocks {
+    free_c(h, &tc, o);
+  }
+  h.retire(&tc);
+}
+
+#[test]
+fn budget_passes_purge_everything_dirty() {
+  let h = heap();
+  h.os().advance(10_000);
+  const RUN: usize = 8;
+  let n = crate::heap::DIRTY_BUDGET_PAGES as usize / RUN + 2;
+  let runs: Vec<_> = (0..n).map(|_| alloc(h, 3, RUN * PAGE_SIZE, 8)).collect();
+  let segs = h.segments_in_use();
+  for o in runs {
+    free(h, o);
+  }
+  // Crossing the budget purged the dirty pages without waiting for the
+  // delay, but kept the (just emptied) segments.
+  assert!(h.dirty_pages() < crate::heap::DIRTY_BUDGET_PAGES as usize);
+  assert_eq!(h.segments_in_use(), segs);
 }

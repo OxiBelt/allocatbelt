@@ -74,6 +74,8 @@ pub struct ThreadCache {
   pending: [Cell<u64>; NUM_CLASSES],
   shard: Cell<usize>,
   state: Cell<u8>,
+  /// Refills so far, to sample the clock.
+  ticks: Cell<u32>,
 }
 
 impl ThreadCache {
@@ -96,6 +98,7 @@ impl ThreadCache {
       pending: [const { Cell::new(0) }; NUM_CLASSES],
       shard: Cell::new(0),
       state: Cell::new(DETACHED),
+      ticks: Cell::new(0),
     }
   }
 
@@ -149,8 +152,14 @@ impl<O: Os> Heap<O> {
       Kind::Small(c) => Self::pop(tc, c)
         .or_else(|| self.refill(tc, c))
         .map(|o| Block::new(o, false)),
-      Kind::Run(n, step) => self.alloc_large(tc.shard.get(), n, step),
-      Kind::Huge(k) => self.alloc_huge(k),
+      Kind::Run(n, step) => {
+        self.tick(tc);
+        self.alloc_large(tc.shard.get(), n, step)
+      }
+      Kind::Huge(k) => {
+        self.tick(tc);
+        self.alloc_huge(k)
+      }
     }
   }
 
@@ -187,7 +196,20 @@ impl<O: Os> Heap<O> {
     cw.base
       .set((page << PAGE_SHIFT) + w as usize * 64 * class::size(c));
     cw.bits.set(bits);
+    self.tick(tc);
     Self::pop(tc, c)
+  }
+
+  /// Counts a slow-path operation of the thread and, every 16th, runs a
+  /// decay pass if one is due: reading the clock on every one would cost
+  /// more than the operation itself.
+  #[inline]
+  fn tick(&self, tc: &ThreadCache) {
+    let ticks = tc.ticks.get().wrapping_add(1);
+    tc.ticks.set(ticks);
+    if ticks.is_multiple_of(16) {
+      self.maybe_decay();
+    }
   }
 
   /// Enables caching for `tc`. The embedder must arrange for
@@ -259,8 +281,14 @@ impl<O: Os> Heap<O> {
           self.free_bits(page, c, w, bit);
         }
       }
-      Target::Large { page, m, pm, info } => self.free_large(page, m, pm, info),
-      Target::Huge { seg, m, hdr } => self.free_huge(seg, m, hdr),
+      Target::Large { page, m, pm, info } => {
+        self.free_large(page, m, pm, info);
+        self.tick(tc);
+      }
+      Target::Huge { seg, m, hdr } => {
+        self.free_huge(seg, m, hdr);
+        self.tick(tc);
+      }
     }
   }
 

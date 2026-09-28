@@ -17,16 +17,19 @@ use std::alloc::{GlobalAlloc, Layout};
 use std::io::Write as _;
 use std::ptr::{self, NonNull};
 use std::sync::OnceLock;
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use allocatbelt_core::{
-  ARENA_SIZE, Block, Heap, MAX_SEGMENTS, META_WORDS, Os, SEGMENT_SIZE, ThreadCache,
+  ARENA_SIZE, Block, Heap, MAX_SEGMENTS, META_WORDS, Os, PAGE_SIZE, SEGMENT_SIZE, ThreadCache,
 };
 use allocatbelt_sys::{MetaArena, Region};
 
 struct Arena {
   user: Region,
   meta: MetaArena<MAX_SEGMENTS>,
+  /// Origin of the heap's clock (see `Os::now_ms`).
+  start: Instant,
 }
 
 /// Initialised on the first allocation. `OnceLock` blocks on a futex and
@@ -39,6 +42,7 @@ fn arena() -> Option<&'static Arena> {
       Some(Arena {
         user: Region::reserve(ARENA_SIZE, SEGMENT_SIZE)?,
         meta: MetaArena::reserve(META_WORDS)?,
+        start: Instant::now(),
       })
     })
     .as_ref()
@@ -91,6 +95,11 @@ impl Os for LinuxOs {
 
   fn yield_now(&self) {
     allocatbelt_sys::yield_now();
+  }
+
+  fn now_ms(&self) -> u64 {
+    // `Instant::now` reads the vDSO clock and does not allocate.
+    u64::try_from(self.arena().start.elapsed().as_millis()).unwrap_or(u64::MAX)
   }
 
   fn fatal(&self, msg: &'static str) -> ! {
@@ -220,7 +229,61 @@ impl Allocatbelt {
   pub fn segments_in_use(self) -> usize {
     HEAP.segments_in_use()
   }
+
+  /// Bytes of freed pages still resident, waiting for a purge, for
+  /// diagnostics.
+  #[must_use]
+  pub fn dirty_bytes(self) -> usize {
+    HEAP.dirty_pages() * PAGE_SIZE
+  }
+
+  /// Sets how long freed memory stays resident before it is returned to the
+  /// OS (1 s by default). Memory is also returned early once 32 MiB of it
+  /// is waiting.
+  pub fn set_purge_delay(self, delay: Duration) {
+    HEAP.set_purge_delay_ms(u64::try_from(delay.as_millis()).unwrap_or(u64::MAX));
+  }
+
+  /// Starts a background thread that returns freed memory to the OS once it
+  /// has been unused for the purge delay, even while the program is idle.
+  /// Allocating threads then no longer run these passes themselves, which
+  /// keeps them off the allocation path.
+  ///
+  /// Call it from ordinary code (not from inside an allocation). Returns
+  /// `Ok(false)` if the thread is already running.
+  ///
+  /// # Errors
+  ///
+  /// Returns the error of [`std::thread::Builder::spawn`].
+  pub fn start_purge_thread(self) -> std::io::Result<bool> {
+    if PURGE_THREAD.swap(true, Ordering::AcqRel) {
+      return Ok(false);
+    }
+    let spawned = std::thread::Builder::new()
+      .name("allocatbelt-purge".into())
+      .spawn(|| {
+        loop {
+          std::thread::sleep(Duration::from_millis(HEAP.decay_interval_ms()));
+          if arena().is_some() {
+            guarded(|| HEAP.decay());
+          }
+        }
+      });
+    match spawned {
+      Ok(_) => {
+        HEAP.set_auto_decay(false);
+        Ok(true)
+      }
+      Err(e) => {
+        PURGE_THREAD.store(false, Ordering::Release);
+        Err(e)
+      }
+    }
+  }
 }
+
+/// Whether the background purge thread has been started.
+static PURGE_THREAD: AtomicBool = AtomicBool::new(false);
 
 fn offset_of(ptr: *const u8) -> usize {
   match arena().and_then(|a| a.user.offset_of(ptr)) {
