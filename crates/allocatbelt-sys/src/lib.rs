@@ -356,18 +356,55 @@ impl<const N: usize> MetaArena<N> {
 pub const GRANULE: usize = 64 * 1024;
 
 /// Sleeps while `word` holds `expected` (`FUTEX_WAIT`, process-private),
-/// for a lock that stayed contended after spinning. Returns at once if the
-/// value differs, and on a wake, a signal or a spurious wake-up; the caller
-/// re-checks the lock either way, so errors (`EAGAIN`, `EINTR`) are ignored.
-/// Does not allocate.
-pub fn futex_wait(word: &AtomicU32, expected: u32) {
-  let _ = futex::wait(word, futex::Flags::PRIVATE, expected, None);
+/// for at most `timeout_ms` if given: for a lock that stayed contended
+/// after spinning, and for the idle maintenance thread. Returns at once if
+/// the value differs, and on a wake, a signal, the timeout or a spurious
+/// wake-up; the caller re-checks either way, so errors (`EAGAIN`, `EINTR`,
+/// `ETIMEDOUT`) are ignored. Does not allocate.
+pub fn futex_wait(word: &AtomicU32, expected: u32, timeout_ms: Option<u64>) {
+  let timeout = timeout_ms.map(|ms| futex::Timespec {
+    tv_sec: i64::try_from(ms / 1000).unwrap_or(i64::MAX),
+    tv_nsec: ((ms % 1000) * 1_000_000) as _,
+  });
+  let _ = futex::wait(word, futex::Flags::PRIVATE, expected, timeout.as_ref());
 }
 
 /// Wakes one thread sleeping in [`futex_wait`] on `word` (`FUTEX_WAKE`,
 /// process-private).
 pub fn futex_wake(word: &AtomicU32) {
   let _ = futex::wake(word, futex::Flags::PRIVATE, 1);
+}
+
+/// Linux `SCHED_BATCH` (`include/uapi/linux/sched.h`).
+const SCHED_BATCH: libc::c_int = 3;
+
+/// The kernel's `struct sched_param` (`include/uapi/linux/sched/types.h`):
+/// only the priority, which must be 0 for `SCHED_BATCH`. Declared here
+/// because libc's `sched_param` differs between glibc and musl.
+#[repr(C)]
+struct SchedParam {
+  sched_priority: libc::c_int,
+}
+
+/// Moves the calling thread to `SCHED_BATCH` (nice value unchanged):
+/// the scheduler treats it as CPU-bound and never lets it preempt
+/// interactive threads on wake-up, which suits allocator housekeeping
+/// (plan §11.2). Returns whether the kernel accepted it.
+pub fn set_batch_scheduling() -> bool {
+  let param = SchedParam { sched_priority: 0 };
+  // SAFETY: `sched_setscheduler(0 = this thread, SCHED_BATCH, &param)`
+  // only reads `param`, a live `repr(C)` struct with the kernel's layout,
+  // and changes nothing but the calling thread's scheduling policy.
+  #[expect(unsafe_code, reason = "no rustix binding for sched_setscheduler")]
+  let r = unsafe {
+    libc::syscall(
+      libc::SYS_sched_setscheduler,
+      0 as libc::pid_t,
+      SCHED_BATCH,
+      &raw const param,
+    )
+  };
+  r == 0
 }
 
 /// Registers `fork` handlers with `pthread_atfork(3)`: `prepare` runs in

@@ -73,9 +73,11 @@ use Ordering::{AcqRel, Acquire, Relaxed, Release};
 
 mod cache;
 mod fork;
+mod maint;
 mod purge;
 
 pub use cache::ThreadCache;
+pub use maint::{DIRTY_HARD_LIMIT_PAGES, MaintenanceStats, Task};
 use purge::Pass;
 
 /// Services the heap needs from its environment.
@@ -119,17 +121,20 @@ pub trait Os: Sync {
   fn unguard(&self, offset: usize, len: usize) {
     let _ = (offset, len);
   }
-  /// Blocks the calling thread while `word` holds `expected`, for a heap
-  /// lock that stayed held after a short spin: a `FUTEX_WAIT`. Checking the
-  /// value and going to sleep must be atomic with respect to
-  /// [`Os::futex_wake`]. May return early or spuriously. The default
-  /// returns at once, which makes contended locks spin.
-  fn futex_wait(&self, word: &AtomicU32, expected: u32) {
-    let _ = (word, expected);
+  /// Blocks the calling thread while `word` holds `expected`, for at most
+  /// `timeout_ms` if given: a `FUTEX_WAIT`. Used by a heap lock that stayed
+  /// held after a short spin (no timeout) and by an idle maintenance thread
+  /// ([`Heap::maintain`]). Checking the value and going to sleep must be
+  /// atomic with respect to [`Os::futex_wake`]. May return early or
+  /// spuriously. The default returns at once, which makes contended locks
+  /// spin.
+  fn futex_wait(&self, word: &AtomicU32, expected: u32, timeout_ms: Option<u64>) {
+    let _ = (word, expected, timeout_ms);
     core::hint::spin_loop();
   }
   /// Wakes one thread blocked in [`Os::futex_wait`] on `word`: a
-  /// `FUTEX_WAKE`. Only called when an unlock finds a thread may be parked.
+  /// `FUTEX_WAKE`. Called when an unlock finds a thread may be parked, and
+  /// when work for the maintenance thread is recorded.
   fn futex_wake(&self, word: &AtomicU32) {
     let _ = word;
   }
@@ -147,7 +152,7 @@ pub trait Os: Sync {
 /// Heap locks park through the [`Os`].
 impl<O: Os> Park for O {
   fn wait(&self, word: &AtomicU32, expected: u32) {
-    self.futex_wait(word, expected);
+    self.futex_wait(word, expected, None);
   }
   fn wake(&self, word: &AtomicU32) {
     self.futex_wake(word);
@@ -367,6 +372,12 @@ pub struct Heap<O> {
   /// Allocation slow paths run decay passes when they are due (unless a
   /// background thread does, see [`Heap::set_auto_decay`]).
   auto_decay: AtomicBool,
+  /// A thread runs [`Heap::maintain`] (see [`maint`]).
+  maint_attached: AtomicBool,
+  /// Work recorded for the maintenance thread, which sleeps on this word.
+  maint_work: AtomicU32,
+  /// [`MaintenanceStats`], indexed by `maint::Stat`.
+  maint_stats: [AtomicU64; maint::STATS],
   /// Round-robin shard assignment for attached thread caches.
   next_shard: AtomicUsize,
   /// Secret for randomized placement; 0 turns randomization off.
@@ -387,6 +398,9 @@ impl<O: Os> Heap<O> {
       last_decay_ms: AtomicU64::new(0),
       epoch: AtomicU64::new(0),
       auto_decay: AtomicBool::new(true),
+      maint_attached: AtomicBool::new(false),
+      maint_work: AtomicU32::new(0),
+      maint_stats: [const { AtomicU64::new(0) }; maint::STATS],
       next_shard: AtomicUsize::new(0),
       seed: AtomicU64::new(0),
       shards: [const { Shard::new() }; SHARDS],
@@ -921,10 +935,8 @@ impl<O: Os> Heap<O> {
       run_mask(in_seg as u32, n as u32),
     );
     let dirty = self.dirty_pages.fetch_add(n as isize, Relaxed) + n as isize;
-    if dirty > DIRTY_BUDGET_PAGES
-      && let Some(_g) = self.purge_lock.try_lock(&self.os)
-    {
-      self.pass(Pass::Budget);
+    if dirty > DIRTY_BUDGET_PAGES {
+      self.over_budget(dirty);
     }
   }
 

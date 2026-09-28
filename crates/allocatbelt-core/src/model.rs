@@ -42,6 +42,11 @@ pub struct MockOs {
   pub(crate) purge_fails: AtomicBool,
   /// The clock `now_ms` reports; advanced by hand.
   clock: AtomicU64,
+  /// `futex_wake` calls (lock hand-offs and maintenance wake-ups).
+  pub(crate) wakes: AtomicUsize,
+  /// Timeout of the last `futex_wait` that had one (an idle
+  /// [`Heap::maintain`]), in ms.
+  pub(crate) last_wait_ms: AtomicU64,
 }
 
 impl MockOs {
@@ -57,6 +62,8 @@ impl MockOs {
       purged: AtomicUsize::new(0),
       purge_fails: AtomicBool::new(false),
       clock: AtomicU64::new(0),
+      wakes: AtomicUsize::new(0),
+      last_wait_ms: AtomicU64::new(0),
     }
   }
 
@@ -151,10 +158,16 @@ impl Os for MockOs {
   }
   // No real futex: a parked thread yields and re-checks, which the lock
   // allows (spurious wake-ups), and wakes are then unnecessary.
-  fn futex_wait(&self, word: &AtomicU32, expected: u32) {
+  fn futex_wait(&self, word: &AtomicU32, expected: u32, timeout_ms: Option<u64>) {
+    if let Some(ms) = timeout_ms {
+      self.last_wait_ms.store(ms, Ordering::Relaxed);
+    }
     if word.load(Ordering::Relaxed) == expected {
       std::thread::yield_now();
     }
+  }
+  fn futex_wake(&self, _word: &AtomicU32) {
+    self.wakes.fetch_add(1, Ordering::Relaxed);
   }
   fn now_ms(&self) -> u64 {
     self.clock.load(Ordering::Relaxed)
@@ -305,7 +318,9 @@ fn size_of(hi: u8, lo: u8) -> usize {
 /// Operations go through two attached thread caches, a detached one (the
 /// uncached paths through a cache) and the uncached API, so frees routinely
 /// cross "threads". The program also flushes and retires caches, purges,
-/// runs decay passes, advances the clock, and changes the purge delay; the
+/// runs decay passes, advances the clock, changes the purge delay, hands
+/// housekeeping to a maintenance "thread" and back, runs its rounds and
+/// requests purges from it; the
 /// first byte seeds randomized placement (or not). At the end everything is
 /// freed and a forced purge must leave nothing dirty.
 pub fn run(data: &[u8]) {
@@ -358,6 +373,12 @@ pub fn run(data: &[u8]) {
       25 => h.os().advance(u64::from(byte()) * 16),
       26 => h.set_purge_delay_ms(u64::from(byte()) * 8),
       27 => tc.into_iter().for_each(|tc| h.retire(tc)),
+      28 if h.maintenance_attached() => h.detach_maintenance(),
+      28 => h.attach_maintenance(),
+      29 => {
+        let _ = h.maintain();
+      }
+      30 => h.request_purge(),
       _ => {}
     }
   }

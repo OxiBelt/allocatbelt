@@ -8,9 +8,10 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::vec::Vec;
 
+use crate::heap::DIRTY_BUDGET_PAGES;
 use crate::heap::MAX_RUN_PAGES;
 use crate::model::{MockOs, alloc, alloc_block, alloc_c, cache, free, free_c, resize};
-use crate::{Heap, PAGE_SIZE, SEGMENT_SIZE, ThreadCache};
+use crate::{DIRTY_HARD_LIMIT_PAGES, Heap, PAGE_SIZE, SEGMENT_SIZE, Task, ThreadCache};
 
 fn heap() -> &'static Heap<MockOs> {
   Box::leak(Box::new(Heap::new(MockOs::new())))
@@ -823,6 +824,161 @@ fn budget_passes_purge_everything_dirty() {
   // delay, but kept the (just emptied) segments.
   assert!(h.dirty_pages() < crate::heap::DIRTY_BUDGET_PAGES as usize);
   assert_eq!(h.segments_in_use(), segs);
+}
+
+// ---- maintenance engine -----------------------------------------------------------
+
+/// Page runs of `RUN` pages whose frees take the dirty count to `pages`
+/// (a multiple of `RUN`), in shard 3.
+const RUN: usize = 8;
+
+fn dirty_runs(h: &Heap<MockOs>, pages: usize) -> Vec<usize> {
+  (0..pages / RUN)
+    .map(|_| alloc(h, 3, RUN * PAGE_SIZE, 8))
+    .collect()
+}
+
+#[test]
+fn maintenance_takes_budget_passes_off_frees() {
+  let h = heap();
+  h.attach_maintenance();
+  let budget = DIRTY_BUDGET_PAGES as usize;
+  let runs = dirty_runs(h, budget + 2 * RUN);
+  let wakes = h.os().wakes.load(Ordering::Relaxed);
+  for o in runs {
+    free(h, o);
+  }
+  // The frees only recorded the work and woke the thread, once.
+  assert_eq!(h.dirty_pages(), budget + 2 * RUN);
+  assert_eq!(h.os().purged.load(Ordering::Relaxed), 0);
+  assert_eq!(h.os().wakes.load(Ordering::Relaxed), wakes + 1);
+  let stats = h.maintenance_stats();
+  assert_eq!((stats.wakeups, stats.inline_budget_passes), (1, 0));
+  assert_eq!(h.next_task(0), Some(Task::Budget));
+  // The maintenance thread's round runs the pass.
+  assert_eq!(h.maintain(), Some(Task::Budget));
+  assert_eq!(h.dirty_pages(), 0);
+  assert_eq!(h.maintenance_stats().budget_passes, 1);
+  assert_eq!(h.next_task(0), None);
+}
+
+#[test]
+fn frees_purge_inline_past_the_hard_limit() {
+  let h = heap();
+  h.attach_maintenance();
+  let runs = dirty_runs(h, DIRTY_HARD_LIMIT_PAGES as usize + RUN);
+  for o in runs {
+    free(h, o);
+  }
+  // The thread never ran; the free past the hard limit purged itself.
+  let stats = h.maintenance_stats();
+  assert_eq!(stats.inline_budget_passes, 1);
+  assert_eq!(stats.budget_passes, 0);
+  assert!(h.dirty_pages() <= RUN);
+}
+
+#[test]
+fn without_maintenance_frees_purge_inline() {
+  let h = heap();
+  let runs = dirty_runs(h, DIRTY_BUDGET_PAGES as usize + RUN);
+  for o in runs {
+    free(h, o);
+  }
+  assert_eq!(h.maintenance_stats().inline_budget_passes, 1);
+  assert_eq!(h.maintenance_stats().wakeups, 0);
+  assert!(h.dirty_pages() <= RUN);
+}
+
+#[test]
+fn maintenance_runs_work_by_priority() {
+  let h = heap();
+  h.attach_maintenance();
+  let budget = DIRTY_BUDGET_PAGES as usize;
+  let runs = dirty_runs(h, budget + RUN);
+  for o in runs {
+    free(h, o);
+  }
+  h.os().advance(10_000);
+  // Budget (P1) and decay (P2) are due; a force request (P0) goes first.
+  h.request_purge();
+  assert_eq!(
+    h.dirty_pages(),
+    budget + RUN,
+    "requests do not purge inline"
+  );
+  assert_eq!(h.maintain(), Some(Task::Force));
+  assert_eq!(h.dirty_pages(), 0);
+  // The budget request is still recorded; its pass finds nothing to do.
+  assert_eq!(h.maintain(), Some(Task::Budget));
+  assert_eq!(h.maintenance_stats().budget_passes, 0);
+  assert_eq!(h.maintain(), Some(Task::Decay));
+  assert_eq!(h.maintain(), None);
+  let stats = h.maintenance_stats();
+  assert_eq!((stats.force_passes, stats.decay_passes), (1, 1));
+}
+
+#[test]
+fn idle_maintenance_sleeps_until_decay_is_due() {
+  let h = heap();
+  h.attach_maintenance();
+  h.os().advance(1000);
+  assert_eq!(h.maintain(), Some(Task::Decay));
+  h.os().advance(100);
+  // Passes are due every quarter of the 1 s delay.
+  assert_eq!(h.maintain(), None);
+  assert_eq!(h.os().last_wait_ms.load(Ordering::Relaxed), 150);
+  // A shorter delay wakes the thread to recompute its deadline: passes
+  // every 50 ms, so the next one is overdue.
+  let wakes = h.os().wakes.load(Ordering::Relaxed);
+  h.set_purge_delay_ms(200);
+  assert_eq!(h.os().wakes.load(Ordering::Relaxed), wakes + 1);
+  assert_eq!(h.maintain(), Some(Task::Decay));
+  assert_eq!(h.maintain(), None);
+  assert_eq!(h.os().last_wait_ms.load(Ordering::Relaxed), 50);
+}
+
+#[test]
+fn maintenance_stops_allocation_driven_decay() {
+  let h = heap();
+  h.set_purge_delay_ms(0);
+  h.attach_maintenance();
+  let tc = cache(h);
+  h.os().advance(1);
+  for _ in 0..32 {
+    let o = alloc_c(h, &tc, 3 * PAGE_SIZE, 8);
+    free_c(h, &tc, o);
+  }
+  assert_eq!(h.maintenance_stats().inline_decay_passes, 0);
+  assert!(h.dirty_pages() > 0);
+  assert_eq!(h.maintain(), Some(Task::Decay));
+  assert_eq!(h.dirty_pages(), 0);
+  h.retire(&tc);
+}
+
+#[test]
+fn request_purge_without_maintenance_purges_inline() {
+  let h = heap();
+  let o = alloc(h, 0, 5 * PAGE_SIZE, 8);
+  free(h, o);
+  assert_eq!(h.dirty_pages(), 5);
+  h.request_purge();
+  assert_eq!(h.dirty_pages(), 0);
+}
+
+#[test]
+fn forked_child_takes_housekeeping_back() {
+  let h = heap();
+  h.attach_maintenance();
+  h.request_purge();
+  h.fork_prepare();
+  h.fork_child();
+  assert!(!h.maintenance_attached());
+  assert_eq!(h.next_task(0), None, "the parent's requests are dropped");
+  let runs = dirty_runs(h, DIRTY_BUDGET_PAGES as usize + RUN);
+  for o in runs {
+    free(h, o);
+  }
+  assert_eq!(h.maintenance_stats().inline_budget_passes, 1);
 }
 
 // ---- hardening -----------------------------------------------------------------

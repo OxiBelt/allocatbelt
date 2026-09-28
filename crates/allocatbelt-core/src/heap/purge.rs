@@ -67,6 +67,7 @@ impl<O: Os> Heap<O> {
   /// default). 0 returns them at the next pass.
   pub fn set_purge_delay_ms(&self, ms: u64) {
     self.purge_delay_ms.store(ms, Relaxed);
+    self.poke_maintenance();
   }
 
   /// The current purge delay in milliseconds.
@@ -116,6 +117,7 @@ impl<O: Os> Heap<O> {
     if let Some(_g) = self.purge_lock.try_lock(&self.os) {
       self.last_decay_ms.store(now, Relaxed);
       self.pass(Pass::Decay);
+      self.count(maint::Stat::InlineDecay);
     }
   }
 

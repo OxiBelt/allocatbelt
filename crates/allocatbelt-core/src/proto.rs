@@ -5,7 +5,7 @@
 //! below) checks exactly the code the heap executes. Callers pass the words
 //! involved; nothing here knows the metadata layout.
 //!
-//! Two protocols live here:
+//! Three protocols live here:
 //!
 //! * **Block bitmaps.** A small page has one bitmap bit per block (1 =
 //!   free), a *summary* word with one bit per bitmap word that may be
@@ -21,10 +21,16 @@
 //!   on `pages`; releases mark dirty before freeing; a purge claims the dirty
 //!   free pages like an allocation would, so no one can hand them out while
 //!   their contents are being discarded.
+//! * **Maintenance requests.** A word of work bits (1 = requested) that
+//!   any thread posts to and the maintenance thread takes from. A poster
+//!   first publishes the cause (e.g. adds to the dirty count) and wakes the
+//!   thread only when it set the bit; the thread takes the bit *before* it
+//!   reads the cause, so a post that races with a take is either seen by
+//!   the pass that follows or re-posts the bit (and wakes the thread).
 
 use crate::bits::{find_run_aligned, pick_bit};
-use crate::sync::AtomicU64;
-use crate::sync::Ordering::{AcqRel, Acquire, Release};
+use crate::sync::Ordering::{AcqRel, Acquire, Relaxed, Release, SeqCst};
+use crate::sync::{AtomicU32, AtomicU64, fence};
 
 /// Returns the blocks in `mask` to bitmap `word` (index `w` in its page).
 ///
@@ -160,6 +166,25 @@ pub(crate) fn finish_purge(pages: &AtomicU64, dirty: &AtomicU64, claimed: u64, p
   let cleared = dirty.fetch_and(!purged, AcqRel) & purged;
   pages.fetch_and(!claimed, Release);
   cleared
+}
+
+/// Posts work `bit` to `work` after the caller published its cause.
+/// Returns whether the bit was newly set: then the caller wakes the
+/// maintenance thread. While the bit is already set, a post is one load.
+pub(crate) fn post_work(work: &AtomicU32, bit: u32) -> bool {
+  // Pairs with the fence in `take_work` (a store-buffering pattern):
+  // either this load sees the bit taken, and the post sets it again, or
+  // the taker's reads after its fence see the cause published before
+  // this one.
+  fence(SeqCst);
+  work.load(Relaxed) & bit == 0 && work.fetch_or(bit, Release) & bit == 0
+}
+
+/// Takes work `bit` off `work` before the caller runs it; the caller reads
+/// the cause afterwards. A post that lands meanwhile sets the bit again.
+pub(crate) fn take_work(work: &AtomicU32, bit: u32) {
+  work.fetch_and(!bit, Acquire);
+  fence(SeqCst);
 }
 
 #[cfg(all(test, loom))]
@@ -508,6 +533,49 @@ mod loom_tests {
       lock.acquire(&*futex);
       lock.release(&*futex);
       t.join().unwrap();
+    });
+  }
+
+  /// Maintenance requests: two threads each publish one unit of work (as
+  /// a free adds dirty pages) and post the same bit; the maintenance
+  /// thread takes the bit, then collects the units, and sleeps while no
+  /// bit is set. The sleep has no timeout here, so a lost request would
+  /// leave it asleep forever, which loom reports as a deadlock. Three
+  /// threads, so preemptions are bounded as in `lock_three_threads`.
+  #[test]
+  fn maintenance_requests_are_not_lost() {
+    let mut model = loom::model::Builder::new();
+    model.preemption_bound = Some(3);
+    model.check(|| {
+      const BIT: u32 = 1 << 1;
+      let work = Arc::new(AtomicU32::new(0));
+      let units = Arc::new(AtomicU64::new(0));
+      let futex = Arc::new(Futex::default());
+      let posters: Vec<_> = (0..2)
+        .map(|_| {
+          let (work, units, futex) = (work.clone(), units.clone(), futex.clone());
+          thread::spawn(move || {
+            units.fetch_add(1, Relaxed);
+            if post_work(&work, BIT) {
+              futex.wake(&work);
+            }
+          })
+        })
+        .collect();
+      let mut collected = 0;
+      while collected < 2 {
+        if work.load(Acquire) == 0 {
+          futex.wait(&work, 0);
+          continue;
+        }
+        take_work(&work, BIT);
+        let n = units.load(Relaxed);
+        units.fetch_sub(n, Relaxed);
+        collected += n;
+      }
+      for p in posters {
+        p.join().unwrap();
+      }
     });
   }
 }

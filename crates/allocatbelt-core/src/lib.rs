@@ -35,7 +35,7 @@ mod proto;
 mod sync;
 
 #[cfg(not(loom))]
-pub use heap::{Block, Heap, Os, ThreadCache};
+pub use heap::{Block, DIRTY_HARD_LIMIT_PAGES, Heap, MaintenanceStats, Os, Task, ThreadCache};
 
 /// log2 of [`PAGE_SIZE`].
 pub const PAGE_SHIFT: u32 = 16;

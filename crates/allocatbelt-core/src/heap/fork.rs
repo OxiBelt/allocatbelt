@@ -31,11 +31,11 @@ impl<O: Os> Heap<O> {
   }
 
   /// Releases the locks [`Heap::fork_prepare`] took, in the child, and
-  /// turns automatic decay back on: a background purge thread does not
-  /// survive the fork.
+  /// gives housekeeping back to the allocating threads: the maintenance
+  /// thread does not survive the fork.
   pub fn fork_child(&self) {
     self.release_fork_locks();
-    self.set_auto_decay(true);
+    self.detach_maintenance();
   }
 
   fn release_fork_locks(&self) {

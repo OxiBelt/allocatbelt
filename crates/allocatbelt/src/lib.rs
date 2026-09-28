@@ -25,6 +25,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 pub use allocatbelt_arch::{CpuFeatures, KernelSet};
+pub use allocatbelt_core::MaintenanceStats;
 use allocatbelt_core::{
   ARENA_SIZE, Block, Heap, MAX_SEGMENTS, META_WORDS, Os, PAGE_SIZE, SEGMENT_SIZE, ThreadCache,
 };
@@ -84,9 +85,10 @@ extern "C" fn fork_parent() {
 
 extern "C" fn fork_child() {
   HEAP.fork_child();
-  // The purge thread (if any) did not survive the fork, and the child
+  // The maintenance thread (if any) did not survive the fork, and the child
   // should not share the parent's placement secret.
-  PURGE_THREAD.store(false, Ordering::Release);
+  MAINT_THREAD.store(false, Ordering::Release);
+  SCHED_BATCH.store(false, Ordering::Relaxed);
   HEAP.set_seed(seed());
 }
 
@@ -166,8 +168,8 @@ impl Os for LinuxOs {
     self.arena().meta.get(segment)
   }
 
-  fn futex_wait(&self, word: &AtomicU32, expected: u32) {
-    allocatbelt_sys::futex_wait(word, expected);
+  fn futex_wait(&self, word: &AtomicU32, expected: u32, timeout_ms: Option<u64>) {
+    allocatbelt_sys::futex_wait(word, expected, timeout_ms);
   }
 
   fn futex_wake(&self, word: &AtomicU32) {
@@ -345,46 +347,92 @@ impl Allocatbelt {
     HEAP.set_purge_delay_ms(u64::try_from(delay.as_millis()).unwrap_or(u64::MAX));
   }
 
-  /// Starts a background thread that returns freed memory to the OS once it
-  /// has been unused for the purge delay, even while the program is idle.
-  /// Allocating threads then no longer run these passes themselves, which
-  /// keeps them off the allocation path.
+  /// Starts the maintenance thread, which from then on runs the
+  /// allocator's housekeeping: budget passes when more than 32 MiB of freed
+  /// memory is waiting, decay passes that return memory unused for the
+  /// purge delay (also while the program is idle), and requested purges
+  /// ([`Allocatbelt::request_purge`]). Allocating threads then only record
+  /// the work, which keeps `madvise` off the allocation path; they still
+  /// purge themselves if 64 MiB pile up. The thread runs as `SCHED_BATCH`
+  /// ([`Allocatbelt::maintenance_is_batch`], docs/platform.md) and is not
+  /// pinned to a CPU.
   ///
   /// Call it from ordinary code (not from inside an allocation). Returns
   /// `Ok(false)` if the thread is already running.
   ///
   /// # Errors
   ///
-  /// Returns the error of [`std::thread::Builder::spawn`].
-  pub fn start_purge_thread(self) -> std::io::Result<bool> {
-    if PURGE_THREAD.swap(true, Ordering::AcqRel) {
+  /// Returns the error of [`std::thread::Builder::spawn`], or an error if
+  /// the arena could not be reserved.
+  pub fn start_maintenance_thread(self) -> std::io::Result<bool> {
+    if MAINT_THREAD.swap(true, Ordering::AcqRel) {
       return Ok(false);
     }
+    if arena().is_none() {
+      MAINT_THREAD.store(false, Ordering::Release);
+      return Err(std::io::Error::other("allocatbelt: no arena"));
+    }
+    // Attached before the thread runs, so that frees record work from now
+    // on; the recorded work waits until the thread's first round.
+    HEAP.attach_maintenance();
     let spawned = std::thread::Builder::new()
-      .name("allocatbelt-purge".into())
+      .name("allocatbelt-mnt".into())
       .spawn(|| {
+        SCHED_BATCH.store(allocatbelt_sys::set_batch_scheduling(), Ordering::Relaxed);
         loop {
-          std::thread::sleep(Duration::from_millis(HEAP.decay_interval_ms()));
-          if arena().is_some() {
-            guarded(|| HEAP.decay());
-          }
+          guarded(|| {
+            let _ = HEAP.maintain();
+          });
         }
       });
     match spawned {
-      Ok(_) => {
-        HEAP.set_auto_decay(false);
-        Ok(true)
-      }
+      Ok(_) => Ok(true),
       Err(e) => {
-        PURGE_THREAD.store(false, Ordering::Release);
+        HEAP.detach_maintenance();
+        MAINT_THREAD.store(false, Ordering::Release);
         Err(e)
       }
     }
   }
+
+  /// The former name of [`Allocatbelt::start_maintenance_thread`].
+  ///
+  /// # Errors
+  ///
+  /// As [`Allocatbelt::start_maintenance_thread`].
+  pub fn start_purge_thread(self) -> std::io::Result<bool> {
+    self.start_maintenance_thread()
+  }
+
+  /// Asks the maintenance thread to return all freed memory and empty
+  /// segments to the OS, and returns without waiting: for memory-pressure
+  /// handlers. Without a maintenance thread it purges inline, like
+  /// [`Allocatbelt::purge`] (which always runs on the calling thread).
+  pub fn request_purge(self) {
+    if arena().is_some() {
+      guarded(|| HEAP.request_purge());
+    }
+  }
+
+  /// Counters of the housekeeping passes: how many each kind ran on the
+  /// maintenance thread and inline, for diagnostics.
+  #[must_use]
+  pub fn maintenance_stats(self) -> MaintenanceStats {
+    HEAP.maintenance_stats()
+  }
+
+  /// Whether the maintenance thread runs as `SCHED_BATCH`: `false` before
+  /// it starts, or if the kernel refused (e.g. a seccomp filter).
+  #[must_use]
+  pub fn maintenance_is_batch(self) -> bool {
+    SCHED_BATCH.load(Ordering::Relaxed)
+  }
 }
 
-/// Whether the background purge thread has been started.
-static PURGE_THREAD: AtomicBool = AtomicBool::new(false);
+/// Whether the maintenance thread has been started.
+static MAINT_THREAD: AtomicBool = AtomicBool::new(false);
+/// Whether the maintenance thread runs as `SCHED_BATCH`.
+static SCHED_BATCH: AtomicBool = AtomicBool::new(false);
 
 fn offset_of(ptr: *const u8) -> usize {
   match arena().and_then(|a| a.user.offset_of(ptr)) {
