@@ -11,7 +11,8 @@
 //!
 //! This crate also holds the platform contract (`platform`): builds for
 //! anything but 64-bit little-endian Linux on x86_64 (x86-64-v3 or newer),
-//! aarch64 or riscv64 fail here with a `compile_error!`.
+//! aarch64 or riscv64 fail here with a `compile_error!`, and [`probe`] checks
+//! the mandatory kernel facilities at run time.
 
 #![no_std]
 #![cfg_attr(not(test), deny(clippy::expect_used, clippy::unwrap_used))]
@@ -23,6 +24,8 @@ use core::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use rustix::mm::{self, Advice, MapFlags, MprotectFlags, ProtFlags};
 
 mod platform;
+
+pub use platform::{Capabilities, KernelVersion, ProbeError, probe};
 
 /// A reserved, never-unmapped range of virtual address space.
 ///
@@ -201,27 +204,51 @@ impl Region {
     let Some(p) = self.range(offset, len) else {
       return false;
     };
+    // SAFETY: forwarded caller contract; the span is inside our mapping.
+    #[expect(unsafe_code, reason = "guard contract is identical")]
+    let marked = unsafe { self.guard_markers(offset, len) };
+    if marked {
+      return true;
+    }
+    // SAFETY: the span is inside our mapping (checked by `range`), and the
+    // caller guarantees nothing uses it, so revoking access cannot fault a
+    // live user.
+    #[expect(unsafe_code, reason = "mprotect syscall")]
+    let r = unsafe { mm::mprotect(p, len, MprotectFlags::empty()) };
+    r.is_ok()
+  }
+
+  /// Installs guard markers (`MADV_GUARD_INSTALL`) on the range and returns
+  /// whether they took effect, without the `mprotect` fallback of
+  /// [`Region::guard`]. Leaves no markers behind when it returns `false`.
+  ///
+  /// # Safety
+  ///
+  /// As for [`Region::guard`].
+  #[expect(unsafe_code, reason = "contract: caller owns the range")]
+  unsafe fn guard_markers(&self, offset: usize, len: usize) -> bool {
+    let Some(p) = self.range(offset, len) else {
+      return false;
+    };
     // SAFETY: the span is inside our mapping (checked by `range`), and the
     // caller guarantees nothing uses its contents, which the markers
     // discard.
     #[expect(unsafe_code, reason = "madvise syscall")]
     let r = unsafe { libc::madvise(p, len, MADV_GUARD_INSTALL) };
-    if r == 0 {
-      // Emulators (qemu-user) and some sandboxes accept advice they do not
-      // implement. Populating a real guard region fails with `EFAULT`.
-      // SAFETY: the span is inside our mapping; populating only faults in
-      // pages for reading and changes no contents.
-      #[expect(unsafe_code, reason = "madvise syscall")]
-      let probe = unsafe { mm::madvise(p, len, Advice::LinuxPopulateRead) };
-      if probe == Err(rustix::io::Errno::FAULT) {
-        return true;
-      }
-      self.unguard(offset, len);
+    if r != 0 {
+      return false;
     }
-    // SAFETY: as above; revoking access cannot fault a live user.
-    #[expect(unsafe_code, reason = "mprotect syscall")]
-    let r = unsafe { mm::mprotect(p, len, MprotectFlags::empty()) };
-    r.is_ok()
+    // Emulators (qemu-user) and some sandboxes accept advice they do not
+    // implement. Populating a real guard region fails with `EFAULT`.
+    // SAFETY: the span is inside our mapping; populating only faults in
+    // pages for reading and changes no contents.
+    #[expect(unsafe_code, reason = "madvise syscall")]
+    let probe = unsafe { mm::madvise(p, len, Advice::LinuxPopulateRead) };
+    if probe == Err(rustix::io::Errno::FAULT) {
+      return true;
+    }
+    self.unguard(offset, len);
+    false
   }
 
   /// Removes guard markers installed by [`Region::guard`]; a no-op for a

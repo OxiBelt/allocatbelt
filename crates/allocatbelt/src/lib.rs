@@ -11,7 +11,9 @@
 //! itself requires: the trait impl, zero-filling and the `realloc` copy.
 //!
 //! Only 64-bit little-endian Linux on x86_64 (x86-64-v3 or newer), aarch64
-//! and riscv64 is supported; `allocatbelt-sys` rejects other builds (see
+//! and riscv64 is supported; `allocatbelt-sys` rejects other builds. Before
+//! it reserves its arena, the allocator checks the kernel facilities it
+//! cannot run without and aborts with a message if one is missing (see
 //! `docs/platform.md`).
 #![cfg_attr(not(test), deny(clippy::expect_used, clippy::unwrap_used))]
 
@@ -25,6 +27,7 @@ use std::time::{Duration, Instant};
 use allocatbelt_core::{
   ARENA_SIZE, Block, Heap, MAX_SEGMENTS, META_WORDS, Os, PAGE_SIZE, SEGMENT_SIZE, ThreadCache,
 };
+pub use allocatbelt_sys::{Capabilities, KernelVersion};
 use allocatbelt_sys::{MetaArena, Region};
 
 struct Arena {
@@ -32,19 +35,25 @@ struct Arena {
   meta: MetaArena<MAX_SEGMENTS>,
   /// Origin of the heap's clock (see `Os::now_ms`).
   start: Instant,
+  /// What the kernel probe found before the arena was reserved.
+  platform: Capabilities,
 }
 
 /// Initialised on the first allocation. `OnceLock` blocks on a futex and
-/// never allocates; the initialiser only issues `mmap`.
+/// never allocates; the initialiser only issues syscalls.
 static ARENA: OnceLock<Option<Arena>> = OnceLock::new();
 
 fn arena() -> Option<&'static Arena> {
   ARENA
     .get_or_init(|| {
+      // A missing mandatory facility is a platform the allocator does not
+      // support, not an out-of-memory condition: say so and stop.
+      let platform = allocatbelt_sys::probe().unwrap_or_else(|e| LinuxOs.fatal(e.message()));
       let arena = Arena {
         user: Region::reserve(ARENA_SIZE, SEGMENT_SIZE)?,
         meta: MetaArena::reserve(META_WORDS)?,
         start: Instant::now(),
+        platform,
       };
       // Before any allocation: every heap call goes through `arena` first.
       HEAP.set_seed(seed());
@@ -282,6 +291,14 @@ impl Allocatbelt {
         HEAP.purge();
       });
     }
+  }
+
+  /// What the start-up probe found about the running kernel, for
+  /// diagnostics. Initialises the allocator if nothing has allocated yet;
+  /// `None` if its address space could not be reserved.
+  #[must_use]
+  pub fn platform(self) -> Option<Capabilities> {
+    arena().map(|a| a.platform)
   }
 
   /// Segments (4 MiB) currently taken from the arena, for diagnostics.
