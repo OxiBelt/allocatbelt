@@ -21,16 +21,17 @@ use std::alloc::{GlobalAlloc, Layout};
 use std::io::Write as _;
 use std::ptr::{self, NonNull};
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 pub use allocatbelt_arch::{CpuFeatures, KernelSet};
 pub use allocatbelt_core::MaintenanceStats;
 use allocatbelt_core::{
-  ARENA_SIZE, Block, Heap, MAX_SEGMENTS, META_WORDS, Os, PAGE_SIZE, SEGMENT_SIZE, ThreadCache,
+  ARENA_SIZE, Block, Heap, MAX_SEGMENTS, META_WORDS, Os, PAGE_SIZE, PURGE_BATCH, Purger,
+  SEGMENT_SIZE, ThreadCache,
 };
-pub use allocatbelt_sys::{Capabilities, KernelVersion};
-use allocatbelt_sys::{MetaArena, Region};
+pub use allocatbelt_sys::{Capabilities, KernelVersion, RingError};
+use allocatbelt_sys::{MetaArena, PurgeRing, Region};
 
 struct Arena {
   user: Region,
@@ -89,6 +90,7 @@ extern "C" fn fork_child() {
   // should not share the parent's placement secret.
   MAINT_THREAD.store(false, Ordering::Release);
   SCHED_BATCH.store(false, Ordering::Relaxed);
+  BACKEND.store(BACKEND_NONE, Ordering::Relaxed);
   HEAP.set_seed(seed());
 }
 
@@ -355,7 +357,9 @@ impl Allocatbelt {
   /// the work, which keeps `madvise` off the allocation path; they still
   /// purge themselves if 64 MiB pile up. The thread runs as `SCHED_BATCH`
   /// ([`Allocatbelt::maintenance_is_batch`], docs/platform.md) and is not
-  /// pinned to a CPU.
+  /// pinned to a CPU. It purges with `madvise`, or in batches through
+  /// io_uring after [`Allocatbelt::set_io_uring`]
+  /// ([`Allocatbelt::purge_backend`]).
   ///
   /// Call it from ordinary code (not from inside an allocation). Returns
   /// `Ok(false)` if the thread is already running.
@@ -379,10 +383,35 @@ impl Allocatbelt {
       .name("allocatbelt-mnt".into())
       .spawn(|| {
         SCHED_BATCH.store(allocatbelt_sys::set_batch_scheduling(), Ordering::Relaxed);
-        loop {
-          guarded(|| {
-            let _ = HEAP.maintain();
-          });
+        // Created here: the thread that enables the ring is its only
+        // submitter.
+        let ring = if USE_IO_URING.load(Ordering::Relaxed) {
+          PurgeRing::new(RING_ENTRIES, RING_WORKERS, true)
+        } else {
+          Err(RingError {
+            step: "turned off",
+            errno: 0,
+          })
+        };
+        match ring {
+          Ok(ring) => {
+            let mut purger = RingPurger(ring);
+            loop {
+              purger.publish();
+              guarded(|| {
+                let _ = HEAP.maintain_with(&mut purger);
+              });
+            }
+          }
+          Err(e) => {
+            let _ = RING_ERROR.set(e);
+            BACKEND.store(BACKEND_MADVISE, Ordering::Relaxed);
+            loop {
+              guarded(|| {
+                let _ = HEAP.maintain();
+              });
+            }
+          }
         }
       });
     match spawned {
@@ -421,6 +450,34 @@ impl Allocatbelt {
     HEAP.maintenance_stats()
   }
 
+  /// Whether the maintenance thread purges in batches through a restricted
+  /// io_uring (`IORING_OP_MADVISE`), or with one `madvise` per page run,
+  /// the default. Takes effect when the thread starts. Off by default
+  /// because it has not won yet: on the kernels measured so far each
+  /// purge takes a detour through a kernel worker thread
+  /// (docs/research/benchmarks.md, Phase 8).
+  pub fn set_io_uring(self, on: bool) {
+    USE_IO_URING.store(on, Ordering::Relaxed);
+  }
+
+  /// How the maintenance thread returns memory.
+  #[must_use]
+  pub fn purge_backend(self) -> PurgeBackend {
+    match BACKEND.load(Ordering::Relaxed) {
+      BACKEND_MADVISE => PurgeBackend::Madvise,
+      BACKEND_URING => PurgeBackend::IoUring { sq_rewind: false },
+      BACKEND_URING_REWIND => PurgeBackend::IoUring { sq_rewind: true },
+      _ => PurgeBackend::NotStarted,
+    }
+  }
+
+  /// Why the maintenance thread has no io_uring (`step` is "turned off"
+  /// unless [`Allocatbelt::set_io_uring`] asked for one).
+  #[must_use]
+  pub fn io_uring_error(self) -> Option<RingError> {
+    RING_ERROR.get().copied()
+  }
+
   /// Whether the maintenance thread runs as `SCHED_BATCH`: `false` before
   /// it starts, or if the kernel refused (e.g. a seccomp filter).
   #[must_use]
@@ -428,6 +485,76 @@ impl Allocatbelt {
     SCHED_BATCH.load(Ordering::Relaxed)
   }
 }
+
+/// How the maintenance thread returns memory to the kernel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PurgeBackend {
+  /// No maintenance thread runs: allocating threads purge with `madvise`.
+  NotStarted,
+  /// The maintenance thread purges page run by page run with `madvise`:
+  /// io_uring was turned off or unavailable
+  /// ([`Allocatbelt::io_uring_error`]), or a submission failed.
+  Madvise,
+  /// The maintenance thread purges in batches through its io_uring;
+  /// `sq_rewind` if the kernel took `IORING_SETUP_SQ_REWIND` (Linux 7.0).
+  IoUring {
+    /// Whether the ring rewinds its submission queue.
+    sq_rewind: bool,
+  },
+}
+
+/// Ring slots: the most page runs one `io_uring_enter` carries (a pass
+/// batches at most [`PURGE_BATCH`]).
+const RING_ENTRIES: u32 = PURGE_BATCH as u32;
+/// Kernel workers that run the ring's purges at once. More did not help
+/// (`ring_benchmark`): parallel purges of one address space contend.
+const RING_WORKERS: u32 = 1;
+
+/// The maintenance thread's purger: batches through its own io_uring.
+struct RingPurger(PurgeRing);
+
+impl RingPurger {
+  /// Publishes the backend for [`Allocatbelt::purge_backend`].
+  fn publish(&self) {
+    let b = match (self.0.retired(), self.0.sq_rewind()) {
+      (true, _) => BACKEND_MADVISE,
+      (false, false) => BACKEND_URING,
+      (false, true) => BACKEND_URING_REWIND,
+    };
+    BACKEND.store(b, Ordering::Relaxed);
+  }
+}
+
+impl Purger for RingPurger {
+  fn batch_size(&self) -> usize {
+    PURGE_BATCH
+  }
+
+  fn purge_batch(&mut self, ranges: &[(usize, usize)], purged: &mut [bool]) {
+    // SAFETY: the `Purger` contract of allocatbelt-core: the heap has
+    // claimed every range, so none holds a live allocation and nothing
+    // hands one out until this returns, and `PurgeRing::purge` returns
+    // only after every purge has completed.
+    #[expect(unsafe_code, reason = "returning unused memory to the kernel")]
+    let r = unsafe { self.0.purge(&LinuxOs.arena().user, ranges, purged) };
+    if r.is_err() {
+      // Purges may still run on pages the heap is about to reuse.
+      LinuxOs.fatal("allocatbelt: lost track of io_uring purges");
+    }
+  }
+}
+
+const BACKEND_NONE: u8 = 0;
+const BACKEND_MADVISE: u8 = 1;
+const BACKEND_URING: u8 = 2;
+const BACKEND_URING_REWIND: u8 = 3;
+
+/// [`PurgeBackend`] of the running maintenance thread.
+static BACKEND: AtomicU8 = AtomicU8::new(BACKEND_NONE);
+/// Whether the maintenance thread tries io_uring ([`Allocatbelt::set_io_uring`]).
+static USE_IO_URING: AtomicBool = AtomicBool::new(false);
+/// Why the maintenance thread has no ring.
+static RING_ERROR: OnceLock<RingError> = OnceLock::new();
 
 /// Whether the maintenance thread has been started.
 static MAINT_THREAD: AtomicBool = AtomicBool::new(false);

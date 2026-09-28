@@ -4,7 +4,7 @@
 
 use std::time::{Duration, Instant};
 
-use allocatbelt::Allocatbelt;
+use allocatbelt::{Allocatbelt, PurgeBackend};
 
 #[global_allocator]
 static GLOBAL: Allocatbelt = Allocatbelt;
@@ -41,10 +41,24 @@ fn policy_of(name: &str) -> Option<u32> {
 fn maintenance_thread_does_the_housekeeping() {
   // No decay pass gets in the way of the counts below.
   GLOBAL.set_purge_delay(Duration::from_secs(3600));
+  // Opt-in (off by default); falls back to `madvise` where io_uring is
+  // unavailable.
+  GLOBAL.set_io_uring(true);
   assert!(GLOBAL.start_maintenance_thread().unwrap());
   assert!(!GLOBAL.start_purge_thread().unwrap(), "started twice");
   assert!(wait_for(|| GLOBAL.maintenance_is_batch()));
   assert_eq!(policy_of("allocatbelt-mnt"), Some(3), "SCHED_BATCH");
+  // io_uring where the kernel allows it; `madvise` otherwise (qemu-user,
+  // seccomp, `kernel.io_uring_disabled`), with the reason.
+  assert!(wait_for(
+    || GLOBAL.purge_backend() != PurgeBackend::NotStarted
+  ));
+  let backend = GLOBAL.purge_backend();
+  eprintln!("purge backend: {backend:?} ({:?})", GLOBAL.io_uring_error());
+  assert_eq!(
+    backend == PurgeBackend::Madvise,
+    GLOBAL.io_uring_error().is_some()
+  );
 
   // 40 MiB of page runs: freeing them passes the 32 MiB budget but not
   // the 64 MiB hard limit, so the frees only record the work.
@@ -56,6 +70,14 @@ fn maintenance_thread_does_the_housekeeping() {
   assert!(after.budget_passes > before.budget_passes);
   assert_eq!(after.inline_budget_passes, before.inline_budget_passes);
   assert!(after.wakeups > before.wakeups);
+  assert!(after.purged_runs > before.purged_runs);
+  if matches!(backend, PurgeBackend::IoUring { .. }) {
+    // The page runs of many segments went to the kernel together.
+    assert!(
+      after.purged_runs - before.purged_runs > after.purge_batches - before.purge_batches,
+      "{before:?} {after:?}"
+    );
+  }
 
   // A purge request returns at once; the thread purges the rest.
   let bufs: Vec<Vec<u8>> = (0..8).map(|i| vec![i as u8 | 1; 1 << 20]).collect();
