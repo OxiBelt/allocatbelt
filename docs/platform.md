@@ -93,7 +93,7 @@ Phases 1 to 5 of the Linux 7 / ISA / SIMD plan changed no allocator algorithm: p
 After `Allocatbelt::set_io_uring(true)`, the maintenance thread purges the page runs of each pass in batches through its own io_uring (`allocatbelt_sys::PurgeRing`, plan §10) instead of one `madvise` per run. `madvise` stays the default because the ring has not won in measurements yet (docs/research/benchmarks.md, Phase 8). The ring:
 
 - is created by the maintenance thread with `IORING_SETUP_R_DISABLED`, `SINGLE_ISSUER`, `DEFER_TASKRUN` and `NO_SQARRAY`, plus `SQ_REWIND` on Linux 7.0 (the setup is retried without it when the kernel rejects the flag), and never with `SQPOLL`;
-- registers restrictions before it is enabled: only `IORING_OP_MADVISE`, no SQE flags, no later `io_uring_register` calls; it registers no files or buffers, so allocator memory is never pinned;
+- registers restrictions before it is enabled: only `IORING_OP_MADVISE`, no SQE flags, and no later `io_uring_register` call but `ENABLE_RINGS` (listed so newer kernels restrict registration at all; an enabled ring refuses it anyway); a test submits a `NOP` and expects `-EACCES`; it registers no files or buffers, so allocator memory is never pinned;
 - caps the kernel's io-wq workers at one, since `IORING_OP_MADVISE` always runs on a worker and parallel purges of one address space only contend;
 - waits for every completion of a batch before the pass ends the pages' claim, so no purge is in flight after a pass (in particular not across `fork`, whose handler takes the purge lock first), and only a completion with result 0 marks pages clean.
 

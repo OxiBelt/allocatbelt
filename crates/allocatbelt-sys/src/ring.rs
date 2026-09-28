@@ -49,7 +49,9 @@ const SETUP_SQ_REWIND: u32 = 1 << 20;
 const IORING_OFF_SQ_RING: u64 = 0;
 const IORING_OFF_SQES: u64 = 0x1000_0000;
 const IORING_OP_MADVISE: u8 = 25;
+const IORING_RESTRICTION_REGISTER_OP: u16 = 0;
 const IORING_RESTRICTION_SQE_OP: u16 = 1;
+const IORING_REGISTER_ENABLE_RINGS: u8 = 12;
 const IO_URING_OP_SUPPORTED: u16 = 1 << 0;
 const MADV_DONTNEED: u32 = 4;
 
@@ -265,17 +267,28 @@ impl PurgeRing {
         2,
       )
       .map_err(|e| RingError::new("max workers", e))?;
-    let allow = [Restriction {
-      opcode: IORING_RESTRICTION_SQE_OP,
-      arg: IORING_OP_MADVISE,
-      resv: 0,
-      resv2: [0; 3],
-    }];
+    // Newer kernels restrict `io_uring_register` only once a register
+    // opcode is listed, so one is: `ENABLE_RINGS`, which fails on an
+    // enabled ring anyway. Older kernels restrict both from the start.
+    let allow = [
+      Restriction {
+        opcode: IORING_RESTRICTION_SQE_OP,
+        arg: IORING_OP_MADVISE,
+        resv: 0,
+        resv2: [0; 3],
+      },
+      Restriction {
+        opcode: IORING_RESTRICTION_REGISTER_OP,
+        arg: IORING_REGISTER_ENABLE_RINGS,
+        resv: 0,
+        resv2: [0; 3],
+      },
+    ];
     self
       .register(
         IoringRegisterOp::RegisterRestrictions,
         (&raw const allow).cast_mut().cast(),
-        1,
+        2,
       )
       .map_err(|e| RingError::new("restrict", e))?;
     self
@@ -633,7 +646,7 @@ mod tests {
 
   #[test]
   fn only_madvise_is_allowed() {
-    let Some(ring) = ring() else { return };
+    let Some(mut ring) = ring() else { return };
     // Registrations after enabling are refused by the restrictions.
     let mut workers = [1u32, 1];
     assert_eq!(
@@ -644,6 +657,46 @@ mod tests {
       ),
       Err(Errno::ACCESS)
     );
+    // So is any operation but madvise: a NOP completes with -EACCES.
+    let slot = if ring.rewind {
+      0
+    } else {
+      ring.word(ring.sq_tail).load(Ordering::Relaxed) & (ring.entries - 1)
+    };
+    // SAFETY: as in `purge_chunk`: a slot of the SQE mapping.
+    #[expect(unsafe_code, reason = "test SQE")]
+    unsafe {
+      ring.sqes.as_ptr().wrapping_add(slot as usize).write(Sqe {
+        user_data: 0,
+        ..Sqe::default()
+      });
+    }
+    if !ring.rewind {
+      let t = ring.word(ring.sq_tail).load(Ordering::Relaxed);
+      ring
+        .word(ring.sq_tail)
+        .store(t.wrapping_add(1), Ordering::Release);
+    }
+    assert_eq!(ring.enter(1, 1), Ok(1));
+    let mut res = [true];
+    let mut seen = [0u64; 64];
+    // `reap` reports result 0 as purged; read the CQE's result instead.
+    let head = ring.word(ring.cq_head).load(Ordering::Relaxed);
+    let at = ring.cqes as usize + (head & ring.cq_mask) as usize * size_of::<Cqe>();
+    // SAFETY: as in `reap`: a published CQE slot of the ring mapping.
+    #[expect(unsafe_code, reason = "test CQE")]
+    let cqe = unsafe {
+      ring
+        .rings
+        .as_ptr()
+        .wrapping_byte_add(at)
+        .cast::<Cqe>()
+        .read()
+    };
+    assert_eq!(cqe.res, -Errno::ACCESS.raw_os_error());
+    assert_eq!(ring.reap(&mut res, &mut seen), 1);
+    assert!(!res[0]);
+    ring.retired = false;
   }
 
   /// Batched `MADV_DONTNEED` through the ring against one `madvise` per
