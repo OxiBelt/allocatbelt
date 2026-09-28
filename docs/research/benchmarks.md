@@ -156,3 +156,28 @@ The bench has a new last row: the 4-thread local churn's work spread over 16 thr
 Peak RSS (23.8 vs 23.9 MB) and RSS after 3 s idle (6.4 vs 6.4 MB) did not change. Every paired median is within 2% except producer/consumer (8% faster, with a wide spread). The run-to-run spread on this VM is ±5–10%, so it can rule out a regression of that size but not one of 1–3%; the counts above say the slow path runs a handful of times per workload, and the only fast-path difference is the swap on unlock.
 
 **Decision:** adopted. `sched_yield` is no longer the long-contention strategy (plan §11.1): `Os::yield_now` is replaced by `Os::futex_wait`/`Os::futex_wake`, which the adapter implements with rustix's safe futex calls (`allocatbelt_sys::futex_wait`/`futex_wake`, no new `unsafe`). The mock `Os` of the model tests yields instead, and loom checks the state machine with a futex emulation (`proto::loom_tests`). Still to measure: a many-core machine, where more threads share a shard, and OxiBelt under load.
+
+## Maintenance thread (plan Phase 7, 2026-09-28)
+
+Budget passes used to run on the free that took the dirty count over 32 MiB, and decay passes on allocation slow paths unless the purge thread was started (it then took only the decay passes). Now `Allocatbelt::start_maintenance_thread` hands all of them to one `SCHED_BATCH` thread (`Heap::maintain`, docs/research/README.md §4): a free over the budget only sets a bit and, on the transition, wakes the thread. `bench-allocatbelt` starts it and prints who ran the passes.
+
+- **Environment:** as in the Phase 6 section (4 vCPUs, Linux 6.18.44, rustc 1.98.1, `--release`, x86-64-v3). **before** = `ff86374` (purge thread), **after** = this change (maintenance thread); 20 alternating runs of each binary; "paired" as before.
+
+| Workload | before ms (median) | after ms (median) | Paired ratio (IQR) |
+|---|---:|---:|---|
+| single-thread churn 2M | 139.4 | 146.1 | 1.02 (0.90–1.23) |
+| 4-thread local churn | 180.1 | 131.5 | 0.72 (0.68–0.74) |
+| 4-thread small churn | 285.9 | 299.9 | 1.02 (0.96–1.08) |
+| 2 producer/consumer pairs | 121.2 | 113.0 | 0.94 (0.72–1.12) |
+| 16-thread local churn (oversubscribed) | 161.6 | 155.4 | 0.96 (0.88–1.06) |
+| peak RSS (MB) | 23.6 | 22.4 | 0.92 (0.84–0.99) |
+| RSS after 3 s idle (MB) | 6.4 | 6.3 | 0.99 (0.97–1.00) |
+
+Who ran the passes after the change, over 5 runs of the whole bench: the maintenance thread 23 to 35 budget passes and 15 decay passes, allocating threads 5 to 10 budget passes and no decay pass, with 55 to 87 wake-ups. Before, every budget pass ran on an allocating thread.
+
+- **The 4-thread local churn is 28% faster.** It is the workload that frees page runs fast enough to cross the budget about 20 times per run; those passes (92–95% `madvise`, see simd-benchmarks.md) no longer stall the freeing thread.
+- **The other rows are within the VM's run-to-run spread** (±5–10%); single-thread and small churn never cross the budget, so the change cannot help them, and their medians moved by 2% in opposite directions across runs.
+- **Inline passes remain only in the oversubscribed row.** With 16 busy threads on 4 CPUs, the batch thread gets little CPU, the dirty count passes the 64 MiB hard limit, and frees run the pass themselves, as designed. RSS stays bounded (peak 22.4 MB).
+- **A missed request was found and fixed.** The first version let a free skip the wake-up because the bit was set, while the thread had just taken the bit and read an old dirty count. Both sides now fence (`proto::post_work`/`take_work`), and the loom model `maintenance_requests_are_not_lost` deadlocks without the fences.
+
+**Decision:** adopted, with the synchronous backend kept. Phase 8 (io_uring) can change how a pass issues `madvise` without touching the scheduling. Still to measure: a many-core machine, and OxiBelt request latency with the thread on and off.

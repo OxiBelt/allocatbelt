@@ -82,7 +82,11 @@ The check needs only `rustup target add riscv64gc-unknown-linux-gnu`, no linker 
 
 ## Not covered yet
 
-Phases 1 to 5 of the Linux 7 / ISA / SIMD plan changed no allocator algorithm: phase 4 measured SIMD candidates and phase 5 promoted none of them. The Linux 7.0 maintenance plane (io_uring purge, futex waits, scheduler policy) comes in later phases.
+Phases 1 to 5 of the Linux 7 / ISA / SIMD plan changed no allocator algorithm: phase 4 measured SIMD candidates and phase 5 promoted none of them. Phase 6 made the heap locks sleep on a futex and phase 7 moved housekeeping to a `SCHED_BATCH` maintenance thread (below); the io_uring purge backend (phase 8) comes later.
+
+## Maintenance thread scheduling
+
+`Allocatbelt::start_maintenance_thread` starts the thread that runs purge passes (docs/research/README.md §4). The thread moves itself to `SCHED_BATCH` with `sched_setscheduler` (`allocatbelt_sys::set_batch_scheduling`), keeping the process's nice value, and the adapter reports whether that worked (`Allocatbelt::maintenance_is_batch`). If a sandbox refuses the call, the thread keeps the default policy. It is never real-time and never pinned to a CPU: it must not delay the process's own threads, and a pin would tie it to a CPU that may be busy (plan §11.2–11.3). It sleeps on a futex with a timeout (the next decay deadline) and wakes early when a freeing thread records work. The thread is named `allocatbelt-mnt` (Linux keeps 15 bytes of a thread name).
 
 ## No portability layer
 

@@ -21,10 +21,11 @@ docs/                     Research reports, benchmark results, unsafe inventory.
 static GLOBAL: allocatbelt::Allocatbelt = allocatbelt::Allocatbelt;
 
 fn main() -> std::io::Result<()> {
-    // Optional: return idle memory from a background thread (otherwise
-    // allocating threads do it), and tune how long freed memory stays.
+    // Optional: run housekeeping (purging, returning idle memory) on a
+    // background thread instead of the allocating threads, and tune how
+    // long freed memory stays.
     GLOBAL.set_purge_delay(std::time::Duration::from_secs(1));
-    GLOBAL.start_purge_thread()?;
+    GLOBAL.start_maintenance_thread()?;
     Ok(())
 }
 ```
@@ -33,7 +34,7 @@ What it does, in the terms of mimalloc (details in [docs/research/README.md](doc
 
 - **Per-thread caches.** Each thread allocates small blocks (≤ 8 KiB) from a claimed bitmap word per size class, with no atomics or locks, and batches its frees per bitmap word. A shard lock is taken only to claim the next word. Threads hand their caches back at exit.
 - **Two-level summaries.** A word summary per page and per-class availability bitmaps per segment find the next free blocks with `trailing_zeros`, never by scanning pages.
-- **Delayed purging.** Freed memory stays resident for the purge delay (1 s), then goes back to the OS (`MADV_DONTNEED`) and empty segments to the arena; a 32 MiB dirty budget bounds RSS under churn.
+- **Delayed purging.** Freed memory stays resident for the purge delay (1 s), then goes back to the OS (`MADV_DONTNEED`) and empty segments to the arena; a 32 MiB dirty budget bounds RSS under churn. With the maintenance thread started, allocating threads only set a flag and the thread (`SCHED_BATCH`) runs the passes.
 - **Hardening.** Free blocks live in out-of-band bitmaps, so user writes cannot corrupt allocator state, and double frees are caught when they reach the bitmap. Every segment ends in a guard page (`MADV_GUARD_INSTALL`, or `mprotect`). Refills, block order and segment placement are randomized with a `getrandom` seed.
 - **fork.** `pthread_atfork` handlers keep the heap usable in children forked while other threads allocate.
 

@@ -94,10 +94,13 @@ Freed page runs and released small pages stay resident as dirty pages. Three kin
 - **Budget passes** run when more than 512 pages (32 MiB) are dirty and purge them all.
 - **Explicit `purge`** returns everything at once.
 
-Who runs decay passes:
+Who runs the passes:
 
-- **Allocating threads,** by default: every 16th slow-path operation per thread checks the clock and runs a due pass.
-- **A background thread,** after `Allocatbelt::start_purge_thread`: it runs the passes and allocating threads stop running them. It returns memory while the process is idle (see the "idle" row in benchmarks.md), and keeps passes off request threads' tail latency.
+- **Allocating threads,** by default: the free that takes the dirty count over the budget runs the budget pass, and every 16th slow-path operation per thread checks the clock and runs a due decay pass.
+- **The maintenance thread,** after `Allocatbelt::start_maintenance_thread` (plan Phase 7; `start_purge_thread` is the old name). Allocating threads then only record work: a free over the budget sets a bit in one atomic word and wakes the thread with `FUTEX_WAKE` if the bit was clear. The thread (`Heap::maintain`, `heap/maint.rs`) runs the work in priority order: P0 force purge (`request_purge`), P1 budget pass, P2 decay pass when its deadline comes; P3, empty-segment retirement, is part of every pass, and P4 is `maintenance_stats`. With nothing to do it sleeps on that word until the next decay deadline. It returns memory while the process is idle (see the "idle" row in benchmarks.md) and keeps passes off request threads' tail latency.
+  - It runs as `SCHED_BATCH`, never real-time, and is not pinned (plan §11.2–11.3). A batch thread can fall behind when the CPUs are oversubscribed, so a free that finds more than twice the budget (64 MiB) dirty runs the budget pass itself, as before.
+  - The passes are the same synchronous ones (`purge_lock`, `madvise`, `mprotect`); only who runs them and when changed. Phase 8 replaces the backend, not the scheduler.
+  - The request word is a protocol in `proto.rs` (`post_work`, `take_work`), and loom checks that no request is lost (`maintenance_requests_are_not_lost`, where the thread sleeps without a timeout). The thread takes a bit before it reads the dirty count, and both sides need a `SeqCst` fence between their two accesses (a store-buffering pattern); without the fences, loom finds a run where a free's pages are neither seen by the pass nor re-posted.
 
 ### Hardening
 
@@ -114,7 +117,7 @@ Who runs decay passes:
 ### fork
 
 - **Handlers.** `pthread_atfork` handlers take every heap lock before `fork`, in the heap's nesting order (purge, shards, segments), and release them in both processes. The prepare handler first waits for a concurrent arena reservation.
-- **In the child:** allocation-driven decay comes back on (the purge thread did not survive) and the placement secret is reseeded.
+- **In the child:** housekeeping goes back to the allocating threads (the maintenance thread did not survive) and the placement secret is reseeded.
 - **Test.** `tests/fork.rs` forks 200 times while four threads churn every lock. Before the handlers existed, its children deadlocked.
 
 ### Verification added
@@ -122,7 +125,7 @@ Who runs decay passes:
 - **loom:** models of every lock-free protocol in `proto.rs`, run in CI.
 - **Fuzzing:** the checking mock `Os` moved to `model.rs` with an interpreter for arbitrary byte programs, driven by cargo-fuzz (`fuzz/`, scheduled in CI) and by proptest on stable.
 - **Mutation testing:** the mewt campaign passes after adding tests for what it found.
-- **Integration tests:** thread exit, the purge thread, guard faults and fork.
+- **Integration tests:** thread exit, the maintenance thread, guard faults and fork.
 
 ### mimalloc correspondence, updated
 
@@ -131,7 +134,7 @@ Who runs decay passes:
 | thread-local heap (`mi_heap_t`), page free lists | `ThreadCache`: claimed bitmap word per class + batched frees; shards own pages |
 | `thread_free` / delayed free for cross-thread frees | buffered frees, one `fetch_or` per bitmap word |
 | page queues per bin | per-segment `SEG_AVAIL`/`SEG_CLS` bitmaps + per-page word summary |
-| `purge_delay`, arena purge, `mi_collect` | epoch-based decay passes, background purge thread, dirty budget, `purge()` |
+| `purge_delay`, arena purge, `mi_collect` | epoch-based decay passes, maintenance thread, dirty budget, `purge()` / `request_purge()` |
 | secure mode: guard pages, randomized free lists and segment placement | guard page per segment (guard markers), randomized words/blocks/segments, bitmaps instead of encoded free lists |
 | (fork safety) | `pthread_atfork` handlers that hold every heap lock across `fork` |
 
@@ -163,4 +166,4 @@ allocatbelt is being evolved into a Linux-only allocator for a fixed set of CPUs
 
 **What must not regress.** Per-thread caches, bitmap words consumed without shared atomics, batched frees, two-level summary bitmaps, out-of-band `AtomicU64` metadata, delayed purging under a dirty budget, guard pages and randomized placement, fork handling, and the verification around the core (model tests, proptest and fuzzing, loom, Miri-compatible paths, mutation testing, integration tests). SIMD or kernel-API work that weakens any of these is not adopted.
 
-**Phases.** 1: platform contract and build matrix (done: [docs/platform.md](../platform.md)). 2: architecture capability layer (done: `allocatbelt-arch`, see [docs/platform.md](../platform.md)). 3: scalar ISA verification (done: `scripts/check-scalar-isa.sh`, see [docs/platform.md](../platform.md)). 4: SIMD benchmark harness (done: `bench/simd`, see [simd-benchmarks.md](simd-benchmarks.md)). 5: promote proven SIMD kernels (done: none qualified, since no candidate operation is a measurable allocator cost; budget passes spend 92–95% of their time in `madvise`, which is for phases 7 and 8; see [simd-benchmarks.md](simd-benchmarks.md#phase-5-promotion-decision-2026-09-28)). 6: adaptive lock and futex work (done: heap locks sleep on a futex instead of calling `sched_yield`, see [benchmarks.md](benchmarks.md)). 7: maintenance micro-scheduler. 8: io_uring purge backend. 9: rseq/mm_cid research. Each phase is a separate, independently tested change.
+**Phases.** 1: platform contract and build matrix (done: [docs/platform.md](../platform.md)). 2: architecture capability layer (done: `allocatbelt-arch`, see [docs/platform.md](../platform.md)). 3: scalar ISA verification (done: `scripts/check-scalar-isa.sh`, see [docs/platform.md](../platform.md)). 4: SIMD benchmark harness (done: `bench/simd`, see [simd-benchmarks.md](simd-benchmarks.md)). 5: promote proven SIMD kernels (done: none qualified, since no candidate operation is a measurable allocator cost; budget passes spend 92–95% of their time in `madvise`, which is for phases 7 and 8; see [simd-benchmarks.md](simd-benchmarks.md#phase-5-promotion-decision-2026-09-28)). 6: adaptive lock and futex work (done: heap locks sleep on a futex instead of calling `sched_yield`, see [benchmarks.md](benchmarks.md)). 7: maintenance micro-scheduler (done: housekeeping is prioritized work for one `SCHED_BATCH` maintenance thread, and allocating threads only set flags, see §4 and [benchmarks.md](benchmarks.md)). 8: io_uring purge backend. 9: rseq/mm_cid research. Each phase is a separate, independently tested change.
