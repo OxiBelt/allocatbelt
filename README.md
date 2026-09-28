@@ -48,6 +48,7 @@ cargo fmt --all --check
 cargo clippy --all-targets --all-features --locked -- -D warnings
 cargo test --release --locked                                   # model tests + global-allocator integration tests
 scripts/check-platform-gates.sh                                 # supported targets build, others are rejected (needs `rustup target add`, see the script)
+scripts/check-scalar-isa.sh                                     # bit scans lower to tzcnt/popcnt/lzcnt (x86-64-v3) and ctz/cpop/clz (riscv64 + Zbb)
 cargo audit && cargo deny check                                 # RustSec advisories, licenses, bans, sources
 MIRIFLAGS=-Zmiri-disable-isolation cargo +nightly miri test -p allocatbelt-core
 scripts/run-mutation-testing.sh                                 # mewt campaign over `allocatbelt-core` bits/classes

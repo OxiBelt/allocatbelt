@@ -66,9 +66,23 @@ The adapter calls `initialize_dispatch()` while it initialises the arena, right 
 
 A detected feature does not mean a kernel exists for it. No architecture kernel has been admitted yet, since each needs benchmark evidence on native hardware first, so `KernelSet` has only `Baseline` for now and every CPU runs the same code as before.
 
+## Scalar bit instructions
+
+The allocator's hot scans work on one `u64` bitmap word at a time with `trailing_zeros`, `count_ones` and `leading_zeros`. The right primitive for one word is a single scalar instruction, not a vector, so before any SIMD work `scripts/check-scalar-isa.sh` (CI job `scalar-isa`) checks that these operations lower to one:
+
+| Operation | Where the allocator uses it | x86-64-v3 | riscv64 + Zbb | riscv64 (rv64gc) |
+|---|---|---|---|---|
+| `trailing_zeros` | `bits::find_run_aligned`, `bits::pick_bit`, the summary scans | `tzcnt`, never `bsf` | `ctz` | no `ctz`: a multi-instruction sequence |
+| `count_ones` | free counters (`proto.rs`), dirty-page accounting (`heap.rs`) | `popcnt` | `cpop` | no `cpop` |
+| `leading_zeros` | `class::class_of` | `lzcnt`, never `bsr` | `clz` | no `clz` |
+
+These helpers are small enough that LLVM inlines them into their callers, so they have no symbol of their own. The script builds `crates/allocatbelt-codegen-probes`, which holds one out-of-line wrapper per operation around the real `allocatbelt-core` helper, with the allocator's own flags, emits assembly, and looks only at those four function bodies, which keeps it independent of scheduling and inlining elsewhere. The rv64gc column is a control: without Zbb none of the three instructions may appear, which shows the check can tell the builds apart and why `-C target-feature=+zbb` matters. A generic x86-64 (v1) build of the probes uses `bsf`/`bsr` and a software popcount, which the check would reject; the platform gate already rules that build out for the allocator itself.
+
+The check needs only `rustup target add riscv64gc-unknown-linux-gnu`, no linker or qemu, since it stops at assembly. It verifies instruction selection only; whether a kernel is faster is a benchmark question for later phases. aarch64 has no scalar popcount before FEAT_CSSC (LLVM uses NEON `cnt`), so it is not part of this check.
+
 ## Not covered yet
 
-Phases 1 and 2 of the Linux 7 / ISA / SIMD plan changed no allocator algorithm. SIMD kernels, generated-code checks for the scalar bit instructions, and the Linux 7.0 maintenance plane (io_uring purge, futex waits, scheduler policy) come in later phases.
+Phases 1 to 3 of the Linux 7 / ISA / SIMD plan changed no allocator algorithm. SIMD kernels and the Linux 7.0 maintenance plane (io_uring purge, futex waits, scheduler policy) come in later phases.
 
 ## No portability layer
 
