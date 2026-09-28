@@ -13,10 +13,11 @@
 //! allocations afterwards                    -> the published KernelSet
 //! ```
 //!
-//! A detected feature does not mean an optimized kernel exists for it. No
-//! architecture kernel has been admitted yet (each needs benchmark evidence,
-//! see `docs/research/README.md` §5), so [`initialize_dispatch`] always
-//! publishes [`KernelSet::Baseline`] for now.
+//! A detected feature does not mean an optimized kernel exists for it. A
+//! kernel is admitted only with benchmark evidence that it speeds up a
+//! measured allocator cost, and none has been (plan phase 5, see
+//! `docs/research/simd-benchmarks.md`), so [`initialize_dispatch`] always
+//! publishes [`KernelSet::Baseline`].
 
 #![no_std]
 #![cfg_attr(not(test), deny(clippy::expect_used, clippy::unwrap_used))]

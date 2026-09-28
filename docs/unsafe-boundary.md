@@ -47,7 +47,7 @@ CPU feature detection only; no architecture kernel exists yet. Every site runs d
 
 ## allocatbelt-simd-bench (benchmark only)
 
-`bench/simd` holds the Phase 4 SIMD candidates ([research/simd-benchmarks.md](research/simd-benchmarks.md)). It is not a dependency of the allocator and nothing in it runs inside `GlobalAlloc`; a kernel promoted in Phase 5 moves into `allocatbelt-arch` and gets its own rows above. Its `unsafe` is listed here so the whole workspace is accounted for.
+`bench/simd` holds the Phase 4 SIMD candidates ([research/simd-benchmarks.md](research/simd-benchmarks.md)). It is not a dependency of the allocator and nothing in it runs inside `GlobalAlloc`. Phase 5 promoted none of them; a kernel promoted later moves into `allocatbelt-arch` and gets its own rows above. Its `unsafe` is listed here so the whole workspace is accounted for.
 
 | Location | Kind | Operation | Why it is sound |
 |---|---|---|---|

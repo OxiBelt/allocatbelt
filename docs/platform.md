@@ -64,7 +64,7 @@ allocations afterwards                    -> the published KernelSet
 
 The adapter calls `initialize_dispatch()` while it initialises the arena, right after the kernel probe. Detection issues only `cpuid`/`xgetbv`, reads libc's saved auxiliary vector, or makes one syscall; it never allocates, which `crates/allocatbelt-arch/tests/allocation_free.rs` checks with a counting global allocator. The result is cached in an `AtomicU32` and the kernel set in an `AtomicU8`, with no `OnceLock` or lazy framework. `Allocatbelt::cpu_features()` and `Allocatbelt::kernel_set()` expose both for diagnostics.
 
-A detected feature does not mean a kernel exists for it. No architecture kernel has been admitted yet, since each needs benchmark evidence on native hardware first, so `KernelSet` has only `Baseline` for now and every CPU runs the same code as before.
+A detected feature does not mean a kernel exists for it. A kernel is admitted only with benchmark evidence that it speeds up a measured allocator cost, and the Phase 5 qualification admitted none ([research/simd-benchmarks.md](research/simd-benchmarks.md#phase-5-promotion-decision-2026-09-28)). So `KernelSet` has only `Baseline`, and every CPU runs the same code as before.
 
 ## Scalar bit instructions
 
@@ -82,7 +82,7 @@ The check needs only `rustup target add riscv64gc-unknown-linux-gnu`, no linker 
 
 ## Not covered yet
 
-Phases 1 to 3 of the Linux 7 / ISA / SIMD plan changed no allocator algorithm. SIMD kernels and the Linux 7.0 maintenance plane (io_uring purge, futex waits, scheduler policy) come in later phases.
+Phases 1 to 5 of the Linux 7 / ISA / SIMD plan changed no allocator algorithm: phase 4 measured SIMD candidates and phase 5 promoted none of them. The Linux 7.0 maintenance plane (io_uring purge, futex waits, scheduler policy) comes in later phases.
 
 ## No portability layer
 
