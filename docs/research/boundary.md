@@ -1,6 +1,7 @@
 # OxiBelt allocator: unsafe-boundary research
 
 Date: 2026-09-27. Target: Rust 1.98, edition 2024, Linux (glibc and musl), x86_64 and aarch64.
+The platform contract has since been fixed as Linux 7.0 or newer on x86_64 (x86-64-v3 or newer), aarch64 and riscv64; see [docs/platform.md](../platform.md).
 Legend: **[V]** means I checked it against a primary source during this research (URL in Sources). **[U]** means unverified: from memory or inference, so check it before relying on it.
 
 ---

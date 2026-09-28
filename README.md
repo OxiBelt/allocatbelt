@@ -35,7 +35,9 @@ What it does, in the terms of mimalloc (details in [docs/research/README.md](doc
 - **Hardening.** Free blocks live in out-of-band bitmaps, so user writes cannot corrupt allocator state, and double frees are caught when they reach the bitmap. Every segment ends in a guard page (`MADV_GUARD_INSTALL`, or `mprotect`). Refills, block order and segment placement are randomized with a `getrandom` seed.
 - **fork.** `pthread_atfork` handlers keep the heap usable in children forked while other threads allocate.
 
-Status: **research prototype**. Only 64-bit Linux is supported: x86_64, aarch64 and riscv64. x86_64 and aarch64 are tested natively in CI (`ubuntu-26.04` and `ubuntu-26.04-arm` runners); riscv64 is tested in CI under qemu-user, with and without Zbb. 32-bit targets (including riscv32) are rejected at compile time. Not recommended for production.
+Status: **research prototype**. Not recommended for production.
+
+**Platform contract** ([docs/platform.md](docs/platform.md)): Linux 7.0 or newer, 64-bit little-endian userspace, on x86_64 (**x86-64-v3 or newer**), aarch64 or riscv64 (RV64GC, Zbb optional). Every other target, and any x86_64 build below x86-64-v3, fails at compile time with a message saying why. `.cargo/config.toml` builds x86_64 with `-C target-cpu=x86-64-v3`; a `RUSTFLAGS` variable replaces it and must carry that flag too, and crates depending on allocatbelt (OxiBelt) must set it in their own build. At start-up the allocator probes the kernel facilities it cannot run without (reservation, commit, `MADV_DONTNEED` zeroing) and aborts with a message if one is missing. x86_64 and aarch64 are tested natively in CI (`ubuntu-26.04` and `ubuntu-26.04-arm` runners); riscv64 is tested in CI under qemu-user, with and without Zbb; the `platform-gates` job checks that the supported targets build and the others are rejected.
 For the conclusions and recommendations see [docs/research/README.md](docs/research/README.md), for measurements see [docs/research/benchmarks.md](docs/research/benchmarks.md), and for the unsafe inventory see [docs/unsafe-boundary.md](docs/unsafe-boundary.md).
 
 ## Verification
@@ -44,12 +46,13 @@ For the conclusions and recommendations see [docs/research/README.md](docs/resea
 cargo fmt --all --check
 cargo clippy --all-targets --all-features --locked -- -D warnings
 cargo test --release --locked                                   # model tests + global-allocator integration tests
+scripts/check-platform-gates.sh                                 # supported targets build, others are rejected (needs `rustup target add`, see the script)
 cargo audit && cargo deny check                                 # RustSec advisories, licenses, bans, sources
 MIRIFLAGS=-Zmiri-disable-isolation cargo +nightly miri test -p allocatbelt-core
 scripts/run-mutation-testing.sh                                 # mewt campaign over `allocatbelt-core` bits/classes
 RUSTFLAGS="--cfg loom" cargo test --release -p allocatbelt-core --lib loom   # loom models of the lock-free protocols
 (cd fuzz && cargo +nightly fuzz run heap_ops)                   # cargo-fuzz over the checked heap model; see fuzz/README.md
-cargo run --release -p allocatbelt-bench --bin bench-allocatbelt   # also bench-system, bench-mimalloc
+cargo run --release -p allocatbelt-bench --bin bench-allocatbelt   # also bench-system, bench-mimalloc (built for x86-64-v3)
 ```
 
 Code style, pinned tool versions and the commit-message format follow OxiBelt; see [CONTRIBUTING.md](CONTRIBUTING.md).

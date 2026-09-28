@@ -1,6 +1,7 @@
 # Benchmarks (prototype)
 
 - **Environment:** Intel Xeon E5-2630 v4 @ 2.20GHz, 36 logical CPUs, 128 GB, Linux 7.0.0, rustc 1.98.1, `--release` (no target-cpu tuning).
+- **Build flags since the platform contract:** `.cargo/config.toml` now builds every x86_64 target with `-C target-cpu=x86-64-v3` ([docs/platform.md](../platform.md)), so the command below no longer reproduces the generic x86-64 build measured here. The results have not been re-measured with v3. The E5-2630 v4 (Broadwell) has AVX2, BMI1/2, FMA, LZCNT and MOVBE, so it can run v3 builds; record the build flags with every new run.
 - **Build and run:**
   ```sh
   cargo build --release -p allocatbelt-bench

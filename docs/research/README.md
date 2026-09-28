@@ -53,6 +53,9 @@ Date: 2026-09-27. Detailed reports (with sources and verification tags):
 
 ## 4. Follow-up implementation (2026-09-28)
 
+Phase 1 of the Linux 7 / ISA / SIMD plan (the platform contract) is recorded in [docs/platform.md](../platform.md): compile-time gates for Linux, x86_64/aarch64/riscv64, 64-bit little-endian userspace and an x86-64-v3 floor, a CI job that checks them, and a start-up probe of the mandatory kernel facilities. It changed no allocation logic.
+
+
 Items 1–5 of the list above, plus fuzzing and loom for item 6. Measurements are in [benchmarks.md](benchmarks.md) ("Third round").
 
 ### Per-thread caches (`heap/cache.rs`)
