@@ -76,6 +76,9 @@ pub struct ThreadCache {
   state: Cell<u8>,
   /// Refills so far, to sample the clock.
   ticks: Cell<u32>,
+  /// Random state for the order blocks are handed out; 0 while
+  /// randomization is off.
+  rng: Cell<u64>,
 }
 
 impl ThreadCache {
@@ -99,6 +102,7 @@ impl ThreadCache {
       shard: Cell::new(0),
       state: Cell::new(DETACHED),
       ticks: Cell::new(0),
+      rng: Cell::new(0),
     }
   }
 
@@ -171,8 +175,16 @@ impl<O: Os> Heap<O> {
     if bits == 0 {
       return None;
     }
-    let i = bits.trailing_zeros();
-    cw.bits.set(bits & (bits - 1));
+    // Randomized, consecutive allocations are not adjacent in memory.
+    let x = tc.rng.get();
+    let i = if x == 0 {
+      bits.trailing_zeros()
+    } else {
+      let x = xorshift(x);
+      tc.rng.set(x);
+      pick_bit(bits, (x >> 32) as u32)
+    };
+    cw.bits.set(bits & !(1 << i));
     Some(cw.base.get() + i as usize * class::size(c))
   }
 
@@ -218,7 +230,14 @@ impl<O: Os> Heap<O> {
     if tc.state.get() == RETIRED {
       return;
     }
-    tc.shard.set(self.next_shard.fetch_add(1, Relaxed) % SHARDS);
+    let n = self.next_shard.fetch_add(1, Relaxed);
+    tc.shard.set(n % SHARDS);
+    let seed = self.seed.load(Relaxed);
+    tc.rng.set(if seed == 0 {
+      0
+    } else {
+      splitmix(seed ^ (n as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15))
+    });
     tc.state.set(ATTACHED);
   }
 

@@ -9,11 +9,14 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::vec::Vec;
 
+use crate::heap::MAX_RUN_PAGES;
 use crate::{
   ARENA_SIZE, Block, Heap, MAX_SEGMENTS, META_WORDS, Os, PAGE_SIZE, SEGMENT_SIZE, ThreadCache,
 };
 
 struct MockOs {
+  /// Pages behind a guard (`Os::guard`).
+  guarded: Mutex<BTreeSet<usize>>,
   meta: Vec<OnceLock<&'static [AtomicU64]>>,
   committed: Vec<AtomicBool>,
   live: Mutex<BTreeMap<usize, usize>>,
@@ -31,6 +34,7 @@ struct MockOs {
 impl MockOs {
   fn new() -> Self {
     Self {
+      guarded: Mutex::new(BTreeSet::new()),
       meta: (0..MAX_SEGMENTS).map(|_| OnceLock::new()).collect(),
       committed: (0..MAX_SEGMENTS).map(|_| AtomicBool::new(false)).collect(),
       live: Mutex::new(BTreeMap::new()),
@@ -70,11 +74,23 @@ impl MockOs {
       );
     }
   }
+
+  fn assert_unguarded(&self, offset: usize, len: usize, what: &str) {
+    let g = self.guarded.lock().unwrap();
+    let hit = g
+      .range(offset / PAGE_SIZE..(offset + len).div_ceil(PAGE_SIZE))
+      .next();
+    assert!(
+      hit.is_none(),
+      "{what} of {offset:#x}+{len:#x} covers guard page {hit:?}"
+    );
+  }
 }
 
 impl Os for MockOs {
   fn commit(&self, offset: usize, len: usize) -> bool {
     assert_eq!(offset % SEGMENT_SIZE, 0);
+    self.assert_unguarded(offset, len, "commit");
     for s in offset / SEGMENT_SIZE..(offset + len) / SEGMENT_SIZE {
       self.committed[s].store(true, Ordering::Relaxed);
     }
@@ -111,6 +127,18 @@ impl Os for MockOs {
   }
   fn now_ms(&self) -> u64 {
     self.clock.load(Ordering::Relaxed)
+  }
+  fn guard(&self, offset: usize, len: usize) -> bool {
+    self.assert_no_live(offset, len, "guard");
+    let mut g = self.guarded.lock().unwrap();
+    g.extend(offset / PAGE_SIZE..(offset + len) / PAGE_SIZE);
+    true
+  }
+  fn unguard(&self, offset: usize, len: usize) {
+    let mut g = self.guarded.lock().unwrap();
+    for p in offset / PAGE_SIZE..(offset + len) / PAGE_SIZE {
+      assert!(g.remove(&p), "unguard of page {p}, which is not guarded");
+    }
   }
   fn fatal(&self, msg: &'static str) -> ! {
     panic!("{msg}")
@@ -172,6 +200,7 @@ fn record(h: &Heap<MockOs>, b: Block, size: usize, align: usize) {
     }
     w.extend(pages);
   }
+  h.os().assert_unguarded(off, size.max(1), "allocation");
   assert_eq!(off % align, 0, "size {size} align {align} -> {off:#x}");
   assert!(off + size <= ARENA_SIZE);
   let usable = h.usable_size(off);
@@ -208,6 +237,7 @@ fn resize(h: &Heap<MockOs>, off: usize, new_size: usize) -> bool {
     return false;
   }
   assert!(h.usable_size(off) >= new_size);
+  h.os().assert_unguarded(off, new_size, "resize");
   let end = off + new_size;
   for s in off / SEGMENT_SIZE..end.div_ceil(SEGMENT_SIZE) {
     assert!(
@@ -549,7 +579,8 @@ fn failed_purges_are_not_zeroed() {
   free(h, huge.offset);
   let owned = alloc_block(h, 1, 5 * PAGE_SIZE, 8);
   assert!(owned.offset < SEGMENT_SIZE && !owned.zeroed);
-  assert_eq!(h.dirty_pages(), 64 - 5);
+  // (All pages but the guard page start dirty.)
+  assert_eq!(h.dirty_pages(), MAX_RUN_PAGES - 5);
   // Once purging works again, the pages are clean and reported zeroed.
   h.os().purge_fails.store(false, Ordering::Relaxed);
   h.purge();
@@ -680,8 +711,9 @@ fn resize_of_freed_block() {
 fn freed_small_pages_leave_their_segments() {
   let h = heap();
   let base = h.segments_in_use();
-  // Enough 16-byte blocks for three segments, then free them all.
-  let n = 3 * SEGMENT_SIZE / 16;
+  // Enough 16-byte blocks for three segments (all pages but the guard
+  // pages), then free them all.
+  let n = 3 * MAX_RUN_PAGES * PAGE_SIZE / 16;
   let offs: Vec<_> = (0..n).map(|_| h.alloc(6, 16, 8).unwrap()).collect();
   assert_eq!(h.segments_in_use(), base + 3);
   // Keep one block so its page stays behind.
@@ -881,8 +913,13 @@ fn cached_threads_with_cross_frees() {
 proptest::proptest! {
     #![proptest_config(proptest::prelude::ProptestConfig::with_cases(if cfg!(miri) { 2 } else { 64 }))]
     #[test]
-    fn random_cached_sequences(ops in proptest::collection::vec((0usize..20_000, 0u32..6, 0u8..5, 0usize..3), 1..400)) {
+    fn random_cached_sequences(
+        ops in proptest::collection::vec((0usize..20_000, 0u32..6, 0u8..5, 0usize..3), 1..400),
+        seed in proptest::prop_oneof![proptest::strategy::Just(0u64), proptest::prelude::any::<u64>()],
+    ) {
         let h = heap();
+        // Randomized placement must keep every invariant too.
+        h.set_seed(seed);
         let caches = [cache(h), cache(h), ThreadCache::new()];
         let mut live = Vec::new();
         for (size, align_shift, op, t) in ops {
@@ -1037,4 +1074,65 @@ fn budget_passes_purge_everything_dirty() {
   // delay, but kept the (just emptied) segments.
   assert!(h.dirty_pages() < crate::heap::DIRTY_BUDGET_PAGES as usize);
   assert_eq!(h.segments_in_use(), segs);
+}
+
+// ---- hardening -----------------------------------------------------------------
+
+#[test]
+fn owned_segments_end_in_a_guard_page() {
+  let h = heap();
+  // The longest page run fits beside the guard page; one page more takes a
+  // whole segment.
+  let run = alloc(h, 0, MAX_RUN_PAGES * PAGE_SIZE, 8);
+  assert_eq!(h.usable_size(run), MAX_RUN_PAGES * PAGE_SIZE);
+  let whole = alloc(h, 0, MAX_RUN_PAGES * PAGE_SIZE + 1, 8);
+  assert_eq!(h.usable_size(whole), SEGMENT_SIZE);
+  assert_eq!(h.os().guarded.lock().unwrap().len(), 1);
+  // A run does not grow into the guard page.
+  assert!(!resize(h, run, MAX_RUN_PAGES * PAGE_SIZE + 1));
+  // A second owned segment gets its own guard.
+  let more = alloc(h, 0, 2 * PAGE_SIZE, 8);
+  assert_eq!(h.os().guarded.lock().unwrap().len(), 2);
+  for o in [run, whole, more] {
+    free(h, o);
+  }
+  // Returning a segment removes its guard (the mock `commit` checks that
+  // nothing guarded is committed again, e.g. for this huge block).
+  h.purge();
+  assert_eq!(h.os().guarded.lock().unwrap().len(), 1);
+  let huge = alloc(h, 0, 3 * SEGMENT_SIZE, 8);
+  free(h, huge);
+}
+
+#[test]
+fn seeded_placement_is_randomized() {
+  let first = |seed: u64| {
+    let h = heap();
+    h.set_seed(seed);
+    let tc = cache(h);
+    let blocks: Vec<_> = (0..4).map(|_| alloc_c(h, &tc, 64, 8)).collect();
+    (blocks[0] / SEGMENT_SIZE, blocks)
+  };
+  // Unseeded heaps are deterministic: first segment, consecutive blocks.
+  let (seg, blocks) = first(0);
+  assert_eq!(seg, 0);
+  assert!(blocks.windows(2).all(|w| w[1] == w[0] + 64));
+  assert_eq!(first(0).1, blocks);
+  // Seeded ones vary the segment, the word and the order within a word.
+  let runs: Vec<_> = (1..=16u64)
+    .map(|i| first(i.wrapping_mul(0x9E37_79B9_7F4A_7C15)))
+    .collect();
+  let segs: BTreeSet<_> = runs.iter().map(|r| r.0).collect();
+  let offsets: BTreeSet<_> = runs.iter().map(|r| r.1[0] % SEGMENT_SIZE).collect();
+  assert!(segs.len() > 8, "segments barely vary: {segs:?}");
+  assert!(offsets.len() > 8, "offsets barely vary: {offsets:?}");
+  let adjacent = runs
+    .iter()
+    .flat_map(|r| r.1.windows(2).map(|w| w[1] == w[0] + 64))
+    .filter(|&a| a)
+    .count();
+  assert!(
+    adjacent < 16,
+    "{adjacent} of 48 consecutive blocks were adjacent"
+  );
 }

@@ -170,7 +170,7 @@ impl<O: Os> Heap<O> {
         let seg = cur as usize - 1;
         let m = self.seg_meta(seg);
         let next = m[SEG_NEXT].load(Relaxed);
-        let empty = m[SEG_PAGES].load(Acquire) == 0;
+        let empty = m[SEG_PAGES].load(Acquire) == GUARD_BIT;
         let expired = if empty && kept_empty {
           // Idle since epoch `since - 1`; stamped by the first pass that
           // saw it.
@@ -187,7 +187,7 @@ impl<O: Os> Heap<O> {
         // in-place growth, which needs a live block in the segment.
         if expired
           && m[SEG_PAGES]
-            .compare_exchange(0, u64::MAX, AcqRel, Relaxed)
+            .compare_exchange(GUARD_BIT, u64::MAX, AcqRel, Relaxed)
             .is_ok()
         {
           match prev {
@@ -213,6 +213,11 @@ impl<O: Os> Heap<O> {
     self
       .dirty_pages
       .fetch_sub(dirty.count_ones() as isize, Relaxed);
+    // The segment may next be committed whole (e.g. for a huge block).
+    self.os.unguard(
+      (seg * PAGES_PER_SEGMENT + GUARD_PAGE) << PAGE_SHIFT,
+      PAGE_SIZE,
+    );
     self.free_segments(seg, 1);
   }
 

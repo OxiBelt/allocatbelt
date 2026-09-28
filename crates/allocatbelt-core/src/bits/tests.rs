@@ -72,6 +72,9 @@ fn pick_wraps() {
   assert_eq!(pick_bit(0b1001, 1), 3);
   assert_eq!(pick_bit(0b1001, 4), 0);
   assert_eq!(pick_bit(1 << 63, 17), 63);
+  // Any `r` works, not only `r < 64`: randomness comes in as a full `u32`.
+  assert_eq!(pick_bit(1 << 62, u32::MAX), 62);
+  assert_eq!(pick_bit(0b1001, 64 + 1), 3);
 }
 
 proptest::proptest! {

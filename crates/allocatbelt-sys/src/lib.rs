@@ -180,7 +180,54 @@ impl Region {
     let _ = unsafe { mm::mprotect(p, len, MprotectFlags::empty()) };
     zeroed
   }
+
+  /// Makes the range fault on any access, discarding its contents. Uses
+  /// guard markers (`MADV_GUARD_INSTALL`, Linux 6.13+), which do not split
+  /// the mapping into more VMAs; on older kernels falls back to
+  /// `mprotect(PROT_NONE)`. Returns `false` if neither worked.
+  /// [`Region::unguard`] removes the markers, and [`Region::commit`]
+  /// restores access after the fallback.
+  ///
+  /// # Safety
+  ///
+  /// As for [`Region::decommit`].
+  #[expect(unsafe_code, reason = "contract: caller owns the range")]
+  pub unsafe fn guard(&self, offset: usize, len: usize) -> bool {
+    let Some(p) = self.range(offset, len) else {
+      return false;
+    };
+    // SAFETY: the span is inside our mapping (checked by `range`), and the
+    // caller guarantees nothing uses its contents, which the markers
+    // discard.
+    #[expect(unsafe_code, reason = "madvise syscall")]
+    let r = unsafe { libc::madvise(p, len, MADV_GUARD_INSTALL) };
+    if r == 0 {
+      return true;
+    }
+    // SAFETY: as above; revoking access cannot fault a live user.
+    #[expect(unsafe_code, reason = "mprotect syscall")]
+    let r = unsafe { mm::mprotect(p, len, MprotectFlags::empty()) };
+    r.is_ok()
+  }
+
+  /// Removes guard markers installed by [`Region::guard`]; a no-op for a
+  /// range without any, and on kernels without guard markers.
+  pub fn unguard(&self, offset: usize, len: usize) {
+    let Some(p) = self.range(offset, len) else {
+      return;
+    };
+    // SAFETY: the span is inside our mapping. Removing guard markers turns
+    // faulting pages into zero-fill-on-demand pages and leaves other pages
+    // alone, so it cannot invalidate memory in use.
+    #[expect(unsafe_code, reason = "madvise syscall")]
+    let _ = unsafe { libc::madvise(p, len, MADV_GUARD_REMOVE) };
+  }
 }
+
+/// `madvise` advice for guard markers (Linux 6.13+,
+/// `include/uapi/asm-generic/mman-common.h`); not yet in the `libc` crate.
+const MADV_GUARD_INSTALL: libc::c_int = 102;
+const MADV_GUARD_REMOVE: libc::c_int = 103;
 
 const SLOT_EMPTY: u8 = 0;
 const SLOT_BUSY: u8 = 1;
@@ -271,10 +318,12 @@ pub fn yield_now() {
 }
 
 /// 64 bits from the kernel CSPRNG (`getrandom(2)`), for hardening secrets.
+/// Returns `None` instead of blocking when the kernel's pool is not
+/// initialised yet (early boot).
 #[must_use]
 pub fn random_u64() -> Option<u64> {
   let mut buf = [0u8; 8];
-  match rustix::rand::getrandom(&mut buf, rustix::rand::GetRandomFlags::empty()) {
+  match rustix::rand::getrandom(&mut buf, rustix::rand::GetRandomFlags::NONBLOCK) {
     Ok(8) => Some(u64::from_ne_bytes(buf)),
     _ => None,
   }

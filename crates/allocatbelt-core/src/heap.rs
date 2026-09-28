@@ -59,7 +59,7 @@
 
 use core::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
-use crate::bits::run_mask;
+use crate::bits::{pick_bit, run_mask};
 use crate::class::{self, MIN_ALIGN, NUM_CLASSES, SMALL_MAX};
 use crate::lock::SpinLock;
 use crate::proto;
@@ -103,6 +103,20 @@ pub trait Os: Sync {
   fn commit_meta(&self, segment: usize) -> Option<&[AtomicU64]>;
   /// Metadata words of `segment` if [`Os::commit_meta`] succeeded before.
   fn meta(&self, segment: usize) -> Option<&[AtomicU64]>;
+  /// Makes `offset..offset + len` fault on any access, discarding its
+  /// contents. Returns whether a guard is in place. The heap only guards
+  /// ranges that hold no live allocation, never hands them out while
+  /// guarded, and calls [`Os::unguard`] before the range can be committed
+  /// for other use. The default installs no guard.
+  fn guard(&self, offset: usize, len: usize) -> bool {
+    let _ = (offset, len);
+    false
+  }
+  /// Removes a guard installed by [`Os::guard`]. The range need not become
+  /// accessible until it is committed again.
+  fn unguard(&self, offset: usize, len: usize) {
+    let _ = (offset, len);
+  }
   /// Called while spinning on a contended lock.
   fn yield_now(&self) {}
   /// Milliseconds on a monotonic clock, for delaying purges (see
@@ -145,6 +159,15 @@ const PAGE_SMALL: u64 = 1;
 const PAGE_LARGE: u64 = 2;
 const PAGE_LARGE_TAIL: u64 = 3;
 
+/// The last page of every owned segment is a guard page: never handed out
+/// and, where the [`Os`] supports it, faulting on access, so that a linear
+/// overflow out of one segment's last block cannot run into the next
+/// segment's memory.
+const GUARD_PAGE: usize = PAGES_PER_SEGMENT - 1;
+const GUARD_BIT: u64 = 1 << GUARD_PAGE;
+/// Longest page run inside a segment; longer blocks take whole segments.
+pub const MAX_RUN_PAGES: usize = PAGES_PER_SEGMENT - 1;
+
 /// Dirty (freed, unpurged) pages tolerated before a purge pass (32 MiB).
 pub const DIRTY_BUDGET_PAGES: isize = 512;
 /// How long freed pages stay resident, and empty segments stay owned,
@@ -177,6 +200,9 @@ struct Shard {
   lock: SpinLock,
   /// Head of the list of segments owned by this shard (segment + 1).
   segs: AtomicU32,
+  /// Random state for placement decisions, stepped under the lock; 0 while
+  /// randomization is off.
+  rng: AtomicU64,
   classes: [ClassState; NUM_CLASSES],
 }
 
@@ -185,9 +211,39 @@ impl Shard {
     Self {
       lock: SpinLock::new(),
       segs: AtomicU32::new(0),
+      rng: AtomicU64::new(0),
       classes: [const { ClassState::new() }; NUM_CLASSES],
     }
   }
+
+  /// Next random number, or 0 if randomization is off. Caller holds the
+  /// lock.
+  fn random(&self) -> u32 {
+    let x = self.rng.load(Relaxed);
+    if x == 0 {
+      return 0;
+    }
+    let x = xorshift(x);
+    self.rng.store(x, Relaxed);
+    (x >> 32) as u32
+  }
+}
+
+/// One step of xorshift64 (never maps a non-zero state to zero).
+const fn xorshift(mut x: u64) -> u64 {
+  x ^= x << 13;
+  x ^= x >> 7;
+  x ^= x << 17;
+  x
+}
+
+/// splitmix64: spreads a seed into an independent non-zero state.
+const fn splitmix(seed: u64) -> u64 {
+  let mut z = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
+  z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+  z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+  z ^= z >> 31;
+  if z == 0 { 1 } else { z }
 }
 
 // ---- blocks and metadata views -------------------------------------------
@@ -289,6 +345,8 @@ pub struct Heap<O> {
   auto_decay: AtomicBool,
   /// Round-robin shard assignment for attached thread caches.
   next_shard: AtomicUsize,
+  /// Secret for randomized placement; 0 turns randomization off.
+  seed: AtomicU64,
   shards: [Shard; SHARDS],
 }
 
@@ -306,6 +364,7 @@ impl<O: Os> Heap<O> {
       epoch: AtomicU64::new(0),
       auto_decay: AtomicBool::new(true),
       next_shard: AtomicUsize::new(0),
+      seed: AtomicU64::new(0),
       shards: [const { Shard::new() }; SHARDS],
     }
   }
@@ -313,6 +372,23 @@ impl<O: Os> Heap<O> {
   /// The environment this heap runs on.
   pub const fn os(&self) -> &O {
     &self.os
+  }
+
+  /// Seeds randomized placement: the bitmap word a refill claims, the order
+  /// a thread hands out the blocks of a word, and where new segments go in
+  /// the arena. The embedder passes a secret from the OS (e.g.
+  /// `getrandom`), so that heap layout is hard to predict; 0 (the default)
+  /// turns randomization off. Threads attached earlier keep their state.
+  pub fn set_seed(&self, seed: u64) {
+    self.seed.store(seed, Relaxed);
+    for (i, sh) in self.shards.iter().enumerate() {
+      let x = if seed == 0 {
+        0
+      } else {
+        splitmix(seed ^ ((i as u64) << 32))
+      };
+      sh.rng.store(x, Relaxed);
+    }
   }
 
   fn kind(size: usize, align: usize) -> Option<Kind> {
@@ -326,7 +402,7 @@ impl<O: Os> Heap<O> {
       return Some(Kind::Small(c));
     }
     let n = size.div_ceil(PAGE_SIZE).max(1);
-    if n <= PAGES_PER_SEGMENT {
+    if n <= MAX_RUN_PAGES {
       // Alignments above a page place the run at a multiple of
       // `align / PAGE_SIZE` pages; the segment itself is aligned.
       return Some(Kind::Run(n, (align / PAGE_SIZE).max(1)));
@@ -403,7 +479,7 @@ impl<O: Os> Heap<O> {
       Target::Large { page, m, pm, info } => {
         let n = ((info >> 16) & 0xFF) as usize;
         let n2 = new_size.div_ceil(PAGE_SIZE).max(1);
-        if n2 > PAGES_PER_SEGMENT {
+        if n2 > MAX_RUN_PAGES {
           return false;
         }
         if n2 > n {
@@ -548,7 +624,7 @@ impl<O: Os> Heap<O> {
         );
         let pm = PageMeta::new(m, in_seg);
         let words = &pm.bitmaps()[..class::bitmap_words(c)];
-        if let Some((w, bits)) = proto::claim_word(pm.summary(), words, 0) {
+        if let Some((w, bits)) = proto::claim_word(pm.summary(), words, sh.random()) {
           pm.free().fetch_sub(u64::from(bits.count_ones()), Relaxed);
           return Some(Some((page, w, bits)));
         }
@@ -749,25 +825,29 @@ impl<O: Os> Heap<O> {
       }
       cur = m[SEG_NEXT].load(Relaxed) as u32;
     }
-    let seg = self.alloc_segments(1)?;
+    let seg = self.alloc_segments(1, sh.random())?;
     let m = self.seg_meta(seg);
     // A segment whose memory may hold stale bytes starts fully dirty, so
     // it is neither reported as zeroed nor kept resident forever. Dirty
     // is written before the pages are opened up so a concurrent purge
     // pass never sees clean-looking free pages.
     if m[SEG_DIRTY].load(Relaxed) != 0 {
-      m[SEG_DIRTY].store(u64::MAX, Relaxed);
-      self
-        .dirty_pages
-        .fetch_add(PAGES_PER_SEGMENT as isize, Relaxed);
+      m[SEG_DIRTY].store(!GUARD_BIT, Relaxed);
+      self.dirty_pages.fetch_add(MAX_RUN_PAGES as isize, Relaxed);
     }
+    // The guard page stays claimed for as long as the shard owns the
+    // segment, so nothing hands it out, purges it or marks it dirty.
+    let _ = self.os.guard(
+      (seg * PAGES_PER_SEGMENT + GUARD_PAGE) << PAGE_SHIFT,
+      PAGE_SIZE,
+    );
     // Late frees of a previous owner may have left hints behind.
     for c in 0..NUM_CLASSES {
       m[SEG_CLS + c].store(0, Relaxed);
       m[SEG_AVAIL + c].store(0, Relaxed);
     }
     m[SEG_IDLE].store(0, Relaxed);
-    m[SEG_PAGES].store(0, Release);
+    m[SEG_PAGES].store(GUARD_BIT, Release);
     m[SEG_NEXT].store(u64::from(sh.segs.load(Relaxed)), Relaxed);
     m[SEG_HDR].store(SEG_OWNED | (s as u64) << 8 | 1 << 16, Release);
     sh.segs.store(seg as u32 + 1, Relaxed);
@@ -816,7 +896,7 @@ impl<O: Os> Heap<O> {
   // ---- segments ------------------------------------------------------
 
   fn alloc_huge(&self, k: usize) -> Option<Block> {
-    let first = self.alloc_segments(k)?;
+    let first = self.alloc_segments(k, 0)?;
     let mut zeroed = true;
     for i in (0..k).rev() {
       let hdr = if i == 0 {
@@ -884,14 +964,15 @@ impl<O: Os> Heap<O> {
 
   /// Takes `k` contiguous segments from the arena, commits their metadata
   /// and memory, and returns the first index. The segments' `SEG_DIRTY`
-  /// word tells whether their memory may hold non-zero bytes.
-  fn alloc_segments(&self, k: usize) -> Option<usize> {
+  /// word tells whether their memory may hold non-zero bytes. `r` randomizes
+  /// the placement of single segments (see `find_free_segments`).
+  fn alloc_segments(&self, k: usize, r: u32) -> Option<usize> {
     if k == 0 || k > MAX_SEGMENTS {
       return None;
     }
     let first = {
       let _g = self.seg_lock.lock(|| self.os.yield_now());
-      let first = self.find_free_segments(k)?;
+      let first = self.find_free_segments(k, r)?;
       self.mark_segments(first, k, true);
       first
     };
@@ -930,7 +1011,18 @@ impl<O: Os> Heap<O> {
   }
 
   /// First-fit search for `k` free segments. Caller holds `seg_lock`.
-  fn find_free_segments(&self, k: usize) -> Option<usize> {
+  ///
+  /// With a non-zero `r`, a single segment is instead picked at random
+  /// among the free ones of the first 64-segment group that has any, which
+  /// makes addresses hard to predict while keeping the arena compact (the
+  /// metadata of a segment that was ever used stays committed).
+  fn find_free_segments(&self, k: usize, r: u32) -> Option<usize> {
+    if k == 1 && r != 0 {
+      return self.seg_used.iter().enumerate().find_map(|(wi, w)| {
+        let free = !w.load(Relaxed);
+        (free != 0).then(|| wi * 64 + pick_bit(free, r) as usize)
+      });
+    }
     let mut run = 0;
     let mut i = 0;
     while i < MAX_SEGMENTS {

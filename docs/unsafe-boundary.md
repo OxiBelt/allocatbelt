@@ -14,7 +14,11 @@ Regenerate: `grep -rn "unsafe" crates/*/src | grep -E "unsafe (\{|fn|impl)"`
 | `Region::commit` | block | `mprotect(RW)` | Range checked; it only adds permissions, so it cannot invalidate any existing reference. |
 | `Region::purge` | **`unsafe fn`** + block | `madvise(MADV_DONTNEED)` | The contents are discarded, so the caller guarantees "no live references or concurrent access in the range". Returns whether the kernel accepted it, i.e. whether the range now reads as zero. |
 | `Region::decommit` | **`unsafe fn`** + block ×2 | `purge` + `mprotect(NONE)` | Same contract, plus no access until the range is committed again. |
+| `Region::guard` | **`unsafe fn`** + block ×2 | `madvise(MADV_GUARD_INSTALL)` (`libc`, Linux 6.13+), else `mprotect(NONE)` | Same contract as `decommit`: the markers discard the contents and fault on access, so nothing may use the range until it is unguarded and committed again. |
+| `Region::unguard` | block | `madvise(MADV_GUARD_REMOVE)` (`libc`) | Range checked; removing guard markers only turns faulting pages into zero-fill pages and leaves other pages alone, so it cannot invalidate memory in use. |
 | `MetaArena::slot` | block | `slice::from_raw_parts` → `&[AtomicU64]` | Published only after commit (READY, Acquire). Never unmapped or purged. Zero-filled by the kernel, so every bit pattern is valid, and only atomic access follows. |
+
+`libc` is used only for what rustix does not cover: the guard-marker advice values (not in rustix's `Advice` enum).
 
 The sys crate **does not use** `rustix::param::page_size()`: reading auxv may allocate when rustix's `alloc` feature gets unified in, which would re-enter the allocator. Instead every range uses a fixed 64 KiB granule, a multiple of all Linux page sizes.
 
@@ -23,6 +27,7 @@ The sys crate **does not use** `rustix::param::page_size()`: reading auxv may al
 | Location | Kind | Operation | Why it is sound |
 |---|---|---|---|
 | `LinuxOs::purge/decommit` | block ×2 | calls `Region::purge/decommit` | The core's `Os` contract: it only purges or decommits ranges with no live allocations (see below). |
+| `LinuxOs::guard` | block | calls `Region::guard` | The core's `Os` contract: it only guards the last page of an owned segment, which it never hands out, and unguards it before the segment can be committed for other use (trust assumption 5). |
 | `impl GlobalAlloc` | `unsafe impl` + 4 `unsafe fn` | — | Required by the trait. Unwinding is blocked by `AbortOnUnwind`. |
 | `alloc_zeroed` | block | `write_bytes(0, size)` | A fresh block that nobody references yet. Skipped when the core reports the block as already zero (trust assumption 4). |
 | `realloc` | block | `copy_nonoverlapping` | The old block is live (caller contract); the new block is a separate fresh block. |
@@ -35,6 +40,7 @@ The narrow boundary makes each *operation* auditable, but soundness still depend
 2. It never calls `purge`/`decommit` on a range that holds a live allocation.
 3. It never hands out an offset that has not been committed.
 4. It only reports a block as `zeroed` if every page of it was never handed out, or was purged/decommitted with success (`Os::purge`/`Os::decommit` returned `true`) since it was last handed out. Otherwise `calloc` would return stale bytes.
+5. It never hands out, purges or commits a guarded page: the guard page of an owned segment stays claimed in the segment's page bitmap for as long as the segment is owned, and `Os::unguard` runs before the segment returns to the arena.
 
 Current verification: shadow-map checks against the mock `Os` (non-overlap, commit state, purge overlap, and a written-pages shadow that every `zeroed` claim is checked against, including with failing purges), proptest random sequences, multi-threaded cross-thread-free tests, and a partial Miri run on the core tests (below).
 

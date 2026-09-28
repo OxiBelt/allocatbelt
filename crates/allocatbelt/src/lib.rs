@@ -39,13 +39,33 @@ static ARENA: OnceLock<Option<Arena>> = OnceLock::new();
 fn arena() -> Option<&'static Arena> {
   ARENA
     .get_or_init(|| {
-      Some(Arena {
+      let arena = Arena {
         user: Region::reserve(ARENA_SIZE, SEGMENT_SIZE)?,
         meta: MetaArena::reserve(META_WORDS)?,
         start: Instant::now(),
-      })
+      };
+      // Before any allocation: every heap call goes through `arena` first.
+      HEAP.set_seed(seed());
+      Some(arena)
     })
     .as_ref()
+}
+
+/// A secret for randomized placement: from the kernel CSPRNG, or, if its
+/// pool is not ready yet (early boot), from ASLR and the time.
+fn seed() -> u64 {
+  if let Some(s) = allocatbelt_sys::random_u64()
+    && s != 0
+  {
+    return s;
+  }
+  let local = 0u8;
+  let aslr =
+    (&raw const local).addr() as u64 ^ (seed as fn() -> u64 as usize as u64).rotate_left(32);
+  let time = std::time::SystemTime::now()
+    .duration_since(std::time::UNIX_EPOCH)
+    .map_or(0, |d| d.as_nanos() as u64);
+  (aslr ^ time.rotate_left(17)) | 1
 }
 
 /// The [`Os`] of the global heap. It is only reached after [`arena`]
@@ -83,6 +103,20 @@ impl Os for LinuxOs {
     unsafe {
       self.arena().user.purge(offset, len)
     }
+  }
+
+  fn guard(&self, offset: usize, len: usize) -> bool {
+    // SAFETY: the `Os` contract of allocatbelt-core: the heap only guards
+    // ranges holding no live allocation and hands nothing out of them
+    // until it has unguarded and committed them again.
+    #[expect(unsafe_code, reason = "installing a guard page")]
+    unsafe {
+      self.arena().user.guard(offset, len)
+    }
+  }
+
+  fn unguard(&self, offset: usize, len: usize) {
+    self.arena().user.unguard(offset, len);
   }
 
   fn commit_meta(&self, segment: usize) -> Option<&[AtomicU64]> {
