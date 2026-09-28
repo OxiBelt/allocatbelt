@@ -387,7 +387,7 @@ fn environment(cfg: &Config, counters: &std::io::Result<Counters>, csv: bool) {
     format!("kernel: {}", kernel.trim()),
     format!("rustc: {}", env!("ALLOCATBELT_RUSTC_VERSION")),
     format!("build target features: {}", flags.join(",")),
-    format!("detected: {:?}", allocatbelt_arch::detected_features()),
+    format!("detected: {:?}", allocatbelt::Allocatbelt.cpu_features()),
     format!("repetitions: {} x ~{} us", cfg.reps, cfg.rep_ns / 1000),
     format!("counters: {counters}"),
   ];

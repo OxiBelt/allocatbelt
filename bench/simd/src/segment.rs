@@ -1,4 +1,4 @@
-//! One segment's metadata words, laid out as in `allocatbelt-core`, so that
+//! One segment's metadata words, laid out as in allocatbelt's core, so that
 //! a kernel can be measured on the data the allocator would really read.
 //!
 //! The `age` family runs its kernels on a contiguous `[u64; 64]`. In the
@@ -13,10 +13,12 @@
 use core::sync::atomic::AtomicU64;
 use core::sync::atomic::Ordering::Relaxed;
 
-use allocatbelt_core::{META_WORDS, PAGE_META_WORDS, PAGES_PER_SEGMENT, SEGMENT_HEADER_WORDS};
+use allocatbelt_core_check::core::{
+  META_WORDS, PAGE_META_WORDS, PAGES_PER_SEGMENT, SEGMENT_HEADER_WORDS,
+};
 
 /// Word of a page record that holds the page's dirty epoch. Mirrors the
-/// private `P_SINCE` of `allocatbelt-core`'s heap.
+/// private `P_SINCE` of the core's heap.
 const P_SINCE: usize = 3;
 
 /// The metadata words of one segment; only the dirty epochs are set.

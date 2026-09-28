@@ -1,10 +1,12 @@
 # unsafe boundary inventory
 
-`allocatbelt-core` uses `#![forbid(unsafe_code)]`, so it contains **0** `unsafe` sites. All the `unsafe` is listed below. Every `unsafe` block holds exactly one unsafe operation and carries a `// SAFETY:` comment (`clippy::undocumented_unsafe_blocks` and `multiple_unsafe_ops_per_block` are deny).
+`allocatbelt` is one package with four modules. `core` (`crates/allocatbelt/src/core/`) carries `#![forbid(unsafe_code)]` as an inner attribute, so it contains **0** `unsafe` sites, and the `publish = false` package `allocatbelt-core-check` compiles the same source as a `#![no_std]`, `#![forbid(unsafe_code)]` crate of its own, which runs the core's tests, the checking model and loom. All the `unsafe` is in `sys`, `arch` and `global` (with `rseq`), listed below. Every `unsafe` block holds exactly one unsafe operation and carries a `// SAFETY:` comment (`clippy::undocumented_unsafe_blocks` and `multiple_unsafe_ops_per_block` are deny).
 
-Regenerate: `grep -rn "unsafe" crates/*/src bench/simd/src | grep -E "unsafe (\{|fn|impl)"`
+Regenerate: `grep -rn "unsafe" crates/allocatbelt/src bench/simd/src | grep -E "unsafe (\{|fn|impl|extern)"`
 
-## allocatbelt-sys
+## `sys` (`crates/allocatbelt/src/sys/`)
+
+`Region`, `MetaArena`, `register_atfork` and `set_batch_scheduling` are in `sys/mod.rs`, `probe` in `sys/platform.rs`.
 
 | Location | Kind | Operation | Why it is sound |
 |---|---|---|---|
@@ -22,7 +24,7 @@ Regenerate: `grep -rn "unsafe" crates/*/src bench/simd/src | grep -E "unsafe (\{
 | `platform::probe` | block ×5 | `write_volatile` / `read_volatile` of one byte, `Region::purge`, `Region::guard_markers`, `Region::decommit`, all on a 64 KiB scratch `Region` the probe reserves itself | The scratch range is private to the function: no reference to it exists and nothing else knows its address, so writing, purging, guarding and decommitting it cannot affect any other memory. The byte is written and read only while the range is committed read/write (a purge keeps it accessible). Runs once, before the arena is reserved ([docs/platform.md](platform.md)). |
 | `set_batch_scheduling` | block | `libc::syscall(SYS_sched_setscheduler, 0, SCHED_BATCH, &param)` | The kernel only reads `param`, a live `#[repr(C)]` local with the UAPI `struct sched_param` layout (one `int`, 0 as `SCHED_BATCH` requires), and changes only the calling thread's policy (pid 0 is the caller). A raw syscall because rustix has no binding and musl's `sched_setscheduler` wrapper always fails. Called once, by the maintenance thread. |
 
-### `ring` (io_uring purge ring, plan Phase 8)
+### `sys/ring.rs` (io_uring purge ring, plan Phase 8)
 
 A restricted ring for batched `MADV_DONTNEED` (`PurgeRing`, used by the maintenance thread only after `Allocatbelt::set_io_uring(true)`). The syscalls go through rustix's `io_uring_*` functions, which are `unsafe` because the kernel works on raw pointers; no safe crate covers a ring that the allocator can use without allocating. A safe alternative would be `madvise` per run, which stays the default.
 
@@ -37,9 +39,9 @@ A restricted ring for batched `MADV_DONTNEED` (`PurgeRing`, used by the maintena
 | `PurgeRing::word` | block | `&*(ring + off) as &AtomicU32` | The kernel's offsets point at aligned `u32` heads, tails and masks inside the mapping, which lives as long as the ring; both sides access them atomically. |
 | `PurgeRing::purge` | **`unsafe fn`** + block ×2 | batched `madvise(MADV_DONTNEED)`; `Region::purge` for ranges that were never submitted (a retired ring) | The contract of `Region::purge`, for every range. `purge` returns only after every submitted purge has completed, or reports `CompletionLost` (a failed completion wait), on which the adapter aborts rather than reuse pages a purge may still discard. |
 
-### `rseq` (`mm_cid` reads, plan Phase 9, feature `rseq`)
+### `sys/rseq.rs` (`mm_cid` reads, plan Phase 9, feature `experimental-rseq`)
 
-Compiled only with the sys feature `rseq` (the adapter's `experimental-rseq`). It reads the calling thread's `mm_cid` from the rseq area glibc registered; it registers nothing and runs no rseq critical section. A safe alternative does not exist: the area is only reachable through the thread pointer.
+Compiled only with the feature `experimental-rseq`. It reads the calling thread's `mm_cid` from the rseq area glibc registered; it registers nothing and runs no rseq critical section. A safe alternative does not exist: the area is only reachable through the thread pointer.
 
 | Location | Kind | Operation | Why it is sound |
 |---|---|---|---|
@@ -50,11 +52,11 @@ Compiled only with the sys feature `rseq` (the adapter's `experimental-rseq`). I
 
 `futex_wait`/`futex_wake` (the heap locks' sleep and wake-up, and the maintenance thread's timed sleep) use rustix's safe futex functions and add no `unsafe` site.
 
-`libc` is used only for what rustix does not cover: the guard-marker advice values (not in rustix's `Advice` enum), `pthread_atfork`, `sched_setscheduler` and, with the `rseq` feature, `getauxval`.
+`libc` is used only for what rustix does not cover: the guard-marker advice values (not in rustix's `Advice` enum), `pthread_atfork`, `sched_setscheduler` and, with `experimental-rseq`, `getauxval`.
 
-The sys crate **does not use** `rustix::param::page_size()`: reading auxv may allocate when rustix's `alloc` feature gets unified in, which would re-enter the allocator. Instead every range uses a fixed 64 KiB granule, a multiple of all Linux page sizes.
+The `sys` module **does not use** `rustix::param::page_size()`: reading auxv may allocate when rustix's `alloc` feature gets unified in, which would re-enter the allocator. Instead every range uses a fixed 64 KiB granule, a multiple of all Linux page sizes.
 
-## allocatbelt-arch
+## `arch` (`crates/allocatbelt/src/arch/`)
 
 CPU feature detection only; no architecture kernel exists yet. Every site runs during `initialize_dispatch()` (or the first `detected_features()` call) and only reads CPU or kernel state.
 
@@ -64,9 +66,9 @@ CPU feature detection only; no architecture kernel exists yet. Every site runs d
 | `aarch64::detect` | block ×2 | `libc::getauxval(AT_HWCAP)`, `libc::getauxval(AT_HWCAP2)` | Accepts any key and returns 0 for unknown ones; it only reads libc's saved copy of the auxiliary vector, without syscalls or allocation (glibc and musl). |
 | `riscv64::detect` | block | `libc::syscall(riscv_hwprobe, &mut pair, 1, 0, null, 0)` | The kernel writes only into the one `Pair` passed, a live exclusive local with the UAPI `struct riscv_hwprobe` layout (`#[repr(C)]` `i64` + `u64`). A null CPU set of size 0 means all online CPUs and the flags are 0, as the hwprobe documentation requires. |
 
-## allocatbelt (adapter)
+## `global` (`crates/allocatbelt/src/global.rs`, the adapter)
 
-The experimental `mm_cid` shard selection (`src/rseq.rs`, feature `experimental-rseq`) adds no `unsafe` here: `LinuxOs::shard_hint` only calls the safe `MmCid::current`.
+`LinuxOs` (the core's `Os`), `RingPurger` and `impl GlobalAlloc for Allocatbelt` are here. The experimental `mm_cid` shard selection (`src/rseq.rs`, feature `experimental-rseq`) adds no `unsafe` here: `LinuxOs::shard_hint` only calls the safe `MmCid::current`.
 
 | Location | Kind | Operation | Why it is sound |
 |---|---|---|---|
@@ -79,7 +81,7 @@ The experimental `mm_cid` shard selection (`src/rseq.rs`, feature `experimental-
 
 ## allocatbelt-simd-bench (benchmark only)
 
-`bench/simd` holds the Phase 4 SIMD candidates ([research/simd-benchmarks.md](research/simd-benchmarks.md)). It is not a dependency of the allocator and nothing in it runs inside `GlobalAlloc`. Phase 5 promoted none of them; a kernel promoted later moves into `allocatbelt-arch` and gets its own rows above. Its `unsafe` is listed here so the whole workspace is accounted for.
+`bench/simd` holds the Phase 4 SIMD candidates ([research/simd-benchmarks.md](research/simd-benchmarks.md)). It is not a dependency of the allocator and nothing in it runs inside `GlobalAlloc`. Phase 5 promoted none of them; a kernel promoted later moves into the `arch` module of `allocatbelt` and gets its own rows above. Its `unsafe` is listed here so the whole workspace is accounted for.
 
 | Location | Kind | Operation | Why it is sound |
 |---|---|---|---|
@@ -105,7 +107,7 @@ The narrow boundary makes each *operation* auditable, but soundness still depend
 
 Current verification:
 
-- **Shadow maps.** The checking mock `Os` (`allocatbelt-core/src/model.rs`, feature `model`) checks non-overlap, commit state, that purged, decommitted and guarded ranges hold no live block, that nothing guarded is handed out or committed, and a written-pages shadow that every `zeroed` claim is checked against, including with failing purges. It backs every model test.
+- **Shadow maps.** The checking mock `Os` (`crates/allocatbelt/src/core/model.rs`, compiled by `allocatbelt-core-check` for its tests and with its feature `model`) checks non-overlap, commit state, that purged, decommitted and guarded ranges hold no live block, that nothing guarded is handed out or committed, and a written-pages shadow that every `zeroed` claim is checked against, including with failing purges. It backs every model test.
 - **proptest.** Random operation sequences, with and without thread caches and randomized placement, and random byte programs for the fuzz interpreter (`model::run`, `tests::fuzz_programs`).
 - **Fuzzing.** `fuzz/` runs `model::run` under libFuzzer (cargo-fuzz). A 10-minute run on 2026-09-28 executed 381,049 programs with no failure. CI repeats it on its daily schedule.
 - **loom.** `proto.rs` holds every lock-free transition the heap performs on shared metadata, and loom checks them exhaustively (`--cfg loom`): free vs. claim, two freers on one word, racing double frees, the free counter never overstating free blocks, page-run claim/release vs. purge, in-place growth vs. segment trimming, and the heap lock, whose futex parking is modelled with a wait queue that checks the word under the same mutex as the wake, so a lost wake-up would show up as a deadlock. The heap calls these same functions, so the models check the shipped code.

@@ -71,7 +71,7 @@ jobs:
       - name: io_uring purge ring report
         run: |
           uname -r
-          cargo test --release --locked -p allocatbelt-sys --lib ring_benchmark -- --ignored --nocapture
+          cargo test --release --locked -p allocatbelt --lib ring_benchmark -- --ignored --nocapture
 
   # The platform contract (docs/platform.md): x86_64 builds need x86-64-v3,
   # and unsupported architectures, ABIs, byte orders and operating systems
@@ -111,6 +111,39 @@ jobs:
 
       - name: Check the platform gates
         run: scripts/check-platform-gates.sh
+
+  # Single-package directive §3.7: `allocatbelt` is the one published
+  # package. It must package and pass `cargo publish --dry-run`, and a
+  # consumer outside this repository must build it (and, on x86_64, stop at
+  # the gate without x86-64-v3).
+  package:
+    name: crates.io package (${{ matrix.runner }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        runner:
+          - ubuntu-26.04
+          - ubuntu-26.04-arm
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # 7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install 1.98.1 --profile minimal
+          rustup default 1.98.1
+
+      - name: Fetch locked Cargo dependency graph
+        run: cargo fetch --locked
+
+      - name: Package, dry-run publish and build a consumer
+        run: scripts/check-package.sh
 
   # Plan phase 3: the bit scans lower to tzcnt/popcnt/lzcnt on x86-64-v3
   # and to ctz/cpop/clz on riscv64 with Zbb (assembly only, no qemu).
@@ -182,7 +215,7 @@ jobs:
       # The runner in `.cargo/config.toml` uses `-cpu max`: Zbb for the +zbb
       # build, and RVA23 for Ubuntu 26.04's riscv64 cross glibc.
       - name: Cargo test
-        run: cargo test --release --locked --target riscv64gc-unknown-linux-gnu -p allocatbelt-arch -p allocatbelt-core -p allocatbelt -p allocatbelt-simd-bench
+        run: cargo test --release --locked --target riscv64gc-unknown-linux-gnu -p allocatbelt -p allocatbelt-core-check -p allocatbelt-simd-bench
 
       # The experimental RVV candidates: the auto-vectorized kernels built
       # with V (an unstable target feature, hence rustc's warning).
@@ -214,7 +247,7 @@ jobs:
         run: cargo fetch --locked
 
       - name: Cargo test (loom)
-        run: cargo test --release --locked -p allocatbelt-core --lib loom
+        run: cargo test --release --locked -p allocatbelt-core-check --lib loom
 
   fuzz:
     name: Fuzz the heap model (cargo-fuzz, 10 minutes)

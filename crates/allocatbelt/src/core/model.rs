@@ -21,7 +21,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering}
 use std::sync::{Mutex, OnceLock};
 use std::vec::Vec;
 
-use crate::{
+use crate::core::{
   ARENA_SIZE, Block, Heap, MAX_SEGMENTS, META_WORDS, Os, PAGE_SIZE, PURGE_BATCH, Purger,
   SEGMENT_SIZE, ThreadCache,
 };
@@ -491,5 +491,5 @@ pub fn run(data: &[u8]) {
     assert_eq!(h.dirty_pages(), 0, "a forced purge left dirty pages");
   }
   // One (purged) segment per shard at most stays behind.
-  assert!(h.segments_in_use() <= crate::SHARDS);
+  assert!(h.segments_in_use() <= crate::core::SHARDS);
 }

@@ -292,7 +292,7 @@ impl<O: Os> Heap<O> {
 
   /// The dirty page count recomputed from the segments' dirty marks, which
   /// must equal [`Heap::dirty_pages`] whenever no pass or free is running.
-  #[cfg(any(test, feature = "model"))]
+  #[cfg(any(all(test, allocatbelt_core_check), allocatbelt_model))]
   pub fn dirty_pages_recounted(&self) -> usize {
     let mut n = 0;
     for (wi, word) in self.seg_used.iter().enumerate() {

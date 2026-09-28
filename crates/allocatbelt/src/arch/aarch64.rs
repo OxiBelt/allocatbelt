@@ -5,7 +5,7 @@
 //! `arch/arm64/include/uapi/asm/hwcap.h` (checked against v7.0); the `libc`
 //! crate lacks `HWCAP2_SVE2` for glibc.
 
-use crate::CpuFeatures;
+use crate::arch::CpuFeatures;
 
 const HWCAP_ASIMD: libc::c_ulong = 1 << 1;
 const HWCAP_SVE: libc::c_ulong = 1 << 22;
@@ -27,7 +27,7 @@ pub(crate) fn detect() -> CpuFeatures {
 
 #[cfg(test)]
 mod tests {
-  use crate::CpuFeatures;
+  use crate::arch::CpuFeatures;
 
   #[test]
   fn matches_std_detection() {

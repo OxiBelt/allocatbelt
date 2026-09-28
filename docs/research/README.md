@@ -7,7 +7,7 @@ Date: 2026-09-27. Detailed reports (with sources and verification tags):
 - [boundary.md](boundary.md): unsafe boundary, reentrancy, provenance, hardware acceleration (English)
 - [benchmarks.md](benchmarks.md): prototype measurements
 - [simd-benchmarks.md](simd-benchmarks.md): SIMD candidate kernels measured against scalar code, and why none was promoted (plan Phases 4 and 5)
-- [single-package-baseline.md](single-package-baseline.md): the state the single-package directive starts from (`33dfc7b`): correctness suite, unsafe inventory counts, public API (directive Phase A)
+- [single-package-baseline.md](single-package-baseline.md): the state the single-package directive starts from (`33dfc7b`): correctness suite, unsafe inventory counts, public API (directive Phase A), and what the package consolidation changed (Phase B)
 
 > The three detailed reports were written by Claude subagents from web sources. Every claim is tagged
 > **[V]** (checked against a primary source), **[S]**/(secondary) or **[U]/[UNVERIFIED]**; check the tag before relying on a claim.
@@ -164,6 +164,8 @@ allocatbelt is being evolved into a Linux-only allocator for a fixed set of CPUs
 - Every hand-written SIMD kernel needs benchmark evidence on native hardware; emulator numbers never count.
 
 **Crate boundaries stay as they are.** `allocatbelt-core` keeps `#![forbid(unsafe_code)]` and holds the algorithms and invariants, `allocatbelt-sys` stays the Linux VM and syscall boundary, and `allocatbelt` stays the `GlobalAlloc` adapter. The core is not replaced by an architecture-specific unsafe implementation. If architecture intrinsics need `unsafe`, they go into one small new crate, `crates/allocatbelt-arch`, limited to CPU-feature discovery that cannot live in the core, run-time-selected architecture kernels, and architecture-specific tests and instruction checks. Every `unsafe` block added there is listed in [docs/unsafe-boundary.md](../unsafe-boundary.md).
+
+> **Package layout since directive Phase B.** The single-package directive replaced these crates with modules of the one published package `allocatbelt`: `core` (still `#![forbid(unsafe_code)]`, and compiled as a `#![no_std]` crate of its own by the unpublished `allocatbelt-core-check`), `sys`, `arch` and the adapter `global`. The boundaries above are unchanged; only the crate names became module paths ([single-package-baseline.md](single-package-baseline.md) section 6).
 
 **What must not regress.** Per-thread caches, bitmap words consumed without shared atomics, batched frees, two-level summary bitmaps, out-of-band `AtomicU64` metadata, delayed purging under a dirty budget, guard pages and randomized placement, fork handling, and the verification around the core (model tests, proptest and fuzzing, loom, Miri-compatible paths, mutation testing, integration tests). SIMD or kernel-API work that weakens any of these is not adopted.
 

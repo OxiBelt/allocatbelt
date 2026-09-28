@@ -1,5 +1,5 @@
-# x86-64-v3 is the minimum x86_64 CPU (docs/platform.md), and allocatbelt-sys
-# rejects x86_64 builds without it. This covers every x86_64 Linux target
+# x86-64-v3 is the minimum x86_64 CPU (docs/platform.md), and allocatbelt's
+# `sys` module rejects x86_64 builds without it. This covers every x86_64 Linux target
 # (gnu and musl) built inside this repository. A `RUSTFLAGS` environment
 # variable replaces these flags, so it must carry `-C target-cpu=x86-64-v3`
 # (or a newer CPU) itself. Crates depending on allocatbelt from elsewhere

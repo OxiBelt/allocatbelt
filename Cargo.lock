@@ -15,17 +15,8 @@ dependencies = [
 name = "allocatbelt"
 version = "0.1.0"
 dependencies = [
- "allocatbelt-arch",
- "allocatbelt-core",
- "allocatbelt-sys",
  "libc",
-]
-
-[[package]]
-name = "allocatbelt-arch"
-version = "0.1.0"
-dependencies = [
- "libc",
+ "rustix",
 ]
 
 [[package]]
@@ -40,11 +31,11 @@ dependencies = [
 name = "allocatbelt-codegen-probes"
 version = "0.1.0"
 dependencies = [
- "allocatbelt-core",
+ "allocatbelt-core-check",
 ]
 
 [[package]]
-name = "allocatbelt-core"
+name = "allocatbelt-core-check"
 version = "0.1.0"
 dependencies = [
  "loom",
@@ -56,17 +47,9 @@ dependencies = [
 name = "allocatbelt-simd-bench"
 version = "0.1.0"
 dependencies = [
- "allocatbelt-arch",
- "allocatbelt-core",
+ "allocatbelt",
+ "allocatbelt-core-check",
  "libc",
-]
-
-[[package]]
-name = "allocatbelt-sys"
-version = "0.1.0"
-dependencies = [
- "libc",
- "rustix",
 ]
 
 [[package]]

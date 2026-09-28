@@ -3,7 +3,7 @@
 //! class, so a power-of-two class block is naturally aligned to its size
 //! inside a page-aligned page.
 
-use crate::PAGE_SIZE;
+use crate::core::PAGE_SIZE;
 
 /// Number of small size classes.
 pub const NUM_CLASSES: usize = 32;
@@ -124,5 +124,5 @@ pub const fn class_for(size: usize, align: usize) -> Option<usize> {
   None
 }
 
-#[cfg(test)]
+#[cfg(all(test, allocatbelt_core_check))]
 mod tests;

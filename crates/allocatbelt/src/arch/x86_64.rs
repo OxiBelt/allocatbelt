@@ -6,7 +6,7 @@
 
 use core::arch::x86_64::{__cpuid, __cpuid_count, CpuidResult};
 
-use crate::CpuFeatures;
+use crate::arch::CpuFeatures;
 
 const fn bit(reg: u32, n: u32) -> bool {
   reg & (1 << n) != 0
@@ -80,7 +80,7 @@ fn xcr0() -> u64 {
   }
 }
 
-/// Builds below x86-64-v3 are rejected by `allocatbelt-sys`; without the
+/// Builds below x86-64-v3 are rejected by the `sys` module; without the
 /// `xsave` target feature report no OS-enabled vector state.
 #[cfg(not(target_feature = "xsave"))]
 fn xcr0() -> u64 {
@@ -89,7 +89,7 @@ fn xcr0() -> u64 {
 
 #[cfg(test)]
 mod tests {
-  use crate::CpuFeatures;
+  use crate::arch::CpuFeatures;
 
   #[test]
   fn matches_std_detection() {

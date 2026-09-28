@@ -2,31 +2,31 @@
   "comment": "Mutants that cannot change observable behavior, matched on path, slug and exact old text. Every entry must still be reported uncaught; stale entries fail the gate.",
   "mutants": [
     {
-      "path": "crates/allocatbelt-core/src/bits.rs",
+      "path": "crates/allocatbelt/src/core/bits.rs",
       "slug": "CR",
       "old_text": "if n == 64 {\n    return if free == u64::MAX { 1 } else { 0 };\n  }",
       "reason": "Fast path only: for `n == 64` the doubling loop also leaves just bit 0, set iff `free == u64::MAX`."
     },
     {
-      "path": "crates/allocatbelt-core/src/bits.rs",
+      "path": "crates/allocatbelt/src/core/bits.rs",
       "slug": "IF",
       "old_text": "n == 64",
       "reason": "Fast path only: for `n == 64` the doubling loop also leaves just bit 0, set iff `free == u64::MAX`."
     },
     {
-      "path": "crates/allocatbelt-core/src/class.rs",
+      "path": "crates/allocatbelt/src/core/class.rs",
       "slug": "CR",
       "old_text": "if align > PAGE_SIZE || size > SMALL_MAX {\n    return None;\n  }",
       "reason": "Early out only: out-of-range inputs map to a class index of at least `NUM_CLASSES`, so the search loop also returns `None`."
     },
     {
-      "path": "crates/allocatbelt-core/src/class.rs",
+      "path": "crates/allocatbelt/src/core/class.rs",
       "slug": "IF",
       "old_text": "align > PAGE_SIZE || size > SMALL_MAX",
       "reason": "Early out only: out-of-range inputs map to a class index of at least `NUM_CLASSES`, so the search loop also returns `None`."
     },
     {
-      "path": "crates/allocatbelt-core/src/class.rs",
+      "path": "crates/allocatbelt/src/core/class.rs",
       "slug": "IF",
       "old_text": "size < align",
       "reason": "Search head start only: a class size that is a multiple of `align` is at least `align`, so starting from `class_of(size)` finds the same class."

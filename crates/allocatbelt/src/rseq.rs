@@ -20,8 +20,8 @@
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
-use allocatbelt_sys::MmCid;
-pub use allocatbelt_sys::RseqUnavailable;
+use crate::sys::MmCid;
+pub use crate::sys::RseqUnavailable;
 
 use crate::Allocatbelt;
 

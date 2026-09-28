@@ -1,23 +1,32 @@
 [package]
 name = "allocatbelt"
-description = "A Rust global allocator whose allocation logic is safe Rust; unsafe is confined to allocatbelt-sys and this adapter."
+description = "A Linux global allocator whose allocation logic is safe Rust over offsets, with unsafe confined to a syscall module and the GlobalAlloc adapter."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-publish.workspace = true
+repository = "https://github.com/OxiBelt/allocatbelt"
+readme = "../../README.md"
+keywords = ["allocator", "global-allocator", "malloc", "linux"]
+categories = ["memory-management", "os::linux-apis"]
+include = ["/src/**/*.rs", "/tests/**/*.rs", "/LICENSE"]
+# The only package of this workspace that is published; every other one is a
+# development tool (`publish = false` from `[workspace.package]`).
 
-# Unconditional, so that a build for an unsupported platform reaches the
-# platform gates in allocatbelt-sys instead of producing an empty crate.
-[dependencies]
-allocatbelt-arch.workspace = true
-allocatbelt-core.workspace = true
-allocatbelt-sys.workspace = true
+# Linux only, so that a build for another OS reaches the platform gates in
+# `src/sys/platform.rs` instead of failing inside a dependency.
+[target.'cfg(target_os = "linux")'.dependencies]
+# Only for what rustix does not cover: guard-marker `madvise` advice,
+# `pthread_atfork`, `sched_setscheduler` and `getauxval`.
+libc.workspace = true
+rustix.workspace = true
 
 [features]
 # Experimental (Phase 9): shard selection by the rseq `mm_cid`, off unless
-# selected with `Allocatbelt::set_rseq_policy`. See docs/platform.md.
-experimental-rseq = ["allocatbelt-sys/rseq"]
+# selected with `Allocatbelt::set_rseq_policy`. Links glibc's
+# `__rseq_offset` and `__rseq_size` (glibc 2.35 or newer). See
+# docs/platform.md.
+experimental-rseq = []
 
 [dev-dependencies]
 libc.workspace = true

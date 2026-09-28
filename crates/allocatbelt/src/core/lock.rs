@@ -12,7 +12,7 @@
 //! compare-and-swap and one swap, with no system call; only an unlock that
 //! finds [`CONTENDED`] wakes a thread.
 
-use crate::sync::{AtomicU32, Ordering, spin_loop};
+use crate::core::sync::{AtomicU32, Ordering, spin_loop};
 
 const UNLOCKED: u32 = 0;
 const LOCKED: u32 = 1;
@@ -135,7 +135,7 @@ impl<P: Park> Drop for Guard<'_, P> {
   }
 }
 
-#[cfg(all(test, not(loom)))]
+#[cfg(all(test, allocatbelt_core_check, not(loom)))]
 mod tests {
   use std::sync::atomic::AtomicBool;
   use std::time::{Duration, Instant};
@@ -196,7 +196,7 @@ mod tests {
     }
   }
 
-  /// What the adapter does (`allocatbelt_sys::futex_wait`/`futex_wake`).
+  /// What the adapter does (`sys::futex_wait`/`futex_wake`).
   struct Futex;
 
   impl Park for Futex {
@@ -260,7 +260,7 @@ mod tests {
 
   /// The Phase 6 qualification: the futex lock against the `sched_yield`
   /// lock it replaced, on lock-heavy patterns. Prints a markdown table;
-  /// `cargo test --release -p allocatbelt-core --lib contention_benchmark
+  /// `cargo test --release -p allocatbelt-core-check --lib contention_benchmark
   /// -- --ignored --nocapture`. See docs/research/benchmarks.md.
   #[test]
   #[ignore = "benchmark; prints timings"]

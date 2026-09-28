@@ -1,5 +1,5 @@
 //! The calling thread's rseq `mm_cid`, read from the area glibc registered
-//! for it (Phase 9 research, feature `rseq`).
+//! for it (Phase 9 research, feature `experimental-rseq`).
 //!
 //! `mm_cid` is a concurrency id the kernel keeps dense per process: threads
 //! running at the same moment have different ids, all below the number of
@@ -153,7 +153,6 @@ fn thread_pointer() -> *const u8 {
 
 #[cfg(test)]
 mod tests {
-  extern crate std;
 
   use super::*;
 

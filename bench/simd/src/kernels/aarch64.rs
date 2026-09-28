@@ -16,7 +16,7 @@ use core::arch::aarch64::{
   vld1q_u8_x4, vld1q_u64, vreinterpretq_u8_u64, vst1q_u8_x4, vtstq_u64,
 };
 
-use allocatbelt_arch::CpuFeatures;
+use allocatbelt::CpuFeatures;
 
 use super::{Families, Tier, Variant, portable};
 

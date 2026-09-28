@@ -28,9 +28,9 @@
 //!   reads the cause, so a post that races with a take is either seen by
 //!   the pass that follows or re-posts the bit (and wakes the thread).
 
-use crate::bits::{find_run_aligned, pick_bit};
-use crate::sync::Ordering::{AcqRel, Acquire, Relaxed, Release, SeqCst};
-use crate::sync::{AtomicU32, AtomicU64, fence};
+use crate::core::bits::{find_run_aligned, pick_bit};
+use crate::core::sync::Ordering::{AcqRel, Acquire, Relaxed, Release, SeqCst};
+use crate::core::sync::{AtomicU32, AtomicU64, fence};
 
 /// Returns the blocks in `mask` to bitmap `word` (index `w` in its page).
 ///
@@ -113,7 +113,7 @@ pub(crate) fn claim_run(
   let mut used = pages.load(Acquire);
   loop {
     let start = find_run_aligned(!used, n, step)?;
-    let mask = crate::bits::run_mask(start, n);
+    let mask = crate::core::bits::run_mask(start, n);
     match pages.compare_exchange_weak(used, used | mask, AcqRel, Acquire) {
       Ok(_) => return Some((start, dirty.fetch_and(!mask, AcqRel) & mask)),
       Err(now) => used = now,
@@ -190,7 +190,7 @@ pub(crate) fn take_work(work: &AtomicU32, bit: u32) {
 #[cfg(all(test, loom))]
 mod loom_tests {
   //! Exhaustive interleaving checks of the protocols above. Run with
-  //! `RUSTFLAGS="--cfg loom" cargo test -p allocatbelt-core --release --lib loom`.
+  //! `RUSTFLAGS="--cfg loom" cargo test -p allocatbelt-core-check --release --lib loom`.
 
   use loom::sync::Arc;
   use loom::sync::atomic::Ordering::{Acquire, Relaxed};
@@ -199,7 +199,7 @@ mod loom_tests {
   use std::vec::Vec;
 
   use super::*;
-  use crate::lock::{Lock, Park};
+  use crate::core::lock::{Lock, Park};
 
   struct Page {
     words: [AtomicU64; 2],

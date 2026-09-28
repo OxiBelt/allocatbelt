@@ -1,4 +1,4 @@
-# Fuzzing `allocatbelt-core` with cargo-fuzz (nightly): see `README.md`.
+# Fuzzing the core of `allocatbelt` (through `allocatbelt-core-check`) with cargo-fuzz (nightly): see `README.md`.
 # A separate workspace, so the main one needs no nightly and no libFuzzer.
 [package]
 name = "allocatbelt-fuzz"
@@ -10,7 +10,7 @@ publish = false
 cargo-fuzz = true
 
 [dependencies]
-allocatbelt-core = { path = "../crates/allocatbelt-core", features = ["model"] }
+allocatbelt-core-check = { path = "../crates/allocatbelt-core-check", features = ["model"] }
 libfuzzer-sys = "0.4.10"
 
 [[bin]]

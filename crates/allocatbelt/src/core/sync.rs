@@ -1,4 +1,4 @@
-//! The atomics and fences used by [`crate::proto`] and [`crate::lock`]: `core`'s, or
+//! The atomics and fences used by [`crate::core::proto`] and [`crate::core::lock`]: `core`'s, or
 //! `loom`'s when the protocols are model-checked (`--cfg loom`).
 
 #[cfg(not(loom))]

@@ -3,7 +3,7 @@
 //!
 //! See `docs/platform.md` for the policy these gates and probes implement.
 
-use crate::{GRANULE, Region};
+use crate::sys::{GRANULE, Region};
 
 #[cfg(not(target_os = "linux"))]
 compile_error!("allocatbelt supports only Linux (7.0 or newer); see docs/platform.md");
@@ -49,7 +49,7 @@ compile_error!("allocatbelt supports only little-endian targets; see docs/platfo
   ))
 ))]
 compile_error!(
-  "allocatbelt on x86_64 must be built for x86-64-v3 or newer: pass `-C target-cpu=x86-64-v3` (or a newer CPU) in RUSTFLAGS. This repository's `.cargo/config.toml` does so, but a `RUSTFLAGS` environment variable replaces it; see docs/platform.md"
+  "allocatbelt on x86_64 must be built for x86-64-v3 or newer: build the final binary with `-C target-cpu=x86-64-v3` (or a newer CPU), in RUSTFLAGS or your workspace's `.cargo/config.toml`. Cargo does not apply allocatbelt's own `.cargo/config.toml` to crates that depend on it, and a `RUSTFLAGS` environment variable replaces the config's flags; see allocatbelt's README"
 );
 
 /// A Linux kernel release as `uname(2)` reports it, for diagnostics.
@@ -206,7 +206,7 @@ pub fn probe() -> Result<Capabilities, ProbeError> {
   Ok(Capabilities {
     kernel,
     guard_markers,
-    getrandom: crate::random_u64().is_some(),
+    getrandom: crate::sys::random_u64().is_some(),
   })
 }
 

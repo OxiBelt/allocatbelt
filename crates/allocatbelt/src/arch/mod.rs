@@ -1,9 +1,9 @@
 //! CPU feature discovery and architecture kernel dispatch for allocatbelt.
 //!
-//! This crate is the architecture boundary of the allocator: it finds out,
+//! This module is the architecture boundary of the allocator: it finds out,
 //! without allocating, which ISA extensions the running CPU and kernel
 //! support, and publishes which set of architecture kernels the allocator
-//! may use. `allocatbelt-core` stays `#![forbid(unsafe_code)]` and never sees
+//! may use. The `core` module stays `#![forbid(unsafe_code)]` and never sees
 //! vector types; the few `unsafe` operations detection needs live here and
 //! are listed in `docs/unsafe-boundary.md`.
 //!
@@ -19,15 +19,14 @@
 //! `docs/research/simd-benchmarks.md`), so [`initialize_dispatch`] always
 //! publishes [`KernelSet::Baseline`].
 
-#![no_std]
 #![cfg_attr(not(test), deny(clippy::expect_used, clippy::unwrap_used))]
-
-#[cfg(test)]
-extern crate std;
 
 use core::sync::atomic::{AtomicU8, AtomicU32, Ordering};
 
 mod features;
+
+#[cfg(test)]
+mod allocation_free;
 
 #[cfg(target_arch = "aarch64")]
 mod aarch64;
@@ -103,7 +102,7 @@ fn detect() -> CpuFeatures {
   riscv64::detect()
 }
 
-/// Other architectures are rejected by `allocatbelt-sys`; report nothing.
+/// Other architectures are rejected by the `sys` module; report nothing.
 #[cfg(not(any(
   target_arch = "x86_64",
   target_arch = "aarch64",

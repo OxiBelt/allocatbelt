@@ -40,7 +40,7 @@ use rustix::io_uring::{
 };
 use rustix::mm::{self, MapFlags, ProtFlags};
 
-use crate::Region;
+use crate::sys::Region;
 
 // UAPI values from `include/uapi/linux/io_uring.h` that rustix 1.1 does
 // not name, or names in types this module does not use.
@@ -219,12 +219,6 @@ impl PurgeRing {
   #[must_use]
   pub fn sq_rewind(&self) -> bool {
     self.rewind
-  }
-
-  /// Submission slots: the most purges one `io_uring_enter` carries.
-  #[must_use]
-  pub fn entries(&self) -> usize {
-    self.entries as usize
   }
 
   /// Whether a failed submission retired the ring (later purges use
@@ -557,10 +551,8 @@ fn unmap(p: NonNull<c_void>, len: usize) {
 mod tests {
   #![allow(clippy::unwrap_used, reason = "tests")]
 
-  extern crate std;
-
   use super::*;
-  use crate::GRANULE;
+  use crate::sys::GRANULE;
 
   /// io_uring can be missing (qemu-user, seccomp, the sysctl); these tests
   /// then check only that setup fails cleanly.
@@ -700,7 +692,7 @@ mod tests {
   }
 
   /// Batched `MADV_DONTNEED` through the ring against one `madvise` per
-  /// run: `cargo test --release -p allocatbelt-sys --lib ring_benchmark --
+  /// run: `cargo test --release -p allocatbelt --lib ring_benchmark --
   /// --ignored --nocapture`. Each round touches 64 runs of `pages` 64 KiB
   /// pages and purges them; prints the median round time.
   #[test]

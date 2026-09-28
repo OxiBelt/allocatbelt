@@ -1,7 +1,7 @@
 //! Hand-written AVX2 and AVX-512 candidates.
 //!
 //! Each kernel is a `#[target_feature]` function behind a plain wrapper, and
-//! a wrapper is only listed when `allocatbelt-arch` detected the features
+//! a wrapper is only listed when allocatbelt's `arch` module detected the features
 //! its kernel is compiled for (AVX2 always holds at the x86-64-v3 floor).
 
 #![allow(
@@ -20,7 +20,7 @@ use core::arch::x86_64::{
   _mm512_test_epi64_mask,
 };
 
-use allocatbelt_arch::CpuFeatures;
+use allocatbelt::CpuFeatures;
 
 use super::{Families, Tier, Variant};
 

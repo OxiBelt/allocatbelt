@@ -30,7 +30,7 @@
 //! levels of summaries (page summary word, then the segment's per-class
 //! availability word), each a `trailing_zeros`, rather than a scan of pages.
 //! The protocols that keep the summaries exact in the face of racing frees
-//! are in [`crate::proto`].
+//! are in [`crate::core::proto`].
 //!
 //! Frees never take a lock. A thread with a cache buffers the freed bit in a
 //! small direct-mapped table keyed by (page, bitmap word); the buffer is
@@ -60,11 +60,11 @@
 
 use core::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
-use crate::bits::{pick_bit, run_mask};
-use crate::class::{self, MIN_ALIGN, NUM_CLASSES, SMALL_MAX};
-use crate::lock::{Lock, Park};
-use crate::proto;
-use crate::{
+use crate::core::bits::{pick_bit, run_mask};
+use crate::core::class::{self, MIN_ALIGN, NUM_CLASSES, SMALL_MAX};
+use crate::core::lock::{Lock, Park};
+use crate::core::proto;
+use crate::core::{
   ARENA_SIZE, MAX_ALIGN, MAX_SEGMENTS, PAGE_META_WORDS, PAGE_SHIFT, PAGE_SIZE, PAGES_PER_SEGMENT,
   SEGMENT_HEADER_WORDS, SEGMENT_SHIFT, SEGMENT_SIZE, SHARDS,
 };
@@ -103,7 +103,7 @@ pub trait Os: Sync {
   /// Returns the physical memory of the range to the OS but keeps it
   /// accessible. Returns `true` if the range now reads as zero.
   fn purge(&self, offset: usize, len: usize) -> bool;
-  /// Commits (once) and returns the [`crate::META_WORDS`] metadata words of
+  /// Commits (once) and returns the [`crate::core::META_WORDS`] metadata words of
   /// `segment`. Words are zero the first time they are returned.
   fn commit_meta(&self, segment: usize) -> Option<&[AtomicU64]>;
   /// Metadata words of `segment` if [`Os::commit_meta`] succeeded before.

@@ -1,5 +1,5 @@
 //! Model tests: the heap runs on the checking [`MockOs`] of
-//! [`crate::model`], which never backs user memory but checks the heap's
+//! [`crate::core::model`], which never backs user memory but checks the heap's
 //! promises against shadow maps.
 
 use std::boxed::Box;
@@ -8,10 +8,12 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::vec::Vec;
 
-use crate::heap::DIRTY_BUDGET_PAGES;
-use crate::heap::MAX_RUN_PAGES;
-use crate::model::{MockOs, MockPurger, alloc, alloc_block, alloc_c, cache, free, free_c, resize};
-use crate::{
+use crate::core::heap::DIRTY_BUDGET_PAGES;
+use crate::core::heap::MAX_RUN_PAGES;
+use crate::core::model::{
+  MockOs, MockPurger, alloc, alloc_block, alloc_c, cache, free, free_c, resize,
+};
+use crate::core::{
   Block, DIRTY_HARD_LIMIT_PAGES, Heap, PAGE_SIZE, PURGE_BATCH, SEGMENT_SIZE, Task, ThreadCache,
 };
 
@@ -130,7 +132,7 @@ fn empty_pages_are_recycled_across_classes() {
 fn purging_is_deferred_until_budget() {
   let h = heap();
   const RUN: usize = 5;
-  let n = crate::heap::DIRTY_BUDGET_PAGES as usize / 4 + 8;
+  let n = crate::core::heap::DIRTY_BUDGET_PAGES as usize / 4 + 8;
   let big: Vec<_> = (0..n).map(|_| alloc(h, 0, RUN * PAGE_SIZE, 8)).collect();
   // The newest segment is searched first, so free runs from it.
   let (rest, last) = big.split_at(n - 4);
@@ -152,7 +154,8 @@ fn purging_is_deferred_until_budget() {
   // Crossing the budget purged everything that was dirty at that point
   // (or returned whole empty segments).
   assert!(
-    h.os().purged.load(Ordering::Relaxed) >= crate::heap::DIRTY_BUDGET_PAGES as usize * PAGE_SIZE
+    h.os().purged.load(Ordering::Relaxed)
+      >= crate::core::heap::DIRTY_BUDGET_PAGES as usize * PAGE_SIZE
   );
   h.purge();
   assert_eq!(h.dirty_pages(), 0);
@@ -816,7 +819,7 @@ fn budget_passes_purge_everything_dirty() {
   let h = heap();
   h.os().advance(10_000);
   const RUN: usize = 8;
-  let n = crate::heap::DIRTY_BUDGET_PAGES as usize / RUN + 2;
+  let n = crate::core::heap::DIRTY_BUDGET_PAGES as usize / RUN + 2;
   let runs: Vec<_> = (0..n).map(|_| alloc(h, 3, RUN * PAGE_SIZE, 8)).collect();
   let segs = h.segments_in_use();
   for o in runs {
@@ -824,7 +827,7 @@ fn budget_passes_purge_everything_dirty() {
   }
   // Crossing the budget purged the dirty pages without waiting for the
   // delay, but kept the (just emptied) segments.
-  assert!(h.dirty_pages() < crate::heap::DIRTY_BUDGET_PAGES as usize);
+  assert!(h.dirty_pages() < crate::core::heap::DIRTY_BUDGET_PAGES as usize);
   assert_eq!(h.segments_in_use(), segs);
 }
 
@@ -1192,14 +1195,14 @@ proptest::proptest! {
   /// The fuzz target's interpreter (see `fuzz/`), on random programs.
   #[test]
   fn fuzz_programs(data in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..3000)) {
-    crate::model::run(&data);
+    crate::core::model::run(&data);
   }
 }
 
 #[test]
 fn fuzz_program_edge_cases() {
-  crate::model::run(&[]);
-  crate::model::run(&[1]);
+  crate::core::model::run(&[]);
+  crate::core::model::run(&[1]);
   // Allocate the largest sizes of each kind through every path, then free
   // them crosswise, with randomization on.
   let mut p = std::vec![1u8];
@@ -1214,7 +1217,7 @@ fn fuzz_program_edge_cases() {
     }
   }
   p.extend([23, 24, 25, 255, 26, 0, 24, 27, 0x20 | 27]);
-  crate::model::run(&p);
+  crate::core::model::run(&p);
 }
 
 #[test]
@@ -1246,7 +1249,11 @@ fn migrating_threads_keep_the_heap_consistent() {
   let h = heap();
   h.os().hint.store(0, Ordering::Relaxed);
   h.os().migrate.store(true, Ordering::Relaxed);
-  let threads = if cfg!(miri) { 2 } else { crate::SHARDS + 8 };
+  let threads = if cfg!(miri) {
+    2
+  } else {
+    crate::core::SHARDS + 8
+  };
   let rounds = if cfg!(miri) { 50 } else { 2_000 };
   let shared = Mutex::new(Vec::<usize>::new());
   std::thread::scope(|sc| {

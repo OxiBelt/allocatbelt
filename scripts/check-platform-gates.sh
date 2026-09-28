@@ -54,7 +54,7 @@ check x86_64-unknown-linux-gnu "${v3}" '-C target-cpu=x86-64-v2'
 check x86_64-unknown-linux-musl "${v3}" '-C target-cpu=x86-64-v2'
 
 # Unsupported architectures, ABIs, byte orders and operating systems.
-# 32-bit targets stop first at allocatbelt-core's own 64-bit gate.
+# 32-bit targets stop first at the core module's own 64-bit gate.
 arch='supports only x86_64 (x86-64-v3 or newer), aarch64 and riscv64'
 bits='needs a 64-bit target with 64-bit atomics'
 check i686-unknown-linux-gnu "${bits}"

@@ -12,10 +12,10 @@
 #![no_std]
 #![forbid(unsafe_code)]
 
-use allocatbelt_core::{bits, class};
+use allocatbelt_core_check::core::{bits, class};
 
 /// `trailing_zeros`: the first aligned run of `n` free blocks in a bitmap
-/// word. (`bits::find_run` is compiled out of line in `allocatbelt-core`
+/// word. (`bits::find_run` is compiled out of line in the core
 /// itself, so wrapping it would only show a call; `find_run_aligned` is
 /// `#[inline]` and shares its `trailing_zeros` step.)
 #[inline(never)]
@@ -55,9 +55,6 @@ mod tests {
     assert_eq!(super::probe_find_run(0b1111_0000, 2, 4), Some(4));
     assert_eq!(super::probe_pick_bit(0b1000, 0), 3);
     assert_eq!(super::probe_count_ones(0xff00), 8);
-    assert_eq!(
-      super::probe_class_of(16),
-      allocatbelt_core::class::class_of(16)
-    );
+    assert_eq!(super::probe_class_of(16), super::class::class_of(16));
   }
 }

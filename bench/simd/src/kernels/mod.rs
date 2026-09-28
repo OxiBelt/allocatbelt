@@ -9,7 +9,7 @@
 //! first take with individual atomic loads (§7.1), or thread-owned bytes. No
 //! kernel reads shared `AtomicU64` metadata.
 
-use allocatbelt_arch::CpuFeatures;
+use allocatbelt::CpuFeatures;
 
 mod portable;
 
@@ -139,7 +139,7 @@ impl Families {
   /// The variants usable on this CPU.
   #[must_use]
   pub fn detected() -> Self {
-    Self::for_features(allocatbelt_arch::detected_features())
+    Self::for_features(allocatbelt::Allocatbelt.cpu_features())
   }
 }
 

@@ -9,9 +9,10 @@
 #   riscv64 (rv64gc):    none of ctz/cpop/clz, a control showing that the
 #                        check tells the two apart
 #
-# It compiles `allocatbelt-codegen-probes` (out-of-line wrappers around
-# `allocatbelt-core`'s helpers) to assembly and looks only at the probe
-# bodies, so unrelated scheduling or inlining changes do not break it.
+# It compiles `allocatbelt-codegen-probes` (out-of-line wrappers around the
+# core's helpers, built through allocatbelt-core-check) to assembly and
+# looks only at the probe bodies, so unrelated scheduling or inlining
+# changes do not break it.
 # Needs `rustup target add riscv64gc-unknown-linux-gnu`; no linker or qemu.
 set -euo pipefail
 

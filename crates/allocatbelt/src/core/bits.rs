@@ -80,5 +80,5 @@ pub const fn run_mask(start: u32, n: u32) -> u64 {
   ones << start
 }
 
-#[cfg(test)]
+#[cfg(all(test, allocatbelt_core_check))]
 mod tests;

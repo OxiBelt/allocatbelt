@@ -1,11 +1,15 @@
 //! `initialize_dispatch` must not allocate: a global allocator can reach it
 //! before `main`, and allocating there would re-enter the allocator.
+//!
+//! The counting allocator below is the global allocator of the whole unit
+//! test binary of this package; it only forwards to `System`, and counts
+//! nothing on threads that did not ask it to.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use allocatbelt_arch::{KernelSet, detected_features, initialize_dispatch, kernel_set};
+use crate::arch::{KernelSet, detected_features, initialize_dispatch, kernel_set};
 
 /// Counts the allocations the current thread makes while `TRACKING` is set.
 struct Counting;

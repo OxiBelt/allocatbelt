@@ -1,6 +1,8 @@
 # Fuzzing
 
-`heap_ops` feeds libFuzzer's inputs to `allocatbelt_core::model::run`, which
+`heap_ops` feeds libFuzzer's inputs to
+`allocatbelt_core_check::core::model::run` (the core of `allocatbelt`, built
+by the `allocatbelt-core-check` tool with its `model` feature), which
 interprets them as programs of heap operations (allocations of every kind
 and alignment, frees across two attached thread caches, a detached one and
 the uncached API, in-place resizes, cache flushes and retirements, purges,

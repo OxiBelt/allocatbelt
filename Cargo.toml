@@ -1,11 +1,9 @@
 [workspace]
 resolver = "3"
 members = [
-  "crates/allocatbelt-arch",
-  "crates/allocatbelt-codegen-probes",
-  "crates/allocatbelt-core",
-  "crates/allocatbelt-sys",
   "crates/allocatbelt",
+  "crates/allocatbelt-codegen-probes",
+  "crates/allocatbelt-core-check",
   "bench",
   "bench/simd",
 ]
@@ -19,9 +17,7 @@ publish = false
 
 [workspace.dependencies]
 allocatbelt = { path = "crates/allocatbelt" }
-allocatbelt-arch = { path = "crates/allocatbelt-arch" }
-allocatbelt-core = { path = "crates/allocatbelt-core" }
-allocatbelt-sys = { path = "crates/allocatbelt-sys" }
+allocatbelt-core-check = { path = "crates/allocatbelt-core-check" }
 libc = { version = "0.2.189", default-features = false }
 # Baseline only: OxiBelt currently ships secure mimalloc on x86_64 Linux.
 mimalloc = { version = "0.1.52", default-features = false, features = ["secure"] }
@@ -32,8 +28,10 @@ rustix = { version = "1.1.5", default-features = false, features = ["io_uring", 
 [workspace.lints.rust]
 unsafe_code = "deny"
 unsafe_op_in_unsafe_fn = "deny"
-# `--cfg loom` model-checks the atomic protocols of allocatbelt-core.
-unexpected_cfgs = { level = "warn", check-cfg = ["cfg(loom)"] }
+# `--cfg loom` model-checks the atomic protocols of the core.
+# `loom`: the loom models, `allocatbelt_core_check` and `allocatbelt_model`:
+# set by allocatbelt-core-check's build script for the core's tests and model.
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(loom)", "cfg(allocatbelt_core_check)", "cfg(allocatbelt_model)"] }
 
 [workspace.lints.clippy]
 chunks_exact_to_as_chunks = "allow"

@@ -1,6 +1,6 @@
 [package]
-name = "allocatbelt-core"
-description = "Safe-Rust allocation logic for allocatbelt: size classes, bitmaps and page/segment bookkeeping over offsets."
+name = "allocatbelt-core-check"
+description = "Development only: compiles allocatbelt's safe core (crates/allocatbelt/src/core) as its own #![no_std] crate and runs its model, property and loom tests."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,8 +8,8 @@ license.workspace = true
 publish.workspace = true
 
 [features]
-# `model`: the checking mock `Os` and the program interpreter that the unit
-# tests and the fuzz target (`fuzz/`) share. Pulls in `std`.
+# `model`: the checking mock `Os` and the program interpreter that the fuzz
+# target (`fuzz/`) shares with the tests. Pulls in `std`.
 model = []
 
 [dev-dependencies]

@@ -8,19 +8,30 @@
 //! double free is detected when the block's bit is already set.
 //!
 //! Converting offsets to pointers, committing memory and returning it to the
-//! kernel are the responsibility of the embedding crate (see `allocatbelt-sys`).
+//! kernel are the responsibility of the embedding code (the `sys` module and
+//! the adapter in `global.rs`).
+//!
+//! This module is safe Rust only (`forbid(unsafe_code)` below cannot be
+//! lifted by any item inside it) and uses only `core`, never `std`, outside
+//! test and model code. The development package `allocatbelt-core-check`
+//! compiles this same source as its own `#![no_std]` crate, so a `std`
+//! dependency fails to build there, and runs the core's model, property and
+//! loom tests.
 
-#![no_std]
 #![forbid(unsafe_code)]
 #![cfg_attr(not(test), deny(clippy::expect_used, clippy::unwrap_used))]
+// The core's API serves the adapter here and, in allocatbelt-core-check (where
+// it is public, and where unused private items still warn), the tests, the
+// fuzz target and the probes; the adapter alone does not use all of it.
+#![cfg_attr(
+  not(allocatbelt_core_check),
+  allow(dead_code, unused_imports, reason = "used by allocatbelt-core-check")
+)]
 
 #[cfg(not(all(target_pointer_width = "64", target_has_atomic = "64")))]
 compile_error!(
   "allocatbelt needs a 64-bit target with 64-bit atomics (e.g. x86_64, aarch64, riscv64)"
 );
-
-#[cfg(any(test, loom, feature = "model"))]
-extern crate std;
 
 pub mod bits;
 pub mod class;
@@ -28,7 +39,7 @@ pub mod class;
 pub mod heap;
 #[cfg_attr(loom, allow(dead_code))]
 mod lock;
-#[cfg(all(any(test, feature = "model"), not(loom)))]
+#[cfg(all(any(all(test, allocatbelt_core_check), allocatbelt_model), not(loom)))]
 pub mod model;
 #[cfg_attr(loom, allow(dead_code))]
 mod proto;
@@ -69,5 +80,5 @@ pub const META_WORDS: usize = SEGMENT_HEADER_WORDS + PAGES_PER_SEGMENT * PAGE_ME
 
 const _: () = assert!(PAGES_PER_SEGMENT == 64);
 
-#[cfg(all(test, not(loom)))]
+#[cfg(all(test, allocatbelt_core_check, not(loom)))]
 mod tests;

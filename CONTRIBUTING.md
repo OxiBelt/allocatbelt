@@ -26,12 +26,12 @@ cargo install cargo-audit --version 0.22.2 --locked
 cargo install cargo-deny --version 0.20.2 --locked
 ```
 
-Changes to `allocatbelt-core` logic should also run the Miri model tests and,
+Changes to the core logic (`crates/allocatbelt/src/core/`) should also run the Miri model tests and,
 when `bits.rs` or `class.rs` change, the mutation campaign (needs `jq` and
 `mewt 4.0.0`, installed with `cargo install mewt --version 4.0.0 --locked`):
 
 ```sh
-MIRIFLAGS=-Zmiri-disable-isolation cargo +nightly miri test -p allocatbelt-core
+MIRIFLAGS=-Zmiri-disable-isolation cargo +nightly miri test -p allocatbelt-core-check
 scripts/run-mutation-testing.sh
 ```
 
@@ -52,8 +52,9 @@ stop matching a surviving mutant fail the gate and must be removed.
 - Declare external dependency versions once in `[workspace.dependencies]`
   and use `<name>.workspace = true` in member manifests. `cargo deny`
   rejects unused workspace dependencies.
-- `unsafe` stays in `allocatbelt-sys`, `allocatbelt-arch` (CPU feature
-  detection and, later, architecture kernels) and the `GlobalAlloc` adapter,
+- `unsafe` stays in the `sys` and `arch` modules of `allocatbelt` (CPU feature
+  detection and, later, architecture kernels) and the `GlobalAlloc` adapter
+  (`global`, `rseq`); the `core` module keeps `#![forbid(unsafe_code)]`,
   plus the benchmark-only SIMD candidates in `bench/simd`. Every
   `unsafe` block holds one unsafe operation and a `// SAFETY:` comment, and
   every change to the boundary updates

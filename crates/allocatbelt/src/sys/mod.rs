@@ -7,14 +7,13 @@
 //! caller might still use ([`Region::purge`], [`Region::decommit`]) are
 //! `unsafe fn` and document the contract the caller (the heap) must uphold.
 //!
-//! Nothing in this crate allocates, panics on the hot path, or unwinds.
+//! Nothing in this module allocates, panics on the hot path, or unwinds.
 //!
-//! This crate also holds the platform contract (`platform`): builds for
+//! This module also holds the platform contract (`platform`): builds for
 //! anything but 64-bit little-endian Linux on x86_64 (x86-64-v3 or newer),
 //! aarch64 or riscv64 fail here with a `compile_error!`, and [`probe`] checks
 //! the mandatory kernel facilities at run time.
 
-#![no_std]
 #![cfg_attr(not(test), deny(clippy::expect_used, clippy::unwrap_used))]
 
 use core::ffi::c_void;
@@ -26,12 +25,12 @@ use rustix::thread::futex;
 
 mod platform;
 mod ring;
-#[cfg(feature = "rseq")]
+#[cfg(feature = "experimental-rseq")]
 mod rseq;
 
-pub use platform::{Capabilities, KernelVersion, ProbeError, probe};
-pub use ring::{CompletionLost, PurgeRing, RingError};
-#[cfg(feature = "rseq")]
+pub use platform::{Capabilities, KernelVersion, probe};
+pub use ring::{PurgeRing, RingError};
+#[cfg(feature = "experimental-rseq")]
 pub use rseq::{MmCid, RseqUnavailable};
 
 /// A reserved, never-unmapped range of virtual address space.
@@ -95,18 +94,6 @@ impl Region {
       base: NonNull::new(base)?,
       len,
     })
-  }
-
-  /// Length of the region in bytes.
-  #[must_use]
-  pub const fn len(&self) -> usize {
-    self.len
-  }
-
-  /// Whether the region is empty (never true for a reserved region).
-  #[must_use]
-  pub const fn is_empty(&self) -> bool {
-    self.len == 0
   }
 
   /// Pointer to `offset` inside the region, carrying the region's
@@ -353,10 +340,10 @@ impl<const N: usize> MetaArena<N> {
   }
 }
 
-/// Granularity of every range this crate maps, commits or purges.
+/// Granularity of every range this module maps, commits or purges.
 ///
 /// 64 KiB is a multiple of every Linux page size (4, 16 and 64 KiB), so the
-/// crate never has to query the page size. That matters: `rustix`'s
+/// module never has to query the page size. That matters: `rustix`'s
 /// `page_size()` reads the auxiliary vector lazily and may allocate when its
 /// `alloc` feature is unified in, which would re-enter the allocator.
 pub const GRANULE: usize = 64 * 1024;

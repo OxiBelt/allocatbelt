@@ -5,7 +5,7 @@
 //! syscall number is `__NR_arch_specific_syscall + 14` from
 //! `include/uapi/asm-generic/unistd.h`. Neither is in the `libc` crate yet.
 
-use crate::CpuFeatures;
+use crate::arch::CpuFeatures;
 
 const NR_RISCV_HWPROBE: libc::c_long = 244 + 14;
 const RISCV_HWPROBE_KEY_IMA_EXT_0: i64 = 4;
@@ -51,7 +51,7 @@ pub(crate) fn detect() -> CpuFeatures {
 
 #[cfg(test)]
 mod tests {
-  use crate::CpuFeatures;
+  use crate::arch::CpuFeatures;
 
   /// `is_riscv_feature_detected!` is unstable, so the check is the build:
   /// a `+zbb` build only runs where Zbb exists, and CI tests one under
