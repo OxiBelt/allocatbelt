@@ -17,7 +17,8 @@
 //!   [0] P_INFO     kind | class << 8 | run length << 16
 //!   [1] P_FREE     number of set bits in the bitmap (may transiently lag)
 //!   [2] P_SUMMARY  small pages: bitmap words that may be non-zero
-//!   [3] reserved
+//!   [3] P_SINCE    free pages: decay epoch in which the page was last
+//!                  marked dirty
 //!   [4..68]        free bitmap (1 = free block)
 //! ```
 //!
