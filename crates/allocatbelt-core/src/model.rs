@@ -48,6 +48,11 @@ pub struct MockOs {
   /// Timeout of the last `futex_wait` that had one (an idle
   /// [`Heap::maintain`]), in ms.
   pub(crate) last_wait_ms: AtomicU64,
+  /// The [`Os::shard_hint`] reported; `usize::MAX` for none.
+  pub(crate) hint: AtomicUsize,
+  /// Makes every [`Os::shard_hint`] report the next shard, as if the
+  /// thread moved to another CPU between any two slow-path calls.
+  pub(crate) migrate: AtomicBool,
 }
 
 impl MockOs {
@@ -65,6 +70,8 @@ impl MockOs {
       clock: AtomicU64::new(0),
       wakes: AtomicUsize::new(0),
       last_wait_ms: AtomicU64::new(0),
+      hint: AtomicUsize::new(usize::MAX),
+      migrate: AtomicBool::new(false),
     }
   }
 
@@ -173,6 +180,15 @@ impl Os for MockOs {
   fn now_ms(&self) -> u64 {
     self.clock.load(Ordering::Relaxed)
   }
+  fn shard_hint(&self) -> Option<usize> {
+    let hint = if self.migrate.load(Ordering::Relaxed) {
+      self.hint.fetch_add(1, Ordering::Relaxed)
+    } else {
+      self.hint.load(Ordering::Relaxed)
+    };
+    (hint != usize::MAX).then_some(hint)
+  }
+
   fn fatal(&self, msg: &'static str) -> ! {
     panic!("{msg}")
   }
@@ -387,7 +403,8 @@ fn size_of(hi: u8, lo: u8) -> usize {
 /// housekeeping to a maintenance "thread" and back, runs its rounds (also
 /// with a batching [`MockPurger`] that fails some runs) and requests purges
 /// from it; the
-/// first byte seeds randomized placement (or not). At the end everything is
+/// first byte seeds randomized placement (or not) and makes the shard
+/// hints move on every call (or not). At the end everything is
 /// freed and a forced purge must leave nothing dirty.
 pub fn run(data: &[u8]) {
   let h = Box::new(Heap::new(MockOs::new()));
@@ -395,6 +412,12 @@ pub fn run(data: &[u8]) {
   let seed = bytes.next().unwrap_or(0);
   if seed & 1 == 1 {
     h.set_seed(u64::from(seed).wrapping_mul(0x9E37_79B9_7F4A_7C15));
+  }
+  if seed & 2 == 2 {
+    // Shard hints that change on every call (an rseq `mm_cid` of a thread
+    // that keeps migrating).
+    h.os().hint.store(usize::from(seed), Ordering::Relaxed);
+    h.os().migrate.store(true, Ordering::Relaxed);
   }
   let caches = [cache(&h), cache(&h), ThreadCache::new()];
   let mut live: Vec<(usize, usize)> = Vec::new();

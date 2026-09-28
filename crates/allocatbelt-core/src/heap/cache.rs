@@ -150,7 +150,7 @@ impl<O: Os> Heap<O> {
 
   fn alloc_cached_slow(&self, tc: &ThreadCache, size: usize, align: usize) -> Option<Block> {
     if !tc.is_attached() {
-      return self.alloc_block(tc.shard.get(), size, align);
+      return self.alloc_block(self.shard_of(tc), size, align);
     }
     match Self::kind(size, align)? {
       Kind::Small(c) => Self::pop(tc, c)
@@ -158,7 +158,7 @@ impl<O: Os> Heap<O> {
         .map(|o| Block::new(o, false)),
       Kind::Run(n, step) => {
         self.tick(tc);
-        self.alloc_large(tc.shard.get(), n, step)
+        self.alloc_large(self.shard_of(tc), n, step)
       }
       Kind::Huge(k) => {
         self.tick(tc);
@@ -195,7 +195,7 @@ impl<O: Os> Heap<O> {
     // while the class has free blocks elsewhere; before a new page is
     // taken for the class, they go back so the claim can reuse them.
     let grow = tc.pending[c].get() == 0;
-    let hint = tc.shard.get();
+    let hint = self.shard_of(tc);
     let (page, w, bits) =
       match self.with_shard(hint, |s, sh| self.claim_class_word(s, sh, c, grow))? {
         Some(claim) => claim,
@@ -210,6 +210,13 @@ impl<O: Os> Heap<O> {
     cw.bits.set(bits);
     self.tick(tc);
     Self::pop(tc, c)
+  }
+
+  /// The shard the thread prefers: the environment's current hint (see
+  /// [`Os::shard_hint`]), else the one given when its cache was attached.
+  #[inline]
+  fn shard_of(&self, tc: &ThreadCache) -> usize {
+    self.os.shard_hint().unwrap_or_else(|| tc.shard.get())
   }
 
   /// Counts a slow-path operation of the thread and, every 16th, runs a

@@ -82,7 +82,7 @@ The check needs only `rustup target add riscv64gc-unknown-linux-gnu`, no linker 
 
 ## Not covered yet
 
-Phases 1 to 5 of the Linux 7 / ISA / SIMD plan changed no allocator algorithm: phase 4 measured SIMD candidates and phase 5 promoted none of them. Phase 6 made the heap locks sleep on a futex, phase 7 moved housekeeping to a `SCHED_BATCH` maintenance thread and phase 8 added an opt-in io_uring purge ring for it (below).
+Phases 1 to 5 of the Linux 7 / ISA / SIMD plan changed no allocator algorithm: phase 4 measured SIMD candidates and phase 5 promoted none of them. Phase 6 made the heap locks sleep on a futex, phase 7 moved housekeeping to a `SCHED_BATCH` maintenance thread and phase 8 added an opt-in io_uring purge ring for it (below). Phase 9 added an experimental, off-by-default shard selection by the rseq `mm_cid` (below), without measurements.
 
 ## Maintenance thread scheduling
 
@@ -98,6 +98,16 @@ After `Allocatbelt::set_io_uring(true)`, the maintenance thread purges the page 
 - waits for every completion of a batch before the pass ends the pages' claim, so no purge is in flight after a pass (in particular not across `fork`, whose handler takes the purge lock first), and only a completion with result 0 marks pages clean.
 
 If io_uring is unavailable (`kernel.io_uring_disabled`, a seccomp filter, qemu-user's `ENOSYS`) or `IORING_OP_MADVISE` is missing, the thread purges with `madvise`; `Allocatbelt::purge_backend` and `Allocatbelt::io_uring_error` say which and why. A forked child inherits the descriptor (close-on-exec) but never uses it: its own maintenance thread, if started, creates a new ring.
+
+## rseq `mm_cid` shard selection (experimental)
+
+Built only with the Cargo feature `experimental-rseq` and used only after `Allocatbelt::set_rseq_policy(RseqPolicy::Prefer)` (or `Require`); the default policy, `Auto`, does not select it (plan §12, Phase 9). It has not been benchmarked: whether it helps is left to a later qualification against real workloads, such as OxiBelt under load, so `Auto` stays off until then. With it, a thread's cache refills and other uncached allocations prefer the shard numbered by its current `mm_cid` instead of the shard its cache got when attached. The cached fast path does not change.
+
+- **Ownership of the rseq area.** A thread can register one rseq area, and glibc (2.35+) registers one for every thread it creates. allocatbelt never registers its own: it reads glibc's, at the thread pointer plus `__rseq_offset`. It is available when glibc registered areas (`__rseq_size != 0`) and the kernel fills in `mm_cid` (`AT_RSEQ_FEATURE_SIZE >= 28`, Linux 6.3+); a thread whose own registration failed (negative `cpu_id`) keeps its per-thread shard. musl registers no area, so there the feature always falls back; `RseqStatus::available` says why (`NotGlibc`, `NotRegistered` for qemu-user, seccomp or `GLIBC_TUNABLES=glibc.pthread.rseq=0`, `NoMmCid`).
+- **Migration and aborts.** The shard is only a preference: the shard is locked as before, so a thread that moves to another CPU (and `mm_cid`) between reading it and taking the lock costs locality, never correctness, and there is no rseq critical section to abort. No system call happens in between.
+- **VMs and containers.** `mm_cid` is the guest kernel's view: dense over the vCPUs and cpuset the process may use, which is the scheduling identity that matters here; nothing tries to find the host CPU.
+- **fork.** The child inherits the policy and the forking thread's registration; its `mm_cid` values start over for the new address space (tests/fork.rs runs with the policy on when the feature is built).
+- **Diagnostics.** `Allocatbelt::rseq_status` reports the policy, availability and whether it is in use; `Allocatbelt::mm_cid` returns the calling thread's value.
 
 ## No portability layer
 

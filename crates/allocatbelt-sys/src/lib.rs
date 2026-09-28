@@ -26,9 +26,13 @@ use rustix::thread::futex;
 
 mod platform;
 mod ring;
+#[cfg(feature = "rseq")]
+mod rseq;
 
 pub use platform::{Capabilities, KernelVersion, ProbeError, probe};
 pub use ring::{CompletionLost, PurgeRing, RingError};
+#[cfg(feature = "rseq")]
+pub use rseq::{MmCid, RseqUnavailable};
 
 /// A reserved, never-unmapped range of virtual address space.
 ///

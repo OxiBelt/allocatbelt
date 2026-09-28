@@ -39,6 +39,9 @@ impl Drop for SetOnDrop<'_> {
 
 #[test]
 fn children_of_busy_parents_can_allocate() {
+  // Children inherit the policy, and the forking thread's rseq area.
+  #[cfg(feature = "experimental-rseq")]
+  let _ = GLOBAL.set_rseq_policy(allocatbelt::RseqPolicy::Prefer);
   let stop = AtomicBool::new(false);
   std::thread::scope(|s| {
     let _stop = SetOnDrop(&stop);

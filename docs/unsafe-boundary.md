@@ -37,9 +37,20 @@ A restricted ring for batched `MADV_DONTNEED` (`PurgeRing`, used by the maintena
 | `PurgeRing::word` | block | `&*(ring + off) as &AtomicU32` | The kernel's offsets point at aligned `u32` heads, tails and masks inside the mapping, which lives as long as the ring; both sides access them atomically. |
 | `PurgeRing::purge` | **`unsafe fn`** + block ×2 | batched `madvise(MADV_DONTNEED)`; `Region::purge` for ranges that were never submitted (a retired ring) | The contract of `Region::purge`, for every range. `purge` returns only after every submitted purge has completed, or reports `CompletionLost` (a failed completion wait), on which the adapter aborts rather than reuse pages a purge may still discard. |
 
+### `rseq` (`mm_cid` reads, plan Phase 9, feature `rseq`)
+
+Compiled only with the sys feature `rseq` (the adapter's `experimental-rseq`). It reads the calling thread's `mm_cid` from the rseq area glibc registered; it registers nothing and runs no rseq critical section. A safe alternative does not exist: the area is only reachable through the thread pointer.
+
+| Location | Kind | Operation | Why it is sound |
+|---|---|---|---|
+| `extern "C"` block (glibc only) | `unsafe extern` | declares glibc's `__rseq_offset` and `__rseq_size` (glibc 2.35+) | The declared types are glibc's (`ptrdiff_t`, `unsigned int`). |
+| `MmCid::probe` | block ×3 | reads `__rseq_size` and `__rseq_offset`; `getauxval(AT_RSEQ_FEATURE_SIZE)` | Constants glibc sets before user code runs; `getauxval` only reads the auxiliary vector and does not allocate. `mm_cid` is used only if glibc registered an area (`__rseq_size != 0`) and the kernel fills `mm_cid` in (feature size at least 28). |
+| `thread_pointer` | block (one per architecture) | `mov fs:[0]` (x86_64), `mrs tpidr_el0` (aarch64), `mv tp` (riscv64) | Reads the thread pointer that `__rseq_offset` is relative to; no other effect. |
+| `field` | block | `&*(tp + __rseq_offset + off) as &AtomicU32` | glibc keeps every thread's rseq area (32 bytes, 32-aligned, in its TCB) at that address for the thread's lifetime, registered or not; `off` names an aligned `u32` (`cpu_id` or `mm_cid`). Only the kernel writes the area, and only while this thread is in the kernel, so the loads never race. A negative `cpu_id` (registration failed for this thread) makes the read return `None`. |
+
 `futex_wait`/`futex_wake` (the heap locks' sleep and wake-up, and the maintenance thread's timed sleep) use rustix's safe futex functions and add no `unsafe` site.
 
-`libc` is used only for what rustix does not cover: the guard-marker advice values (not in rustix's `Advice` enum), `pthread_atfork` and `sched_setscheduler`.
+`libc` is used only for what rustix does not cover: the guard-marker advice values (not in rustix's `Advice` enum), `pthread_atfork`, `sched_setscheduler` and, with the `rseq` feature, `getauxval`.
 
 The sys crate **does not use** `rustix::param::page_size()`: reading auxv may allocate when rustix's `alloc` feature gets unified in, which would re-enter the allocator. Instead every range uses a fixed 64 KiB granule, a multiple of all Linux page sizes.
 
@@ -54,6 +65,8 @@ CPU feature detection only; no architecture kernel exists yet. Every site runs d
 | `riscv64::detect` | block | `libc::syscall(riscv_hwprobe, &mut pair, 1, 0, null, 0)` | The kernel writes only into the one `Pair` passed, a live exclusive local with the UAPI `struct riscv_hwprobe` layout (`#[repr(C)]` `i64` + `u64`). A null CPU set of size 0 means all online CPUs and the flags are 0, as the hwprobe documentation requires. |
 
 ## allocatbelt (adapter)
+
+The experimental `mm_cid` shard selection (`src/rseq.rs`, feature `experimental-rseq`) adds no `unsafe` here: `LinuxOs::shard_hint` only calls the safe `MmCid::current`.
 
 | Location | Kind | Operation | Why it is sound |
 |---|---|---|---|

@@ -14,5 +14,10 @@ publish.workspace = true
 libc.workspace = true
 rustix.workspace = true
 
+[features]
+# Reads the rseq `mm_cid` glibc registers (Phase 9 research); links
+# glibc's `__rseq_offset` and `__rseq_size` (glibc 2.35 or newer).
+rseq = []
+
 [lints]
 workspace = true

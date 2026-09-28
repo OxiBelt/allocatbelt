@@ -1216,3 +1216,71 @@ fn fuzz_program_edge_cases() {
   p.extend([23, 24, 25, 255, 26, 0, 24, 27, 0x20 | 27]);
   crate::model::run(&p);
 }
+
+#[test]
+fn shard_hints_override_the_attached_shard() {
+  let h = heap();
+  // Two caches, attached to two different shards.
+  let (a, b) = (cache(h), cache(h));
+  let seg = |o: usize| o / SEGMENT_SIZE;
+  let run = 4 * PAGE_SIZE;
+  assert_ne!(seg(alloc_c(h, &a, run, 8)), seg(alloc_c(h, &b, run, 8)));
+  // With a hint, both allocate from the hinted shard's segment: its runs
+  // and its small pages alike.
+  h.os().hint.store(7, Ordering::Relaxed);
+  let (x, y) = (alloc_c(h, &a, run, 8), alloc_c(h, &b, run, 8));
+  assert_eq!(seg(x), seg(y));
+  let (x, y) = (alloc_c(h, &a, 48, 8), alloc_c(h, &b, 48, 8));
+  assert_eq!(seg(x), seg(y));
+  // Without one again, each cache is back on its own shard.
+  h.os().hint.store(usize::MAX, Ordering::Relaxed);
+  assert_ne!(seg(alloc_c(h, &a, run, 8)), seg(alloc_c(h, &b, run, 8)));
+}
+
+/// More threads than shards, each "migrating" on every slow-path call:
+/// shard hints change under them (as an rseq `mm_cid` does), so blocks
+/// cached, freed and flushed by one thread come from shards the others
+/// are using. The hints are only preferences; the heap stays consistent.
+#[test]
+fn migrating_threads_keep_the_heap_consistent() {
+  let h = heap();
+  h.os().hint.store(0, Ordering::Relaxed);
+  h.os().migrate.store(true, Ordering::Relaxed);
+  let threads = if cfg!(miri) { 2 } else { crate::SHARDS + 8 };
+  let rounds = if cfg!(miri) { 50 } else { 2_000 };
+  let shared = Mutex::new(Vec::<usize>::new());
+  std::thread::scope(|sc| {
+    for t in 0..threads {
+      let shared = &shared;
+      sc.spawn(move || {
+        let tc = cache(h);
+        let mut mine = Vec::new();
+        for i in 0..rounds {
+          mine.push(alloc_c(h, &tc, SIZES[(i * 5 + t) % 16], 8));
+          if mine.len() == 16 {
+            // Half go to other threads, half are freed here.
+            let mut s = shared.lock().unwrap();
+            s.extend(mine.drain(..8));
+            let n = s.len().min(8);
+            let theirs: Vec<usize> = s.drain(..n).collect();
+            drop(s);
+            for o in theirs.into_iter().chain(mine.drain(..)) {
+              free_c(h, &tc, o);
+            }
+          }
+        }
+        for o in mine {
+          free_c(h, &tc, o);
+        }
+        h.retire(&tc);
+      });
+    }
+  });
+  for o in shared.into_inner().unwrap() {
+    free(h, o);
+  }
+  assert!(h.os().live.lock().unwrap().is_empty());
+  assert_eq!(h.dirty_pages(), h.dirty_pages_recounted());
+  h.purge();
+  assert_eq!(h.dirty_pages(), 0);
+}

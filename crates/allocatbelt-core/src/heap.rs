@@ -145,6 +145,16 @@ pub trait Os: Sync {
   fn now_ms(&self) -> u64 {
     0
   }
+  /// The shard the calling thread should prefer right now, in place of the
+  /// one its cache was given when attached; `None` keeps that one. Asked
+  /// on cache refills and other uncached allocations, never on the cached
+  /// fast path. Only a preference: the shard is locked either way, so a
+  /// hint that is stale by the time it is used (the thread moved to
+  /// another CPU) costs locality, never correctness. The default returns
+  /// `None`.
+  fn shard_hint(&self) -> Option<usize> {
+    None
+  }
   /// Reports heap corruption or misuse (invalid or double free). Must not
   /// return.
   fn fatal(&self, msg: &'static str) -> !;

@@ -24,6 +24,12 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+#[cfg(feature = "experimental-rseq")]
+mod rseq;
+
+#[cfg(feature = "experimental-rseq")]
+pub use rseq::{RseqPolicy, RseqStatus, RseqUnavailable};
+
 pub use allocatbelt_arch::{CpuFeatures, KernelSet};
 pub use allocatbelt_core::MaintenanceStats;
 use allocatbelt_core::{
@@ -181,6 +187,12 @@ impl Os for LinuxOs {
   fn now_ms(&self) -> u64 {
     // `Instant::now` reads the vDSO clock and does not allocate.
     u64::try_from(self.arena().start.elapsed().as_millis()).unwrap_or(u64::MAX)
+  }
+
+  #[cfg(feature = "experimental-rseq")]
+  #[inline]
+  fn shard_hint(&self) -> Option<usize> {
+    rseq::shard_hint()
   }
 
   fn fatal(&self, msg: &'static str) -> ! {

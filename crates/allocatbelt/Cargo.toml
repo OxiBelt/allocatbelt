@@ -14,6 +14,11 @@ allocatbelt-arch.workspace = true
 allocatbelt-core.workspace = true
 allocatbelt-sys.workspace = true
 
+[features]
+# Experimental (Phase 9): shard selection by the rseq `mm_cid`, off unless
+# selected with `Allocatbelt::set_rseq_policy`. See docs/platform.md.
+experimental-rseq = ["allocatbelt-sys/rseq"]
+
 [dev-dependencies]
 libc.workspace = true
 
