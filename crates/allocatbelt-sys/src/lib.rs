@@ -317,6 +317,24 @@ pub fn yield_now() {
   rustix::thread::sched_yield();
 }
 
+/// Registers `fork` handlers with `pthread_atfork(3)`: `prepare` runs in
+/// the forking thread before the fork, `parent` and `child` after it in the
+/// respective process. Returns whether the registration succeeded; handlers
+/// stay registered for the life of the process.
+pub fn register_atfork(
+  prepare: extern "C" fn(),
+  parent: extern "C" fn(),
+  child: extern "C" fn(),
+) -> bool {
+  let [prepare, parent, child] = [prepare, parent, child].map(|f| f as unsafe extern "C" fn());
+  // SAFETY: the handlers are `extern "C"` functions without arguments, as
+  // `pthread_atfork` expects, and function pointers stay valid for the life
+  // of the process. Calling them is sound: they are safe functions.
+  #[expect(unsafe_code, reason = "pthread_atfork call")]
+  let r = unsafe { libc::pthread_atfork(Some(prepare), Some(parent), Some(child)) };
+  r == 0
+}
+
 /// 64 bits from the kernel CSPRNG (`getrandom(2)`), for hardening secrets.
 /// Returns `None` instead of blocking when the kernel's pool is not
 /// initialised yet (early boot).

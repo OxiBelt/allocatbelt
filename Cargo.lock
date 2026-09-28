@@ -17,6 +17,7 @@ version = "0.1.0"
 dependencies = [
  "allocatbelt-core",
  "allocatbelt-sys",
+ "libc",
 ]
 
 [[package]]

@@ -46,9 +46,33 @@ fn arena() -> Option<&'static Arena> {
       };
       // Before any allocation: every heap call goes through `arena` first.
       HEAP.set_seed(seed());
+      // glibc's `pthread_atfork` allocates with its own `malloc`, not
+      // through us, so registering here does not re-enter the allocator.
+      let _ = allocatbelt_sys::register_atfork(fork_prepare, fork_parent, fork_child);
       Some(arena)
     })
     .as_ref()
+}
+
+/// `fork` handlers: the forking thread takes every heap lock, so that no
+/// lock is held by a thread that does not exist in the child.
+extern "C" fn fork_prepare() {
+  // A fork while another thread is still reserving the arena would leave
+  // the child waiting for that thread forever.
+  let _ = ARENA.wait();
+  HEAP.fork_prepare();
+}
+
+extern "C" fn fork_parent() {
+  HEAP.fork_parent();
+}
+
+extern "C" fn fork_child() {
+  HEAP.fork_child();
+  // The purge thread (if any) did not survive the fork, and the child
+  // should not share the parent's placement secret.
+  PURGE_THREAD.store(false, Ordering::Release);
+  HEAP.set_seed(seed());
 }
 
 /// A secret for randomized placement: from the kernel CSPRNG, or, if its

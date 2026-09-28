@@ -71,6 +71,7 @@ use crate::{
 use Ordering::{AcqRel, Acquire, Relaxed, Release};
 
 mod cache;
+mod fork;
 mod purge;
 
 pub use cache::ThreadCache;

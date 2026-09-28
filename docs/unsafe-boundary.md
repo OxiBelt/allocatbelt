@@ -16,9 +16,10 @@ Regenerate: `grep -rn "unsafe" crates/*/src | grep -E "unsafe (\{|fn|impl)"`
 | `Region::decommit` | **`unsafe fn`** + block ×2 | `purge` + `mprotect(NONE)` | Same contract, plus no access until the range is committed again. |
 | `Region::guard` | **`unsafe fn`** + block ×2 | `madvise(MADV_GUARD_INSTALL)` (`libc`, Linux 6.13+), else `mprotect(NONE)` | Same contract as `decommit`: the markers discard the contents and fault on access, so nothing may use the range until it is unguarded and committed again. |
 | `Region::unguard` | block | `madvise(MADV_GUARD_REMOVE)` (`libc`) | Range checked; removing guard markers only turns faulting pages into zero-fill pages and leaves other pages alone, so it cannot invalidate memory in use. |
+| `register_atfork` | block | `pthread_atfork(prepare, parent, child)` (`libc`) | The handlers are `extern "C" fn()` items, valid for the life of the process and safe to call. glibc allocates the registration with its own `malloc`, not through us. |
 | `MetaArena::slot` | block | `slice::from_raw_parts` → `&[AtomicU64]` | Published only after commit (READY, Acquire). Never unmapped or purged. Zero-filled by the kernel, so every bit pattern is valid, and only atomic access follows. |
 
-`libc` is used only for what rustix does not cover: the guard-marker advice values (not in rustix's `Advice` enum).
+`libc` is used only for what rustix does not cover: the guard-marker advice values (not in rustix's `Advice` enum) and `pthread_atfork`.
 
 The sys crate **does not use** `rustix::param::page_size()`: reading auxv may allocate when rustix's `alloc` feature gets unified in, which would re-enter the allocator. Instead every range uses a fixed 64 KiB granule, a multiple of all Linux page sizes.
 
@@ -51,5 +52,5 @@ Since the core has no `unsafe`, Miri mainly checks panics/overflow and data race
 Before production, add loom models and fuzzing (cargo-fuzz against `Heap<MockOs>`).
 
 Other caveats:
-- **fork:** if another thread holds a shard or segment spin lock at fork time, the child can deadlock. That needs a `pthread_atfork` handler or a fork epoch (boundary.md §2.5).
+- **fork:** the adapter registers `pthread_atfork` handlers that take every heap lock before `fork` and release them on both sides (`Heap::fork_prepare/parent/child`), so no lock is held by a thread missing in the child; the child also reseeds its placement secret and falls back to allocation-driven purging. Blocks cached by the parent's other threads stay allocated in the child. `posix_spawn` and `vfork` do not run the handlers, and do not need to. Covered by `tests/fork.rs`, which deadlocked before the handlers existed.
 - `std::io::stderr()` is used only on the fatal path (unbuffered, no allocation expected).
