@@ -65,9 +65,13 @@ fn maintenance_thread_does_the_housekeeping() {
   let bufs: Vec<Vec<u8>> = (0..40).map(|i| vec![i as u8 | 1; 1 << 20]).collect();
   let before = GLOBAL.maintenance_stats();
   drop(bufs);
-  assert!(wait_for(|| GLOBAL.dirty_bytes() < 32 << 20));
+  // A pass lowers the dirty count batch by batch and is counted once it
+  // ends, so the count can drop below the budget before the pass shows.
+  assert!(wait_for(|| {
+    GLOBAL.dirty_bytes() < 32 << 20
+      && GLOBAL.maintenance_stats().budget_passes > before.budget_passes
+  }));
   let after = GLOBAL.maintenance_stats();
-  assert!(after.budget_passes > before.budget_passes);
   assert_eq!(after.inline_budget_passes, before.inline_budget_passes);
   assert!(after.wakeups > before.wakeups);
   assert!(after.purged_runs > before.purged_runs);
@@ -84,6 +88,7 @@ fn maintenance_thread_does_the_housekeeping() {
   drop(bufs);
   assert!(GLOBAL.dirty_bytes() >= 7 << 20);
   GLOBAL.request_purge();
-  assert!(wait_for(|| GLOBAL.dirty_bytes() == 0));
-  assert!(GLOBAL.maintenance_stats().force_passes > after.force_passes);
+  assert!(wait_for(|| {
+    GLOBAL.dirty_bytes() == 0 && GLOBAL.maintenance_stats().force_passes > after.force_passes
+  }));
 }
