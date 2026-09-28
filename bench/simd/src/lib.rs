@@ -10,3 +10,4 @@
 pub mod harness;
 pub mod kernels;
 pub mod perf;
+pub mod segment;

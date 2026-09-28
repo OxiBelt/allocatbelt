@@ -2,14 +2,15 @@
 //! allocator uses and prints one table (or CSV) row per measurement.
 //!
 //! ```text
-//! bench-simd [--quick] [--csv] [--family nonzero|popcount|age|zero|copy]
+//! bench-simd [--quick] [--csv] [--family nonzero|popcount|age|age-meta|zero|copy]
 //! ```
 
 use std::hint::black_box;
 
 use allocatbelt_simd_bench::harness::{Config, Measurement, measure};
-use allocatbelt_simd_bench::kernels::{Families, Tier, Variant};
+use allocatbelt_simd_bench::kernels::{AgeFn, Families, Tier, Variant};
 use allocatbelt_simd_bench::perf::{Counters, EVENTS};
+use allocatbelt_simd_bench::segment::SegmentMeta;
 
 /// `find_nonzero_local_words` / `reduce_local_masks` lengths: one segment's
 /// words, a few segments, the 64 page records of a segment, and the 256
@@ -17,6 +18,9 @@ use allocatbelt_simd_bench::perf::{Counters, EVENTS};
 const WORD_LENGTHS: [usize; 5] = [1, 4, 16, 64, 256];
 /// Candidate pages per segment for the age classification.
 const AGE_CANDIDATES: [u32; 4] = [1, 8, 32, 64];
+/// Segments whose metadata `age-meta` cycles through for its cold case:
+/// about 70 MiB of page records, more than a last-level cache holds.
+const COLD_SEGMENTS: usize = 2048;
 /// Block sizes: small classes, the 8 KiB small limit, a page (64 KiB), a
 /// large block and a segment (4 MiB).
 const BYTE_SIZES: [usize; 8] = [16, 64, 256, 1024, 8192, 65_536, 1 << 20, 4 << 20];
@@ -185,6 +189,28 @@ fn main() {
       );
     }
   }
+  if wants("age-meta") {
+    // `warm` re-reads one segment's records; `cold` cycles through more
+    // than the caches hold, like a purge pass that walks every owned
+    // segment a quarter second after the last one.
+    let segs: Vec<SegmentMeta> = (0..COLD_SEGMENTS)
+      .map(|_| SegmentMeta::new(&core::array::from_fn(|_| next() % 32)))
+      .collect();
+    for (label, n) in [("warm", 1), ("cold", COLD_SEGMENTS)] {
+      for bits in AGE_CANDIDATES {
+        let candidates = spread(bits, &mut next);
+        age_meta(
+          &report,
+          cfg,
+          &mut c,
+          &format!("{bits}/64 {label}"),
+          &segs[..n],
+          &f.age,
+          candidates,
+        );
+      }
+    }
+  }
   if wants("zero") {
     for n in BYTE_SIZES {
       let mut buf = vec![1u8; n];
@@ -246,6 +272,73 @@ fn family<F: Copy>(
       baseline = m.median_ns;
     }
     report.row(name, size, v.name(), v.tier(), &m, baseline, per_op, unit);
+  }
+}
+
+/// The purge-age classification on the heap's metadata layout: today's
+/// sparse loop over the candidates' atomics is the baseline, then every
+/// vector `age` kernel on a snapshot taken with 64 atomic loads.
+#[allow(clippy::too_many_arguments, reason = "one family at one size")]
+fn age_meta(
+  report: &Report,
+  cfg: Config,
+  counters: &mut Option<&mut Counters>,
+  size: &str,
+  segs: &[SegmentMeta],
+  kernels: &[Variant<AgeFn>],
+  candidates: u64,
+) {
+  const CUTOFF: u64 = 16;
+  let sparse = measure(
+    cfg,
+    counters.as_deref_mut(),
+    cycle(segs, |s| {
+      black_box(s.age_sparse(black_box(candidates), black_box(CUTOFF)));
+    }),
+  );
+  let branchless = measure(
+    cfg,
+    counters.as_deref_mut(),
+    cycle(segs, |s| {
+      black_box(s.age_sparse_branchless(black_box(candidates), black_box(CUTOFF)));
+    }),
+  );
+  let row = |name: &str, tier: Tier, m: &Measurement| {
+    report.row(
+      "age-meta",
+      size,
+      name,
+      tier,
+      m,
+      sparse.median_ns,
+      64.0,
+      "Gpage/s",
+    );
+  };
+  row("sparse", Tier::Scalar, &sparse);
+  row("sparse-branchless", Tier::Scalar, &branchless);
+  for v in kernels.iter().filter(|v| v.tier() != Tier::Scalar) {
+    let k = v.get();
+    let m = measure(
+      cfg,
+      counters.as_deref_mut(),
+      cycle(segs, |s| {
+        black_box(k(&s.snapshot(), black_box(candidates), black_box(CUTOFF)));
+      }),
+    );
+    row(&format!("snapshot+{}", v.name()), v.tier(), &m);
+  }
+}
+
+/// Calls `f` on each of `segs` in turn, one per operation.
+fn cycle<'a>(segs: &'a [SegmentMeta], mut f: impl FnMut(&SegmentMeta) + 'a) -> impl FnMut() + 'a {
+  let mut i = 0;
+  move || {
+    f(&segs[i]);
+    i += 1;
+    if i == segs.len() {
+      i = 0;
+    }
   }
 }
 

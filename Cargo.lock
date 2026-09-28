@@ -56,6 +56,7 @@ name = "allocatbelt-simd-bench"
 version = "0.1.0"
 dependencies = [
  "allocatbelt-arch",
+ "allocatbelt-core",
  "libc",
 ]
 
