@@ -22,11 +22,11 @@ Regenerate: `grep -rn "unsafe" crates/allocatbelt/src bench/simd/src | grep -E "
 | `register_atfork` | block | `pthread_atfork(prepare, parent, child)` (`libc`) | The handlers are `extern "C" fn()` items, valid for the life of the process and safe to call. glibc allocates the registration with its own `malloc`, not through us. |
 | `MetaArena::slot` | block | `slice::from_raw_parts` → `&[AtomicU64]` | Published only after commit (READY, Acquire). Never unmapped or purged. Zero-filled by the kernel, so every bit pattern is valid, and only atomic access follows. |
 | `platform::probe` | block ×5 | `write_volatile` / `read_volatile` of one byte, `Region::purge`, `Region::guard_markers`, `Region::decommit`, all on a 64 KiB scratch `Region` the probe reserves itself | The scratch range is private to the function: no reference to it exists and nothing else knows its address, so writing, purging, guarding and decommitting it cannot affect any other memory. The byte is written and read only while the range is committed read/write (a purge keeps it accessible). Runs once, before the arena is reserved ([docs/platform.md](platform.md)). |
-| `set_batch_scheduling` | block | `libc::syscall(SYS_sched_setscheduler, 0, SCHED_BATCH, &param)` | The kernel only reads `param`, a live `#[repr(C)]` local with the UAPI `struct sched_param` layout (one `int`, 0 as `SCHED_BATCH` requires), and changes only the calling thread's policy (pid 0 is the caller). A raw syscall because rustix has no binding and musl's `sched_setscheduler` wrapper always fails. Called once, by the maintenance thread. |
+| `set_batch_scheduling` (feature `scheduler`) | block | `libc::syscall(SYS_sched_setscheduler, 0, SCHED_BATCH, &param)` | The kernel only reads `param`, a live `#[repr(C)]` local with the UAPI `struct sched_param` layout (one `int`, 0 as `SCHED_BATCH` requires), and changes only the calling thread's policy (pid 0 is the caller). A raw syscall because rustix has no binding and musl's `sched_setscheduler` wrapper always fails. Called once, by the maintenance thread. |
 
-### `sys/ring.rs` (io_uring purge ring, plan Phase 8)
+### `sys/ring.rs` (io_uring purge ring, plan Phase 8, feature `io-uring`)
 
-A restricted ring for batched `MADV_DONTNEED` (`PurgeRing`, used by the maintenance thread only after `Allocatbelt::set_io_uring(true)`). The syscalls go through rustix's `io_uring_*` functions, which are `unsafe` because the kernel works on raw pointers; no safe crate covers a ring that the allocator can use without allocating. A safe alternative would be `madvise` per run, which stays the default.
+Compiled only with the Cargo feature `io-uring` (not default). A restricted ring for batched `MADV_DONTNEED` (`PurgeRing`, used by the maintenance thread only after `Allocatbelt::set_io_uring(true)`). The syscalls go through rustix's `io_uring_*` functions, which are `unsafe` because the kernel works on raw pointers; no safe crate covers a ring that the allocator can use without allocating. A safe alternative would be `madvise` per run, which stays the default.
 
 | Location | Kind | Operation | Why it is sound |
 |---|---|---|---|
@@ -52,7 +52,7 @@ Compiled only with the feature `experimental-rseq`. It reads the calling thread'
 
 `futex_wait`/`futex_wake` (the heap locks' sleep and wake-up, and the maintenance thread's timed sleep) use rustix's safe futex functions and add no `unsafe` site.
 
-`libc` is used only for what rustix does not cover: the guard-marker advice values (not in rustix's `Advice` enum), `pthread_atfork`, `sched_setscheduler` and, with `experimental-rseq`, `getauxval`.
+`libc` is used only for what rustix does not cover: the guard-marker advice values (not in rustix's `Advice` enum), `pthread_atfork`, `sched_setscheduler` (feature `scheduler`) and, with `experimental-rseq`, `getauxval`.
 
 The `sys` module **does not use** `rustix::param::page_size()`: reading auxv may allocate when rustix's `alloc` feature gets unified in, which would re-enter the allocator. Instead every range uses a fixed 64 KiB granule, a multiple of all Linux page sizes.
 
@@ -68,7 +68,7 @@ CPU feature detection only; no architecture kernel exists yet. Every site runs d
 
 ## `global` (`crates/allocatbelt/src/global.rs`, the adapter)
 
-`LinuxOs` (the core's `Os`), `RingPurger` and `impl GlobalAlloc for Allocatbelt` are here. The experimental `mm_cid` shard selection (`src/rseq.rs`, feature `experimental-rseq`) adds no `unsafe` here: `LinuxOs::shard_hint` only calls the safe `MmCid::current`.
+`LinuxOs` (the core's `Os`) and `impl GlobalAlloc for Allocatbelt` are in `global.rs`; the maintenance thread is in `src/maintenance.rs` (feature `maintenance`), and its `RingPurger` only with the feature `io-uring`. The experimental `mm_cid` shard selection (`src/rseq.rs`, feature `experimental-rseq`) adds no `unsafe` here: `LinuxOs::shard_hint` only calls the safe `MmCid::current`.
 
 | Location | Kind | Operation | Why it is sound |
 |---|---|---|---|
@@ -76,7 +76,7 @@ CPU feature detection only; no architecture kernel exists yet. Every site runs d
 | `LinuxOs::guard` | block | calls `Region::guard` | The core's `Os` contract: it only guards the last page of an owned segment, which it never hands out, and unguards it before the segment can be committed for other use (trust assumption 5). |
 | `impl GlobalAlloc` | `unsafe impl` + 4 `unsafe fn` | — | Required by the trait. Unwinding is blocked by `AbortOnUnwind`. |
 | `alloc_zeroed` | block | `write_bytes(0, size)` | A fresh block that nobody references yet. Skipped when the core reports the block as already zero (trust assumption 4). |
-| `RingPurger::purge_batch` | block | calls `PurgeRing::purge` | The core's `Purger` contract: every range was claimed by the purge pass, so it holds no live allocation and none of its pages is handed out until the call returns; the ring returns only after all completions (and the adapter aborts on `CompletionLost`). |
+| `RingPurger::purge_batch` (`maintenance.rs`, feature `io-uring`) | block | calls `PurgeRing::purge` | The core's `Purger` contract: every range was claimed by the purge pass, so it holds no live allocation and none of its pages is handed out until the call returns; the ring returns only after all completions (and the adapter aborts on `CompletionLost`). |
 | `realloc` | block | `copy_nonoverlapping` | The old block is live (caller contract); the new block is a separate fresh block. |
 
 ## allocatbelt-simd-bench (benchmark only)

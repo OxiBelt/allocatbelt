@@ -14,9 +14,17 @@ Run the checks CI runs from the repository root. The toolchain is pinned by
 cargo fmt --all --check
 cargo clippy --all-targets --all-features --locked -- -D warnings
 cargo test --release --all-features --locked
+scripts/check-features.sh    # each supported Cargo feature combination
+scripts/check-package.sh     # the crates.io package and a clean consumer
 cargo audit
 cargo deny check
 ```
+
+A new Cargo feature needs code behind it, must be additive and build on
+stable Rust, gets a field in `CompiledCapabilities`, a row in
+[docs/features.md](docs/features.md) and a combination in
+`scripts/check-features.sh`. Allocator correctness and hardening are never
+features.
 
 `cargo audit` and `cargo deny` are pinned in CI; install the same versions
 locally with:

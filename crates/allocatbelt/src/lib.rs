@@ -24,7 +24,26 @@
 //! - `sys`: the syscalls and raw-memory conversions, one `unsafe` operation
 //!   per block, and the platform contract.
 //! - `arch`: allocation-free CPU feature discovery and kernel dispatch.
-//! - `global`: the `GlobalAlloc` adapter that joins them.
+//! - `global`: the `GlobalAlloc` adapter that joins them, and
+//!   `maintenance`, its background thread.
+//!
+//! # Cargo features
+//!
+//! Features decide which optional parts are compiled in; what a process
+//! then uses is chosen at run time, within what was compiled
+//! ([`CompiledCapabilities`]). All build on stable Rust. Allocator
+//! correctness and hardening (out-of-band metadata, double-free detection,
+//! guard pages, fork handling, the platform probes) are not features.
+//!
+//! | Feature | Default | Status | Adds |
+//! |---|---|---|---|
+//! | `maintenance` | yes | stable | the background maintenance thread (`start_maintenance_thread`, `purge_backend`, `PurgeBackend`) |
+//! | `scheduler` | yes | stable | runs that thread as `SCHED_BATCH`; implies `maintenance` |
+//! | `io-uring` | no | stable, off at run time until `set_io_uring(true)` | batched purges through a restricted io_uring, falling back to `madvise` (`set_io_uring`, `io_uring_error`, `RingError`); implies `maintenance` |
+//! | `experimental-rseq` | no | experimental, off at run time until `set_rseq_policy` | shard selection by the rseq `mm_cid`, glibc 2.35+ (`RseqPolicy`, `RseqStatus`) |
+//!
+//! Details, and what happens where the system lacks a facility, are in
+//! `docs/features.md` in the repository.
 //!
 //! Every `unsafe` site is listed in `docs/unsafe-boundary.md`.
 
@@ -35,15 +54,23 @@
 #![cfg_attr(not(test), deny(clippy::expect_used, clippy::unwrap_used))]
 
 mod arch;
+mod capabilities;
 mod core;
 mod global;
+#[cfg(feature = "maintenance")]
+mod maintenance;
 #[cfg(feature = "experimental-rseq")]
 mod rseq;
 mod sys;
 
 pub use crate::arch::{CpuFeatures, KernelSet};
+pub use crate::capabilities::CompiledCapabilities;
 pub use crate::core::MaintenanceStats;
-pub use crate::global::{Allocatbelt, PurgeBackend};
+pub use crate::global::Allocatbelt;
+#[cfg(feature = "maintenance")]
+pub use crate::maintenance::PurgeBackend;
 #[cfg(feature = "experimental-rseq")]
 pub use crate::rseq::{RseqPolicy, RseqStatus, RseqUnavailable};
-pub use crate::sys::{Capabilities, KernelVersion, RingError};
+#[cfg(feature = "io-uring")]
+pub use crate::sys::RingError;
+pub use crate::sys::{Capabilities, KernelVersion};

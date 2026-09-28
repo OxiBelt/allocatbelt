@@ -1,25 +1,25 @@
 //! The `GlobalAlloc` adapter: turns the core's offsets into pointers through
 //! `sys` and holds the `unsafe` that the `GlobalAlloc` contract itself
 //! requires (the trait impl, zero-filling and the `realloc` copy), the
-//! arena, the per-thread caches and the maintenance thread.
+//! arena and the per-thread caches. The maintenance thread is in
+//! `maintenance` (feature `maintenance`).
 
 use std::alloc::{GlobalAlloc, Layout};
 use std::io::Write as _;
 use std::ptr::{self, NonNull};
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64};
 use std::time::{Duration, Instant};
 
 use crate::arch::{CpuFeatures, KernelSet};
 use crate::core::MaintenanceStats;
 use crate::core::{
-  ARENA_SIZE, Block, Heap, MAX_SEGMENTS, META_WORDS, Os, PAGE_SIZE, PURGE_BATCH, Purger,
-  SEGMENT_SIZE, ThreadCache,
+  ARENA_SIZE, Block, Heap, MAX_SEGMENTS, META_WORDS, Os, PAGE_SIZE, SEGMENT_SIZE, ThreadCache,
 };
-use crate::sys::{Capabilities, MetaArena, PurgeRing, Region, RingError};
+use crate::sys::{Capabilities, MetaArena, Region};
 
-struct Arena {
-  user: Region,
+pub(crate) struct Arena {
+  pub(crate) user: Region,
   meta: MetaArena<MAX_SEGMENTS>,
   /// Origin of the heap's clock (see `Os::now_ms`).
   start: Instant,
@@ -31,7 +31,7 @@ struct Arena {
 /// never allocates; the initialiser only issues syscalls.
 static ARENA: OnceLock<Option<Arena>> = OnceLock::new();
 
-fn arena() -> Option<&'static Arena> {
+pub(crate) fn arena() -> Option<&'static Arena> {
   ARENA
     .get_or_init(|| {
       // A missing mandatory facility is a platform the allocator does not
@@ -73,9 +73,8 @@ extern "C" fn fork_child() {
   HEAP.fork_child();
   // The maintenance thread (if any) did not survive the fork, and the child
   // should not share the parent's placement secret.
-  MAINT_THREAD.store(false, Ordering::Release);
-  SCHED_BATCH.store(false, Ordering::Relaxed);
-  BACKEND.store(BACKEND_NONE, Ordering::Relaxed);
+  #[cfg(feature = "maintenance")]
+  crate::maintenance::fork_child();
   HEAP.set_seed(seed());
 }
 
@@ -99,10 +98,10 @@ fn seed() -> u64 {
 /// The [`Os`] of the global heap. It is only reached after [`arena`]
 /// succeeded, because the heap is only entered with an arena offset or on an
 /// allocation that initialised the arena first.
-struct LinuxOs;
+pub(crate) struct LinuxOs;
 
 impl LinuxOs {
-  fn arena(&self) -> &'static Arena {
+  pub(crate) fn arena(&self) -> &'static Arena {
     match ARENA.get() {
       Some(Some(a)) => a,
       _ => self.fatal("allocatbelt: heap used before the arena was reserved"),
@@ -182,7 +181,7 @@ impl Os for LinuxOs {
   }
 }
 
-static HEAP: Heap<LinuxOs> = Heap::new(LinuxOs);
+pub(crate) static HEAP: Heap<LinuxOs> = Heap::new(LinuxOs);
 
 std::thread_local! {
     // `const`-initialised and without `Drop`: no lazy init and no destructor
@@ -245,7 +244,7 @@ impl Drop for AbortOnUnwind {
   }
 }
 
-fn guarded<R>(f: impl FnOnce() -> R) -> R {
+pub(crate) fn guarded<R>(f: impl FnOnce() -> R) -> R {
   let bomb = AbortOnUnwind;
   let r = f();
   std::mem::forget(bomb);
@@ -340,90 +339,6 @@ impl Allocatbelt {
     HEAP.set_purge_delay_ms(u64::try_from(delay.as_millis()).unwrap_or(u64::MAX));
   }
 
-  /// Starts the maintenance thread, which from then on runs the
-  /// allocator's housekeeping: budget passes when more than 32 MiB of freed
-  /// memory is waiting, decay passes that return memory unused for the
-  /// purge delay (also while the program is idle), and requested purges
-  /// ([`Allocatbelt::request_purge`]). Allocating threads then only record
-  /// the work, which keeps `madvise` off the allocation path; they still
-  /// purge themselves if 64 MiB pile up. The thread runs as `SCHED_BATCH`
-  /// ([`Allocatbelt::maintenance_is_batch`], docs/platform.md) and is not
-  /// pinned to a CPU. It purges with `madvise`, or in batches through
-  /// io_uring after [`Allocatbelt::set_io_uring`]
-  /// ([`Allocatbelt::purge_backend`]).
-  ///
-  /// Call it from ordinary code (not from inside an allocation). Returns
-  /// `Ok(false)` if the thread is already running.
-  ///
-  /// # Errors
-  ///
-  /// Returns the error of [`std::thread::Builder::spawn`], or an error if
-  /// the arena could not be reserved.
-  pub fn start_maintenance_thread(self) -> std::io::Result<bool> {
-    if MAINT_THREAD.swap(true, Ordering::AcqRel) {
-      return Ok(false);
-    }
-    if arena().is_none() {
-      MAINT_THREAD.store(false, Ordering::Release);
-      return Err(std::io::Error::other("allocatbelt: no arena"));
-    }
-    // Attached before the thread runs, so that frees record work from now
-    // on; the recorded work waits until the thread's first round.
-    HEAP.attach_maintenance();
-    let spawned = std::thread::Builder::new()
-      .name("allocatbelt-mnt".into())
-      .spawn(|| {
-        SCHED_BATCH.store(crate::sys::set_batch_scheduling(), Ordering::Relaxed);
-        // Created here: the thread that enables the ring is its only
-        // submitter.
-        let ring = if USE_IO_URING.load(Ordering::Relaxed) {
-          PurgeRing::new(RING_ENTRIES, RING_WORKERS, true)
-        } else {
-          Err(RingError {
-            step: "turned off",
-            errno: 0,
-          })
-        };
-        match ring {
-          Ok(ring) => {
-            let mut purger = RingPurger(ring);
-            loop {
-              purger.publish();
-              guarded(|| {
-                let _ = HEAP.maintain_with(&mut purger);
-              });
-            }
-          }
-          Err(e) => {
-            let _ = RING_ERROR.set(e);
-            BACKEND.store(BACKEND_MADVISE, Ordering::Relaxed);
-            loop {
-              guarded(|| {
-                let _ = HEAP.maintain();
-              });
-            }
-          }
-        }
-      });
-    match spawned {
-      Ok(_) => Ok(true),
-      Err(e) => {
-        HEAP.detach_maintenance();
-        MAINT_THREAD.store(false, Ordering::Release);
-        Err(e)
-      }
-    }
-  }
-
-  /// The former name of [`Allocatbelt::start_maintenance_thread`].
-  ///
-  /// # Errors
-  ///
-  /// As [`Allocatbelt::start_maintenance_thread`].
-  pub fn start_purge_thread(self) -> std::io::Result<bool> {
-    self.start_maintenance_thread()
-  }
-
   /// Asks the maintenance thread to return all freed memory and empty
   /// segments to the OS, and returns without waiting: for memory-pressure
   /// handlers. Without a maintenance thread it purges inline, like
@@ -440,117 +355,7 @@ impl Allocatbelt {
   pub fn maintenance_stats(self) -> MaintenanceStats {
     HEAP.maintenance_stats()
   }
-
-  /// Whether the maintenance thread purges in batches through a restricted
-  /// io_uring (`IORING_OP_MADVISE`), or with one `madvise` per page run,
-  /// the default. Takes effect when the thread starts. Off by default
-  /// because it has not won yet: on the kernels measured so far each
-  /// purge takes a detour through a kernel worker thread
-  /// (docs/research/benchmarks.md, Phase 8).
-  pub fn set_io_uring(self, on: bool) {
-    USE_IO_URING.store(on, Ordering::Relaxed);
-  }
-
-  /// How the maintenance thread returns memory.
-  #[must_use]
-  pub fn purge_backend(self) -> PurgeBackend {
-    match BACKEND.load(Ordering::Relaxed) {
-      BACKEND_MADVISE => PurgeBackend::Madvise,
-      BACKEND_URING => PurgeBackend::IoUring { sq_rewind: false },
-      BACKEND_URING_REWIND => PurgeBackend::IoUring { sq_rewind: true },
-      _ => PurgeBackend::NotStarted,
-    }
-  }
-
-  /// Why the maintenance thread has no io_uring (`step` is "turned off"
-  /// unless [`Allocatbelt::set_io_uring`] asked for one).
-  #[must_use]
-  pub fn io_uring_error(self) -> Option<RingError> {
-    RING_ERROR.get().copied()
-  }
-
-  /// Whether the maintenance thread runs as `SCHED_BATCH`: `false` before
-  /// it starts, or if the kernel refused (e.g. a seccomp filter).
-  #[must_use]
-  pub fn maintenance_is_batch(self) -> bool {
-    SCHED_BATCH.load(Ordering::Relaxed)
-  }
 }
-
-/// How the maintenance thread returns memory to the kernel.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PurgeBackend {
-  /// No maintenance thread runs: allocating threads purge with `madvise`.
-  NotStarted,
-  /// The maintenance thread purges page run by page run with `madvise`:
-  /// io_uring was turned off or unavailable
-  /// ([`Allocatbelt::io_uring_error`]), or a submission failed.
-  Madvise,
-  /// The maintenance thread purges in batches through its io_uring;
-  /// `sq_rewind` if the kernel took `IORING_SETUP_SQ_REWIND` (Linux 7.0).
-  IoUring {
-    /// Whether the ring rewinds its submission queue.
-    sq_rewind: bool,
-  },
-}
-
-/// Ring slots: the most page runs one `io_uring_enter` carries (a pass
-/// batches at most [`PURGE_BATCH`]).
-const RING_ENTRIES: u32 = PURGE_BATCH as u32;
-/// Kernel workers that run the ring's purges at once. More did not help
-/// (`ring_benchmark`): parallel purges of one address space contend.
-const RING_WORKERS: u32 = 1;
-
-/// The maintenance thread's purger: batches through its own io_uring.
-struct RingPurger(PurgeRing);
-
-impl RingPurger {
-  /// Publishes the backend for [`Allocatbelt::purge_backend`].
-  fn publish(&self) {
-    let b = match (self.0.retired(), self.0.sq_rewind()) {
-      (true, _) => BACKEND_MADVISE,
-      (false, false) => BACKEND_URING,
-      (false, true) => BACKEND_URING_REWIND,
-    };
-    BACKEND.store(b, Ordering::Relaxed);
-  }
-}
-
-impl Purger for RingPurger {
-  fn batch_size(&self) -> usize {
-    PURGE_BATCH
-  }
-
-  fn purge_batch(&mut self, ranges: &[(usize, usize)], purged: &mut [bool]) {
-    // SAFETY: the `Purger` contract of the core: the heap has
-    // claimed every range, so none holds a live allocation and nothing
-    // hands one out until this returns, and `PurgeRing::purge` returns
-    // only after every purge has completed.
-    #[expect(unsafe_code, reason = "returning unused memory to the kernel")]
-    let r = unsafe { self.0.purge(&LinuxOs.arena().user, ranges, purged) };
-    if r.is_err() {
-      // Purges may still run on pages the heap is about to reuse.
-      LinuxOs.fatal("allocatbelt: lost track of io_uring purges");
-    }
-  }
-}
-
-const BACKEND_NONE: u8 = 0;
-const BACKEND_MADVISE: u8 = 1;
-const BACKEND_URING: u8 = 2;
-const BACKEND_URING_REWIND: u8 = 3;
-
-/// [`PurgeBackend`] of the running maintenance thread.
-static BACKEND: AtomicU8 = AtomicU8::new(BACKEND_NONE);
-/// Whether the maintenance thread tries io_uring ([`Allocatbelt::set_io_uring`]).
-static USE_IO_URING: AtomicBool = AtomicBool::new(false);
-/// Why the maintenance thread has no ring.
-static RING_ERROR: OnceLock<RingError> = OnceLock::new();
-
-/// Whether the maintenance thread has been started.
-static MAINT_THREAD: AtomicBool = AtomicBool::new(false);
-/// Whether the maintenance thread runs as `SCHED_BATCH`.
-static SCHED_BATCH: AtomicBool = AtomicBool::new(false);
 
 fn offset_of(ptr: *const u8) -> usize {
   match arena().and_then(|a| a.user.offset_of(ptr)) {

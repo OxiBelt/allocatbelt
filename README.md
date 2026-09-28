@@ -38,7 +38,16 @@ docs/                     Research reports, benchmark results, unsafe inventory.
 allocatbelt = "0.1"
 ```
 
-Cargo features: none by default. `experimental-rseq` adds the `mm_cid` shard selection, which stays off until it is selected (`RseqPolicy`).
+Cargo features pick which optional parts are compiled in; which of them a process uses is chosen at run time, within that ceiling (`Allocatbelt::compiled_capabilities()`). All of them build on stable Rust, and none turns allocator correctness or hardening on or off. Details in [docs/features.md](docs/features.md).
+
+| Feature | Default | Adds |
+|---|---|---|
+| `maintenance` | yes | the background maintenance thread (`start_maintenance_thread`); without it, allocating threads run housekeeping inline |
+| `scheduler` | yes | runs that thread as `SCHED_BATCH` |
+| `io-uring` | no | batched purges through a restricted io_uring, off until `set_io_uring(true)`, with a `madvise` fallback |
+| `experimental-rseq` | no | experimental shard selection by the rseq `mm_cid`, off until selected (`RseqPolicy`) |
+
+`allocatbelt = { version = "0.1", default-features = false }` builds the allocator without the maintenance thread.
 
 ```rust
 #[global_allocator]
@@ -58,7 +67,7 @@ What it does, in the terms of mimalloc (details in [docs/research/README.md](doc
 
 - **Per-thread caches.** Each thread allocates small blocks (≤ 8 KiB) from a claimed bitmap word per size class, with no atomics or locks, and batches its frees per bitmap word. A shard lock is taken only to claim the next word. Threads hand their caches back at exit.
 - **Two-level summaries.** A word summary per page and per-class availability bitmaps per segment find the next free blocks with `trailing_zeros`, never by scanning pages.
-- **Delayed purging.** Freed memory stays resident for the purge delay (1 s), then goes back to the OS (`MADV_DONTNEED`) and empty segments to the arena; a 32 MiB dirty budget bounds RSS under churn. With the maintenance thread started, allocating threads only set a flag and the thread (`SCHED_BATCH`) runs the passes. It can also purge each pass's page runs in batches through a restricted io_uring (`set_io_uring(true)`, opt-in).
+- **Delayed purging.** Freed memory stays resident for the purge delay (1 s), then goes back to the OS (`MADV_DONTNEED`) and empty segments to the arena; a 32 MiB dirty budget bounds RSS under churn. With the maintenance thread started, allocating threads only set a flag and the thread (`SCHED_BATCH`) runs the passes. It can also purge each pass's page runs in batches through a restricted io_uring (feature `io-uring`, then `set_io_uring(true)`; opt-in).
 - **Hardening.** Free blocks live in out-of-band bitmaps, so user writes cannot corrupt allocator state, and double frees are caught when they reach the bitmap. Every segment ends in a guard page (`MADV_GUARD_INSTALL`, or `mprotect`). Refills, block order and segment placement are randomized with a `getrandom` seed.
 - **fork.** `pthread_atfork` handlers keep the heap usable in children forked while other threads allocate.
 
@@ -73,6 +82,7 @@ For the conclusions and recommendations see [docs/research/README.md](docs/resea
 cargo fmt --all --check
 cargo clippy --all-targets --all-features --locked -- -D warnings
 cargo test --release --locked                                   # core tests (allocatbelt-core-check) + global-allocator integration tests
+scripts/check-features.sh                                       # clippy and tests for each supported feature combination
 scripts/check-package.sh                                        # cargo package/publish --dry-run, package contents, clean-consumer builds
 scripts/check-platform-gates.sh                                 # supported targets build, others are rejected (needs `rustup target add`, see the script)
 scripts/check-scalar-isa.sh                                     # bit scans lower to tzcnt/popcnt/lzcnt (x86-64-v3) and ctz/cpop/clz (riscv64 + Zbb)

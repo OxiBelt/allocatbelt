@@ -1,6 +1,6 @@
 //! The maintenance thread takes budget passes off the freeing threads,
-//! serves purge requests, and runs as `SCHED_BATCH`. A separate test
-//! binary, so that no other test allocates meanwhile.
+//! serves purge requests, and runs as `SCHED_BATCH` (feature `scheduler`).
+//! A separate test binary, so that no other test allocates meanwhile.
 
 use std::time::{Duration, Instant};
 
@@ -43,22 +43,33 @@ fn maintenance_thread_does_the_housekeeping() {
   GLOBAL.set_purge_delay(Duration::from_secs(3600));
   // Opt-in (off by default); falls back to `madvise` where io_uring is
   // unavailable.
+  #[cfg(feature = "io-uring")]
   GLOBAL.set_io_uring(true);
   assert!(GLOBAL.start_maintenance_thread().unwrap());
   assert!(!GLOBAL.start_purge_thread().unwrap(), "started twice");
-  assert!(wait_for(|| GLOBAL.maintenance_is_batch()));
-  assert_eq!(policy_of("allocatbelt-mnt"), Some(3), "SCHED_BATCH");
-  // io_uring where the kernel allows it; `madvise` otherwise (qemu-user,
-  // seccomp, `kernel.io_uring_disabled`), with the reason.
   assert!(wait_for(
     || GLOBAL.purge_backend() != PurgeBackend::NotStarted
   ));
+  if cfg!(feature = "scheduler") {
+    assert!(wait_for(|| GLOBAL.maintenance_is_batch()));
+    assert_eq!(policy_of("allocatbelt-mnt"), Some(3), "SCHED_BATCH");
+  } else {
+    assert!(!GLOBAL.maintenance_is_batch());
+    assert_eq!(policy_of("allocatbelt-mnt"), Some(0), "SCHED_OTHER");
+  }
+  // io_uring where the kernel allows it; `madvise` otherwise (qemu-user,
+  // seccomp, `kernel.io_uring_disabled`), with the reason.
   let backend = GLOBAL.purge_backend();
-  eprintln!("purge backend: {backend:?} ({:?})", GLOBAL.io_uring_error());
-  assert_eq!(
-    backend == PurgeBackend::Madvise,
-    GLOBAL.io_uring_error().is_some()
-  );
+  #[cfg(feature = "io-uring")]
+  {
+    eprintln!("purge backend: {backend:?} ({:?})", GLOBAL.io_uring_error());
+    assert_eq!(
+      backend == PurgeBackend::Madvise,
+      GLOBAL.io_uring_error().is_some()
+    );
+  }
+  #[cfg(not(feature = "io-uring"))]
+  assert_eq!(backend, PurgeBackend::Madvise);
 
   // 40 MiB of page runs: freeing them passes the 32 MiB budget but not
   // the 64 MiB hard limit, so the frees only record the work.

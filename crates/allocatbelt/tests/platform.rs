@@ -37,3 +37,16 @@ fn dispatch_is_initialised_with_the_arena() {
   let _ = features;
   assert_eq!(v.len(), 16);
 }
+
+#[test]
+fn compiled_capabilities_follow_the_features() {
+  let c = GLOBAL.compiled_capabilities();
+  assert_eq!(c, allocatbelt::CompiledCapabilities::CURRENT);
+  assert_eq!(c.maintenance, cfg!(feature = "maintenance"));
+  assert_eq!(c.scheduler, cfg!(feature = "scheduler"));
+  assert_eq!(c.io_uring, cfg!(feature = "io-uring"));
+  assert_eq!(c.rseq, cfg!(feature = "experimental-rseq"));
+  // Features that imply others.
+  assert!(!c.scheduler || c.maintenance);
+  assert!(!c.io_uring || c.maintenance);
+}

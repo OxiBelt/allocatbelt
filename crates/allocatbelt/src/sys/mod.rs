@@ -24,11 +24,13 @@ use rustix::mm::{self, Advice, MapFlags, MprotectFlags, ProtFlags};
 use rustix::thread::futex;
 
 mod platform;
+#[cfg(feature = "io-uring")]
 mod ring;
 #[cfg(feature = "experimental-rseq")]
 mod rseq;
 
 pub use platform::{Capabilities, KernelVersion, probe};
+#[cfg(feature = "io-uring")]
 pub use ring::{PurgeRing, RingError};
 #[cfg(feature = "experimental-rseq")]
 pub use rseq::{MmCid, RseqUnavailable};
@@ -369,11 +371,13 @@ pub fn futex_wake(word: &AtomicU32) {
 }
 
 /// Linux `SCHED_BATCH` (`include/uapi/linux/sched.h`).
+#[cfg(feature = "scheduler")]
 const SCHED_BATCH: libc::c_int = 3;
 
 /// The kernel's `struct sched_param` (`include/uapi/linux/sched/types.h`):
 /// only the priority, which must be 0 for `SCHED_BATCH`. Declared here
 /// because libc's `sched_param` differs between glibc and musl.
+#[cfg(feature = "scheduler")]
 #[repr(C)]
 struct SchedParam {
   sched_priority: libc::c_int,
@@ -383,6 +387,7 @@ struct SchedParam {
 /// the scheduler treats it as CPU-bound and never lets it preempt
 /// interactive threads on wake-up, which suits allocator housekeeping
 /// (plan §11.2). Returns whether the kernel accepted it.
+#[cfg(feature = "scheduler")]
 pub fn set_batch_scheduling() -> bool {
   let param = SchedParam { sched_priority: 0 };
   // SAFETY: `sched_setscheduler(0 = this thread, SCHED_BATCH, &param)`

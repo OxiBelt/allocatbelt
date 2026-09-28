@@ -8,7 +8,7 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
-allocatbelt.workspace = true
+allocatbelt = { workspace = true, features = ["io-uring"] }
 mimalloc.workspace = true
 
 [lints]

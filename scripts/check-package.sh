@@ -8,7 +8,9 @@
 # - its manifest has no path dependency (nothing unpublished);
 # - a consumer project outside this repository, which does not see its
 #   `.cargo/config.toml`, builds and runs the unpacked crate as its global
-#   allocator, also with `experimental-rseq`;
+#   allocator with the default features, with `default-features = false`,
+#   and with each optional feature, and each build reports exactly its
+#   features in `CompiledCapabilities`;
 # - on x86_64, that consumer fails with the gate's message without
 #   `-C target-cpu=x86-64-v3`, and builds with it.
 #
@@ -84,9 +86,13 @@ edition = "2024"
 publish = false
 
 [dependencies]
-allocatbelt = { path = "${unpacked}" }
+allocatbelt = { path = "${unpacked}", default-features = false }
 
+# `--no-default-features` here builds allocatbelt without its defaults.
 [features]
+default = ["allocatbelt-default"]
+allocatbelt-default = ["allocatbelt/default"]
+io-uring = ["allocatbelt/io-uring"]
 rseq = ["allocatbelt/experimental-rseq"]
 
 [workspace]
@@ -101,6 +107,7 @@ fn main() {
   drop(v);
   GLOBAL.purge();
   println!("consumer ok: {:?}", GLOBAL.platform());
+  println!("{:?}", GLOBAL.compiled_capabilities());
 }
 EOF
 # The same dependency versions as this workspace.
@@ -125,9 +132,21 @@ if [[ "$(uname -m)" == x86_64 ]]; then
     { cat "${log}" >&2; fail "x86_64 without v3 failed without the gate's message"; }
   echo "ok: x86_64 consumer without x86-64-v3 stops at the gate"
 fi
-build "${v3[*]:-}"
-(cd "${consumer}" && RUSTFLAGS="${v3[*]:-}" cargo run --quiet --target-dir "${work}/target")
-echo "ok: consumer builds and runs (default features)"
-build "${v3[*]:-}" --features rseq
-(cd "${consumer}" && RUSTFLAGS="${v3[*]:-}" cargo run --quiet --target-dir "${work}/target" --features rseq)
-echo "ok: consumer builds and runs (experimental-rseq)"
+run() {
+  # run <expected CompiledCapabilities> [cargo args...]
+  local expect="$1"
+  shift
+  local out
+  out="$(cd "${consumer}" && RUSTFLAGS="${v3[*]:-}" cargo run --quiet --target-dir "${work}/target" "$@")"
+  echo "${out}"
+  grep -qF "${expect}" <<<"${out}" || fail "expected ${expect}"
+  echo "ok: consumer builds and runs (${*:-default features})"
+}
+caps() {
+  echo "CompiledCapabilities { maintenance: $1, scheduler: $2, io_uring: $3, rseq: $4 }"
+}
+run "$(caps true true false false)"
+run "$(caps false false false false)" --no-default-features
+run "$(caps true true true false)" --features io-uring
+run "$(caps true false true false)" --no-default-features --features io-uring
+run "$(caps true true false true)" --features rseq

@@ -21,12 +21,33 @@ include = ["/src/**/*.rs", "/tests/**/*.rs", "/LICENSE"]
 libc.workspace = true
 rustix.workspace = true
 
+# Cargo features choose which optional parts are compiled in (a ceiling);
+# which of them a process uses is chosen at run time. All are additive and
+# build on stable Rust. See docs/features.md and `CompiledCapabilities`.
 [features]
+default = ["maintenance", "scheduler"]
+# The background maintenance thread (`start_maintenance_thread`). Without
+# it, allocating threads run every housekeeping pass inline.
+maintenance = []
+# The maintenance thread runs as `SCHED_BATCH` (best effort).
+scheduler = ["maintenance"]
+# Batched purges through a restricted io_uring on the maintenance thread,
+# off until `set_io_uring(true)`; falls back to `madvise`.
+io-uring = ["maintenance", "rustix/io_uring"]
 # Experimental (Phase 9): shard selection by the rseq `mm_cid`, off unless
 # selected with `Allocatbelt::set_rseq_policy`. Links glibc's
 # `__rseq_offset` and `__rseq_size` (glibc 2.35 or newer). See
 # docs/platform.md.
 experimental-rseq = []
+
+# The tests of an optional part run only when it is compiled in.
+[[test]]
+name = "maintenance"
+required-features = ["maintenance"]
+
+[[test]]
+name = "purge_thread"
+required-features = ["maintenance"]
 
 [dev-dependencies]
 libc.workspace = true
