@@ -100,7 +100,8 @@ jobs:
       - name: Fetch locked Cargo dependency graph
         run: cargo fetch --locked
 
-      # The runner in `.cargo/config.toml` emulates a Zbb-capable CPU.
+      # The runner in `.cargo/config.toml` uses `-cpu max`: Zbb for the +zbb
+      # build, and RVA23 for Ubuntu 26.04's riscv64 cross glibc.
       - name: Cargo test
         run: cargo test --release --locked --target riscv64gc-unknown-linux-gnu -p allocatbelt-core -p allocatbelt
 

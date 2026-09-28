@@ -38,7 +38,7 @@ Code style, pinned tool versions and the commit-message format follow OxiBelt; s
 
 ### RISC-V (riscv64)
 
-`.cargo/config.toml` sets the linker and a qemu-user runner for `riscv64gc-unknown-linux-gnu`, so the tests can run on an x86_64 host. The runner emulates a CPU with Zbb (`-cpu rv64,zbb=true`), so both commands below run. Use qemu 10.2.1 or later (Ubuntu 26.04's `qemu-user`): qemu 8.2 intermittently crashes with `QEMU internal SIGSEGV` on the multithreaded tests.
+`.cargo/config.toml` sets the linker and a qemu-user runner for `riscv64gc-unknown-linux-gnu`, so the tests can run on an x86_64 host. The runner uses `-cpu max`, which provides Zbb for the second command and the RVA23 extensions that Ubuntu 26.04's riscv64 cross glibc is built for, so both commands below run. Use qemu 10.2.1 or later (Ubuntu 26.04's `qemu-user`): qemu 8.2 intermittently crashes with `QEMU internal SIGSEGV` on the multithreaded tests.
 
 ```sh
 sudo apt-get install qemu-user gcc-riscv64-linux-gnu libc6-dev-riscv64-cross

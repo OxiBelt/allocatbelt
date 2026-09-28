@@ -1,5 +1,7 @@
 # Cross-testing on riscv64 (see README). Only applies when building for that target.
-# The emulated CPU enables Zbb so builds with `-C target-feature=+zbb` also run.
+# `-cpu max` enables every extension qemu implements: Zbb for builds with
+# `-C target-feature=+zbb`, and the RVA23 set (V, Zicond, ...) that Ubuntu
+# 26.04's riscv64 cross glibc is built for.
 [target.riscv64gc-unknown-linux-gnu]
 linker = "riscv64-linux-gnu-gcc"
-runner = "qemu-riscv64 -cpu rv64,zbb=true -L /usr/riscv64-linux-gnu"
+runner = "qemu-riscv64 -cpu max -L /usr/riscv64-linux-gnu"
