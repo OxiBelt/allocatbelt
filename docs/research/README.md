@@ -133,3 +133,33 @@ Who runs decay passes:
 | `purge_delay`, arena purge, `mi_collect` | epoch-based decay passes, background purge thread, dirty budget, `purge()` |
 | secure mode: guard pages, randomized free lists and segment placement | guard page per segment (guard markers), randomized words/blocks/segments, bitmaps instead of encoded free lists |
 | (fork safety) | `pthread_atfork` handlers that hold every heap lock across `fork` |
+
+## 5. Direction: Linux 7.x, ISA baselines and SIMD (adopted 2026-09-28)
+
+allocatbelt is being evolved into a Linux-only allocator for a fixed set of CPUs, as an evidence-driven performance project rather than an ISA-intrinsics showcase. This section records the directive the later phases follow; each phase is recorded here or in its own document as it lands.
+
+**Target end state.**
+
+| | Target |
+|---|---|
+| Operating system | Linux 7.0.x or newer only |
+| x86_64 | x86-64-v3 is the hard minimum; newer ISA paths only after run-time detection |
+| aarch64 | 64-bit AArch64; Advanced SIMD (NEON) as the main vector path, newer features only when safe |
+| riscv64 | RV64 Linux with a correct baseline; Zbb and V acceleration only when available |
+
+**Fast paths stay in userspace.** Small allocation and free stay mostly thread-local: no io_uring submission, clock syscall or general scheduler syscall per allocation or free.
+
+**Maintenance moves to a slow plane.** A dedicated maintenance scheduler, io_uring-batched `MADV_DONTNEED` where it measurably wins, futex-based sleeping and waking where contention warrants it, deliberate Linux scheduler policy for maintenance work, and rseq/mm_cid only as experiments after correctness and benchmark gates.
+
+**SIMD policy.**
+
+- Use SIMD where data ownership and the memory model allow it: thread-owned or snapshotted data, never shared metadata.
+- Never replace atomic accesses to shared allocator metadata with plain vector loads or stores (a data race; see §3).
+- For a single `u64` bitmap word, prefer scalar bit-manipulation instructions (`tzcnt`/`lzcnt`/`popcnt`, Zbb `ctz`/`clz`/`cpop`) over vectors.
+- Every hand-written SIMD kernel needs benchmark evidence on native hardware; emulator numbers never count.
+
+**Crate boundaries stay as they are.** `allocatbelt-core` keeps `#![forbid(unsafe_code)]` and holds the algorithms and invariants, `allocatbelt-sys` stays the Linux VM and syscall boundary, and `allocatbelt` stays the `GlobalAlloc` adapter. The core is not replaced by an architecture-specific unsafe implementation. If architecture intrinsics need `unsafe`, they go into one small new crate, `crates/allocatbelt-arch`, limited to CPU-feature discovery that cannot live in the core, run-time-selected architecture kernels, and architecture-specific tests and instruction checks. Every `unsafe` block added there is listed in [docs/unsafe-boundary.md](../unsafe-boundary.md).
+
+**What must not regress.** Per-thread caches, bitmap words consumed without shared atomics, batched frees, two-level summary bitmaps, out-of-band `AtomicU64` metadata, delayed purging under a dirty budget, guard pages and randomized placement, fork handling, and the verification around the core (model tests, proptest and fuzzing, loom, Miri-compatible paths, mutation testing, integration tests). SIMD or kernel-API work that weakens any of these is not adopted.
+
+**Phases.** 1: platform contract and build matrix (done: [docs/platform.md](../platform.md)). 2: architecture capability layer (`allocatbelt-arch`). 3: scalar ISA verification. 4: SIMD benchmark harness. 5: promote proven SIMD kernels. 6: adaptive lock and futex work. 7: maintenance micro-scheduler. 8: io_uring purge backend. 9: rseq/mm_cid research. Each phase is a separate, independently tested change.
