@@ -42,9 +42,33 @@ The probe also reads the kernel release from `uname(2)`. `Allocatbelt::platform(
 
 The baseline is RV64GC, as before. Zbb is optional: building with `-C target-feature=+zbb` turns the bitmap scans' `trailing_zeros`/`count_ones`/`leading_zeros` into single `ctz`/`cpop`/`clz` instructions, and CI tests both builds under qemu-user. The V extension is not required and not used yet. Feature detection with `riscv_hwprobe` belongs to the architecture capability layer (phase 2), not to this contract.
 
+## CPU features and kernel dispatch (`allocatbelt-arch`)
+
+Above the build floor, `crates/allocatbelt-arch` finds out at run time which ISA extensions the CPU and kernel support, and publishes which set of architecture kernels the allocator may use. It is the only place architecture-specific `unsafe` may go; `allocatbelt-core` never sees vector types.
+
+| Architecture | Tracked features (`CpuFeatures`) | Source | Checked against |
+|---|---|---|---|
+| x86_64 | `X86_64_V3` (the whole v3 set), `AVX2`, `AVX512F`, `AVX512CD`, `AVX512BW`, `AVX512DQ`, `AVX512VL`, `AVX512VPOPCNTDQ` | `cpuid` leaves 1, 7 and 0x80000001, plus `xgetbv` for the XMM/YMM and opmask/ZMM state the OS enables | `std::arch::is_x86_feature_detected!` in the unit tests |
+| aarch64 | `ASIMD`, `SVE`, `SVE2` | `getauxval(AT_HWCAP)`, `getauxval(AT_HWCAP2)` | `std::arch::is_aarch64_feature_detected!` in the unit tests |
+| riscv64 | `ZBB`, `RVV` (the V extension) | `riscv_hwprobe(RISCV_HWPROBE_KEY_IMA_EXT_0)` over all online CPUs | the `+zbb` CI build must detect Zbb (`is_riscv_feature_detected!` is unstable); qemu-user `-cpu max` reports Zbb and V |
+
+The kernel constants (HWCAP bits, hwprobe key, bits and syscall number) come from the Linux v7.0 UAPI headers, because the `libc` crate does not have all of them.
+
+Dispatch follows the plan's reentrancy rule:
+
+```text
+allocations before initialize_dispatch()  -> KernelSet::Baseline (always correct)
+initialize_dispatch()                     -> probe once (allocation-free), publish in an atomic
+allocations afterwards                    -> the published KernelSet
+```
+
+The adapter calls `initialize_dispatch()` while it initialises the arena, right after the kernel probe. Detection issues only `cpuid`/`xgetbv`, reads libc's saved auxiliary vector, or makes one syscall; it never allocates, which `crates/allocatbelt-arch/tests/allocation_free.rs` checks with a counting global allocator. The result is cached in an `AtomicU32` and the kernel set in an `AtomicU8`, with no `OnceLock` or lazy framework. `Allocatbelt::cpu_features()` and `Allocatbelt::kernel_set()` expose both for diagnostics.
+
+A detected feature does not mean a kernel exists for it. No architecture kernel has been admitted yet, since each needs benchmark evidence on native hardware first, so `KernelSet` has only `Baseline` for now and every CPU runs the same code as before.
+
 ## Not covered yet
 
-This is phase 1 of the Linux 7 / ISA / SIMD plan: no allocator algorithm changed. Run-time CPU feature detection, SIMD kernels, generated-code checks for the scalar bit instructions, and the Linux 7.0 maintenance plane (io_uring purge, futex waits, scheduler policy) come in later phases.
+Phases 1 and 2 of the Linux 7 / ISA / SIMD plan changed no allocator algorithm. SIMD kernels, generated-code checks for the scalar bit instructions, and the Linux 7.0 maintenance plane (io_uring purge, futex waits, scheduler policy) come in later phases.
 
 ## No portability layer
 

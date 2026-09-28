@@ -3,12 +3,13 @@
 A Rust-based alternative to mimalloc (C) for [OxiBelt](https://github.com/OxiBelt/OxiBelt): research and a prototype.
 
 - **Allocation logic is safe Rust.** `allocatbelt-core` is `#![no_std]` + `#![forbid(unsafe_code)]`.
-- **`unsafe` lives only at the syscall and raw-memory boundaries.** That means `allocatbelt-sys` (mmap/mprotect/madvise, exposing metadata as atomics) and the `GlobalAlloc` adapter in `allocatbelt`.
+- **`unsafe` lives only at the syscall, raw-memory and architecture boundaries.** That means `allocatbelt-sys` (mmap/mprotect/madvise, exposing metadata as atomics), `allocatbelt-arch` (CPU feature detection) and the `GlobalAlloc` adapter in `allocatbelt`.
 - The workspace lints are copied from OxiBelt (`unsafe_code = deny`, `undocumented_unsafe_blocks`, `multiple_unsafe_ops_per_block`, `missing_safety_doc`).
 
 ```text
 crates/allocatbelt-core   Allocation logic (offsets, bitmaps, size classes, segments/pages). No unsafe.
-crates/allocatbelt-sys    Arena reservation/commit/purge and the metadata slab. The only unsafe boundary.
+crates/allocatbelt-sys    Arena reservation/commit/purge and the metadata slab. The syscall unsafe boundary.
+crates/allocatbelt-arch   CPU feature detection (cpuid, getauxval, riscv_hwprobe) and kernel dispatch. The architecture unsafe boundary.
 crates/allocatbelt        #[global_allocator] adapter (Allocatbelt).
 bench/                    Comparison against system and secure mimalloc.
 docs/                     Research reports, benchmark results, unsafe inventory.
@@ -64,8 +65,8 @@ Code style, pinned tool versions and the commit-message format follow OxiBelt; s
 ```sh
 sudo apt-get install qemu-user gcc-riscv64-linux-gnu libc6-dev-riscv64-cross
 rustup target add riscv64gc-unknown-linux-gnu
-cargo test --release --target riscv64gc-unknown-linux-gnu -p allocatbelt-core -p allocatbelt
-RUSTFLAGS="-C target-feature=+zbb" cargo test --release --target riscv64gc-unknown-linux-gnu -p allocatbelt-core -p allocatbelt
+cargo test --release --target riscv64gc-unknown-linux-gnu -p allocatbelt-arch -p allocatbelt-core -p allocatbelt
+RUSTFLAGS="-C target-feature=+zbb" cargo test --release --target riscv64gc-unknown-linux-gnu -p allocatbelt-arch -p allocatbelt-core -p allocatbelt
 ```
 
 - Build with `-C target-feature=+zbb` (part of the RVA22 profile) when the hardware has it. Without Zbb, the bitmap scans' `trailing_zeros`/`count_ones`/`leading_zeros` compile to multi-instruction sequences instead of `ctz`/`cpop`/`clz`.
