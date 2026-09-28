@@ -17,7 +17,7 @@
 
 use std::boxed::Box;
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::vec::Vec;
 
@@ -149,8 +149,12 @@ impl Os for MockOs {
   fn meta(&self, segment: usize) -> Option<&[AtomicU64]> {
     self.meta[segment].get().map(|m| &**m)
   }
-  fn yield_now(&self) {
-    std::thread::yield_now();
+  // No real futex: a parked thread yields and re-checks, which the lock
+  // allows (spurious wake-ups), and wakes are then unnecessary.
+  fn futex_wait(&self, word: &AtomicU32, expected: u32) {
+    if word.load(Ordering::Relaxed) == expected {
+      std::thread::yield_now();
+    }
   }
   fn now_ms(&self) -> u64 {
     self.clock.load(Ordering::Relaxed)

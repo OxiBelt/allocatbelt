@@ -62,7 +62,7 @@ use core::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, AtomicU64, AtomicUs
 
 use crate::bits::{pick_bit, run_mask};
 use crate::class::{self, MIN_ALIGN, NUM_CLASSES, SMALL_MAX};
-use crate::lock::SpinLock;
+use crate::lock::{Lock, Park};
 use crate::proto;
 use crate::{
   ARENA_SIZE, MAX_ALIGN, MAX_SEGMENTS, PAGE_META_WORDS, PAGE_SHIFT, PAGE_SIZE, PAGES_PER_SEGMENT,
@@ -119,8 +119,20 @@ pub trait Os: Sync {
   fn unguard(&self, offset: usize, len: usize) {
     let _ = (offset, len);
   }
-  /// Called while spinning on a contended lock.
-  fn yield_now(&self) {}
+  /// Blocks the calling thread while `word` holds `expected`, for a heap
+  /// lock that stayed held after a short spin: a `FUTEX_WAIT`. Checking the
+  /// value and going to sleep must be atomic with respect to
+  /// [`Os::futex_wake`]. May return early or spuriously. The default
+  /// returns at once, which makes contended locks spin.
+  fn futex_wait(&self, word: &AtomicU32, expected: u32) {
+    let _ = (word, expected);
+    core::hint::spin_loop();
+  }
+  /// Wakes one thread blocked in [`Os::futex_wait`] on `word`: a
+  /// `FUTEX_WAKE`. Only called when an unlock finds a thread may be parked.
+  fn futex_wake(&self, word: &AtomicU32) {
+    let _ = word;
+  }
   /// Milliseconds on a monotonic clock, for delaying purges (see
   /// [`Heap::decay`]). A clock that never advances, like this default,
   /// leaves purging to the dirty budget and explicit [`Heap::purge`] calls.
@@ -130,6 +142,16 @@ pub trait Os: Sync {
   /// Reports heap corruption or misuse (invalid or double free). Must not
   /// return.
   fn fatal(&self, msg: &'static str) -> !;
+}
+
+/// Heap locks park through the [`Os`].
+impl<O: Os> Park for O {
+  fn wait(&self, word: &AtomicU32, expected: u32) {
+    self.futex_wait(word, expected);
+  }
+  fn wake(&self, word: &AtomicU32) {
+    self.futex_wake(word);
+  }
 }
 
 const SEG_HDR: usize = 0;
@@ -199,7 +221,7 @@ impl ClassState {
 #[derive(Debug)]
 #[repr(align(128))]
 struct Shard {
-  lock: SpinLock,
+  lock: Lock,
   /// Head of the list of segments owned by this shard (segment + 1).
   segs: AtomicU32,
   /// Random state for placement decisions, stepped under the lock; 0 while
@@ -211,7 +233,7 @@ struct Shard {
 impl Shard {
   const fn new() -> Self {
     Self {
-      lock: SpinLock::new(),
+      lock: Lock::new(),
       segs: AtomicU32::new(0),
       rng: AtomicU64::new(0),
       classes: [const { ClassState::new() }; NUM_CLASSES],
@@ -331,11 +353,11 @@ impl<'a> PageMeta<'a> {
 #[derive(Debug)]
 pub struct Heap<O> {
   os: O,
-  seg_lock: SpinLock,
+  seg_lock: Lock,
   seg_used: [AtomicU64; MAX_SEGMENTS / 64],
   /// Pages marked dirty and not yet purged or reused (may transiently lag).
   dirty_pages: AtomicIsize,
-  purge_lock: SpinLock,
+  purge_lock: Lock,
   purge_delay_ms: AtomicU64,
   /// Clock reading of the last decay pass.
   last_decay_ms: AtomicU64,
@@ -357,10 +379,10 @@ impl<O: Os> Heap<O> {
   pub const fn new(os: O) -> Self {
     Self {
       os,
-      seg_lock: SpinLock::new(),
+      seg_lock: Lock::new(),
       seg_used: [const { AtomicU64::new(0) }; MAX_SEGMENTS / 64],
       dirty_pages: AtomicIsize::new(0),
-      purge_lock: SpinLock::new(),
+      purge_lock: Lock::new(),
       purge_delay_ms: AtomicU64::new(DEFAULT_PURGE_DELAY_MS),
       last_decay_ms: AtomicU64::new(0),
       epoch: AtomicU64::new(0),
@@ -579,12 +601,12 @@ impl<O: Os> Heap<O> {
   fn with_shard<R>(&self, hint: usize, f: impl FnOnce(usize, &Shard) -> R) -> R {
     for i in 0..SHARD_PROBES {
       let s = (hint + i) % SHARDS;
-      if let Some(_g) = self.shards[s].lock.try_lock() {
+      if let Some(_g) = self.shards[s].lock.try_lock(&self.os) {
         return f(s, &self.shards[s]);
       }
     }
     let s = hint % SHARDS;
-    let _g = self.shards[s].lock.lock(|| self.os.yield_now());
+    let _g = self.shards[s].lock.lock(&self.os);
     f(s, &self.shards[s])
   }
 
@@ -900,7 +922,7 @@ impl<O: Os> Heap<O> {
     );
     let dirty = self.dirty_pages.fetch_add(n as isize, Relaxed) + n as isize;
     if dirty > DIRTY_BUDGET_PAGES
-      && let Some(_g) = self.purge_lock.try_lock()
+      && let Some(_g) = self.purge_lock.try_lock(&self.os)
     {
       self.pass(Pass::Budget);
     }
@@ -946,7 +968,7 @@ impl<O: Os> Heap<O> {
       return false;
     }
     {
-      let _g = self.seg_lock.lock(|| self.os.yield_now());
+      let _g = self.seg_lock.lock(&self.os);
       let free =
         (first..first + extra).all(|s| self.seg_used[s / 64].load(Relaxed) & 1 << (s % 64) == 0);
       if !free {
@@ -984,7 +1006,7 @@ impl<O: Os> Heap<O> {
       return None;
     }
     let first = {
-      let _g = self.seg_lock.lock(|| self.os.yield_now());
+      let _g = self.seg_lock.lock(&self.os);
       let first = self.find_free_segments(k, r)?;
       self.mark_segments(first, k, true);
       first
@@ -998,7 +1020,7 @@ impl<O: Os> Heap<O> {
     // Metadata first: until it exists, nothing records whether the
     // memory is zero, so the memory must not be touched before.
     if !(first..first + k).all(|s| self.os.commit_meta(s).is_some()) {
-      let _g = self.seg_lock.lock(|| self.os.yield_now());
+      let _g = self.seg_lock.lock(&self.os);
       self.mark_segments(first, k, false);
       return false;
     }
@@ -1019,7 +1041,7 @@ impl<O: Os> Heap<O> {
       m[SEG_PAGES].store(u64::MAX, Relaxed);
       m[SEG_DIRTY].store(if zeroed { 0 } else { u64::MAX }, Relaxed);
     }
-    let _g = self.seg_lock.lock(|| self.os.yield_now());
+    let _g = self.seg_lock.lock(&self.os);
     self.mark_segments(first, k, false);
   }
 

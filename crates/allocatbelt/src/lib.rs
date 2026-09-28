@@ -21,7 +21,7 @@ use std::alloc::{GlobalAlloc, Layout};
 use std::io::Write as _;
 use std::ptr::{self, NonNull};
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 pub use allocatbelt_arch::{CpuFeatures, KernelSet};
@@ -166,8 +166,12 @@ impl Os for LinuxOs {
     self.arena().meta.get(segment)
   }
 
-  fn yield_now(&self) {
-    allocatbelt_sys::yield_now();
+  fn futex_wait(&self, word: &AtomicU32, expected: u32) {
+    allocatbelt_sys::futex_wait(word, expected);
+  }
+
+  fn futex_wake(&self, word: &AtomicU32) {
+    allocatbelt_sys::futex_wake(word);
   }
 
   fn now_ms(&self) -> u64 {

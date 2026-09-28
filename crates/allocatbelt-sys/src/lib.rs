@@ -19,9 +19,10 @@
 
 use core::ffi::c_void;
 use core::ptr::NonNull;
-use core::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
 
 use rustix::mm::{self, Advice, MapFlags, MprotectFlags, ProtFlags};
+use rustix::thread::futex;
 
 mod platform;
 
@@ -354,9 +355,19 @@ impl<const N: usize> MetaArena<N> {
 /// `alloc` feature is unified in, which would re-enter the allocator.
 pub const GRANULE: usize = 64 * 1024;
 
-/// Gives up the CPU while spinning on a contended lock.
-pub fn yield_now() {
-  rustix::thread::sched_yield();
+/// Sleeps while `word` holds `expected` (`FUTEX_WAIT`, process-private),
+/// for a lock that stayed contended after spinning. Returns at once if the
+/// value differs, and on a wake, a signal or a spurious wake-up; the caller
+/// re-checks the lock either way, so errors (`EAGAIN`, `EINTR`) are ignored.
+/// Does not allocate.
+pub fn futex_wait(word: &AtomicU32, expected: u32) {
+  let _ = futex::wait(word, futex::Flags::PRIVATE, expected, None);
+}
+
+/// Wakes one thread sleeping in [`futex_wait`] on `word` (`FUTEX_WAKE`,
+/// process-private).
+pub fn futex_wake(word: &AtomicU32) {
+  let _ = futex::wake(word, futex::Flags::PRIVATE, 1);
 }
 
 /// Registers `fork` handlers with `pthread_atfork(3)`: `prepare` runs in

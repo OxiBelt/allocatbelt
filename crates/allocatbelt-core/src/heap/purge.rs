@@ -48,7 +48,7 @@ impl<O: Os> Heap<O> {
   /// until the next pass. Blocks held in thread caches stay allocated; flush
   /// the calling thread's cache first with [`Heap::flush`].
   pub fn purge(&self) {
-    let _g = self.purge_lock.lock(|| self.os.yield_now());
+    let _g = self.purge_lock.lock(&self.os);
     self.pass(Pass::Force);
   }
 
@@ -57,7 +57,7 @@ impl<O: Os> Heap<O> {
   /// background thread that calls it every [`Heap::decay_interval_ms`]; see
   /// [`Heap::set_auto_decay`].
   pub fn decay(&self) {
-    let _g = self.purge_lock.lock(|| self.os.yield_now());
+    let _g = self.purge_lock.lock(&self.os);
     self.last_decay_ms.store(self.os.now_ms(), Relaxed);
     self.pass(Pass::Decay);
   }
@@ -113,7 +113,7 @@ impl<O: Os> Heap<O> {
     if now < due {
       return;
     }
-    if let Some(_g) = self.purge_lock.try_lock() {
+    if let Some(_g) = self.purge_lock.try_lock(&self.os) {
       self.last_decay_ms.store(now, Relaxed);
       self.pass(Pass::Decay);
     }
@@ -157,7 +157,7 @@ impl<O: Os> Heap<O> {
   /// `purge_lock`, so no purge pass races the claim.
   fn trim_shards(&self, epoch: u64, age: u64, force: bool) {
     for sh in &self.shards {
-      let Some(_g) = sh.lock.try_lock() else {
+      let Some(_g) = sh.lock.try_lock(&self.os) else {
         continue;
       };
       for c in 0..NUM_CLASSES {

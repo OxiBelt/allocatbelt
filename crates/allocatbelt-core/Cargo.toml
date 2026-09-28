@@ -14,6 +14,8 @@ model = []
 
 [dev-dependencies]
 proptest.workspace = true
+# The futex and CPU clock of the lock benchmark (`lock::tests`).
+rustix = { workspace = true, features = ["time"] }
 
 # Model checker for the atomic protocols in `proto.rs`, only under
 # `RUSTFLAGS="--cfg loom"`. Declared here rather than in

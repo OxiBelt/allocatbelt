@@ -18,11 +18,11 @@ impl<O: Os> Heap<O> {
   /// nests them; the heap only ever `try_lock`s against it, so this cannot
   /// deadlock with a thread in the middle of an operation.
   pub fn fork_prepare(&self) {
-    self.purge_lock.acquire(|| self.os.yield_now());
+    self.purge_lock.acquire(&self.os);
     for sh in &self.shards {
-      sh.lock.acquire(|| self.os.yield_now());
+      sh.lock.acquire(&self.os);
     }
-    self.seg_lock.acquire(|| self.os.yield_now());
+    self.seg_lock.acquire(&self.os);
   }
 
   /// Releases the locks [`Heap::fork_prepare`] took, in the parent.
@@ -39,10 +39,10 @@ impl<O: Os> Heap<O> {
   }
 
   fn release_fork_locks(&self) {
-    self.seg_lock.release();
+    self.seg_lock.release(&self.os);
     for sh in self.shards.iter().rev() {
-      sh.lock.release();
+      sh.lock.release(&self.os);
     }
-    self.purge_lock.release();
+    self.purge_lock.release(&self.os);
   }
 }

@@ -168,13 +168,13 @@ mod loom_tests {
   //! `RUSTFLAGS="--cfg loom" cargo test -p allocatbelt-core --release --lib loom`.
 
   use loom::sync::Arc;
-  use loom::sync::atomic::AtomicU64;
   use loom::sync::atomic::Ordering::{Acquire, Relaxed};
+  use loom::sync::atomic::{AtomicU32, AtomicU64};
   use loom::thread;
   use std::vec::Vec;
 
   use super::*;
-  use crate::lock::SpinLock;
+  use crate::lock::{Lock, Park};
 
   struct Page {
     words: [AtomicU64; 2],
@@ -389,26 +389,125 @@ mod loom_tests {
     });
   }
 
-  #[test]
-  fn spin_lock_excludes() {
-    loom::model(|| {
-      let lock = Arc::new(SpinLock::new());
+  /// A futex for loom: a mutex-protected wait queue. `wait` checks the
+  /// word and blocks under the same mutex that `wake` takes, which is the
+  /// atomicity `FUTEX_WAIT`/`FUTEX_WAKE` guarantee, so a lost wake-up shows
+  /// up as a deadlock that loom reports.
+  #[derive(Default)]
+  struct Futex {
+    queue: loom::sync::Mutex<()>,
+    cond: loom::sync::Condvar,
+  }
+
+  impl Park for Futex {
+    fn wait(&self, word: &AtomicU32, expected: u32) {
+      let g = self.queue.lock().unwrap();
+      if word.load(Relaxed) == expected {
+        drop(self.cond.wait(g).unwrap());
+      }
+    }
+    fn wake(&self, word: &AtomicU32) {
+      let _ = word;
+      let _g = self.queue.lock().unwrap();
+      self.cond.notify_one();
+    }
+  }
+
+  /// `threads` threads each take the lock `rounds` times around a
+  /// non-atomic read-modify-write; the lock must exclude them and no thread
+  /// may stay parked.
+  fn lock_model(threads: usize, rounds: usize, preemption_bound: Option<usize>) {
+    let mut model = loom::model::Builder::new();
+    model.preemption_bound = preemption_bound;
+    model.check(move || {
+      let lock = Arc::new(Lock::new());
+      let futex = Arc::new(Futex::default());
       let data = Arc::new(AtomicU64::new(0));
-      let handles: Vec<_> = (0..2)
+      let handles: Vec<_> = (0..threads)
         .map(|_| {
-          let (lock, data) = (lock.clone(), data.clone());
+          let (lock, futex, data) = (lock.clone(), futex.clone(), data.clone());
           thread::spawn(move || {
-            let _g = lock.lock(loom::thread::yield_now);
-            // A non-atomic read-modify-write, made safe by the lock.
-            let v = data.load(Relaxed);
-            data.store(v + 1, Relaxed);
+            for _ in 0..rounds {
+              let _g = lock.lock(&*futex);
+              // A non-atomic read-modify-write, made safe by the lock.
+              let v = data.load(Relaxed);
+              data.store(v + 1, Relaxed);
+            }
           })
         })
         .collect();
       for h in handles {
         h.join().unwrap();
       }
-      assert_eq!(data.load(Relaxed), 2);
+      assert_eq!(data.load(Relaxed), (threads * rounds) as u64);
+    });
+  }
+
+  #[test]
+  fn lock_excludes() {
+    lock_model(2, 1, None);
+  }
+
+  /// Re-locking after a release exercises taking the lock as CONTENDED
+  /// while the other thread is parked or about to park.
+  #[test]
+  fn lock_wakes_parked_threads() {
+    lock_model(2, 2, None);
+  }
+
+  /// Two threads parked at once: each unlock must pass the wake-up on.
+  /// Exhaustive search takes more than ten minutes here, so preemptions
+  /// are bounded (loom's recommended way to cut the search).
+  #[test]
+  fn lock_three_threads() {
+    lock_model(3, 1, Some(3));
+  }
+
+  /// `try_lock` excludes like `lock`, and a failed `try_lock` leaves the
+  /// holder's lock alone: two threads `lock` while a third `try_lock`s,
+  /// and every entry into the critical section must be counted once.
+  #[test]
+  fn try_lock_and_lock() {
+    let mut model = loom::model::Builder::new();
+    model.preemption_bound = Some(3);
+    model.check(|| {
+      let lock = Arc::new(Lock::new());
+      let futex = Arc::new(Futex::default());
+      let data = Arc::new(AtomicU64::new(0));
+      let handles: Vec<_> = (0..2)
+        .map(|_| {
+          let (l, f, d) = (lock.clone(), futex.clone(), data.clone());
+          thread::spawn(move || {
+            let _g = l.lock(&*f);
+            let v = d.load(Relaxed);
+            d.store(v + 1, Relaxed);
+          })
+        })
+        .collect();
+      let mut entered = 2;
+      if let Some(_g) = lock.try_lock(&*futex) {
+        let v = data.load(Relaxed);
+        data.store(v + 1, Relaxed);
+        entered += 1;
+      }
+      for h in handles {
+        h.join().unwrap();
+      }
+      assert_eq!(data.load(Relaxed), entered);
+    });
+  }
+
+  /// The fork handlers' pair: `acquire` in one call, `release` in another.
+  #[test]
+  fn acquire_release() {
+    loom::model(|| {
+      let lock = Arc::new(Lock::new());
+      let futex = Arc::new(Futex::default());
+      let (l, f) = (lock.clone(), futex.clone());
+      let t = thread::spawn(move || drop(l.lock(&*f)));
+      lock.acquire(&*futex);
+      lock.release(&*futex);
+      t.join().unwrap();
     });
   }
 }
