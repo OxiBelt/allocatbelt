@@ -37,6 +37,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "allocatbelt-codegen-probes"
+version = "0.1.0"
+dependencies = [
+ "allocatbelt-core",
+]
+
+[[package]]
 name = "allocatbelt-core"
 version = "0.1.0"
 dependencies = [

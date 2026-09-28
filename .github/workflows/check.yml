@@ -97,6 +97,31 @@ jobs:
       - name: Check the platform gates
         run: scripts/check-platform-gates.sh
 
+  # Plan phase 3: the bit scans lower to tzcnt/popcnt/lzcnt on x86-64-v3
+  # and to ctz/cpop/clz on riscv64 with Zbb (assembly only, no qemu).
+  scalar-isa:
+    name: Scalar ISA lowering (x86-64-v3, riscv64 + Zbb)
+    runs-on: ubuntu-26.04
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # 7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install 1.98.1 --profile minimal --target riscv64gc-unknown-linux-gnu
+          rustup default 1.98.1
+
+      - name: Fetch locked Cargo dependency graph
+        run: cargo fetch --locked
+
+      - name: Check the generated bit instructions
+        run: scripts/check-scalar-isa.sh
+
   riscv64-qemu-tests:
     name: riscv64 tests under qemu-user (${{ matrix.name }})
     runs-on: ubuntu-26.04

@@ -2,6 +2,7 @@
 resolver = "3"
 members = [
   "crates/allocatbelt-arch",
+  "crates/allocatbelt-codegen-probes",
   "crates/allocatbelt-core",
   "crates/allocatbelt-sys",
   "crates/allocatbelt",
