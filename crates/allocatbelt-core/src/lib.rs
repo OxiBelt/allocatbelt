@@ -19,7 +19,7 @@ compile_error!(
   "allocatbelt needs a 64-bit target with 64-bit atomics (e.g. x86_64, aarch64, riscv64)"
 );
 
-#[cfg(any(test, loom))]
+#[cfg(any(test, loom, feature = "model"))]
 extern crate std;
 
 pub mod bits;
@@ -28,6 +28,8 @@ pub mod class;
 pub mod heap;
 #[cfg_attr(loom, allow(dead_code))]
 mod lock;
+#[cfg(all(any(test, feature = "model"), not(loom)))]
+pub mod model;
 #[cfg_attr(loom, allow(dead_code))]
 mod proto;
 mod sync;

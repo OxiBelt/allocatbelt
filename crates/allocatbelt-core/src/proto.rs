@@ -257,9 +257,8 @@ mod loom_tests {
       freer.join().unwrap();
       page.check_reachable();
       // Every block is either claimed or still free, never both.
-      for w in 0..2 {
-        let left = page.words[w].load(Relaxed);
-        assert_eq!(got[w] & left, 0);
+      for (got, word) in got.iter().zip(&page.words) {
+        assert_eq!(got & word.load(Relaxed), 0);
       }
       let all = [
         got[0] | page.words[0].load(Relaxed),
@@ -288,6 +287,31 @@ mod loom_tests {
       }
       page.check_reachable();
       assert_eq!(got[0] | page.words[0].load(Relaxed), 0b11);
+    });
+  }
+
+  #[test]
+  fn full_counter_means_every_block_is_free() {
+    loom::model(|| {
+      // Two blocks: block 0 free, block 1 live and about to be freed.
+      let page = Arc::new(Page::new([0b01, 0]));
+      let p = page.clone();
+      let freer = thread::spawn(move || assert!(p.free(0, 0b10)));
+      // The owner claims what it can and hands it back, as a thread cache
+      // does, then decides whether the page is empty (and releasable) from
+      // the counter, as `release_empty_pages` does.
+      if let Some((w, b)) = claim_word(&page.summary, &page.words, 0) {
+        page.count.fetch_sub(u64::from(b.count_ones()), Relaxed);
+        assert!(page.free(w, b));
+      }
+      if page.count.load(Acquire) >= 2 {
+        assert_eq!(
+          page.words[0].load(Relaxed),
+          0b11,
+          "the counter overstated the free blocks"
+        );
+      }
+      freer.join().unwrap();
     });
   }
 

@@ -43,7 +43,15 @@ The narrow boundary makes each *operation* auditable, but soundness still depend
 4. It only reports a block as `zeroed` if every page of it was never handed out, or was purged/decommitted with success (`Os::purge`/`Os::decommit` returned `true`) since it was last handed out. Otherwise `calloc` would return stale bytes.
 5. It never hands out, purges or commits a guarded page: the guard page of an owned segment stays claimed in the segment's page bitmap for as long as the segment is owned, and `Os::unguard` runs before the segment returns to the arena.
 
-Current verification: shadow-map checks against the mock `Os` (non-overlap, commit state, purge overlap, and a written-pages shadow that every `zeroed` claim is checked against, including with failing purges), proptest random sequences, multi-threaded cross-thread-free tests, and a partial Miri run on the core tests (below).
+Current verification:
+
+- **Shadow maps.** The checking mock `Os` (`allocatbelt-core/src/model.rs`, feature `model`) checks non-overlap, commit state, that purged, decommitted and guarded ranges hold no live block, that nothing guarded is handed out or committed, and a written-pages shadow that every `zeroed` claim is checked against, including with failing purges. It backs every model test.
+- **proptest.** Random operation sequences, with and without thread caches and randomized placement, and random byte programs for the fuzz interpreter (`model::run`, `tests::fuzz_programs`).
+- **Fuzzing.** `fuzz/` runs `model::run` under libFuzzer (cargo-fuzz). A 10-minute run on 2026-09-28 executed 381,049 programs with no failure. CI repeats it on its daily schedule.
+- **loom.** `proto.rs` holds every lock-free transition the heap performs on shared metadata, and loom checks them exhaustively (`--cfg loom`): free vs. claim, two freers on one word, racing double frees, the free counter never overstating free blocks, page-run claim/release vs. purge, in-place growth vs. segment trimming, and the spin lock. The heap calls these same functions, so the models check the shipped code.
+- **Integration tests.** Multi-threaded cross-thread frees, thread exit returning caches, the background purge thread returning RSS, a real overflow faulting in the guard page, and `fork` from a busy process.
+- **Mutation testing.** The mewt campaign over `bits`/`class` (see CONTRIBUTING.md) passes: 77 mutants caught, 5 listed as equivalent.
+- **Miri.** Only a partial run on the core tests (below).
 
 Miri result (**run on commit 0271678**, i.e. before the later follow-up commits, nightly 2026-09-26, `-Zmiri-disable-isolation`, 90-minute limit): **8/17 tests passed with no UB detected**:
 `bits::{masks, run_matches_naive}`, `class::{table_shape, class_of_is_tight}`, `tests::{alignments, cross_thread_frees, double_free_small, double_free_large}`.

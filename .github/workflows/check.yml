@@ -105,6 +105,63 @@ jobs:
       - name: Cargo test
         run: cargo test --release --locked --target riscv64gc-unknown-linux-gnu -p allocatbelt-core -p allocatbelt
 
+  loom-models:
+    name: loom models of the core's atomic protocols
+    runs-on: ubuntu-26.04
+    timeout-minutes: 30
+    env:
+      RUSTFLAGS: --cfg loom
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # 7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install 1.98.1 --profile minimal
+          rustup default 1.98.1
+
+      - name: Fetch locked Cargo dependency graph
+        run: cargo fetch --locked
+
+      - name: Cargo test (loom)
+        run: cargo test --release --locked -p allocatbelt-core --lib loom
+
+  fuzz:
+    name: Fuzz the heap model (cargo-fuzz, 10 minutes)
+    runs-on: ubuntu-26.04
+    timeout-minutes: 30
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # 7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Install Rust toolchains and cargo-fuzz
+        run: |
+          rustup toolchain install nightly-2026-09-28 --profile minimal
+          rustup toolchain install 1.98.1 --profile minimal
+          cargo +1.98.1 install cargo-fuzz --version 0.13.2 --locked
+
+      - name: Fuzz heap_ops
+        working-directory: fuzz
+        run: cargo +nightly-2026-09-28 fuzz run heap_ops -- -max_total_time=600 -rss_limit_mb=4096 -max_len=4096
+
+      - name: Upload crashing inputs
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # 7.0.1
+        with:
+          name: allocatbelt-fuzz-${{ github.run_id }}-${{ github.run_attempt }}
+          path: fuzz/artifacts
+          if-no-files-found: warn
+          retention-days: 30
+
   rust-advisory-checks:
     name: Rust dependency admission
     runs-on: ubuntu-26.04

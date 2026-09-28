@@ -8,3 +8,9 @@
 
 # Temporary files directory for LLM Agents
 .agents/temp
+
+# cargo-fuzz output
+/fuzz/target
+/fuzz/corpus
+/fuzz/artifacts
+/fuzz/coverage

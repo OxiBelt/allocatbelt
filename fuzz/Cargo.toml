@@ -1,0 +1,24 @@
+# Fuzzing `allocatbelt-core` with cargo-fuzz (nightly): see `README.md`.
+# A separate workspace, so the main one needs no nightly and no libFuzzer.
+[package]
+name = "allocatbelt-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+allocatbelt-core = { path = "../crates/allocatbelt-core", features = ["model"] }
+libfuzzer-sys = "0.4.10"
+
+[[bin]]
+name = "heap_ops"
+path = "fuzz_targets/heap_ops.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]
+members = ["."]

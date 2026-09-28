@@ -1,270 +1,19 @@
-//! Model tests: the heap runs on a mock [`Os`] that never backs user memory
-//! but checks the heap's promises (offsets are committed, purged ranges hold
-//! no live allocation, blocks reported as zeroed were not written since they
-//! were last purged) against shadow maps.
+//! Model tests: the heap runs on the checking [`MockOs`] of
+//! [`crate::model`], which never backs user memory but checks the heap's
+//! promises against shadow maps.
 
 use std::boxed::Box;
-use std::collections::{BTreeMap, BTreeSet};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::collections::BTreeSet;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::vec::Vec;
 
 use crate::heap::MAX_RUN_PAGES;
-use crate::{
-  ARENA_SIZE, Block, Heap, MAX_SEGMENTS, META_WORDS, Os, PAGE_SIZE, SEGMENT_SIZE, ThreadCache,
-};
-
-struct MockOs {
-  /// Pages behind a guard (`Os::guard`).
-  guarded: Mutex<BTreeSet<usize>>,
-  meta: Vec<OnceLock<&'static [AtomicU64]>>,
-  committed: Vec<AtomicBool>,
-  live: Mutex<BTreeMap<usize, usize>>,
-  /// Pages the "program" wrote to since they were last purged.
-  written: Mutex<BTreeSet<usize>>,
-  /// Bytes handed back to the OS by `purge` or `decommit`.
-  purged: AtomicUsize,
-  /// Makes `purge` and `decommit` report failure, as `madvise` does on
-  /// `mlock`ed memory.
-  purge_fails: AtomicBool,
-  /// The clock `now_ms` reports; tests advance it by hand.
-  clock: AtomicU64,
-}
-
-impl MockOs {
-  fn new() -> Self {
-    Self {
-      guarded: Mutex::new(BTreeSet::new()),
-      meta: (0..MAX_SEGMENTS).map(|_| OnceLock::new()).collect(),
-      committed: (0..MAX_SEGMENTS).map(|_| AtomicBool::new(false)).collect(),
-      live: Mutex::new(BTreeMap::new()),
-      written: Mutex::new(BTreeSet::new()),
-      purged: AtomicUsize::new(0),
-      purge_fails: AtomicBool::new(false),
-      clock: AtomicU64::new(0),
-    }
-  }
-
-  fn advance(&self, ms: u64) {
-    self.clock.fetch_add(ms, Ordering::Relaxed);
-  }
-
-  /// Clears the written marks of the range unless purging fails.
-  fn zero(&self, offset: usize, len: usize) -> bool {
-    if self.purge_fails.load(Ordering::Relaxed) {
-      return false;
-    }
-    let mut w = self.written.lock().unwrap();
-    let pages: Vec<_> = w
-      .range(offset / PAGE_SIZE..(offset + len).div_ceil(PAGE_SIZE))
-      .copied()
-      .collect();
-    for p in pages {
-      w.remove(&p);
-    }
-    true
-  }
-
-  fn assert_no_live(&self, offset: usize, len: usize, what: &str) {
-    let live = self.live.lock().unwrap();
-    if let Some((&s, &e)) = live.range(..offset + len).next_back() {
-      assert!(
-        e <= offset,
-        "{what} of {offset:#x}+{len:#x} overlaps live {s:#x}..{e:#x}"
-      );
-    }
-  }
-
-  fn assert_unguarded(&self, offset: usize, len: usize, what: &str) {
-    let g = self.guarded.lock().unwrap();
-    let hit = g
-      .range(offset / PAGE_SIZE..(offset + len).div_ceil(PAGE_SIZE))
-      .next();
-    assert!(
-      hit.is_none(),
-      "{what} of {offset:#x}+{len:#x} covers guard page {hit:?}"
-    );
-  }
-}
-
-impl Os for MockOs {
-  fn commit(&self, offset: usize, len: usize) -> bool {
-    assert_eq!(offset % SEGMENT_SIZE, 0);
-    self.assert_unguarded(offset, len, "commit");
-    for s in offset / SEGMENT_SIZE..(offset + len) / SEGMENT_SIZE {
-      self.committed[s].store(true, Ordering::Relaxed);
-    }
-    true
-  }
-  fn decommit(&self, offset: usize, len: usize) -> bool {
-    self.assert_no_live(offset, len, "decommit");
-    for s in offset / SEGMENT_SIZE..(offset + len) / SEGMENT_SIZE {
-      self.committed[s].store(false, Ordering::Relaxed);
-    }
-    self.purged.fetch_add(len, Ordering::Relaxed);
-    self.zero(offset, len)
-  }
-  fn purge(&self, offset: usize, len: usize) -> bool {
-    self.assert_no_live(offset, len, "purge");
-    self.purged.fetch_add(len, Ordering::Relaxed);
-    self.zero(offset, len)
-  }
-  fn commit_meta(&self, segment: usize) -> Option<&[AtomicU64]> {
-    Some(self.meta[segment].get_or_init(|| {
-      Box::leak(
-        (0..META_WORDS)
-          .map(|_| AtomicU64::new(0))
-          .collect::<Vec<_>>()
-          .into_boxed_slice(),
-      )
-    }))
-  }
-  fn meta(&self, segment: usize) -> Option<&[AtomicU64]> {
-    self.meta[segment].get().copied()
-  }
-  fn yield_now(&self) {
-    std::thread::yield_now();
-  }
-  fn now_ms(&self) -> u64 {
-    self.clock.load(Ordering::Relaxed)
-  }
-  fn guard(&self, offset: usize, len: usize) -> bool {
-    self.assert_no_live(offset, len, "guard");
-    let mut g = self.guarded.lock().unwrap();
-    g.extend(offset / PAGE_SIZE..(offset + len) / PAGE_SIZE);
-    true
-  }
-  fn unguard(&self, offset: usize, len: usize) {
-    let mut g = self.guarded.lock().unwrap();
-    for p in offset / PAGE_SIZE..(offset + len) / PAGE_SIZE {
-      assert!(g.remove(&p), "unguard of page {p}, which is not guarded");
-    }
-  }
-  fn fatal(&self, msg: &'static str) -> ! {
-    panic!("{msg}")
-  }
-}
+use crate::model::{MockOs, alloc, alloc_block, alloc_c, cache, free, free_c, resize};
+use crate::{Heap, PAGE_SIZE, SEGMENT_SIZE, ThreadCache};
 
 fn heap() -> &'static Heap<MockOs> {
   Box::leak(Box::new(Heap::new(MockOs::new())))
-}
-
-/// Allocates and records the block in the shadow map, checking the
-/// allocator's post-conditions.
-fn alloc(h: &Heap<MockOs>, shard: usize, size: usize, align: usize) -> usize {
-  alloc_block(h, shard, size, align).offset
-}
-
-/// As [`alloc`], returning the whole [`Block`]. The block is then treated as
-/// written, like a program would.
-fn alloc_block(h: &Heap<MockOs>, shard: usize, size: usize, align: usize) -> Block {
-  let b = h.alloc_block(shard, size, align).expect("out of memory");
-  record(h, b, size, align);
-  b
-}
-
-/// Allocates through a thread cache, with the same checks as [`alloc`].
-fn alloc_c(h: &Heap<MockOs>, tc: &ThreadCache, size: usize, align: usize) -> usize {
-  let b = h.alloc_cached(tc, size, align).expect("out of memory");
-  record(h, b, size, align);
-  b.offset
-}
-
-/// Frees through a thread cache, updating the shadow map.
-fn free_c(h: &Heap<MockOs>, tc: &ThreadCache, off: usize) {
-  h.os().live.lock().unwrap().remove(&off);
-  h.dealloc_cached(tc, off);
-}
-
-/// An attached cache, as a thread would hold it.
-fn cache(h: &Heap<MockOs>) -> ThreadCache {
-  let tc = ThreadCache::new();
-  tc.begin_attach();
-  h.attach(&tc);
-  tc
-}
-
-/// Checks the allocator's post-conditions for a fresh block and records it
-/// in the shadow maps.
-fn record(h: &Heap<MockOs>, b: Block, size: usize, align: usize) {
-  let off = b.offset;
-  {
-    let mut w = h.os().written.lock().unwrap();
-    let pages = off / PAGE_SIZE..(off + size.max(1)).div_ceil(PAGE_SIZE);
-    if b.zeroed {
-      let dirty = w.range(pages.clone()).next();
-      assert!(
-        dirty.is_none(),
-        "{b:?} claims zero but page {dirty:?} was written"
-      );
-    }
-    w.extend(pages);
-  }
-  h.os().assert_unguarded(off, size.max(1), "allocation");
-  assert_eq!(off % align, 0, "size {size} align {align} -> {off:#x}");
-  assert!(off + size <= ARENA_SIZE);
-  let usable = h.usable_size(off);
-  assert!(usable >= size, "usable {usable} < {size}");
-  let end = off + size.max(1);
-  for s in off / SEGMENT_SIZE..end.div_ceil(SEGMENT_SIZE) {
-    assert!(
-      h.os().committed[s].load(Ordering::Relaxed),
-      "segment {s} not committed"
-    );
-  }
-  let mut live = h.os().live.lock().unwrap();
-  if let Some((&s, &e)) = live.range(..end).next_back() {
-    assert!(
-      e <= off,
-      "new {off:#x}..{end:#x} overlaps live {s:#x}..{e:#x}"
-    );
-  }
-  live.insert(off, end);
-}
-
-/// Resizes in place, updating the shadow maps and checking that a grown
-/// block stays committed and overlaps nothing.
-fn resize(h: &Heap<MockOs>, off: usize, new_size: usize) -> bool {
-  // While shrinking, only the first `new_size` bytes must stay intact.
-  let old_end = h.os().live.lock().unwrap()[&off];
-  h.os()
-    .live
-    .lock()
-    .unwrap()
-    .insert(off, old_end.min(off + new_size));
-  if !h.resize_in_place(off, new_size) {
-    h.os().live.lock().unwrap().insert(off, old_end);
-    return false;
-  }
-  assert!(h.usable_size(off) >= new_size);
-  h.os().assert_unguarded(off, new_size, "resize");
-  let end = off + new_size;
-  for s in off / SEGMENT_SIZE..end.div_ceil(SEGMENT_SIZE) {
-    assert!(
-      h.os().committed[s].load(Ordering::Relaxed),
-      "segment {s} not committed"
-    );
-  }
-  let mut live = h.os().live.lock().unwrap();
-  live.remove(&off);
-  if let Some((&s, &e)) = live.range(..end).next_back() {
-    assert!(
-      e <= off,
-      "resized {off:#x}..{end:#x} overlaps live {s:#x}..{e:#x}"
-    );
-  }
-  live.insert(off, end);
-  h.os()
-    .written
-    .lock()
-    .unwrap()
-    .extend(off / PAGE_SIZE..end.div_ceil(PAGE_SIZE));
-  true
-}
-
-fn free(h: &Heap<MockOs>, off: usize) {
-  h.os().live.lock().unwrap().remove(&off);
-  h.dealloc(off);
 }
 
 const SIZES: &[usize] = &[
@@ -1135,4 +884,36 @@ fn seeded_placement_is_randomized() {
     adjacent < 16,
     "{adjacent} of 48 consecutive blocks were adjacent"
   );
+}
+
+// ---- fuzz programs -------------------------------------------------------------
+
+proptest::proptest! {
+  #![proptest_config(proptest::prelude::ProptestConfig::with_cases(if cfg!(miri) { 2 } else { 256 }))]
+  /// The fuzz target's interpreter (see `fuzz/`), on random programs.
+  #[test]
+  fn fuzz_programs(data in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..3000)) {
+    crate::model::run(&data);
+  }
+}
+
+#[test]
+fn fuzz_program_edge_cases() {
+  crate::model::run(&[]);
+  crate::model::run(&[1]);
+  // Allocate the largest sizes of each kind through every path, then free
+  // them crosswise, with randomization on.
+  let mut p = std::vec![1u8];
+  for who in 0..4u8 {
+    for hi in [0x00, 0x7F, 0xBF, 0xFF] {
+      p.extend([who << 5, hi, 0xFF, 22]);
+    }
+  }
+  for who in 0..4u8 {
+    for _ in 0..4 {
+      p.extend([(who << 5) | 12, 0]);
+    }
+  }
+  p.extend([23, 24, 25, 255, 26, 0, 24, 27, 0x20 | 27]);
+  crate::model::run(&p);
 }

@@ -1,0 +1,373 @@
+//! A checking model of the heap's environment, shared by the unit tests and
+//! the fuzz target (`--features model`).
+//!
+//! [`MockOs`] never backs user memory. It checks the heap's promises against
+//! shadow maps instead: blocks handed out are committed and overlap no live
+//! block or guard page; purged, decommitted and guarded ranges hold no live
+//! block; blocks reported as zeroed were not written since they were last
+//! purged; nothing guarded is committed again. The checked operations below
+//! (`alloc`, `free_c`, `resize`, ...) keep the shadow maps in step with the
+//! heap, and [`run`] interprets arbitrary bytes as a program of them.
+
+#![allow(
+  clippy::unwrap_used,
+  clippy::expect_used,
+  reason = "a test harness: a failed check is meant to panic"
+)]
+
+use std::boxed::Box;
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Mutex, OnceLock};
+use std::vec::Vec;
+
+use crate::{
+  ARENA_SIZE, Block, Heap, MAX_SEGMENTS, META_WORDS, Os, PAGE_SIZE, SEGMENT_SIZE, ThreadCache,
+};
+
+/// An [`Os`] that records what the heap does and checks it.
+pub struct MockOs {
+  meta: Vec<OnceLock<Box<[AtomicU64]>>>,
+  pub(crate) committed: Vec<AtomicBool>,
+  /// Live blocks: start offset to end offset.
+  pub(crate) live: Mutex<BTreeMap<usize, usize>>,
+  /// Pages the "program" wrote to since they were last purged.
+  pub(crate) written: Mutex<BTreeSet<usize>>,
+  /// Pages behind a guard ([`Os::guard`]).
+  pub(crate) guarded: Mutex<BTreeSet<usize>>,
+  /// Bytes handed back to the OS by `purge` or `decommit`.
+  pub(crate) purged: AtomicUsize,
+  /// Makes `purge` and `decommit` report failure, as `madvise` does on
+  /// `mlock`ed memory.
+  pub(crate) purge_fails: AtomicBool,
+  /// The clock `now_ms` reports; advanced by hand.
+  clock: AtomicU64,
+}
+
+impl MockOs {
+  /// A fresh environment: nothing committed, the clock at 0.
+  #[must_use]
+  pub fn new() -> Self {
+    Self {
+      meta: (0..MAX_SEGMENTS).map(|_| OnceLock::new()).collect(),
+      committed: (0..MAX_SEGMENTS).map(|_| AtomicBool::new(false)).collect(),
+      live: Mutex::new(BTreeMap::new()),
+      written: Mutex::new(BTreeSet::new()),
+      guarded: Mutex::new(BTreeSet::new()),
+      purged: AtomicUsize::new(0),
+      purge_fails: AtomicBool::new(false),
+      clock: AtomicU64::new(0),
+    }
+  }
+
+  /// Moves the clock forward.
+  pub fn advance(&self, ms: u64) {
+    self.clock.fetch_add(ms, Ordering::Relaxed);
+  }
+
+  /// Clears the written marks of the range unless purging fails.
+  fn zero(&self, offset: usize, len: usize) -> bool {
+    if self.purge_fails.load(Ordering::Relaxed) {
+      return false;
+    }
+    let mut w = self.written.lock().unwrap();
+    let pages: Vec<_> = w
+      .range(offset / PAGE_SIZE..(offset + len).div_ceil(PAGE_SIZE))
+      .copied()
+      .collect();
+    for p in pages {
+      w.remove(&p);
+    }
+    true
+  }
+
+  fn assert_no_live(&self, offset: usize, len: usize, what: &str) {
+    let live = self.live.lock().unwrap();
+    if let Some((&s, &e)) = live.range(..offset + len).next_back() {
+      assert!(
+        e <= offset,
+        "{what} of {offset:#x}+{len:#x} overlaps live {s:#x}..{e:#x}"
+      );
+    }
+  }
+
+  pub(crate) fn assert_unguarded(&self, offset: usize, len: usize, what: &str) {
+    let g = self.guarded.lock().unwrap();
+    let hit = g
+      .range(offset / PAGE_SIZE..(offset + len).div_ceil(PAGE_SIZE))
+      .next();
+    assert!(
+      hit.is_none(),
+      "{what} of {offset:#x}+{len:#x} covers guard page {hit:?}"
+    );
+  }
+}
+
+impl Default for MockOs {
+  fn default() -> Self {
+    Self::new()
+  }
+}
+
+impl Os for MockOs {
+  fn commit(&self, offset: usize, len: usize) -> bool {
+    assert_eq!(offset % SEGMENT_SIZE, 0);
+    self.assert_unguarded(offset, len, "commit");
+    for s in offset / SEGMENT_SIZE..(offset + len) / SEGMENT_SIZE {
+      self.committed[s].store(true, Ordering::Relaxed);
+    }
+    true
+  }
+  fn decommit(&self, offset: usize, len: usize) -> bool {
+    self.assert_no_live(offset, len, "decommit");
+    for s in offset / SEGMENT_SIZE..(offset + len) / SEGMENT_SIZE {
+      self.committed[s].store(false, Ordering::Relaxed);
+    }
+    self.purged.fetch_add(len, Ordering::Relaxed);
+    self.zero(offset, len)
+  }
+  fn purge(&self, offset: usize, len: usize) -> bool {
+    self.assert_no_live(offset, len, "purge");
+    self.purged.fetch_add(len, Ordering::Relaxed);
+    self.zero(offset, len)
+  }
+  fn guard(&self, offset: usize, len: usize) -> bool {
+    self.assert_no_live(offset, len, "guard");
+    let mut g = self.guarded.lock().unwrap();
+    g.extend(offset / PAGE_SIZE..(offset + len) / PAGE_SIZE);
+    true
+  }
+  fn unguard(&self, offset: usize, len: usize) {
+    let mut g = self.guarded.lock().unwrap();
+    for p in offset / PAGE_SIZE..(offset + len) / PAGE_SIZE {
+      assert!(g.remove(&p), "unguard of page {p}, which is not guarded");
+    }
+  }
+  fn commit_meta(&self, segment: usize) -> Option<&[AtomicU64]> {
+    Some(self.meta[segment].get_or_init(|| (0..META_WORDS).map(|_| AtomicU64::new(0)).collect()))
+  }
+  fn meta(&self, segment: usize) -> Option<&[AtomicU64]> {
+    self.meta[segment].get().map(|m| &**m)
+  }
+  fn yield_now(&self) {
+    std::thread::yield_now();
+  }
+  fn now_ms(&self) -> u64 {
+    self.clock.load(Ordering::Relaxed)
+  }
+  fn fatal(&self, msg: &'static str) -> ! {
+    panic!("{msg}")
+  }
+}
+
+/// Allocates (uncached) and records the block in the shadow maps, checking
+/// the allocator's post-conditions.
+pub fn alloc(h: &Heap<MockOs>, shard: usize, size: usize, align: usize) -> usize {
+  alloc_block(h, shard, size, align).offset
+}
+
+/// As [`alloc`], returning the whole [`Block`]. The block is then treated as
+/// written, like a program would.
+pub fn alloc_block(h: &Heap<MockOs>, shard: usize, size: usize, align: usize) -> Block {
+  let b = h.alloc_block(shard, size, align).expect("out of memory");
+  record(h, b, size, align);
+  b
+}
+
+/// Allocates through a thread cache, with the same checks as [`alloc`].
+pub fn alloc_c(h: &Heap<MockOs>, tc: &ThreadCache, size: usize, align: usize) -> usize {
+  let b = h.alloc_cached(tc, size, align).expect("out of memory");
+  record(h, b, size, align);
+  b.offset
+}
+
+/// Frees (uncached), updating the shadow map.
+pub fn free(h: &Heap<MockOs>, off: usize) {
+  h.os().live.lock().unwrap().remove(&off);
+  h.dealloc(off);
+}
+
+/// Frees through a thread cache, updating the shadow map.
+pub fn free_c(h: &Heap<MockOs>, tc: &ThreadCache, off: usize) {
+  h.os().live.lock().unwrap().remove(&off);
+  h.dealloc_cached(tc, off);
+}
+
+/// An attached cache, as a thread would hold it.
+pub fn cache(h: &Heap<MockOs>) -> ThreadCache {
+  let tc = ThreadCache::new();
+  tc.begin_attach();
+  h.attach(&tc);
+  tc
+}
+
+/// Checks the allocator's post-conditions for a fresh block and records it
+/// in the shadow maps.
+pub fn record(h: &Heap<MockOs>, b: Block, size: usize, align: usize) {
+  let off = b.offset;
+  {
+    let mut w = h.os().written.lock().unwrap();
+    let pages = off / PAGE_SIZE..(off + size.max(1)).div_ceil(PAGE_SIZE);
+    if b.zeroed {
+      let dirty = w.range(pages.clone()).next();
+      assert!(
+        dirty.is_none(),
+        "{b:?} claims zero but page {dirty:?} was written"
+      );
+    }
+    w.extend(pages);
+  }
+  h.os().assert_unguarded(off, size.max(1), "allocation");
+  assert_eq!(off % align, 0, "size {size} align {align} -> {off:#x}");
+  assert!(off + size <= ARENA_SIZE);
+  let usable = h.usable_size(off);
+  assert!(usable >= size, "usable {usable} < {size}");
+  let end = off + size.max(1);
+  for s in off / SEGMENT_SIZE..end.div_ceil(SEGMENT_SIZE) {
+    assert!(
+      h.os().committed[s].load(Ordering::Relaxed),
+      "segment {s} not committed"
+    );
+  }
+  let mut live = h.os().live.lock().unwrap();
+  if let Some((&s, &e)) = live.range(..end).next_back() {
+    assert!(
+      e <= off,
+      "new {off:#x}..{end:#x} overlaps live {s:#x}..{e:#x}"
+    );
+  }
+  live.insert(off, end);
+}
+
+/// Resizes in place, updating the shadow maps and checking that a grown
+/// block stays committed and overlaps nothing.
+pub fn resize(h: &Heap<MockOs>, off: usize, new_size: usize) -> bool {
+  // While shrinking, only the first `new_size` bytes must stay intact.
+  let old_end = h.os().live.lock().unwrap()[&off];
+  h.os()
+    .live
+    .lock()
+    .unwrap()
+    .insert(off, old_end.min(off + new_size.max(1)));
+  if !h.resize_in_place(off, new_size) {
+    h.os().live.lock().unwrap().insert(off, old_end);
+    return false;
+  }
+  assert!(h.usable_size(off) >= new_size);
+  h.os().assert_unguarded(off, new_size.max(1), "resize");
+  let end = off + new_size.max(1);
+  for s in off / SEGMENT_SIZE..end.div_ceil(SEGMENT_SIZE) {
+    assert!(
+      h.os().committed[s].load(Ordering::Relaxed),
+      "segment {s} not committed"
+    );
+  }
+  let mut live = h.os().live.lock().unwrap();
+  live.remove(&off);
+  if let Some((&s, &e)) = live.range(..end).next_back() {
+    assert!(
+      e <= off,
+      "resized {off:#x}..{end:#x} overlaps live {s:#x}..{e:#x}"
+    );
+  }
+  live.insert(off, end);
+  h.os()
+    .written
+    .lock()
+    .unwrap()
+    .extend(off / PAGE_SIZE..end.div_ceil(PAGE_SIZE));
+  true
+}
+
+/// Live bytes above which [`run`] stops allocating, so that the 64 GiB
+/// arena cannot run out (which would be a legitimate `None`).
+const RUN_LIVE_LIMIT: usize = 8 << 30;
+
+/// Decodes a request size from two bytes, spread over every block kind:
+/// class blocks, page runs and multi-segment blocks.
+fn size_of(hi: u8, lo: u8) -> usize {
+  let v = usize::from(hi & 0x3F) << 8 | usize::from(lo);
+  match hi >> 6 {
+    0 => v % 257,
+    1 => v % 8193,
+    2 => v * 16,
+    _ => v * 1024,
+  }
+}
+
+/// Runs the program encoded in `data` on a fresh heap, with every check of
+/// this module. Any byte string is a valid program; a panic is a heap bug.
+///
+/// Operations go through two attached thread caches, a detached one (the
+/// uncached paths through a cache) and the uncached API, so frees routinely
+/// cross "threads". The program also flushes and retires caches, purges,
+/// runs decay passes, advances the clock, and changes the purge delay; the
+/// first byte seeds randomized placement (or not). At the end everything is
+/// freed and a forced purge must leave nothing dirty.
+pub fn run(data: &[u8]) {
+  let h = Box::new(Heap::new(MockOs::new()));
+  let mut bytes = data.iter().copied();
+  let seed = bytes.next().unwrap_or(0);
+  if seed & 1 == 1 {
+    h.set_seed(u64::from(seed).wrapping_mul(0x9E37_79B9_7F4A_7C15));
+  }
+  let caches = [cache(&h), cache(&h), ThreadCache::new()];
+  let mut live: Vec<(usize, usize)> = Vec::new();
+  let mut live_bytes = 0usize;
+  while let Some(op) = bytes.next() {
+    let mut byte = || bytes.next().unwrap_or(0);
+    let who = usize::from(op >> 5) % 4;
+    let tc = caches.get(who);
+    match op & 0x1F {
+      0..=11 => {
+        let size = size_of(byte(), byte());
+        let align = 1usize << (byte() % 23);
+        if live_bytes + size > RUN_LIVE_LIMIT {
+          continue;
+        }
+        let off = match tc {
+          Some(tc) => alloc_c(&h, tc, size, align),
+          None => alloc(&h, usize::from(op), size, align),
+        };
+        live.push((off, size));
+        live_bytes += size;
+      }
+      12..=19 if !live.is_empty() => {
+        let (off, size) = live.swap_remove(usize::from(byte()) % live.len());
+        live_bytes -= size;
+        match tc {
+          Some(tc) => free_c(&h, tc, off),
+          None => free(&h, off),
+        }
+      }
+      20 | 21 if !live.is_empty() => {
+        let i = usize::from(byte()) % live.len();
+        let size = size_of(byte(), byte());
+        if live_bytes - live[i].1 + size <= RUN_LIVE_LIMIT && resize(&h, live[i].0, size) {
+          live_bytes = live_bytes - live[i].1 + size;
+          live[i].1 = size;
+        }
+      }
+      22 => tc.into_iter().for_each(|tc| h.flush(tc)),
+      23 => h.purge(),
+      24 => h.decay(),
+      25 => h.os().advance(u64::from(byte()) * 16),
+      26 => h.set_purge_delay_ms(u64::from(byte()) * 8),
+      27 => tc.into_iter().for_each(|tc| h.retire(tc)),
+      _ => {}
+    }
+  }
+  for (off, _) in live {
+    free(&h, off);
+  }
+  for tc in &caches {
+    h.retire(tc);
+  }
+  assert!(h.os().live.lock().unwrap().is_empty());
+  h.purge();
+  if !h.os().purge_fails.load(Ordering::Relaxed) {
+    assert_eq!(h.dirty_pages(), 0, "a forced purge left dirty pages");
+  }
+  // One (purged) segment per shard at most stays behind.
+  assert!(h.segments_in_use() <= crate::SHARDS);
+}
