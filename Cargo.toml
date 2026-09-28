@@ -7,6 +7,7 @@ members = [
   "crates/allocatbelt-sys",
   "crates/allocatbelt",
   "bench",
+  "bench/simd",
 ]
 
 [workspace.package]

@@ -1,0 +1,18 @@
+[package]
+name = "allocatbelt-simd-bench"
+description = "Microbenchmarks of candidate SIMD kernels for allocatbelt (plan phase 4). Not linked into the allocator."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+allocatbelt-arch.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# `perf_event_open`, `ioctl` and `read` for the hardware counters.
+libc.workspace = true
+
+[lints]
+workspace = true

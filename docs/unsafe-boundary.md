@@ -2,7 +2,7 @@
 
 `allocatbelt-core` uses `#![forbid(unsafe_code)]`, so it contains **0** `unsafe` sites. All the `unsafe` is listed below. Every `unsafe` block holds exactly one unsafe operation and carries a `// SAFETY:` comment (`clippy::undocumented_unsafe_blocks` and `multiple_unsafe_ops_per_block` are deny).
 
-Regenerate: `grep -rn "unsafe" crates/*/src | grep -E "unsafe (\{|fn|impl)"`
+Regenerate: `grep -rn "unsafe" crates/*/src bench/simd/src | grep -E "unsafe (\{|fn|impl)"`
 
 ## allocatbelt-sys
 
@@ -44,6 +44,22 @@ CPU feature detection only; no architecture kernel exists yet. Every site runs d
 | `impl GlobalAlloc` | `unsafe impl` + 4 `unsafe fn` | — | Required by the trait. Unwinding is blocked by `AbortOnUnwind`. |
 | `alloc_zeroed` | block | `write_bytes(0, size)` | A fresh block that nobody references yet. Skipped when the core reports the block as already zero (trust assumption 4). |
 | `realloc` | block | `copy_nonoverlapping` | The old block is live (caller contract); the new block is a separate fresh block. |
+
+## allocatbelt-simd-bench (benchmark only)
+
+`bench/simd` holds the Phase 4 SIMD candidates ([research/simd-benchmarks.md](research/simd-benchmarks.md)). It is not a dependency of the allocator and nothing in it runs inside `GlobalAlloc`; a kernel promoted in Phase 5 moves into `allocatbelt-arch` and gets its own rows above. Its `unsafe` is listed here so the whole workspace is accounted for.
+
+| Location | Kind | Operation | Why it is sound |
+|---|---|---|---|
+| `kernels/x86_64.rs`: `nonzero_avx2`, `popcount_avx2`, `age_avx2`, `zero_avx2`, `zero_avx2_nt`, `copy_avx2` | block each | call of the `#[target_feature(enable = "avx2")]` `_imp` function | The wrapper is only put into a `Variant` when `CpuFeatures::AVX2` was detected (always true at the x86-64-v3 floor). |
+| `kernels/x86_64.rs`: `nonzero_avx512`, `age_avx512`, `zero_avx512`, `copy_avx512`, `popcount_avx512` | block each | call of the `avx512f` (popcount: `avx512f,avx512vpopcntdq`) `_imp` function | Listed only when `AVX512F` (and `AVX512VPOPCNTDQ`) were detected. |
+| `kernels/x86_64.rs`: `zero_avx2_imp`, `zero_avx512_imp`, `copy_avx2_imp`, `copy_avx512_imp` | block ×1 or ×2 | `_mm256_storeu_si256` / `_mm512_storeu_si512`, `_mm256_loadu_si256` / `_mm512_loadu_si512` | Each pointer comes from a `chunks_exact(_mut)` chunk of exactly the vector width, so the access is in bounds; the unaligned forms have no alignment requirement; source and destination are a `&[u8]` and a `&mut [u8]`, so they do not overlap. |
+| `kernels/x86_64.rs`: `zero_avx2_nt_imp` | block | `_mm256_stream_si256` | The chunks start after a scalar head that brings the pointer to 32-byte alignment, as `movntdq` requires, and are exactly 32 bytes; an `_mm_sfence` follows the loop so the stores are ordered before the function returns. |
+| `kernels/aarch64.rs`: `nonzero_neon`, `popcount_neon`, `age_neon`, `zero_neon`, `copy_neon` | block each | call of the `#[target_feature(enable = "neon")]` `_imp` function | Listed only when `ASIMD` was detected. |
+| `kernels/aarch64.rs`: `nonzero_sve`, `popcount_sve`, `age_sve` | block each | call of the `#[target_feature(enable = "sve")]` `_imp` function | Listed only when `SVE` was detected. |
+| `kernels/aarch64.rs`: `zero_neon_imp`, `copy_neon_imp`, `load2` | block ×1 or ×2 | `vst1q_u8_x4`, `vld1q_u8_x4`, `vld1q_u64` | 64-byte chunks from `chunks_exact(_mut)`, or a `&[u64; 2]`, so every access is in bounds; `ld1`/`st1` have no alignment requirement beyond the element's; source and destination do not overlap (`&` and `&mut`). |
+| `perf.rs`: `Counters::open` | block ×2 | `libc::syscall(SYS_perf_event_open, &attr, 0, -1, group_fd, 0)`, then `File::from_raw_fd` | The kernel only reads `attr`, a live `#[repr(C)]` struct of `PERF_ATTR_SIZE_VER0` bytes (checked by a const assertion), and returns a new descriptor that nothing else owns, so the `File` may close it. |
+| `perf.rs`: `Counters::group_ioctl` | block | `libc::ioctl(leader, PERF_EVENT_IOC_{RESET,ENABLE,DISABLE}, PERF_IOC_FLAG_GROUP)` | These requests take an integer flag, not a pointer, on a perf descriptor this `Counters` owns; a failure only makes the counts unusable. |
 
 ## Trust assumptions (the part the boundary does not cover)
 

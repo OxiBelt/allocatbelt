@@ -53,7 +53,8 @@ stop matching a surviving mutant fail the gate and must be removed.
   and use `<name>.workspace = true` in member manifests. `cargo deny`
   rejects unused workspace dependencies.
 - `unsafe` stays in `allocatbelt-sys`, `allocatbelt-arch` (CPU feature
-  detection and, later, architecture kernels) and the `GlobalAlloc` adapter. Every
+  detection and, later, architecture kernels) and the `GlobalAlloc` adapter,
+  plus the benchmark-only SIMD candidates in `bench/simd`. Every
   `unsafe` block holds one unsafe operation and a `// SAFETY:` comment, and
   every change to the boundary updates
   [docs/unsafe-boundary.md](docs/unsafe-boundary.md).

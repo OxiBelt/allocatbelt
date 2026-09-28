@@ -58,6 +58,12 @@ jobs:
       - name: Cargo test
         run: cargo test --release --all-features --locked
 
+      # Checks that every detected SIMD candidate runs on this runner's CPU
+      # (AVX2/AVX-512 on x86_64, NEON/SVE on the arm runner).
+      # Hosted-runner timings are not evidence (docs/research/simd-benchmarks.md).
+      - name: SIMD benchmark smoke run
+        run: cargo run --release --locked -p allocatbelt-simd-bench --bin bench-simd -- --quick
+
   # The platform contract (docs/platform.md): x86_64 builds need x86-64-v3,
   # and unsupported architectures, ABIs, byte orders and operating systems
   # fail at compile time with the gates' own messages.
@@ -167,7 +173,14 @@ jobs:
       # The runner in `.cargo/config.toml` uses `-cpu max`: Zbb for the +zbb
       # build, and RVA23 for Ubuntu 26.04's riscv64 cross glibc.
       - name: Cargo test
-        run: cargo test --release --locked --target riscv64gc-unknown-linux-gnu -p allocatbelt-arch -p allocatbelt-core -p allocatbelt
+        run: cargo test --release --locked --target riscv64gc-unknown-linux-gnu -p allocatbelt-arch -p allocatbelt-core -p allocatbelt -p allocatbelt-simd-bench
+
+      # The experimental RVV candidates: the auto-vectorized kernels built
+      # with V (an unstable target feature, hence rustc's warning).
+      - name: Cargo test (SIMD candidates with V)
+        env:
+          RUSTFLAGS: ${{ matrix.rustflags }} -C target-feature=+v
+        run: cargo test --release --locked --target riscv64gc-unknown-linux-gnu -p allocatbelt-simd-bench
 
   loom-models:
     name: loom models of the core's atomic protocols
