@@ -35,22 +35,61 @@ const SIZES: [usize; NUM_CLASSES] = {
   t
 };
 
+const CAPACITY: [u16; NUM_CLASSES] = {
+  let mut t = [0; NUM_CLASSES];
+  let mut c = 0;
+  while c < NUM_CLASSES {
+    t[c] = (PAGE_SIZE / SIZES[c]) as u16;
+    c += 1;
+  }
+  t
+};
+
+/// `ceil(2^32 / size)`: `(offset * RECIP[c]) >> 32` is `offset / size` for
+/// every in-page offset (below 2^16), since `offset * size < 2^32`.
+const RECIP: [u64; NUM_CLASSES] = {
+  let mut t = [0; NUM_CLASSES];
+  let mut c = 0;
+  while c < NUM_CLASSES {
+    t[c] = (1u64 << 32).div_ceil(SIZES[c] as u64);
+    c += 1;
+  }
+  t
+};
+
 /// Block size of class `c`.
 #[must_use]
+#[inline]
 pub const fn size(c: usize) -> usize {
   SIZES[c]
 }
 
 /// Blocks per page for class `c`.
 #[must_use]
+#[inline]
 pub const fn capacity(c: usize) -> usize {
-  PAGE_SIZE / SIZES[c]
+  CAPACITY[c] as usize
 }
 
 /// Bitmap words in use for class `c`.
 #[must_use]
+#[inline]
 pub const fn bitmap_words(c: usize) -> usize {
   capacity(c).div_ceil(64)
+}
+
+/// Index of the class-`c` block that starts `in_page` bytes into its page,
+/// or `None` if no block starts there. Uses a multiplication instead of a
+/// division: this sits on the free path.
+#[must_use]
+#[inline]
+pub const fn block_index(c: usize, in_page: usize) -> Option<usize> {
+  let idx = ((in_page as u64 * RECIP[c]) >> 32) as usize;
+  if idx * SIZES[c] == in_page && idx < capacity(c) {
+    Some(idx)
+  } else {
+    None
+  }
 }
 
 /// Smallest class whose blocks hold `size` bytes (`size` in `0..=SMALL_MAX`).

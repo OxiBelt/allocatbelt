@@ -9,7 +9,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::vec::Vec;
 
-use crate::{ARENA_SIZE, Block, Heap, MAX_SEGMENTS, META_WORDS, Os, PAGE_SIZE, SEGMENT_SIZE};
+use crate::{
+  ARENA_SIZE, Block, Heap, MAX_SEGMENTS, META_WORDS, Os, PAGE_SIZE, SEGMENT_SIZE, ThreadCache,
+};
 
 struct MockOs {
   meta: Vec<OnceLock<&'static [AtomicU64]>>,
@@ -119,6 +121,34 @@ fn alloc(h: &Heap<MockOs>, shard: usize, size: usize, align: usize) -> usize {
 /// written, like a program would.
 fn alloc_block(h: &Heap<MockOs>, shard: usize, size: usize, align: usize) -> Block {
   let b = h.alloc_block(shard, size, align).expect("out of memory");
+  record(h, b, size, align);
+  b
+}
+
+/// Allocates through a thread cache, with the same checks as [`alloc`].
+fn alloc_c(h: &Heap<MockOs>, tc: &ThreadCache, size: usize, align: usize) -> usize {
+  let b = h.alloc_cached(tc, size, align).expect("out of memory");
+  record(h, b, size, align);
+  b.offset
+}
+
+/// Frees through a thread cache, updating the shadow map.
+fn free_c(h: &Heap<MockOs>, tc: &ThreadCache, off: usize) {
+  h.os().live.lock().unwrap().remove(&off);
+  h.dealloc_cached(tc, off);
+}
+
+/// An attached cache, as a thread would hold it.
+fn cache(h: &Heap<MockOs>) -> ThreadCache {
+  let tc = ThreadCache::new();
+  tc.begin_attach();
+  h.attach(&tc);
+  tc
+}
+
+/// Checks the allocator's post-conditions for a fresh block and records it
+/// in the shadow maps.
+fn record(h: &Heap<MockOs>, b: Block, size: usize, align: usize) {
   let off = b.offset;
   {
     let mut w = h.os().written.lock().unwrap();
@@ -151,7 +181,6 @@ fn alloc_block(h: &Heap<MockOs>, shard: usize, size: usize, align: usize) -> Blo
     );
   }
   live.insert(off, end);
-  b
 }
 
 /// Resizes in place, updating the shadow maps and checking that a grown
@@ -372,6 +401,7 @@ fn misaligned_small_free() {
   h.dealloc(a + 8);
 }
 
+/// Sets the flag when dropped.
 struct SetOnDrop<'a>(&'a AtomicBool);
 
 impl Drop for SetOnDrop<'_> {
@@ -661,4 +691,209 @@ fn freed_small_pages_leave_their_segments() {
   for o in again.into_iter().chain([offs[0]]) {
     h.dealloc(o);
   }
+}
+
+// ---- thread caches and summaries -------------------------------------------
+
+#[test]
+fn cached_round_trip_and_reuse() {
+  let h = heap();
+  let tc = cache(h);
+  let offs: Vec<_> = (0..500).map(|i| alloc_c(h, &tc, 16 + i % 200, 8)).collect();
+  for &o in &offs {
+    free_c(h, &tc, o);
+  }
+  // Buffered frees are returned before the next claim of their class, so
+  // the same memory comes back instead of new pages.
+  let segs = h.segments_in_use();
+  let again: Vec<_> = (0..500).map(|i| alloc_c(h, &tc, 16 + i % 200, 8)).collect();
+  assert_eq!(h.segments_in_use(), segs);
+  for o in again {
+    free_c(h, &tc, o);
+  }
+  h.retire(&tc);
+  // Once everything is returned, a purge pass releases every small page.
+  h.purge();
+  h.purge();
+  assert_eq!(h.dirty_pages(), 0);
+}
+
+#[test]
+fn caches_free_each_others_blocks() {
+  let h = heap();
+  let (a, b) = (cache(h), cache(h));
+  let from_a: Vec<_> = (0..3000).map(|i| alloc_c(h, &a, 8 + i % 3000, 8)).collect();
+  for &o in &from_a {
+    free_c(h, &b, o);
+  }
+  h.flush(&b);
+  // Every block freed through `b` is available to `a` again.
+  let before = h.segments_in_use();
+  let again: Vec<_> = (0..3000).map(|i| alloc_c(h, &a, 8 + i % 3000, 8)).collect();
+  assert_eq!(h.segments_in_use(), before);
+  for o in again {
+    free_c(h, &a, o);
+  }
+  h.retire(&a);
+  h.retire(&b);
+}
+
+#[test]
+fn detached_and_retired_caches_are_bypassed() {
+  let h = heap();
+  let tc = ThreadCache::new();
+  assert!(tc.is_detached());
+  let o = alloc_c(h, &tc, 64, 8);
+  free_c(h, &tc, o);
+  let tc = cache(h);
+  let o = alloc_c(h, &tc, 64, 8);
+  h.retire(&tc);
+  free_c(h, &tc, o);
+  // Retired caches stay retired.
+  h.attach(&tc);
+  let o = alloc_c(h, &tc, 64, 8);
+  free_c(h, &tc, o);
+  h.flush(&tc);
+}
+
+#[test]
+#[should_panic(expected = "double free")]
+fn double_free_in_buffer() {
+  let h = heap();
+  let tc = cache(h);
+  let a = h.alloc_cached(&tc, 48, 8).unwrap().offset;
+  let _b = h.alloc_cached(&tc, 48, 8).unwrap();
+  h.dealloc_cached(&tc, a);
+  h.dealloc_cached(&tc, a);
+}
+
+#[test]
+#[should_panic(expected = "double free")]
+fn double_free_across_caches() {
+  let h = heap();
+  let (a, b) = (cache(h), cache(h));
+  let x = h.alloc_cached(&a, 48, 8).unwrap().offset;
+  h.dealloc_cached(&a, x);
+  h.dealloc_cached(&b, x);
+  h.flush(&a);
+  h.flush(&b);
+}
+
+#[test]
+#[should_panic(expected = "double free")]
+fn free_of_a_claimed_block() {
+  let h = heap();
+  let tc = cache(h);
+  let a = h.alloc_cached(&tc, 48, 8).unwrap().offset;
+  // The next block of the word is claimed by the cache but not handed out.
+  h.dealloc_cached(&tc, a + 48);
+}
+
+#[test]
+fn refill_finds_freed_page_without_scanning() {
+  let h = heap();
+  // Fill many pages of one class, then free one block in an early page.
+  let per_page = PAGE_SIZE / 32;
+  let offs: Vec<_> = (0..per_page * 40).map(|_| alloc(h, 7, 32, 8)).collect();
+  let segs = h.segments_in_use();
+  free(h, offs[5]);
+  // The next allocation of the class takes the freed block from that page
+  // (found through the availability words) rather than a new page.
+  let again = alloc(h, 7, 32, 8);
+  assert_eq!(again, offs[5]);
+  assert_eq!(h.segments_in_use(), segs);
+  for o in offs.into_iter().filter(|&o| o != again).chain([again]) {
+    free(h, o);
+  }
+}
+
+#[test]
+fn cached_threads_with_cross_frees() {
+  let h = heap();
+  let threads = if cfg!(miri) { 2 } else { 8 };
+  let rounds = if cfg!(miri) { 50 } else { 20_000 };
+  let (tx, rx) = std::sync::mpsc::channel::<Vec<usize>>();
+  let rx = std::sync::Arc::new(Mutex::new(rx));
+  let done = AtomicBool::new(false);
+  std::thread::scope(|sc| {
+    let done = &done;
+    sc.spawn(move || {
+      while !done.load(Ordering::Relaxed) {
+        h.purge();
+        std::thread::yield_now();
+      }
+    });
+    // Stops the purger even when a worker panics, so a failure ends the
+    // test instead of leaving the scope waiting on the purge loop.
+    let _stop = SetOnDrop(done);
+    let mut workers = Vec::new();
+    for t in 0..threads {
+      let tx = tx.clone();
+      let rx = rx.clone();
+      workers.push(sc.spawn(move || {
+        let tc = cache(h);
+        let mut batch = Vec::new();
+        for i in 0..rounds {
+          let size = SIZES[(i * 7 + t) % 12];
+          batch.push(alloc_c(h, &tc, size, 8));
+          if batch.len() == 32 {
+            tx.send(std::mem::take(&mut batch)).unwrap();
+            let theirs = rx.lock().unwrap().try_recv();
+            if let Ok(v) = theirs {
+              for o in v {
+                free_c(h, &tc, o);
+              }
+            }
+          }
+        }
+        for o in batch {
+          free_c(h, &tc, o);
+        }
+        h.retire(&tc);
+      }));
+    }
+    for w in workers {
+      w.join().unwrap();
+    }
+  });
+  drop(tx);
+  for v in rx.lock().unwrap().iter() {
+    for o in v {
+      free(h, o);
+    }
+  }
+  assert!(h.os().live.lock().unwrap().is_empty());
+  // Everything went back: two passes return all pages and segments but
+  // the one each shard keeps.
+  h.purge();
+  h.purge();
+  assert_eq!(h.dirty_pages(), 0);
+}
+
+proptest::proptest! {
+    #![proptest_config(proptest::prelude::ProptestConfig::with_cases(if cfg!(miri) { 2 } else { 64 }))]
+    #[test]
+    fn random_cached_sequences(ops in proptest::collection::vec((0usize..20_000, 0u32..6, 0u8..5, 0usize..3), 1..400)) {
+        let h = heap();
+        let caches = [cache(h), cache(h), ThreadCache::new()];
+        let mut live = Vec::new();
+        for (size, align_shift, op, t) in ops {
+            let tc = &caches[t];
+            match op {
+                1 | 2 if !live.is_empty() => {
+                    let o = live.swap_remove(size % live.len());
+                    free_c(h, tc, o);
+                }
+                3 => h.flush(tc),
+                4 if size % 50 == 0 => h.purge(),
+                _ => live.push(alloc_c(h, tc, size % (1 << (align_shift * 3)), 1 << align_shift)),
+            }
+        }
+        for o in live {
+            free(h, o);
+        }
+        for tc in &caches {
+            h.retire(tc);
+        }
+    }
 }

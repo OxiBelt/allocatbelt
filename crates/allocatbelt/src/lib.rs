@@ -14,14 +14,13 @@
 #![cfg_attr(not(test), deny(clippy::expect_used, clippy::unwrap_used))]
 
 use std::alloc::{GlobalAlloc, Layout};
-use std::cell::Cell;
 use std::io::Write as _;
 use std::ptr::{self, NonNull};
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::AtomicU64;
 
 use allocatbelt_core::{
-  ARENA_SIZE, Block, Heap, MAX_SEGMENTS, META_WORDS, Os, SEGMENT_SIZE, SHARDS,
+  ARENA_SIZE, Block, Heap, MAX_SEGMENTS, META_WORDS, Os, SEGMENT_SIZE, ThreadCache,
 };
 use allocatbelt_sys::{MetaArena, Region};
 
@@ -104,26 +103,54 @@ impl Os for LinuxOs {
 
 static HEAP: Heap<LinuxOs> = Heap::new(LinuxOs);
 
-static NEXT_SHARD: AtomicUsize = AtomicUsize::new(0);
-
 std::thread_local! {
-    // `const`-initialised and without `Drop`: no lazy init, no destructor
-    // registration, so touching it never allocates or re-enters us.
-    static SHARD: Cell<usize> = const { Cell::new(usize::MAX) };
+    // `const`-initialised and without `Drop`: no lazy init and no destructor
+    // registration, so touching it never allocates or re-enters us, and it
+    // stays usable while other thread-local destructors run.
+    static CACHE: ThreadCache = const { ThreadCache::new() };
+    // Zero-sized, with a `Drop` that hands the cache back at thread exit.
+    // Touched once per thread, when the cache is attached.
+    static RETIRE: Retire = const { Retire };
 }
 
-fn shard_hint() -> usize {
-  SHARD
-    .try_with(|s| {
-      let v = s.get();
-      if v != usize::MAX {
-        return v;
-      }
-      let n = NEXT_SHARD.fetch_add(1, Ordering::Relaxed) % SHARDS;
-      s.set(n);
-      n
-    })
-    .unwrap_or(0)
+struct Retire;
+
+impl Drop for Retire {
+  fn drop(&mut self) {
+    let _ = CACHE.try_with(|tc| guarded(|| HEAP.retire(tc)));
+  }
+}
+
+/// Runs `f` with the calling thread's cache, attaching it first if needed.
+/// Falls back to a detached cache (the uncached paths) if the thread-local
+/// is unavailable.
+#[inline]
+fn with_cache<R>(f: impl FnOnce(&ThreadCache) -> R) -> R {
+  let mut f = Some(f);
+  let r = CACHE.try_with(|tc| {
+    if tc.is_detached() {
+      attach(tc);
+    }
+    f.take().map(|f| f(tc))
+  });
+  match r {
+    Ok(Some(r)) => r,
+    _ => match f {
+      Some(f) => f(&ThreadCache::new()),
+      None => LinuxOs.fatal("allocatbelt: cache callback lost"),
+    },
+  }
+}
+
+#[cold]
+fn attach(tc: &ThreadCache) {
+  // Registering the destructor may allocate (it does not go through us on
+  // glibc, but nothing guarantees that); until `attach` returns, such
+  // allocations take the uncached paths.
+  tc.begin_attach();
+  if RETIRE.try_with(|_| ()).is_ok() {
+    HEAP.attach(tc);
+  }
 }
 
 /// Aborts the process if dropped during unwinding: unwinding out of a
@@ -162,7 +189,7 @@ impl Allocatbelt {
     guarded(|| {
       let a = arena()?;
       let Block { offset, zeroed } =
-        HEAP.alloc_block(shard_hint(), layout.size(), layout.align())?;
+        with_cache(|tc| HEAP.alloc_cached(tc, layout.size(), layout.align()))?;
       Some((a.user.ptr(offset)?, zeroed))
     })
   }
@@ -176,9 +203,15 @@ impl Allocatbelt {
   /// Returns all freed-but-unpurged memory to the OS. Purging also happens
   /// automatically once the dirty budget is exceeded; call this from a
   /// maintenance task to shrink RSS promptly after load drops.
+  ///
+  /// Blocks cached by the calling thread are returned first; other
+  /// threads' caches (a few words per size class each) are not touched.
   pub fn purge(self) {
     if arena().is_some() {
-      guarded(|| HEAP.purge());
+      guarded(|| {
+        let _ = CACHE.try_with(|tc| HEAP.flush(tc));
+        HEAP.purge();
+      });
     }
   }
 
@@ -231,7 +264,10 @@ unsafe impl GlobalAlloc for Allocatbelt {
 
   #[expect(unsafe_code, reason = "GlobalAlloc method")]
   unsafe fn dealloc(&self, ptr: *mut u8, _layout: Layout) {
-    guarded(|| HEAP.dealloc(offset_of(ptr)));
+    guarded(|| {
+      let off = offset_of(ptr);
+      with_cache(|tc| HEAP.dealloc_cached(tc, off));
+    });
   }
 
   #[expect(unsafe_code, reason = "GlobalAlloc method")]
@@ -257,7 +293,7 @@ unsafe impl GlobalAlloc for Allocatbelt {
     unsafe {
       ptr::copy_nonoverlapping(ptr, new.as_ptr(), layout.size().min(new_size));
     }
-    guarded(|| HEAP.dealloc(off));
+    guarded(|| with_cache(|tc| HEAP.dealloc_cached(tc, off)));
     new.as_ptr()
   }
 }

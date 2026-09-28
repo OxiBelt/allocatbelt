@@ -1,4 +1,5 @@
-//! The heap: segment allocation, page runs, small-object bitmaps and frees.
+//! The heap: segment allocation, page runs, small-object bitmaps, per-thread
+//! caches and frees.
 //!
 //! Metadata layout (all `AtomicU64`, one slice of [`META_WORDS`] per segment):
 //!
@@ -9,20 +10,37 @@
 //! [3] SEG_DIRTY  free pages whose memory has not been purged yet; while
 //!                the segment is not owned, non-zero if its memory may hold
 //!                non-zero bytes
+//! [4..8]         reserved
+//! [SEG_CLS + c]    small pages of class c (changed under the shard lock)
+//! [SEG_AVAIL + c]  pages of class c that may have free blocks
 //! then per page (PAGE_META_WORDS each):
-//!   [0] P_INFO   kind | class << 8 | run length << 16
-//!   [1] P_FREE   number of set bits in the bitmap (may transiently lag)
-//!   [2] P_NEXT   next page of the same class in the shard (index + 1)
+//!   [0] P_INFO     kind | class << 8 | run length << 16
+//!   [1] P_FREE     number of set bits in the bitmap (may transiently lag)
+//!   [2] P_SUMMARY  small pages: bitmap words that may be non-zero
 //!   [3] reserved
-//!   [4..68]      free bitmap (1 = free block)
+//!   [4..68]        free bitmap (1 = free block)
 //! ```
 //!
-//! Locking: each shard has a spin lock that serialises *allocation* from its
-//! pages. Frees never take a lock: a small free is one `fetch_or` on the
-//! bitmap plus a `fetch_add` on the page's free counter, and a large free is a
-//! compare-exchange on the page header and a `fetch_and` on the segment's page
-//! bitmap. Only the owning shard (under its lock) hands out bits, and only it
-//! recycles a page, which it does solely when every block of the page is free.
+//! Small objects: a thread allocates from a [`ThreadCache`] that holds one
+//! claimed bitmap word per size class, so the fast path is a bit pop on
+//! thread-local `Cell`s with no atomics and no lock. When the word runs out,
+//! the thread takes its shard's lock and claims the next word of the shard's
+//! current page for that class. Finding that word and page goes through two
+//! levels of summaries (page summary word, then the segment's per-class
+//! availability word), each a `trailing_zeros`, rather than a scan of pages.
+//! The protocols that keep the summaries exact in the face of racing frees
+//! are in [`crate::proto`].
+//!
+//! Frees never take a lock. A thread with a cache buffers the freed bit in a
+//! small direct-mapped table keyed by (page, bitmap word); the buffer is
+//! flushed with one `fetch_or` per word, so a burst of frees into the same
+//! word costs one read-modify-write. Every free, buffered or not, reaches the
+//! shared bitmap through `fetch_or` before its block can be handed out again,
+//! and the bit value returned there detects double frees. A large free is a
+//! compare-exchange on the page header and a `fetch_and` on the segment's
+//! page bitmap. Only the owning shard (under its lock) hands out bits, and
+//! only it recycles a page, which it does solely when every block of the page
+//! is free.
 //!
 //! Purging is deferred: freed page runs are only marked dirty. Once more than
 //! [`DIRTY_BUDGET_PAGES`] pages are dirty, the freeing thread claims the dirty
@@ -39,11 +57,13 @@
 //! such memory, so a page run or segment run claimed without dirty pages is
 //! reported as zeroed ([`Block::zeroed`]) and `calloc` can skip the memset.
 
-use core::sync::atomic::{AtomicIsize, AtomicU32, AtomicU64, Ordering};
+use core::cell::Cell;
+use core::sync::atomic::{AtomicIsize, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
-use crate::bits::{find_run_aligned, run_mask};
+use crate::bits::run_mask;
 use crate::class::{self, MIN_ALIGN, NUM_CLASSES, SMALL_MAX};
 use crate::lock::SpinLock;
+use crate::proto;
 use crate::{
   ARENA_SIZE, MAX_ALIGN, MAX_SEGMENTS, PAGE_META_WORDS, PAGE_SHIFT, PAGE_SIZE, PAGES_PER_SEGMENT,
   SEGMENT_HEADER_WORDS, SEGMENT_SHIFT, SEGMENT_SIZE, SHARDS,
@@ -89,6 +109,10 @@ const SEG_HDR: usize = 0;
 const SEG_PAGES: usize = 1;
 const SEG_NEXT: usize = 2;
 const SEG_DIRTY: usize = 3;
+const SEG_CLS: usize = 8;
+const SEG_AVAIL: usize = SEG_CLS + NUM_CLASSES;
+
+const _: () = assert!(SEG_AVAIL + NUM_CLASSES == SEGMENT_HEADER_WORDS);
 
 const SEG_FREE: u64 = 0;
 const SEG_OWNED: u64 = 1;
@@ -97,7 +121,7 @@ const SEG_HUGE_TAIL: u64 = 3;
 
 const P_INFO: usize = 0;
 const P_FREE: usize = 1;
-const P_NEXT: usize = 2;
+const P_SUMMARY: usize = 2;
 const P_BITMAP: usize = 4;
 
 const PAGE_FREE: u64 = 0;
@@ -110,22 +134,20 @@ pub const DIRTY_BUDGET_PAGES: isize = 512;
 /// Shards tried with `try_lock` before blocking on the preferred one.
 const SHARD_PROBES: usize = 4;
 
+const INVALID_FREE: &str = "allocatbelt: invalid or double free (pointer is not allocated)";
+const DOUBLE_FREE: &str = "allocatbelt: double free detected";
+
 #[derive(Debug)]
 struct ClassState {
-  /// `(page + 1) << 32 | next bitmap word to scan`; 0 when there is no page.
+  /// Page (+ 1) this shard currently claims words of this class from; 0
+  /// when there is none.
   cursor: AtomicU64,
-  /// Free blocks claimed from bitmap word `next - 1` of the cursor page.
-  bits: AtomicU64,
-  /// Head of this shard's list of pages of this class (page + 1).
-  head: AtomicU32,
 }
 
 impl ClassState {
   const fn new() -> Self {
     Self {
       cursor: AtomicU64::new(0),
-      bits: AtomicU64::new(0),
-      head: AtomicU32::new(0),
     }
   }
 }
@@ -149,16 +171,129 @@ impl Shard {
   }
 }
 
-const fn pack(page: usize, next: usize) -> u64 {
-  ((page as u64 + 1) << 32) | next as u64
+// ---- per-thread cache ----------------------------------------------------
+
+/// Direct-mapped slots of buffered frees per thread.
+const FREE_SLOTS: usize = 64;
+
+const DETACHED: u8 = 0;
+const ATTACHING: u8 = 1;
+const ATTACHED: u8 = 2;
+const RETIRED: u8 = 3;
+
+/// Free blocks of one bitmap word, claimed by a thread.
+#[derive(Debug)]
+struct CachedWord {
+  /// Arena offset of the word's first block.
+  base: Cell<usize>,
+  /// Claimed free blocks (bit `i` is block `base + i * size`).
+  bits: Cell<u64>,
 }
 
-const fn unpack(cursor: u64) -> (usize, usize) {
+/// Freed blocks of one bitmap word, not yet returned to the bitmap.
+#[derive(Debug)]
+struct FreeSlot {
+  /// [`slot_key`] of the word, or 0 when the slot is empty.
+  key: Cell<u64>,
+  mask: Cell<u64>,
+}
+
+/// Packs a (page, bitmap word, class) triple; never zero.
+const fn slot_key(page: usize, w: usize, c: usize) -> u64 {
+  1 << 63 | (page as u64) << 11 | (w as u64) << 5 | c as u64
+}
+
+const fn unpack_key(key: u64) -> (usize, usize, usize) {
   (
-    ((cursor >> 32) - 1) as usize,
-    (cursor & 0xFFFF_FFFF) as usize,
+    ((key >> 11) & ((1 << 52) - 1)) as usize,
+    ((key >> 5) & 63) as usize,
+    (key & 31) as usize,
   )
 }
+
+const _: () = assert!(NUM_CLASSES <= 32);
+
+#[inline]
+const fn slot_index(page: usize, w: usize) -> usize {
+  ((((page << 6) | w) as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 58) as usize
+}
+
+const _: () = assert!(FREE_SLOTS == 64);
+
+/// A thread's private allocation state: one claimed bitmap word per size
+/// class, and a small buffer of frees not yet returned to the bitmaps.
+///
+/// It is built from `Cell`s, so it is `!Sync` and needs no `unsafe`: the
+/// embedder keeps one per thread (a `const`-initialised thread local without
+/// `Drop`) and passes it to [`Heap::alloc_cached`] and
+/// [`Heap::dealloc_cached`]. Blocks held in a cache are unavailable to other
+/// threads, so the embedder must hand the cache back with [`Heap::retire`]
+/// when the thread exits.
+///
+/// A new cache is *detached* and every call through it takes the shared
+/// (uncached) paths. [`Heap::attach`] enables caching; the embedder calls
+/// [`ThreadCache::begin_attach`] first, so allocations made while it
+/// registers its thread-exit hook bypass the cache too.
+#[derive(Debug)]
+pub struct ThreadCache {
+  words: [CachedWord; NUM_CLASSES],
+  frees: [FreeSlot; FREE_SLOTS],
+  /// Occupied free slots per class (bit `i` = `frees[i]`).
+  pending: [Cell<u64>; NUM_CLASSES],
+  shard: Cell<usize>,
+  state: Cell<u8>,
+}
+
+impl ThreadCache {
+  /// A detached, empty cache.
+  #[must_use]
+  pub const fn new() -> Self {
+    Self {
+      words: [const {
+        CachedWord {
+          base: Cell::new(0),
+          bits: Cell::new(0),
+        }
+      }; NUM_CLASSES],
+      frees: [const {
+        FreeSlot {
+          key: Cell::new(0),
+          mask: Cell::new(0),
+        }
+      }; FREE_SLOTS],
+      pending: [const { Cell::new(0) }; NUM_CLASSES],
+      shard: Cell::new(0),
+      state: Cell::new(DETACHED),
+    }
+  }
+
+  /// Whether the cache still has to be attached (see [`Heap::attach`]).
+  #[must_use]
+  pub fn is_detached(&self) -> bool {
+    self.state.get() == DETACHED
+  }
+
+  /// Marks the cache as being attached. Until [`Heap::attach`], calls
+  /// through it take the uncached paths, so the embedder may allocate while
+  /// it sets up the thread-exit hook.
+  pub fn begin_attach(&self) {
+    if self.state.get() == DETACHED {
+      self.state.set(ATTACHING);
+    }
+  }
+
+  fn is_attached(&self) -> bool {
+    self.state.get() == ATTACHED
+  }
+}
+
+impl Default for ThreadCache {
+  fn default() -> Self {
+    Self::new()
+  }
+}
+
+// ---- blocks and metadata views -------------------------------------------
 
 /// A fresh allocation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -175,12 +310,22 @@ impl Block {
   }
 }
 
+/// How a request is served.
+enum Kind {
+  /// A block of size class `c`.
+  Small(usize),
+  /// A run of `n` pages starting at a multiple of `step` pages.
+  Run(usize, usize),
+  /// A run of `k` whole segments.
+  Huge(usize),
+}
+
 /// What an allocated offset refers to.
 enum Target<'a> {
-  /// A class block `in_page` bytes into its page.
+  /// A class block `in_page` bytes into `page`.
   Small {
     in_page: usize,
-    pm: PageMeta<'a>,
+    page: usize,
     c: usize,
   },
   /// A page run starting at `page`.
@@ -213,11 +358,14 @@ impl<'a> PageMeta<'a> {
   fn free(self) -> &'a AtomicU64 {
     &self.0[P_FREE]
   }
-  fn next(self) -> &'a AtomicU64 {
-    &self.0[P_NEXT]
+  fn summary(self) -> &'a AtomicU64 {
+    &self.0[P_SUMMARY]
   }
   fn bitmap(self, w: usize) -> &'a AtomicU64 {
     &self.0[P_BITMAP + w]
+  }
+  fn bitmaps(self) -> &'a [AtomicU64] {
+    &self.0[P_BITMAP..]
   }
 }
 
@@ -233,6 +381,8 @@ pub struct Heap<O> {
   /// Owned segments found empty (and not kept) by the last purge pass.
   /// Only touched under `purge_lock`.
   seg_idle: [AtomicU64; MAX_SEGMENTS / 64],
+  /// Round-robin shard assignment for attached thread caches.
+  next_shard: AtomicUsize,
   shards: [Shard; SHARDS],
 }
 
@@ -246,6 +396,7 @@ impl<O: Os> Heap<O> {
       dirty_pages: AtomicIsize::new(0),
       purge_lock: SpinLock::new(),
       seg_idle: [const { AtomicU64::new(0) }; MAX_SEGMENTS / 64],
+      next_shard: AtomicUsize::new(0),
       shards: [const { Shard::new() }; SHARDS],
     }
   }
@@ -253,6 +404,25 @@ impl<O: Os> Heap<O> {
   /// The environment this heap runs on.
   pub const fn os(&self) -> &O {
     &self.os
+  }
+
+  fn kind(size: usize, align: usize) -> Option<Kind> {
+    if !align.is_power_of_two() || align > MAX_ALIGN || size > ARENA_SIZE / 2 {
+      return None;
+    }
+    if align <= MIN_ALIGN && size <= SMALL_MAX {
+      return Some(Kind::Small(class::class_of(size)));
+    }
+    if let Some(c) = class::class_for(size, align) {
+      return Some(Kind::Small(c));
+    }
+    let n = size.div_ceil(PAGE_SIZE).max(1);
+    if n <= PAGES_PER_SEGMENT {
+      // Alignments above a page place the run at a multiple of
+      // `align / PAGE_SIZE` pages; the segment itself is aligned.
+      return Some(Kind::Run(n, (align / PAGE_SIZE).max(1)));
+    }
+    Some(Kind::Huge(size.div_ceil(SEGMENT_SIZE).max(1)))
   }
 
   /// Allocates `size` bytes aligned to `align` and returns the arena offset.
@@ -266,38 +436,165 @@ impl<O: Os> Heap<O> {
 
   /// As [`Heap::alloc`], but also reports whether the block is known to
   /// read as zero, so a zeroing allocation can skip clearing it.
+  ///
+  /// This is the uncached path: a small allocation claims a bitmap word
+  /// under the shard lock and returns the blocks it does not use.
   pub fn alloc_block(&self, shard_hint: usize, size: usize, align: usize) -> Option<Block> {
-    if !align.is_power_of_two() || align > MAX_ALIGN || size > ARENA_SIZE / 2 {
+    match Self::kind(size, align)? {
+      Kind::Small(c) => self
+        .alloc_small(shard_hint, c)
+        .map(|o| Block::new(o, false)),
+      Kind::Run(n, step) => self.alloc_large(shard_hint, n, step),
+      Kind::Huge(k) => self.alloc_huge(k),
+    }
+  }
+
+  /// Allocates through the calling thread's cache. Small blocks come from
+  /// the cache without atomics; everything else, and every call through a
+  /// cache that is not attached, behaves like [`Heap::alloc_block`].
+  #[inline]
+  pub fn alloc_cached(&self, tc: &ThreadCache, size: usize, align: usize) -> Option<Block> {
+    if align <= MIN_ALIGN && size <= SMALL_MAX && tc.is_attached() {
+      let c = class::class_of(size);
+      if let Some(o) = Self::pop(tc, c) {
+        return Some(Block::new(o, false));
+      }
+      return self.refill(tc, c).map(|o| Block::new(o, false));
+    }
+    self.alloc_cached_slow(tc, size, align)
+  }
+
+  fn alloc_cached_slow(&self, tc: &ThreadCache, size: usize, align: usize) -> Option<Block> {
+    if !tc.is_attached() {
+      return self.alloc_block(tc.shard.get(), size, align);
+    }
+    match Self::kind(size, align)? {
+      Kind::Small(c) => Self::pop(tc, c)
+        .or_else(|| self.refill(tc, c))
+        .map(|o| Block::new(o, false)),
+      Kind::Run(n, step) => self.alloc_large(tc.shard.get(), n, step),
+      Kind::Huge(k) => self.alloc_huge(k),
+    }
+  }
+
+  /// Takes a free block of class `c` from the thread's claimed word.
+  #[inline(always)]
+  fn pop(tc: &ThreadCache, c: usize) -> Option<usize> {
+    let cw = &tc.words[c];
+    let bits = cw.bits.get();
+    if bits == 0 {
       return None;
     }
-    if align <= MIN_ALIGN && size <= SMALL_MAX {
-      return self
-        .alloc_small(shard_hint, class::class_of(size))
-        .map(|o| Block::new(o, false));
+    let i = bits.trailing_zeros();
+    cw.bits.set(bits & (bits - 1));
+    Some(cw.base.get() + i as usize * class::size(c))
+  }
+
+  /// Claims a new word of class `c` for the thread and pops from it.
+  #[inline(never)]
+  fn refill(&self, tc: &ThreadCache, c: usize) -> Option<usize> {
+    // Frees the thread has buffered stay buffered (and keep batching)
+    // while the class has free blocks elsewhere; before a new page is
+    // taken for the class, they go back so the claim can reuse them.
+    let grow = tc.pending[c].get() == 0;
+    let hint = tc.shard.get();
+    let (page, w, bits) =
+      match self.with_shard(hint, |s, sh| self.claim_class_word(s, sh, c, grow))? {
+        Some(claim) => claim,
+        None => {
+          self.flush_class(tc, c);
+          self.with_shard(hint, |s, sh| self.claim_class_word(s, sh, c, true))??
+        }
+      };
+    let cw = &tc.words[c];
+    cw.base
+      .set((page << PAGE_SHIFT) + w as usize * 64 * class::size(c));
+    cw.bits.set(bits);
+    Self::pop(tc, c)
+  }
+
+  /// Enables caching for `tc`. The embedder must arrange for
+  /// [`Heap::retire`] to run when the thread exits, before calling this.
+  pub fn attach(&self, tc: &ThreadCache) {
+    if tc.state.get() == RETIRED {
+      return;
     }
-    if let Some(c) = class::class_for(size, align) {
-      return self
-        .alloc_small(shard_hint, c)
-        .map(|o| Block::new(o, false));
+    tc.shard.set(self.next_shard.fetch_add(1, Relaxed) % SHARDS);
+    tc.state.set(ATTACHED);
+  }
+
+  /// Returns every block held by `tc` (claimed or freed) to the shared
+  /// bitmaps. The cache stays usable.
+  pub fn flush(&self, tc: &ThreadCache) {
+    for i in 0..FREE_SLOTS {
+      self.flush_slot(tc, i);
     }
-    if size <= SEGMENT_SIZE {
-      // Alignments above a page place the run at a multiple of
-      // `align / PAGE_SIZE` pages; the segment itself is aligned.
-      let n = size.div_ceil(PAGE_SIZE).max(1);
-      let step = (align / PAGE_SIZE).max(1);
-      return self.alloc_large(shard_hint, n, step);
+    for (c, cw) in tc.words.iter().enumerate() {
+      let bits = cw.bits.replace(0);
+      if bits != 0 {
+        let base = cw.base.get();
+        let w = base % PAGE_SIZE / (64 * class::size(c));
+        self.free_bits(base >> PAGE_SHIFT, c, w, bits);
+      }
     }
-    self.alloc_huge(size.div_ceil(SEGMENT_SIZE).max(1))
+  }
+
+  /// Flushes `tc` and stops caching in it for good: later calls through it
+  /// take the uncached paths. For thread exit, where thread-local
+  /// destructors that run afterwards may still allocate and free.
+  pub fn retire(&self, tc: &ThreadCache) {
+    tc.state.set(RETIRED);
+    self.flush(tc);
   }
 
   /// Frees the allocation at `offset`. Invalid and double frees are reported
   /// through [`Os::fatal`].
   pub fn dealloc(&self, offset: usize) {
-    match self.block(
-      offset,
-      "allocatbelt: invalid or double free (pointer is not allocated)",
-    ) {
-      Target::Small { in_page, pm, c } => self.free_small(in_page, pm, c),
+    match self.block(offset, INVALID_FREE) {
+      Target::Small { in_page, page, c } => {
+        let (w, bit) = self.block_bit(in_page, c);
+        self.free_bits(page, c, w, bit);
+      }
+      Target::Large { page, m, pm, info } => self.free_large(page, m, pm, info),
+      Target::Huge { seg, m, hdr } => self.free_huge(seg, m, hdr),
+    }
+  }
+
+  /// Frees the allocation at `offset` through the calling thread's cache:
+  /// small blocks are buffered and returned in batches.
+  #[inline]
+  pub fn dealloc_cached(&self, tc: &ThreadCache, offset: usize) {
+    // Fast path: a small block freed into an attached cache.
+    if offset < ARENA_SIZE
+      && tc.is_attached()
+      && let Some(m) = self.os.meta(offset >> SEGMENT_SHIFT)
+      && m[SEG_HDR].load(Acquire) & 0xFF == SEG_OWNED
+    {
+      let page = offset >> PAGE_SHIFT;
+      let info =
+        m[SEGMENT_HEADER_WORDS + page % PAGES_PER_SEGMENT * PAGE_META_WORDS + P_INFO].load(Acquire);
+      if info & 0xFF == PAGE_SMALL {
+        let c = ((info >> 8) & 0xFF) as usize;
+        if let Some(idx) = class::block_index(c, offset % PAGE_SIZE) {
+          self.buffer_free(tc, page, c, idx / 64, 1 << (idx % 64));
+          return;
+        }
+      }
+    }
+    self.dealloc_cached_slow(tc, offset);
+  }
+
+  #[inline(never)]
+  fn dealloc_cached_slow(&self, tc: &ThreadCache, offset: usize) {
+    match self.block(offset, INVALID_FREE) {
+      Target::Small { in_page, page, c } => {
+        let (w, bit) = self.block_bit(in_page, c);
+        if tc.is_attached() {
+          self.buffer_free(tc, page, c, w, bit);
+        } else {
+          self.free_bits(page, c, w, bit);
+        }
+      }
       Target::Large { page, m, pm, info } => self.free_large(page, m, pm, info),
       Target::Huge { seg, m, hdr } => self.free_huge(seg, m, hdr),
     }
@@ -334,10 +631,10 @@ impl<O: Os> Heap<O> {
       }
       Target::Large { page, m, pm, info } => {
         let n = ((info >> 16) & 0xFF) as usize;
-        if new_size > SEGMENT_SIZE {
+        let n2 = new_size.div_ceil(PAGE_SIZE).max(1);
+        if n2 > PAGES_PER_SEGMENT {
           return false;
         }
-        let n2 = new_size.div_ceil(PAGE_SIZE).max(1);
         if n2 > n {
           return self.grow_large(page, m, pm, n, n2);
         }
@@ -381,7 +678,7 @@ impl<O: Os> Heap<O> {
         match info & 0xFF {
           PAGE_SMALL => Target::Small {
             in_page: offset % PAGE_SIZE,
-            pm,
+            page,
             c: ((info >> 8) & 0xFF) as usize,
           },
           PAGE_LARGE if offset.is_multiple_of(PAGE_SIZE) => Target::Large { page, m, pm, info },
@@ -428,13 +725,6 @@ impl<O: Os> Heap<O> {
     }
   }
 
-  fn page_meta(&self, page: usize) -> PageMeta<'_> {
-    PageMeta::new(
-      self.seg_meta(page / PAGES_PER_SEGMENT),
-      page % PAGES_PER_SEGMENT,
-    )
-  }
-
   /// Runs `f` with a locked shard, preferring `hint` and probing a few
   /// neighbours before blocking so that threads sharing a shard rarely spin.
   fn with_shard<R>(&self, hint: usize, f: impl FnOnce(usize, &Shard) -> R) -> R {
@@ -451,116 +741,117 @@ impl<O: Os> Heap<O> {
 
   // ---- small objects -------------------------------------------------
 
+  /// Uncached small allocation: claims a word, keeps one block and gives
+  /// the rest back.
   fn alloc_small(&self, hint: usize, c: usize) -> Option<usize> {
-    self.with_shard(hint, |s, sh| self.alloc_small_locked(s, sh, c))
+    let (page, w, bits) =
+      self.with_shard(hint, |s, sh| self.claim_class_word(s, sh, c, true))??;
+    let i = bits.trailing_zeros() as usize;
+    let rest = bits & (bits - 1);
+    if rest != 0 {
+      self.free_bits(page, c, w as usize, rest);
+    }
+    Some((page << PAGE_SHIFT) + (w as usize * 64 + i) * class::size(c))
   }
 
-  fn alloc_small_locked(&self, s: usize, sh: &Shard, c: usize) -> Option<usize> {
+  /// Claims the free blocks of one bitmap word of class `c`: from the
+  /// shard's current page, else from another page of the class that has
+  /// free blocks, else, if `grow`, from a new page. Returns `Some(None)`
+  /// when a new page would be needed but `grow` is false, and `None` when
+  /// out of memory. Caller holds the shard lock.
+  fn claim_class_word(
+    &self,
+    s: usize,
+    sh: &Shard,
+    c: usize,
+    grow: bool,
+  ) -> Option<Option<(usize, u32, u64)>> {
     let cs = &sh.classes[c];
-    let size = class::size(c);
-    'refill: loop {
-      let bits = cs.bits.load(Relaxed);
-      let cursor = cs.cursor.load(Relaxed);
-      if bits != 0 {
-        cs.bits.store(bits & (bits - 1), Relaxed);
-        let (page, next) = unpack(cursor);
-        let idx = (next - 1) * 64 + bits.trailing_zeros() as usize;
-        return Some((page << PAGE_SHIFT) + idx * size);
-      }
-      if cursor != 0 {
-        let (page, mut next) = unpack(cursor);
-        let pm = self.page_meta(page);
-        while next < class::bitmap_words(c) {
-          // Claim a whole word: later pops need no atomics.
-          let b = pm.bitmap(next).swap(0, Acquire);
-          next += 1;
-          if b != 0 {
-            pm.free().fetch_sub(u64::from(b.count_ones()), Relaxed);
-            cs.cursor.store(pack(page, next), Relaxed);
-            cs.bits.store(b, Relaxed);
-            continue 'refill;
-          }
+    loop {
+      let cur = cs.cursor.load(Relaxed);
+      if cur != 0 {
+        let page = cur as usize - 1;
+        let (m, in_seg) = (
+          self.seg_meta(page / PAGES_PER_SEGMENT),
+          page % PAGES_PER_SEGMENT,
+        );
+        let pm = PageMeta::new(m, in_seg);
+        let words = &pm.bitmaps()[..class::bitmap_words(c)];
+        if let Some((w, bits)) = proto::claim_word(pm.summary(), words, 0) {
+          pm.free().fetch_sub(u64::from(bits.count_ones()), Relaxed);
+          return Some(Some((page, w, bits)));
+        }
+        if !proto::retire_page(&m[SEG_AVAIL + c], 1 << in_seg, pm.summary()) {
+          continue;
         }
         cs.cursor.store(0, Relaxed);
       }
-      let page = match self.find_page(cs, c) {
+      let page = match self.find_page(sh, c) {
         Some(p) => p,
-        None => self.new_small_page(s, sh, cs, c)?,
+        None if !grow => return Some(None),
+        None => self.new_small_page(s, sh, c)?,
       };
-      cs.cursor.store(pack(page, 0), Relaxed);
+      cs.cursor.store(page as u64 + 1, Relaxed);
     }
   }
 
-  /// Finds a page of class `c` with free blocks and recycles surplus pages
-  /// whose blocks are all free.
-  fn find_page(&self, cs: &ClassState, c: usize) -> Option<usize> {
-    let cap = class::capacity(c) as i64;
-    let mut prev: Option<usize> = None;
-    let mut cur = cs.head.load(Relaxed);
-    let mut found = None;
+  /// Finds a page of class `c` with free blocks among the shard's
+  /// segments, through their availability words. Caller holds the lock.
+  fn find_page(&self, sh: &Shard, c: usize) -> Option<usize> {
+    let mut cur = sh.segs.load(Relaxed);
     while cur != 0 {
-      let p = cur as usize - 1;
-      let pm = self.page_meta(p);
-      let next = pm.next().load(Relaxed) as u32;
-      // Frees set the bit before bumping the counter, so the counter
-      // never overstates the set bits once our own claims are
-      // subtracted. It can transiently read low (even negative).
-      let free = pm.free().load(Acquire) as i64;
-      if free >= cap && found.is_some() {
-        self.unlink_and_release(cs, prev, p, pm);
-        cur = next;
-        continue;
+      let seg = cur as usize - 1;
+      let m = self.seg_meta(seg);
+      let mut cand = m[SEG_AVAIL + c].load(Acquire) & m[SEG_CLS + c].load(Relaxed);
+      while cand != 0 {
+        let i = cand.trailing_zeros() as usize;
+        cand &= cand - 1;
+        let summary = PageMeta::new(m, i).summary();
+        // A stale availability bit is dropped here, unless a free
+        // refills the page meanwhile.
+        if summary.load(Acquire) != 0 || !proto::retire_page(&m[SEG_AVAIL + c], 1 << i, summary) {
+          return Some(seg * PAGES_PER_SEGMENT + i);
+        }
       }
-      if free > 0 && found.is_none() {
-        found = Some(p);
-      }
-      prev = Some(p);
-      cur = next;
+      cur = m[SEG_NEXT].load(Relaxed) as u32;
     }
-    found
+    None
   }
 
   /// Releases every page of class `c` whose blocks are all free. Caller
   /// holds the shard lock.
-  fn release_empty_pages(&self, cs: &ClassState, c: usize) {
-    // Without claimed bits the cursor is only a scan position; dropping
-    // it makes the next allocation start from the list.
-    if cs.bits.load(Relaxed) == 0 {
-      cs.cursor.store(0, Relaxed);
-    }
-    let cursor = cs.cursor.load(Relaxed);
-    let cursor_page = (cursor != 0).then(|| unpack(cursor).0);
+  fn release_empty_pages(&self, sh: &Shard, c: usize) {
+    // The cursor is only a scan position; dropping it makes the next
+    // claim start from the availability words.
+    sh.classes[c].cursor.store(0, Relaxed);
     let cap = class::capacity(c) as i64;
-    let mut prev: Option<usize> = None;
-    let mut cur = cs.head.load(Relaxed);
+    let mut cur = sh.segs.load(Relaxed);
     while cur != 0 {
-      let p = cur as usize - 1;
-      let pm = self.page_meta(p);
-      let next = pm.next().load(Relaxed) as u32;
-      if Some(p) != cursor_page && pm.free().load(Acquire) as i64 >= cap {
-        self.unlink_and_release(cs, prev, p, pm);
-      } else {
-        prev = Some(p);
+      let seg = cur as usize - 1;
+      let m = self.seg_meta(seg);
+      let mut pages = m[SEG_CLS + c].load(Relaxed);
+      while pages != 0 {
+        let i = pages.trailing_zeros() as usize;
+        pages &= pages - 1;
+        // Frees set bits before bumping the counter, and our own
+        // claims are subtracted under this lock, so the counter never
+        // overstates the free blocks here.
+        if PageMeta::new(m, i).free().load(Acquire) as i64 >= cap {
+          self.release_small_page(seg * PAGES_PER_SEGMENT + i, m, c);
+        }
       }
-      cur = next;
+      cur = m[SEG_NEXT].load(Relaxed) as u32;
     }
   }
 
-  /// Unlinks page `p` (preceded by `prev`) from its class list and returns
-  /// it to its segment.
-  fn unlink_and_release(&self, cs: &ClassState, prev: Option<usize>, p: usize, pm: PageMeta<'_>) {
-    let next = pm.next().load(Relaxed);
-    match prev {
-      None => cs.head.store(next as u32, Relaxed),
-      Some(q) => self.page_meta(q).next().store(next, Relaxed),
-    }
-    self.release_small_page(p, pm);
-  }
-
-  fn new_small_page(&self, s: usize, sh: &Shard, cs: &ClassState, c: usize) -> Option<usize> {
+  fn new_small_page(&self, s: usize, sh: &Shard, c: usize) -> Option<usize> {
     let (p, _) = self.alloc_pages(s, sh, 1, 1)?;
-    let pm = self.page_meta(p);
+    let (m, in_seg) = (self.seg_meta(p / PAGES_PER_SEGMENT), p % PAGES_PER_SEGMENT);
+    let pm = PageMeta::new(m, in_seg);
     let cap = class::capacity(c);
+    let words = class::bitmap_words(c);
+    // Words past the class's range are zeroed too: a free of the page's
+    // previous life may still set a stale summary bit for one of them.
     for w in 0..class::MAX_BITMAP_WORDS {
       let v = if (w + 1) * 64 <= cap {
         u64::MAX
@@ -572,30 +863,106 @@ impl<O: Os> Heap<O> {
       pm.bitmap(w).store(v, Relaxed);
     }
     pm.free().store(cap as u64, Relaxed);
-    pm.next().store(u64::from(cs.head.load(Relaxed)), Relaxed);
+    pm.summary().store(run_mask(0, words as u32), Relaxed);
     pm.info().store(PAGE_SMALL | (c as u64) << 8, Release);
-    cs.head.store(p as u32 + 1, Relaxed);
+    m[SEG_CLS + c].fetch_or(1 << in_seg, Relaxed);
+    m[SEG_AVAIL + c].fetch_or(1 << in_seg, AcqRel);
     Some(p)
   }
 
-  fn release_small_page(&self, page: usize, pm: PageMeta<'_>) {
-    pm.info().store(PAGE_FREE, Release);
+  /// Returns a small page whose blocks are all free to its segment. Caller
+  /// holds the owning shard's lock.
+  fn release_small_page(&self, page: usize, m: &[AtomicU64], c: usize) {
+    let in_seg = page % PAGES_PER_SEGMENT;
+    m[SEG_CLS + c].fetch_and(!(1 << in_seg), Relaxed);
+    m[SEG_AVAIL + c].fetch_and(!(1 << in_seg), AcqRel);
+    PageMeta::new(m, in_seg).info().store(PAGE_FREE, Release);
     self.release_pages(page, 1);
   }
 
-  fn free_small(&self, in_page: usize, pm: PageMeta<'_>, c: usize) {
-    let size = class::size(c);
-    let idx = in_page / size;
-    if !in_page.is_multiple_of(size) || idx >= class::capacity(c) {
-      self
+  /// Bitmap word and bit of the class-`c` block `in_page` bytes into its
+  /// page, or a fatal error if no block starts there.
+  fn block_bit(&self, in_page: usize, c: usize) -> (usize, u64) {
+    match class::block_index(c, in_page) {
+      Some(idx) => (idx / 64, 1u64 << (idx % 64)),
+      None => self
         .os
-        .fatal("allocatbelt: free of a misaligned small pointer");
+        .fatal("allocatbelt: free of a misaligned small pointer"),
     }
-    let bit = 1u64 << (idx % 64);
-    if pm.bitmap(idx / 64).fetch_or(bit, Release) & bit != 0 {
-      self.os.fatal("allocatbelt: double free detected");
+  }
+
+  /// Returns the blocks `mask` of bitmap word `w` of small page `page`
+  /// (class `c`) to the shared bitmap.
+  fn free_bits(&self, page: usize, c: usize, w: usize, mask: u64) {
+    let (m, in_seg) = (
+      self.seg_meta(page / PAGES_PER_SEGMENT),
+      page % PAGES_PER_SEGMENT,
+    );
+    let pm = PageMeta::new(m, in_seg);
+    if !proto::release_blocks(
+      pm.bitmap(w),
+      pm.free(),
+      pm.summary(),
+      &m[SEG_AVAIL + c],
+      w as u32,
+      1 << in_seg,
+      mask,
+    ) {
+      self.os.fatal(DOUBLE_FREE);
     }
-    pm.free().fetch_add(1, Release);
+  }
+
+  /// Records a small free in the thread's buffer.
+  #[inline(always)]
+  fn buffer_free(&self, tc: &ThreadCache, page: usize, c: usize, w: usize, bit: u64) {
+    let cw = &tc.words[c];
+    // A block the thread claimed but has not handed out cannot be freed.
+    if cw.bits.get() & bit != 0 && cw.base.get() == (page << PAGE_SHIFT) + w * 64 * class::size(c) {
+      self.os.fatal(DOUBLE_FREE);
+    }
+    let key = slot_key(page, w, c);
+    let i = slot_index(page, w);
+    let slot = &tc.frees[i];
+    if slot.key.get() == key {
+      let m = slot.mask.get();
+      if m & bit != 0 {
+        self.os.fatal(DOUBLE_FREE);
+      }
+      slot.mask.set(m | bit);
+    } else {
+      self.replace_slot(tc, i, key, c, bit);
+    }
+  }
+
+  /// Flushes slot `i` and makes it hold `bit` of the word `key`.
+  #[inline(never)]
+  fn replace_slot(&self, tc: &ThreadCache, i: usize, key: u64, c: usize, bit: u64) {
+    self.flush_slot(tc, i);
+    let slot = &tc.frees[i];
+    slot.key.set(key);
+    slot.mask.set(bit);
+    tc.pending[c].set(tc.pending[c].get() | 1 << i);
+  }
+
+  /// Returns the frees buffered in slot `i` to the bitmap.
+  fn flush_slot(&self, tc: &ThreadCache, i: usize) {
+    let slot = &tc.frees[i];
+    let key = slot.key.replace(0);
+    if key == 0 {
+      return;
+    }
+    let (page, w, c) = unpack_key(key);
+    tc.pending[c].set(tc.pending[c].get() & !(1 << i));
+    self.free_bits(page, c, w, slot.mask.get());
+  }
+
+  /// Returns the buffered frees of class `c`.
+  fn flush_class(&self, tc: &ThreadCache, c: usize) {
+    let mut pending = tc.pending[c].get();
+    while pending != 0 {
+      self.flush_slot(tc, pending.trailing_zeros() as usize);
+      pending &= pending - 1;
+    }
   }
 
   // ---- page runs -----------------------------------------------------
@@ -622,7 +989,7 @@ impl<O: Os> Heap<O> {
       .compare_exchange(info, PAGE_FREE, AcqRel, Relaxed)
       .is_err()
     {
-      self.os.fatal("allocatbelt: double free detected");
+      self.os.fatal(DOUBLE_FREE);
     }
     let n = ((info >> 16) & 0xFF) as usize;
     for t in 1..n {
@@ -649,17 +1016,9 @@ impl<O: Os> Heap<O> {
       return false;
     }
     let mask = run_mask((in_seg + n) as u32, (n2 - n) as u32);
-    let mut used = m[SEG_PAGES].load(Acquire);
-    loop {
-      if used & mask != 0 {
-        return false;
-      }
-      match m[SEG_PAGES].compare_exchange_weak(used, used | mask, AcqRel, Acquire) {
-        Ok(_) => break,
-        Err(now) => used = now,
-      }
-    }
-    let was_dirty = m[SEG_DIRTY].fetch_and(!mask, AcqRel) & mask;
+    let Some(was_dirty) = proto::claim_exact(&m[SEG_PAGES], &m[SEG_DIRTY], mask) else {
+      return false;
+    };
     if was_dirty != 0 {
       self
         .dirty_pages
@@ -710,6 +1069,11 @@ impl<O: Os> Heap<O> {
         .dirty_pages
         .fetch_add(PAGES_PER_SEGMENT as isize, Relaxed);
     }
+    // Late frees of a previous owner may have left hints behind.
+    for c in 0..NUM_CLASSES {
+      m[SEG_CLS + c].store(0, Relaxed);
+      m[SEG_AVAIL + c].store(0, Relaxed);
+    }
     m[SEG_PAGES].store(0, Release);
     m[SEG_NEXT].store(u64::from(sh.segs.load(Relaxed)), Relaxed);
     m[SEG_HDR].store(SEG_OWNED | (s as u64) << 8 | 1 << 16, Release);
@@ -723,32 +1087,20 @@ impl<O: Os> Heap<O> {
   /// `step` in a segment and reports whether it reads as zero. Reusing dirty
   /// pages is free: they simply stop being dirty (and are not zero).
   fn claim_run(&self, m: &[AtomicU64], n: usize, step: usize) -> Option<(usize, bool)> {
-    let mut used = m[SEG_PAGES].load(Acquire);
-    loop {
-      let start = find_run_aligned(!used, n as u32, step as u32)?;
-      let mask = run_mask(start, n as u32);
-      match m[SEG_PAGES].compare_exchange_weak(used, used | mask, AcqRel, Acquire) {
-        Ok(_) => {
-          let was_dirty = m[SEG_DIRTY].fetch_and(!mask, AcqRel) & mask;
-          if was_dirty != 0 {
-            self
-              .dirty_pages
-              .fetch_sub(was_dirty.count_ones() as isize, Relaxed);
-          }
-          return Some((start as usize, was_dirty == 0));
-        }
-        Err(now) => used = now,
-      }
+    let (start, was_dirty) = proto::claim_run(&m[SEG_PAGES], &m[SEG_DIRTY], n as u32, step as u32)?;
+    if was_dirty != 0 {
+      self
+        .dirty_pages
+        .fetch_sub(was_dirty.count_ones() as isize, Relaxed);
     }
+    Some((start as usize, was_dirty == 0))
   }
 
   /// Marks `n` pages dirty and returns them to their segment.
   fn release_pages(&self, page: usize, n: usize) {
     let m = self.seg_meta(page / PAGES_PER_SEGMENT);
     let mask = run_mask((page % PAGES_PER_SEGMENT) as u32, n as u32);
-    // Dirty first, so a claimer that grabs the pages clears the mark.
-    m[SEG_DIRTY].fetch_or(mask, Release);
-    m[SEG_PAGES].fetch_and(!mask, Release);
+    proto::release_run(&m[SEG_PAGES], &m[SEG_DIRTY], mask);
     let dirty = self.dirty_pages.fetch_add(n as isize, Relaxed) + n as isize;
     if dirty > DIRTY_BUDGET_PAGES
       && let Some(_g) = self.purge_lock.try_lock()
@@ -763,7 +1115,8 @@ impl<O: Os> Heap<O> {
   /// Embedders may call this from a maintenance task (e.g. when idle); it is
   /// also run automatically once the dirty budget is exceeded. Shards that
   /// are allocating at that moment keep their empty segments until the next
-  /// pass.
+  /// pass. Blocks held in thread caches stay allocated; flush the calling
+  /// thread's cache first with [`Heap::flush`].
   pub fn purge(&self) {
     let _g = self.purge_lock.lock(|| self.os.yield_now());
     self.purge_segments();
@@ -795,8 +1148,8 @@ impl<O: Os> Heap<O> {
       let Some(_g) = sh.lock.try_lock() else {
         continue;
       };
-      for (c, cs) in sh.classes.iter().enumerate() {
-        self.release_empty_pages(cs, c);
+      for c in 0..NUM_CLASSES {
+        self.release_empty_pages(sh, c);
       }
       let mut kept_empty = false;
       let mut prev: Option<&[AtomicU64]> = None;
@@ -847,19 +1200,12 @@ impl<O: Os> Heap<O> {
   }
 
   fn purge_segment(&self, seg: usize, m: &[AtomicU64]) {
-    let mut used = m[SEG_PAGES].load(Acquire);
-    let dirty = loop {
-      let d = m[SEG_DIRTY].load(Acquire) & !used;
-      if d == 0 {
-        return;
-      }
-      // Claim the dirty free pages like an allocation would, so nobody
-      // can hand them out while their contents are being discarded.
-      match m[SEG_PAGES].compare_exchange_weak(used, used | d, AcqRel, Acquire) {
-        Ok(_) => break d,
-        Err(now) => used = now,
-      }
-    };
+    // Claim the dirty free pages like an allocation would, so nobody can
+    // hand them out while their contents are being discarded.
+    let dirty = proto::claim_dirty(&m[SEG_PAGES], &m[SEG_DIRTY], u64::MAX);
+    if dirty == 0 {
+      return;
+    }
     let mut rest = dirty;
     let mut purged = 0;
     while rest != 0 {
@@ -874,11 +1220,10 @@ impl<O: Os> Heap<O> {
       }
       rest &= !run;
     }
-    let cleared = m[SEG_DIRTY].fetch_and(!purged, AcqRel) & purged;
+    let cleared = proto::finish_purge(&m[SEG_PAGES], &m[SEG_DIRTY], dirty, purged);
     self
       .dirty_pages
       .fetch_sub(cleared.count_ones() as isize, Relaxed);
-    m[SEG_PAGES].fetch_and(!dirty, Release);
   }
 
   // ---- segments ------------------------------------------------------
@@ -904,7 +1249,7 @@ impl<O: Os> Heap<O> {
       .compare_exchange(hdr, SEG_FREE, AcqRel, Relaxed)
       .is_err()
     {
-      self.os.fatal("allocatbelt: double free detected");
+      self.os.fatal(DOUBLE_FREE);
     }
     let k = (hdr >> 16) as usize;
     for i in 1..k {

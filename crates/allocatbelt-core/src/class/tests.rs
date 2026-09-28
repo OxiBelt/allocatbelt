@@ -45,3 +45,13 @@ fn class_of_is_tight() {
     }
   }
 }
+
+#[test]
+fn block_index_divides() {
+  for c in 0..NUM_CLASSES {
+    for off in 0..PAGE_SIZE {
+      let want = (off % size(c) == 0 && off / size(c) < capacity(c)).then(|| off / size(c));
+      assert_eq!(block_index(c, off), want, "class {c} offset {off}");
+    }
+  }
+}

@@ -19,15 +19,21 @@ compile_error!(
   "allocatbelt needs a 64-bit target with 64-bit atomics (e.g. x86_64, aarch64, riscv64)"
 );
 
-#[cfg(test)]
+#[cfg(any(test, loom))]
 extern crate std;
 
 pub mod bits;
 pub mod class;
+#[cfg(not(loom))]
 pub mod heap;
+#[cfg_attr(loom, allow(dead_code))]
 mod lock;
+#[cfg_attr(loom, allow(dead_code))]
+mod proto;
+mod sync;
 
-pub use heap::{Block, Heap, Os};
+#[cfg(not(loom))]
+pub use heap::{Block, Heap, Os, ThreadCache};
 
 /// log2 of [`PAGE_SIZE`].
 pub const PAGE_SHIFT: u32 = 16;
@@ -50,12 +56,13 @@ pub const MAX_ALIGN: usize = SEGMENT_SIZE;
 
 /// Words of per-page metadata: 4 header words and a 64-word free bitmap.
 pub const PAGE_META_WORDS: usize = 4 + class::MAX_BITMAP_WORDS;
-/// Words of segment header metadata that precede the page records.
-pub const SEGMENT_HEADER_WORDS: usize = 4;
+/// Words of segment header metadata that precede the page records: eight
+/// words of segment state, then two bitmaps per size class.
+pub const SEGMENT_HEADER_WORDS: usize = 8 + 2 * class::NUM_CLASSES;
 /// Metadata words the [`Os`] must provide for every segment.
 pub const META_WORDS: usize = SEGMENT_HEADER_WORDS + PAGES_PER_SEGMENT * PAGE_META_WORDS;
 
 const _: () = assert!(PAGES_PER_SEGMENT == 64);
 
-#[cfg(test)]
+#[cfg(all(test, not(loom)))]
 mod tests;

@@ -144,3 +144,77 @@ fn realloc_grows_and_shrinks() {
   // SAFETY: `p` is live with `layout`.
   unsafe { GLOBAL.dealloc(p, layout) };
 }
+
+#[test]
+fn exiting_threads_return_their_caches() {
+  // Many short-lived threads, each leaving blocks in its cache at exit:
+  // retiring the caches must let the pages go back, so repeated rounds do
+  // not accumulate segments.
+  let round = || {
+    let handles: Vec<_> = (0..16)
+      .map(|t| {
+        std::thread::spawn(move || {
+          let v: Vec<Box<[u8]>> = (0..20_000)
+            .map(|i| vec![t as u8; 16 + (i * 13) % 2000].into_boxed_slice())
+            .collect();
+          // Free half now (buffered in this thread's cache) and
+          // half at thread exit.
+          let (keep, drop_now): (Vec<_>, Vec<_>) =
+            v.into_iter().enumerate().partition(|(i, _)| i % 2 == 0);
+          drop(drop_now);
+          keep.len()
+        })
+      })
+      .collect();
+    for h in handles {
+      assert_eq!(h.join().unwrap(), 10_000);
+    }
+    GLOBAL.purge();
+    GLOBAL.purge();
+    GLOBAL.segments_in_use()
+  };
+  // Threads are spread over the 64 shards round-robin, and each shard keeps
+  // one empty (purged) segment; warm them all up before measuring.
+  for _ in 0..4 {
+    round();
+  }
+  let first = round();
+  let mut last = first;
+  for _ in 0..6 {
+    last = round();
+  }
+  // Other tests allocate concurrently, so allow a little noise.
+  assert!(last <= first + 8, "segments grew from {first} to {last}");
+}
+
+#[test]
+fn thread_local_destructors_may_free_after_retire() {
+  #[allow(clippy::vec_box, reason = "each box is a separate small allocation")]
+  struct Holder(Vec<Box<[u8; 100]>>);
+  impl Drop for Holder {
+    fn drop(&mut self) {
+      // Runs during thread exit, possibly after the cache was retired;
+      // frees and allocations must keep working.
+      self.0.clear();
+      let v = vec![1u8; 1000];
+      assert_eq!(v.len(), 1000);
+    }
+  }
+  std::thread_local! {
+      static HOLDER: std::cell::RefCell<Option<Holder>> = const { std::cell::RefCell::new(None) };
+  }
+  let handles: Vec<_> = (0..8)
+    .map(|_| {
+      std::thread::spawn(|| {
+        let v = (0..1000).map(|_| Box::new([7u8; 100])).collect();
+        HOLDER.with(|h| *h.borrow_mut() = Some(Holder(v)));
+        // A second allocation after the holder, so our retire hook
+        // may be registered before or after it.
+        let _ = vec![0u8; 64];
+      })
+    })
+    .collect();
+  for h in handles {
+    h.join().unwrap();
+  }
+}

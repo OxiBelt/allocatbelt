@@ -65,3 +65,23 @@ proptest::proptest! {
         proptest::prop_assert_eq!(find_run_aligned(f, n, step), naive_aligned(f, n, step));
     }
 }
+
+#[test]
+fn pick_wraps() {
+  assert_eq!(pick_bit(0b1001, 0), 0);
+  assert_eq!(pick_bit(0b1001, 1), 3);
+  assert_eq!(pick_bit(0b1001, 4), 0);
+  assert_eq!(pick_bit(1 << 63, 17), 63);
+}
+
+proptest::proptest! {
+    #[test]
+    fn pick_prop(m in 1u64.., r: u32) {
+        let i = pick_bit(m, r);
+        proptest::prop_assert!(m >> i & 1 == 1);
+        // No set bit lies between the start and the pick.
+        let start = r & 63;
+        let skipped = (0..(i + 64 - start) % 64).all(|d| m >> ((start + d) % 64) & 1 == 0);
+        proptest::prop_assert!(skipped);
+    }
+}

@@ -63,6 +63,16 @@ const fn stride_mask(step: u32) -> u64 {
   MASKS[step.trailing_zeros() as usize]
 }
 
+/// Index of the first set bit of `m` (non-zero) at or after bit `r % 64`,
+/// wrapping around. `r = 0` gives the lowest set bit; a random `r` gives a
+/// cheap randomized pick.
+#[must_use]
+#[inline]
+pub const fn pick_bit(m: u64, r: u32) -> u32 {
+  let r = r & 63;
+  (m.rotate_right(r).trailing_zeros() + r) & 63
+}
+
 /// Mask with bits `start..start + n` set (`n` in `1..=64`).
 #[must_use]
 pub const fn run_mask(start: u32, n: u32) -> u64 {
