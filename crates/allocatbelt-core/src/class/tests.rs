@@ -11,6 +11,10 @@ fn table_shape() {
     assert_eq!(size(c) % MIN_ALIGN, 0);
     assert!(bitmap_words(c) <= MAX_BITMAP_WORDS);
   }
+  for c in 0..NUM_CLASSES {
+    assert_eq!(capacity(c), PAGE_SIZE / size(c), "class {c}");
+    assert_eq!(bitmap_words(c), capacity(c).div_ceil(64), "class {c}");
+  }
   for k in 4..=13 {
     let p = 1usize << k;
     assert_eq!(size(class_of(p)), p, "power of two {p} must be a class");

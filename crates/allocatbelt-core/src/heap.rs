@@ -615,6 +615,9 @@ impl<O: Os> Heap<O> {
     grow: bool,
   ) -> Option<Option<(usize, u32, u64)>> {
     let cs = &sh.classes[c];
+    // A page just set up for the class must have blocks to claim; if not,
+    // the metadata is corrupt, and retrying would take pages forever.
+    let mut fresh = false;
     loop {
       let cur = cs.cursor.load(Relaxed);
       if cur != 0 {
@@ -629,6 +632,11 @@ impl<O: Os> Heap<O> {
           pm.free().fetch_sub(u64::from(bits.count_ones()), Relaxed);
           return Some(Some((page, w, bits)));
         }
+        if fresh {
+          self
+            .os
+            .fatal("allocatbelt: a new small page has no free blocks");
+        }
         if !proto::retire_page(&m[SEG_AVAIL + c], 1 << in_seg, pm.summary()) {
           continue;
         }
@@ -637,7 +645,10 @@ impl<O: Os> Heap<O> {
       let page = match self.find_page(sh, c) {
         Some(p) => p,
         None if !grow => return Some(None),
-        None => self.new_small_page(s, sh, c)?,
+        None => {
+          fresh = true;
+          self.new_small_page(s, sh, c)?
+        }
       };
       cs.cursor.store(page as u64 + 1, Relaxed);
     }
