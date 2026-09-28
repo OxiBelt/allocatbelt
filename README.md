@@ -29,13 +29,17 @@ docs/                     Research reports, benchmark results, unsafe inventory.
 > ```toml
 > [target.x86_64-unknown-linux-gnu]
 > rustflags = ["-C", "target-cpu=x86-64-v3"]
+> rustdocflags = ["-C", "target-cpu=x86-64-v3"]  # for doctests (`cargo test --doc`)
 > ```
 >
-> or with `RUSTFLAGS="-C target-cpu=x86-64-v3"`. aarch64 and riscv64 need no flag.
+> or with `RUSTFLAGS="-C target-cpu=x86-64-v3"` (and the same `RUSTDOCFLAGS` for doctests). aarch64 and riscv64 need no flag.
+
+allocatbelt is **not on crates.io yet**. The package is ready for it (`cargo publish --dry-run` passes, and the unpacked crate builds, tests and documents on its own: [docs/research/publish-readiness.md](docs/research/publish-readiness.md)), but publishing is a separate decision. Until then, depend on the repository:
 
 ```toml
 [dependencies]
-allocatbelt = "0.1"
+allocatbelt = { git = "https://github.com/OxiBelt/allocatbelt", branch = "research/rust-allocator" }
+# once published: allocatbelt = "0.1"
 ```
 
 Cargo features pick which optional parts are compiled in; which of them a process uses is chosen at run time, within that ceiling (`Allocatbelt::compiled_capabilities()`). All of them build on stable Rust except `experimental-riscv-rvv` on riscv64, and none turns allocator correctness or hardening on or off. Details in [docs/features.md](docs/features.md).
@@ -49,7 +53,7 @@ Cargo features pick which optional parts are compiled in; which of them a proces
 | `experimental-aarch64-sve`, `experimental-aarch64-sve2` | no | experimental SVE/SVE2 kernels for the decay pass's age scan (aarch64 only), off until `Policy::experimental_isa` selects them; not measured |
 | `experimental-riscv-rvv` | no | the same scan for RISC-V V (riscv64 only; **needs nightly Rust there**), off until selected; not measured |
 
-`allocatbelt = { version = "0.1", default-features = false }` builds the allocator without the maintenance thread.
+`default-features = false` builds the allocator without the maintenance thread.
 
 Features are the ceiling; `Allocatbelt::configure(Policy)` chooses within it at run time (`FeaturePolicy::Auto`, `Prefer`, `Require` or `Disable` per capability), and `Allocatbelt::report()` shows what was compiled, detected and selected ([docs/features.md](docs/features.md#run-time-policy)).
 
@@ -85,6 +89,7 @@ What it does, in the terms of mimalloc (details in [docs/research/README.md](doc
 Status: **research prototype**. Not recommended for production.
 
 **Platform contract** ([docs/platform.md](docs/platform.md)): Linux 7.0 or newer, 64-bit little-endian userspace, on x86_64 (**x86-64-v3 or newer**), aarch64 or riscv64 (RV64GC, Zbb optional). Every other target, and any x86_64 build below x86-64-v3, fails at compile time with a message saying why. Inside this repository `.cargo/config.toml` builds x86_64 with `-C target-cpu=x86-64-v3`; a `RUSTFLAGS` variable replaces it and must carry that flag too, and crates depending on allocatbelt (OxiBelt) must set it in their own build ([above](#using-it-from-another-crate)). At start-up the allocator probes the kernel facilities it cannot run without (reservation, commit, `MADV_DONTNEED` zeroing) and aborts with a message if one is missing. x86_64 and aarch64 are tested natively in CI (`ubuntu-26.04` and `ubuntu-26.04-arm` runners); riscv64 is tested in CI under qemu-user, with and without Zbb; the `platform-gates` job checks that the supported targets build and the others are rejected. Every supported CPU runs the same scalar code by default: none of the SIMD candidates measured in `bench/simd` qualified ([docs/research/simd-benchmarks.md](docs/research/simd-benchmarks.md)). The experimental SVE/SVE2 and RVV kernels run only when compiled in, exposed to the process and selected by the policy ([docs/features.md](docs/features.md#experimental-isa-kernels)).
+allocatbelt does not depend on OxiBelt, and OxiBelt does not need it: an application opts in with `#[global_allocator]` (above), and any Rust program on a supported platform can use it the same way. OxiBelt keeps secure mimalloc as its default; the research summary recommends adding allocatbelt there only as an experimental option and comparing it under real traffic first ([docs/research/README.md](docs/research/README.md)).
 Containers and VMs are first-class: the allocator needs no Linux capability, writable filesystem or `seccomp=unconfined`, falls back when a sandbox refuses io_uring or `SCHED_BATCH`, and uses only the ISA the guest exposes ([docs/sandbox.md](docs/sandbox.md)).
 For the conclusions and recommendations see [docs/research/README.md](docs/research/README.md), for measurements see [docs/research/benchmarks.md](docs/research/benchmarks.md), and for the unsafe inventory see [docs/unsafe-boundary.md](docs/unsafe-boundary.md).
 
@@ -95,10 +100,11 @@ cargo fmt --all --check
 cargo clippy --all-targets --all-features --locked -- -D warnings
 cargo test --release --locked                                   # core tests (allocatbelt-core-check) + global-allocator integration tests
 scripts/check-features.sh                                       # clippy and tests for each supported feature combination
-scripts/check-package.sh                                        # cargo package/publish --dry-run, package contents, clean-consumer builds
+scripts/check-package.sh                                        # cargo package/publish --dry-run, package contents, the unpacked crate's tests and docs.rs build, clean-consumer builds
 scripts/check-sandbox.sh                                        # hardened container, seccomp fallbacks, visible ISA under qemu (docs/sandbox.md)
 scripts/check-experimental-isa.sh                               # experimental SVE/SVE2 kernels under qemu CPU models (docs/features.md)
 scripts/check-experimental-rvv.sh                               # experimental RVV kernel on the pinned nightly, under qemu (docs/features.md)
+scripts/check-rseq.sh                                           # experimental rseq mm_cid: glibc, glibc with rseq off, musl (docs/platform.md)
 scripts/check-platform-gates.sh                                 # supported targets build, others are rejected (needs `rustup target add`, see the script)
 scripts/check-scalar-isa.sh                                     # bit scans lower to tzcnt/popcnt/lzcnt (x86-64-v3) and ctz/cpop/clz (riscv64 + Zbb)
 cargo audit && cargo deny check                                 # RustSec advisories, licenses, bans, sources

@@ -90,6 +90,21 @@ The check needs only `rustup target add riscv64gc-unknown-linux-gnu`, no linker 
 
 Phases 1 to 5 of the Linux 7 / ISA / SIMD plan changed no allocator algorithm: phase 4 measured SIMD candidates and phase 5 promoted none of them. Phase 6 made the heap locks sleep on a futex, phase 7 moved housekeeping to a `SCHED_BATCH` maintenance thread and phase 8 added an opt-in io_uring purge ring for it (below). Phase 9 added an experimental, off-by-default shard selection by the rseq `mm_cid` (below), without measurements.
 
+## Optional capabilities at a glance
+
+Everything below is optional: the allocator is correct without any of it, and each row can be compiled out, refused by the system or left unselected. A Cargo feature compiles a capability in; the run-time policy (`Allocatbelt::configure`, docs/features.md) selects it; the probe decides whether the system allows it. `Allocatbelt::report()` shows all three.
+
+| Capability | Compiled feature | Probe | Default policy | Fallback | `Require` failure |
+|---|---|---|---|---|---|
+| Maintenance thread | `maintenance` (default) | spawning the thread in `start_maintenance_thread()` | not started until the application calls it | allocating threads run housekeeping inline | no policy field: `start_maintenance_thread` returns the spawn error |
+| `SCHED_BATCH` for that thread | `scheduler` (default, implies `maintenance`) | `sched_setscheduler(SCHED_BATCH)` when the thread starts | `Auto`: ask, keep the default policy if refused | the default scheduling policy; `maintenance_is_batch()` is `false` | `start_maintenance_thread` returns `Unsupported` wrapping `PolicyError::Unavailable`; no thread runs |
+| io_uring purge ring | `io-uring` (implies `maintenance`) | setting up the restricted ring and probing `IORING_OP_MADVISE` when the thread starts | `Auto`: `madvise` | `madvise` purges; `io_uring_error()` names the step and errno | as for `SCHED_BATCH` |
+| rseq `mm_cid` shard hints | `experimental-rseq` | glibc's `__rseq_size`, `getauxval(AT_RSEQ_FEATURE_SIZE)` | `Auto`: off | the TLS per-thread shards | `configure` fails with `Unavailable { step }` (`not glibc`, `not registered`, `no mm_cid`), `set_rseq_policy` with that `RseqUnavailable` |
+| SVE/SVE2 age-scan kernels | `experimental-aarch64-sve`, `-sve2` (aarch64) | `getauxval(AT_HWCAP)`, `getauxval(AT_HWCAP2)` | `Auto`: baseline | baseline kernels | `configure` fails: `NotCompiled`, or `Unavailable { step: "cpu features" }` |
+| RVV age-scan kernel | `experimental-riscv-rvv` (riscv64, nightly) | `riscv_hwprobe` (`IMA_V` on all online CPUs), `prctl(PR_RISCV_V_GET_CONTROL)` | `Auto`: baseline | baseline kernels | as for SVE |
+
+A `Require` for a capability the build lacks fails in `configure` with `PolicyError::NotCompiled`.
+
 ## Maintenance thread scheduling
 
 `Allocatbelt::start_maintenance_thread` (Cargo feature `maintenance`, default) starts the thread that runs purge passes (docs/research/README.md §4). With the feature `scheduler` (default), and unless the policy's `scheduler` is `Disable` (docs/features.md), the thread moves itself to `SCHED_BATCH` with `sched_setscheduler` (`sys::set_batch_scheduling`); without it, the thread keeps the default policy, keeping the process's nice value, and the adapter reports whether that worked (`Allocatbelt::maintenance_is_batch`). If a sandbox refuses the call, the thread keeps the default policy. It is never real-time and never pinned to a CPU: it must not delay the process's own threads, and a pin would tie it to a CPU that may be busy (plan §11.2–11.3). It sleeps on a futex with a timeout (the next decay deadline) and wakes early when a freeing thread records work. The thread is named `allocatbelt-mnt` (Linux keeps 15 bytes of a thread name).

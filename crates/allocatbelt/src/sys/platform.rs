@@ -54,7 +54,7 @@ compile_error!(
 
 /// A Linux kernel release as `uname(2)` reports it, for diagnostics.
 ///
-/// The version is not what decides whether allocatbelt runs: [`probe`]
+/// The version is not what decides whether allocatbelt runs: the start-up probe
 /// checks the facilities themselves (see `docs/platform.md`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct KernelVersion {
@@ -107,7 +107,8 @@ impl KernelVersion {
   }
 }
 
-/// What [`probe`] found about the running kernel.
+/// What the start-up probe found about the running kernel.
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Capabilities {
   /// The running kernel's release, if `uname(2)` reports a parseable one.

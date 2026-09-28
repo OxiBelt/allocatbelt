@@ -119,6 +119,7 @@ pub(crate) static IO_URING: Detected = Detected::new();
 /// Every variant exists in every build, so that matching on it does not
 /// depend on the features another crate turns on; without the feature
 /// `io-uring`, `IoUring` is never reported.
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PurgeBackend {
   /// No maintenance thread runs: allocating threads purge with `madvise`.

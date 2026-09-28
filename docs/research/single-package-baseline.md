@@ -173,3 +173,13 @@ Directive §20 Phase H builds on the Phase 9 experiment (section 5) rather than 
 - **CI.** `scripts/check-rseq.sh` (job "Experimental rseq mm_cid", x86_64 and arm64): glibc with registration (expects `available`), with the tunable (`not registered`) and static musl (`not glibc`). The riscv64 qemu-user job now builds `experimental-rseq` too and expects `not registered`.
 - **Not done.** No benchmark was run and no default changes; a later qualification decides whether `Auto` ever selects it. No rseq critical section was added.
 - **unsafe.** None added to the library; the new unsafe is in test code only (docs/unsafe-boundary.md).
+
+## 13. Phase I: publish-readiness review
+
+Directive §20 Phase I is a review, recorded in [publish-readiness.md](publish-readiness.md). Nothing was published, tagged or released, and no benchmark was run.
+
+- **Found and fixed.** docs.rs would have failed at the x86-64-v3 gate: `[package.metadata.docs.rs]` now passes the flag, and `doc_cfg` labels feature-gated items there. Five rustdoc links to private items. A consumer's doctests need the flag in `RUSTDOCFLAGS` (README).
+- **Checks added** to `scripts/check-package.sh`: the unpacked crate's own tests outside the workspace, and its documentation built with the docs.rs metadata alone.
+- **API.** `#[non_exhaustive]` on six public types expected to grow (`MaintenanceStats`, `PurgeBackend`, `Capabilities`, `RingError`, `RseqStatus`, `RseqUnavailable`); `CpuFeatures::with_if` is crate-private. The package metadata's description names the `arch` boundary too.
+- **Docs.** README (not on crates.io yet, OxiBelt independence), docs/platform.md (one table of every optional capability).
+- **Open for the owner.** Whether and when to publish; README links resolve against `main` on crates.io; removing duplicate names (`start_purge_thread`, `RseqPolicy`, possibly `set_io_uring`) before they become permanent; which experimental features ship in 0.1.0; the license.

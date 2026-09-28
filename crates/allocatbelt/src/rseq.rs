@@ -33,6 +33,7 @@ use crate::policy::{self, FeaturePolicy};
 pub type RseqPolicy = FeaturePolicy;
 
 /// What [`Allocatbelt::rseq_status`] reports.
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RseqStatus {
   /// The policy set last.

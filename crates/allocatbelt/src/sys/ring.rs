@@ -110,6 +110,7 @@ const _: () = {
 };
 
 /// Why a ring could not be set up, for diagnostics.
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RingError {
   /// The step that failed.

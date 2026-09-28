@@ -51,6 +51,7 @@ pub enum Task {
 }
 
 /// Counters of the housekeeping passes (P4), for diagnostics and tests.
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct MaintenanceStats {
   /// Force passes run by the maintenance thread.
@@ -60,13 +61,13 @@ pub struct MaintenanceStats {
   /// Decay passes run by the maintenance thread.
   pub decay_passes: u64,
   /// Budget passes run inline by a freeing thread: no maintenance thread,
-  /// or the dirty count passed [`DIRTY_HARD_LIMIT_PAGES`].
+  /// or the dirty count passed the hard limit (`DIRTY_HARD_LIMIT_PAGES`).
   pub inline_budget_passes: u64,
   /// Decay passes run inline by allocating threads.
   pub inline_decay_passes: u64,
   /// Times a freeing thread woke the maintenance thread.
   pub wakeups: u64,
-  /// Purge batches, by any pass (one per segment for [`SyncPurger`]).
+  /// Purge batches, by any pass (one per segment for `madvise` purges).
   pub purge_batches: u64,
   /// Page runs purged (or attempted) by those batches.
   pub purged_runs: u64,

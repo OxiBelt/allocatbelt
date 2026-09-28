@@ -80,7 +80,7 @@ impl CpuFeatures {
 
   /// `self` with `other` added when `present`.
   #[must_use]
-  pub const fn with_if(self, other: Self, present: bool) -> Self {
+  pub(crate) const fn with_if(self, other: Self, present: bool) -> Self {
     if present {
       Self(self.0 | other.0)
     } else {

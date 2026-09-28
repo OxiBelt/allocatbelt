@@ -6,6 +6,8 @@
 # - the .crate holds the sources, LICENSE and README, and nothing from the
 #   development packages;
 # - its manifest has no path dependency (nothing unpublished);
+# - the unpacked crate's own tests pass outside this workspace, and its
+#   documentation builds with the docs.rs metadata alone;
 # - a consumer project outside this repository, which does not see its
 #   `.cargo/config.toml`, builds and runs the unpacked crate as its global
 #   allocator with the default features, with `default-features = false`,
@@ -74,6 +76,43 @@ if bad:
   sys.exit(f"path dependencies: {bad}")
 EOF
 echo "ok: no path dependencies"
+
+# Outside this workspace the unpacked crate has no `.cargo/config.toml`:
+# its own tests (as crater or a vendoring consumer would run them) need
+# the x86-64-v3 flag like any other build, and its doctests need it in
+# RUSTDOCFLAGS (README).
+unpacked_flags=""
+[[ "$(uname -m)" == x86_64 ]] && unpacked_flags="-C target-cpu=x86-64-v3"
+cp Cargo.lock "${unpacked}/"
+printf '\n[workspace]\n' >>"${unpacked}/Cargo.toml"
+unpacked_test() {
+  (cd "${unpacked}" && env -u CARGO_BUILD_RUSTFLAGS RUSTFLAGS="${unpacked_flags}" \
+    RUSTDOCFLAGS="${unpacked_flags}" cargo test --release --quiet --target-dir "${work}/target" "$@")
+}
+unpacked_test 2>&1 | grep -E '^test result' | sort | uniq -c
+unpacked_test >/dev/null 2>&1 || fail "the unpacked crate's tests fail"
+echo "ok: the unpacked crate's tests pass"
+
+# docs.rs builds the documentation with `[package.metadata.docs.rs]` and
+# nothing from this repository: its flags must get past the platform gate.
+# (docs.rs also passes `--cfg docsrs`, which needs its nightly.)
+mapfile -t docsrs < <(python3 - "${unpacked}/Cargo.toml" <<'EOF'
+import sys, tomllib
+
+d = tomllib.load(open(sys.argv[1], "rb"))["package"]["metadata"]["docs"]["rs"]
+print(d["targets"][0])
+print(" ".join(d.get("rustc-args", [])))
+print(" ".join(d.get("rustdoc-args", [])))
+print("--all-features" if d.get("all-features") else "--lib")
+EOF
+)
+[[ ${#docsrs[@]} -eq 4 ]] || fail "no [package.metadata.docs.rs] in the packaged manifest"
+if [[ "$(uname -m)" == "${docsrs[0]%%-*}" ]]; then
+  (cd "${unpacked}" && env -u CARGO_BUILD_RUSTFLAGS RUSTFLAGS="${docsrs[1]}" \
+    RUSTDOCFLAGS="${docsrs[2]} -D warnings" cargo doc --quiet --no-deps "${docsrs[3]}" \
+    --target-dir "${work}/target") || fail "documentation as docs.rs builds it"
+  echo "ok: documentation builds with the docs.rs metadata (${docsrs[0]})"
+fi
 
 # A consumer outside the repository: no workspace, no .cargo/config.toml.
 consumer="${work}/consumer"

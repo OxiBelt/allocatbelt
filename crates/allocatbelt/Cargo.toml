@@ -1,6 +1,6 @@
 [package]
 name = "allocatbelt"
-description = "A Linux global allocator whose allocation logic is safe Rust over offsets, with unsafe confined to a syscall module and the GlobalAlloc adapter."
+description = "A Linux global allocator whose allocation logic is safe Rust over offsets, with unsafe confined to the syscall, CPU-detection and GlobalAlloc boundaries."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -12,6 +12,16 @@ categories = ["memory-management", "os::linux-apis"]
 include = ["/src/**/*.rs", "/tests/**/*.rs", "/LICENSE"]
 # The only package of this workspace that is published; every other one is a
 # development tool (`publish = false` from `[workspace.package]`).
+
+# docs.rs does not read this repository's `.cargo/config.toml`, so it gets
+# the x86-64-v3 flag the platform gate requires (docs/platform.md) here.
+# One target: the API is the same on every supported architecture, apart
+# from the per-architecture `CpuFeatures` constants.
+[package.metadata.docs.rs]
+targets = ["x86_64-unknown-linux-gnu"]
+all-features = true
+rustc-args = ["-C", "target-cpu=x86-64-v3"]
+rustdoc-args = ["-C", "target-cpu=x86-64-v3"]
 
 # Linux only, so that a build for another OS reaches the platform gates in
 # `src/sys/platform.rs` instead of failing inside a dependency.

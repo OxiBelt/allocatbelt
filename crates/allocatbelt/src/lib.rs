@@ -65,6 +65,9 @@
   all(target_arch = "riscv64", feature = "experimental-riscv-rvv"),
   feature(riscv_target_feature)
 )]
+// docs.rs (nightly, `--cfg docsrs`) labels feature-gated items with the
+// Cargo feature they need.
+#![cfg_attr(docsrs, feature(doc_cfg))]
 
 mod arch;
 mod capabilities;

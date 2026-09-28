@@ -16,6 +16,7 @@
 use core::sync::atomic::{AtomicU32, Ordering};
 
 /// Why `mm_cid` cannot be read.
+#[non_exhaustive]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RseqUnavailable {
   /// Not built against glibc, the only C library whose rseq area is read.

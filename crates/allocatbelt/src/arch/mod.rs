@@ -74,7 +74,8 @@ pub use features::CpuFeatures;
 #[non_exhaustive]
 pub enum KernelSet {
   /// Portable scalar code only. Always correct, the default, and what
-  /// every allocation uses before [`initialize_dispatch`] has run.
+  /// every allocation uses before the allocator's first allocation has
+  /// detected the CPU.
   Baseline,
   /// Experimental (feature `experimental-aarch64-sve`): the decay pass's
   /// age scan compiled for SVE. Not measured.
