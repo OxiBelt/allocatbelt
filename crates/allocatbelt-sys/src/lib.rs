@@ -190,9 +190,10 @@ impl Region {
   }
 
   /// Makes the range fault on any access, discarding its contents. Uses
-  /// guard markers (`MADV_GUARD_INSTALL`, Linux 6.13+), which do not split
-  /// the mapping into more VMAs; on older kernels falls back to
-  /// `mprotect(PROT_NONE)`. Returns `false` if neither worked.
+  /// guard markers (`MADV_GUARD_INSTALL`, Linux 6.13+, so every supported
+  /// kernel), which do not split the mapping into more VMAs. Where the
+  /// markers do not take effect (qemu-user and some sandboxes accept the
+  /// advice without implementing it) falls back to `mprotect(PROT_NONE)`. Returns `false` if neither worked.
   /// [`Region::unguard`] removes the markers, and [`Region::commit`]
   /// restores access after the fallback.
   ///

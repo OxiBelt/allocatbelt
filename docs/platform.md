@@ -4,13 +4,14 @@ allocatbelt is a Linux-only allocator for a fixed set of 64-bit CPUs. This page 
 
 | | Supported | Rejected |
 |---|---|---|
-| Operating system | Linux 7.0 or newer | everything else, at compile time |
+| Operating system | Linux 7.0 or newer | everything else (FreeBSD, macOS, bare metal, wasm, ...), at compile time |
+| Architecture | x86_64, aarch64, riscv64 | x86/i686, arm/armv7, riscv32, powerpc*, s390x, loongarch*, wasm* and all others |
 | Userspace | 64-bit, little-endian, with 64-bit atomics | 32-bit and ILP32 ABIs (x32), big-endian |
 | x86_64 | x86-64-v3 or newer (`-C target-cpu=x86-64-v3`) | x86-64-v1/v2 builds, at compile time |
 | aarch64 | any AArch64 Linux target (`aarch64_be` is rejected as big-endian) | |
 | riscv64 | RV64GC (`riscv64gc-unknown-linux-gnu`); Zbb optional | riscv32 |
 
-The gates are `compile_error!`s, so an unsupported build fails before anything runs, with a message that names the problem. 32-bit targets stop at `allocatbelt-core`'s own 64-bit gate; everything else stops in `allocatbelt-sys`, which the `allocatbelt` adapter now depends on unconditionally so that the gates are always reached.
+The gates are `compile_error!`s, so an unsupported build fails before anything runs, with a message that names the problem. `scripts/check-platform-gates.sh` checks one or more representatives of every rejected row: i686, armv7, x32, riscv32, wasm32, powerpc64le, loongarch64, s390x and FreeBSD. 32-bit targets stop at `allocatbelt-core`'s own 64-bit gate; everything else stops in `allocatbelt-sys`, which the `allocatbelt` adapter now depends on unconditionally so that the gates are always reached.
 
 ## x86-64-v3 is the floor
 
@@ -44,3 +45,7 @@ The baseline is RV64GC, as before. Zbb is optional: building with `-C target-fea
 ## Not covered yet
 
 This is phase 1 of the Linux 7 / ISA / SIMD plan: no allocator algorithm changed. Run-time CPU feature detection, SIMD kernels, generated-code checks for the scalar bit instructions, and the Linux 7.0 maintenance plane (io_uring purge, futex waits, scheduler policy) come in later phases.
+
+## No portability layer
+
+Because Linux is a hard requirement, the crates do not carry generic-Unix abstractions or old-kernel compatibility paths. The one fallback that remains, `mprotect(PROT_NONE)` guard pages, is not for older kernels (every supported kernel has guard markers) but for environments that accept `MADV_GUARD_INSTALL` without implementing it, such as qemu-user, which the guard code detects with a populate check. The only `cfg(target_os = "linux")` left is on `allocatbelt-sys`'s own dependencies, so that a build for another OS stops at the gate's message instead of at a dependency that does not build there.

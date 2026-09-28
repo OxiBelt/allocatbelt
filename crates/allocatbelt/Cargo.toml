@@ -13,7 +13,7 @@ publish.workspace = true
 allocatbelt-core.workspace = true
 allocatbelt-sys.workspace = true
 
-[target.'cfg(target_os = "linux")'.dev-dependencies]
+[dev-dependencies]
 libc.workspace = true
 
 [lints]
