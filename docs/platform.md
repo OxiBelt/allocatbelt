@@ -36,7 +36,7 @@ Linux 7.0 is the oldest kernel the project supports and tests against. The kerne
 
 A missing mandatory facility aborts the process with a one-line `allocatbelt: ...` message on stderr instead of returning null from the first allocation, which Rust would report only as a generic allocation failure. The probe issues only syscalls and does not allocate; afterwards the scratch range is `PROT_NONE` again and holds no memory.
 
-The probe also reads the kernel release from `uname(2)`. `Allocatbelt::platform()` returns everything the probe found (`Capabilities`: kernel version, guard markers, getrandom) for diagnostics, and `KernelVersion::meets_minimum()` compares a release against 7.0. An older kernel is not rejected as long as every mandatory facility is present: that keeps the allocator usable under qemu-user and on CI hosts whose kernel is older than the contract, and a run there is outside the supported configuration, not a different code path. As later phases start to rely on Linux 7.0 interfaces (io_uring `IORING_SETUP_SQ_REWIND` for the purge backend, for example), each one is added to the probe as a mandatory facility, so the check stays tied to what the allocator actually uses.
+The probe also reads the kernel release from `uname(2)`. `Allocatbelt::platform()` returns everything the probe found (`Capabilities`: kernel version, guard markers, getrandom) for diagnostics, and `KernelVersion::meets_minimum()` compares a release against 7.0. An older kernel is not rejected as long as every mandatory facility is present: that keeps the allocator usable under qemu-user and on CI hosts whose kernel is older than the contract, and a run there is outside the supported configuration, not a different code path. As later phases start to rely on Linux 7.0 interfaces, each one is added to the probe as a mandatory facility, so the check stays tied to what the allocator actually uses. The io_uring purge ring (phase 8) is not one of them: it is opt-in, uses `IORING_SETUP_SQ_REWIND` only when the kernel accepts it, and falls back to `madvise` when io_uring is unavailable (below).
 
 ## RISC-V
 
@@ -82,11 +82,22 @@ The check needs only `rustup target add riscv64gc-unknown-linux-gnu`, no linker 
 
 ## Not covered yet
 
-Phases 1 to 5 of the Linux 7 / ISA / SIMD plan changed no allocator algorithm: phase 4 measured SIMD candidates and phase 5 promoted none of them. Phase 6 made the heap locks sleep on a futex and phase 7 moved housekeeping to a `SCHED_BATCH` maintenance thread (below); the io_uring purge backend (phase 8) comes later.
+Phases 1 to 5 of the Linux 7 / ISA / SIMD plan changed no allocator algorithm: phase 4 measured SIMD candidates and phase 5 promoted none of them. Phase 6 made the heap locks sleep on a futex, phase 7 moved housekeeping to a `SCHED_BATCH` maintenance thread and phase 8 added an opt-in io_uring purge ring for it (below).
 
 ## Maintenance thread scheduling
 
 `Allocatbelt::start_maintenance_thread` starts the thread that runs purge passes (docs/research/README.md §4). The thread moves itself to `SCHED_BATCH` with `sched_setscheduler` (`allocatbelt_sys::set_batch_scheduling`), keeping the process's nice value, and the adapter reports whether that worked (`Allocatbelt::maintenance_is_batch`). If a sandbox refuses the call, the thread keeps the default policy. It is never real-time and never pinned to a CPU: it must not delay the process's own threads, and a pin would tie it to a CPU that may be busy (plan §11.2–11.3). It sleeps on a futex with a timeout (the next decay deadline) and wakes early when a freeing thread records work. The thread is named `allocatbelt-mnt` (Linux keeps 15 bytes of a thread name).
+
+## io_uring purge ring
+
+After `Allocatbelt::set_io_uring(true)`, the maintenance thread purges the page runs of each pass in batches through its own io_uring (`allocatbelt_sys::PurgeRing`, plan §10) instead of one `madvise` per run. `madvise` stays the default because the ring has not won in measurements yet (docs/research/benchmarks.md, Phase 8). The ring:
+
+- is created by the maintenance thread with `IORING_SETUP_R_DISABLED`, `SINGLE_ISSUER`, `DEFER_TASKRUN` and `NO_SQARRAY`, plus `SQ_REWIND` on Linux 7.0 (the setup is retried without it when the kernel rejects the flag), and never with `SQPOLL`;
+- registers restrictions before it is enabled: only `IORING_OP_MADVISE`, no SQE flags, no later `io_uring_register` calls; it registers no files or buffers, so allocator memory is never pinned;
+- caps the kernel's io-wq workers at one, since `IORING_OP_MADVISE` always runs on a worker and parallel purges of one address space only contend;
+- waits for every completion of a batch before the pass ends the pages' claim, so no purge is in flight after a pass (in particular not across `fork`, whose handler takes the purge lock first), and only a completion with result 0 marks pages clean.
+
+If io_uring is unavailable (`kernel.io_uring_disabled`, a seccomp filter, qemu-user's `ENOSYS`) or `IORING_OP_MADVISE` is missing, the thread purges with `madvise`; `Allocatbelt::purge_backend` and `Allocatbelt::io_uring_error` say which and why. A forked child inherits the descriptor (close-on-exec) but never uses it: its own maintenance thread, if started, creates a new ring.
 
 ## No portability layer
 

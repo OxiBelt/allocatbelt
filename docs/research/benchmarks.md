@@ -181,3 +181,41 @@ Who ran the passes after the change, over 5 runs of the whole bench: the mainten
 - **A missed request was found and fixed.** The first version let a free skip the wake-up because the bit was set, while the thread had just taken the bit and read an old dirty count. Both sides now fence (`proto::post_work`/`take_work`), and the loom model `maintenance_requests_are_not_lost` deadlocks without the fences.
 
 **Decision:** adopted, with the synchronous backend kept. Phase 8 (io_uring) can change how a pass issues `madvise` without touching the scheduling. Still to measure: a many-core machine, and OxiBelt request latency with the thread on and off.
+
+## io_uring purge ring (plan Phase 8, 2026-09-28)
+
+A pass now hands the page runs it claims to a `Purger` in batches of up to 64 runs. After `Allocatbelt::set_io_uring(true)` the maintenance thread's purger is a restricted io_uring (docs/platform.md, "io_uring purge ring"): one `io_uring_enter` submits a batch of `IORING_OP_MADVISE(MADV_DONTNEED)` and waits for its completions. Without it, runs are purged with one `madvise` each, as before.
+
+- **Environment:** as in the Phase 6 section; Linux 6.18.44, so `IORING_SETUP_SQ_REWIND` (Linux 7.0) is not available and every ring here used the SQ tail. CI's rust-checks jobs print the runner's kernel and the same microbenchmark (step "io_uring purge ring report"), including whether `SQ_REWIND` could be set up there.
+
+### Purging 64 runs (`ring_benchmark`)
+
+`cargo test --release -p allocatbelt-sys --lib ring_benchmark -- --ignored --nocapture`: each round writes 64 separate runs of 1, 4 or 16 pages (64 KiB each) and purges them; median of 41 rounds, µs per run.
+
+| Pages per run | `madvise` per run | ring 64 slots, 1 worker | 2 workers | 4 workers | 32 slots | 128 slots |
+|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 6.3 | 18.0–18.9 | 18.1 | 21.4 | 17.5 | 20.6 |
+| 4 | 13.6 | 27.9–28.0 | 27.5 | 27.5 | 33.1 | 33.7 |
+| 16 | 29.6 | 67.8–69.2 | 62.0 | 59.0 | 61.8 | 55.9 |
+
+(Two rows of the 64-slot, 1-worker ring: with and without asking for `SQ_REWIND`, which this kernel refused.) The ring is 2 to 3 times slower per run at every depth and worker count. The kernel always punts `IORING_OP_MADVISE` to an io-wq worker thread (it cannot run without blocking), so each purge pays a hand-off and a wake-up that a direct `madvise` does not; the saved system calls are worth less than that. More workers purge the same address space in parallel and contend on it, so the adapter caps them at one.
+
+### Allocator workloads (`bench-allocatbelt`)
+
+20 alternating runs each of **Phase 7** (`70fcdd8`), **madvise** (this change, default) and **ring** (this change with `ALLOCATBELT_BENCH_IO_URING=1`); "cpu" is the process's user + system time, which includes the io-wq workers.
+
+| Workload | Phase 7 | madvise | ring | madvise / Phase 7 (IQR) | ring / madvise (IQR) |
+|---|---:|---:|---:|---|---|
+| single-thread churn 2M (ms) | 135.8 | 142.2 | 142.2 | 1.00 (0.93–1.13) | 0.98 (0.83–1.09) |
+| 4-thread local churn (ms) | 122.9 | 132.6 | 119.5 | 1.01 (0.97–1.19) | 0.94 (0.84–1.02) |
+| 4-thread small churn (ms) | 273.3 | 272.5 | 265.2 | 0.99 (0.91–1.07) | 1.00 (0.93–1.12) |
+| 2 producer/consumer pairs (ms) | 110.3 | 110.2 | 114.8 | 1.07 (0.77–1.28) | 1.10 (0.85–1.21) |
+| 16-thread local churn, oversubscribed (ms) | 150.7 | 147.2 | 154.6 | 0.96 (0.93–1.04) | 1.03 (0.98–1.08) |
+| peak RSS (MB) | 23.3 | 22.9 | 23.7 | 0.96 (0.86–1.06) | 1.05 (0.97–1.09) |
+| RSS after 3 s idle (MB) | 6.3 | 6.3 | 6.9 | 1.00 (0.98–1.03) | 1.09 (1.05–1.12) |
+| cpu (ms) | 2352.8 | 2379.2 | 2351.6 | 1.03 (0.98–1.05) | 0.99 (0.97–1.03) |
+
+- **Batching without the ring changes nothing:** every madvise / Phase 7 ratio is within the VM's spread. `SyncPurger` still purges segment by segment, as before.
+- **The ring does not win end to end either.** Every wall-time ratio's interquartile range includes 1, CPU time is equal, and idle RSS is 9% higher. The ring does batch: 6 to 10 runs per batch on average over three runs (for example 2,910 runs in 478 batches, counting the inline passes' per-segment batches too), against one `madvise` per run. But the purges already run on the maintenance thread since Phase 7, so the allocating threads never waited for them, and the batch's slower completion only keeps pages claimed a little longer.
+
+**Decision:** the ring stays in, restricted and tested, but **off by default**; the plan asks for io_uring purging "where it wins", and it has not won here. Still to measure before turning it on: `SQ_REWIND` on a Linux 7.0 machine (the CI report shows whether a runner has it), a many-core machine where a direct `madvise`'s TLB shootdowns cost more, and OxiBelt under load.
