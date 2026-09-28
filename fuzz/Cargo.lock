@@ -12,7 +12,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "allocatbelt-core"
+name = "allocatbelt-core-check"
 version = "0.1.0"
 dependencies = [
  "loom",
@@ -22,7 +22,7 @@ dependencies = [
 name = "allocatbelt-fuzz"
 version = "0.0.0"
 dependencies = [
- "allocatbelt-core",
+ "allocatbelt-core-check",
  "libfuzzer-sys",
 ]
 
