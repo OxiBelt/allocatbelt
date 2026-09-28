@@ -17,3 +17,23 @@ fn probe_ran_before_the_first_allocation() {
   );
   assert_eq!(v.iter().map(|&b| usize::from(b)).sum::<usize>(), 4096);
 }
+
+#[test]
+fn dispatch_is_initialised_with_the_arena() {
+  let v: Vec<u64> = (0..16).collect();
+  assert_eq!(GLOBAL.kernel_set(), allocatbelt::KernelSet::Baseline);
+  let features = GLOBAL.cpu_features();
+  #[cfg(target_arch = "x86_64")]
+  assert!(
+    features.contains(allocatbelt::CpuFeatures::X86_64_V3),
+    "{features:?}"
+  );
+  #[cfg(target_arch = "aarch64")]
+  assert!(
+    features.contains(allocatbelt::CpuFeatures::ASIMD),
+    "{features:?}"
+  );
+  #[cfg(target_arch = "riscv64")]
+  let _ = features;
+  assert_eq!(v.len(), 16);
+}

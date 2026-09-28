@@ -10,6 +10,7 @@ publish.workspace = true
 # Unconditional, so that a build for an unsupported platform reaches the
 # platform gates in allocatbelt-sys instead of producing an empty crate.
 [dependencies]
+allocatbelt-arch.workspace = true
 allocatbelt-core.workspace = true
 allocatbelt-sys.workspace = true
 

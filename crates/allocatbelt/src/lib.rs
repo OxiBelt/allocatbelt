@@ -24,6 +24,7 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+pub use allocatbelt_arch::{CpuFeatures, KernelSet};
 use allocatbelt_core::{
   ARENA_SIZE, Block, Heap, MAX_SEGMENTS, META_WORDS, Os, PAGE_SIZE, SEGMENT_SIZE, ThreadCache,
 };
@@ -49,6 +50,9 @@ fn arena() -> Option<&'static Arena> {
       // A missing mandatory facility is a platform the allocator does not
       // support, not an out-of-memory condition: say so and stop.
       let platform = allocatbelt_sys::probe().unwrap_or_else(|e| LinuxOs.fatal(e.message()));
+      // Allocation-free (cpuid, getauxval or riscv_hwprobe). Allocations
+      // before this point, and on the way here, use the baseline kernels.
+      let _ = allocatbelt_arch::initialize_dispatch();
       let arena = Arena {
         user: Region::reserve(ARENA_SIZE, SEGMENT_SIZE)?,
         meta: MetaArena::reserve(META_WORDS)?,
@@ -299,6 +303,22 @@ impl Allocatbelt {
   #[must_use]
   pub fn platform(self) -> Option<Capabilities> {
     arena().map(|a| a.platform)
+  }
+
+  /// The ISA extensions detected on this CPU, for diagnostics. A detected
+  /// feature does not mean allocatbelt has a kernel that uses it; see
+  /// [`Allocatbelt::kernel_set`].
+  #[must_use]
+  pub fn cpu_features(self) -> CpuFeatures {
+    allocatbelt_arch::detected_features()
+  }
+
+  /// The architecture kernels in use: [`KernelSet::Baseline`] until the
+  /// first allocation has initialised the allocator, and for now also
+  /// afterwards, since no architecture kernel has been admitted yet.
+  #[must_use]
+  pub fn kernel_set(self) -> KernelSet {
+    allocatbelt_arch::kernel_set()
   }
 
   /// Segments (4 MiB) currently taken from the arena, for diagnostics.
