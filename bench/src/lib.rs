@@ -50,6 +50,33 @@ fn churn(seed: u64, ops: usize, window: usize) -> usize {
   touched
 }
 
+/// Small objects only (16–256 B), the class-block fast path.
+fn small_churn(seed: u64, ops: usize, window: usize) -> usize {
+  let mut rng = Rng(seed | 1);
+  let mut live: Vec<Box<[u8]>> = Vec::with_capacity(window);
+  let mut n = 0usize;
+  for _ in 0..ops {
+    let b = vec![1u8; 16 + (rng.next() % 241) as usize].into_boxed_slice();
+    n += b.len();
+    if live.len() < window {
+      live.push(b);
+    } else {
+      let i = (rng.next() as usize) % window;
+      live[i] = b;
+    }
+  }
+  black_box(&live);
+  n
+}
+
+fn threads_small(threads: usize, ops: usize) {
+  std::thread::scope(|s| {
+    for t in 0..threads {
+      s.spawn(move || black_box(small_churn(t as u64 * 7919 + 1, ops, 1000)));
+    }
+  });
+}
+
 fn threads_local(threads: usize, ops: usize) {
   std::thread::scope(|s| {
     for t in 0..threads {
@@ -115,6 +142,11 @@ pub fn run(name: &str) {
     &format!("{threads}-thread local churn 1M each"),
     name,
     || threads_local(threads, 1_000_000),
+  );
+  time(
+    &format!("{threads}-thread small churn 4M each"),
+    name,
+    || threads_small(threads, 4_000_000),
   );
   time(
     &format!("{} producer/consumer pairs 20k batches", threads / 2),
