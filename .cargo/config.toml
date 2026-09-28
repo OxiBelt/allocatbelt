@@ -1,3 +1,20 @@
+# x86-64-v3 is the minimum x86_64 CPU (docs/platform.md), and allocatbelt-sys
+# rejects x86_64 builds without it. This covers every x86_64 Linux target
+# (gnu and musl) built inside this repository. A `RUSTFLAGS` environment
+# variable replaces these flags, so it must carry `-C target-cpu=x86-64-v3`
+# (or a newer CPU) itself. Crates depending on allocatbelt from elsewhere
+# (OxiBelt) do not read this file and must set the flag in their own build.
+[target.'cfg(target_arch = "x86_64")']
+rustflags = ["-C", "target-cpu=x86-64-v3"]
+
+# rustdoc compiles the crates again for doctests and reads only
+# `rustdocflags`, which cargo takes from triple tables, not `cfg` ones.
+[target.x86_64-unknown-linux-gnu]
+rustdocflags = ["-C", "target-cpu=x86-64-v3"]
+
+[target.x86_64-unknown-linux-musl]
+rustdocflags = ["-C", "target-cpu=x86-64-v3"]
+
 # Cross-testing on riscv64 (see README). Only applies when building for that target.
 # `-cpu max` enables every extension qemu implements: Zbb for builds with
 # `-C target-feature=+zbb`, and the RVA23 set (V, Zicond, ...) that Ubuntu

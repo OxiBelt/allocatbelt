@@ -7,7 +7,9 @@ rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
 
-[target.'cfg(target_os = "linux")'.dependencies]
+# Unconditional, so that a build for an unsupported platform reaches the
+# platform gates in allocatbelt-sys instead of producing an empty crate.
+[dependencies]
 allocatbelt-core.workspace = true
 allocatbelt-sys.workspace = true
 

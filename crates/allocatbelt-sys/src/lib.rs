@@ -8,9 +8,12 @@
 //! `unsafe fn` and document the contract the caller (the heap) must uphold.
 //!
 //! Nothing in this crate allocates, panics on the hot path, or unwinds.
+//!
+//! This crate also holds the platform contract (`platform`): builds for
+//! anything but 64-bit little-endian Linux on x86_64 (x86-64-v3 or newer),
+//! aarch64 or riscv64 fail here with a `compile_error!`.
 
 #![no_std]
-#![cfg(target_os = "linux")]
 #![cfg_attr(not(test), deny(clippy::expect_used, clippy::unwrap_used))]
 
 use core::ffi::c_void;
@@ -18,6 +21,8 @@ use core::ptr::NonNull;
 use core::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 
 use rustix::mm::{self, Advice, MapFlags, MprotectFlags, ProtFlags};
+
+mod platform;
 
 /// A reserved, never-unmapped range of virtual address space.
 ///

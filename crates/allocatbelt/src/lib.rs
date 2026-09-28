@@ -9,8 +9,10 @@
 //! and works on offsets. This crate turns offsets into pointers through
 //! `allocatbelt-sys` and contains the `unsafe` that the `GlobalAlloc` contract
 //! itself requires: the trait impl, zero-filling and the `realloc` copy.
-
-#![cfg(target_os = "linux")]
+//!
+//! Only 64-bit little-endian Linux on x86_64 (x86-64-v3 or newer), aarch64
+//! and riscv64 is supported; `allocatbelt-sys` rejects other builds (see
+//! `docs/platform.md`).
 #![cfg_attr(not(test), deny(clippy::expect_used, clippy::unwrap_used))]
 
 use std::alloc::{GlobalAlloc, Layout};
