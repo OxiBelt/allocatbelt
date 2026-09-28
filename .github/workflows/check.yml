@@ -58,6 +58,42 @@ jobs:
       - name: Cargo test
         run: cargo test --release --all-features --locked
 
+  # The platform contract (docs/platform.md): x86_64 builds need x86-64-v3,
+  # and unsupported architectures, ABIs, byte orders and operating systems
+  # fail at compile time with the gates' own messages.
+  platform-gates:
+    name: Platform gates (x86-64-v3 floor, unsupported targets rejected)
+    runs-on: ubuntu-26.04
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # 7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Install Rust toolchain and targets
+        run: |
+          rustup toolchain install 1.98.1 --profile minimal
+          rustup default 1.98.1
+          rustup target add \
+            x86_64-unknown-linux-musl \
+            aarch64-unknown-linux-gnu \
+            riscv64gc-unknown-linux-gnu \
+            i686-unknown-linux-gnu \
+            armv7-unknown-linux-gnueabihf \
+            x86_64-unknown-linux-gnux32 \
+            powerpc64le-unknown-linux-gnu \
+            s390x-unknown-linux-gnu \
+            x86_64-unknown-freebsd
+
+      - name: Fetch locked Cargo dependency graph
+        run: cargo fetch --locked
+
+      - name: Check the platform gates
+        run: scripts/check-platform-gates.sh
+
   riscv64-qemu-tests:
     name: riscv64 tests under qemu-user (${{ matrix.name }})
     runs-on: ubuntu-26.04
