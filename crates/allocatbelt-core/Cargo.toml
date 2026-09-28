@@ -15,8 +15,12 @@ model = []
 [dev-dependencies]
 proptest.workspace = true
 
+# Model checker for the atomic protocols in `proto.rs`, only under
+# `RUSTFLAGS="--cfg loom"`. Declared here rather than in
+# `[workspace.dependencies]`: cargo-deny resolves the graph without
+# `--cfg loom` and would reject it there as an unused workspace dependency.
 [target.'cfg(loom)'.dependencies]
-loom.workspace = true
+loom = "0.7.2"
 
 [lints]
 workspace = true

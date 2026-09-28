@@ -19,8 +19,6 @@ allocatbelt = { path = "crates/allocatbelt" }
 allocatbelt-core = { path = "crates/allocatbelt-core" }
 allocatbelt-sys = { path = "crates/allocatbelt-sys" }
 libc = { version = "0.2.189", default-features = false }
-# Model checker for `allocatbelt-core`'s atomic protocols, only under `--cfg loom`.
-loom = "0.7.2"
 # Baseline only: OxiBelt currently ships secure mimalloc on x86_64 Linux.
 mimalloc = { version = "0.1.52", default-features = false, features = ["secure"] }
 proptest = { version = "1.11.0", default-features = false, features = ["std"] }
