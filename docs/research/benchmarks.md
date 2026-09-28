@@ -84,3 +84,30 @@ With 4 KiB OS pages, the unused tail of a 64 KiB page costs address space but no
 ### Segment return: aging
 
 Returning every empty segment on each budget-triggered purge pass made a 64 KiB–1 MiB churn decommit and recommit segments repeatedly (`mprotect` calls 343 → 650, about 10% slower). A segment now goes back only if it is still empty at the pass after the one that found it empty (`mprotect` 542, same speed as before), and each shard keeps one empty segment.
+
+## Third round: per-thread caches, summaries, decay, hardening (2026-09-28)
+
+- **Environment:** the 4-vCPU VM of the second round (Intel Xeon @ 2.80GHz, shared, Linux 6.18), rustc 1.98.1, `--release`. 4 churn threads, 2 producer/consumer pairs. Run-to-run noise on this VM is ±10–15%, so each cell is the median of 10 alternating runs of all four binaries.
+- **before** = `9a0ad1e`: the code after the second round, with the bench changes below. **after** = this branch, with randomized placement and guard pages on (the defaults), and `bench-allocatbelt` starting the purge thread (`Allocatbelt::start_purge_thread`), the recommended setup.
+- **Bench changes:** a small-object-only workload (`4-thread small churn`: 16–256 B boxes, 4M operations per thread), and an **idle** row: VmRSS after the workloads and 3 s without allocator calls, i.e. what a server keeps between bursts.
+
+| Workload (ms / MB, median) | system (glibc) | mimalloc-secure | allocatbelt before | allocatbelt after |
+|---|---:|---:|---:|---:|
+| single-thread churn 2M | 228 | 829 | 162 | 176 |
+| 4-thread local churn | 152 | 583 | 238 | 217 |
+| 4-thread small churn | 214 | 441 | 299 | 284 |
+| 2 producer/consumer pairs | 1565 | 446 | 229 | 211 |
+| VmHWM (peak RSS) | 47 | 280 | 23 | 24 |
+| VmRSS at the end | 18 | 41 | 23 | 24 |
+| **VmRSS after 3 s idle** | 18 | 41 | 23 | **6** |
+
+- **Throughput.**
+  - The multi-threaded workloads are 5–10% faster.
+  - Single-thread churn is within noise. Its minimums are equal (155 vs 156 ms), and a separate run of that workload alone gave 164 ms before vs. 159 after (159 with randomization off, 168 without the purge thread).
+  - On this VM each thread has its own shard, so the shard lock the caches take off the fast path was never contended. The gain should be larger with more threads than shards per core, which a 4-vCPU VM cannot show.
+- **Idle RSS.** The purge thread returns freed memory within about a second of the last free, so the idle process keeps 6 MB instead of the 23 MB high-water mark. Without the thread, a process that stops allocating keeps its freed memory until the next allocation slow path (or the 32 MiB budget) triggers a pass. glibc and mimalloc keep theirs too.
+- **Development measurements** (single-thread, 20M random 16–256 B alloc/free pairs, before → after unless noted):
+  - The first per-thread cache was ~8% *slower*. Profiling (callgrind on a build with a smaller arena) found three causes: a scan of all 64 buffer slots on every refill, a division per free, and register spills in one large inlined free path. The fixes were a per-class slot mask with flush-before-new-page, a per-class reciprocal (`class::block_index`), and a slim inline fast path with out-of-line slow paths. After them it was at parity (1235 vs 1215 ms median).
+  - Frees reach the bitmap at one `fetch_or` per ~2.3 frees under random frees. Refills claim a word every ~13 allocations (1.56M refills for 20M allocations).
+  - A first time-based decay read the clock on every page-run free (`Instant::now` costs 28 ns here) and cost ~12% on mixed churn (152 → 170 ms). Stamping pages with a decay-pass epoch instead, and sampling the clock every 16th slow path per thread, brought it back to 157 vs 157 ms.
+- **Segment return.** Budget passes no longer return empty segments by the two-pass rule of the second round; segments go back once they have been empty for the purge delay, or on an explicit `purge()`.

@@ -160,4 +160,11 @@ pub fn run(name: &str) {
     rss_kib("VmHWM:"),
     rss_kib("VmRSS:")
   );
+  // What a server keeps after a burst while it waits for the next one: no
+  // allocator calls happen during the sleep.
+  std::thread::sleep(std::time::Duration::from_secs(3));
+  println!(
+    "{name}\tidle\tVmRSS after 3 s idle {} KiB",
+    rss_kib("VmRSS:")
+  );
 }
