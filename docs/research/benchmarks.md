@@ -112,3 +112,47 @@ Returning every empty segment on each budget-triggered purge pass made a 64 KiB�
   - Frees reach the bitmap at one `fetch_or` per ~2.3 frees under random frees. Refills claim a word every ~13 allocations (1.56M refills for 20M allocations).
   - A first time-based decay read the clock on every page-run free (`Instant::now` costs 28 ns here) and cost ~12% on mixed churn (152 → 170 ms). Stamping pages with a decay-pass epoch instead, and sampling the clock every 16th slow path per thread, brought it back to 157 vs 157 ms.
 - **Segment return.** Budget passes no longer return empty segments by the two-pass rule of the second round; segments go back once they have been empty for the purge delay, or on an explicit `purge()`.
+
+## Lock contention: `sched_yield` vs futex (plan Phase 6, 2026-09-28)
+
+The heap's locks used to spin 64 times and then call `sched_yield` in a loop. They now spin up to 100 times and then sleep on a futex (`FUTEX_WAIT`, process-private), and an unlock issues `FUTEX_WAKE` only when a thread may be asleep (the three-state futex mutex; `crates/allocatbelt-core/src/lock.rs`). An uncontended lock and unlock stays in user space: one compare-and-swap and one swap, where the old unlock was a plain store.
+
+- **Environment:** a 4-vCPU shared VM (Intel Xeon @ 2.10 GHz), Linux 6.18.44, rustc 1.98.1, `--release`, x86-64-v3. No hardware counters. **yield** = `f374343` (before this change), **futex** = this change; both built with the same bench, run alternately.
+
+### How often the heap waits at all
+
+A local, uncommitted counter patch (as in Phase 5) counted entries into the lock's slow path during `bench-allocatbelt`. Per run of each workload: 0 in single-thread churn, small churn and producer/consumer, 0–1 in 4-thread local churn, and 2–4 (with up to 11 futex waits) in the new oversubscribed row below. Thread caches and shard probing (`with_shard` tries four shards before it waits) keep the heap's locks almost uncontended, so the change cannot move these workloads much either way; it matters when a waiter meets a holder that is off the CPU.
+
+### The lock itself (`lock::tests::contention_benchmark`)
+
+`cargo test --release -p allocatbelt-core --lib contention_benchmark -- --ignored --nocapture` runs the futex lock against a copy of the old `sched_yield` lock. Threads take one lock in a loop: 50 iterations of work inside, 200 outside. In the "holder blocks" rows, every 64th holder also sleeps 20 µs inside the lock, as a holder in `mprotect`/`madvise` (the shard lock is held across segment commits) or a preempted one would. Median of 7 runs:
+
+| Scenario | Threads | Lock | Wall ms | CPU ms | CPU / wall |
+|---|---:|---|---:|---:|---:|
+| short hold | 4 | yield | 108.4 | 420.1 | 3.88 |
+| short hold | 4 | futex | 87.5 | 313.2 | 3.58 |
+| short hold, 4× threads | 16 | yield | 105.7 | 400.1 | 3.79 |
+| short hold, 4× threads | 16 | futex | 90.9 | 357.0 | 3.93 |
+| holder blocks 1/64 | 4 | yield | 131.8 | 373.4 | 2.83 |
+| holder blocks 1/64 | 4 | futex | 135.2 | 60.6 | 0.45 |
+| holder blocks 1/64, 4× threads | 16 | yield | 152.4 | 570.6 | 3.74 |
+| holder blocks 1/64, 4× threads | 16 | futex | 136.2 | 57.3 | 0.42 |
+
+- **When a holder blocks, `sched_yield` burns the machine.** Waiters of the old lock kept 3 to 4 CPUs busy re-checking the lock while the holder slept; the futex lock used 0.4 to 0.5 CPUs for the same work, 6 to 10 times less CPU, and the wall time was the same or better. In a server, that CPU belongs to the request, TLS and network threads.
+- **Short holds:** the futex lock took 14 to 19% less wall time; the spin phase handles these and threads rarely sleep.
+
+### Allocator workloads (`bench-allocatbelt`, gate B)
+
+The bench has a new last row: the 4-thread local churn's work spread over 16 threads (4× the CPUs), so holders get preempted. 20 alternating runs of each binary; "paired" is the median of the per-pair ratios futex / yield, with its interquartile range.
+
+| Workload | yield ms (median) | futex ms (median) | Paired ratio (IQR) |
+|---|---:|---:|---|
+| single-thread churn 2M | 136.8 | 143.6 | 1.01 (0.95–1.16) |
+| 4-thread local churn | 185.4 | 182.1 | 1.02 (0.91–1.08) |
+| 4-thread small churn | 279.5 | 273.8 | 0.98 (0.93–1.03) |
+| 2 producer/consumer pairs | 111.7 | 109.9 | 0.92 (0.80–1.20) |
+| 16-thread local churn (oversubscribed) | 166.9 | 164.2 | 0.99 (0.91–1.07) |
+
+Peak RSS (23.8 vs 23.9 MB) and RSS after 3 s idle (6.4 vs 6.4 MB) did not change. Every paired median is within 2% except producer/consumer (8% faster, with a wide spread). The run-to-run spread on this VM is ±5–10%, so it can rule out a regression of that size but not one of 1–3%; the counts above say the slow path runs a handful of times per workload, and the only fast-path difference is the swap on unlock.
+
+**Decision:** adopted. `sched_yield` is no longer the long-contention strategy (plan §11.1): `Os::yield_now` is replaced by `Os::futex_wait`/`Os::futex_wake`, which the adapter implements with rustix's safe futex calls (`allocatbelt_sys::futex_wait`/`futex_wake`, no new `unsafe`). The mock `Os` of the model tests yields instead, and loom checks the state machine with a futex emulation (`proto::loom_tests`). Still to measure: a many-core machine, where more threads share a shard, and OxiBelt under load.
