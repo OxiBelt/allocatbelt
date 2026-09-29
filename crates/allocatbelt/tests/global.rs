@@ -242,3 +242,21 @@ fn diagnostics_are_readable_through_the_adapter() {
   .join()
   .unwrap();
 }
+
+#[test]
+fn reclamation_is_configurable_through_the_adapter() {
+  use allocatbelt::{ReclaimTargets, ReclaimTargetsError, Retention};
+  assert_eq!(GLOBAL.reclaim_targets(), ReclaimTargets::DEFAULT);
+  assert_eq!(
+    ReclaimTargets::from_bytes(64 << 20, 32 << 20, 128 << 20),
+    Err(ReclaimTargetsError::Order)
+  );
+  // Setting the defaults again changes nothing for the other tests.
+  GLOBAL.set_reclaim_targets(ReclaimTargets::DEFAULT);
+  GLOBAL.set_retention(Retention::Fixed);
+  let s = GLOBAL.reclaim_status();
+  assert_eq!(
+    (s.targets, s.retention_mode, s.retention),
+    (ReclaimTargets::DEFAULT, Retention::Fixed, 1)
+  );
+}

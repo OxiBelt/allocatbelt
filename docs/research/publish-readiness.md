@@ -60,6 +60,8 @@ What 0.1.0 would publish: `Allocatbelt` (the allocator and its methods), `Policy
 
 Added after this review (theory-driven plan Stage A, see [theory-driven-implementation-status.md](theory-driven-implementation-status.md)): `SearchStats`, `CacheStats` and `HeapUsage`, all `#[non_exhaustive]`, read through `Allocatbelt::search_stats`, `heap_usage` and `thread_cache_stats`, and new `MaintenanceStats` fields.
 
+Added by Stage B (bounded, resumable reclamation, [reclamation.md](../reclamation.md)): `ReclaimTargets` (private fields), `ReclaimTargetsError`, `Retention` and `ReclaimStatus` (all three `#[non_exhaustive]`), `MAX_RETENTION` and `Task` (now exported, `#[non_exhaustive]`), read and set through `Allocatbelt::set_reclaim_targets`, `reclaim_targets`, `set_retention` and `reclaim_status`; `SearchStats::dirty_reused_pages`; and the `MaintenanceStats` fields `slices`, `inline_slices`, `emergency_slices` and `stalled_cycles`. `MaintenanceStats::hard_limit_passes` (Stage A, unpublished) was renamed `hard_limit_slices`.
+
 Changed in this review, so that later additions are not breaking:
 
 - `#[non_exhaustive]` on `MaintenanceStats`, `PurgeBackend`, `Capabilities`, `RingError`, `RseqStatus` and `RseqUnavailable`: types whose fields or variants are expected to grow (new counters, backends, probe results, rseq failure causes). The other report and policy types already were. Users read these types; they cannot build them with a literal or match them exhaustively any more, which nothing in this repository did.

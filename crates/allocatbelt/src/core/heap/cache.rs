@@ -240,7 +240,7 @@ impl<O: Os> Heap<O> {
     let ticks = tc.ticks.get().wrapping_add(1);
     tc.ticks.set(ticks);
     if ticks.is_multiple_of(16) {
-      self.maybe_decay();
+      self.maybe_housekeep();
     }
   }
 

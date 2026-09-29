@@ -15,7 +15,9 @@ use crate::arch::{CpuFeatures, KernelSet};
 use crate::core::{
   ARENA_SIZE, Block, Heap, MAX_SEGMENTS, META_WORDS, Os, PAGE_SIZE, SEGMENT_SIZE, ThreadCache,
 };
-use crate::core::{CacheStats, HeapUsage, MaintenanceStats, SearchStats};
+use crate::core::{
+  CacheStats, HeapUsage, MaintenanceStats, ReclaimStatus, ReclaimTargets, Retention, SearchStats,
+};
 use crate::sys::{Capabilities, MetaArena, Region};
 
 pub(crate) struct Arena {
@@ -343,10 +345,45 @@ impl Allocatbelt {
   }
 
   /// Sets how long freed memory stays resident before it is returned to the
-  /// OS (1 s by default). Memory is also returned early once 32 MiB of it
-  /// is waiting.
+  /// OS (1 s by default). Memory is also returned early once more than the
+  /// trigger (32 MiB by default, see [`Allocatbelt::set_reclaim_targets`])
+  /// is waiting. A sweep in progress keeps the delay it started with.
   pub fn set_purge_delay(self, delay: Duration) {
     HEAP.set_purge_delay_ms(u64::try_from(delay.as_millis()).unwrap_or(u64::MAX));
+  }
+
+  /// Sets the thresholds on freed memory waiting for a purge: past the
+  /// trigger a budget cycle starts and purges down to the low target; past
+  /// the emergency threshold freeing threads reclaim themselves even with
+  /// a maintenance thread. Defaults: low 0, trigger 32 MiB, emergency
+  /// 64 MiB ([`ReclaimTargets::DEFAULT`]). They bound the freed pages the
+  /// allocator tracks, not the process's RSS. Does not initialise the
+  /// allocator.
+  pub fn set_reclaim_targets(self, targets: ReclaimTargets) {
+    HEAP.set_reclaim_targets(targets);
+  }
+
+  /// The thresholds in force (see [`Allocatbelt::set_reclaim_targets`]).
+  #[must_use]
+  pub fn reclaim_targets(self) -> ReclaimTargets {
+    HEAP.reclaim_targets()
+  }
+
+  /// Sets how long decay keeps freed memory: exactly the purge delay
+  /// ([`Retention::Fixed`], the default), or, opt-in, up to
+  /// [`crate::MAX_RETENTION`] times it while freed memory keeps being
+  /// reused ([`Retention::Adaptive`]). The thresholds of
+  /// [`Allocatbelt::set_reclaim_targets`] apply either way.
+  pub fn set_retention(self, retention: Retention) {
+    HEAP.set_retention(retention);
+  }
+
+  /// Where reclamation stands: thresholds, the sweep in progress, whether a
+  /// budget cycle is pending or deferred, and the retention in force, for
+  /// diagnostics. Allocation-free.
+  #[must_use]
+  pub fn reclaim_status(self) -> ReclaimStatus {
+    HEAP.reclaim_status()
   }
 
   /// Asks the maintenance thread to return all freed memory and empty
@@ -359,9 +396,10 @@ impl Allocatbelt {
     }
   }
 
-  /// Counters of the housekeeping passes: how many each kind ran on the
-  /// maintenance thread and inline, and the work they did (pages
-  /// inspected, runs purged or refused, pages returned), for diagnostics.
+  /// Counters of the housekeeping passes and the bounded slices they run
+  /// in: how many each kind ran on the maintenance thread and inline, and
+  /// the work they did (pages inspected, runs purged or refused, pages
+  /// returned), for diagnostics.
   #[must_use]
   pub fn maintenance_stats(self) -> MaintenanceStats {
     HEAP.maintenance_stats()

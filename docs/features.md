@@ -60,7 +60,7 @@ purge_backend: Madvise
 
 The three queries are allocation-free; formatting the report allocates in the caller.
 
-Without any feature (`default-features = false`) the allocator is complete: allocation, the per-thread caches, delayed purging with the dirty budget and hard limit, `purge()`, `request_purge()` (inline), guard pages, randomized placement and fork handling are the same in every build. What is missing is only the background thread, so the decay and budget passes run on the allocating threads, and idle memory is returned on the next allocator call instead of while the process sleeps.
+Without any feature (`default-features = false`) the allocator is complete: allocation, the per-thread caches, delayed purging with the reclamation thresholds ([reclamation.md](reclamation.md)), `purge()`, `request_purge()` (inline), guard pages, randomized placement and fork handling are the same in every build. What is missing is only the background thread, so the decay sweeps and budget cycles run on the allocating threads, in bounded slices, and idle memory is returned on the next allocator call instead of while the process sleeps.
 
 ## Not features
 

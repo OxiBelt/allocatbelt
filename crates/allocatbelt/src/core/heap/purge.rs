@@ -3,21 +3,24 @@
 //!
 //! Freed page runs are only marked dirty and stay resident, so that a
 //! workload that frees and reallocates reuses them without a syscall. Three
-//! kinds of pass return memory:
+//! kinds of pass (sweeps, run in bounded slices, see [`super::reclaim`])
+//! return memory:
 //!
 //! * a **decay** pass purges the pages that have been dirty for the purge
 //!   delay, and returns segments that have been empty that long. Decay
-//!   passes are due every quarter delay; allocation slow paths run one when
-//!   it is due, or a background thread calls [`Heap::decay`] instead. Ages
-//!   are counted in decay passes (epochs) rather than read from the clock,
-//!   so freeing never reads it: a page freed in epoch `e` is purged by the
+//!   epochs are due every quarter delay; allocation slow paths start one
+//!   when it is due, or a background thread calls [`Heap::decay`] instead.
+//!   Ages are counted in decay epochs rather than read from the clock, so
+//!   freeing never reads it: a page freed in epoch `e` is purged by the
 //!   pass that starts epoch `e + 5`, one to one and a quarter delays later
-//!   when passes are regular, later when they are not;
-//! * a **budget** pass runs when more than [`DIRTY_BUDGET_PAGES`] pages are
-//!   dirty and purges all of them at once, bounding the tracked dirty pages
-//!   under churn (not the process's RSS: live blocks, blocks held in thread
-//!   caches, metadata and pages the OS has not reclaimed yet are outside
-//!   it);
+//!   when passes are regular, later when they are not (and later still
+//!   with [`Retention::Adaptive`](super::Retention::Adaptive));
+//! * a **budget** cycle runs when more than the trigger
+//!   ([`ReclaimTargets`](super::ReclaimTargets), 512 pages by default) are
+//!   dirty and purges regardless of age down to the low target, bounding
+//!   the tracked dirty pages under churn (not the process's RSS: live
+//!   blocks, blocks held in thread caches, metadata and pages the OS has
+//!   not reclaimed yet are outside it);
 //! * an explicit [`Heap::purge`] returns everything it can right away.
 //!
 //! Every pass also releases small pages whose blocks are all free, turning
@@ -36,10 +39,11 @@
 //! reported as zero.
 
 use super::maint::PassWork;
+use super::reclaim::Want;
 use super::*;
 
-/// Decay passes per purge delay.
-const DECAY_STEPS: u64 = 4;
+/// Decay epochs per purge delay.
+pub(super) const DECAY_STEPS: u64 = 4;
 
 /// The most page runs one [`Purger::purge_batch`] call carries.
 pub const PURGE_BATCH: usize = 64;
@@ -76,58 +80,78 @@ impl<O: Os> Purger for SyncPurger<'_, O> {
   }
 }
 
-/// Runs claimed by a pass and not yet purged.
-struct Batch {
+/// Runs claimed by a slice and not yet purged.
+pub(super) struct Batch {
   ranges: [(usize, usize); PURGE_BATCH],
   purged: [bool; PURGE_BATCH],
-  len: usize,
+  pub(super) len: usize,
   /// Per segment in the batch: its index and the pages claimed in it.
   segs: [(usize, u64); PURGE_BATCH],
   nsegs: usize,
-  /// The work of the pass so far.
-  work: PassWork,
+  /// The work of the slice so far.
+  pub(super) work: PassWork,
 }
 
-/// What a pass returns.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(super) enum Pass {
-  /// Pages dirty for the purge delay; segments empty for the purge delay.
-  Decay,
-  /// All dirty pages; segments empty for the purge delay.
-  Budget,
-  /// All dirty pages and all empty segments (but one per shard).
-  Force,
+impl Batch {
+  pub(super) const fn new() -> Self {
+    Self {
+      ranges: [(0, 0); PURGE_BATCH],
+      purged: [false; PURGE_BATCH],
+      len: 0,
+      segs: [(0, 0); PURGE_BATCH],
+      nsegs: 0,
+      work: PassWork::new(),
+    }
+  }
+
+  /// Pages claimed and not purged yet.
+  pub(super) fn claimed_pages(&self) -> u64 {
+    self.segs[..self.nsegs]
+      .iter()
+      .map(|&(_, claimed)| u64::from(claimed.count_ones()))
+      .sum()
+  }
 }
 
 impl<O: Os> Heap<O> {
   /// Returns the memory of every free, dirty page to the OS, and empty
   /// segments (beyond one per shard) to the arena, without waiting for the
-  /// purge delay.
+  /// purge delay: a force sweep, run to its end here in slices (replacing
+  /// any other sweep in progress; a budget cycle continues afterwards if
+  /// still needed).
   ///
   /// Embedders may call this from a maintenance task (e.g. when idle).
   /// Shards that are allocating at that moment keep their empty segments
   /// until the next pass. Blocks held in thread caches stay allocated; flush
-  /// the calling thread's cache first with [`Heap::flush`].
+  /// the calling thread's cache first with [`Heap::flush`]. Pages freed
+  /// while it runs may stay dirty: it does not chase concurrent frees.
   pub fn purge(&self) {
     let _g = self.purge_lock.lock(&self.os);
-    self.pass(Pass::Force, &mut SyncPurger(&self.os));
+    self.reset_retention();
+    self.run_sweep(Want::NewForce, &mut SyncPurger(&self.os));
   }
 
-  /// Runs a decay pass: purges the pages that have been dirty for the purge
-  /// delay and returns segments that have been empty that long. For a
-  /// background thread that calls it every [`Heap::decay_interval_ms`]; see
+  /// Runs a decay pass: advances the decay epoch, then purges the pages
+  /// that have been dirty for the purge delay and returns segments that
+  /// have been empty that long, to the end of the sweep. A sweep of
+  /// another kind in progress is finished first. For a background thread
+  /// that calls it every [`Heap::decay_interval_ms`]; see
   /// [`Heap::set_auto_decay`].
   pub fn decay(&self) {
     let _g = self.purge_lock.lock(&self.os);
-    self.last_decay_ms.store(self.os.now_ms(), Relaxed);
-    self.pass(Pass::Decay, &mut SyncPurger(&self.os));
+    self.decay_tick(self.os.now_ms());
+    self.run_sweep(Want::Decay, &mut SyncPurger(&self.os));
   }
 
   /// Sets how long freed pages stay resident and empty segments stay owned
   /// before a decay pass returns them ([`DEFAULT_PURGE_DELAY_MS`] by
-  /// default). 0 returns them at the next pass.
+  /// default). 0 returns them at the next pass. A sweep in progress keeps
+  /// the delay it started with.
   pub fn set_purge_delay_ms(&self, ms: u64) {
     self.purge_delay_ms.store(ms, Relaxed);
+    if ms == 0 {
+      self.reset_retention();
+    }
     self.poke_maintenance();
   }
 
@@ -136,21 +160,10 @@ impl<O: Os> Heap<O> {
     self.purge_delay_ms.load(Relaxed)
   }
 
-  /// How often decay passes are due: a quarter of the purge delay, at least
+  /// How often decay epochs are due: a quarter of the purge delay, at least
   /// 1 ms.
   pub fn decay_interval_ms(&self) -> u64 {
     (self.purge_delay_ms() / DECAY_STEPS).max(1)
-  }
-
-  /// Decay passes a page stays dirty (a segment stays empty) before a decay
-  /// pass returns it: one more than the passes per delay, since the first
-  /// may follow the free immediately.
-  fn decay_age(&self) -> u64 {
-    if self.purge_delay_ms() == 0 {
-      0
-    } else {
-      DECAY_STEPS + 1
-    }
   }
 
   /// Whether allocation slow paths run decay passes when they are due (the
@@ -160,147 +173,9 @@ impl<O: Os> Heap<O> {
     self.auto_decay.store(on, Relaxed);
   }
 
-  /// Runs a decay pass if one is due and nobody else is running a pass.
-  /// Called from allocation slow paths (sampled, as it reads the clock),
-  /// never with a shard lock held.
-  pub(super) fn maybe_decay(&self) {
-    if !self.auto_decay.load(Relaxed) {
-      return;
-    }
-    let now = self.os.now_ms();
-    let due = self
-      .last_decay_ms
-      .load(Relaxed)
-      .saturating_add(self.decay_interval_ms());
-    if now < due {
-      return;
-    }
-    if let Some(_g) = self.purge_lock.try_lock(&self.os) {
-      self.last_decay_ms.store(now, Relaxed);
-      self.pass(Pass::Decay, &mut SyncPurger(&self.os));
-      self.count(maint::Stat::InlineDecay);
-    } else {
-      self.count(maint::Stat::SkippedPass);
-    }
-  }
-
-  /// Caller holds `purge_lock`.
-  pub(super) fn pass<P: Purger>(&self, kind: Pass, purger: &mut P) {
-    // Only decay passes age pages and segments.
-    let epoch = if kind == Pass::Decay {
-      self.epoch.fetch_add(1, Relaxed) + 1
-    } else {
-      self.epoch.load(Relaxed)
-    };
-    let age = self.decay_age();
-    let mut batch = Batch {
-      ranges: [(0, 0); PURGE_BATCH],
-      purged: [false; PURGE_BATCH],
-      len: 0,
-      segs: [(0, 0); PURGE_BATCH],
-      nsegs: 0,
-      work: PassWork::default(),
-    };
-    self.trim_shards(epoch, age, kind == Pass::Force, &mut batch.work);
-    // Pages dirty since epoch `cutoff` or earlier are purged.
-    let cutoff = match kind {
-      Pass::Decay => epoch.checked_sub(age),
-      Pass::Budget | Pass::Force => Some(u64::MAX),
-    };
-    if let Some(cutoff) = cutoff {
-      self.purge_segments(cutoff, &mut batch, purger);
-    }
-    self.count_work(&batch.work);
-  }
-
-  /// Claims and purges the pages of every owned segment dirty since epoch
-  /// `cutoff` or earlier. Caller holds `purge_lock`.
-  fn purge_segments<P: Purger>(&self, cutoff: u64, batch: &mut Batch, purger: &mut P) {
-    // Only decay passes compare ages.
-    let kernel = if cutoff == u64::MAX {
-      None
-    } else {
-      self.os.age_kernel()
-    };
-    let batch_size = purger.batch_size().clamp(1, PURGE_BATCH);
-    for (wi, word) in self.seg_used.iter().enumerate() {
-      let mut used_segs = word.load(Relaxed);
-      while used_segs != 0 {
-        let seg = wi * 64 + used_segs.trailing_zeros() as usize;
-        used_segs &= used_segs - 1;
-        if let Some(m) = self.os.meta(seg)
-          && m[SEG_HDR].load(Acquire) & 0xFF == SEG_OWNED
-        {
-          batch.work.segments_inspected += 1;
-          self.claim_segment(seg, m, cutoff, kernel, batch, purger);
-          if batch.len >= batch_size {
-            self.purge_claimed(batch, purger);
-          }
-        }
-      }
-    }
-    self.purge_claimed(batch, purger);
-  }
-
-  /// Releases the fully free small pages of each idle shard, then unlinks
-  /// and frees its empty segments, except the first, once they have been
-  /// empty for `age` epochs (or right away if `force`). Caller holds
-  /// `purge_lock`, so no purge pass races the claim.
-  fn trim_shards(&self, epoch: u64, age: u64, force: bool, work: &mut PassWork) {
-    for sh in &self.shards {
-      let Some(_g) = sh.lock.try_lock(&self.os) else {
-        work.busy_shards += 1;
-        continue;
-      };
-      work.trimmed_shards += 1;
-      for c in 0..NUM_CLASSES {
-        self.release_empty_pages(sh, c, work);
-      }
-      let mut kept_empty = false;
-      let mut prev: Option<&[AtomicU64]> = None;
-      let mut cur = sh.segs.load(Relaxed);
-      while cur != 0 {
-        let seg = cur as usize - 1;
-        let m = self.seg_meta(seg);
-        let next = m[SEG_NEXT].load(Relaxed);
-        let empty = m[SEG_PAGES].load(Acquire) == GUARD_BIT;
-        let expired = if empty && kept_empty {
-          // Idle since epoch `since - 1`; stamped by the first pass that
-          // saw it.
-          let since = m[SEG_IDLE].load(Relaxed);
-          if since == 0 {
-            m[SEG_IDLE].store(epoch + 1, Relaxed);
-          }
-          force || (since != 0 && (since - 1).saturating_add(age) <= epoch)
-        } else {
-          m[SEG_IDLE].store(0, Relaxed);
-          false
-        };
-        // Claiming every page shuts out the only other claimers:
-        // in-place growth, which needs a live block in the segment.
-        if expired
-          && m[SEG_PAGES]
-            .compare_exchange(GUARD_BIT, u64::MAX, AcqRel, Relaxed)
-            .is_ok()
-        {
-          match prev {
-            None => sh.segs.store(next as u32, Relaxed),
-            Some(p) => p[SEG_NEXT].store(next, Relaxed),
-          }
-          self.free_owned_segment(seg, m);
-          work.returned_segments += 1;
-        } else {
-          kept_empty |= empty;
-          prev = Some(m);
-        }
-        cur = next as u32;
-      }
-    }
-  }
-
   /// Returns an unlinked owned segment whose pages have all been claimed
   /// by the caller to the arena.
-  fn free_owned_segment(&self, seg: usize, m: &[AtomicU64]) {
+  pub(super) fn free_owned_segment(&self, seg: usize, m: &[AtomicU64]) {
     m[SEG_HDR].store(SEG_FREE, Release);
     m[SEG_IDLE].store(0, Relaxed);
     let dirty = m[SEG_DIRTY].swap(0, AcqRel);
@@ -338,7 +213,7 @@ impl<O: Os> Heap<O> {
   /// Claims the free pages of a segment that have been dirty since epoch
   /// `cutoff` or earlier and adds their runs to `batch`, purging it first
   /// if they do not fit. `kernel` compares the ages if given.
-  fn claim_segment<P: Purger>(
+  pub(super) fn claim_segment<P: Purger>(
     &self,
     seg: usize,
     m: &[AtomicU64],
@@ -406,7 +281,7 @@ impl<O: Os> Heap<O> {
   /// Purges the runs in `batch` and ends the claims on their segments.
   /// Pages that could not be purged keep their dirty mark: they are not
   /// known to be zero.
-  fn purge_claimed<P: Purger>(&self, batch: &mut Batch, purger: &mut P) {
+  pub(super) fn purge_claimed<P: Purger>(&self, batch: &mut Batch, purger: &mut P) {
     if batch.len == 0 {
       return;
     }
@@ -439,19 +314,18 @@ impl<O: Os> Heap<O> {
     batch.nsegs = 0;
   }
 
-  /// Releases every page of class `c` whose blocks are all free. Caller
-  /// holds the shard lock.
-  fn release_empty_pages(&self, sh: &Shard, c: usize, work: &mut PassWork) {
-    // The cursor is only a scan position; dropping it makes the next
-    // claim start from the availability words.
-    if sh.classes[c].cursor.swap(0, Relaxed) != 0 {
-      sh.bump(SearchStat::CursorInvalidation, 1);
-    }
-    let cap = class::capacity(c) as i64;
-    let mut cur = sh.segs.load(Relaxed);
-    while cur != 0 {
-      let seg = cur as usize - 1;
-      let m = self.seg_meta(seg);
+  /// Releases every small page of segment `seg` whose blocks are all free
+  /// and returns the number of small pages it checked. Caller holds the
+  /// lock of the shard that owns the segment.
+  pub(super) fn release_empty_pages(
+    &self,
+    seg: usize,
+    m: &[AtomicU64],
+    work: &mut PassWork,
+  ) -> u64 {
+    let mut inspected = 0;
+    for c in 0..NUM_CLASSES {
+      let cap = class::capacity(c) as i64;
       let mut pages = m[SEG_CLS + c].load(Relaxed);
       while pages != 0 {
         let i = pages.trailing_zeros() as usize;
@@ -459,13 +333,14 @@ impl<O: Os> Heap<O> {
         // Frees set bits before bumping the counter, and our own
         // claims are subtracted under this lock, so the counter never
         // overstates the free blocks here.
-        work.trim_pages_inspected += 1;
+        inspected += 1;
         if PageMeta::new(m, i).free().load(Acquire) as i64 >= cap {
           self.release_small_page(seg * PAGES_PER_SEGMENT + i, m, c);
           work.released_pages += 1;
         }
       }
-      cur = m[SEG_NEXT].load(Relaxed) as u32;
     }
+    work.trim_pages_inspected += inspected;
+    inspected
   }
 }

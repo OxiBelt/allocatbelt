@@ -187,6 +187,17 @@ pub(crate) fn take_work(work: &AtomicU32, bit: u32) {
   fence(SeqCst);
 }
 
+/// The value of `work` the maintenance thread may sleep on: the word, if
+/// every bit set in it is `deferred` work (none, or a budget request held
+/// back after a stalled cycle), else `None`. Sleeping on the value read,
+/// rather than on 0, keeps a deferred bit from waking the thread at once,
+/// while any new bit changes the word, so the `FUTEX_WAIT` returns or the
+/// poster's `FUTEX_WAKE` wakes it (`post_work` wakes on every new bit).
+pub(crate) fn idle_word(work: &AtomicU32, deferred: u32) -> Option<u32> {
+  let w = work.load(Acquire);
+  (w & !deferred == 0).then_some(w)
+}
+
 #[cfg(all(test, loom))]
 mod loom_tests {
   //! Exhaustive interleaving checks of the protocols above. Run with
@@ -627,6 +638,48 @@ mod loom_tests {
         units.fetch_sub(n, Relaxed);
         collected += n;
       }
+      for p in posters {
+        p.join().unwrap();
+      }
+    });
+  }
+
+  /// A budget request held back after a stalled cycle: the maintenance
+  /// thread sleeps on the word with that bit set, a second budget post
+  /// lands on the set bit (no wake-up), and a force request must still
+  /// wake it. A lost wake-up would leave it asleep, which loom reports as
+  /// a deadlock.
+  #[test]
+  fn deferred_budget_does_not_hide_a_force_request() {
+    let mut model = loom::model::Builder::new();
+    model.preemption_bound = Some(3);
+    model.check(|| {
+      const FORCE: u32 = 1 << 0;
+      const BUDGET: u32 = 1 << 1;
+      let work = Arc::new(AtomicU32::new(BUDGET));
+      let futex = Arc::new(Futex::default());
+      let posters: Vec<_> = [BUDGET, FORCE]
+        .into_iter()
+        .map(|bit| {
+          let (work, futex) = (work.clone(), futex.clone());
+          thread::spawn(move || {
+            if post_work(&work, bit) {
+              futex.wake(&work);
+            }
+          })
+        })
+        .collect();
+      loop {
+        match idle_word(&work, BUDGET) {
+          Some(w) => futex.wait(&work, w),
+          None => {
+            take_work(&work, FORCE);
+            break;
+          }
+        }
+      }
+      // The deferred request is still recorded.
+      assert_ne!(work.load(Relaxed) & BUDGET, 0);
       for p in posters {
         p.join().unwrap();
       }

@@ -1372,7 +1372,7 @@ fn work_since(
       m.released_pages,
       m.returned_segments,
       m.skipped_passes,
-      m.hard_limit_passes,
+      m.hard_limit_slices,
     ]
   };
   let (b, a) = (f(before), f(after));
@@ -1658,4 +1658,514 @@ fn usage_tells_memory_apart() {
     (0, 0, 0)
   );
   assert_eq!(u.dirty_pages, h.dirty_pages());
+}
+
+// ---- bounded, resumable reclamation (theory-driven plan, Stage B) -----------
+
+use crate::core::{ReclaimTargets, ReclaimTargetsError, Retention};
+
+/// Runs maintenance rounds until nothing is pending (at most `max`), and
+/// returns how many ran.
+fn maintain_until_idle(h: &Heap<MockOs>, max: usize) -> usize {
+  for n in 0..max {
+    if h.next_task(crate::core::Os::now_ms(h.os())).is_none() {
+      return n;
+    }
+    let _ = h.maintain();
+  }
+  panic!(
+    "maintenance still busy after {max} rounds: {:?}",
+    h.reclaim_status()
+  );
+}
+
+#[test]
+fn reclaim_targets_are_validated() {
+  let d = ReclaimTargets::DEFAULT;
+  assert_eq!(
+    (d.low_pages(), d.trigger_pages(), d.emergency_pages()),
+    (
+      0,
+      DIRTY_BUDGET_PAGES as usize,
+      DIRTY_HARD_LIMIT_PAGES as usize
+    )
+  );
+  assert_eq!(
+    ReclaimTargets::new(0, 0, 10),
+    Err(ReclaimTargetsError::ZeroTrigger)
+  );
+  assert_eq!(
+    ReclaimTargets::new(10, 10, 20),
+    Err(ReclaimTargetsError::Order)
+  );
+  assert_eq!(
+    ReclaimTargets::new(0, 21, 20),
+    Err(ReclaimTargetsError::Order)
+  );
+  assert_eq!(
+    ReclaimTargets::new(0, 1, 1 << 21),
+    Err(ReclaimTargetsError::TooLarge)
+  );
+  let max = crate::core::MAX_SEGMENTS * crate::core::PAGES_PER_SEGMENT;
+  assert!(ReclaimTargets::new(max - 2, max - 1, max).is_ok());
+  // Bytes round down to whole pages.
+  let t = ReclaimTargets::from_bytes(PAGE_SIZE + 1, 3 * PAGE_SIZE - 1, 4 * PAGE_SIZE).unwrap();
+  assert_eq!(
+    (t.low_pages(), t.trigger_pages(), t.emergency_pages()),
+    (1, 2, 4)
+  );
+  assert_eq!(
+    ReclaimTargets::from_bytes(0, PAGE_SIZE - 1, PAGE_SIZE),
+    Err(ReclaimTargetsError::ZeroTrigger)
+  );
+  let h = heap();
+  h.set_reclaim_targets(t);
+  assert_eq!(h.reclaim_targets(), t);
+  assert_eq!(h.reclaim_status().targets, t);
+}
+
+/// Nine 8-page runs in shard 3: seven fill one segment (56 pages), two go
+/// to a second one. Freeing them all leaves 72 dirty pages.
+fn nine_runs(h: &Heap<MockOs>) -> Vec<usize> {
+  (0..9).map(|_| alloc(h, 3, 8 * PAGE_SIZE, 8)).collect()
+}
+
+#[test]
+fn budget_cycles_purge_down_to_the_low_target() {
+  let h = heap();
+  h.set_reclaim_targets(ReclaimTargets::new(16, 64, 1024).unwrap());
+  let runs = nine_runs(h);
+  for (i, o) in runs.into_iter().enumerate() {
+    free(h, o);
+    // Up to the trigger, frees only mark pages dirty.
+    if i < 8 {
+      assert_eq!(h.dirty_pages(), 8 * (i + 1));
+    }
+  }
+  // The free that crossed the trigger ran the cycle's slice inline: it
+  // purged the first segment (56 pages) and stopped at the low target,
+  // keeping the second segment's 16 pages for reuse.
+  assert_eq!(h.dirty_pages(), 16);
+  let s = h.reclaim_status();
+  assert!(!s.budget_pending && s.sweep.is_none(), "{s:?}");
+  let m = h.maintenance_stats();
+  assert_eq!((m.inline_budget_passes, m.inline_slices), (1, 1));
+  // With the default targets, the same frees purge everything, as the
+  // budget pass did.
+  let h = heap();
+  for o in nine_runs(h) {
+    free(h, o);
+  }
+  assert!(h.dirty_pages() <= crate::core::heap::DIRTY_BUDGET_PAGES as usize);
+}
+
+#[test]
+fn cycles_continue_below_the_trigger_until_the_low_target() {
+  let h = heap();
+  h.attach_maintenance();
+  h.set_reclaim_targets(ReclaimTargets::new(8, 64, 1024).unwrap());
+  // Slices small enough that the cycle takes many of them.
+  h.set_slice_work(1);
+  for o in nine_runs(h) {
+    free(h, o);
+  }
+  assert_eq!(h.dirty_pages(), 72);
+  assert!(h.reclaim_status().budget_pending);
+  let mut below_trigger = 0;
+  let mut slices = 0;
+  while h.reclaim_status().budget_pending {
+    assert_eq!(h.maintain(), Some(Task::Budget));
+    slices += 1;
+    let d = h.dirty_pages();
+    if (8..=64).contains(&d) && h.reclaim_status().budget_pending {
+      // Below the trigger, above the low target: still pending.
+      below_trigger += 1;
+      assert_eq!(h.next_task(0), Some(Task::Budget));
+    }
+    assert!(slices < 1000);
+  }
+  assert!(slices > 1 && below_trigger > 0, "{slices} {below_trigger}");
+  assert!(h.dirty_pages() <= 8);
+  assert_eq!(h.maintenance_stats().budget_passes, 1);
+  assert_eq!(h.maintenance_stats().slices, slices);
+}
+
+#[test]
+fn slices_bound_attempted_work_when_every_purge_fails() {
+  let h = heap();
+  h.attach_maintenance();
+  let work = 64;
+  h.set_slice_work(work);
+  // 96 runs of 8 pages over 14 segments: 768 dirty pages.
+  let runs = dirty_runs(h, 96 * RUN);
+  h.os().purge_fails.store(true, Ordering::Relaxed);
+  for o in runs {
+    free(h, o);
+  }
+  let dirty = h.dirty_pages();
+  assert_eq!(dirty, 96 * RUN);
+  let mut rounds = 0;
+  loop {
+    let before = h.maintenance_stats();
+    match h.maintain() {
+      Some(Task::Budget) => {}
+      Some(t) => panic!("unexpected {t:?}"),
+      None => break,
+    }
+    let after = h.maintenance_stats();
+    // Each slice attempts a bounded number of runs, all refused: at most
+    // the limit, plus the runs of the one segment that crossed it.
+    assert!(after.purged_runs - before.purged_runs <= work + 32);
+    assert_eq!(
+      after.failed_runs - before.failed_runs,
+      after.purged_runs - before.purged_runs
+    );
+    rounds += 1;
+    assert!(rounds < 1000, "the cycle never gave up");
+  }
+  // One full sweep without progress stalls the cycle: nothing purged, the
+  // obligation visible, and no more budget work until the next epoch.
+  let s = h.reclaim_status();
+  assert!(s.budget_deferred && !s.budget_pending, "{s:?}");
+  assert_eq!(h.maintenance_stats().stalled_cycles, 1);
+  assert_eq!(h.dirty_pages(), dirty);
+  assert_eq!(h.next_task(0), None);
+  // The thread went to sleep on the deferred request instead of spinning.
+  assert_eq!(h.maintain(), None);
+  // The next decay epoch lifts the deferral, and purges work again.
+  h.os().purge_fails.store(false, Ordering::Relaxed);
+  h.os().advance(h.decay_interval_ms());
+  maintain_until_idle(h, 1000);
+  assert_eq!(h.dirty_pages(), 0);
+}
+
+#[test]
+fn stalled_cycles_leave_frees_alone_until_the_emergency_threshold() {
+  let h = heap();
+  h.set_slice_work(64);
+  h.os().purge_fails.store(true, Ordering::Relaxed);
+  let budget = DIRTY_BUDGET_PAGES as usize;
+  // Allocated up front: allocations would reuse the dirty pages.
+  let mut runs = dirty_runs(h, DIRTY_HARD_LIMIT_PAGES as usize + 8 * RUN).into_iter();
+  // Up to the trigger and past it: the crossing free starts a cycle and
+  // later frees continue it until a full sweep stalls.
+  for o in runs.by_ref().take(budget / RUN + 20) {
+    free(h, o);
+  }
+  assert!(
+    h.reclaim_status().budget_deferred,
+    "{:?}",
+    h.reclaim_status()
+  );
+  let slices = h.maintenance_stats().slices;
+  // More frees below the emergency threshold run no slice ...
+  for o in runs.by_ref().take(20) {
+    free(h, o);
+  }
+  assert_eq!(h.maintenance_stats().slices, slices);
+  // ... past it, every free runs a bounded emergency slice.
+  for o in runs {
+    free(h, o);
+  }
+  let m = h.maintenance_stats();
+  assert!(m.emergency_slices > 0 && m.hard_limit_slices == 0, "{m:?}");
+  h.os().purge_fails.store(false, Ordering::Relaxed);
+  h.purge();
+  assert_eq!(h.dirty_pages(), 0);
+}
+
+#[test]
+fn partial_batch_success_finishes_every_claim() {
+  let h = heap();
+  h.attach_maintenance();
+  let runs = dirty_runs(h, DIRTY_BUDGET_PAGES as usize + 8 * RUN);
+  for o in runs {
+    free(h, o);
+  }
+  let mut p = MockPurger::new(h.os(), 4);
+  p.fail_every = 3;
+  while h.next_task(0) == Some(Task::Budget) {
+    let _ = h.maintain_with(&mut p);
+  }
+  // Every third run failed and stays dirty; the others are clean, and no
+  // page is left claimed by the purge.
+  let m = h.maintenance_stats();
+  assert!(m.failed_runs > 0 && m.failed_runs < m.purged_runs, "{m:?}");
+  assert!(h.dirty_pages() > 0);
+  assert_eq!(h.dirty_pages(), h.dirty_pages_recounted());
+  let u = h.usage();
+  assert_eq!((u.pages_in_use, u.dirty_pages), (0, h.dirty_pages()));
+}
+
+#[test]
+fn busy_shards_do_not_hold_up_later_ones() {
+  let h = heap();
+  h.set_slice_work(4);
+  // A fully free small page in shard 40.
+  let o = alloc(h, 40, 1000, 8);
+  free(h, o);
+  let before = h.maintenance_stats();
+  // Shard 5 stays locked for a whole force purge of many small slices.
+  h.with_shard_held(5, || h.purge());
+  let w = work_since(before, h.maintenance_stats());
+  assert_eq!((w[BUSY], w[RELEASED]), (1, 1));
+  assert_eq!(h.usage().small_pages, 0);
+}
+
+#[test]
+fn resumed_sweeps_survive_segment_reuse() {
+  let h = heap();
+  h.attach_maintenance();
+  h.set_slice_work(3);
+  // Dirty pages and empty segments in several shards.
+  let mut runs = Vec::new();
+  for s in 0..6 {
+    runs.extend((0..10).map(|_| alloc(h, s, 6 * PAGE_SIZE, 8)));
+  }
+  for o in runs.drain(..) {
+    free(h, o);
+  }
+  h.request_purge();
+  let mut held: Vec<usize> = Vec::new();
+  let mut rounds = 0;
+  while h.next_task(0) == Some(Task::Force) {
+    let _ = h.maintain();
+    // Between slices, other threads take segments the sweep returned or is
+    // about to visit: huge blocks, runs in the shards being trimmed (new
+    // segments linked ahead of the sweep's position), and frees.
+    match rounds % 4 {
+      0 => held.push(alloc(h, 0, 5 << 20, 8)),
+      1 => held.push(alloc(h, rounds % 6, 20 * PAGE_SIZE, 8)),
+      2 if !held.is_empty() => free(h, held.swap_remove(0)),
+      _ => held.push(alloc(h, 7, 100, 8)),
+    }
+    rounds += 1;
+    assert!(rounds < 10_000);
+  }
+  assert!(rounds > 10, "the sweep should take many slices");
+  assert_eq!(h.dirty_pages(), h.dirty_pages_recounted());
+  crate::core::model::check_observations(h, &[]);
+  for o in held {
+    free(h, o);
+  }
+  h.detach_maintenance();
+  h.purge();
+  assert_eq!(h.dirty_pages(), 0);
+}
+
+#[test]
+fn many_slices_do_not_age_pages_faster() {
+  // `decay_waits_for_the_purge_delay`, with slices of one work unit: a
+  // decay pass takes hundreds of slices, and ages still move one epoch
+  // per pass.
+  let h = heap();
+  h.set_slice_work(1);
+  let runs: Vec<_> = (0..8).map(|_| alloc(h, 2, 5 * PAGE_SIZE, 8)).collect();
+  for &o in &runs[..4] {
+    free(h, o);
+  }
+  let slices = h.maintenance_stats().slices;
+  for _ in 0..2 {
+    h.decay();
+  }
+  assert!(h.maintenance_stats().slices - slices > 100);
+  for &o in &runs[4..] {
+    free(h, o);
+  }
+  for _ in 2..DECAY_AGE - 1 {
+    h.decay();
+  }
+  assert_eq!(h.dirty_pages(), 40);
+  h.decay();
+  assert_eq!(h.dirty_pages(), 20, "only the first four runs expired");
+  h.decay();
+  assert_eq!(h.dirty_pages(), 20);
+  h.decay();
+  assert_eq!(h.dirty_pages(), 0);
+}
+
+#[test]
+fn target_changes_apply_to_the_cycle_in_progress() {
+  let h = heap();
+  h.attach_maintenance();
+  h.set_reclaim_targets(ReclaimTargets::new(0, 64, 1024).unwrap());
+  h.set_slice_work(2);
+  for o in nine_runs(h) {
+    free(h, o);
+  }
+  assert_eq!(h.maintain(), Some(Task::Budget));
+  assert_eq!(h.reclaim_status().sweep, Some(Task::Budget));
+  // A low target above the dirty count ends the cycle at its next slice,
+  // with nothing more purged.
+  h.set_reclaim_targets(ReclaimTargets::new(100, 200, 1024).unwrap());
+  assert_eq!(h.maintain(), Some(Task::Budget));
+  let s = h.reclaim_status();
+  assert!(s.sweep.is_none() && !s.budget_pending, "{s:?}");
+  assert_eq!(h.dirty_pages(), 72);
+  assert_eq!(h.next_task(0), None);
+}
+
+#[test]
+fn purge_delay_changes_leave_the_sweep_in_progress_alone() {
+  let h = heap();
+  h.attach_maintenance();
+  h.set_slice_work(1);
+  let runs: Vec<_> = (0..4).map(|_| alloc(h, 2, 5 * PAGE_SIZE, 8)).collect();
+  for o in runs {
+    free(h, o);
+  }
+  // A decay sweep starts with the 1 s delay: nothing is old enough.
+  h.os().advance(1000);
+  assert_eq!(h.maintain(), Some(Task::Decay));
+  assert_eq!(h.reclaim_status().sweep, Some(Task::Decay));
+  // A zero delay applies from the next sweep on, not to this one.
+  h.set_purge_delay_ms(0);
+  while h.reclaim_status().sweep == Some(Task::Decay) {
+    let _ = h.maintain();
+  }
+  assert_eq!(h.dirty_pages(), 20);
+  h.os().advance(1);
+  maintain_until_idle(h, 10_000);
+  assert_eq!(h.dirty_pages(), 0);
+}
+
+#[test]
+fn detached_maintenance_leaves_the_cycle_to_frees_and_allocations() {
+  let h = heap();
+  h.attach_maintenance();
+  h.set_reclaim_targets(ReclaimTargets::new(0, 64, 1024).unwrap());
+  h.set_slice_work(2);
+  for o in nine_runs(h) {
+    free(h, o);
+  }
+  // The thread ran one slice, then went away (a fork, say).
+  assert_eq!(h.maintain(), Some(Task::Budget));
+  h.detach_maintenance();
+  assert!(h.reclaim_status().budget_pending);
+  // Allocation slow paths (cached page-run allocations and frees, every
+  // 16th of which checks) finish the cycle.
+  let tc = cache(h);
+  let mut ops = 0;
+  while h.reclaim_status().budget_pending {
+    let o = alloc_c(h, &tc, 3 * PAGE_SIZE, 8);
+    free_c(h, &tc, o);
+    ops += 1;
+    assert!(ops < 100_000, "{:?}", h.reclaim_status());
+  }
+  assert!(h.dirty_pages() <= 8, "{}", h.dirty_pages());
+  h.retire(&tc);
+}
+
+#[test]
+fn without_a_worker_page_run_frees_resume_the_cycle() {
+  let h = heap();
+  h.set_reclaim_targets(ReclaimTargets::new(0, 64, 1024).unwrap());
+  h.set_slice_work(2);
+  for o in nine_runs(h) {
+    free(h, o);
+  }
+  // The crossing free ran one small slice; the cycle is pending.
+  assert!(h.reclaim_status().budget_pending);
+  assert_eq!(h.maintenance_stats().inline_slices, 1);
+  let mut frees = 0;
+  while h.reclaim_status().budget_pending {
+    let o = alloc(h, 9, PAGE_SIZE * 2, 8);
+    free(h, o);
+    frees += 1;
+    assert!(frees < 100_000);
+  }
+  assert!(h.maintenance_stats().inline_slices > 1);
+  assert!(h.dirty_pages() <= 8, "{}", h.dirty_pages());
+}
+
+#[test]
+fn force_purges_preempt_a_budget_cycle() {
+  let h = heap();
+  h.attach_maintenance();
+  h.set_reclaim_targets(ReclaimTargets::new(0, 64, 1024).unwrap());
+  h.set_slice_work(2);
+  for o in nine_runs(h) {
+    free(h, o);
+  }
+  assert_eq!(h.maintain(), Some(Task::Budget));
+  assert_eq!(h.reclaim_status().sweep, Some(Task::Budget));
+  // A request goes ahead of the cycle in progress ...
+  h.request_purge();
+  assert_eq!(h.next_task(0), Some(Task::Force));
+  assert_eq!(h.maintain(), Some(Task::Force));
+  assert_eq!(h.reclaim_status().sweep, Some(Task::Force));
+  // ... and an explicit purge replaces whatever runs and finishes.
+  h.purge();
+  let s = h.reclaim_status();
+  assert_eq!(h.dirty_pages(), 0);
+  assert!(s.sweep.is_none(), "{s:?}");
+  // The cycle, now below its low target, ended with it.
+  maintain_until_idle(h, 1000);
+  assert!(!h.reclaim_status().budget_pending);
+}
+
+#[test]
+fn emergency_slices_are_larger_but_bounded() {
+  let h = heap();
+  h.attach_maintenance();
+  h.set_slice_work(16);
+  let runs = dirty_runs(h, DIRTY_HARD_LIMIT_PAGES as usize + 16 * RUN);
+  let mut worst = 0;
+  for o in runs {
+    let before = h.maintenance_stats().purged_runs;
+    free(h, o);
+    worst = worst.max(h.maintenance_stats().purged_runs - before);
+  }
+  let m = h.maintenance_stats();
+  assert!(
+    m.emergency_slices > 0 && m.hard_limit_slices == m.emergency_slices,
+    "{m:?}"
+  );
+  // Four ordinary slices' worth of runs, plus one segment's.
+  assert!(worst > 0 && worst <= 4 * 16 + 32, "{worst}");
+  assert!(h.dirty_pages() <= DIRTY_HARD_LIMIT_PAGES as usize + RUN);
+}
+
+#[test]
+fn adaptive_retention_follows_reuse_and_idleness() {
+  let h = heap();
+  assert_eq!(h.reclaim_status().retention, 1);
+  h.set_retention(Retention::Adaptive);
+  // Epochs in which freed page runs are reused before any purge: the
+  // retention grows, one step per delay (four epochs) at most.
+  let mut last = 1;
+  for epoch in 0..40 {
+    let o = alloc(h, 1, 4 * PAGE_SIZE, 8);
+    free(h, o);
+    h.decay();
+    let r = h.reclaim_status().retention;
+    assert!(r >= last && r <= last + 1, "epoch {epoch}: {last} -> {r}");
+    last = r;
+  }
+  assert_eq!(last, crate::core::MAX_RETENTION);
+  // Pages now wait four times the delay (in epochs) before decay purges
+  // them.
+  let o = alloc(h, 1, 4 * PAGE_SIZE, 8);
+  free(h, o);
+  for _ in 0..DECAY_AGE {
+    h.decay();
+  }
+  assert_eq!(h.dirty_pages(), 4, "kept past one delay");
+  // Idle epochs bring it back down, step by step.
+  for _ in 0..80 {
+    h.decay();
+  }
+  assert_eq!(h.reclaim_status().retention, 1);
+  assert_eq!(h.dirty_pages(), 0);
+  // Explicit pressure resets it at once, and the fixed mode pins it.
+  for _ in 0..40 {
+    let o = alloc(h, 1, 4 * PAGE_SIZE, 8);
+    free(h, o);
+    h.decay();
+  }
+  assert!(h.reclaim_status().retention > 1);
+  h.request_purge();
+  assert_eq!(h.reclaim_status().retention, 1);
+  h.set_retention(Retention::Fixed);
+  assert_eq!(h.reclaim_status().retention_mode, Retention::Fixed);
 }

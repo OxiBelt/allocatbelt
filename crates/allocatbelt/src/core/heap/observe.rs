@@ -38,10 +38,11 @@ pub(super) enum SearchStat {
   RunSearch,
   RunSearchSegment,
   NewSegment,
+  DirtyReuse,
 }
 
 /// Number of [`SearchStat`]s.
-pub(super) const SEARCH_STATS: usize = 12;
+pub(super) const SEARCH_STATS: usize = 13;
 
 impl Shard {
   /// Adds `n` to a search counter. Caller holds the shard lock, so a load
@@ -86,6 +87,10 @@ pub struct SearchStats {
   pub run_search_segments: u64,
   /// Segments taken from the arena because no owned segment had room.
   pub new_segments: u64,
+  /// Dirty pages handed out again by page-run claims before a purge
+  /// returned them: reuse the retention of freed pages paid for (the
+  /// signal of [`Retention::Adaptive`](super::Retention::Adaptive)).
+  pub dirty_reused_pages: u64,
 }
 
 /// What one thread's cache holds and how it flushed its buffered frees.
@@ -159,7 +164,7 @@ pub struct HeapUsage {
 }
 
 impl<O: Os> Heap<O> {
-  /// The search counters of all shards, summed. Allocation-free; reads 12
+  /// The search counters of all shards, summed. Allocation-free; reads 13
   /// words per shard.
   pub fn search_stats(&self) -> SearchStats {
     let mut t = [0u64; SEARCH_STATS];
@@ -182,6 +187,7 @@ impl<O: Os> Heap<O> {
       run_searches: s(SearchStat::RunSearch),
       run_search_segments: s(SearchStat::RunSearchSegment),
       new_segments: s(SearchStat::NewSegment),
+      dirty_reused_pages: s(SearchStat::DirtyReuse),
     }
   }
 

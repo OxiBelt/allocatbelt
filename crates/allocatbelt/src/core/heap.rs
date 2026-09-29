@@ -44,14 +44,15 @@
 //! is free.
 //!
 //! Purging is deferred: freed page runs are only marked dirty. Once more than
-//! [`DIRTY_BUDGET_PAGES`] pages are dirty, the freeing thread claims the dirty
-//! free pages of every segment (as if allocating them), `madvise`s them and
-//! releases them again. Purging on every free costs an `mmap_lock` round trip
-//! and a TLB shootdown per call, which dominated multi-threaded profiles.
-//! The same pass returns segments whose pages have all been free since the
-//! previous pass to the arena, keeping one empty segment per shard; both
-//! damp the decommit/recommit churn of a workload that empties and refills
-//! segments.
+//! the trigger ([`ReclaimTargets`], [`DIRTY_BUDGET_PAGES`] by default) are
+//! dirty, a budget cycle claims the dirty free pages of the segments (as if
+//! allocating them), `madvise`s them and releases them again, in bounded
+//! slices, until the low target is reached (see the `reclaim` module). Purging on
+//! every free costs an `mmap_lock` round trip and a TLB shootdown per call,
+//! which dominated multi-threaded profiles. The same sweeps return segments
+//! whose pages have all been free for the purge delay to the arena, keeping
+//! one empty segment per shard; both damp the decommit/recommit churn of a
+//! workload that empties and refills segments.
 //!
 //! Zero tracking: memory that was never handed out, or that was purged or
 //! decommitted successfully, reads as zero. Free pages that are not dirty are
@@ -76,13 +77,14 @@ mod fork;
 mod maint;
 mod observe;
 mod purge;
+mod reclaim;
 
 pub use cache::ThreadCache;
 pub use maint::{DIRTY_HARD_LIMIT_PAGES, MaintenanceStats, Task};
 pub use observe::{CacheStats, HeapUsage, SearchStats};
 use observe::{SEARCH_STATS, SearchStat};
-use purge::Pass;
 pub use purge::{PURGE_BATCH, Purger, SyncPurger};
+pub use reclaim::{MAX_RETENTION, ReclaimStatus, ReclaimTargets, ReclaimTargetsError, Retention};
 
 /// The age scan of a decay pass over one segment: see [`aged_pages`].
 pub type AgeKernel = fn(&[u64; PAGES_PER_SEGMENT], u64) -> u64;
@@ -239,10 +241,11 @@ const GUARD_BIT: u64 = 1 << GUARD_PAGE;
 /// Longest page run inside a segment; longer blocks take whole segments.
 pub const MAX_RUN_PAGES: usize = PAGES_PER_SEGMENT - 1;
 
-/// Dirty (freed, unpurged) pages tolerated before a purge pass (32 MiB).
-/// A bound on the pages the heap tracks as dirty, not on the process's
-/// RSS: live and cached blocks, metadata, and memory the OS keeps resident
-/// after a purge are outside it (see [`HeapUsage`]).
+/// The default trigger: dirty (freed, unpurged) pages tolerated before a
+/// budget cycle (32 MiB; see [`ReclaimTargets`]). A bound on the pages the
+/// heap tracks as dirty, not on the process's RSS: live and cached blocks,
+/// metadata, and memory the OS keeps resident after a purge are outside it
+/// (see [`HeapUsage`]).
 pub const DIRTY_BUDGET_PAGES: isize = 512;
 /// How long freed pages stay resident, and empty segments stay owned,
 /// before a decay pass returns them (see [`Heap::set_purge_delay_ms`]).
@@ -427,6 +430,8 @@ pub struct Heap<O> {
   maint_work: AtomicU32,
   /// [`MaintenanceStats`], indexed by `maint::Stat`.
   maint_stats: [AtomicU64; maint::STATS],
+  /// Reclamation policy and the sweep in progress (see [`reclaim`]).
+  sweep: reclaim::Sweep,
   /// Round-robin shard assignment for attached thread caches.
   next_shard: AtomicUsize,
   /// Secret for randomized placement; 0 turns randomization off.
@@ -450,6 +455,7 @@ impl<O: Os> Heap<O> {
       maint_attached: AtomicBool::new(false),
       maint_work: AtomicU32::new(0),
       maint_stats: [const { AtomicU64::new(0) }; maint::STATS],
+      sweep: reclaim::Sweep::new(),
       next_shard: AtomicUsize::new(0),
       seed: AtomicU64::new(0),
       shards: [const { Shard::new() }; SHARDS],
@@ -815,7 +821,9 @@ impl<O: Os> Heap<O> {
     m[SEG_CLS + c].fetch_and(!(1 << in_seg), Relaxed);
     m[SEG_AVAIL + c].fetch_and(!(1 << in_seg), AcqRel);
     PageMeta::new(m, in_seg).info().store(PAGE_FREE, Release);
-    self.release_pages(page, 1);
+    // Only trimming releases small pages, inside a sweep: the sweep's own
+    // freed page does not start another one.
+    self.mark_free_dirty(page, 1);
   }
 
   /// Bitmap word and bit of the class-`c` block `in_page` bytes into its
@@ -940,9 +948,10 @@ impl<O: Os> Heap<O> {
       let seg = cur as usize - 1;
       segs += 1;
       let m = self.seg_meta(seg);
-      if let Some((start, zeroed)) = self.claim_run(m, n, step) {
+      if let Some((start, reused)) = self.claim_run(m, n, step) {
         sh.bump(SearchStat::RunSearchSegment, segs);
-        return Some((seg * PAGES_PER_SEGMENT + start, zeroed));
+        sh.bump(SearchStat::DirtyReuse, reused);
+        return Some((seg * PAGES_PER_SEGMENT + start, reused == 0));
       }
       cur = m[SEG_NEXT].load(Relaxed) as u32;
     }
@@ -974,26 +983,35 @@ impl<O: Os> Heap<O> {
     m[SEG_NEXT].store(u64::from(sh.segs.load(Relaxed)), Relaxed);
     m[SEG_HDR].store(SEG_OWNED | (s as u64) << 8 | 1 << 16, Release);
     sh.segs.store(seg as u32 + 1, Relaxed);
-    self
-      .claim_run(m, n, step)
-      .map(|(start, zeroed)| (seg * PAGES_PER_SEGMENT + start, zeroed))
+    let (start, reused) = self.claim_run(m, n, step)?;
+    sh.bump(SearchStat::DirtyReuse, reused);
+    Some((seg * PAGES_PER_SEGMENT + start, reused == 0))
   }
 
   /// Atomically claims a run of `n` free pages starting at a multiple of
-  /// `step` in a segment and reports whether it reads as zero. Reusing dirty
-  /// pages is free: they simply stop being dirty (and are not zero).
-  fn claim_run(&self, m: &[AtomicU64], n: usize, step: usize) -> Option<(usize, bool)> {
+  /// `step` in a segment and returns its first page and how many of its
+  /// pages were dirty (0: it reads as zero). Reusing dirty pages is free:
+  /// they simply stop being dirty (and are not zero).
+  fn claim_run(&self, m: &[AtomicU64], n: usize, step: usize) -> Option<(usize, u64)> {
     let (start, was_dirty) = proto::claim_run(&m[SEG_PAGES], &m[SEG_DIRTY], n as u32, step as u32)?;
     if was_dirty != 0 {
       self
         .dirty_pages
         .fetch_sub(was_dirty.count_ones() as isize, Relaxed);
     }
-    Some((start as usize, was_dirty == 0))
+    Some((start as usize, u64::from(was_dirty.count_ones())))
   }
 
-  /// Marks `n` pages dirty and returns them to their segment.
+  /// Marks `n` pages dirty and returns them to their segment, then records
+  /// or runs reclamation if that took the dirty count over the trigger.
   fn release_pages(&self, page: usize, n: usize) {
+    let dirty = self.mark_free_dirty(page, n);
+    self.after_release(dirty);
+  }
+
+  /// Marks `n` pages dirty and returns them to their segment; returns the
+  /// dirty count after.
+  fn mark_free_dirty(&self, page: usize, n: usize) -> isize {
     let m = self.seg_meta(page / PAGES_PER_SEGMENT);
     let in_seg = page % PAGES_PER_SEGMENT;
     // Stamped before the pages are marked dirty, so a purge pass that sees
@@ -1008,10 +1026,7 @@ impl<O: Os> Heap<O> {
       &m[SEG_DIRTY],
       run_mask(in_seg as u32, n as u32),
     );
-    let dirty = self.dirty_pages.fetch_add(n as isize, Relaxed) + n as isize;
-    if dirty > DIRTY_BUDGET_PAGES {
-      self.over_budget(dirty);
-    }
+    self.dirty_pages.fetch_add(n as isize, Relaxed) + n as isize
   }
 
   // ---- segments ------------------------------------------------------

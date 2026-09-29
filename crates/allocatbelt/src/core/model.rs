@@ -23,7 +23,7 @@ use std::vec::Vec;
 
 use crate::core::{
   ARENA_SIZE, AgeKernel, Block, Heap, MAX_SEGMENTS, META_WORDS, Os, PAGE_SIZE, PURGE_BATCH, Purger,
-  SEGMENT_SIZE, ThreadCache, aged_pages,
+  ReclaimTargets, Retention, SEGMENT_SIZE, ThreadCache, aged_pages,
 };
 
 /// An [`Os`] that records what the heap does and checks it.
@@ -410,7 +410,8 @@ fn size_of(hi: u8, lo: u8) -> usize {
 /// Operations go through two attached thread caches, a detached one (the
 /// uncached paths through a cache) and the uncached API, so frees routinely
 /// cross "threads". The program also flushes and retires caches, purges,
-/// runs decay passes, advances the clock, changes the purge delay, hands
+/// runs decay passes, advances the clock, changes the purge delay, the
+/// reclamation thresholds, the slice size and the retention mode, hands
 /// housekeeping to a maintenance "thread" and back, runs its rounds (also
 /// with a batching [`MockPurger`] that fails some runs) and requests purges
 /// from it; the
@@ -471,7 +472,30 @@ pub fn run(data: &[u8]) {
       23 => h.purge(),
       24 => h.decay(),
       25 => h.os().advance(u64::from(byte()) * 16),
-      26 => h.set_purge_delay_ms(u64::from(byte()) * 8),
+      26 => {
+        let b = byte();
+        match b % 4 {
+          0 | 1 => h.set_purge_delay_ms(u64::from(byte()) * 8),
+          2 => {
+            // Thresholds, valid or not (a refused set changes nothing).
+            let low = usize::from(byte()) * 4;
+            let trigger = low + usize::from(byte()) * 4;
+            let emergency = trigger + usize::from(byte()) * 8;
+            if let Ok(t) = ReclaimTargets::new(low, trigger, emergency) {
+              h.set_reclaim_targets(t);
+            }
+          }
+          _ => {
+            // Slices from one work unit up, so sweeps resume often.
+            h.set_slice_work(1 + u64::from(byte()) * 8);
+            h.set_retention(if b & 4 == 0 {
+              Retention::Fixed
+            } else {
+              Retention::Adaptive
+            });
+          }
+        }
+      }
       27 => tc.into_iter().for_each(|tc| h.retire(tc)),
       28 if h.maintenance_attached() => h.detach_maintenance(),
       28 => h.attach_maintenance(),
@@ -523,7 +547,21 @@ pub fn check_observations(h: &Heap<MockOs>, caches: &[ThreadCache]) {
   // Every page reported purged was handed to `purge` (or later
   // decommitted with its segment, which `purged` counts too).
   assert!(m.purged_pages as usize * PAGE_SIZE <= h.os().purged.load(Ordering::Relaxed));
-  assert!(m.hard_limit_passes <= m.inline_budget_passes, "{m:?}");
+  assert!(m.hard_limit_slices <= m.emergency_slices, "{m:?}");
+  assert!(
+    m.emergency_slices <= m.inline_slices && m.inline_slices <= m.slices,
+    "{m:?}"
+  );
+  // A sweep ends in a slice.
+  assert!(
+    m.force_passes
+      + m.budget_passes
+      + m.decay_passes
+      + m.inline_budget_passes
+      + m.inline_decay_passes
+      <= m.slices,
+    "{m:?}"
+  );
   assert!(m.released_pages <= m.trim_pages_inspected, "{m:?}");
   let s = h.search_stats();
   assert!(s.stale_hints <= s.candidates, "{s:?}");
