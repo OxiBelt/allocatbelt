@@ -467,6 +467,23 @@ impl Allocatbelt {
   pub fn thread_cache_stats(self) -> Option<CacheStats> {
     CACHE.try_with(|tc| HEAP.cache_stats(tc)).ok()
   }
+
+  /// Makes the calling thread prefer shard `shard % 64` for its cache
+  /// refills and uncached allocations, in place of the one it got when its
+  /// cache was attached (consecutive threads get consecutive shards). For
+  /// runtimes that number their worker threads: giving worker `i` shard
+  /// `i` spreads a fixed pool evenly over the shards, whatever other
+  /// threads started in between. With the `experimental-rseq` policy
+  /// active, the `mm_cid` hint still comes first.
+  ///
+  /// Only a preference: every shard is locked when used, so any value is
+  /// correct, and threads may share a shard. Attaches the thread's cache
+  /// if it is not attached yet (which may allocate once, to register its
+  /// thread-exit hook); allocation-free afterwards. Lasts until the thread
+  /// exits; [`CacheStats::shard`] reads it back.
+  pub fn set_thread_shard(self, shard: usize) {
+    guarded(|| with_cache(|tc| HEAP.set_preferred_shard(tc, shard)));
+  }
 }
 
 fn offset_of(ptr: *const u8) -> usize {

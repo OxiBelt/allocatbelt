@@ -1332,6 +1332,29 @@ fn shard_hints_override_the_attached_shard() {
   assert_ne!(seg(alloc_c(h, &a, run, 8)), seg(alloc_c(h, &b, run, 8)));
 }
 
+#[test]
+fn preferred_shards_replace_the_attached_one() {
+  let h = heap();
+  let (a, b) = (cache(h), cache(h));
+  let seg = |o: usize| o / SEGMENT_SIZE;
+  let run = 4 * PAGE_SIZE;
+  assert_ne!(h.cache_stats(&a).shard, h.cache_stats(&b).shard);
+  assert_ne!(seg(alloc_c(h, &a, run, 8)), seg(alloc_c(h, &b, run, 8)));
+  // Both prefer shard 5 (given modulo the shard count): they share its
+  // segments, for runs and small pages alike.
+  h.set_preferred_shard(&a, 5);
+  h.set_preferred_shard(&b, 5 + crate::core::SHARDS);
+  assert_eq!((h.cache_stats(&a).shard, h.cache_stats(&b).shard), (5, 5));
+  assert_eq!(seg(alloc_c(h, &a, run, 8)), seg(alloc_c(h, &b, run, 8)));
+  assert_eq!(seg(alloc_c(h, &a, 48, 8)), seg(alloc_c(h, &b, 48, 8)));
+  // An environment hint still comes first.
+  h.set_preferred_shard(&b, 6);
+  h.os().hint.store(9, Ordering::Relaxed);
+  assert_eq!(seg(alloc_c(h, &a, run, 8)), seg(alloc_c(h, &b, run, 8)));
+  h.os().hint.store(usize::MAX, Ordering::Relaxed);
+  assert_ne!(seg(alloc_c(h, &a, run, 8)), seg(alloc_c(h, &b, run, 8)));
+}
+
 /// More threads than shards, each "migrating" on every slow-path call:
 /// shard hints change under them (as an rseq `mm_cid` does), so blocks
 /// cached, freed and flushed by one thread come from shards the others

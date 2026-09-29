@@ -103,6 +103,10 @@ pub struct CacheStats {
   /// Whether the cache is attached (caching); a detached or retired cache
   /// holds nothing.
   pub attached: bool,
+  /// The shard (0 to 63) the cache prefers when the environment gives no
+  /// hint: the one it was attached to, or the one set with
+  /// `Allocatbelt::set_thread_shard`.
+  pub shard: usize,
   /// Free blocks of the claimed bitmap words, one word per size class at
   /// most: taken from the shared bitmaps, not handed out yet.
   pub claimed_blocks: u64,

@@ -63,7 +63,11 @@ fn worker(jobs: std::sync::mpsc::Receiver<Box<dyn FnOnce() + Send>>) {
 }
 ```
 
-Executors that have a hook for "about to park" or "idle" (for example a thread-pool callback) can call `flush_thread_cache` there; allocatbelt depends on no executor. A memory-pressure handler can call `request_cache_return` together with `request_purge`: running threads return their caches soon after, parked ones as they wake, and parked workers that follow the pattern above hold nothing.
+Executors that have a hook for "about to park" or "idle" (for example a thread-pool callback) can call `flush_thread_cache` there; allocatbelt depends on no executor. For Tokio, the separate workspace crate `allocatbelt-tokio` installs this as the runtime's park hook ([tokio.md](tokio.md)). A memory-pressure handler can call `request_cache_return` together with `request_purge`: running threads return their caches soon after, parked ones as they wake, and parked workers that follow the pattern above hold nothing.
+
+## Shards per thread
+
+A cache is attached to a shard when the thread first allocates: consecutive threads get consecutive shards (of 64), and refills lock that shard first. `Allocatbelt::set_thread_shard(n)` replaces it with shard `n % 64` for the calling thread, for runtimes that number their workers: giving worker `i` shard `i` spreads a fixed pool evenly, whatever other threads started in between. It is only a preference (every shard is locked when used, and threads may share one); with the `experimental-rseq` policy active, the `mm_cid` hint comes first. `CacheStats::shard` reads it back.
 
 ## After `fork`
 

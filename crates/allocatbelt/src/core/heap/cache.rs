@@ -316,6 +316,16 @@ impl<O: Os> Heap<O> {
     tc.state.set(ATTACHED);
   }
 
+  /// Makes `shard % SHARDS` the shard `tc` prefers from now on, in place
+  /// of the one [`Heap::attach`] gave it: for an embedder that numbers its
+  /// threads, such as an async runtime's workers. The environment's
+  /// [`Os::shard_hint`], when it gives one, still comes first. Only a
+  /// preference, as in `attach`: the shard is locked either way. A later
+  /// `attach` of a detached cache gives it a shard again.
+  pub fn set_preferred_shard(&self, tc: &ThreadCache, shard: usize) {
+    tc.shard.set(shard % SHARDS);
+  }
+
   /// Returns every block held by `tc` (claimed or freed) to the shared
   /// bitmaps: at most 64 buffered words and one claimed word per class, one
   /// atomic update each. The cache stays usable (and attached, if it was).
@@ -524,6 +534,7 @@ impl<O: Os> Heap<O> {
     let flush_sizes = core::array::from_fn(|i| tc.flush_sizes[i].get());
     CacheStats {
       attached: tc.is_attached(),
+      shard: tc.shard.get(),
       claimed_blocks: tc
         .words
         .iter()
