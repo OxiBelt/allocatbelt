@@ -10,7 +10,7 @@
 #![cfg(feature = "experimental-rseq")]
 #![allow(
   unsafe_code,
-  reason = "the tests call fork, sched_setaffinity, alarm, _exit, waitpid and prctl"
+  reason = "the tests call fork, pthread_create, sched_setaffinity, alarm, _exit, waitpid and prctl"
 )]
 
 use std::sync::Mutex;
@@ -24,37 +24,82 @@ static GLOBAL: Allocatbelt = Allocatbelt;
 /// The policy is process-wide: one test at a time sets it.
 static POLICY: Mutex<()> = Mutex::new(());
 
+/// Runs `f(t)` for `t` in `0..n`, each on its own thread, and waits for
+/// them.
+///
+/// The threads are started with `pthread_create`, not `std::thread`: the
+/// forked children below start threads, and a child inherits every lock
+/// as it was at the `fork`. std's thread start and exit take a
+/// process-wide lock (its stack-overflow bookkeeping), which another
+/// test's thread, starting or ending in the parent at that moment, may
+/// hold; the child's `std::thread::spawn` would then wait on it forever.
+fn on_threads(n: usize, f: &(dyn Fn(usize) + Sync)) {
+  struct Arg<'a> {
+    f: &'a (dyn Fn(usize) + Sync),
+    t: usize,
+  }
+  extern "C" fn start(arg: *mut libc::c_void) -> *mut libc::c_void {
+    // SAFETY: `arg` points to an `Arg` of `args` below, which outlives the
+    // thread (it is joined before `args` is dropped).
+    let arg = unsafe { &*arg.cast::<Arg<'_>>() };
+    (arg.f)(arg.t);
+    std::ptr::null_mut()
+  }
+  let args: Vec<Arg<'_>> = (0..n).map(|t| Arg { f, t }).collect();
+  let ids: Vec<libc::pthread_t> = args
+    .iter()
+    .map(|arg| {
+      // SAFETY: `pthread_t` is plain data, written by `pthread_create`.
+      let mut id: libc::pthread_t = unsafe { std::mem::zeroed() };
+      // SAFETY: `id` is a valid out pointer, `start` has the signature
+      // `pthread_create` expects, and `arg` stays valid until the join.
+      let r = unsafe {
+        libc::pthread_create(
+          &raw mut id,
+          std::ptr::null(),
+          start,
+          std::ptr::from_ref(arg).cast_mut().cast(),
+        )
+      };
+      assert_eq!(r, 0, "pthread_create failed");
+      id
+    })
+    .collect();
+  for id in ids {
+    // SAFETY: `id` is a thread created above and not joined yet.
+    let r = unsafe { libc::pthread_join(id, std::ptr::null_mut()) };
+    assert_eq!(r, 0, "pthread_join failed");
+  }
+}
+
 /// Allocates and checks small blocks (cache refills pick the shard) and
 /// page runs on `threads` threads at once; returns the largest `mm_cid`
-/// any of them read, or `None` if none could be read.
+/// any of them read, or `None` if none could be read. Nothing on these
+/// threads panics (a panic would abort in `on_threads`' start routine):
+/// failures are recorded and returned.
 fn allocate_on_threads(threads: usize, rounds: usize) -> (bool, Option<u32>) {
   let ok = AtomicBool::new(true);
   let max_cid = AtomicU32::new(0);
   let seen = AtomicBool::new(false);
-  std::thread::scope(|s| {
-    for t in 0..threads {
-      let (ok, max_cid, seen) = (&ok, &max_cid, &seen);
-      s.spawn(move || {
-        let tag = t as u64;
-        for i in 0..rounds {
-          let blocks: Vec<Vec<u64>> = (0..16)
-            .map(|j| {
-              let len = if j == 0 { 20_000 } else { 1 + (i + j) % 60 };
-              vec![tag << 32 | (i * 16 + j) as u64; len]
-            })
-            .collect();
-          if !blocks.iter().all(|v| v.iter().all(|&x| x == v[0])) {
-            ok.store(false, Ordering::Relaxed);
-          }
-          if let Some(cid) = GLOBAL.mm_cid() {
-            seen.store(true, Ordering::Relaxed);
-            max_cid.fetch_max(cid, Ordering::Relaxed);
-          }
-          if i % 16 == 0 {
-            std::thread::yield_now();
-          }
-        }
-      });
+  on_threads(threads, &|t| {
+    let tag = t as u64;
+    for i in 0..rounds {
+      let blocks: Vec<Vec<u64>> = (0..16)
+        .map(|j| {
+          let len = if j == 0 { 20_000 } else { 1 + (i + j) % 60 };
+          vec![tag << 32 | (i * 16 + j) as u64; len]
+        })
+        .collect();
+      if !blocks.iter().all(|v| v.iter().all(|&x| x == v[0])) {
+        ok.store(false, Ordering::Relaxed);
+      }
+      if let Some(cid) = GLOBAL.mm_cid() {
+        seen.store(true, Ordering::Relaxed);
+        max_cid.fetch_max(cid, Ordering::Relaxed);
+      }
+      if i % 16 == 0 {
+        std::thread::yield_now();
+      }
     }
   });
   let cid = seen
@@ -212,8 +257,8 @@ fn a_cpuset_of_one_cpu_bounds_mm_cid() {
   // space starts with only that CPU allowed.
   set_allowed_cpus(&one);
   let child = in_child(|| {
+    // No printing here: another thread may hold stderr's lock at the fork.
     let (ok, cid) = allocate_on_threads(16, 300);
-    eprintln!("16 threads on CPU {first}: largest mm_cid {cid:?}");
     ok && cid.is_some() == status.available.is_ok() && cid.is_none_or(|c| c == 0)
   });
   set_allowed_cpus(&all);
