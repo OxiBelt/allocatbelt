@@ -24,6 +24,10 @@ cargo audit
 cargo deny check
 ```
 
+Changes must keep the rules in
+[docs/design-constraints.md](docs/design-constraints.md); one that would break
+a rule needs the review that document names first.
+
 A new Cargo feature needs code behind it, must be additive and build on
 stable Rust, gets a field in `CompiledCapabilities`, a row in
 [docs/features.md](docs/features.md) and a combination in

@@ -343,6 +343,38 @@ fn failed_purges_are_not_zeroed() {
   assert!(alloc_block(h, 1, 5 * PAGE_SIZE, 8).zeroed);
 }
 
+/// Free pages are taken first fit by position, whatever their history: a
+/// page that was used and freed (and still holds its bytes) is not
+/// preferred to one that was never handed out, nor the other way round.
+#[test]
+fn free_page_choice_ignores_page_history() {
+  let h = heap();
+  let first = alloc(h, 0, PAGE_SIZE, 8);
+  assert_eq!(first % SEGMENT_SIZE, 0);
+  // Pages 1 to 3 are skipped by the alignment and never handed out.
+  let used = alloc(h, 0, PAGE_SIZE, 4 * PAGE_SIZE);
+  assert_eq!(used, first + 4 * PAGE_SIZE);
+  free(h, used);
+  assert_eq!(h.dirty_pages(), 1);
+  // The never-used page 1 comes first; the freed page 4 waits its turn.
+  let next = alloc_block(h, 0, PAGE_SIZE, 8);
+  assert_eq!(next.offset, first + PAGE_SIZE);
+  assert!(next.zeroed);
+  assert_eq!(h.dirty_pages(), 1);
+  // A purged page is taken where it lies too, before later dirty ones.
+  let (a, b) = (alloc(h, 0, PAGE_SIZE, 8), alloc(h, 0, PAGE_SIZE, 8));
+  assert_eq!((a, b), (first + 2 * PAGE_SIZE, first + 3 * PAGE_SIZE));
+  free(h, a);
+  h.purge();
+  free(h, b);
+  let again = alloc_block(h, 0, PAGE_SIZE, 8);
+  assert_eq!(again.offset, a);
+  assert!(again.zeroed);
+  for o in [first, next.offset, again.offset] {
+    free(h, o);
+  }
+}
+
 #[test]
 fn page_aligned_runs_stay_inside_segments() {
   let h = heap();
