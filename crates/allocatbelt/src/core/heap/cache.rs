@@ -296,13 +296,20 @@ impl<O: Os> Heap<O> {
     if matches!(tc.state.get(), RETIRED | ATTACHED) {
       return;
     }
-    let n = self.next_shard.fetch_add(1, Relaxed);
+    // Consecutive caches get consecutive shards. A plain load and store,
+    // not a read-modify-write: two threads attaching at once may get the
+    // same shard, which costs them some lock sharing and nothing else, as
+    // the shard is only a first choice (see `with_shard`). The random seed
+    // below still differs, as it mixes in the cache's own address.
+    let n = self.next_shard.load(Relaxed);
+    self.next_shard.store(n.wrapping_add(1), Relaxed);
     tc.shard.set(n % SHARDS);
     let seed = self.seed.load(Relaxed);
     tc.rng.set(if seed == 0 {
       0
     } else {
-      splitmix(seed ^ (n as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15))
+      let at = core::ptr::from_ref(tc).addr() as u64;
+      splitmix(seed ^ (n as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ at.rotate_left(32))
     });
     // A new cache owes nothing for requests made before it existed.
     tc.pressure_seen.set(self.cache_pressure.load(Relaxed));

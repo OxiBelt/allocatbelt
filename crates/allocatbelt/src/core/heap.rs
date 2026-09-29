@@ -449,7 +449,8 @@ pub struct Heap<O> {
   maint_stats: [AtomicU64; maint::STATS],
   /// Reclamation policy and the sweep in progress (see [`reclaim`]).
   sweep: reclaim::Sweep,
-  /// Round-robin shard assignment for attached thread caches.
+  /// Next shard to assign to an attaching thread cache (round robin, not
+  /// exact: see `Heap::attach`).
   next_shard: AtomicUsize,
   /// Cache-return generation: bumped by [`Heap::request_cache_return`];
   /// each attached cache drains itself when it sees a new value (see
