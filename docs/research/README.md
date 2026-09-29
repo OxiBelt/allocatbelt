@@ -84,6 +84,7 @@ Items 1–5 of the list above, plus fuzzing and loom for item 6. Measurements ar
   - The owner clears a hint *before* taking what it points to, and re-checks with a read-modify-write before retiring a page.
   - A hint can be stale-set (costing one wasted look) but never stale-clear while blocks are waiting.
   - loom checks this, including the page-level counter that page recycling relies on.
+- **Since the theory-driven plan's Stage D** ([theory-driven-implementation-status.md](theory-driven-implementation-status.md)): trimming keeps each shard's per-class cursor unless it releases that page, and finds fully free pages through empty-page candidates that the last free of a page publishes, instead of checking every small page. The level above (which segments of a shard have pages of a class) is not indexed; [class-segment-index.md](class-segment-index.md) is the bounded design for it.
 
 ### Delayed purging (`heap/purge.rs`)
 

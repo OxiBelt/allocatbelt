@@ -64,6 +64,8 @@ Added by Stage B (bounded, resumable reclamation, [reclamation.md](../reclamatio
 
 Added by Stage C ([thread-caches.md](../thread-caches.md)): `Allocatbelt::flush_thread_cache` and `request_cache_return`, and `CacheStats::pressure_returns`; `CacheStats::evictions` now counts evictions from a full set of the 2-way buffer.
 
+Added by Stage D ([reclamation.md](../reclamation.md)): the `MaintenanceStats` fields `stale_empty_candidates` and `reconciled_pages`; `SearchStats::cursor_invalidations` now counts only cursors of pages trimming released.
+
 Changed in this review, so that later additions are not breaking:
 
 - `#[non_exhaustive]` on `MaintenanceStats`, `PurgeBackend`, `Capabilities`, `RingError`, `RseqStatus` and `RseqUnavailable`: types whose fields or variants are expected to grow (new counters, backends, probe results, rseq failure causes). The other report and policy types already were. Users read these types; they cannot build them with a literal or match them exhaustively any more, which nothing in this repository did.

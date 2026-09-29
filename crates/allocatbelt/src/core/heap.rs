@@ -10,7 +10,11 @@
 //! [3] SEG_DIRTY  free pages whose memory has not been purged yet; while
 //!                the segment is not owned, non-zero if its memory may hold
 //!                non-zero bytes
-//! [4..8]         reserved
+//! [4] SEG_IDLE   decay epoch (+ 1) in which trimming first found the
+//!                owned segment empty, or 0
+//! [5] SEG_EMPTY  small pages that may have become completely free
+//!                (empty-page candidates, set by frees, taken by trimming)
+//! [6..8]         reserved
 //! [SEG_CLS + c]    small pages of class c (changed under the shard lock)
 //! [SEG_AVAIL + c]  pages of class c that may have free blocks
 //! then per page (PAGE_META_WORDS each):
@@ -210,6 +214,9 @@ const SEG_DIRTY: usize = 3;
 /// Decay epoch (+ 1) in which a purge pass first found the owned segment
 /// empty, or 0.
 const SEG_IDLE: usize = 4;
+/// Small pages that may have become completely free: set by the free that
+/// brings a page's free count to its capacity, taken by trimming.
+const SEG_EMPTY: usize = 5;
 const SEG_CLS: usize = 8;
 const SEG_AVAIL: usize = SEG_CLS + NUM_CLASSES;
 
@@ -259,7 +266,11 @@ const DOUBLE_FREE: &str = "allocatbelt: double free detected";
 #[derive(Debug)]
 struct ClassState {
   /// Page (+ 1) this shard currently claims words of this class from; 0
-  /// when there is none.
+  /// when there is none. Changed under the shard lock. A non-zero cursor
+  /// always names a small page of this class in a segment the shard owns:
+  /// releasing the page ([`Heap::release_small_page`], the only way a small
+  /// page stops being one, and a precondition of returning its segment)
+  /// clears it.
   cursor: AtomicU64,
 }
 
@@ -819,10 +830,16 @@ impl<O: Os> Heap<O> {
     Some(p)
   }
 
-  /// Returns a small page whose blocks are all free to its segment. Caller
-  /// holds the owning shard's lock.
-  fn release_small_page(&self, page: usize, m: &[AtomicU64], c: usize) {
+  /// Returns a small page whose blocks are all free to its segment, and
+  /// drops the shard's cursor for the class if it is on that page. Caller
+  /// holds the lock of `sh`, the owning shard.
+  fn release_small_page(&self, sh: &Shard, page: usize, m: &[AtomicU64], c: usize) {
     let in_seg = page % PAGES_PER_SEGMENT;
+    let cs = &sh.classes[c];
+    if cs.cursor.load(Relaxed) == page as u64 + 1 {
+      cs.cursor.store(0, Relaxed);
+      sh.bump(SearchStat::CursorInvalidation, 1);
+    }
     m[SEG_CLS + c].fetch_and(!(1 << in_seg), Relaxed);
     m[SEG_AVAIL + c].fetch_and(!(1 << in_seg), AcqRel);
     PageMeta::new(m, in_seg).info().store(PAGE_FREE, Release);
@@ -850,7 +867,7 @@ impl<O: Os> Heap<O> {
       page % PAGES_PER_SEGMENT,
     );
     let pm = PageMeta::new(m, in_seg);
-    if !proto::release_blocks(
+    let Some(now) = proto::release_blocks(
       pm.bitmap(w),
       pm.free(),
       pm.summary(),
@@ -858,9 +875,10 @@ impl<O: Os> Heap<O> {
       w as u32,
       1 << in_seg,
       mask,
-    ) {
+    ) else {
       self.os.fatal(DOUBLE_FREE);
-    }
+    };
+    proto::publish_if_empty(&m[SEG_EMPTY], 1 << in_seg, now, class::capacity(c) as u64);
   }
 
   // ---- page runs -----------------------------------------------------
@@ -984,6 +1002,7 @@ impl<O: Os> Heap<O> {
       m[SEG_AVAIL + c].store(0, Relaxed);
     }
     m[SEG_IDLE].store(0, Relaxed);
+    m[SEG_EMPTY].store(0, Relaxed);
     m[SEG_PAGES].store(GUARD_BIT, Release);
     m[SEG_NEXT].store(u64::from(sh.segs.load(Relaxed)), Relaxed);
     m[SEG_HDR].store(SEG_OWNED | (s as u64) << 8 | 1 << 16, Release);

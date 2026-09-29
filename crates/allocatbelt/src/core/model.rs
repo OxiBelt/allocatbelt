@@ -411,7 +411,8 @@ fn size_of(hi: u8, lo: u8) -> usize {
 /// uncached paths through a cache) and the uncached API, so frees routinely
 /// cross "threads". The program also flushes and retires caches, purges,
 /// runs decay passes, advances the clock, changes the purge delay, the
-/// reclamation thresholds, the slice size and the retention mode, hands
+/// reclamation thresholds, the slice size, the retention mode and how often
+/// decay sweeps reconcile the empty-page candidates, hands
 /// housekeeping to a maintenance "thread" and back, runs its rounds (also
 /// with a batching [`MockPurger`] that fails some runs) and requests purges
 /// from it; the
@@ -473,8 +474,14 @@ pub fn run(data: &[u8]) {
         // Asks every cache to drain itself at its next sampled slow path.
         None => h.request_cache_return(),
       },
-      23 => h.purge(),
-      24 => h.decay(),
+      23 => {
+        h.purge();
+        h.check_indexes();
+      }
+      24 => {
+        h.decay();
+        h.check_indexes();
+      }
       25 => h.os().advance(u64::from(byte()) * 16),
       26 => {
         let b = byte();
@@ -492,6 +499,9 @@ pub fn run(data: &[u8]) {
           _ => {
             // Slices from one work unit up, so sweeps resume often.
             h.set_slice_work(1 + u64::from(byte()) * 8);
+            // Decay sweeps that trust the empty-page candidates alone, or
+            // reconcile every few epochs.
+            h.set_reconcile_epochs(u64::from(byte() % 4));
             h.set_retention(if b & 4 == 0 {
               Retention::Fixed
             } else {
@@ -566,7 +576,14 @@ pub fn check_observations(h: &Heap<MockOs>, caches: &[ThreadCache]) {
       <= m.slices,
     "{m:?}"
   );
-  assert!(m.released_pages <= m.trim_pages_inspected, "{m:?}");
+  assert!(
+    m.released_pages + m.stale_empty_candidates <= m.trim_pages_inspected,
+    "{m:?}"
+  );
+  // One thread at a time: no free publishes a candidate while a sweep
+  // runs, so reconciling finds nothing the candidates missed.
+  assert_eq!(m.reconciled_pages, 0, "{m:?}");
+  h.check_indexes();
   let s = h.search_stats();
   assert!(s.stale_hints <= s.candidates, "{s:?}");
   assert!(s.cursor_claims <= s.refills, "{s:?}");

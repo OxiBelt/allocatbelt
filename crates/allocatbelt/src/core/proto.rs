@@ -5,7 +5,7 @@
 //! below) checks exactly the code the heap executes. Callers pass the words
 //! involved; nothing here knows the metadata layout.
 //!
-//! Three protocols live here:
+//! Four protocols live here:
 //!
 //! * **Block bitmaps.** A small page has one bitmap bit per block (1 =
 //!   free), a *summary* word with one bit per bitmap word that may be
@@ -16,6 +16,15 @@
 //!   hint *before* taking the bits, so a racing free either lands in the
 //!   bits it takes or re-sets the hint afterwards. A hint may be stale-set,
 //!   never stale-clear while bits are waiting.
+//! * **Empty-page candidates.** A segment has an *empty* word with one bit
+//!   per small page that may have become completely free. The free whose
+//!   counter increment brings the page's free count to its capacity sets
+//!   the bit ([`publish_if_empty`]); trimming, under the owner's lock,
+//!   takes the whole word ([`take_candidates`]) and checks each page's
+//!   counter before releasing it. The counter never exceeds the capacity
+//!   and only the owner's claims lower it, so every fully free page was
+//!   published by the increment that made it so, after any take that could
+//!   have dropped its bit: a candidate may be stale, never lost.
 //! * **Page runs.** A segment has a `pages` word (1 = claimed) and a
 //!   `dirty` word (1 = free but not yet purged). Claims are compare-exchanges
 //!   on `pages`; releases mark dirty before freeing; a purge claims the dirty
@@ -36,8 +45,9 @@ use crate::core::sync::{AtomicU32, AtomicU64, fence};
 ///
 /// `count` is the page's free-block counter, `summary` its word summary and
 /// `avail`/`page_bit` its bit in the segment's availability word for its
-/// class. Returns `false`, having changed only `word`, if a bit of `mask`
-/// was already free: a double free.
+/// class. Returns the free count this free raised the counter to, or
+/// `None`, having changed only `word`, if a bit of `mask` was already
+/// free: a double free.
 pub(crate) fn release_blocks(
   word: &AtomicU64,
   count: &AtomicU64,
@@ -46,18 +56,36 @@ pub(crate) fn release_blocks(
   w: u32,
   page_bit: u64,
   mask: u64,
-) -> bool {
+) -> Option<u64> {
   let old = word.fetch_or(mask, AcqRel);
   if old & mask != 0 {
-    return false;
+    return None;
   }
   // Bits first, then the counter: the counter never overstates the set
   // bits once the owner's claims are subtracted.
-  count.fetch_add(u64::from(mask.count_ones()), Release);
+  let n = u64::from(mask.count_ones());
+  let now = count.fetch_add(n, Release).wrapping_add(n);
   if old == 0 && summary.fetch_or(1 << w, AcqRel) == 0 {
     avail.fetch_or(page_bit, AcqRel);
   }
-  true
+  Some(now)
+}
+
+/// Publishes a page as an empty-page candidate in its segment's `empty`
+/// word if `now`, the free count a [`release_blocks`] just returned, is
+/// the page's capacity `cap`: that free may have returned the page's last
+/// block. A claim racing the free can make the candidate stale.
+pub(crate) fn publish_if_empty(empty: &AtomicU64, page_bit: u64, now: u64, cap: u64) {
+  if now == cap {
+    // Release: whoever takes the bit reads the counter at least at `now`.
+    empty.fetch_or(page_bit, Release);
+  }
+}
+
+/// Takes a segment's empty-page candidates, for the owner to check under
+/// its lock. A free that publishes after the take sets its bit again.
+pub(crate) fn take_candidates(empty: &AtomicU64) -> u64 {
+  empty.swap(0, AcqRel)
 }
 
 /// Claims every free block of one bitmap word of a page, choosing among the
@@ -217,21 +245,29 @@ mod loom_tests {
     count: AtomicU64,
     summary: AtomicU64,
     avail: AtomicU64,
+    /// The segment's empty-page candidates (this page is bit 0).
+    empty: AtomicU64,
+    /// Blocks of the page.
+    cap: u64,
   }
 
   impl Page {
-    fn new(words: [u64; 2]) -> Self {
+    /// A page of `cap` blocks whose free blocks are `words`.
+    fn new(words: [u64; 2], cap: u64) -> Self {
       let summary = u64::from(words[0] != 0) | u64::from(words[1] != 0) << 1;
       Self {
         words: [AtomicU64::new(words[0]), AtomicU64::new(words[1])],
         count: AtomicU64::new(u64::from(words[0].count_ones() + words[1].count_ones())),
         summary: AtomicU64::new(summary),
         avail: AtomicU64::new(u64::from(summary != 0)),
+        empty: AtomicU64::new(0),
+        cap,
       }
     }
 
+    /// A free, as `Heap::free_bits` makes it.
     fn free(&self, w: u32, mask: u64) -> bool {
-      release_blocks(
+      let Some(now) = release_blocks(
         &self.words[w as usize],
         &self.count,
         &self.summary,
@@ -239,7 +275,18 @@ mod loom_tests {
         w,
         1,
         mask,
-      )
+      ) else {
+        return false;
+      };
+      publish_if_empty(&self.empty, 1, now, self.cap);
+      true
+    }
+
+    /// Trimming, under the owner's lock: takes the candidate and checks
+    /// the counter, as `release_empty_pages` does. Returns whether the
+    /// page would be released.
+    fn trim(&self) -> bool {
+      take_candidates(&self.empty) != 0 && self.count.load(Acquire) >= self.cap
     }
 
     /// The owner's refill loop: claim words until the page is empty and
@@ -283,7 +330,7 @@ mod loom_tests {
   #[test]
   fn free_races_claim() {
     loom::model(|| {
-      let page = Arc::new(Page::new([0b0001, 0]));
+      let page = Arc::new(Page::new([0b0001, 0], 3));
       let p = page.clone();
       let freer = thread::spawn(move || {
         assert!(p.free(0, 0b0010));
@@ -309,7 +356,7 @@ mod loom_tests {
   #[test]
   fn two_freers_one_word() {
     loom::model(|| {
-      let page = Arc::new(Page::new([0, 0]));
+      let page = Arc::new(Page::new([0, 0], 2));
       let handles: Vec<_> = [0b01u64, 0b10]
         .into_iter()
         .map(|m| {
@@ -330,7 +377,7 @@ mod loom_tests {
   fn full_counter_means_every_block_is_free() {
     loom::model(|| {
       // Two blocks: block 0 free, block 1 live and about to be freed.
-      let page = Arc::new(Page::new([0b01, 0]));
+      let page = Arc::new(Page::new([0b01, 0], 2));
       let p = page.clone();
       let freer = thread::spawn(move || assert!(p.free(0, 0b10)));
       // The owner claims what it can and hands it back, as a thread cache
@@ -351,10 +398,63 @@ mod loom_tests {
     });
   }
 
+  /// The frees of a page's last two blocks race trimming: if the trim
+  /// did not see the page empty, the candidate is still published.
+  #[test]
+  fn last_free_publishes_a_candidate() {
+    loom::model(|| {
+      let page = Arc::new(Page::new([0, 0], 2));
+      let handles: Vec<_> = [0b01u64, 0b10]
+        .into_iter()
+        .map(|m| {
+          let p = page.clone();
+          thread::spawn(move || assert!(p.free(0, m)))
+        })
+        .collect();
+      let released = page.trim();
+      for h in handles {
+        h.join().unwrap();
+      }
+      assert_eq!(page.count.load(Relaxed), 2);
+      assert!(
+        released || page.empty.load(Relaxed) == 1,
+        "a fully free page is neither released nor a candidate"
+      );
+      if released {
+        assert_eq!(page.words[0].load(Relaxed), 0b11);
+      }
+    });
+  }
+
+  /// The owner claims a word while the page's last live block is freed, so
+  /// the free may publish a stale candidate; the owner hands the word back
+  /// (a cache return) and trims. The candidate for the page, now fully
+  /// free, is not lost.
+  #[test]
+  fn a_claim_racing_the_last_free_loses_no_candidate() {
+    loom::model(|| {
+      // Block 0 free, block 1 live.
+      let page = Arc::new(Page::new([0b01, 0], 2));
+      let p = page.clone();
+      let freer = thread::spawn(move || assert!(p.free(0, 0b10)));
+      if let Some((w, b)) = claim_word(&page.summary, &page.words, 0) {
+        page.count.fetch_sub(u64::from(b.count_ones()), Relaxed);
+        assert!(page.free(w, b));
+      }
+      let released = page.trim();
+      freer.join().unwrap();
+      assert_eq!(page.count.load(Relaxed), 2);
+      assert!(
+        released || page.empty.load(Relaxed) == 1,
+        "a fully free page is neither released nor a candidate"
+      );
+    });
+  }
+
   #[test]
   fn racing_double_free_is_caught() {
     loom::model(|| {
-      let page = Arc::new(Page::new([0, 0]));
+      let page = Arc::new(Page::new([0, 0], 1));
       let p = page.clone();
       let t = thread::spawn(move || p.free(0, 0b1));
       let mine = page.free(0, 0b1);

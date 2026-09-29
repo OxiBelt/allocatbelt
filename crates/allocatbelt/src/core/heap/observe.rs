@@ -78,8 +78,9 @@ pub struct SearchStats {
   pub stale_hints: u64,
   /// Pages set up for a size class because no page of it had free blocks.
   pub new_pages: u64,
-  /// Current pages forgotten by trimming (see `release_empty_pages`), so
-  /// the next refill of the class searches again.
+  /// Current pages released by trimming (see `release_empty_pages`): their
+  /// cursor is dropped, so the next refill of the class searches again.
+  /// Trimming keeps the cursors of pages it does not release.
   pub cursor_invalidations: u64,
   /// Searches for a free page run (large blocks and new small pages).
   pub run_searches: u64,
@@ -241,12 +242,86 @@ impl<O: Os> Heap<O> {
   }
 }
 
+#[cfg(any(all(test, allocatbelt_core_check), allocatbelt_model))]
+impl<O: Os> Heap<O> {
+  /// Checks the search indexes against the metadata they summarize, while
+  /// no operation is running: every class cursor names a small page of its
+  /// class in a segment on its shard's list, and every small page whose
+  /// blocks are all free is an empty-page candidate of its segment.
+  pub fn check_indexes(&self) {
+    for (s, sh) in self.shards.iter().enumerate() {
+      let mut segs = std::vec::Vec::new();
+      let mut cur = sh.segs.load(Relaxed);
+      while cur != 0 {
+        let seg = cur as usize - 1;
+        let m = self.seg_meta(seg);
+        let hdr = m[SEG_HDR].load(Acquire);
+        assert_eq!(
+          (hdr & 0xFF, (hdr >> 8) & 0xFF),
+          (SEG_OWNED, s as u64),
+          "segment {seg} on the list of shard {s}"
+        );
+        segs.push(seg);
+        cur = m[SEG_NEXT].load(Relaxed) as u32;
+      }
+      for (c, cs) in sh.classes.iter().enumerate() {
+        let cur = cs.cursor.load(Relaxed);
+        if cur == 0 {
+          continue;
+        }
+        let (seg, i) = (
+          (cur as usize - 1) / PAGES_PER_SEGMENT,
+          (cur as usize - 1) % PAGES_PER_SEGMENT,
+        );
+        assert!(
+          segs.contains(&seg),
+          "cursor of shard {s} class {c} in segment {seg}, not the shard's"
+        );
+        let m = self.seg_meta(seg);
+        assert_eq!(
+          PageMeta::new(m, i).info().load(Acquire),
+          PAGE_SMALL | (c as u64) << 8,
+          "cursor of shard {s} class {c} on page {i} of segment {seg}"
+        );
+        assert_ne!(m[SEG_CLS + c].load(Relaxed) & 1 << i, 0);
+      }
+      for &seg in &segs {
+        let m = self.seg_meta(seg);
+        let empty = m[SEG_EMPTY].load(Relaxed);
+        for c in 0..NUM_CLASSES {
+          let mut small = m[SEG_CLS + c].load(Relaxed);
+          while small != 0 {
+            let i = small.trailing_zeros() as usize;
+            small &= small - 1;
+            if PageMeta::new(m, i).free().load(Relaxed) >= class::capacity(c) as u64 {
+              assert_ne!(
+                empty & 1 << i,
+                0,
+                "fully free page {i} of segment {seg} (class {c}) is not a candidate"
+              );
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
 #[cfg(all(test, allocatbelt_core_check))]
 impl<O: Os> Heap<O> {
   /// Runs `f` while shard `s` is locked, as by an allocating thread.
   pub(crate) fn with_shard_held<R>(&self, s: usize, f: impl FnOnce() -> R) -> R {
     let _g = self.shards[s].lock.lock(&self.os);
     f()
+  }
+
+  /// Drops every empty-page candidate, as a lost publication would.
+  pub(crate) fn forget_empty_candidates(&self) {
+    for seg in 0..MAX_SEGMENTS {
+      if let Some(m) = self.os.meta(seg) {
+        m[SEG_EMPTY].store(0, Relaxed);
+      }
+    }
   }
 
   /// Runs `f` while the purge lock is held, as by a running pass.

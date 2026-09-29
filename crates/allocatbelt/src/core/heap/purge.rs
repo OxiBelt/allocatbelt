@@ -24,7 +24,12 @@
 //! * an explicit [`Heap::purge`] returns everything it can right away.
 //!
 //! Every pass also releases small pages whose blocks are all free, turning
-//! them into dirty free pages that the time rule then handles. Each shard
+//! them into dirty free pages that the time rule then handles. It finds
+//! them through the empty-page candidates that frees publish (see
+//! `proto`), not by checking every small page; force sweeps and every
+//! `RECONCILE_EPOCHS`-th decay sweep (see `reclaim`)
+//! check every small page as well, a bounded reconciliation that would
+//! recover a candidate lost to a bug. Each shard
 //! keeps one empty segment, so a shard that drains and refills does not
 //! decommit and recommit a segment every time.
 //!
@@ -316,30 +321,52 @@ impl<O: Os> Heap<O> {
     batch.nsegs = 0;
   }
 
-  /// Releases every small page of segment `seg` whose blocks are all free
-  /// and returns the number of small pages it checked. Caller holds the
-  /// lock of the shard that owns the segment.
+  /// Releases the small pages of segment `seg` whose blocks are all free
+  /// and returns the number of pages it checked. Checks the segment's
+  /// empty-page candidates; with `reconcile`, every small page of the
+  /// segment instead (counting releases that had no candidate). Caller
+  /// holds the lock of `sh`, the shard that owns the segment.
+  ///
+  /// A candidate is only a request to look: the page is released if it is
+  /// still a small page of its class here (`SEG_CLS`, changed under this
+  /// lock) and its free count is its capacity. Frees set bits before
+  /// bumping the counter, and our own claims are subtracted under this
+  /// lock, so the counter never overstates the free blocks here; blocks
+  /// held in thread caches are claimed, so they keep the page.
   pub(super) fn release_empty_pages(
     &self,
+    sh: &Shard,
     seg: usize,
     m: &[AtomicU64],
+    reconcile: bool,
     work: &mut PassWork,
   ) -> u64 {
+    let hinted = proto::take_candidates(&m[SEG_EMPTY]);
+    let mut pages = hinted;
+    if reconcile {
+      for c in 0..NUM_CLASSES {
+        pages |= m[SEG_CLS + c].load(Relaxed);
+      }
+    }
     let mut inspected = 0;
-    for c in 0..NUM_CLASSES {
-      let cap = class::capacity(c) as i64;
-      let mut pages = m[SEG_CLS + c].load(Relaxed);
-      while pages != 0 {
-        let i = pages.trailing_zeros() as usize;
-        pages &= pages - 1;
-        // Frees set bits before bumping the counter, and our own
-        // claims are subtracted under this lock, so the counter never
-        // overstates the free blocks here.
-        inspected += 1;
-        if PageMeta::new(m, i).free().load(Acquire) as i64 >= cap {
-          self.release_small_page(seg * PAGES_PER_SEGMENT + i, m, c);
-          work.released_pages += 1;
+    while pages != 0 {
+      let i = pages.trailing_zeros() as usize;
+      let bit = 1u64 << i;
+      pages &= pages - 1;
+      inspected += 1;
+      let pm = PageMeta::new(m, i);
+      let info = pm.info().load(Acquire);
+      let c = ((info >> 8) & 0xFF) as usize;
+      let small =
+        info & 0xFF == PAGE_SMALL && c < NUM_CLASSES && m[SEG_CLS + c].load(Relaxed) & bit != 0;
+      if small && pm.free().load(Acquire) >= class::capacity(c) as u64 {
+        self.release_small_page(sh, seg * PAGES_PER_SEGMENT + i, m, c);
+        work.released_pages += 1;
+        if hinted & bit == 0 {
+          work.reconciled_pages += 1;
         }
+      } else if hinted & bit != 0 {
+        work.stale_empty_candidates += 1;
       }
     }
     work.trim_pages_inspected += inspected;

@@ -116,7 +116,9 @@ pub struct MaintenanceStats {
   /// Shards a pass skipped because another thread held their lock; their
   /// pages and segments wait for a later pass.
   pub busy_shards: u64,
-  /// Small pages whose free count trimming checked.
+  /// Small pages whose free count trimming checked: empty-page candidates
+  /// (published by the free that made a page fully free), and in
+  /// reconciling sweeps every small page.
   pub trim_pages_inspected: u64,
   /// Small pages trimming found fully free and turned into dirty free
   /// pages. Returning a page to its segment does not return memory to the
@@ -124,6 +126,14 @@ pub struct MaintenanceStats {
   pub released_pages: u64,
   /// Empty segments trimming returned to the arena (decommitted).
   pub returned_segments: u64,
+  /// Empty-page candidates trimming checked and did not release: the page
+  /// was claimed from again, released or reused since its last block was
+  /// freed.
+  pub stale_empty_candidates: u64,
+  /// Pages a reconciling sweep (force, and every `RECONCILE_EPOCHS`-th
+  /// decay sweep) released without a candidate. 0 unless a candidate was
+  /// lost, or a free published it while the sweep ran.
+  pub reconciled_pages: u64,
   /// Passes an allocating or freeing thread would have run but skipped,
   /// because another thread held the purge lock.
   pub skipped_passes: u64,
@@ -169,10 +179,12 @@ pub(super) enum Stat {
   InlineSlice,
   EmergencySlice,
   StalledCycle,
+  StaleEmptyCandidate,
+  ReconciledPage,
 }
 
 /// Number of [`Stat`]s.
-pub(super) const STATS: usize = 22;
+pub(super) const STATS: usize = 24;
 
 /// The work of one slice, counted in private and added to the shared
 /// counters once when the slice ends.
@@ -188,6 +200,8 @@ pub(super) struct PassWork {
   pub(super) trim_pages_inspected: u64,
   pub(super) released_pages: u64,
   pub(super) returned_segments: u64,
+  pub(super) stale_empty_candidates: u64,
+  pub(super) reconciled_pages: u64,
 }
 
 impl PassWork {
@@ -203,6 +217,8 @@ impl PassWork {
       trim_pages_inspected: 0,
       released_pages: 0,
       returned_segments: 0,
+      stale_empty_candidates: 0,
+      reconciled_pages: 0,
     }
   }
 }
@@ -387,6 +403,8 @@ impl<O: Os> Heap<O> {
     self.count_n(Stat::TrimPageInspected, w.trim_pages_inspected);
     self.count_n(Stat::ReleasedPage, w.released_pages);
     self.count_n(Stat::ReturnedSegment, w.returned_segments);
+    self.count_n(Stat::StaleEmptyCandidate, w.stale_empty_candidates);
+    self.count_n(Stat::ReconciledPage, w.reconciled_pages);
   }
 
   /// The housekeeping counters so far.
@@ -409,6 +427,8 @@ impl<O: Os> Heap<O> {
       trim_pages_inspected: s(Stat::TrimPageInspected),
       released_pages: s(Stat::ReleasedPage),
       returned_segments: s(Stat::ReturnedSegment),
+      stale_empty_candidates: s(Stat::StaleEmptyCandidate),
+      reconciled_pages: s(Stat::ReconciledPage),
       skipped_passes: s(Stat::SkippedPass),
       slices: s(Stat::Slice),
       inline_slices: s(Stat::InlineSlice),

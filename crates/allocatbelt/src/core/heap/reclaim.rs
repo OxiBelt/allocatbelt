@@ -65,6 +65,11 @@ use super::*;
 pub(super) const SLICE_WORK: u64 = 4096;
 /// An emergency slice may spend this many times [`SLICE_WORK`].
 const EMERGENCY_FACTOR: u64 = 4;
+/// Every this many decay epochs a decay sweep reconciles: its trim checks
+/// every small page, not only the empty-page candidates (force sweeps
+/// always do). Bounds how long a candidate lost to a bug could keep a
+/// fully free page: four purge delays with regular decay.
+pub(super) const RECONCILE_EPOCHS: u64 = 16;
 
 /// Pages of the arena; every threshold must fit.
 const ARENA_PAGES: usize = MAX_SEGMENTS * PAGES_PER_SEGMENT;
@@ -317,6 +322,8 @@ struct SweepState {
   prev: u64,
   /// Trim: the current shard kept an empty segment already.
   kept_empty: bool,
+  /// Trim: check every small page, not only the empty-page candidates.
+  reconcile: bool,
   /// Purge: segment indices covered, from `purge_start`.
   purge_off: u64,
   /// Pages purged or released and segments returned by this sweep.
@@ -336,6 +343,7 @@ pub(super) struct Sweep {
   shards_done: AtomicU64,
   prev: AtomicU64,
   kept_empty: AtomicBool,
+  reconcile: AtomicBool,
   purge_off: AtomicU64,
   progress: AtomicU64,
   /// Where the next sweep's trim starts (rotates by one per sweep).
@@ -355,6 +363,9 @@ pub(super) struct Sweep {
   decay_owed: AtomicBool,
   /// Work units per slice ([`SLICE_WORK`]; tests lower it).
   slice_work: AtomicU64,
+  /// Decay epochs between reconciling decay sweeps
+  /// ([`RECONCILE_EPOCHS`]; tests change it, 0 never).
+  reconcile_epochs: AtomicU64,
   /// [`Retention`]: 0 fixed, 1 adaptive.
   adaptive: AtomicBool,
   /// Current multiple of the delay decay keeps pages (1..=MAX_RETENTION).
@@ -379,6 +390,7 @@ impl Sweep {
       shards_done: AtomicU64::new(0),
       prev: AtomicU64::new(0),
       kept_empty: AtomicBool::new(false),
+      reconcile: AtomicBool::new(false),
       purge_off: AtomicU64::new(0),
       progress: AtomicU64::new(0),
       trim_start: AtomicU64::new(0),
@@ -388,6 +400,7 @@ impl Sweep {
       stall_epoch: AtomicU64::new(u64::MAX),
       decay_owed: AtomicBool::new(false),
       slice_work: AtomicU64::new(SLICE_WORK),
+      reconcile_epochs: AtomicU64::new(RECONCILE_EPOCHS),
       adaptive: AtomicBool::new(false),
       retention: AtomicU64::new(1),
       reuse_ewma: AtomicU64::new(0),
@@ -407,6 +420,7 @@ impl Sweep {
       shards_done: self.shards_done.load(Relaxed),
       prev: self.prev.load(Relaxed),
       kept_empty: self.kept_empty.load(Relaxed),
+      reconcile: self.reconcile.load(Relaxed),
       purge_off: self.purge_off.load(Relaxed),
       progress: self.progress.load(Relaxed),
       trim_start: self.trim_start.load(Relaxed),
@@ -423,6 +437,7 @@ impl Sweep {
     self.shards_done.store(s.shards_done, Relaxed);
     self.prev.store(s.prev, Relaxed);
     self.kept_empty.store(s.kept_empty, Relaxed);
+    self.reconcile.store(s.reconcile, Relaxed);
     self.purge_off.store(s.purge_off, Relaxed);
     self.progress.store(s.progress, Relaxed);
     self.trim_start.store(s.trim_start, Relaxed);
@@ -490,6 +505,13 @@ impl<O: Os> Heap<O> {
   #[cfg(any(all(test, allocatbelt_core_check), allocatbelt_model))]
   pub fn set_slice_work(&self, units: u64) {
     self.sweep.slice_work.store(units.max(1), Relaxed);
+  }
+
+  /// Sets how many decay epochs pass between reconciling decay sweeps
+  /// (0: never), for tests of the empty-page candidates.
+  #[cfg(any(all(test, allocatbelt_core_check), allocatbelt_model))]
+  pub fn set_reconcile_epochs(&self, epochs: u64) {
+    self.sweep.reconcile_epochs.store(epochs, Relaxed);
   }
 
   /// Work units of an ordinary or an emergency slice.
@@ -783,6 +805,8 @@ impl<O: Os> Heap<O> {
       // is owed again.
       self.sweep.decay_owed.store(false, Relaxed);
     }
+    let every = self.sweep.reconcile_epochs.load(Relaxed);
+    st.reconcile = kind == FORCE || (kind == DECAY && every != 0 && epoch.is_multiple_of(every));
     st.shards_done = 0;
     st.prev = 0;
     st.kept_empty = false;
@@ -838,14 +862,7 @@ impl<O: Os> Heap<O> {
       if st.prev == 0 {
         pw.trimmed_shards += 1;
       }
-      // The cursors are only scan positions; dropping them makes the next
-      // claims start from the availability words, and no cursor is left
-      // on a page released below.
-      for cs in &sh.classes {
-        if cs.cursor.swap(0, Relaxed) != 0 {
-          sh.bump(SearchStat::CursorInvalidation, 1);
-        }
-      }
+      // Class cursors stay: releasing a page drops the cursor on it.
       let mut prev: Option<(usize, &[AtomicU64])> = None;
       let mut cur = sh.segs.load(Relaxed) as u64;
       if st.prev != 0 {
@@ -867,7 +884,7 @@ impl<O: Os> Heap<O> {
         let seg = cur as usize - 1;
         let m = self.seg_meta(seg);
         let next = m[SEG_NEXT].load(Relaxed);
-        *work += 1 + self.release_empty_pages(seg, m, pw);
+        *work += 1 + self.release_empty_pages(sh, seg, m, st.reconcile, pw);
         let empty = m[SEG_PAGES].load(Acquire) == GUARD_BIT;
         let expired = if empty && st.kept_empty {
           // Idle since epoch `since - 1`; stamped by the first sweep that

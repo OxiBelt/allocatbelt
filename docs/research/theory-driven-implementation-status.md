@@ -9,12 +9,12 @@ Status record of `allocatbelt-theory-driven-performance-implementation.md` (the 
 | A: contracts, observability, test scaffolding | **done** | Purge, free-buffering and search/trim counters; memory usage walk; deterministic tests; RSS wording | Not measured |
 | B / P1: bounded, resumable reclamation | **done** | Thresholds (low target, trigger, emergency) separate from the mechanism; every pass a sweep in bounded, resumable slices; stall deferral; opt-in adaptive retention | Not measured |
 | C / P1: collision-aware free batching, cooperative cache return | **done** | 2-way set-associative free buffer (32 x 2, per-set round robin); caller-local cache flush in the adapter; cooperative cache-return generation observed at sampled slow paths of allocation and free | Not measured |
-| D / P2: selective cursor invalidation, candidate indexes | not started | | |
+| D / P2: selective cursor invalidation, candidate indexes | **done** (D3 as a bounded design) | D1: class cursors survive trimming, dropped only when their page is released. D2: empty-page candidates published by the last free of a page, revalidated under the shard lock; bounded reconciliation by force sweeps and every 16th decay sweep. D3: class-to-segment index designed, not built ([class-segment-index.md](class-segment-index.md)) | Not measured |
 | E / P2: explicit-lifetime region API | not started | | |
 | F / P3: placement experiments (conditional) | not started, conditional | | |
 | G: integration, docs, optional benchmark tooling | not started | | |
 
-Stages A, B and C are implemented; D to G are not. Nothing here is a claim that the allocator got faster, and nothing is recommended for production.
+Stages A, B, C and D are implemented (D3 as a design, which the brief accepts as an intermediate delivery); E to G are not. Nothing here is a claim that the allocator got faster, and nothing is recommended for production.
 
 ## Stage A: define the mechanism before tuning it
 
@@ -156,7 +156,7 @@ Miri: within the local 40-minute limit, 11 of the 16 tests passed under Miri (`a
 - The defaults were kept, not tuned: a low target of 0 purges as much as before, the slice limit (4096 units) and the emergency factor (4) are unmeasured choices, and the adaptive controller's constants (1/4 weight, 1/4 and 3/4 bands, 4x cap) are too.
 - Without a maintenance thread, reclamation only happens on allocator calls; an idle process keeps its dirty pages until it calls again.
 - The adaptive signal counts page-run reuse only (small pages reuse through their own bitmaps, not through dirty pages), and is not a page-fault measurement.
-- Trimming still clears every class cursor of a shard at each visit (selective invalidation is Stage D).
+- Trimming still clears every class cursor of a shard at each visit (selective invalidation is Stage D). Done by Stage D.
 
 ## Stage C: collision-aware free batching and cooperative cache return
 
@@ -208,7 +208,7 @@ Loom: no new model. The generation is a relaxed counter read by each cache's own
 | `scripts/check-rseq.sh` | pass (seccomp and tunable cases skipped on this host, as before) |
 | `scripts/check-package.sh` | pass |
 | Loom (`RUSTFLAGS="-C target-cpu=x86-64-v3 --cfg loom" cargo test --release --locked -p allocatbelt-core-check --lib loom`) | pass (14 models, none new) |
-| Miri on the Stage C core tests | run locally after the commit; not part of CI (result appended below when it finishes) |
+| Miri on the Stage C core tests | **not completed**: the local run after the commit (all 14 Stage C tests, 40-minute cap, pinned nightly) did not finish its first test (`a_refill_flushes_only_its_class_and_flush_the_rest`) within the cap, so no Stage C test has a Miri result from it. Targeted runs of single, smaller tests: see Stage D's checks. Miri is not part of CI. |
 | `scripts/check-sandbox.sh` | not run locally (no Docker daemon on this host); by CI |
 | aarch64, riscv64 (qemu), experimental ISA, platform gates, audit, deny, fuzz, mutation | by CI on the pushed commit (`bits.rs` and `class.rs` unchanged) |
 | Benchmarks | not run. Performance not measured; benchmark gate intentionally disabled. |
@@ -218,3 +218,61 @@ Loom: no new model. The generation is a relaxed counter read by each cache's own
 - Two ways, 64 slots and round robin are the brief's starting point, not tuned; 4-way sets, larger buffers and other eviction policies were not tried.
 - A cache return needs the thread's cooperation: sleeping or blocked threads keep their caches, and there is no time bound. Only the owner drains its cache.
 - The free-only bound (4096 frees) counts small frees; a thread that frees nothing and allocates only from its claimed words sees a request at its next refill (within 64 allocations of each class it uses).
+
+## Stage D: avoid rediscovering the entire heap
+
+**What changed.** [reclamation.md](../reclamation.md) describes candidate-driven trimming for users; `core/proto.rs` has the new protocol in its module docs; [class-segment-index.md](class-segment-index.md) is the D3 design.
+
+| Part | Implemented | Changed symbols |
+|---|---|---|
+| D1 preserve valid class cursors | Trimming no longer clears every cursor of a shard. Audit of every path that can make a cursor's page unusable: a small page stops being one only through `release_small_page` (trimming, under the owning shard's lock), which now drops the shard's cursor for the class if it names that page. Every other path follows from that: a segment is returned (`free_owned_segment`) or reused as a huge block only when all its pages are free, so no small page and hence no cursor is left in it; a segment taken from the arena (`alloc_pages`) is new to the shard and its hints are reset; segments never change shard while owned; a page reused at the same offset (as a run, or a small page of another class) is reused only after its release dropped the cursor. The invariant: a non-zero cursor names a small page of its class in a segment on its shard's list; `Heap::check_indexes` asserts it. | `Heap::release_small_page` (takes the shard), `reclaim::trim_step`; `ClassState::cursor` docs; `SearchStats::cursor_invalidations` now counts only released cursor pages |
+| D2 empty-page candidates | New segment header word `SEG_EMPTY` ([5], was reserved): bit per small page that may have become fully free. `proto::release_blocks` returns the free count it raised the counter to; `proto::publish_if_empty` sets the page's bit when that count is the class capacity; `proto::take_candidates` (a swap) hands them to trimming. The counter never exceeds the capacity and only the owner's claims (under its lock) lower it, so the free that makes a page fully free always publishes, after any take that could have dropped the bit: candidates can be stale, never lost. Trimming (`release_empty_pages`) checks only candidates: page kind and class from `P_INFO`, membership in `SEG_CLS + c` (changed under this lock), and the free count against the capacity, then releases. Cached blocks are claimed, so they keep the page. Every path that returns blocks goes through `free_bits` (buffer flush, eviction, claimed-word return at flush and retirement, uncached frees, the rest of an uncached claim), so all of them publish. Bounded reconciliation: force sweeps and every `RECONCILE_EPOCHS` (16)-th decay sweep check every small page as well, counting releases without a candidate (`reconciled_pages`). The empty-segment reserve and teardown rules are unchanged: segments still become empty only by releasing their pages in the trim, and are returned only by the existing idle-age and one-per-shard rules; no candidate path returns or unguards a segment. | `SEG_EMPTY`; `proto::release_blocks` (returns `Option<u64>`), `publish_if_empty`, `take_candidates`; `Heap::free_bits`, `release_empty_pages`, `alloc_pages` (clears `SEG_EMPTY`); `reclaim::RECONCILE_EPOCHS`, `SweepState::reconcile`, `Heap::set_reconcile_epochs` (tests); `MaintenanceStats::stale_empty_candidates`, `reconciled_pages` |
+| D3 class-to-segment index | Designed, not built: shard-local slots (64 per shard) with one word per shard and class, about 16.5 KiB instead of a dense 4 MiB product; publication on a segment's availability transition, clear-then-recheck by the owner that also removes stale non-class availability bits; validation against authoritative words instead of generation tags; list walk as the fallback before growth. The Loom models and full-scan comparison it would need are listed. Not built because nothing measured shows the remaining list walk (`page_search_segments`) matters, and the brief allows the design as an intermediate delivery. | none |
+
+Partial sweeps and ageing: a candidate taken by a slice is either released or dropped as stale in the same step; a candidate published after its segment was visited waits for the next sweep, as a page that became empty after the visit did before. `SEG_IDLE` stamping and the per-shard kept segment are untouched.
+
+The model program (`model::run`, fuzz target) now also sets how often decay sweeps reconcile (operation 26), and checks the indexes after every purge and decay operation and in `check_observations`: `Heap::check_indexes` (every cursor valid; every fully free small page a candidate) and `reconciled_pages == 0` (one operation at a time, so reconciliation must find nothing the candidates missed).
+
+### Complexity notes
+
+| Change | What grows | Work bounded | Extra memory | Outside the bound |
+|---|---|---|---|---|
+| Cursor kept across trims | release of a cursor page: one load and compare | none | none | none |
+| Candidate publication | shared free path: one compare with the class capacity; one `fetch_or` only on the free that makes a page fully free | one per page per emptying | one reserved header word per segment | none |
+| Candidate trimming | nothing | per segment visit: one swap, then one page check per candidate (was: every small page) | none | trimming still visits every owned segment (empty-segment ageing) |
+| Reconciliation | force sweeps and every 16th decay sweep | every small page of each visited segment, as before Stage D | none | a lost candidate (none known) waits up to 16 decay epochs, four purge delays with regular decay |
+
+Remaining costs, per the brief: page searches after a cursor runs dry still walk the shard's segment list (`page_search_segments`); trimming still takes each shard's lock with `try_lock` and skips busy ones; stale candidates cost one page check each (`stale_empty_candidates`).
+
+### Invariant tests
+
+`crates/allocatbelt/src/core/tests.rs`, section "search indexes":
+
+- D1: `trimming_keeps_the_cursor_of_a_page_it_does_not_release` (the next refill claims through the kept cursor, no search), `releasing_one_class_keeps_the_cursors_of_the_others`, `a_released_page_reused_at_the_same_offset_is_not_claimed_from` (reuse as a one-page run, then as a small page of another class, at the released page's offset), `a_returned_and_reacquired_segment_holds_no_cursor` (segment return, reuse as a huge block and for small pages). With the cursor drop in `release_small_page` removed as a check of the tests, at least ten tests fail (three of these, older ones such as `cross_thread_frees`, and the D2 tests through `check_indexes`) and some hang.
+- D2: `the_last_free_of_a_page_makes_it_a_candidate` (exact counts: no candidate while one block per page is live; one page checked for one emptied page among eight; a reconciling sweep checks all seven and releases none), `stale_candidates_are_checked_and_dropped`, `cache_flushes_and_retirement_publish_candidates`, `reconciling_sweeps_recover_lost_candidates` (candidates dropped on purpose: a non-reconciling decay leaves the page, a reconciling decay and a force purge release it and count it), `concurrent_frees_and_trims_lose_no_candidate` (four caching threads allocate and free four classes while another thread runs decay sweeps without reconciliation; afterwards the indexes check and one more candidate-only sweep releases every small page).
+- Loom (`proto.rs`): `last_free_publishes_a_candidate` (two last frees race the trim: the page is released or still a candidate) and `a_claim_racing_the_last_free_loses_no_candidate` (an owner claim and cache return race the last free, which may publish a stale candidate). The existing page models now drive the same `free` helper, which publishes.
+
+### Checks run (x86_64 host, 1.98.1)
+
+| Check | Result |
+|---|---|
+| `cargo fmt --all --check` | pass |
+| `cargo clippy --all-targets --all-features --locked -- -D warnings` | pass |
+| `cargo test --release --all-features --locked` | pass (core suite: 116 tests) |
+| `fuzz_programs` (the model's property test, now with the index checks) repeated 80 times | pass |
+| `scripts/check-features.sh` | pass (11 combinations) |
+| `scripts/check-rseq.sh` | pass (seccomp and tunable cases skipped on this host, as before) |
+| `scripts/check-package.sh` | run after the commit (needs a clean tree); see the commit's report |
+| Loom (`RUSTFLAGS="-C target-cpu=x86-64-v3 --cfg loom" cargo test --release --locked -p allocatbelt-core-check --lib loom`) | pass (16 models, 2 new) |
+| Test check of D1 (cursor drop removed on purpose, then restored) | at least ten tests fail, some hang |
+| Miri | running locally on single tests of Stages C and D (`duplicate_free_in_the_first_way`, `duplicate_free_in_the_second_way`, `cache_return_generations_wrap`, `caches_owe_only_requests_made_while_attached`, `releasing_one_class_keeps_the_cursors_of_the_others`, `stale_candidates_are_checked_and_dropped`, `reconciling_sweeps_recover_lost_candidates`, `a_released_page_reused_at_the_same_offset_is_not_claimed_from`), 20 minutes each; not part of CI. Results are added here when they finish. |
+| `scripts/check-sandbox.sh` | not run locally (no Docker daemon on this host); by CI |
+| aarch64, riscv64 (qemu), experimental ISA, platform gates, audit, deny, fuzz, mutation | by CI on the pushed commit (`bits.rs` and `class.rs` unchanged, so no local mutation run) |
+| Benchmarks | not run. Performance not measured; benchmark gate intentionally disabled. |
+
+### Known limitations
+
+- D3 is a design only: page searches still walk the shard's segment list, linear in the segments a shard owns.
+- Trimming still visits every owned segment of every shard it can lock (one candidate swap and the empty-segment check per segment); only the per-page scan is gone.
+- The reconciliation interval (16 decay epochs) is a chosen bound, not tuned. A candidate lost to a bug would keep one fully free page resident until the next reconciling sweep; no such loss is known, and the model asserts none.
+- Frees pay one comparison with the class capacity on every shared free (not on buffered ones), and one `fetch_or` on the free that empties a page.
