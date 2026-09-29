@@ -30,14 +30,20 @@ run() {
   local expect="$1"
   shift
   echo "-- expect ${expect}"
-  ALLOCATBELT_EXPECT_RSEQ="${expect}" cargo test --release --locked -p allocatbelt \
-    --features experimental-rseq "$@" "${tests[@]}" -- --nocapture 2>&1 |
-    grep -E '^(rseq:|tunable:|seccomp:|16 threads|[0-9]+ threads on|test result|mm_cid)' |
-    sort | uniq -c
-  # grep hides the rest; the verdict is cargo's exit status.
-  ALLOCATBELT_EXPECT_RSEQ="${expect}" cargo test --release --locked -p allocatbelt \
-    --features experimental-rseq "$@" "${tests[@]}" -q >/dev/null 2>&1 ||
-    { echo "FAIL: expected ${expect}" >&2; exit 1; }
+  local log status=0
+  log="$(mktemp)"
+  ALLOCATBELT_EXPECT_RSEQ="${expect}" cargo test --release --locked --no-fail-fast -p allocatbelt \
+    --features experimental-rseq "$@" "${tests[@]}" -- --nocapture >"${log}" 2>&1 || status=$?
+  grep -E '^(rseq:|tunable:|seccomp:|16 threads|[0-9]+ threads on|test result|mm_cid)' "${log}" |
+    sort | uniq -c || true
+  # The verdict is cargo's exit status; on failure, show why.
+  if [ "${status}" -ne 0 ]; then
+    echo "FAIL: expected ${expect} (cargo test exit ${status})" >&2
+    grep -E -B 3 -A 15 '(panicked|^failures:|FAILED|child killed|^error)' "${log}" | tail -n 300 >&2 || true
+    rm -f "${log}"
+    exit 1
+  fi
+  rm -f "${log}"
 }
 
 echo "== glibc"

@@ -208,7 +208,7 @@ Loom: no new model. The generation is a relaxed counter read by each cache's own
 | `scripts/check-rseq.sh` | pass (seccomp and tunable cases skipped on this host, as before) |
 | `scripts/check-package.sh` | pass |
 | Loom (`RUSTFLAGS="-C target-cpu=x86-64-v3 --cfg loom" cargo test --release --locked -p allocatbelt-core-check --lib loom`) | pass (14 models, none new) |
-| Miri on the Stage C core tests | **not completed**: the local run after the commit (all 14 Stage C tests, 40-minute cap, pinned nightly) did not finish its first test (`a_refill_flushes_only_its_class_and_flush_the_rest`) within the cap, so no Stage C test has a Miri result from it. Targeted runs of single, smaller tests: see Stage D's checks. Miri is not part of CI. |
+| Miri on the Stage C core tests | **not completed**: the local run after the commit (all 14 Stage C tests, 40-minute cap, pinned nightly) did not finish its first test (`a_refill_flushes_only_its_class_and_flush_the_rest`) within the cap, so no Stage C test has a Miri result from it. Targeted runs of single, smaller tests afterwards: see Stage D's checks (two Stage C tests pass). Miri is not part of CI. |
 | `scripts/check-sandbox.sh` | not run locally (no Docker daemon on this host); by CI |
 | aarch64, riscv64 (qemu), experimental ISA, platform gates, audit, deny, fuzz, mutation | by CI on the pushed commit (`bits.rs` and `class.rs` unchanged) |
 | Benchmarks | not run. Performance not measured; benchmark gate intentionally disabled. |
@@ -262,10 +262,10 @@ Remaining costs, per the brief: page searches after a cursor runs dry still walk
 | `fuzz_programs` (the model's property test, now with the index checks) repeated 80 times | pass |
 | `scripts/check-features.sh` | pass (11 combinations) |
 | `scripts/check-rseq.sh` | pass (seccomp and tunable cases skipped on this host, as before) |
-| `scripts/check-package.sh` | run after the commit (needs a clean tree); see the commit's report |
+| `scripts/check-package.sh` | pass (on the committed tree) |
 | Loom (`RUSTFLAGS="-C target-cpu=x86-64-v3 --cfg loom" cargo test --release --locked -p allocatbelt-core-check --lib loom`) | pass (16 models, 2 new) |
 | Test check of D1 (cursor drop removed on purpose, then restored) | at least ten tests fail, some hang |
-| Miri | running locally on single tests of Stages C and D (`duplicate_free_in_the_first_way`, `duplicate_free_in_the_second_way`, `cache_return_generations_wrap`, `caches_owe_only_requests_made_while_attached`, `releasing_one_class_keeps_the_cursors_of_the_others`, `stale_candidates_are_checked_and_dropped`, `reconciling_sweeps_recover_lost_candidates`, `a_released_page_reused_at_the_same_offset_is_not_claimed_from`), 20 minutes each; not part of CI. Results are added here when they finish. |
+| Miri (pinned nightly, one test per run, 20-minute cap each; not part of CI) | Stage C: `cache_return_generations_wrap` and `caches_owe_only_requests_made_while_attached` pass; `duplicate_free_in_the_first_way` and `duplicate_free_in_the_second_way` (`should_panic`) did not finish within the cap. Stage D: `releasing_one_class_keeps_the_cursors_of_the_others` and `stale_candidates_are_checked_and_dropped` pass; `reconciling_sweeps_recover_lost_candidates` and `a_released_page_reused_at_the_same_offset_is_not_claimed_from` not run (stopped for CPU time). No undefined behaviour reported. Miri exits with status 1 after each passing test only because its leak check reports the heaps the tests leak on purpose (`Box::leak`, plus the metadata they own). All other Stage C and D tests: not run under Miri. |
 | `scripts/check-sandbox.sh` | not run locally (no Docker daemon on this host); by CI |
 | aarch64, riscv64 (qemu), experimental ISA, platform gates, audit, deny, fuzz, mutation | by CI on the pushed commit (`bits.rs` and `class.rs` unchanged, so no local mutation run) |
 | Benchmarks | not run. Performance not measured; benchmark gate intentionally disabled. |
@@ -276,3 +276,5 @@ Remaining costs, per the brief: page searches after a cursor runs dry still walk
 - Trimming still visits every owned segment of every shard it can lock (one candidate swap and the empty-segment check per segment); only the per-page scan is gone.
 - The reconciliation interval (16 decay epochs) is a chosen bound, not tuned. A candidate lost to a bug would keep one fully free page resident until the next reconciling sweep; no such loss is known, and the model asserts none.
 - Frees pay one comparison with the class capacity on every shared free (not on buffered ones), and one `fetch_or` on the free that empties a page.
+
+**CI after the push.** The aarch64 "Experimental rseq mm_cid" job failed once on `0a155dd`: one of the six `tests/rseq_process.rs` tests failed (5 passed, in 3 s, so not the 20 s child watchdog). `scripts/check-rseq.sh` hid which test and why (it keeps only summary lines), and this job had passed on every earlier commit of the branch, on the same kernel (7.0.0-1012-azure). Locally (x86_64) `tests/rseq_process.rs` passed 30 runs out of 30, and the x86_64 job passed on the same commit. The script now runs each configuration once with `--no-fail-fast`, keeps its output, and prints the failing tests' panics and failure lists, so a recurrence names its cause. Reviewing the Stage D orderings for a weakly ordered CPU found no candidate: the cursor is read and written only under the shard lock, `SEG_CLS` only changes under it, and the empty-page candidate is published with release and taken with acquire-release after the counter increment it follows.
