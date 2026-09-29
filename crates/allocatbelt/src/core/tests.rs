@@ -2860,6 +2860,9 @@ fn concurrent_frees_and_trims_lose_no_candidate() {
   h.set_purge_delay_ms(0);
   let done = AtomicBool::new(false);
   std::thread::scope(|s| {
+    // Stops the trimmer even when a worker panics (the join below then
+    // panics too), so a failure does not hang the scope.
+    let _done = SetOnDrop(&done);
     // The trimmer: decay sweeps (all trimming, delay 0) until the workers
     // are done.
     s.spawn(|| {
@@ -2888,7 +2891,6 @@ fn concurrent_frees_and_trims_lose_no_candidate() {
     for w in workers {
       w.join().unwrap();
     }
-    done.store(true, Ordering::Relaxed);
   });
   h.check_indexes();
   // Without reconciling, the candidates alone find every fully free page.
