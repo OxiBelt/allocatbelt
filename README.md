@@ -111,7 +111,7 @@ scripts/check-scalar-isa.sh                                     # bit scans lowe
 cargo audit && cargo deny check                                 # RustSec advisories, licenses, bans, sources
 MIRIFLAGS=-Zmiri-disable-isolation cargo +nightly miri test -p allocatbelt-core-check
 scripts/run-mutation-testing.sh                                 # mewt campaign over the core's bits/classes
-RUSTFLAGS="--cfg loom" cargo test --release -p allocatbelt-core-check --lib loom   # loom models of the lock-free protocols
+RUSTFLAGS="--cfg loom" cargo test --release -p allocatbelt-core-check --lib loom   # loom models of the core's protocols
 (cd fuzz && cargo +nightly fuzz run heap_ops)                   # cargo-fuzz over the checked heap model; see fuzz/README.md
 cargo run --release -p allocatbelt-bench --bin bench-allocatbelt   # also bench-system, bench-mimalloc (built for x86-64-v3)
 cargo run --release -p allocatbelt-simd-bench --bin bench-simd  # SIMD candidates vs scalar; see docs/research/simd-benchmarks.md

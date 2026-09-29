@@ -40,7 +40,8 @@
 //! that safe: from `proto::claim_dirty` until `proto::finish_purge`, the
 //! claimed pages are allocated as far as every other thread can tell, so
 //! nothing hands them out while their purge is in flight, however long the
-//! batch takes. A run the purger reports as failed stays dirty and is not
+//! batch takes. Both take the lock of the shard that owns the segment, as
+//! every change to its page words does; the purge itself runs outside it. A run the purger reports as failed stays dirty and is not
 //! reported as zero.
 
 use super::maint::PassWork;
@@ -179,11 +180,13 @@ impl<O: Os> Heap<O> {
   }
 
   /// Returns an unlinked owned segment whose pages have all been claimed
-  /// by the caller to the arena.
+  /// by the caller to the arena. Caller holds the lock of the shard that
+  /// owned it.
   pub(super) fn free_owned_segment(&self, seg: usize, m: &[AtomicU64]) {
     m[SEG_HDR].store(SEG_FREE, Release);
     m[SEG_IDLE].store(0, Relaxed);
-    let dirty = m[SEG_DIRTY].swap(0, AcqRel);
+    let dirty = m[SEG_DIRTY].load(Relaxed);
+    m[SEG_DIRTY].store(0, Relaxed);
     self
       .dirty_pages
       .fetch_sub(dirty.count_ones() as isize, Relaxed);
@@ -260,8 +263,18 @@ impl<O: Os> Heap<O> {
       };
     }
     // Claim the dirty free pages like an allocation would, so nobody can
-    // hand them out while their contents are being discarded.
-    let dirty = proto::claim_dirty(&m[SEG_PAGES], &m[SEG_DIRTY], eligible);
+    // hand them out while their contents are being discarded. Under the
+    // owner's lock, like every change to the page words; the header is
+    // checked again under it, since the segment may have been returned
+    // (and even reused by another shard) since the caller read it.
+    let hdr = m[SEG_HDR].load(Acquire);
+    let dirty = {
+      let _g = self.header_shard(hdr).lock.lock(&self.os);
+      if m[SEG_HDR].load(Acquire) != hdr || hdr & 0xFF != SEG_OWNED {
+        return;
+      }
+      proto::claim_dirty(&m[SEG_PAGES], &m[SEG_DIRTY], eligible)
+    };
     if dirty == 0 {
       return;
     }
@@ -311,7 +324,11 @@ impl<O: Os> Heap<O> {
         r += 1;
       }
       let m = self.seg_meta(seg);
-      let cleared = proto::finish_purge(&m[SEG_PAGES], &m[SEG_DIRTY], claimed, done);
+      // The claimed pages keep the segment owned by the same shard.
+      let cleared = {
+        let _g = self.owner(m).lock.lock(&self.os);
+        proto::finish_purge(&m[SEG_PAGES], &m[SEG_DIRTY], claimed, done)
+      };
       self
         .dirty_pages
         .fetch_sub(cleared.count_ones() as isize, Relaxed);

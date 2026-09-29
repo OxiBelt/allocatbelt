@@ -36,16 +36,22 @@
 //! The protocols that keep the summaries exact in the face of racing frees
 //! are in [`crate::core::proto`].
 //!
-//! Frees never take a lock. A thread with a cache buffers the freed bit in a
+//! Small frees never take a lock. A thread with a cache buffers the freed bit in a
 //! small 2-way set-associative table keyed by (page, bitmap word); the buffer is
 //! flushed with one `fetch_or` per word, so a burst of frees into the same
 //! word costs one read-modify-write. Every free, buffered or not, reaches the
 //! shared bitmap through `fetch_or` before its block can be handed out again,
-//! and the bit value returned there detects double frees. A large free is a
-//! compare-exchange on the page header and a `fetch_and` on the segment's
-//! page bitmap. Only the owning shard (under its lock) hands out bits, and
-//! only it recycles a page, which it does solely when every block of the page
-//! is free.
+//! and the bit value returned there detects double frees. Only the owning
+//! shard (under its lock) hands out bits, and only it recycles a page, which
+//! it does solely when every block of the page is free.
+//!
+//! Page runs and segments are different: a segment's page words
+//! (`SEG_PAGES`, `SEG_DIRTY`) change only under the lock of the shard that
+//! owns it, and the arena's segment words only under `seg_lock`, each as a
+//! plain load and store. A large free is a compare-exchange on the page
+//! header (which catches double frees) and then a short critical section
+//! under the owner's lock; so are in-place growth and the claims of a
+//! purge.
 //!
 //! Purging is deferred: freed page runs are only marked dirty. Once more than
 //! the trigger ([`ReclaimTargets`], [`DIRTY_BUDGET_PAGES`] by default) are
@@ -672,6 +678,18 @@ impl<O: Os> Heap<O> {
     (seg, m, hdr)
   }
 
+  /// The shard that owns the segment of metadata `m`, per its header. Stable
+  /// while the segment holds a live or claimed page, or while that shard's
+  /// lock is held and the header still names it.
+  fn owner(&self, m: &[AtomicU64]) -> &Shard {
+    self.header_shard(m[SEG_HDR].load(Acquire))
+  }
+
+  /// The shard a segment header names.
+  fn header_shard(&self, hdr: u64) -> &Shard {
+    &self.shards[((hdr >> 8) & 0xFF) as usize % SHARDS]
+  }
+
   fn seg_meta(&self, seg: usize) -> &[AtomicU64] {
     match self.os.meta(seg) {
       Some(m) => m,
@@ -917,8 +935,10 @@ impl<O: Os> Heap<O> {
   }
 
   /// Extends the live run of `n` pages at `page` to `n2` pages if the pages
-  /// after it are free. Any thread may do this for a block it owns: the
-  /// claim is a compare-exchange like every other page claim.
+  /// after it are free. Any thread may do this for a block it owns, under
+  /// the lock of the shard that owns the segment, like every other change
+  /// to a segment's pages. The live block keeps the segment owned by that
+  /// shard meanwhile.
   fn grow_large(
     &self,
     page: usize,
@@ -932,7 +952,11 @@ impl<O: Os> Heap<O> {
       return false;
     }
     let mask = run_mask((in_seg + n) as u32, (n2 - n) as u32);
-    let Some(was_dirty) = proto::claim_exact(&m[SEG_PAGES], &m[SEG_DIRTY], mask) else {
+    let claimed = {
+      let _g = self.owner(m).lock.lock(&self.os);
+      proto::claim_exact(&m[SEG_PAGES], &m[SEG_DIRTY], mask)
+    };
+    let Some(was_dirty) = claimed else {
       return false;
     };
     if was_dirty != 0 {
@@ -1026,15 +1050,22 @@ impl<O: Os> Heap<O> {
     Some((start as usize, u64::from(was_dirty.count_ones())))
   }
 
-  /// Marks `n` pages dirty and returns them to their segment, then records
-  /// or runs reclamation if that took the dirty count over the trigger.
+  /// Marks `n` pages dirty and returns them to their segment, under the
+  /// lock of the shard that owns it, then records or runs reclamation if
+  /// that took the dirty count over the trigger. The pages are live until
+  /// then, so the segment stays owned by that shard.
   fn release_pages(&self, page: usize, n: usize) {
-    let dirty = self.mark_free_dirty(page, n);
+    let dirty = {
+      let m = self.seg_meta(page / PAGES_PER_SEGMENT);
+      let _g = self.owner(m).lock.lock(&self.os);
+      self.mark_free_dirty(page, n)
+    };
     self.after_release(dirty);
   }
 
   /// Marks `n` pages dirty and returns them to their segment; returns the
-  /// dirty count after.
+  /// dirty count after. Caller holds the lock of the shard that owns the
+  /// segment.
   fn mark_free_dirty(&self, page: usize, n: usize) -> isize {
     let m = self.seg_meta(page / PAGES_PER_SEGMENT);
     let in_seg = page % PAGES_PER_SEGMENT;
@@ -1211,14 +1242,15 @@ impl<O: Os> Heap<O> {
     None
   }
 
+  /// Marks `k` segments used or free in the arena. Caller holds
+  /// `seg_lock`, which every change to `seg_used` takes: a plain load and
+  /// store under it, other threads only read the words.
   fn mark_segments(&self, first: usize, k: usize, used: bool) {
     for s in first..first + k {
       let bit = 1u64 << (s % 64);
-      if used {
-        self.seg_used[s / 64].fetch_or(bit, Relaxed);
-      } else {
-        self.seg_used[s / 64].fetch_and(!bit, Relaxed);
-      }
+      let word = &self.seg_used[s / 64];
+      let w = word.load(Relaxed);
+      word.store(if used { w | bit } else { w & !bit }, Relaxed);
     }
   }
 }

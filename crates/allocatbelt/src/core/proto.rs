@@ -1,11 +1,11 @@
-//! The lock-free protocols on metadata words.
+//! The protocols on metadata words.
 //!
 //! The heap runs every transition that other threads can race with through
 //! the functions here, so that loom (`--cfg loom`, see the `loom` tests
 //! below) checks exactly the code the heap executes. Callers pass the words
 //! involved; nothing here knows the metadata layout.
 //!
-//! Four protocols live here:
+//! Four protocols live here; all but the page runs are lock-free:
 //!
 //! * **Block bitmaps.** A small page has one bitmap bit per block (1 =
 //!   free), a *summary* word with one bit per bitmap word that may be
@@ -26,10 +26,16 @@
 //!   published by the increment that made it so, after any take that could
 //!   have dropped its bit: a candidate may be stale, never lost.
 //! * **Page runs.** A segment has a `pages` word (1 = claimed) and a
-//!   `dirty` word (1 = free but not yet purged). Claims are compare-exchanges
-//!   on `pages`; releases mark dirty before freeing; a purge claims the dirty
-//!   free pages like an allocation would, so no one can hand them out while
-//!   their contents are being discarded.
+//!   `dirty` word (1 = free but not yet purged). Unlike the protocols
+//!   above they are not lock-free: only a thread holding the lock of the
+//!   shard that owns the segment changes them, and every change is a plain
+//!   load and store under that lock, never a read-modify-write
+//!   instruction. Allocation, in-place growth, frees of page runs, purges
+//!   and trimming all take the lock; other threads read the words only as
+//!   hints. A purge claims the dirty free pages like an allocation would
+//!   and gives them back after the `madvise`, so no one can hand them out
+//!   while their contents are being discarded; it holds the lock only for
+//!   the claim and for the end, not while the purge is in flight.
 //! * **Maintenance requests.** A word of work bits (1 = requested) that
 //!   any thread posts to and the maintenance thread takes from. A poster
 //!   first publishes the cause (e.g. adds to the dirty count) and wakes the
@@ -130,72 +136,70 @@ pub(crate) fn retire_page(avail: &AtomicU64, page_bit: u64, summary: &AtomicU64)
   false
 }
 
-/// Atomically claims a run of `n` free pages starting at a multiple of
-/// `step` in a segment's `pages` word, never touching pages in `reserved`.
-/// Returns the first page and which of the claimed pages were dirty (their
-/// dirty mark is cleared: reused memory needs no purge).
+/// Claims a run of `n` free pages starting at a multiple of `step` in a
+/// segment's `pages` word. Returns the first page and which of the claimed
+/// pages were dirty (their dirty mark is cleared: reused memory needs no
+/// purge). Caller holds the lock of the shard that owns the segment.
 pub(crate) fn claim_run(
   pages: &AtomicU64,
   dirty: &AtomicU64,
   n: u32,
   step: u32,
 ) -> Option<(u32, u64)> {
-  let mut used = pages.load(Acquire);
-  loop {
-    let start = find_run_aligned(!used, n, step)?;
-    let mask = crate::core::bits::run_mask(start, n);
-    match pages.compare_exchange_weak(used, used | mask, AcqRel, Acquire) {
-      Ok(_) => return Some((start, dirty.fetch_and(!mask, AcqRel) & mask)),
-      Err(now) => used = now,
-    }
-  }
+  let used = pages.load(Relaxed);
+  let start = find_run_aligned(!used, n, step)?;
+  let mask = crate::core::bits::run_mask(start, n);
+  pages.store(used | mask, Relaxed);
+  Some((start, take_marks(dirty, mask)))
 }
 
 /// Claims the pages of `mask`, which must all be free, and reports which
 /// were dirty. Fails without changing anything if one of them is taken.
+/// Caller holds the lock of the shard that owns the segment.
 pub(crate) fn claim_exact(pages: &AtomicU64, dirty: &AtomicU64, mask: u64) -> Option<u64> {
-  let mut used = pages.load(Acquire);
-  loop {
-    if used & mask != 0 {
-      return None;
-    }
-    match pages.compare_exchange_weak(used, used | mask, AcqRel, Acquire) {
-      Ok(_) => return Some(dirty.fetch_and(!mask, AcqRel) & mask),
-      Err(now) => used = now,
-    }
+  let used = pages.load(Relaxed);
+  if used & mask != 0 {
+    return None;
   }
+  pages.store(used | mask, Relaxed);
+  Some(take_marks(dirty, mask))
 }
 
-/// Frees the claimed pages of `mask`, marking them dirty first so that a
-/// claimer that grabs them clears the mark.
+/// Frees the claimed pages of `mask` and marks them dirty. Caller holds the
+/// lock of the shard that owns the segment.
 pub(crate) fn release_run(pages: &AtomicU64, dirty: &AtomicU64, mask: u64) {
-  dirty.fetch_or(mask, Release);
-  pages.fetch_and(!mask, Release);
+  dirty.store(dirty.load(Relaxed) | mask, Relaxed);
+  pages.store(pages.load(Relaxed) & !mask, Relaxed);
 }
 
 /// Claims the dirty free pages among `eligible` so their memory can be
-/// discarded. Returns the claimed mask (possibly empty).
+/// discarded. Returns the claimed mask (possibly empty). Caller holds the
+/// lock of the shard that owns the segment.
 pub(crate) fn claim_dirty(pages: &AtomicU64, dirty: &AtomicU64, eligible: u64) -> u64 {
-  let mut used = pages.load(Acquire);
-  loop {
-    let d = dirty.load(Acquire) & !used & eligible;
-    if d == 0 {
-      return 0;
-    }
-    match pages.compare_exchange_weak(used, used | d, AcqRel, Acquire) {
-      Ok(_) => return d,
-      Err(now) => used = now,
-    }
+  let used = pages.load(Relaxed);
+  let d = dirty.load(Relaxed) & !used & eligible;
+  if d != 0 {
+    pages.store(used | d, Relaxed);
   }
+  d
 }
 
 /// Ends a purge of the `claimed` pages: those in `purged` (now zero) lose
 /// their dirty mark, and all of them become free again. Returns the dirty
-/// marks actually cleared.
+/// marks actually cleared. Caller holds the lock of the shard that owns
+/// the segment.
 pub(crate) fn finish_purge(pages: &AtomicU64, dirty: &AtomicU64, claimed: u64, purged: u64) -> u64 {
-  let cleared = dirty.fetch_and(!purged, AcqRel) & purged;
-  pages.fetch_and(!claimed, Release);
+  let cleared = take_marks(dirty, purged);
+  pages.store(pages.load(Relaxed) & !claimed, Relaxed);
   cleared
+}
+
+/// Clears the marks of `mask` in `marks` and returns those that were set.
+/// Caller holds the lock that guards `marks`.
+fn take_marks(marks: &AtomicU64, mask: u64) -> u64 {
+  let old = marks.load(Relaxed);
+  marks.store(old & !mask, Relaxed);
+  old & mask
 }
 
 /// Posts work `bit` to `work` after the caller published its cause.
@@ -469,27 +473,54 @@ mod loom_tests {
     });
   }
 
+  /// A segment's page-run words and the lock of the shard that owns it,
+  /// which every change to them takes.
+  struct Runs {
+    lock: Lock,
+    futex: Futex,
+    pages: AtomicU64,
+    dirty: AtomicU64,
+  }
+
+  impl Runs {
+    fn new(pages: u64, dirty: u64) -> Arc<Self> {
+      Arc::new(Self {
+        lock: Lock::new(),
+        futex: Futex::default(),
+        pages: AtomicU64::new(pages),
+        dirty: AtomicU64::new(dirty),
+      })
+    }
+
+    /// Runs `f` on the words under the owner's lock.
+    fn locked<R>(&self, f: impl FnOnce(&AtomicU64, &AtomicU64) -> R) -> R {
+      let _g = self.lock.lock(&self.futex);
+      f(&self.pages, &self.dirty)
+    }
+  }
+
   #[test]
   fn page_runs_race_purge() {
-    loom::model(|| {
+    let mut model = loom::model::Builder::new();
+    model.preemption_bound = Some(3);
+    model.check(|| {
       // Pages 0 and 1 are live; page 2 is free and dirty; the rest of
       // the segment is taken.
-      let pages = Arc::new(AtomicU64::new(!0b100));
-      let dirty = Arc::new(AtomicU64::new(0b100));
-      let (p1, d1) = (pages.clone(), dirty.clone());
-      let releaser = thread::spawn(move || release_run(&p1, &d1, 0b001));
-      let (p2, d2) = (pages.clone(), dirty.clone());
+      let runs = Runs::new(!0b100, 0b100);
+      let r1 = runs.clone();
+      let releaser = thread::spawn(move || r1.locked(|p, d| release_run(p, d, 0b001)));
+      let r2 = runs.clone();
       let purger = thread::spawn(move || {
-        let c = claim_dirty(&p2, &d2, u64::MAX);
+        let c = r2.locked(|p, d| claim_dirty(p, d, u64::MAX));
         // Nothing that is live may be purged.
         assert_eq!(c & 0b010, 0);
-        finish_purge(&p2, &d2, c, c);
+        r2.locked(|p, d| finish_purge(p, d, c, c));
         c
       });
-      let claimed = claim_run(&pages, &dirty, 1, 1);
+      let claimed = runs.locked(|p, d| claim_run(p, d, 1, 1));
       releaser.join().unwrap();
       let purged = purger.join().unwrap();
-      let (used, d) = (pages.load(Relaxed), dirty.load(Relaxed));
+      let (used, d) = runs.locked(|p, d| (p.load(Relaxed), d.load(Relaxed)));
       // The live page and the claimed page are held; page 0 was freed.
       let mine = claimed.map_or(0, |(start, _)| 1u64 << start);
       assert!(
@@ -510,9 +541,9 @@ mod loom_tests {
   }
 
   /// A purge whose completion comes later, as with io_uring, and fails for
-  /// one page: while the purge is in flight an allocator claims pages and
-  /// a thread frees one; no claimed page may be handed out before the
-  /// purge ends, and the failed page keeps its dirty mark.
+  /// one page: while the purge is in flight (outside the lock) an allocator
+  /// claims pages and a thread frees one; no claimed page may be handed
+  /// out before the purge ends, and the failed page keeps its dirty mark.
   #[test]
   fn async_purge_with_failure() {
     let mut model = loom::model::Builder::new();
@@ -520,37 +551,43 @@ mod loom_tests {
     model.check(|| {
       // Page 0 is live, page 1 free and clean, pages 2 and 3 free and
       // dirty; the rest of the segment is taken.
-      let pages = Arc::new(AtomicU64::new(!0b1110));
-      let dirty = Arc::new(AtomicU64::new(0b1100));
+      let runs = Runs::new(!0b1110, 0b1100);
       let in_flight = Arc::new(AtomicU64::new(0));
-      let (p1, d1) = (pages.clone(), dirty.clone());
-      let freer = thread::spawn(move || release_run(&p1, &d1, 0b0001));
-      let (p2, d2, f2) = (pages.clone(), dirty.clone(), in_flight.clone());
+      let r1 = runs.clone();
+      let freer = thread::spawn(move || r1.locked(|p, d| release_run(p, d, 0b0001)));
+      let (r2, f2) = (runs.clone(), in_flight.clone());
       let purger = thread::spawn(move || {
-        let c = claim_dirty(&p2, &d2, u64::MAX);
-        f2.store(c, Release);
+        let c = r2.locked(|p, d| {
+          let c = claim_dirty(p, d, u64::MAX);
+          f2.store(c, Relaxed);
+          c
+        });
         // Submitted; the completion arrives later. Page 3 fails.
         thread::yield_now();
         let purged = c & 0b0100;
-        f2.store(0, Release);
-        finish_purge(&p2, &d2, c, purged);
+        r2.locked(|p, d| {
+          f2.store(0, Relaxed);
+          finish_purge(p, d, c, purged)
+        });
         (c, purged)
       });
       let mut mine = 0;
       for _ in 0..2 {
-        if let Some((start, _)) = claim_run(&pages, &dirty, 1, 1) {
-          let bit = 1u64 << start;
-          assert_eq!(
-            in_flight.load(Acquire) & bit,
-            0,
-            "handed out a page in flight"
-          );
-          mine |= bit;
-        }
+        runs.locked(|p, d| {
+          if let Some((start, _)) = claim_run(p, d, 1, 1) {
+            let bit = 1u64 << start;
+            assert_eq!(
+              in_flight.load(Relaxed) & bit,
+              0,
+              "handed out a page in flight"
+            );
+            mine |= bit;
+          }
+        });
       }
       freer.join().unwrap();
       let (claimed, purged) = purger.join().unwrap();
-      let (used, d) = (pages.load(Relaxed), dirty.load(Relaxed));
+      let (used, d) = runs.locked(|p, d| (p.load(Relaxed), d.load(Relaxed)));
       assert_eq!(mine & !0b1111, 0, "claimed a taken page");
       assert_eq!(used, !0b1111 | mine);
       assert_eq!(d & used, 0, "held page left dirty");
@@ -567,12 +604,20 @@ mod loom_tests {
   fn grow_races_trim() {
     loom::model(|| {
       // Page 0 is live; a trimmer claims the whole segment only if it
-      // is empty, a grower extends page 0 into page 1.
-      let pages = Arc::new(AtomicU64::new(0b01));
-      let dirty = Arc::new(AtomicU64::new(0));
-      let p = pages.clone();
-      let trimmer = thread::spawn(move || p.compare_exchange(0, u64::MAX, AcqRel, Acquire).is_ok());
-      let grown = claim_exact(&pages, &dirty, 0b10).is_some();
+      // is empty, as `trim_step` does, and a grower extends page 0 into
+      // page 1.
+      let runs = Runs::new(0b01, 0);
+      let r = runs.clone();
+      let trimmer = thread::spawn(move || {
+        r.locked(|p, _| {
+          let empty = p.load(Relaxed) == 0;
+          if empty {
+            p.store(u64::MAX, Relaxed);
+          }
+          empty
+        })
+      });
+      let grown = runs.locked(|p, d| claim_exact(p, d, 0b10)).is_some();
       assert!(
         !trimmer.join().unwrap(),
         "trimmed a segment with a live page"

@@ -898,13 +898,11 @@ impl<O: Os> Heap<O> {
           m[SEG_IDLE].store(0, Relaxed);
           false
         };
-        // Claiming every page shuts out the only other claimers:
-        // in-place growth, which needs a live block in the segment.
-        if expired
-          && m[SEG_PAGES]
-            .compare_exchange(GUARD_BIT, u64::MAX, AcqRel, Relaxed)
-            .is_ok()
-        {
+        // Every change to the page words takes this lock, so the segment
+        // is still empty here; claiming every page keeps it from being
+        // handed out before it is back in the arena.
+        if expired {
+          m[SEG_PAGES].store(u64::MAX, Relaxed);
           match prev {
             None => sh.segs.store(next as u32, Relaxed),
             Some((_, p)) => p[SEG_NEXT].store(next, Relaxed),
