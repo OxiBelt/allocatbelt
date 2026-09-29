@@ -62,7 +62,7 @@ Items 1–5 of the list above, plus fuzzing and loom for item 6. Measurements ar
 
 ### Per-thread caches (`heap/cache.rs`)
 
-- **What.** Each thread has a `ThreadCache`: one claimed bitmap word per size class and a 64-slot direct-mapped buffer of frees keyed by (page, bitmap word). It is built from `Cell`s, so the core stays `forbid(unsafe_code)`. The adapter keeps it in a `const`-initialised, `Drop`-free thread local and hands it back from a zero-sized thread-local destructor.
+- **What.** Each thread has a `ThreadCache`: one claimed bitmap word per size class and a 64-slot buffer of frees keyed by (page, bitmap word), direct-mapped when this was written and 2-way set-associative (32 sets) since the theory-driven plan's Stage C ([theory-driven-implementation-status.md](theory-driven-implementation-status.md)). It is built from `Cell`s, so the core stays `forbid(unsafe_code)`. The adapter keeps it in a `const`-initialised, `Drop`-free thread local and hands it back from a zero-sized thread-local destructor.
 - **Fast paths.**
   - An allocation pops a bit from the claimed word: no atomics, no lock.
   - A free sets a bit in the buffer slot.

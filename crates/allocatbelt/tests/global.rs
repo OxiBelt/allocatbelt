@@ -260,3 +260,51 @@ fn reclamation_is_configurable_through_the_adapter() {
     (ReclaimTargets::DEFAULT, Retention::Fixed, 1)
   );
 }
+
+#[test]
+fn thread_caches_are_returned_explicitly_and_on_request() {
+  // Threads of their own, so their caches hold only what this test does.
+  std::thread::spawn(|| {
+    let kept: Vec<Box<[u8; 48]>> = (0..10).map(|i| Box::new([i as u8; 48])).collect();
+    drop(
+      (0..100)
+        .map(|i| Box::new([i as u8; 48]))
+        .collect::<Vec<_>>(),
+    );
+    let s = GLOBAL.thread_cache_stats().expect("cache");
+    assert!(s.claimed_blocks + s.buffered_blocks > 0, "{s:?}");
+    // The worker contract: flush before parking. Nothing stays held.
+    GLOBAL.flush_thread_cache();
+    let s = GLOBAL.thread_cache_stats().expect("cache");
+    assert_eq!(
+      (s.claimed_blocks, s.buffered_blocks, s.attached),
+      (0, 0, true)
+    );
+    // The cache keeps working.
+    let again = Box::new([7u8; 48]);
+    assert_eq!(again[47], 7);
+    drop(kept);
+  })
+  .join()
+  .unwrap();
+  std::thread::spawn(|| {
+    let small: Vec<Box<[u8; 16]>> = (0..3).map(|i| Box::new([i as u8; 16])).collect();
+    let before = GLOBAL.thread_cache_stats().expect("cache");
+    GLOBAL.request_cache_return();
+    // A refill of another size class is a sampled point: the thread drains
+    // what it held before taking the new word.
+    let other = Box::new([1u8; 200]);
+    let after = GLOBAL.thread_cache_stats().expect("cache");
+    assert!(
+      after.pressure_returns > before.pressure_returns,
+      "{before:?} {after:?}"
+    );
+    drop((small, other));
+  })
+  .join()
+  .unwrap();
+  // A thread that never allocated: nothing to flush, nothing initialised.
+  std::thread::spawn(|| GLOBAL.flush_thread_cache())
+    .join()
+    .unwrap();
+}

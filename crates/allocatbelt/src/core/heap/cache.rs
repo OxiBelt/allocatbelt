@@ -1,12 +1,38 @@
 //! Per-thread caches: claimed bitmap words for allocation, and a buffer of
 //! frees returned to the shared bitmaps one word at a time.
+//!
+//! **Free buffer.** 64 slots in 32 sets of 2 ways (theory-driven plan,
+//! Stage C). A free of a block goes to the set its bitmap word hashes to:
+//! into the way that already holds the word, else an empty way, else it
+//! evicts the older of the two (per-set round robin, one bit per set), whose
+//! frees go back to the shared bitmap in one update. A word lives in at
+//! most one slot, so a duplicate free is caught in either way. Two words
+//! whose frees interleave share a set without evicting each other, which a
+//! direct-mapped buffer could not do: the shared update per free is
+//! amortized over the batch a slot actually collects.
+//!
+//! **Cache return.** Blocks a cache holds (claimed words, buffered frees)
+//! are unavailable to other threads until it flushes. Its owner flushes it
+//! explicitly ([`Heap::flush`]) or cooperatively: [`Heap::request_cache_return`]
+//! bumps a generation, and each attached cache drains itself completely
+//! when it next sees a new value at a sampled point of its own slow paths:
+//! a refill, a page-run or huge allocation or free, and a free that needs a
+//! new slot. A thread that only frees reaches the last within 4096 frees
+//! (a slot takes at most 64 frees of its word before a free must start a
+//! new one, and there are 64 slots). A drain is bounded: 64 slots and one
+//! claimed word per class, one shared update each. Only the owner mutates
+//! its cache; a thread that sleeps or blocks sees nothing and keeps what it
+//! holds, so the embedder flushes before parking.
 
 use core::cell::Cell;
 
 use super::*;
 
-/// Direct-mapped slots of buffered frees per thread.
+/// Slots of buffered frees per thread: [`FREE_SETS`] sets of [`FREE_WAYS`]
+/// ways. Slot `i` is way `i % FREE_WAYS` of set `i / FREE_WAYS`.
 const FREE_SLOTS: usize = 64;
+const FREE_WAYS: usize = 2;
+const FREE_SETS: usize = FREE_SLOTS / FREE_WAYS;
 
 const DETACHED: u8 = 0;
 const ATTACHING: u8 = 1;
@@ -45,12 +71,15 @@ const fn unpack_key(key: u64) -> (usize, usize, usize) {
 
 const _: () = assert!(NUM_CLASSES <= 32);
 
+/// The set of the free buffer that frees of word `w` of `page` go to.
 #[inline]
-const fn slot_index(page: usize, w: usize) -> usize {
-  ((((page << 6) | w) as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 58) as usize
+const fn set_index(page: usize, w: usize) -> usize {
+  ((((page << 6) | w) as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 59) as usize
 }
 
-const _: () = assert!(FREE_SLOTS == 64);
+// Slot indices fit the per-class `pending` masks, and the per-set victim
+// bits fit a `u32`.
+const _: () = assert!(FREE_SLOTS == 64 && FREE_WAYS == 2 && FREE_SETS == 32);
 
 /// A thread's private allocation state: one claimed bitmap word per size
 /// class, and a small buffer of frees not yet returned to the bitmaps.
@@ -72,6 +101,12 @@ pub struct ThreadCache {
   frees: [FreeSlot; FREE_SLOTS],
   /// Occupied free slots per class (bit `i` = `frees[i]`).
   pending: [Cell<u64>; NUM_CLASSES],
+  /// Way to evict next, per set (bit `s` for set `s`).
+  victims: Cell<u32>,
+  /// Last cache-return generation this cache drained for.
+  pressure_seen: Cell<u32>,
+  /// [`CacheStats::pressure_returns`].
+  pressure_returns: Cell<u64>,
   shard: Cell<usize>,
   state: Cell<u8>,
   /// Refills so far, to sample the clock.
@@ -107,6 +142,9 @@ impl ThreadCache {
         }
       }; FREE_SLOTS],
       pending: [const { Cell::new(0) }; NUM_CLASSES],
+      victims: Cell::new(0),
+      pressure_seen: Cell::new(0),
+      pressure_returns: Cell::new(0),
       shard: Cell::new(0),
       state: Cell::new(DETACHED),
       ticks: Cell::new(0),
@@ -169,10 +207,12 @@ impl<O: Os> Heap<O> {
         .or_else(|| self.refill(tc, c))
         .map(|o| Block::new(o, false)),
       Kind::Run(n, step) => {
+        self.observe_pressure(tc);
         self.tick(tc);
         self.alloc_large(self.shard_of(tc), n, step)
       }
       Kind::Huge(k) => {
+        self.observe_pressure(tc);
         self.tick(tc);
         self.alloc_huge(k)
       }
@@ -203,6 +243,7 @@ impl<O: Os> Heap<O> {
   /// Claims a new word of class `c` for the thread and pops from it.
   #[inline(never)]
   fn refill(&self, tc: &ThreadCache, c: usize) -> Option<usize> {
+    self.observe_pressure(tc);
     // Frees the thread has buffered stay buffered (and keep batching)
     // while the class has free blocks elsewhere; before a new page is
     // taken for the class, they go back so the claim can reuse them.
@@ -246,8 +287,11 @@ impl<O: Os> Heap<O> {
 
   /// Enables caching for `tc`. The embedder must arrange for
   /// [`Heap::retire`] to run when the thread exits, before calling this.
+  /// Does nothing to a cache that is attached or retired.
   pub fn attach(&self, tc: &ThreadCache) {
-    if tc.state.get() == RETIRED {
+    // Retired for good; or attached already (a reentrant call), which
+    // keeps the cache's shard, random state and cache-return obligation.
+    if matches!(tc.state.get(), RETIRED | ATTACHED) {
       return;
     }
     let n = self.next_shard.fetch_add(1, Relaxed);
@@ -258,11 +302,15 @@ impl<O: Os> Heap<O> {
     } else {
       splitmix(seed ^ (n as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15))
     });
+    // A new cache owes nothing for requests made before it existed.
+    tc.pressure_seen.set(self.cache_pressure.load(Relaxed));
     tc.state.set(ATTACHED);
   }
 
   /// Returns every block held by `tc` (claimed or freed) to the shared
-  /// bitmaps. The cache stays usable.
+  /// bitmaps: at most 64 buffered words and one claimed word per class, one
+  /// atomic update each. The cache stays usable (and attached, if it was).
+  /// Only the thread that owns `tc` can call it; not async-signal-safe.
   pub fn flush(&self, tc: &ThreadCache) {
     for i in 0..FREE_SLOTS {
       self.flush_slot(tc, i);
@@ -322,10 +370,12 @@ impl<O: Os> Heap<O> {
       }
       Target::Large { page, m, pm, info } => {
         self.free_large(page, m, pm, info);
+        self.observe_pressure(tc);
         self.tick(tc);
       }
       Target::Huge { seg, m, hdr } => {
         self.free_huge(seg, m, hdr);
+        self.observe_pressure(tc);
         self.tick(tc);
       }
     }
@@ -340,30 +390,86 @@ impl<O: Os> Heap<O> {
       self.os.fatal(DOUBLE_FREE);
     }
     let key = slot_key(page, w, c);
-    let i = slot_index(page, w);
-    let slot = &tc.frees[i];
-    if slot.key.get() == key {
-      let m = slot.mask.get();
-      if m & bit != 0 {
-        self.os.fatal(DOUBLE_FREE);
-      }
-      slot.mask.set(m | bit);
+    let set = set_index(page, w);
+    let i = set * FREE_WAYS;
+    // The word lives in at most one way of its set.
+    let slot = if tc.frees[i].key.get() == key {
+      &tc.frees[i]
+    } else if tc.frees[i + 1].key.get() == key {
+      &tc.frees[i + 1]
     } else {
-      self.replace_slot(tc, i, key, c, bit);
+      return self.insert_slot(tc, set, key, c, bit);
+    };
+    let m = slot.mask.get();
+    if m & bit != 0 {
+      self.os.fatal(DOUBLE_FREE);
     }
+    slot.mask.set(m | bit);
   }
 
-  /// Flushes slot `i` and makes it hold `bit` of the word `key`.
+  /// Makes a way of `set` hold `bit` of the word `key`, which no way of the
+  /// set holds: an empty way, else the set's victim, flushed first. Also a
+  /// sampled point where the cache sees cache-return requests.
   #[inline(never)]
-  fn replace_slot(&self, tc: &ThreadCache, i: usize, key: u64, c: usize, bit: u64) {
-    if tc.frees[i].key.get() != 0 {
+  fn insert_slot(&self, tc: &ThreadCache, set: usize, key: u64, c: usize, bit: u64) {
+    self.observe_pressure(tc);
+    let first = set * FREE_WAYS;
+    let way = if tc.frees[first].key.get() == 0 {
+      0
+    } else if tc.frees[first + 1].key.get() == 0 {
+      1
+    } else {
       bump(&tc.evictions, 1);
-    }
-    self.flush_slot(tc, i);
+      let way = (tc.victims.get() >> set) as usize & 1;
+      self.flush_slot(tc, first + way);
+      way
+    };
+    // The other way is now the older one: the next to go.
+    let v = tc.victims.get();
+    tc.victims.set(v & !(1 << set) | ((way as u32 ^ 1) << set));
+    let i = first + way;
     let slot = &tc.frees[i];
     slot.key.set(key);
     slot.mask.set(bit);
     tc.pending[c].set(tc.pending[c].get() | 1 << i);
+  }
+
+  /// Drains `tc` if a cache return was requested since it last looked (see
+  /// the module docs). One relaxed load when nothing is requested.
+  #[inline]
+  fn observe_pressure(&self, tc: &ThreadCache) {
+    let g = self.cache_pressure.load(Relaxed);
+    if g != tc.pressure_seen.get() {
+      self.return_cache(tc, g);
+    }
+  }
+
+  /// Flushes `tc` for cache-return generation `g`, and records that it did.
+  #[cold]
+  #[inline(never)]
+  fn return_cache(&self, tc: &ThreadCache, g: u32) {
+    // A detached or retired cache holds nothing and owes nothing.
+    if !tc.is_attached() {
+      return;
+    }
+    self.flush(tc);
+    tc.pressure_seen.set(g);
+    bump(&tc.pressure_returns, 1);
+  }
+
+  /// Asks every attached thread cache to return what it holds to the
+  /// shared bitmaps. Returns at once; each cache drains itself, on its own
+  /// thread, at its next sampled slow path (see the module docs). A thread
+  /// that never calls the allocator again, or is asleep, does not drain.
+  /// Lock-free and allocation-free.
+  pub fn request_cache_return(&self) {
+    self.cache_pressure.fetch_add(1, Relaxed);
+  }
+
+  /// The cache-return generation: how many requests were made (modulo
+  /// 2^32).
+  pub fn cache_return_generation(&self) -> u32 {
+    self.cache_pressure.load(Relaxed)
   }
 
   /// Returns the frees buffered in slot `i` to the bitmap.
@@ -421,16 +527,59 @@ impl<O: Os> Heap<O> {
       flush_sizes,
       evictions: tc.evictions.get(),
       refill_flushes: tc.refill_flushes.get(),
+      pressure_returns: tc.pressure_returns.get(),
     }
   }
 
-  /// The slot of the free buffer that a free at `offset` (a small block)
+  /// The set of the free buffer that a free at `offset` (a small block)
   /// goes to, for tests that build collisions.
   #[cfg(all(test, allocatbelt_core_check))]
-  pub(crate) fn free_slot_of(offset: usize, c: usize) -> usize {
+  pub(crate) fn free_set_of(offset: usize, c: usize) -> usize {
     let page = offset >> PAGE_SHIFT;
     let idx = class::block_index(c, offset % PAGE_SIZE).unwrap_or(0);
-    slot_index(page, idx / 64)
+    set_index(page, idx / 64)
+  }
+
+  /// The occupied slots of class `c`, for tests of the pending masks.
+  #[cfg(all(test, allocatbelt_core_check))]
+  pub(crate) fn pending_slots(tc: &ThreadCache, c: usize) -> u64 {
+    tc.pending[c].get()
+  }
+
+  /// Checks that every class's pending mask names exactly the occupied
+  /// slots of that class, and that no word is in two slots.
+  #[cfg(all(any(all(test, allocatbelt_core_check), allocatbelt_model), not(loom)))]
+  pub(crate) fn check_free_buffer(tc: &ThreadCache) {
+    let mut seen = [0u64; NUM_CLASSES];
+    for (i, slot) in tc.frees.iter().enumerate() {
+      let key = slot.key.get();
+      if key == 0 {
+        continue;
+      }
+      assert_ne!(slot.mask.get(), 0, "slot {i} holds no block");
+      let (page, w, c) = unpack_key(key);
+      assert_eq!(
+        set_index(page, w),
+        i / FREE_WAYS,
+        "slot {i} in the wrong set"
+      );
+      seen[c] |= 1 << i;
+      for (j, other) in tc.frees.iter().enumerate() {
+        assert!(
+          j == i || other.key.get() != key,
+          "word in slots {i} and {j}"
+        );
+      }
+    }
+    for (c, p) in tc.pending.iter().enumerate() {
+      assert_eq!(p.get(), seen[c], "pending mask of class {c}");
+    }
+  }
+
+  /// Sets the cache-return generation, for tests of its wrap-around.
+  #[cfg(all(test, allocatbelt_core_check))]
+  pub(crate) fn set_cache_return_generation(&self, g: u32) {
+    self.cache_pressure.store(g, Relaxed);
   }
 }
 

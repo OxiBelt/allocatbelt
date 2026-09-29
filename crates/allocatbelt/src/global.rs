@@ -386,6 +386,38 @@ impl Allocatbelt {
     HEAP.reclaim_status()
   }
 
+  /// Returns every block the calling thread's cache holds (the rest of a
+  /// claimed bitmap word per size class, and up to 64 words of buffered
+  /// frees) to the shared heap, where other threads can use them. The
+  /// cache stays usable. Call it before a worker thread parks or ends an
+  /// idle phase: a thread that sleeps holds its cache until it runs again.
+  ///
+  /// Bounded (one atomic update per word held) and lock-free on the small
+  /// blocks; purges nothing. Does not initialise the allocator or a cache
+  /// the thread has not used, and allocates nothing. Not async-signal-safe:
+  /// do not call it from a signal handler.
+  pub fn flush_thread_cache(self) {
+    if ARENA.get().is_some_and(Option::is_some) {
+      guarded(|| {
+        let _ = CACHE.try_with(|tc| HEAP.flush(tc));
+      });
+    }
+  }
+
+  /// Asks every thread's cache to return what it holds to the shared heap,
+  /// and returns at once. Each thread drains its own cache, completely, the
+  /// next time it takes one of the allocator's slower paths (a cache refill,
+  /// a large allocation or free, a free that starts a new buffered word;
+  /// a thread that only frees reaches the last within 4096 small frees). A
+  /// thread that sleeps, blocks or stops calling the allocator does not
+  /// drain, so there is no time bound: pair it with
+  /// [`Allocatbelt::flush_thread_cache`] in workers before they park. For
+  /// memory-pressure handlers, with [`Allocatbelt::request_purge`].
+  /// Lock-free and allocation-free.
+  pub fn request_cache_return(self) {
+    HEAP.request_cache_return();
+  }
+
   /// Asks the maintenance thread to return all freed memory and empty
   /// segments to the OS, and returns without waiting: for memory-pressure
   /// handlers. Without a maintenance thread it purges inline, like

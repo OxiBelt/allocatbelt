@@ -468,7 +468,11 @@ pub fn run(data: &[u8]) {
           live[i].1 = size;
         }
       }
-      22 => tc.into_iter().for_each(|tc| h.flush(tc)),
+      22 => match tc {
+        Some(tc) => h.flush(tc),
+        // Asks every cache to drain itself at its next sampled slow path.
+        None => h.request_cache_return(),
+      },
       23 => h.purge(),
       24 => h.decay(),
       25 => h.os().advance(u64::from(byte()) * 16),
@@ -589,5 +593,8 @@ pub fn check_observations(h: &Heap<MockOs>, caches: &[ThreadCache]) {
     );
     assert!(c.buffered_words <= c.buffered_blocks, "{c:?}");
     assert!(c.evictions <= c.flushes, "{c:?}");
+    // At most one slot per word, in its own set, and pending masks that
+    // name exactly the occupied slots of each class.
+    Heap::<MockOs>::check_free_buffer(tc);
   }
 }

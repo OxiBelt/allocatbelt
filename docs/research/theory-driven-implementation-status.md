@@ -8,13 +8,13 @@ Status record of `allocatbelt-theory-driven-performance-implementation.md` (the 
 |---|---|---|---|
 | A: contracts, observability, test scaffolding | **done** | Purge, free-buffering and search/trim counters; memory usage walk; deterministic tests; RSS wording | Not measured |
 | B / P1: bounded, resumable reclamation | **done** | Thresholds (low target, trigger, emergency) separate from the mechanism; every pass a sweep in bounded, resumable slices; stall deferral; opt-in adaptive retention | Not measured |
-| C / P1: collision-aware free batching, cooperative cache return | not started | | |
+| C / P1: collision-aware free batching, cooperative cache return | **done** | 2-way set-associative free buffer (32 x 2, per-set round robin); caller-local cache flush in the adapter; cooperative cache-return generation observed at sampled slow paths of allocation and free | Not measured |
 | D / P2: selective cursor invalidation, candidate indexes | not started | | |
 | E / P2: explicit-lifetime region API | not started | | |
 | F / P3: placement experiments (conditional) | not started, conditional | | |
 | G: integration, docs, optional benchmark tooling | not started | | |
 
-Stages A and B are implemented; C to G are not. Nothing here is a claim that the allocator got faster, and nothing is recommended for production.
+Stages A, B and C are implemented; D to G are not. Nothing here is a claim that the allocator got faster, and nothing is recommended for production.
 
 ## Stage A: define the mechanism before tuning it
 
@@ -157,3 +157,64 @@ Miri: within the local 40-minute limit, 11 of the 16 tests passed under Miri (`a
 - Without a maintenance thread, reclamation only happens on allocator calls; an idle process keeps its dirty pages until it calls again.
 - The adaptive signal counts page-run reuse only (small pages reuse through their own bitmaps, not through dirty pages), and is not a page-fault measurement.
 - Trimming still clears every class cursor of a shard at each visit (selective invalidation is Stage D).
+
+## Stage C: collision-aware free batching and cooperative cache return
+
+**What changed.** [docs/thread-caches.md](../thread-caches.md) is the user-facing description, including the worker integration pattern; `core/heap/cache.rs` has the mechanism in its module docs.
+
+| Part | Implemented | Changed symbols |
+|---|---|---|
+| C1 2-way set associativity | The 64-slot direct-mapped free buffer became 32 sets of 2 ways, still 64 fixed slots of (key, mask). A free looks in both ways of its word's set for the full key before taking an empty way or the victim. Replacement is per-set round robin: one bit per set in a `u32`, no timestamps. Key encoding (never zero, class in the low bits), per-class pending masks (bit = slot index), flush-before-refill and the check against the claimed word are unchanged. A key is inserted only when neither way of its set holds it, so a word lives in at most one slot and duplicate frees are caught in either way. Flushing a slot clears its class bit once; filling one sets it once. No owner message queue: the shared bitmap stays the transfer, and frees are not classified as remote. | `cache.rs` `FREE_WAYS`, `FREE_SETS`, `set_index` (was `slot_index`), `buffer_free`, `insert_slot` (was `replace_slot`), `ThreadCache::victims`; `CacheStats::evictions` now counts evictions of a full set |
+| C2 cooperative cache return | `Allocatbelt::flush_thread_cache`: the caller's cache, whole (at most 64 slots and one claimed word per class), through `Heap::flush`; stays attached; no arena or cache initialisation, no allocation; documented as not async-signal-safe. `Allocatbelt::request_cache_return` / `Heap::request_cache_return`: bumps a `u32` generation (relaxed). Each attached cache compares it with the last generation it drained for at sampled points: refill, page-run and huge allocation and free, and a free that needs a new slot (so a free-only thread sees it within 4096 small frees). On a new value the owner drains completely, then records the generation (completion only after the obligation is met) and counts it. New caches start at the current generation; attaching caches and retired ones are never asked; a reentrant `attach` is now a no-op that keeps shard, random state and obligation. Claimed words are returned too, not only buffered frees. Nothing waits for other threads, so a fork child does not wait for vanished caches or the vanished maintenance thread. | `Heap::request_cache_return`, `cache_return_generation`, `observe_pressure`, `return_cache`, `attach`; `Heap::cache_pressure`; `ThreadCache::pressure_seen`, `pressure_returns`; `CacheStats::pressure_returns`; `Allocatbelt::flush_thread_cache`, `request_cache_return` |
+
+The model program (`model::run`, fuzz target) now also requests cache returns (operation 22 on the uncached "thread"), and `model::check_observations` checks every cache's free buffer: each occupied slot in its word's set, no word in two slots, pending masks equal to the occupied slots of each class.
+
+### Complexity notes
+
+| Change | What grows | Work bounded | Extra memory | Outside the bound |
+|---|---|---|---|---|
+| 2-way lookup | small free fast path: one more key comparison | per free: two slots | 4 bytes per cache (victim bits) | none |
+| Eviction | nothing | one slot flush (one `fetch_or`) | none | none |
+| Cache-return check | sampled slow paths: one relaxed load and a comparison | none when nothing is requested | 12 bytes per cache, 4 in the heap | none |
+| Drain (explicit or requested) | nothing | at most 64 slot flushes plus one claimed word per class, one atomic update each | none | a thread that sleeps or stops calling the allocator never drains: no time bound without its cooperation |
+
+### Invariant tests
+
+`crates/allocatbelt/src/core/tests.rs`:
+
+- `a_third_word_in_a_set_evicts_the_older_way` (replaces `slot_collisions_are_counted_as_evictions`): colliding distinct keys share a set without eviction; a third word evicts the older way; round robin; a matching second way.
+- `interleaved_frees_of_one_set_batch_without_evictions`: the deterministic operation-count test. 128 alternating frees of two words of one set: no eviction, two updates of 64 blocks (a direct-mapped buffer would make 127 one-block updates).
+- `duplicate_free_in_the_first_way`, `duplicate_free_in_the_second_way`; `free_of_a_claimed_block` and `double_free_in_buffer` unchanged.
+- `pending_masks_follow_evictions_across_classes`: masks after evictions across three classes; every freed block flushed or buffered exactly once.
+- `a_refill_flushes_only_its_class_and_flush_the_rest`: partial (per-class, before a refill would grow the heap) and full flush.
+- `producer_consumer_frees_are_all_accounted_for`: frees through another thread's cache; everything accounted for after retirement.
+- `free_only_threads_see_cache_return_requests`, `allocations_see_cache_return_requests`, `cache_return_generations_wrap`, `caches_owe_only_requests_made_while_attached` (new caches, reentrant attach, attaching and retired caches).
+- `parked_workers_that_flush_hold_nothing` and `parked_workers_keep_their_cache_until_they_run`: a parked thread following the flush contract, and one that does not (a request reaches no sleeping thread; it drains when it runs).
+- `fork_children_do_not_wait_for_vanished_caches`.
+
+`crates/allocatbelt/tests/global.rs` `thread_caches_are_returned_explicitly_and_on_request` (adapter, TLS cache; a thread that never allocated), and `tests/fork_maintenance.rs` (request and flush in a fork child). Thread exit and TLS teardown keep their tests (`exiting_threads_return_their_caches`, `thread_local_destructors_may_free_after_retire`).
+
+Loom: no new model. The generation is a relaxed counter read by each cache's owner; a missed or late read only delays a cooperative drain, and the drain itself is the existing flush, whose `fetch_or` protocol the existing models cover.
+
+### Checks run (x86_64 host, 1.98.1)
+
+| Check | Result |
+|---|---|
+| `cargo fmt --all --check` | pass |
+| `cargo clippy --all-targets --all-features --locked -- -D warnings` | pass |
+| `cargo test --release --all-features --locked` | pass (core suite: 107 tests) |
+| `fuzz_programs` (the model's property test) repeated 80 times | pass |
+| `scripts/check-features.sh` | pass |
+| `scripts/check-rseq.sh` | pass (seccomp and tunable cases skipped on this host, as before) |
+| `scripts/check-package.sh` | pass |
+| Loom (`RUSTFLAGS="-C target-cpu=x86-64-v3 --cfg loom" cargo test --release --locked -p allocatbelt-core-check --lib loom`) | pass (14 models, none new) |
+| Miri on the Stage C core tests | run locally after the commit; not part of CI (result appended below when it finishes) |
+| `scripts/check-sandbox.sh` | not run locally (no Docker daemon on this host); by CI |
+| aarch64, riscv64 (qemu), experimental ISA, platform gates, audit, deny, fuzz, mutation | by CI on the pushed commit (`bits.rs` and `class.rs` unchanged) |
+| Benchmarks | not run. Performance not measured; benchmark gate intentionally disabled. |
+
+### Known limitations
+
+- Two ways, 64 slots and round robin are the brief's starting point, not tuned; 4-way sets, larger buffers and other eviction policies were not tried.
+- A cache return needs the thread's cooperation: sleeping or blocked threads keep their caches, and there is no time bound. Only the owner drains its cache.
+- The free-only bound (4096 frees) counts small frees; a thread that frees nothing and allocates only from its claimed words sees a request at its next refill (within 64 allocations of each class it uses).

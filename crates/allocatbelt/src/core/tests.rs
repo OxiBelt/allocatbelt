@@ -1536,48 +1536,68 @@ fn a_full_word_is_flushed_in_one_update() {
   assert_eq!((s.evictions, s.refill_flushes), (0, 0));
 }
 
+/// Words of the 16-byte class (64 blocks each, allocated through `tc`) of
+/// which `k` share a set of the free buffer: `k` distinct words, in the
+/// order they were claimed.
+fn words_in_one_set(h: &Heap<MockOs>, tc: &ThreadCache, k: usize) -> (Vec<usize>, Vec<Vec<usize>>) {
+  let c = crate::core::class::class_of(16);
+  // 70 words in 32 sets: some set gets at least three.
+  let offs: Vec<_> = (0..64 * 70).map(|_| alloc_c(h, tc, 16, 8)).collect();
+  let mut by_set: std::collections::BTreeMap<usize, Vec<Vec<usize>>> = Default::default();
+  for w in offs.chunks(64) {
+    by_set
+      .entry(Heap::<MockOs>::free_set_of(w[0], c))
+      .or_default()
+      .push(w.to_vec());
+  }
+  let words = by_set
+    .into_values()
+    .find(|v| v.len() >= k)
+    .expect("70 words in 32 sets of two")
+    .into_iter()
+    .take(k)
+    .collect();
+  (offs, words)
+}
+
+/// Frees through `tc` every block of `offs` not in `freed`, then retires
+/// `tc`, so the heap ends empty.
+fn free_rest(h: &Heap<MockOs>, tc: &ThreadCache, offs: &[usize], freed: &[usize]) {
+  for &o in offs.iter().filter(|o| !freed.contains(o)) {
+    free_c(h, tc, o);
+  }
+  h.retire(tc);
+}
+
 #[test]
-fn slot_collisions_are_counted_as_evictions() {
+fn a_third_word_in_a_set_evicts_the_older_way() {
   let h = heap();
   let tc = cache(h);
-  let c = crate::core::class::class_of(16);
-  // 70 words of the class, in two pages: some pair of words shares a slot
-  // of the direct-mapped free buffer.
-  let offs: Vec<_> = (0..64 * 70).map(|_| alloc_c(h, &tc, 16, 8)).collect();
-  let word = |o: usize| o / (64 * 16);
-  let mut first = std::collections::BTreeMap::new();
-  let (a, b) = offs
-    .chunks(64)
-    .find_map(|w| {
-      let slot = Heap::<MockOs>::free_slot_of(w[0], c);
-      match first.insert(slot, w) {
-        Some(prev) if word(prev[0]) != word(w[0]) => Some((prev, w)),
-        _ => None,
-      }
-    })
-    .expect("70 words in 64 slots collide");
-  // Interleaved frees of the two words: every free after the first evicts
-  // the other word's one-block batch.
+  let (offs, w) = words_in_one_set(h, &tc, 3);
+  let (a, b, c) = (&w[0], &w[1], &w[2]);
+  // Interleaved frees of two words of one set: both ways, no eviction.
   for o in [a[0], b[0], a[1], b[1]] {
     free_c(h, &tc, o);
   }
   let s = h.cache_stats(&tc);
-  assert_eq!((s.evictions, s.flushes, s.flushed_blocks), (3, 3, 3));
-  assert_eq!(s.flush_sizes[0], 3);
-  assert_eq!((s.buffered_blocks, s.buffered_words), (1, 1));
-  // Grouped by word, the same frees evict once, with a batch of two.
-  for o in [a[2], a[3], b[2], b[3]] {
-    free_c(h, &tc, o);
-  }
+  assert_eq!((s.evictions, s.flushes), (0, 0));
+  assert_eq!((s.buffered_blocks, s.buffered_words), (4, 2));
+  // A third word evicts the older way (a's two blocks, in one update).
+  free_c(h, &tc, c[0]);
+  let s = h.cache_stats(&tc);
+  assert_eq!((s.evictions, s.flushes, s.flushed_blocks), (1, 1, 2));
+  assert_eq!(s.flush_sizes[1], 1);
+  // b is still buffered, in the other way.
+  free_c(h, &tc, b[2]);
+  assert_eq!(h.cache_stats(&tc).evictions, 1);
+  // a again: now b is the older way (round robin), with three blocks.
+  free_c(h, &tc, a[2]);
   let t = h.cache_stats(&tc);
-  // The slot held b[1]: a[2] evicts it, and b[2] evicts a[2..=3].
-  assert_eq!(t.evictions - s.evictions, 2);
-  assert_eq!(t.flush_sizes[1] - s.flush_sizes[1], 1);
-  let freed = [a[0], a[1], a[2], a[3], b[0], b[1], b[2], b[3]];
-  for &o in offs.iter().filter(|o| !freed.contains(o)) {
-    free_c(h, &tc, o);
-  }
-  h.retire(&tc);
+  assert_eq!((t.evictions, t.flushed_blocks), (2, 5));
+  assert_eq!(t.flush_sizes[1], 2);
+  assert_eq!((t.buffered_blocks, t.buffered_words), (2, 2));
+  Heap::<MockOs>::check_free_buffer(&tc);
+  free_rest(h, &tc, &offs, &[a[0], a[1], a[2], b[0], b[1], b[2], c[0]]);
 }
 
 #[test]
@@ -2209,4 +2229,365 @@ fn adaptive_retention_follows_reuse_and_idleness() {
   assert_eq!(h.reclaim_status().retention, 1);
   h.set_retention(Retention::Fixed);
   assert_eq!(h.reclaim_status().retention_mode, Retention::Fixed);
+}
+
+// ---- thread caches: 2-way free buffer and cache return (Stage C) ----------
+
+#[test]
+fn interleaved_frees_of_one_set_batch_without_evictions() {
+  let h = heap();
+  let tc = cache(h);
+  let (offs, w) = words_in_one_set(h, &tc, 2);
+  let (a, b) = (&w[0], &w[1]);
+  // Every block of two words of one set, alternately: 128 frees. A
+  // direct-mapped buffer would flush on every free after the first (127
+  // one-block updates); two ways keep both words.
+  for i in 0..64 {
+    free_c(h, &tc, a[i]);
+    free_c(h, &tc, b[i]);
+  }
+  let s = h.cache_stats(&tc);
+  assert_eq!((s.evictions, s.flushes), (0, 0));
+  assert_eq!((s.buffered_blocks, s.buffered_words), (128, 2));
+  h.flush(&tc);
+  let s = h.cache_stats(&tc);
+  // Two shared updates of 64 blocks each.
+  assert_eq!((s.flushes, s.flushed_blocks), (2, 128));
+  assert_eq!(s.flush_sizes, [0, 0, 0, 0, 0, 0, 2]);
+  let freed: Vec<usize> = a.iter().chain(b).copied().collect();
+  free_rest(h, &tc, &offs, &freed);
+}
+
+#[test]
+#[should_panic(expected = "double free")]
+fn duplicate_free_in_the_first_way() {
+  let h = heap();
+  let tc = cache(h);
+  let (_, w) = words_in_one_set(h, &tc, 2);
+  for o in [w[0][0], w[1][0], w[0][0]] {
+    h.dealloc_cached(&tc, o);
+  }
+}
+
+#[test]
+#[should_panic(expected = "double free")]
+fn duplicate_free_in_the_second_way() {
+  let h = heap();
+  let tc = cache(h);
+  let (_, w) = words_in_one_set(h, &tc, 2);
+  for o in [w[0][0], w[1][0], w[1][0]] {
+    h.dealloc_cached(&tc, o);
+  }
+}
+
+#[test]
+fn pending_masks_follow_evictions_across_classes() {
+  let h = heap();
+  let tc = cache(h);
+  // Blocks of three classes, freed in an order that fills sets and evicts
+  // across classes; the masks must name exactly each class's slots.
+  let mut offs: Vec<usize> = Vec::new();
+  for size in [16, 48, 256] {
+    offs.extend((0..64 * 40).map(|_| alloc_c(h, &tc, size, 8)));
+  }
+  let mut x = 0x9E37_79B9u64;
+  let mut order: Vec<usize> = (0..offs.len()).collect();
+  for i in (1..order.len()).rev() {
+    x ^= x << 13;
+    x ^= x >> 7;
+    x ^= x << 17;
+    order.swap(i, (x % (i as u64 + 1)) as usize);
+  }
+  for (n, &i) in order.iter().enumerate() {
+    free_c(h, &tc, offs[i]);
+    if n % 97 == 0 {
+      Heap::<MockOs>::check_free_buffer(&tc);
+    }
+  }
+  Heap::<MockOs>::check_free_buffer(&tc);
+  let s = h.cache_stats(&tc);
+  assert!(s.evictions > 0, "{s:?}");
+  // Everything freed is either flushed or still buffered, once.
+  assert_eq!(
+    s.flushed_blocks + s.buffered_blocks,
+    offs.len() as u64,
+    "{s:?}"
+  );
+  h.retire(&tc);
+  for c in 0..crate::core::class::NUM_CLASSES {
+    assert_eq!(Heap::<MockOs>::pending_slots(&tc, c), 0);
+  }
+  assert_eq!(h.usage().small_bytes_out, 0);
+}
+
+#[test]
+fn a_refill_flushes_only_its_class_and_flush_the_rest() {
+  let h = heap();
+  let tc = cache(h);
+  let c = crate::core::class::class_of(16);
+  let y = alloc_c(h, &tc, 48, 8);
+  // One whole page of the 16-byte class, all handed out.
+  let n = crate::core::class::capacity(c);
+  let offs: Vec<_> = (0..n).map(|_| alloc_c(h, &tc, 16, 8)).collect();
+  assert_eq!(
+    offs
+      .iter()
+      .map(|o| o / PAGE_SIZE)
+      .collect::<BTreeSet<_>>()
+      .len(),
+    1
+  );
+  let x = offs[100];
+  free_c(h, &tc, x);
+  free_c(h, &tc, y);
+  // The class has no free block but the buffered one: the refill returns
+  // the class's buffered frees (not the other class's) and takes x again,
+  // instead of a new page.
+  let again = alloc_c(h, &tc, 16, 8);
+  assert_eq!(again, x);
+  let s = h.cache_stats(&tc);
+  assert_eq!((s.refill_flushes, s.flushes), (1, 1));
+  assert_eq!((s.buffered_blocks, s.buffered_words), (1, 1));
+  h.flush(&tc);
+  let s = h.cache_stats(&tc);
+  assert_eq!((s.buffered_blocks, s.claimed_blocks, s.flushes), (0, 0, 2));
+  free_rest(h, &tc, &offs, &[]);
+  assert_eq!(h.usage().small_bytes_out, 0);
+}
+
+#[test]
+fn producer_consumer_frees_are_all_accounted_for() {
+  let h = heap();
+  let (p, c) = (cache(h), cache(h));
+  let offs: Vec<_> = (0..1000)
+    .map(|i| alloc_c(h, &p, 16 + i % 5 * 16, 8))
+    .collect();
+  // The consumer frees what the producer allocated.
+  for &o in &offs {
+    free_c(h, &c, o);
+  }
+  let (ps, cs) = (h.cache_stats(&p), h.cache_stats(&c));
+  assert_eq!(cs.flushed_blocks + cs.buffered_blocks, 1000);
+  // Out of the shared bitmaps: the producer's claimed blocks and the
+  // consumer's buffered frees.
+  let u = h.usage();
+  assert!(u.small_bytes_out > 0 && ps.claimed_blocks > 0);
+  h.flush(&c);
+  // The producer allocates again from what the consumer returned.
+  let again: Vec<_> = (0..1000)
+    .map(|i| alloc_c(h, &p, 16 + i % 5 * 16, 8))
+    .collect();
+  for o in again {
+    free_c(h, &p, o);
+  }
+  h.retire(&p);
+  h.retire(&c);
+  let (ps, cs) = (h.cache_stats(&p), h.cache_stats(&c));
+  assert_eq!(
+    (ps.claimed_blocks, ps.buffered_blocks, ps.attached),
+    (0, 0, false)
+  );
+  assert_eq!(
+    (cs.claimed_blocks, cs.buffered_blocks, cs.attached),
+    (0, 0, false)
+  );
+  assert_eq!(h.usage().small_bytes_out, 0);
+}
+
+#[test]
+fn free_only_threads_see_cache_return_requests() {
+  let h = heap();
+  let (p, c) = (cache(h), cache(h));
+  let w: Vec<_> = (0..128).map(|_| alloc_c(h, &p, 16, 8)).collect();
+  // The consumer only frees: two blocks of one word, then a request.
+  free_c(h, &c, w[0]);
+  h.request_cache_return();
+  free_c(h, &c, w[1]);
+  // A free into a word already buffered is the fast path: nothing seen.
+  let s = h.cache_stats(&c);
+  assert_eq!((s.pressure_returns, s.buffered_blocks), (0, 2));
+  // The next free that needs a slot sees the request: the cache drains
+  // (two blocks, one update), then buffers the new free.
+  free_c(h, &c, w[64]);
+  let s = h.cache_stats(&c);
+  assert_eq!((s.pressure_returns, s.flushes, s.flushed_blocks), (1, 1, 2));
+  assert_eq!((s.buffered_blocks, s.buffered_words), (1, 1));
+  // Seen once: later frees do not drain again.
+  free_c(h, &c, w[2]);
+  assert_eq!(h.cache_stats(&c).pressure_returns, 1);
+  free_rest(h, &c, &w, &[w[0], w[1], w[2], w[64]]);
+  h.retire(&p);
+}
+
+#[test]
+fn allocations_see_cache_return_requests() {
+  let h = heap();
+  let tc = cache(h);
+  let a = alloc_c(h, &tc, 16, 8);
+  // The cache holds the rest of a's word.
+  assert_eq!(h.cache_stats(&tc).claimed_blocks, 63);
+  h.request_cache_return();
+  // Allocations from the claimed word see nothing ...
+  let b = alloc_c(h, &tc, 16, 8);
+  assert_eq!(h.cache_stats(&tc).pressure_returns, 0);
+  // ... a refill (another class) does, and returns the 16-byte word first.
+  let c = alloc_c(h, &tc, 48, 8);
+  let s = h.cache_stats(&tc);
+  assert_eq!((s.pressure_returns, s.claimed_blocks), (1, 63));
+  assert_eq!(h.usage().small_bytes_out, 2 * 16 + 64 * 48);
+  // A page run is a sampled point too.
+  h.request_cache_return();
+  let big = alloc_c(h, &tc, 100_000, 8);
+  let s = h.cache_stats(&tc);
+  assert_eq!((s.pressure_returns, s.claimed_blocks), (2, 0));
+  for o in [a, b, c, big] {
+    free_c(h, &tc, o);
+  }
+  h.retire(&tc);
+}
+
+#[test]
+fn cache_return_generations_wrap() {
+  let h = heap();
+  h.set_cache_return_generation(u32::MAX);
+  let tc = cache(h);
+  let a = alloc_c(h, &tc, 16, 8);
+  h.request_cache_return();
+  assert_eq!(h.cache_return_generation(), 0);
+  let b = alloc_c(h, &tc, 48, 8);
+  let s = h.cache_stats(&tc);
+  assert_eq!((s.pressure_returns, s.claimed_blocks), (1, 63));
+  for o in [a, b] {
+    free_c(h, &tc, o);
+  }
+  h.retire(&tc);
+}
+
+#[test]
+fn caches_owe_only_requests_made_while_attached() {
+  let h = heap();
+  for _ in 0..3 {
+    h.request_cache_return();
+  }
+  // A new cache owes nothing for earlier requests.
+  let tc = cache(h);
+  let a = alloc_c(h, &tc, 16, 8);
+  let b = alloc_c(h, &tc, 48, 8);
+  assert_eq!(h.cache_stats(&tc).pressure_returns, 0);
+  // A reentrant attach keeps what the cache holds and what it owes.
+  h.request_cache_return();
+  h.attach(&tc);
+  assert_eq!(h.cache_stats(&tc).claimed_blocks, 126);
+  let c = alloc_c(h, &tc, 256, 8);
+  assert_eq!(h.cache_stats(&tc).pressure_returns, 1);
+  // A cache being attached, or retired, takes the uncached paths and is
+  // never asked to drain.
+  let attaching = ThreadCache::new();
+  attaching.begin_attach();
+  h.retire(&tc);
+  h.request_cache_return();
+  for t in [&tc, &attaching] {
+    let big = alloc_c(h, t, 100_000, 8);
+    free_c(h, t, big);
+    let s = h.cache_stats(t);
+    assert!(!s.attached && s.claimed_blocks == 0 && s.buffered_blocks == 0);
+  }
+  assert_eq!(h.cache_stats(&tc).pressure_returns, 1);
+  assert_eq!(h.cache_stats(&attaching).pressure_returns, 0);
+  for o in [a, b, c] {
+    free(h, o);
+  }
+  assert_eq!(h.usage().small_bytes_out, 0);
+}
+
+/// A worker thread that allocates, frees and parks (waits on a channel),
+/// flushing its cache before parking if `flush`. Returns the worker, the
+/// channel that wakes it, and its live block.
+fn parked_worker(
+  h: &'static Heap<MockOs>,
+  flush: bool,
+) -> (
+  std::thread::JoinHandle<crate::core::CacheStats>,
+  std::sync::mpsc::Sender<()>,
+  usize,
+) {
+  let (parked_tx, parked) = std::sync::mpsc::channel();
+  let (wake, wake_rx) = std::sync::mpsc::channel::<()>();
+  let worker = std::thread::spawn(move || {
+    let tc = cache(h);
+    let live = alloc_c(h, &tc, 16, 8);
+    let x = alloc_c(h, &tc, 48, 8);
+    free_c(h, &tc, x);
+    if flush {
+      // The integration contract: flush before parking.
+      h.flush(&tc);
+    }
+    parked_tx.send(live).unwrap();
+    wake_rx.recv().unwrap();
+    // Woken: its next slow path sees any request made meanwhile.
+    let big = alloc_c(h, &tc, 100_000, 8);
+    free_c(h, &tc, big);
+    let s = h.cache_stats(&tc);
+    h.retire(&tc);
+    s
+  });
+  let live = parked.recv().unwrap();
+  (worker, wake, live)
+}
+
+#[test]
+fn parked_workers_that_flush_hold_nothing() {
+  let h = heap();
+  let (worker, wake, live) = parked_worker(h, true);
+  // Only the live block is out of the shared bitmaps.
+  assert_eq!(h.usage().small_bytes_out, 16);
+  wake.send(()).unwrap();
+  assert_eq!(worker.join().unwrap().pressure_returns, 0);
+  free(h, live);
+  assert_eq!(h.usage().small_bytes_out, 0);
+}
+
+#[test]
+fn parked_workers_keep_their_cache_until_they_run() {
+  let h = heap();
+  let (worker, wake, live) = parked_worker(h, false);
+  let held = h.usage().small_bytes_out;
+  // The rest of two claimed words and a buffered free.
+  assert_eq!(held, 64 * 16 + 64 * 48);
+  // A request reaches no sleeping thread: nothing changes.
+  h.request_cache_return();
+  assert_eq!(h.usage().small_bytes_out, held);
+  // Woken, the worker drains at its first slow path.
+  wake.send(()).unwrap();
+  assert_eq!(worker.join().unwrap().pressure_returns, 1);
+  free(h, live);
+  assert_eq!(h.usage().small_bytes_out, 0);
+}
+
+#[test]
+fn fork_children_do_not_wait_for_vanished_caches() {
+  let h = heap();
+  let (mine, theirs) = (cache(h), cache(h));
+  let a = alloc_c(h, &mine, 16, 8);
+  let b = alloc_c(h, &theirs, 48, 8);
+  h.attach_maintenance();
+  // `fork` from this thread: `theirs` belongs to a thread the child does
+  // not have, and the maintenance thread is gone too.
+  h.fork_prepare();
+  h.fork_child();
+  assert!(!h.maintenance_attached());
+  // Requests and flushes return at once; the vanished cache keeps its
+  // blocks (lost to the child, a bounded amount), ours drains.
+  h.request_cache_return();
+  let c = alloc_c(h, &mine, 256, 8);
+  assert_eq!(h.cache_stats(&mine).pressure_returns, 1);
+  h.flush(&mine);
+  assert_eq!(h.usage().small_bytes_out, 16 + 256 + 64 * 48);
+  for o in [a, c] {
+    free_c(h, &mine, o);
+  }
+  h.retire(&mine);
+  free_c(h, &theirs, b);
+  h.retire(&theirs);
+  assert_eq!(h.usage().small_bytes_out, 0);
 }

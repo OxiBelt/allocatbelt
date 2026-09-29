@@ -118,12 +118,16 @@ pub struct CacheStats {
   /// Flushes by the number of blocks they carried: 1, 2-3, 4-7, 8-15,
   /// 16-31, 32-63 and 64 (bucket `floor(log2(n))`).
   pub flush_sizes: [u64; 7],
-  /// Flushes forced because a free of another word needed the slot (a
-  /// collision in the direct-mapped buffer).
+  /// Flushes forced because a free of another word needed a slot and both
+  /// ways of the word's set were taken (the buffer is 32 sets of 2 ways).
   pub evictions: u64,
   /// Flushes of a class's buffered frees before a refill of that class
   /// would have taken a new page.
   pub refill_flushes: u64,
+  /// Times the cache drained itself for a cache-return request
+  /// (`Allocatbelt::request_cache_return`), seen at one of its sampled
+  /// slow paths.
+  pub pressure_returns: u64,
 }
 
 /// A walk over the heap's segments that tells apart what the memory it

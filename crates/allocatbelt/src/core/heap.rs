@@ -33,7 +33,7 @@
 //! are in [`crate::core::proto`].
 //!
 //! Frees never take a lock. A thread with a cache buffers the freed bit in a
-//! small direct-mapped table keyed by (page, bitmap word); the buffer is
+//! small 2-way set-associative table keyed by (page, bitmap word); the buffer is
 //! flushed with one `fetch_or` per word, so a burst of frees into the same
 //! word costs one read-modify-write. Every free, buffered or not, reaches the
 //! shared bitmap through `fetch_or` before its block can be handed out again,
@@ -434,6 +434,10 @@ pub struct Heap<O> {
   sweep: reclaim::Sweep,
   /// Round-robin shard assignment for attached thread caches.
   next_shard: AtomicUsize,
+  /// Cache-return generation: bumped by [`Heap::request_cache_return`];
+  /// each attached cache drains itself when it sees a new value (see
+  /// `cache`).
+  cache_pressure: AtomicU32,
   /// Secret for randomized placement; 0 turns randomization off.
   seed: AtomicU64,
   shards: [Shard; SHARDS],
@@ -457,6 +461,7 @@ impl<O: Os> Heap<O> {
       maint_stats: [const { AtomicU64::new(0) }; maint::STATS],
       sweep: reclaim::Sweep::new(),
       next_shard: AtomicUsize::new(0),
+      cache_pressure: AtomicU32::new(0),
       seed: AtomicU64::new(0),
       shards: [const { Shard::new() }; SHARDS],
     }

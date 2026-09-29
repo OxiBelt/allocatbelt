@@ -27,6 +27,12 @@ fn child(parent_backend: PurgeBackend) -> ! {
   let v = vec![5u8; 40 << 20];
   ok &= v[v.len() - 1] == 5;
   drop(v);
+  // Cache return in the child: nothing waits for the parent's threads.
+  GLOBAL.request_cache_return();
+  GLOBAL.flush_thread_cache();
+  let small = Box::new([3u8; 48]);
+  ok &= small[0] == 3;
+  drop(small);
   GLOBAL.request_purge();
   // SAFETY: `_exit` ends the child without running the parent's atexit
   // handlers.
