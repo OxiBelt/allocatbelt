@@ -27,10 +27,11 @@ target="${arch}-unknown-linux-musl"
 image=allocatbelt-empty
 
 echo "== building static test binaries (${target})"
+# Test binaries only: `cargo test` also builds the examples, elsewhere.
 mapfile -t bins < <(
   cargo test --release --locked -p allocatbelt --features io-uring \
     --target "${target}" --no-run --message-format=json 2>/dev/null |
-    jq -r 'select(.reason == "compiler-artifact" and .executable != null
+    jq -r 'select(.reason == "compiler-artifact" and .executable != null and .profile.test
       and .target.name != "allocatbelt-bench") | .executable'
 )
 [[ ${#bins[@]} -ge 9 ]] || { echo "FAIL: found only ${#bins[@]} test binaries" >&2; exit 1; }

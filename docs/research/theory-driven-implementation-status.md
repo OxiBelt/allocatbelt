@@ -346,3 +346,5 @@ Bulk release is not O(1): it scales with the chunks held.
 - A region is not `Sync`; threads sharing work need one region each.
 - No per-piece randomization, double-free detection or guard page between pieces (by design; the heap's segment guards and out-of-band metadata still apply to the chunks).
 - Not measured, and nothing claims it is faster than the global allocator for any workload, or that it suits OxiBelt.
+
+**CI after the push.** On `2eddb6a` both "Sandbox and virtualization" jobs failed: `scripts/check-sandbox.sh` ran every executable `cargo test --no-run` reported, which now includes the new example, built outside the mounted test directory. The script now keeps test binaries only (`profile.test`). Every other job passed on that commit, the new Miri job included.
