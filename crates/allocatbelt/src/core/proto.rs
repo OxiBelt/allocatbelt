@@ -100,6 +100,8 @@ pub(crate) fn claim_word(summary: &AtomicU64, words: &[AtomicU64], r: u32) -> Op
       return None;
     }
     let w = pick_bit(s, r);
+    // A pick outside the summary would clear nothing and spin here.
+    debug_assert!(s & 1 << w != 0, "pick_bit chose a clear bit");
     // Clear the hint before taking the bits: a free that lands after the
     // swap sees an empty word and sets the hint again.
     summary.fetch_and(!(1 << w), AcqRel);

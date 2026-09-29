@@ -24,7 +24,8 @@ pub fn probe_find_run(free: u64, n: u32, step: u32) -> Option<u32> {
   bits::find_run_aligned(free, n, step)
 }
 
-/// `trailing_zeros` after a rotation: the randomized pick of a set bit.
+/// `count_ones` of halves of the word: the randomized pick of a set bit by
+/// rank.
 #[inline(never)]
 #[must_use]
 pub fn probe_pick_bit(m: u64, r: u32) -> u32 {

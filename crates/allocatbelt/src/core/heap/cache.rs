@@ -236,6 +236,8 @@ impl<O: Os> Heap<O> {
       tc.rng.set(x);
       pick_bit(bits, (x >> 32) as u32)
     };
+    // A pick outside the word would hand the same block out again.
+    debug_assert!(bits & 1 << i != 0, "pick_bit chose a clear bit");
     cw.bits.set(bits & !(1 << i));
     Some(cw.base.get() + i as usize * class::size(c))
   }

@@ -78,8 +78,8 @@ The allocator's hot scans work on one `u64` bitmap word at a time with `trailing
 
 | Operation | Where the allocator uses it | x86-64-v3 | riscv64 + Zbb | riscv64 (rv64gc) |
 |---|---|---|---|---|
-| `trailing_zeros` | `bits::find_run_aligned`, `bits::pick_bit`, the summary scans | `tzcnt`, never `bsf` | `ctz` | no `ctz`: a multi-instruction sequence |
-| `count_ones` | free counters (`proto.rs`), dirty-page accounting (`heap.rs`) | `popcnt` | `cpop` | no `cpop` |
+| `trailing_zeros` | `bits::find_run_aligned`, the summary scans | `tzcnt`, never `bsf` | `ctz` | no `ctz`: a multi-instruction sequence |
+| `count_ones` | free counters (`proto.rs`), dirty-page accounting (`heap.rs`), `bits::pick_bit` (rank selection) | `popcnt` | `cpop` | no `cpop` |
 | `leading_zeros` | `class::class_of` | `lzcnt`, never `bsr` | `clz` | no `clz` |
 
 These helpers are small enough that LLVM inlines them into their callers, so they have no symbol of their own. The script builds `crates/allocatbelt-codegen-probes`, which holds one out-of-line wrapper per operation around the real helper of the `core` module (through `allocatbelt-core-check`), with the allocator's own flags, emits assembly, and looks only at those four function bodies, which keeps it independent of scheduling and inlining elsewhere. The rv64gc column is a control: without Zbb none of the three instructions may appear, which shows the check can tell the builds apart and why `-C target-feature=+zbb` matters. A generic x86-64 (v1) build of the probes uses `bsf`/`bsr` and a software popcount, which the check would reject; the platform gate already rules that build out for the allocator itself.

@@ -63,14 +63,42 @@ const fn stride_mask(step: u32) -> u64 {
   MASKS[step.trailing_zeros() as usize]
 }
 
-/// Index of the first set bit of `m` (non-zero) at or after bit `r % 64`,
-/// wrapping around. `r = 0` gives the lowest set bit; a random `r` gives a
-/// cheap randomized pick.
+/// A set bit of `m` (non-zero) chosen by `r`: the set bits are ranked from
+/// the lowest, and `r`, read as a fraction of 2^32, picks the rank
+/// (`rank = r * m.count_ones() / 2^32`). `r = 0` gives the lowest set bit;
+/// a uniformly random `r` gives every set bit the same chance, whatever
+/// the gaps between them.
+///
+/// The pick is a rank selection, not a scan from a random position: a scan
+/// from a random start favours set bits that follow long runs of zeros,
+/// and the rank is where randomization belongs.
 #[must_use]
 #[inline]
 pub const fn pick_bit(m: u64, r: u32) -> u32 {
-  let r = r & 63;
-  (m.rotate_right(r).trailing_zeros() + r) & 63
+  let rank = ((r as u64 * m.count_ones() as u64) >> 32) as u32;
+  select_bit(m, rank)
+}
+
+/// Index of the set bit of `m` with `rank` set bits below it; `rank` must be
+/// below `m.count_ones()`. Halves the word six times by population count,
+/// so it takes the same steps for every input.
+#[must_use]
+#[inline]
+pub const fn select_bit(m: u64, rank: u32) -> u32 {
+  let mut m = m;
+  let mut rank = rank;
+  let mut index = 0;
+  let mut width = 32;
+  while width != 0 {
+    let below = (m & ((1u64 << width) - 1)).count_ones();
+    if rank >= below {
+      rank -= below;
+      m >>= width;
+      index += width;
+    }
+    width /= 2;
+  }
+  index
 }
 
 /// Mask with bits `start..start + n` set (`n` in `1..=64`).

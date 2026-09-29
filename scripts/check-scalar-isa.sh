@@ -84,13 +84,13 @@ reject() {
 # x86-64-v3 comes from .cargo/config.toml; clear RUSTFLAGS so it applies.
 x86="$(env -u RUSTFLAGS bash -c "$(declare -f emit); target_dir='${target_dir}'; emit x86_64-unknown-linux-gnu x86-64-v3")"
 expect x86-64-v3 "${x86}" probe_find_run 'tzcnt[lq]?' 'bsf[lq]?'
-expect x86-64-v3 "${x86}" probe_pick_bit 'tzcnt[lq]?' 'bsf[lq]?'
+expect x86-64-v3 "${x86}" probe_pick_bit 'popcnt[lq]?' 'bsf[lq]?'
 expect x86-64-v3 "${x86}" probe_count_ones 'popcnt[lq]?'
 expect x86-64-v3 "${x86}" probe_class_of 'lzcnt[lq]?' 'bsr[lq]?'
 
 zbb="$(emit riscv64gc-unknown-linux-gnu rv64gc-zbb '-C target-feature=+zbb')"
 expect rv64gc+zbb "${zbb}" probe_find_run 'ctzw?'
-expect rv64gc+zbb "${zbb}" probe_pick_bit 'ctzw?'
+expect rv64gc+zbb "${zbb}" probe_pick_bit 'cpopw?'
 expect rv64gc+zbb "${zbb}" probe_count_ones 'cpopw?'
 expect rv64gc+zbb "${zbb}" probe_class_of 'clzw?'
 
