@@ -23,7 +23,8 @@
 //! segments ([`Os::decommit`]) stays synchronous. Two safety valves keep memory bounded if the thread
 //! falls behind (it runs as a batch task, see the adapter): a free that
 //! finds more than [`DIRTY_HARD_LIMIT_PAGES`] dirty pages runs the budget
-//! pass inline as before, and a forked child, which has no maintenance
+//! pass inline as before (a foreground intervention,
+//! [`MaintenanceStats::hard_limit_passes`]), and a forked child, which has no maintenance
 //! thread, goes back to inline housekeeping.
 
 use super::*;
@@ -34,8 +35,9 @@ const WORK_FORCE: u32 = 1 << 0;
 const WORK_BUDGET: u32 = 1 << 1;
 
 /// Dirty pages beyond which a free runs the budget pass itself even when a
-/// maintenance thread is attached (64 MiB): the thread is behind, and RSS
-/// must stay bounded.
+/// maintenance thread is attached (64 MiB): the thread is behind, and the
+/// dirty pages it has not purged must not grow without bound. A bound on
+/// tracked dirty pages, not on the process's RSS (see [`DIRTY_BUDGET_PAGES`]).
 pub const DIRTY_HARD_LIMIT_PAGES: isize = 2 * DIRTY_BUDGET_PAGES;
 
 /// Housekeeping work, in priority order.
@@ -51,6 +53,14 @@ pub enum Task {
 }
 
 /// Counters of the housekeeping passes (P4), for diagnostics and tests.
+///
+/// Each counter only grows, and wraps modulo 2^64 (which no process
+/// reaches). A snapshot reads the counters one by one while passes may be
+/// running, so two counters of one snapshot can disagree by the work of a
+/// pass in progress; each pass adds its work when it ends, so counters of
+/// one pass (inspected, attempted, purged, failed) appear together.
+/// Counting costs a few atomic additions per pass, none per allocation or
+/// free.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct MaintenanceStats {
@@ -71,6 +81,36 @@ pub struct MaintenanceStats {
   pub purge_batches: u64,
   /// Page runs purged (or attempted) by those batches.
   pub purged_runs: u64,
+  /// Of [`MaintenanceStats::purged_runs`], the runs the OS refused (or
+  /// whose completion failed): their pages stay dirty and are tried again
+  /// by a later pass.
+  pub failed_runs: u64,
+  /// Pages whose purge succeeded: memory handed back to the OS. Not the
+  /// same as a drop in the process's RSS, which the OS decides.
+  pub purged_pages: u64,
+  /// Owned segments whose dirty free pages a pass inspected.
+  pub segments_inspected: u64,
+  /// Shards a pass trimmed (released their fully free small pages and
+  /// checked their empty segments).
+  pub trimmed_shards: u64,
+  /// Shards a pass skipped because another thread held their lock; their
+  /// pages and segments wait for a later pass.
+  pub busy_shards: u64,
+  /// Small pages whose free count trimming checked.
+  pub trim_pages_inspected: u64,
+  /// Small pages trimming found fully free and turned into dirty free
+  /// pages. Returning a page to its segment does not return memory to the
+  /// OS; a purge does, later.
+  pub released_pages: u64,
+  /// Empty segments trimming returned to the arena (decommitted).
+  pub returned_segments: u64,
+  /// Passes an allocating or freeing thread would have run but skipped,
+  /// because another thread held the purge lock.
+  pub skipped_passes: u64,
+  /// Of [`MaintenanceStats::inline_budget_passes`], those a freeing thread
+  /// ran although a maintenance thread was attached, because the dirty
+  /// count passed the hard limit: foreground intervention.
+  pub hard_limit_passes: u64,
 }
 
 /// Indices into `Heap::maint_stats`.
@@ -84,10 +124,36 @@ pub(super) enum Stat {
   Wakeup,
   Batch,
   Run,
+  FailedRun,
+  PurgedPage,
+  SegmentInspected,
+  TrimmedShard,
+  BusyShard,
+  TrimPageInspected,
+  ReleasedPage,
+  ReturnedSegment,
+  SkippedPass,
+  HardLimit,
 }
 
 /// Number of [`Stat`]s.
-pub(super) const STATS: usize = 8;
+pub(super) const STATS: usize = 18;
+
+/// The work of one pass, counted in private and added to the shared
+/// counters once when the pass ends.
+#[derive(Default)]
+pub(super) struct PassWork {
+  pub(super) batches: u64,
+  pub(super) runs: u64,
+  pub(super) failed_runs: u64,
+  pub(super) purged_pages: u64,
+  pub(super) segments_inspected: u64,
+  pub(super) trimmed_shards: u64,
+  pub(super) busy_shards: u64,
+  pub(super) trim_pages_inspected: u64,
+  pub(super) released_pages: u64,
+  pub(super) returned_segments: u64,
+}
 
 impl<O: Os> Heap<O> {
   /// Hands housekeeping to the calling thread, which must then call
@@ -196,11 +262,17 @@ impl<O: Os> Heap<O> {
   /// Called by a free that took the dirty count to `dirty`, over the
   /// budget.
   pub(super) fn over_budget(&self, dirty: isize) {
-    if self.maintenance_attached() && dirty <= DIRTY_HARD_LIMIT_PAGES {
+    let attached = self.maintenance_attached();
+    if attached && dirty <= DIRTY_HARD_LIMIT_PAGES {
       self.request(WORK_BUDGET);
     } else if let Some(_g) = self.purge_lock.try_lock(&self.os) {
       self.pass(Pass::Budget, &mut SyncPurger(&self.os));
       self.count(Stat::InlineBudget);
+      if attached {
+        self.count(Stat::HardLimit);
+      }
+    } else {
+      self.count(Stat::SkippedPass);
     }
   }
 
@@ -235,7 +307,23 @@ impl<O: Os> Heap<O> {
   }
 
   pub(super) fn count_n(&self, stat: Stat, n: u64) {
-    self.maint_stats[stat as usize].fetch_add(n, Relaxed);
+    if n != 0 {
+      self.maint_stats[stat as usize].fetch_add(n, Relaxed);
+    }
+  }
+
+  /// Adds the work of a pass that just ended to the counters.
+  pub(super) fn count_work(&self, w: &PassWork) {
+    self.count_n(Stat::Batch, w.batches);
+    self.count_n(Stat::Run, w.runs);
+    self.count_n(Stat::FailedRun, w.failed_runs);
+    self.count_n(Stat::PurgedPage, w.purged_pages);
+    self.count_n(Stat::SegmentInspected, w.segments_inspected);
+    self.count_n(Stat::TrimmedShard, w.trimmed_shards);
+    self.count_n(Stat::BusyShard, w.busy_shards);
+    self.count_n(Stat::TrimPageInspected, w.trim_pages_inspected);
+    self.count_n(Stat::ReleasedPage, w.released_pages);
+    self.count_n(Stat::ReturnedSegment, w.returned_segments);
   }
 
   /// The housekeeping counters so far.
@@ -250,6 +338,16 @@ impl<O: Os> Heap<O> {
       wakeups: s(Stat::Wakeup),
       purge_batches: s(Stat::Batch),
       purged_runs: s(Stat::Run),
+      failed_runs: s(Stat::FailedRun),
+      purged_pages: s(Stat::PurgedPage),
+      segments_inspected: s(Stat::SegmentInspected),
+      trimmed_shards: s(Stat::TrimmedShard),
+      busy_shards: s(Stat::BusyShard),
+      trim_pages_inspected: s(Stat::TrimPageInspected),
+      released_pages: s(Stat::ReleasedPage),
+      returned_segments: s(Stat::ReturnedSegment),
+      skipped_passes: s(Stat::SkippedPass),
+      hard_limit_passes: s(Stat::HardLimit),
     }
   }
 }

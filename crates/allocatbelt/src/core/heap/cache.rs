@@ -79,6 +79,14 @@ pub struct ThreadCache {
   /// Random state for the order blocks are handed out; 0 while
   /// randomization is off.
   rng: Cell<u64>,
+  /// [`CacheStats::flush_sizes`], counted when a slot is flushed.
+  flush_sizes: [Cell<u64>; 7],
+  /// [`CacheStats::flushed_blocks`].
+  flushed_blocks: Cell<u64>,
+  /// [`CacheStats::evictions`].
+  evictions: Cell<u64>,
+  /// [`CacheStats::refill_flushes`].
+  refill_flushes: Cell<u64>,
 }
 
 impl ThreadCache {
@@ -103,6 +111,10 @@ impl ThreadCache {
       state: Cell::new(DETACHED),
       ticks: Cell::new(0),
       rng: Cell::new(0),
+      flush_sizes: [const { Cell::new(0) }; 7],
+      flushed_blocks: Cell::new(0),
+      evictions: Cell::new(0),
+      refill_flushes: Cell::new(0),
     }
   }
 
@@ -200,6 +212,7 @@ impl<O: Os> Heap<O> {
       match self.with_shard(hint, |s, sh| self.claim_class_word(s, sh, c, grow))? {
         Some(claim) => claim,
         None => {
+          bump(&tc.refill_flushes, 1);
           self.flush_class(tc, c);
           self.with_shard(hint, |s, sh| self.claim_class_word(s, sh, c, true))??
         }
@@ -343,6 +356,9 @@ impl<O: Os> Heap<O> {
   /// Flushes slot `i` and makes it hold `bit` of the word `key`.
   #[inline(never)]
   fn replace_slot(&self, tc: &ThreadCache, i: usize, key: u64, c: usize, bit: u64) {
+    if tc.frees[i].key.get() != 0 {
+      bump(&tc.evictions, 1);
+    }
     self.flush_slot(tc, i);
     let slot = &tc.frees[i];
     slot.key.set(key);
@@ -359,7 +375,15 @@ impl<O: Os> Heap<O> {
     }
     let (page, w, c) = unpack_key(key);
     tc.pending[c].set(tc.pending[c].get() & !(1 << i));
-    self.free_bits(page, c, w, slot.mask.get());
+    let mask = slot.mask.get();
+    let n = mask.count_ones();
+    bump(&tc.flushed_blocks, u64::from(n));
+    // A slot holds at least one block: bucket floor(log2(n)), 0..=6.
+    bump(
+      &tc.flush_sizes[(u32::BITS - 1 - n.leading_zeros()) as usize],
+      1,
+    );
+    self.free_bits(page, c, w, mask);
   }
 
   /// Returns the buffered frees of class `c`.
@@ -370,4 +394,48 @@ impl<O: Os> Heap<O> {
       pending &= pending - 1;
     }
   }
+
+  /// What `tc` holds now and how it flushed its buffered frees so far (see
+  /// [`CacheStats`]). Only the thread that owns `tc` can call it; it reads
+  /// the cache's `Cell`s and nothing shared.
+  pub fn cache_stats(&self, tc: &ThreadCache) -> CacheStats {
+    let (mut buffered_blocks, mut buffered_words) = (0, 0);
+    for slot in &tc.frees {
+      if slot.key.get() != 0 {
+        buffered_words += 1;
+        buffered_blocks += u64::from(slot.mask.get().count_ones());
+      }
+    }
+    let flush_sizes = core::array::from_fn(|i| tc.flush_sizes[i].get());
+    CacheStats {
+      attached: tc.is_attached(),
+      claimed_blocks: tc
+        .words
+        .iter()
+        .map(|w| u64::from(w.bits.get().count_ones()))
+        .sum(),
+      buffered_blocks,
+      buffered_words,
+      flushes: flush_sizes.iter().fold(0u64, |a, &n| a.wrapping_add(n)),
+      flushed_blocks: tc.flushed_blocks.get(),
+      flush_sizes,
+      evictions: tc.evictions.get(),
+      refill_flushes: tc.refill_flushes.get(),
+    }
+  }
+
+  /// The slot of the free buffer that a free at `offset` (a small block)
+  /// goes to, for tests that build collisions.
+  #[cfg(all(test, allocatbelt_core_check))]
+  pub(crate) fn free_slot_of(offset: usize, c: usize) -> usize {
+    let page = offset >> PAGE_SHIFT;
+    let idx = class::block_index(c, offset % PAGE_SIZE).unwrap_or(0);
+    slot_index(page, idx / 64)
+  }
+}
+
+/// Adds `n` to a diagnostic counter of the cache (wrapping).
+#[inline]
+fn bump(counter: &Cell<u64>, n: u64) {
+  counter.set(counter.get().wrapping_add(n));
 }

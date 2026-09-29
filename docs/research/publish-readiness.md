@@ -58,6 +58,8 @@ None of them is a default, and none is selected by `Auto`.
 
 What 0.1.0 would publish: `Allocatbelt` (the allocator and its methods), `Policy`, `FeaturePolicy`, `Capability`, `PolicyError`, `CompiledCapabilities`, `DetectedCapabilities`, `Availability`, `EffectiveProfile`, `Report`, `PurgeBackend`, `MaintenanceStats`, `Capabilities`, `KernelVersion`, `CpuFeatures`, `KernelSet`; with `io-uring` `RingError`; with `experimental-rseq` `RseqPolicy`, `RseqStatus`, `RseqUnavailable`. Features: `maintenance`, `scheduler`, `io-uring`, `experimental-rseq`, `experimental-aarch64-sve`, `experimental-aarch64-sve2`, `experimental-riscv-rvv`.
 
+Added after this review (theory-driven plan Stage A, see [theory-driven-implementation-status.md](theory-driven-implementation-status.md)): `SearchStats`, `CacheStats` and `HeapUsage`, all `#[non_exhaustive]`, read through `Allocatbelt::search_stats`, `heap_usage` and `thread_cache_stats`, and new `MaintenanceStats` fields.
+
 Changed in this review, so that later additions are not breaking:
 
 - `#[non_exhaustive]` on `MaintenanceStats`, `PurgeBackend`, `Capabilities`, `RingError`, `RseqStatus` and `RseqUnavailable`: types whose fields or variants are expected to grow (new counters, backends, probe results, rseq failure causes). The other report and policy types already were. Users read these types; they cannot build them with a literal or match them exhaustively any more, which nothing in this repository did.

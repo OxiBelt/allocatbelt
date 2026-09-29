@@ -74,10 +74,13 @@ use Ordering::{AcqRel, Acquire, Relaxed, Release};
 mod cache;
 mod fork;
 mod maint;
+mod observe;
 mod purge;
 
 pub use cache::ThreadCache;
 pub use maint::{DIRTY_HARD_LIMIT_PAGES, MaintenanceStats, Task};
+pub use observe::{CacheStats, HeapUsage, SearchStats};
+use observe::{SEARCH_STATS, SearchStat};
 use purge::Pass;
 pub use purge::{PURGE_BATCH, Purger, SyncPurger};
 
@@ -237,6 +240,9 @@ const GUARD_BIT: u64 = 1 << GUARD_PAGE;
 pub const MAX_RUN_PAGES: usize = PAGES_PER_SEGMENT - 1;
 
 /// Dirty (freed, unpurged) pages tolerated before a purge pass (32 MiB).
+/// A bound on the pages the heap tracks as dirty, not on the process's
+/// RSS: live and cached blocks, metadata, and memory the OS keeps resident
+/// after a purge are outside it (see [`HeapUsage`]).
 pub const DIRTY_BUDGET_PAGES: isize = 512;
 /// How long freed pages stay resident, and empty segments stay owned,
 /// before a decay pass returns them (see [`Heap::set_purge_delay_ms`]).
@@ -272,6 +278,9 @@ struct Shard {
   /// randomization is off.
   rng: AtomicU64,
   classes: [ClassState; NUM_CLASSES],
+  /// [`SearchStats`] of this shard, indexed by [`SearchStat`], changed
+  /// under the lock.
+  stats: [AtomicU64; SEARCH_STATS],
 }
 
 impl Shard {
@@ -281,6 +290,7 @@ impl Shard {
       segs: AtomicU32::new(0),
       rng: AtomicU64::new(0),
       classes: [const { ClassState::new() }; NUM_CLASSES],
+      stats: [const { AtomicU64::new(0) }; SEARCH_STATS],
     }
   }
 
@@ -691,9 +701,11 @@ impl<O: Os> Heap<O> {
     grow: bool,
   ) -> Option<Option<(usize, u32, u64)>> {
     let cs = &sh.classes[c];
+    sh.bump(SearchStat::Refill, 1);
     // A page just set up for the class must have blocks to claim; if not,
     // the metadata is corrupt, and retrying would take pages forever.
     let mut fresh = false;
+    let mut searched = false;
     loop {
       let cur = cs.cursor.load(Relaxed);
       if cur != 0 {
@@ -706,6 +718,9 @@ impl<O: Os> Heap<O> {
         let words = &pm.bitmaps()[..class::bitmap_words(c)];
         if let Some((w, bits)) = proto::claim_word(pm.summary(), words, sh.random()) {
           pm.free().fetch_sub(u64::from(bits.count_ones()), Relaxed);
+          if !searched {
+            sh.bump(SearchStat::CursorClaim, 1);
+          }
           return Some(Some((page, w, bits)));
         }
         if fresh {
@@ -716,8 +731,10 @@ impl<O: Os> Heap<O> {
         if !proto::retire_page(&m[SEG_AVAIL + c], 1 << in_seg, pm.summary()) {
           continue;
         }
+        sh.bump(SearchStat::CursorRetired, 1);
         cs.cursor.store(0, Relaxed);
       }
+      searched = true;
       let page = match self.find_page(sh, c) {
         Some(p) => p,
         None if !grow => return Some(None),
@@ -733,28 +750,40 @@ impl<O: Os> Heap<O> {
   /// Finds a page of class `c` with free blocks among the shard's
   /// segments, through their availability words. Caller holds the lock.
   fn find_page(&self, sh: &Shard, c: usize) -> Option<usize> {
+    // Counted locally and added once: the search holds the lock anyway.
+    let (mut segs, mut cands, mut stale) = (0, 0, 0);
+    let mut found = None;
     let mut cur = sh.segs.load(Relaxed);
-    while cur != 0 {
+    'segs: while cur != 0 {
       let seg = cur as usize - 1;
+      segs += 1;
       let m = self.seg_meta(seg);
       let mut cand = m[SEG_AVAIL + c].load(Acquire) & m[SEG_CLS + c].load(Relaxed);
       while cand != 0 {
         let i = cand.trailing_zeros() as usize;
         cand &= cand - 1;
+        cands += 1;
         let summary = PageMeta::new(m, i).summary();
         // A stale availability bit is dropped here, unless a free
         // refills the page meanwhile.
         if summary.load(Acquire) != 0 || !proto::retire_page(&m[SEG_AVAIL + c], 1 << i, summary) {
-          return Some(seg * PAGES_PER_SEGMENT + i);
+          found = Some(seg * PAGES_PER_SEGMENT + i);
+          break 'segs;
         }
+        stale += 1;
       }
       cur = m[SEG_NEXT].load(Relaxed) as u32;
     }
-    None
+    sh.bump(SearchStat::PageSearch, 1);
+    sh.bump(SearchStat::PageSearchSegment, segs);
+    sh.bump(SearchStat::Candidate, cands);
+    sh.bump(SearchStat::StaleHint, stale);
+    found
   }
 
   fn new_small_page(&self, s: usize, sh: &Shard, c: usize) -> Option<usize> {
     let (p, _) = self.alloc_pages(s, sh, 1, 1)?;
+    sh.bump(SearchStat::NewPage, 1);
     let (m, in_seg) = (self.seg_meta(p / PAGES_PER_SEGMENT), p % PAGES_PER_SEGMENT);
     let pm = PageMeta::new(m, in_seg);
     let cap = class::capacity(c);
@@ -904,16 +933,22 @@ impl<O: Os> Heap<O> {
   /// a segment owned by shard `s`. Also returns whether the pages read as
   /// zero.
   fn alloc_pages(&self, s: usize, sh: &Shard, n: usize, step: usize) -> Option<(usize, bool)> {
+    sh.bump(SearchStat::RunSearch, 1);
+    let mut segs = 0;
     let mut cur = sh.segs.load(Relaxed);
     while cur != 0 {
       let seg = cur as usize - 1;
+      segs += 1;
       let m = self.seg_meta(seg);
       if let Some((start, zeroed)) = self.claim_run(m, n, step) {
+        sh.bump(SearchStat::RunSearchSegment, segs);
         return Some((seg * PAGES_PER_SEGMENT + start, zeroed));
       }
       cur = m[SEG_NEXT].load(Relaxed) as u32;
     }
+    sh.bump(SearchStat::RunSearchSegment, segs);
     let seg = self.alloc_segments(1, sh.random())?;
+    sh.bump(SearchStat::NewSegment, 1);
     let m = self.seg_meta(seg);
     // A segment whose memory may hold stale bytes starts fully dirty, so
     // it is neither reported as zeroed nor kept resident forever. Dirty

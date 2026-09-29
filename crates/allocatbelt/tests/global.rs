@@ -218,3 +218,27 @@ fn thread_local_destructors_may_free_after_retire() {
     h.join().unwrap();
   }
 }
+
+#[test]
+fn diagnostics_are_readable_through_the_adapter() {
+  // A thread of its own, so its cache holds only what this test does.
+  std::thread::spawn(|| {
+    let blocks: Vec<Box<[u8; 32]>> = (0..1000).map(|i| Box::new([i as u8; 32])).collect();
+    let usage = GLOBAL.heap_usage();
+    assert!(usage.owned_segments >= 1 && usage.small_bytes_out >= 32 * 1000);
+    assert!(GLOBAL.search_stats().refills > 0);
+    let before = GLOBAL.thread_cache_stats().expect("cache");
+    assert!(before.attached);
+    drop(blocks);
+    let after = GLOBAL.thread_cache_stats().expect("cache");
+    // Every free is either still buffered or was flushed in a batch.
+    let returned = |s: allocatbelt::CacheStats| s.buffered_blocks + s.flushed_blocks;
+    assert!(
+      returned(after) - returned(before) >= 1000,
+      "{before:?} {after:?}"
+    );
+    assert_eq!(after.flushes, after.flush_sizes.iter().sum::<u64>());
+  })
+  .join()
+  .unwrap();
+}

@@ -1351,3 +1351,311 @@ fn migrating_threads_keep_the_heap_consistent() {
   h.purge();
   assert_eq!(h.dirty_pages(), 0);
 }
+
+// ---- observations (theory-driven plan, Stage A) -------------------------------
+
+/// The counters of `after` minus those of `before`.
+fn work_since(
+  before: crate::core::MaintenanceStats,
+  after: crate::core::MaintenanceStats,
+) -> [u64; 12] {
+  let f = |m: crate::core::MaintenanceStats| {
+    [
+      m.purge_batches,
+      m.purged_runs,
+      m.failed_runs,
+      m.purged_pages,
+      m.segments_inspected,
+      m.trimmed_shards,
+      m.busy_shards,
+      m.trim_pages_inspected,
+      m.released_pages,
+      m.returned_segments,
+      m.skipped_passes,
+      m.hard_limit_passes,
+    ]
+  };
+  let (b, a) = (f(before), f(after));
+  core::array::from_fn(|i| a[i] - b[i])
+}
+
+const BATCHES: usize = 0;
+const RUNS: usize = 1;
+const FAILED: usize = 2;
+const PURGED_PAGES: usize = 3;
+const SEGS_INSPECTED: usize = 4;
+const TRIMMED: usize = 5;
+const BUSY: usize = 6;
+const RELEASED: usize = 8;
+const SKIPPED: usize = 10;
+const HARD_LIMIT: usize = 11;
+
+/// Four runs of 8 pages freed in one segment of shard 3: 32 dirty pages in
+/// one contiguous run (placement is not randomized).
+fn one_dirty_run(h: &Heap<MockOs>) {
+  let runs: Vec<_> = (0..4).map(|_| alloc(h, 3, 8 * PAGE_SIZE, 8)).collect();
+  for o in runs {
+    free(h, o);
+  }
+  assert_eq!(h.dirty_pages(), 32);
+}
+
+#[test]
+fn purge_work_is_counted() {
+  let h = heap();
+  one_dirty_run(h);
+  let u = h.usage();
+  assert_eq!(
+    (
+      u.owned_segments,
+      u.pages_in_use,
+      u.dirty_pages,
+      u.clean_pages
+    ),
+    (1, 0, 32, 31)
+  );
+  let before = h.maintenance_stats();
+  h.purge();
+  let w = work_since(before, h.maintenance_stats());
+  // One segment inspected, one run claimed and purged in one batch: the
+  // operation counts of a force pass over this heap, not a timing.
+  assert_eq!(w[SEGS_INSPECTED], 1);
+  assert_eq!(
+    (w[BATCHES], w[RUNS], w[FAILED], w[PURGED_PAGES]),
+    (1, 1, 0, 32)
+  );
+  assert_eq!((w[TRIMMED], w[BUSY]), (crate::core::SHARDS as u64, 0));
+  let u = h.usage();
+  assert_eq!((u.dirty_pages, u.clean_pages), (0, 63));
+}
+
+#[test]
+fn failed_purges_are_counted_and_stay_dirty() {
+  let h = heap();
+  one_dirty_run(h);
+  h.os().purge_fails.store(true, Ordering::Relaxed);
+  for _ in 0..3 {
+    let before = h.maintenance_stats();
+    h.purge();
+    let w = work_since(before, h.maintenance_stats());
+    // Each pass tries the run once, however often it failed before: the
+    // attempts of a pass are bounded by what is dirty, not by success.
+    assert_eq!((w[RUNS], w[FAILED], w[PURGED_PAGES]), (1, 1, 0));
+    assert_eq!(h.dirty_pages(), 32);
+  }
+  h.os().purge_fails.store(false, Ordering::Relaxed);
+  let before = h.maintenance_stats();
+  h.purge();
+  let w = work_since(before, h.maintenance_stats());
+  assert_eq!((w[RUNS], w[FAILED], w[PURGED_PAGES]), (1, 0, 32));
+  assert_eq!(h.dirty_pages(), 0);
+}
+
+#[test]
+fn busy_shards_are_skipped_and_counted() {
+  let h = heap();
+  let before = h.maintenance_stats();
+  h.with_shard_held(5, || h.purge());
+  let w = work_since(before, h.maintenance_stats());
+  assert_eq!((w[TRIMMED], w[BUSY]), (crate::core::SHARDS as u64 - 1, 1));
+}
+
+#[test]
+fn contended_inline_passes_are_counted_as_skipped() {
+  let h = heap();
+  let runs = dirty_runs(h, DIRTY_BUDGET_PAGES as usize + 2 * RUN);
+  let before = h.maintenance_stats();
+  h.with_purge_lock_held(|| {
+    for o in runs {
+      free(h, o);
+    }
+  });
+  let w = work_since(before, h.maintenance_stats());
+  // The two frees past the budget found the purge lock taken.
+  assert_eq!(w[SKIPPED], 2);
+  assert_eq!(
+    h.maintenance_stats().inline_budget_passes,
+    before.inline_budget_passes
+  );
+  assert_eq!(h.dirty_pages(), DIRTY_BUDGET_PAGES as usize + 2 * RUN);
+}
+
+#[test]
+fn hard_limit_interventions_are_counted() {
+  let h = heap();
+  h.attach_maintenance();
+  let runs = dirty_runs(h, DIRTY_HARD_LIMIT_PAGES as usize + RUN);
+  let before = h.maintenance_stats();
+  for o in runs {
+    free(h, o);
+  }
+  let after = h.maintenance_stats();
+  let w = work_since(before, after);
+  assert_eq!(w[HARD_LIMIT], 1);
+  assert_eq!(after.inline_budget_passes - before.inline_budget_passes, 1);
+}
+
+#[test]
+fn trimming_counts_released_pages_and_forgotten_cursors() {
+  let h = heap();
+  let size = 1000;
+  let n = 2 * PAGE_SIZE / size;
+  let offs: Vec<_> = (0..n).map(|_| alloc(h, 0, size, 8)).collect();
+  let pages = h.usage().small_pages;
+  assert!(pages >= 2);
+  for o in offs {
+    free(h, o);
+  }
+  let (before, search) = (h.maintenance_stats(), h.search_stats());
+  h.purge();
+  let w = work_since(before, h.maintenance_stats());
+  assert_eq!(w[RELEASED], pages as u64);
+  assert_eq!(
+    h.search_stats().cursor_invalidations - search.cursor_invalidations,
+    1
+  );
+  assert_eq!(h.usage().small_pages, 0);
+}
+
+#[test]
+fn a_full_word_is_flushed_in_one_update() {
+  let h = heap();
+  let tc = cache(h);
+  // One claimed word of the 16-byte class holds 64 blocks.
+  let offs: Vec<_> = (0..64).map(|_| alloc_c(h, &tc, 16, 8)).collect();
+  assert_eq!(h.cache_stats(&tc).claimed_blocks, 0);
+  for o in offs {
+    free_c(h, &tc, o);
+  }
+  let s = h.cache_stats(&tc);
+  assert_eq!((s.buffered_blocks, s.buffered_words, s.flushes), (64, 1, 0));
+  h.flush(&tc);
+  let s = h.cache_stats(&tc);
+  assert_eq!((s.buffered_blocks, s.flushes, s.flushed_blocks), (0, 1, 64));
+  assert_eq!(s.flush_sizes, [0, 0, 0, 0, 0, 0, 1]);
+  assert_eq!((s.evictions, s.refill_flushes), (0, 0));
+}
+
+#[test]
+fn slot_collisions_are_counted_as_evictions() {
+  let h = heap();
+  let tc = cache(h);
+  let c = crate::core::class::class_of(16);
+  // 70 words of the class, in two pages: some pair of words shares a slot
+  // of the direct-mapped free buffer.
+  let offs: Vec<_> = (0..64 * 70).map(|_| alloc_c(h, &tc, 16, 8)).collect();
+  let word = |o: usize| o / (64 * 16);
+  let mut first = std::collections::BTreeMap::new();
+  let (a, b) = offs
+    .chunks(64)
+    .find_map(|w| {
+      let slot = Heap::<MockOs>::free_slot_of(w[0], c);
+      match first.insert(slot, w) {
+        Some(prev) if word(prev[0]) != word(w[0]) => Some((prev, w)),
+        _ => None,
+      }
+    })
+    .expect("70 words in 64 slots collide");
+  // Interleaved frees of the two words: every free after the first evicts
+  // the other word's one-block batch.
+  for o in [a[0], b[0], a[1], b[1]] {
+    free_c(h, &tc, o);
+  }
+  let s = h.cache_stats(&tc);
+  assert_eq!((s.evictions, s.flushes, s.flushed_blocks), (3, 3, 3));
+  assert_eq!(s.flush_sizes[0], 3);
+  assert_eq!((s.buffered_blocks, s.buffered_words), (1, 1));
+  // Grouped by word, the same frees evict once, with a batch of two.
+  for o in [a[2], a[3], b[2], b[3]] {
+    free_c(h, &tc, o);
+  }
+  let t = h.cache_stats(&tc);
+  // The slot held b[1]: a[2] evicts it, and b[2] evicts a[2..=3].
+  assert_eq!(t.evictions - s.evictions, 2);
+  assert_eq!(t.flush_sizes[1] - s.flush_sizes[1], 1);
+  let freed = [a[0], a[1], a[2], a[3], b[0], b[1], b[2], b[3]];
+  for &o in offs.iter().filter(|o| !freed.contains(o)) {
+    free_c(h, &tc, o);
+  }
+  h.retire(&tc);
+}
+
+#[test]
+fn refills_count_their_search() {
+  let h = heap();
+  let tc = cache(h);
+  let before = h.search_stats();
+  let first = alloc_c(h, &tc, 16, 8);
+  let s = h.search_stats();
+  // A fresh heap: the refill searches the (empty) segment list for a page of
+  // the class, sets up a new page, and takes a new segment for it.
+  assert_eq!(
+    (
+      s.refills - before.refills,
+      s.cursor_claims - before.cursor_claims,
+      s.page_searches - before.page_searches,
+      s.page_search_segments - before.page_search_segments,
+      s.new_pages - before.new_pages,
+      s.run_searches - before.run_searches,
+      s.new_segments - before.new_segments,
+    ),
+    (1, 0, 1, 0, 1, 1, 1)
+  );
+  // The next 64 allocations empty the claimed word and claim the next word
+  // of the same page through the cursor, without a search.
+  let rest: Vec<_> = (0..64).map(|_| alloc_c(h, &tc, 16, 8)).collect();
+  let t = h.search_stats();
+  assert_eq!(
+    (t.refills - s.refills, t.cursor_claims - s.cursor_claims),
+    (1, 1)
+  );
+  assert_eq!(
+    (t.page_searches, t.new_pages),
+    (s.page_searches, s.new_pages)
+  );
+  for o in rest.into_iter().chain([first]) {
+    free_c(h, &tc, o);
+  }
+  h.retire(&tc);
+}
+
+#[test]
+fn usage_tells_memory_apart() {
+  let h = heap();
+  let small = alloc(h, 0, 16, 8);
+  let run = alloc(h, 0, 8 * PAGE_SIZE, 8);
+  let huge = alloc(h, 0, 20 << 20, 8);
+  let u = h.usage();
+  let cap = crate::core::class::capacity(crate::core::class::class_of(16));
+  assert_eq!((u.owned_segments, u.huge_segments), (1, 5));
+  assert_eq!((u.pages_in_use, u.small_pages), (9, 1));
+  assert_eq!(
+    (u.small_bytes_out, u.small_bytes_free),
+    (16, (cap - 1) * 16)
+  );
+  assert_eq!((u.dirty_pages, u.clean_pages), (0, 54));
+  free(h, run);
+  free(h, huge);
+  let u = h.usage();
+  assert_eq!(
+    (
+      u.huge_segments,
+      u.pages_in_use,
+      u.dirty_pages,
+      u.clean_pages
+    ),
+    (0, 1, 8, 54)
+  );
+  assert_eq!(u.dirty_pages, h.dirty_pages());
+  h.purge();
+  let u = h.usage();
+  assert_eq!((u.pages_in_use, u.dirty_pages, u.clean_pages), (1, 0, 62));
+  free(h, small);
+  h.purge();
+  let u = h.usage();
+  assert_eq!(
+    (u.pages_in_use, u.small_pages, u.small_bytes_out),
+    (0, 0, 0)
+  );
+  assert_eq!(u.dirty_pages, h.dirty_pages());
+}

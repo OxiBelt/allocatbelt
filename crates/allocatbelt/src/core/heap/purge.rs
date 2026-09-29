@@ -14,7 +14,10 @@
 //!   pass that starts epoch `e + 5`, one to one and a quarter delays later
 //!   when passes are regular, later when they are not;
 //! * a **budget** pass runs when more than [`DIRTY_BUDGET_PAGES`] pages are
-//!   dirty and purges all of them at once, bounding RSS under churn;
+//!   dirty and purges all of them at once, bounding the tracked dirty pages
+//!   under churn (not the process's RSS: live blocks, blocks held in thread
+//!   caches, metadata and pages the OS has not reclaimed yet are outside
+//!   it);
 //! * an explicit [`Heap::purge`] returns everything it can right away.
 //!
 //! Every pass also releases small pages whose blocks are all free, turning
@@ -32,6 +35,7 @@
 //! batch takes. A run the purger reports as failed stays dirty and is not
 //! reported as zero.
 
+use super::maint::PassWork;
 use super::*;
 
 /// Decay passes per purge delay.
@@ -80,6 +84,8 @@ struct Batch {
   /// Per segment in the batch: its index and the pages claimed in it.
   segs: [(usize, u64); PURGE_BATCH],
   nsegs: usize,
+  /// The work of the pass so far.
+  work: PassWork,
 }
 
 /// What a pass returns.
@@ -173,6 +179,8 @@ impl<O: Os> Heap<O> {
       self.last_decay_ms.store(now, Relaxed);
       self.pass(Pass::Decay, &mut SyncPurger(&self.os));
       self.count(maint::Stat::InlineDecay);
+    } else {
+      self.count(maint::Stat::SkippedPass);
     }
   }
 
@@ -185,22 +193,29 @@ impl<O: Os> Heap<O> {
       self.epoch.load(Relaxed)
     };
     let age = self.decay_age();
-    self.trim_shards(epoch, age, kind == Pass::Force);
-    // Pages dirty since epoch `cutoff` or earlier are purged.
-    let cutoff = match kind {
-      Pass::Decay => epoch.checked_sub(age),
-      Pass::Budget | Pass::Force => Some(u64::MAX),
-    };
-    let Some(cutoff) = cutoff else {
-      return;
-    };
     let mut batch = Batch {
       ranges: [(0, 0); PURGE_BATCH],
       purged: [false; PURGE_BATCH],
       len: 0,
       segs: [(0, 0); PURGE_BATCH],
       nsegs: 0,
+      work: PassWork::default(),
     };
+    self.trim_shards(epoch, age, kind == Pass::Force, &mut batch.work);
+    // Pages dirty since epoch `cutoff` or earlier are purged.
+    let cutoff = match kind {
+      Pass::Decay => epoch.checked_sub(age),
+      Pass::Budget | Pass::Force => Some(u64::MAX),
+    };
+    if let Some(cutoff) = cutoff {
+      self.purge_segments(cutoff, &mut batch, purger);
+    }
+    self.count_work(&batch.work);
+  }
+
+  /// Claims and purges the pages of every owned segment dirty since epoch
+  /// `cutoff` or earlier. Caller holds `purge_lock`.
+  fn purge_segments<P: Purger>(&self, cutoff: u64, batch: &mut Batch, purger: &mut P) {
     // Only decay passes compare ages.
     let kernel = if cutoff == u64::MAX {
       None
@@ -216,27 +231,30 @@ impl<O: Os> Heap<O> {
         if let Some(m) = self.os.meta(seg)
           && m[SEG_HDR].load(Acquire) & 0xFF == SEG_OWNED
         {
-          self.claim_segment(seg, m, cutoff, kernel, &mut batch, purger);
+          batch.work.segments_inspected += 1;
+          self.claim_segment(seg, m, cutoff, kernel, batch, purger);
           if batch.len >= batch_size {
-            self.purge_claimed(&mut batch, purger);
+            self.purge_claimed(batch, purger);
           }
         }
       }
     }
-    self.purge_claimed(&mut batch, purger);
+    self.purge_claimed(batch, purger);
   }
 
   /// Releases the fully free small pages of each idle shard, then unlinks
   /// and frees its empty segments, except the first, once they have been
   /// empty for `age` epochs (or right away if `force`). Caller holds
   /// `purge_lock`, so no purge pass races the claim.
-  fn trim_shards(&self, epoch: u64, age: u64, force: bool) {
+  fn trim_shards(&self, epoch: u64, age: u64, force: bool, work: &mut PassWork) {
     for sh in &self.shards {
       let Some(_g) = sh.lock.try_lock(&self.os) else {
+        work.busy_shards += 1;
         continue;
       };
+      work.trimmed_shards += 1;
       for c in 0..NUM_CLASSES {
-        self.release_empty_pages(sh, c);
+        self.release_empty_pages(sh, c, work);
       }
       let mut kept_empty = false;
       let mut prev: Option<&[AtomicU64]> = None;
@@ -270,6 +288,7 @@ impl<O: Os> Heap<O> {
             Some(p) => p[SEG_NEXT].store(next, Relaxed),
           }
           self.free_owned_segment(seg, m);
+          work.returned_segments += 1;
         } else {
           kept_empty |= empty;
           prev = Some(m);
@@ -394,8 +413,9 @@ impl<O: Os> Heap<O> {
     let (ranges, purged) = (&batch.ranges[..batch.len], &mut batch.purged[..batch.len]);
     purged.fill(false);
     purger.purge_batch(ranges, purged);
-    self.count(maint::Stat::Batch);
-    self.count_n(maint::Stat::Run, batch.len as u64);
+    batch.work.batches += 1;
+    batch.work.runs += batch.len as u64;
+    batch.work.failed_runs += purged.iter().filter(|&&p| !p).count() as u64;
     // Ranges are in segment order, so each segment's are contiguous.
     let mut r = 0;
     for &(seg, claimed) in &batch.segs[..batch.nsegs] {
@@ -413,6 +433,7 @@ impl<O: Os> Heap<O> {
       self
         .dirty_pages
         .fetch_sub(cleared.count_ones() as isize, Relaxed);
+      batch.work.purged_pages += u64::from(cleared.count_ones());
     }
     batch.len = 0;
     batch.nsegs = 0;
@@ -420,10 +441,12 @@ impl<O: Os> Heap<O> {
 
   /// Releases every page of class `c` whose blocks are all free. Caller
   /// holds the shard lock.
-  fn release_empty_pages(&self, sh: &Shard, c: usize) {
+  fn release_empty_pages(&self, sh: &Shard, c: usize, work: &mut PassWork) {
     // The cursor is only a scan position; dropping it makes the next
     // claim start from the availability words.
-    sh.classes[c].cursor.store(0, Relaxed);
+    if sh.classes[c].cursor.swap(0, Relaxed) != 0 {
+      sh.bump(SearchStat::CursorInvalidation, 1);
+    }
     let cap = class::capacity(c) as i64;
     let mut cur = sh.segs.load(Relaxed);
     while cur != 0 {
@@ -436,8 +459,10 @@ impl<O: Os> Heap<O> {
         // Frees set bits before bumping the counter, and our own
         // claims are subtracted under this lock, so the counter never
         // overstates the free blocks here.
+        work.trim_pages_inspected += 1;
         if PageMeta::new(m, i).free().load(Acquire) as i64 >= cap {
           self.release_small_page(seg * PAGES_PER_SEGMENT + i, m, c);
+          work.released_pages += 1;
         }
       }
       cur = m[SEG_NEXT].load(Relaxed) as u32;

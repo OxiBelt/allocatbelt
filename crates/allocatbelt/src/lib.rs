@@ -83,7 +83,7 @@ mod sys;
 
 pub use crate::arch::{CpuFeatures, KernelSet};
 pub use crate::capabilities::CompiledCapabilities;
-pub use crate::core::MaintenanceStats;
+pub use crate::core::{CacheStats, HeapUsage, MaintenanceStats, SearchStats};
 pub use crate::global::Allocatbelt;
 pub use crate::policy::{Capability, FeaturePolicy, Policy, PolicyError};
 pub use crate::report::{

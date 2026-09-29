@@ -484,6 +484,7 @@ pub fn run(data: &[u8]) {
         p.fail_every = usize::from(byte() % 4);
         let _ = h.maintain_with(&mut p);
         assert_eq!(h.dirty_pages(), h.dirty_pages_recounted());
+        check_observations(&h, &caches);
       }
       _ => {}
     }
@@ -503,4 +504,52 @@ pub fn run(data: &[u8]) {
   }
   // One (purged) segment per shard at most stays behind.
   assert!(h.segments_in_use() <= crate::core::SHARDS);
+  check_observations(&h, &caches);
+  // Nothing is allocated or cached, and the forced purge released every
+  // small page.
+  let u = h.usage();
+  assert_eq!(
+    (u.pages_in_use, u.small_pages, u.small_bytes_out),
+    (0, 0, 0),
+    "{u:?}"
+  );
+}
+
+/// Checks the heap's observations (Stage A diagnostics) against each other
+/// and against the shadow maps, while no operation is running.
+pub fn check_observations(h: &Heap<MockOs>, caches: &[ThreadCache]) {
+  let m = h.maintenance_stats();
+  assert!(m.failed_runs <= m.purged_runs, "{m:?}");
+  // Every page reported purged was handed to `purge` (or later
+  // decommitted with its segment, which `purged` counts too).
+  assert!(m.purged_pages as usize * PAGE_SIZE <= h.os().purged.load(Ordering::Relaxed));
+  assert!(m.hard_limit_passes <= m.inline_budget_passes, "{m:?}");
+  assert!(m.released_pages <= m.trim_pages_inspected, "{m:?}");
+  let s = h.search_stats();
+  assert!(s.stale_hints <= s.candidates, "{s:?}");
+  assert!(s.cursor_claims <= s.refills, "{s:?}");
+  assert!(s.new_segments <= s.run_searches, "{s:?}");
+  let u = h.usage();
+  assert_eq!(u.dirty_pages, h.dirty_pages(), "{u:?}");
+  assert_eq!(
+    u.owned_segments + u.huge_segments,
+    h.segments_in_use(),
+    "{u:?}"
+  );
+  assert_eq!(
+    u.pages_in_use + u.dirty_pages + u.clean_pages,
+    u.owned_segments * (crate::core::PAGES_PER_SEGMENT - 1),
+    "{u:?}"
+  );
+  for tc in caches {
+    let c = h.cache_stats(tc);
+    assert_eq!(c.flushes, c.flush_sizes.iter().sum::<u64>());
+    // A flush carries 1 to 64 blocks.
+    assert!(
+      c.flushes <= c.flushed_blocks && c.flushed_blocks <= 64 * c.flushes,
+      "{c:?}"
+    );
+    assert!(c.buffered_words <= c.buffered_blocks, "{c:?}");
+    assert!(c.evictions <= c.flushes, "{c:?}");
+  }
 }

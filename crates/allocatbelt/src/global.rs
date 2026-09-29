@@ -12,10 +12,10 @@ use std::sync::atomic::{AtomicU32, AtomicU64};
 use std::time::{Duration, Instant};
 
 use crate::arch::{CpuFeatures, KernelSet};
-use crate::core::MaintenanceStats;
 use crate::core::{
   ARENA_SIZE, Block, Heap, MAX_SEGMENTS, META_WORDS, Os, PAGE_SIZE, SEGMENT_SIZE, ThreadCache,
 };
+use crate::core::{CacheStats, HeapUsage, MaintenanceStats, SearchStats};
 use crate::sys::{Capabilities, MetaArena, Region};
 
 pub(crate) struct Arena {
@@ -288,7 +288,9 @@ impl Allocatbelt {
 
   /// Returns all freed-but-unpurged memory to the OS. Purging also happens
   /// automatically once the dirty budget is exceeded; call this from a
-  /// maintenance task to shrink RSS promptly after load drops.
+  /// maintenance task to return freed memory promptly after load drops.
+  /// This lowers RSS only by the pages that were resident: live blocks,
+  /// other threads' caches and metadata stay, and the OS decides the rest.
   ///
   /// Blocks cached by the calling thread are returned first; other
   /// threads' caches (a few words per size class each) are not touched.
@@ -358,10 +360,42 @@ impl Allocatbelt {
   }
 
   /// Counters of the housekeeping passes: how many each kind ran on the
-  /// maintenance thread and inline, for diagnostics.
+  /// maintenance thread and inline, and the work they did (pages
+  /// inspected, runs purged or refused, pages returned), for diagnostics.
   #[must_use]
   pub fn maintenance_stats(self) -> MaintenanceStats {
     HEAP.maintenance_stats()
+  }
+
+  /// How the heap found memory for small-block refills and page runs
+  /// (searches, segments visited, stale hints, growth), summed over its
+  /// shards, for diagnostics. Allocation-free.
+  #[must_use]
+  pub fn search_stats(self) -> SearchStats {
+    HEAP.search_stats()
+  }
+
+  /// What the memory taken from the arena is used for: handed out, free in
+  /// the shared bitmaps, dirty (awaiting a purge) or clean, for
+  /// diagnostics. A walk over the segments in use, allocation-free; not the
+  /// process's RSS (see [`HeapUsage`]). Does not initialise the allocator.
+  #[must_use]
+  pub fn heap_usage(self) -> HeapUsage {
+    if ARENA.get().is_some_and(Option::is_some) {
+      guarded(|| HEAP.usage())
+    } else {
+      HeapUsage::default()
+    }
+  }
+
+  /// What the calling thread's cache holds and how it flushed its buffered
+  /// frees, for diagnostics. After thread exit retired the cache it reports
+  /// `attached: false` and holds nothing; `None` only if the thread-local
+  /// cannot be reached. Other threads' caches can only be read by their
+  /// own threads. Allocation-free.
+  #[must_use]
+  pub fn thread_cache_stats(self) -> Option<CacheStats> {
+    CACHE.try_with(|tc| HEAP.cache_stats(tc)).ok()
   }
 }
 
