@@ -291,11 +291,13 @@ impl<O: Os> Heap<O> {
     batch.work.batches += 1;
     batch.work.runs += batch.len as u64;
     batch.work.failed_runs += purged.iter().filter(|&&p| !p).count() as u64;
-    // Ranges are in segment order, so each segment's are contiguous.
+    // Each segment's ranges are contiguous and in the order of `segs`,
+    // which is not ascending: a resumed sweep walks the segments from
+    // where it stopped and wraps around.
     let mut r = 0;
     for &(seg, claimed) in &batch.segs[..batch.nsegs] {
       let mut done = 0;
-      while r < batch.len && batch.ranges[r].0 >> PAGE_SHIFT < (seg + 1) * PAGES_PER_SEGMENT {
+      while r < batch.len && (batch.ranges[r].0 >> PAGE_SHIFT) / PAGES_PER_SEGMENT == seg {
         let (offset, len) = batch.ranges[r];
         if batch.purged[r] {
           let start = ((offset >> PAGE_SHIFT) % PAGES_PER_SEGMENT) as u32;

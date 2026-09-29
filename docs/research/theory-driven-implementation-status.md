@@ -111,6 +111,7 @@ No protocol in `proto.rs` changed and no atomic ordering was weakened, so no new
 - `cycles_continue_below_the_trigger_until_the_low_target`: incomplete cycles below the trigger and above the target.
 - `slices_bound_attempted_work_when_every_purge_fails` and `stalled_cycles_leave_frees_alone_until_the_emergency_threshold`: attempted-work bounds with all purges failing, and deferral.
 - `partial_batch_success_finishes_every_claim`.
+- `wrapped_batches_credit_each_segment_its_own_runs`: a batch whose segments wrap round the arena (a sweep resumed after a budget cycle stopped at the low target) credits each segment with its own runs' results.
 - `busy_shards_do_not_hold_up_later_ones`: busy-shard fairness.
 - `resumed_sweeps_survive_segment_reuse`: huge blocks, new segments and frees between slices.
 - `many_slices_do_not_age_pages_faster`: delay and epoch semantics across many slices.
@@ -133,16 +134,20 @@ Loom: `proto::loom_tests::deferred_budget_does_not_hide_a_force_request` covers 
 |---|---|
 | `cargo fmt --all --check` | pass |
 | `cargo clippy --all-targets --all-features --locked -- -D warnings` | pass |
-| `cargo test --release --all-features --locked` | pass (core suite: 93 tests) |
+| `cargo test --release --all-features --locked` | pass (core suite: 94 tests with the regression test) |
 | `scripts/check-features.sh` | pass |
 | `scripts/check-rseq.sh` | pass (seccomp and tunable cases skipped on this host, as before) |
 | `scripts/check-package.sh` | pass |
 | Loom (`RUSTFLAGS="-C target-cpu=x86-64-v3 --cfg loom" cargo test --release --locked -p allocatbelt-core-check --lib loom`) | pass (14 models, one new) |
-| Miri on the 16 Stage B tests (`cargo +nightly-2026-09-27 miri test -p allocatbelt-core-check --lib -- <names>`) | run locally; not part of CI, see below |
+| Miri on the 16 Stage B tests first committed (`cargo +nightly-2026-09-27 miri test -p allocatbelt-core-check --lib -- <names>`) | partial, see below; not part of CI |
 | `scripts/check-sandbox.sh` | not run locally (no Docker daemon on this host); by CI |
 | aarch64, riscv64 (qemu), experimental ISA, platform gates, audit, deny, fuzz | by CI on the pushed commit |
-| Mutation campaign | not run: `bits.rs` and `class.rs` are unchanged |
+| Mutation campaign (`scripts/run-mutation-testing.sh`) | pass locally (77 caught, 5 listed as equivalent); failed once in CI, see below |
 | Benchmarks | not run. Performance not measured; benchmark gate intentionally disabled. |
+
+Miri: within the local 40-minute limit, 11 of the 16 tests passed under Miri (`adaptive_retention_follows_reuse_and_idleness` through `reclaim_targets_are_validated`, in name order) and none failed. `resumed_sweeps_survive_segment_reuse`, `slices_bound_attempted_work_when_every_purge_fails`, `stalled_cycles_leave_frees_alone_until_the_emergency_threshold`, `target_changes_apply_to_the_cycle_in_progress` and `without_a_worker_page_run_frees_resume_the_cycle` are **not run** under Miri, nor is the later regression test: outstanding verification, not a pass.
+
+**Defect found by CI after the first push (fixed in the follow-up commit).** The CI mutation job failed on a stale equivalent-mutant entry: a surviving mutant of `bits.rs` had been "caught" by an unrelated failure of `fuzz_programs`. Repeating that property test locally reproduced a real defect in a few runs out of a hundred: `purge_claimed` matched each claimed segment with its runs by assuming the batch was in ascending segment order, and a sweep that resumes mid-arena and wraps round can put a higher segment ahead of a lower one in the same batch. The higher segment was then credited with the lower one's successful runs, so its failed pages were marked clean (a block later claimed to be zero on a written page), and the lower segment's purged pages stayed dirty. The match is now by segment index, `wrapped_batches_credit_each_segment_its_own_runs` covers it, and 200 further runs of `fuzz_programs` passed.
 
 ### Known limitations
 

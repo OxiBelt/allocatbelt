@@ -1898,6 +1898,47 @@ fn partial_batch_success_finishes_every_claim() {
 }
 
 #[test]
+fn wrapped_batches_credit_each_segment_its_own_runs() {
+  let h = heap();
+  h.attach_maintenance();
+  h.set_reclaim_targets(ReclaimTargets::new(8, 40, 1024).unwrap());
+  // Segment x holds runs 0..7, segment y runs 7 and 8 (see `nine_runs`);
+  // the last run of each stays live so that trimming returns neither.
+  let runs = nine_runs(h);
+  let (x, y) = (runs[0] / SEGMENT_SIZE, runs[7] / SEGMENT_SIZE);
+  assert!(x < y && runs[6] / SEGMENT_SIZE == x && runs[8] / SEGMENT_SIZE == y);
+  for &o in runs[..6].iter().chain(&runs[7..8]) {
+    free(h, o);
+  }
+  assert_eq!(h.dirty_pages(), 56);
+  // A budget cycle claims x, reaches the low target on paper and stops:
+  // the next sweep starts after x. Every purge fails, so nothing changes.
+  let mut p = MockPurger::new(h.os(), PURGE_BATCH);
+  p.fail_every = 1;
+  assert_eq!(h.maintain_with(&mut p), Some(Task::Budget));
+  assert_eq!(h.dirty_pages(), 56);
+  // A force sweep from there visits y, wraps round the arena and ends with
+  // x, all in one batch: y's run fails, x's succeeds.
+  h.request_purge();
+  let mut p = MockPurger::new(h.os(), PURGE_BATCH);
+  p.fail_every = 2;
+  p.runs = 1;
+  while h.next_task(0) == Some(Task::Force) {
+    let _ = h.maintain_with(&mut p);
+  }
+  assert_eq!(p.batches, 1);
+  // y's 8 pages stay dirty and x's are clean, not the other way round.
+  assert_eq!(h.dirty_pages(), 8);
+  assert_eq!(h.dirty_pages(), h.dirty_pages_recounted());
+  // Handing y's pages out again does not claim they are zero.
+  free(h, runs[6]);
+  free(h, runs[8]);
+  h.detach_maintenance();
+  let again = alloc(h, 3, 8 * PAGE_SIZE, 8);
+  free(h, again);
+}
+
+#[test]
 fn busy_shards_do_not_hold_up_later_ones() {
   let h = heap();
   h.set_slice_work(4);
