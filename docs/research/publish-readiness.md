@@ -66,6 +66,8 @@ Added by Stage C ([thread-caches.md](../thread-caches.md)): `Allocatbelt::flush_
 
 Added by Stage D ([reclamation.md](../reclamation.md)): the `MaintenanceStats` fields `stale_empty_candidates` and `reconciled_pages`; `SearchStats::cursor_invalidations` now counts only cursors of pages trimming released.
 
+Added by Stage E ([region.md](../region.md)): the opt-in `Region` API, with `RegionOptions` (private fields, `const` builder), `RegionError` and `RegionStats` (both `#[non_exhaustive]`); the package now includes `examples/`, and its `description` names the region boundary as a fourth place for `unsafe`. `Region` takes only `Copy` values; destructor support could be added later as a separate method without breaking these.
+
 Changed in this review, so that later additions are not breaking:
 
 - `#[non_exhaustive]` on `MaintenanceStats`, `PurgeBackend`, `Capabilities`, `RingError`, `RseqStatus` and `RseqUnavailable`: types whose fields or variants are expected to grow (new counters, backends, probe results, rseq failure causes). The other report and policy types already were. Users read these types; they cannot build them with a literal or match them exhaustively any more, which nothing in this repository did.

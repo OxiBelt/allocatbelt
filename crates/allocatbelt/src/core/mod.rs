@@ -43,6 +43,7 @@ mod lock;
 pub mod model;
 #[cfg_attr(loom, allow(dead_code))]
 mod proto;
+pub mod region;
 mod sync;
 
 #[cfg(not(loom))]

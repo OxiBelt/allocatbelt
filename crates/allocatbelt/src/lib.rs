@@ -27,6 +27,12 @@
 //! - `global`: the `GlobalAlloc` adapter that joins them, and
 //!   `maintenance`, its background thread.
 //!
+//! Apart from the global allocator, [`Region`] is an opt-in API for values
+//! that die together (a request's or task's temporary data): it bump
+//! allocates `Copy` values, slices and strings in chunks of the same heap
+//! and frees them all at a reset. Nothing is placed in a region unless the
+//! application asks for it (`docs/region.md` in the repository).
+//!
 //! # Cargo features
 //!
 //! Features decide which optional parts are compiled in; what a process
@@ -76,6 +82,7 @@ mod global;
 #[cfg(feature = "maintenance")]
 mod maintenance;
 mod policy;
+mod region;
 mod report;
 #[cfg(feature = "experimental-rseq")]
 mod rseq;
@@ -89,6 +96,7 @@ pub use crate::core::{
 };
 pub use crate::global::Allocatbelt;
 pub use crate::policy::{Capability, FeaturePolicy, Policy, PolicyError};
+pub use crate::region::{Region, RegionError, RegionOptions, RegionStats};
 pub use crate::report::{
   Availability, DetectedCapabilities, EffectiveProfile, PurgeBackend, Report,
 };

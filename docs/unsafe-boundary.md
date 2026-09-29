@@ -1,6 +1,6 @@
 # unsafe boundary inventory
 
-`allocatbelt` is one package with four modules. `core` (`crates/allocatbelt/src/core/`) carries `#![forbid(unsafe_code)]` as an inner attribute, so it contains **0** `unsafe` sites, and the `publish = false` package `allocatbelt-core-check` compiles the same source as a `#![no_std]`, `#![forbid(unsafe_code)]` crate of its own, which runs the core's tests, the checking model and loom. All the `unsafe` is in `sys`, `arch` and `global` (with `rseq`), listed below. Every `unsafe` block holds exactly one unsafe operation and carries a `// SAFETY:` comment (`clippy::undocumented_unsafe_blocks` and `multiple_unsafe_ops_per_block` are deny).
+`allocatbelt` is one package with four modules. `core` (`crates/allocatbelt/src/core/`) carries `#![forbid(unsafe_code)]` as an inner attribute, so it contains **0** `unsafe` sites, and the `publish = false` package `allocatbelt-core-check` compiles the same source as a `#![no_std]`, `#![forbid(unsafe_code)]` crate of its own, which runs the core's tests, the checking model and loom. All the `unsafe` is in `sys`, `arch`, `global` (with `rseq`) and the opt-in `region` API, listed below. Every `unsafe` block holds exactly one unsafe operation and carries a `// SAFETY:` comment (`clippy::undocumented_unsafe_blocks` and `multiple_unsafe_ops_per_block` are deny).
 
 Regenerate: `grep -rn "unsafe" crates/allocatbelt/src bench/simd/src | grep -E "unsafe (\{|fn|impl|extern)"`
 
@@ -84,6 +84,21 @@ CPU feature detection, and the experimental SVE/SVE2 and RVV kernels (features `
 | `alloc_zeroed` | block | `write_bytes(0, size)` | A fresh block that nobody references yet. Skipped when the core reports the block as already zero (trust assumption 4). |
 | `RingPurger::purge_batch` (`maintenance.rs`, feature `io-uring`) | block | calls `PurgeRing::purge` | The core's `Purger` contract: every range was claimed by the purge pass, so it holds no live allocation and none of its pages is handed out until the call returns; the ring returns only after all completions (and the adapter aborts on `CompletionLost`). |
 | `realloc` | block | `copy_nonoverlapping` | The old block is live (caller contract); the new block is a separate fresh block. |
+
+## `region` (`crates/allocatbelt/src/region.rs`, theory-driven plan Stage E)
+
+The explicit-lifetime `Region` API. The arithmetic (alignment, fitting, chunk sizing, retention, the limit) is the safe core's `core/region.rs`, which returns `None` instead of wrapping; the adapter owns the chunks and builds pointers only for addresses that arithmetic placed inside a chunk it holds. Soundness of the handed-out references rests on the borrow checker: pieces borrow the region (`&self`), and `reset`, `release` and `Drop` need `&mut self` or ownership; the compile-fail doctests on `Region` check that a piece cannot outlive them, that non-`Copy` types are refused and that the region is not `Sync`. Chunk descriptors are in a `Vec`, never inside a chunk.
+
+| Location | Kind | Operation | Why it is sound |
+|---|---|---|---|
+| `ChunkSource::release` | **`unsafe fn`** (trait) | — | Contract: the pointer came from the same source's `allocate` for that layout and is not used afterwards. |
+| `HeapChunks::release` | **`unsafe fn`** + block | `Allocatbelt.dealloc(ptr, layout)` | Its contract is `GlobalAlloc::dealloc`'s: the chunk came from `Allocatbelt::allocate` for the same layout. The heap accepts frees from any thread. |
+| `RawRegion::give_back` | block | `source.release(chunk)` | Called only by `reset`, `release` and `Drop`, which hold the region mutably or by value, so no piece of the chunk is borrowed; the chunk is removed from the region in the same step, so it is released once. |
+| `Chunk` | `unsafe impl Send` | — | A chunk owns its allocation exclusively, like a `Box<[u8]>`, and holds no thread-local state. `Region` is therefore `Send`, and not `Sync` (its bump state is in `Cell`s). |
+| `RawRegion::alloc_copy` | block ×2 | `ptr.write(value)`; `&mut *ptr` | The piece is fresh (never handed out since the last reset), aligned for `T` and large enough (or a dangling aligned address for a zero-sized `T`), so the write initializes it and the reference is unique; it borrows the region, so it ends before the chunk can be reset or freed. `T: Copy`, so no destructor is skipped. |
+| `RawRegion::alloc_slice_fill` | block ×2 | `ptr.add(i).write(value)` per element; `slice::from_raw_parts_mut` | As `alloc_copy`, for `len` elements (the size was computed with `checked_mul`); every element is written before the slice is made. Zero-sized `T` writes nothing. |
+| `RawRegion::alloc_slice_copy` | block ×2 | `copy_nonoverlapping(src, piece, len)`; `slice::from_raw_parts_mut` | As above; the piece is fresh, so it does not overlap `src`. `alloc_zeroed_bytes` and `alloc_str` use these two and add no site (`alloc_str` checks the copy with the safe `str::from_utf8_mut`). |
+| `region/tests.rs` (test only) | `unsafe fn` + block ×3 | `System.alloc`, `System.dealloc`, one write to a piece | A test chunk source over the system allocator (so that Miri can run the region's tests) and a write inside a 24-byte piece. |
 
 ## allocatbelt-simd-bench (benchmark only)
 

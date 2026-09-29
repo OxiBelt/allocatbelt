@@ -10,11 +10,11 @@ Status record of `allocatbelt-theory-driven-performance-implementation.md` (the 
 | B / P1: bounded, resumable reclamation | **done** | Thresholds (low target, trigger, emergency) separate from the mechanism; every pass a sweep in bounded, resumable slices; stall deferral; opt-in adaptive retention | Not measured |
 | C / P1: collision-aware free batching, cooperative cache return | **done** | 2-way set-associative free buffer (32 x 2, per-set round robin); caller-local cache flush in the adapter; cooperative cache-return generation observed at sampled slow paths of allocation and free | Not measured |
 | D / P2: selective cursor invalidation, candidate indexes | **done** (D3 as a bounded design) | D1: class cursors survive trimming, dropped only when their page is released. D2: empty-page candidates published by the last free of a page, revalidated under the shard lock; bounded reconciliation by force sweeps and every 16th decay sweep. D3: class-to-segment index designed, not built ([class-segment-index.md](class-segment-index.md)) | Not measured |
-| E / P2: explicit-lifetime region API | not started | | |
+| E / P2: explicit-lifetime region API | **done** | Opt-in `Region`: bump allocation of initialized `Copy` values, slices and strings in heap chunks; borrow-checked reset, release and scope; bounded retention; limit; Miri in CI for its pointer code ([region.md](../region.md)) | Not measured |
 | F / P3: placement experiments (conditional) | not started, conditional | | |
 | G: integration, docs, optional benchmark tooling | not started | | |
 
-Stages A, B, C and D are implemented (D3 as a design, which the brief accepts as an intermediate delivery); E to G are not. Nothing here is a claim that the allocator got faster, and nothing is recommended for production.
+Stages A to E are implemented (D3 as a design, which the brief accepts as an intermediate delivery); F and G are not. Nothing here is a claim that the allocator got faster, and nothing is recommended for production.
 
 ## Stage A: define the mechanism before tuning it
 
@@ -280,3 +280,69 @@ Remaining costs, per the brief: page searches after a cursor runs dry still walk
 **CI after the push.** The aarch64 "Experimental rseq mm_cid" job failed once on `0a155dd`: one of the six `tests/rseq_process.rs` tests failed (5 passed, in 3 s, so not the 20 s child watchdog). `scripts/check-rseq.sh` hid which test and why (it keeps only summary lines), and this job had passed on every earlier commit of the branch, on the same kernel (7.0.0-1012-azure). Locally (x86_64) `tests/rseq_process.rs` passed 30 runs out of 30, and the x86_64 job passed on the same commit. The script now runs each configuration once with `--no-fail-fast`, keeps its output, and prints the failing tests' panics and failure lists, so a recurrence names its cause. Reviewing the Stage D orderings for a weakly ordered CPU found no candidate: the cursor is read and written only under the shard lock, `SEG_CLS` only changes under it, and the empty-page candidate is published with release and taken with acquire-release after the counter increment it follows.
 
 **Mutation job timeout (fixed).** On `0a155dd` and `6a99817` the "Core mutation testing" job hit its 120-minute limit (it took 5 to 7 minutes before Stage D). `concurrent_frees_and_trims_lose_no_candidate` stopped its trimming thread only after every worker joined, so a mutant that made a worker panic left the thread looping and the test running until mewt's 602-second timeout, once per such mutant. The test now stops the trimmer from a drop guard, as the older threaded tests do. Local campaign (`scripts/run-mutation-testing.sh`, mewt 4.0.0): 82 mutants, 77 caught, 5 listed as equivalent, no timeouts.
+
+## Stage E: explicit-lifetime region allocation
+
+**What changed.** A new, opt-in public API, [region.md](../region.md) for users. Nothing in the global allocator changed: no allocation is ever placed in a region implicitly, and ordinary allocations keep their lifetime, free semantics and hardening.
+
+| Requirement of the brief | How it is met |
+|---|---|
+| Explicitly opted into, backed by allocatbelt chunks | `Region` takes its chunks from the allocatbelt heap (`Allocatbelt::allocate`, `dealloc`), whatever the process's global allocator is; the global allocator never infers a region |
+| Byte/slice or initialized `Copy` API first | `alloc_copy`, `alloc_slice_fill`, `alloc_slice_copy`, `alloc_zeroed_bytes`, `alloc_str`; every piece is written before a reference to it exists; no raw-pointer or uninitialized API |
+| Safe scope/borrow boundary with many live allocations | borrowed-owner design: allocation takes `&self` and returns `&mut` pieces borrowing the region; `reset`, `release` and `scope` take `&mut self`, `Drop` ownership. `compile_fail` doctests: reset while a piece is borrowed (E0502), drop while borrowed (E0505), a piece escaping `scope` |
+| Checked arithmetic, fallible growth | `core::region` (`align_up`, `bump`, `fits_standard`, `own_chunk`, `within_limit`) returns `None` on overflow; sizes use `checked_mul`; every allocation returns `Result<_, RegionError>` (`Layout`, `Limit`, `OutOfMemory`) and a failure leaves the region and its pieces unchanged |
+| Metadata separate from payload; explicit chunk ownership | chunk descriptors in a `Vec` owned by the region; each chunk is released once, through the source that allocated it, by `reset` (the ones not kept), `release` or `Drop` |
+| Bounded retention after large requests; documented reset/trim policy | a reset keeps the first standard chunks within `retain_bytes` (1 MiB by default) and never a chunk of its own (requests that do not fit an empty standard chunk); `release` returns everything; optional `limit_bytes` |
+| `Send`/`Sync` from ownership; no TLS across `.await` | `unsafe impl Send` only for `Chunk` (owns its allocation like a `Box<[u8]>`); `Region` is then `Send` and, through its `Cell`s, not `Sync` (`compile_fail` doctest, E0277). No thread-local state; a borrow of a piece across `.await` is an ordinary borrow of the region |
+| `Drop` types | rejected: every allocation method requires `T: Copy` (`compile_fail` doctest with `String`, E0277). No destructor API, so no destructor tests |
+| Hardening kept; differences documented | global allocations unchanged; [region.md](../region.md) lists no per-piece randomization, no double-free detection (no individual free), guard pages only between segments, reuse only after a reset |
+| Pure bookkeeping in the safe core, pointers in the adapter; one package, no nightly, no dependency | `core/region.rs` (`forbid(unsafe_code)`, `no_std`, compiled by `allocatbelt-core-check`); `src/region.rs` owns the chunks and builds pointers (sites in [unsafe-boundary.md](../unsafe-boundary.md)); stable Rust, no new dependency, no change needed in OxiBelt |
+
+### Complexity notes
+
+| Operation | Work | Memory |
+|---|---|---|
+| Allocation that fits the current chunk | one checked bump (a few integer operations), no lock, no atomic | the piece plus its alignment padding |
+| Allocation moving to the next standard chunk | the same, plus one heap allocation if no retained chunk is left (a retained one is reused first) | the rest of the previous chunk stays unused until the reset (counted in `used`) |
+| Allocation that does not fit an empty standard chunk | one heap allocation of its exact size and alignment | none beyond it |
+| `alloc_slice_fill` | one write per element (none for zero-sized types) | |
+| `reset` | one step per chunk held, plus one heap free per chunk not kept; no destructor runs | the retained chunks (at most `retain_bytes`) |
+| `release`, `Drop` | one heap free per chunk | none |
+| Per region | | the descriptor `Vec`s (24 bytes per chunk) and about 140 bytes of state |
+
+Bulk release is not O(1): it scales with the chunks held.
+
+### Invariant tests
+
+- `crates/allocatbelt/src/core/region/tests.rs` (core-check): exact cases for `align_up`, `bump` (exact fit, one byte over, zero size at the end, overflow at the top of the address space), chunk clamping, own chunks and the retention and limit rules; property tests that successive bumps are aligned, in bounds and disjoint and refused only when they do not fit, that what `fits_standard` accepts fits an empty chunk at every 16-aligned base, and that a chunk of its own holds its request at its base.
+- `crates/allocatbelt/src/region/tests.rs` (over a counting chunk source on the system allocator, so Miri can run them): contents and alignment of many live pieces; alignments from 1 to beyond a chunk and invalid ones; zero-sized requests take no chunk; 100 pieces fill exactly 12 chunks of 256 bytes without overwriting each other; large requests get chunks of their own and the standard chunk continues after them; resets keep chunks within the retain bytes and reuse them before taking new ones; a retain of 0 returns every chunk; limit and allocation failures leave the region and its pieces intact and refuse overflowing sizes before taking a chunk; dropping returns every chunk; 50 resets reuse one chunk. One more test runs alignments up to the heap's largest (4 MiB) on heap chunks (not under Miri).
+- `crates/allocatbelt/tests/region.rs` (heap-backed): 20,000 pieces across more than 100 chunks keep their contents after rewrites; types aligned to 64 B, 4 KiB and 64 KiB; an 8 MiB alignment refused; zero-sized requests; the limit and the heap's out-of-memory answer; a 24 MiB chunk of its own counted in `HeapUsage::huge_segments` and returned at reset and drop; retained chunks reused at the same addresses; `scope` over 100 tasks; a region moved between threads twice; one region per thread on eight threads.
+- Doctests on `Region`: one working example and five `compile_fail` cases (reset and drop while borrowed, escape from `scope`, a non-`Copy` type, sharing between threads).
+- `crates/allocatbelt/examples/region_request.rs`: four worker threads, one region each, parse made-up requests into it and reset it after each; not an OxiBelt integration.
+
+### Checks run (x86_64 host, 1.98.1)
+
+| Check | Result |
+|---|---|
+| `cargo fmt --all --check` | pass |
+| `cargo clippy --all-targets --all-features --locked -- -D warnings`, and with the default features | pass |
+| `cargo test --release --all-features --locked` | pass (8 core region tests, 11 adapter unit tests, 9 integration tests, 6 doctests of which 5 `compile_fail`) |
+| `compile_fail` doctests checked for the intended error | each built separately: the escape from `scope` fails with "lifetime may not live long enough", the shared region with `Cell`/`RefCell` not `Sync`; the same closure with `move` (the region moved to the thread) compiles |
+| `cargo test --release --locked -p allocatbelt-core-check` | pass |
+| `scripts/check-features.sh` | pass (11 combinations) |
+| `scripts/check-rseq.sh` | pass |
+| `scripts/check-package.sh` | pass (on the committed tree; the package now includes `examples/`) |
+| `cargo run --release -p allocatbelt --example region_request` | pass (1000 requests, 0 failed; each worker ends with one retained 16 KiB chunk) |
+| Miri (`cargo +nightly-2026-09-27 miri test -p allocatbelt --lib region::`, `-Zmiri-disable-isolation`), Stacked Borrows and Tree Borrows | pass: 10 of 10 tests run under Miri, no undefined behaviour and no leak reported; the heap-backed alignment test is ignored under Miri (the heap needs `mmap`). New CI job "Miri (region API, nightly)" runs both |
+| Loom | not rerun: no protocol in `proto.rs` changed |
+| aarch64, riscv64 (qemu), sandbox, experimental ISA, platform gates, audit, deny, fuzz, mutation | by CI on the pushed commit (`bits.rs` and `class.rs` unchanged, so no local mutation run) |
+| Benchmarks | not run. Performance not measured; benchmark gate intentionally disabled. |
+
+### Known limitations
+
+- `Copy` types only: no destructor support, and no way to allocate a type with drop glue.
+- No per-piece free, and no reuse before a reset: a long-lived region that keeps allocating grows until it is reset or reaches its limit.
+- The tail of a standard chunk is wasted when a request moves to the next chunk (at most one chunk minus the request per move).
+- A region is not `Sync`; threads sharing work need one region each.
+- No per-piece randomization, double-free detection or guard page between pieces (by design; the heap's segment guards and out-of-band metadata still apply to the chunks).
+- Not measured, and nothing claims it is faster than the global allocator for any workload, or that it suits OxiBelt.

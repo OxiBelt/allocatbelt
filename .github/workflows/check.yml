@@ -324,6 +324,37 @@ jobs:
       - name: Lint, isolation and kernel checks under qemu
         run: scripts/check-experimental-rvv.sh
 
+  # Theory-driven plan Stage E: the region API's pointer code under Miri
+  # (Stacked and Tree Borrows). Its unit tests use a chunk source over the
+  # system allocator, since the heap needs mmap, which Miri does not run.
+  miri-region:
+    name: Miri (region API, nightly)
+    runs-on: ubuntu-26.04
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # 7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Install the pinned nightly toolchain with Miri
+        run: |
+          rustup toolchain install nightly-2026-09-27 --profile minimal --component miri,rust-src
+          cargo +nightly-2026-09-27 miri setup
+
+      - name: Fetch locked Cargo dependency graph
+        run: cargo +nightly-2026-09-27 fetch --locked
+
+      - name: Region tests under Miri
+        env:
+          MIRIFLAGS: -Zmiri-disable-isolation
+        run: |
+          cargo +nightly-2026-09-27 miri test --locked -p allocatbelt --lib region::
+          MIRIFLAGS="$MIRIFLAGS -Zmiri-tree-borrows" \
+            cargo +nightly-2026-09-27 miri test --locked -p allocatbelt --lib region::
+
   # Plan phase 3: the bit scans lower to tzcnt/popcnt/lzcnt on x86-64-v3
   # and to ctz/cpop/clz on riscv64 with Zbb (assembly only, no qemu).
   scalar-isa:

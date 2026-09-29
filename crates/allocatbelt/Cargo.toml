@@ -1,6 +1,6 @@
 [package]
 name = "allocatbelt"
-description = "A Linux global allocator whose allocation logic is safe Rust over offsets, with unsafe confined to the syscall, CPU-detection and GlobalAlloc boundaries."
+description = "A Linux global allocator whose allocation logic is safe Rust over offsets, with unsafe confined to the syscall, CPU-detection, GlobalAlloc and region boundaries."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -9,7 +9,7 @@ repository = "https://github.com/OxiBelt/allocatbelt"
 readme = "../../README.md"
 keywords = ["allocator", "global-allocator", "malloc", "linux"]
 categories = ["memory-management", "os::linux-apis"]
-include = ["/src/**/*.rs", "/tests/**/*.rs", "/LICENSE"]
+include = ["/src/**/*.rs", "/tests/**/*.rs", "/examples/**/*.rs", "/LICENSE"]
 # The only package of this workspace that is published; every other one is a
 # development tool (`publish = false` from `[workspace.package]`).
 
