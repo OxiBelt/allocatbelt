@@ -57,8 +57,8 @@ impl Shard {
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SearchStats {
-  /// Bitmap words claimed for a size class (cache refills and uncached
-  /// small allocations).
+  /// Claims for a size class: a bitmap word for a cache refill, a single
+  /// block for an uncached small allocation.
   pub refills: u64,
   /// Of those, words found on the shard's current page for the class (its
   /// cursor), without a search.
@@ -111,8 +111,8 @@ pub struct CacheStats {
   pub buffered_blocks: u64,
   /// Bitmap words those buffered blocks belong to (occupied slots).
   pub buffered_words: u64,
-  /// Buffered words returned to the shared bitmaps, each with one atomic
-  /// read-modify-write.
+  /// Buffered words returned to the shared bitmaps, each in one update
+  /// under the lock of the shard that owns the word's page.
   pub flushes: u64,
   /// Blocks returned by those flushes. `flushed_blocks / flushes` is the
   /// batch a shared update actually carried.
@@ -231,9 +231,8 @@ impl<O: Os> Heap<O> {
             let i = small.trailing_zeros() as usize;
             small &= small - 1;
             let cap = class::capacity(c);
-            // Below zero while a claim is ahead of the frees it took from.
-            let free = PageMeta::new(m, i).free().load(Relaxed).cast_signed();
-            let free = usize::try_from(free).unwrap_or(0).min(cap);
+            // Read without the owner's lock: may be one update behind.
+            let free = (PageMeta::new(m, i).free().load(Relaxed) as usize).min(cap);
             u.small_bytes_out += (cap - free) * class::size(c);
             u.small_bytes_free += free * class::size(c);
           }
@@ -250,7 +249,8 @@ impl<O: Os> Heap<O> {
   /// operation is running: every class list is well formed and holds
   /// exactly the listed small pages of its class in the shard's segments,
   /// every such page with a free block is listed, every class cursor names
-  /// a listed page, and every small page whose blocks are all free is an
+  /// a listed page, every small page's free counter is the number of its
+  /// free bits, and every small page whose blocks are all free is an
   /// empty-page candidate of its segment.
   pub fn check_indexes(&self) {
     for (s, sh) in self.shards.iter().enumerate() {
@@ -307,6 +307,16 @@ impl<O: Os> Heap<O> {
             let i = small.trailing_zeros() as usize;
             small &= small - 1;
             let pm = PageMeta::new(m, i);
+            let bits: u64 = pm
+              .bitmaps()
+              .iter()
+              .map(|w| u64::from(w.load(Relaxed).count_ones()))
+              .sum();
+            assert_eq!(
+              pm.free().load(Relaxed),
+              bits,
+              "page {i} of segment {seg} (class {c}): counter and bitmap disagree"
+            );
             let on = listed.contains(&(seg * PAGES_PER_SEGMENT + i));
             assert_eq!(
               on,

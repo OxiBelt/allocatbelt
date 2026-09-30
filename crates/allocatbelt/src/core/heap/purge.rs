@@ -346,13 +346,9 @@ impl<O: Os> Heap<O> {
   ///
   /// A candidate is only a request to look: the page is released if it is
   /// still a small page of its class here (`SEG_CLS`, changed under this
-  /// lock) and its free count is its capacity. Frees set bits before
-  /// bumping the counter, and our own claims are subtracted under this
-  /// lock, so the counter never overstates the free blocks here; blocks
-  /// held in thread caches are claimed, so they keep the page. The counter
-  /// is compared as signed ([`proto::all_free`]): a claim that took bits of
-  /// frees that have not counted them yet leaves it below zero, and read as
-  /// unsigned that would look like a full page.
+  /// lock) and its free count is its capacity ([`proto::all_free`]). Every
+  /// free and claim changes the counter under this lock, so it is exact
+  /// here; blocks held in thread caches are claimed, so they keep the page.
   pub(super) fn release_empty_pages(
     &self,
     sh: &Shard,

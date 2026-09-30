@@ -274,12 +274,12 @@ impl<O: Os> Heap<O> {
     let grow = tc.pending[c].get() == 0;
     let hint = self.shard_of(tc);
     let (page, w, bits) =
-      match self.with_shard(hint, |s, sh| self.claim_class_word(s, sh, c, grow))? {
+      match self.with_shard(hint, |s, sh| self.claim_class(s, sh, c, grow, false))? {
         Some(claim) => claim,
         None => {
           bump(&tc.refill_flushes, 1);
           self.flush_class(tc, c);
-          self.with_shard(hint, |s, sh| self.claim_class_word(s, sh, c, true))??
+          self.with_shard(hint, |s, sh| self.claim_class(s, sh, c, true, false))??
         }
       };
     let cw = &tc.words[c];
@@ -360,7 +360,8 @@ impl<O: Os> Heap<O> {
 
   /// Returns every block held by `tc` (claimed or freed) to the shared
   /// bitmaps: at most 64 buffered words and one claimed word per class, one
-  /// atomic update each. The cache stays usable (and attached, if it was).
+  /// update each under the lock of the shard that owns the word's page.
+  /// The cache stays usable (and attached, if it was).
   /// Only the thread that owns `tc` can call it; not async-signal-safe.
   pub fn flush(&self, tc: &ThreadCache) {
     for i in 0..FREE_SLOTS {

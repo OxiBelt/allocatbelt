@@ -30,7 +30,7 @@ Date: 2026-09-27. Detailed reports (with sources and verification tags):
    - No candidate has a structure that confines unsafe to the allocator's boundaries. Unsafe is spread through the core logic of all of them.
 2. **Hence a new design: "offsets + out-of-band atomic bitmaps".** Validated by this repository's prototype.
    - The core manipulates only **offsets** (integers) into a single reserved arena, and never dereferences memory → it can be `#![forbid(unsafe_code)]`.
-   - Free blocks are tracked in **per-page atomic bitmaps** instead of intrusive free lists → user memory corruption (UAF writes) cannot reach allocator metadata, and a double free is **detected deterministically** by the bit value returned from `fetch_or`. The closest precedent is GrapheneOS hardened_malloc (designs.md §1.6).
+   - Free blocks are tracked in **per-page atomic bitmaps** instead of intrusive free lists → user memory corruption (UAF writes) cannot reach allocator metadata, and a double free is **detected deterministically** by the bit value returned from `fetch_or` (since 2026-09-30, the bit read under the owner's lock). The closest precedent is GrapheneOS hardened_malloc (designs.md §1.6).
    - Locking uses **atomics only** (Relaxed accesses under an Acquire/Release lock that spins briefly, then sleeps on a futex), with no `UnsafeCell`.
    - Hardware acceleration: bitmap scans are safe `trailing_zeros`/`count_ones`/`leading_zeros`, so with `-C target-cpu=x86-64-v3` they compile to `tzcnt`/`popcnt`/`lzcnt`.
    - The unsafe boundary is `allocatbelt-sys` (13 unsafe blocks, 3 `unsafe fn` with contracts, `Send`/`Sync` for `Region`) plus the adapter (`GlobalAlloc` impl, zero fill, realloc copy, purge/decommit/guard calls). See [../unsafe-boundary.md](../unsafe-boundary.md).
@@ -45,12 +45,12 @@ Date: 2026-09-27. Detailed reports (with sources and verification tags):
 - **Short term:** keep secure mimalloc as OxiBelt's default. Put allocatbelt behind an `oxibelt-allocator` feature (e.g. `native-allocatbelt`) as an **experimental option**, and compare p99/throughput/24-hour RSS under real traffic (wrk/h2load). Put rallocator and rusty_alloc(`secure`) in the same comparison.
 - **Integration path:** make `oxibelt-allocator` a thin crate that re-exports `allocatbelt::Allocatbelt`. The `cc` build-dependency goes away, which also simplifies `cargo vet`/`deny`. It can be applied equally to ARM64 and RISC-V, since sys uses a 64 KiB granule and no page-size query. That needs testing on those targets.
 - **Things to finish before production** (in priority order; design grounds in designs.md §3). Items 1–5 were implemented on 2026-09-28 (§4 below); what is left of each is noted.
-  1. ~~Owner-local word caches exist, but the fast path still takes a shard lock (two atomic RMWs). Move to a per-thread heap (with a const TLS handle), separate the `local_free`/`remote_free` bitmaps, and batch remote frees.~~ **Done** as a per-thread cache in front of the shards: the fast path is a bit pop on thread-local `Cell`s, and frees are batched per bitmap word. Deliberately *not* done: owner-local free bitmaps, because every free still has to pass the shared bitmap's `fetch_or` for double frees to stay detectable (§4).
+  1. ~~Owner-local word caches exist, but the fast path still takes a shard lock (two atomic RMWs). Move to a per-thread heap (with a const TLS handle), separate the `local_free`/`remote_free` bitmaps, and batch remote frees.~~ **Done** as a per-thread cache in front of the shards: the fast path is a bit pop on thread-local `Cell`s, and frees are batched per bitmap word. Deliberately *not* done: owner-local free bitmaps, because every free still has to pass the shared bitmap (with `fetch_or`, since 2026-09-30 under the owner's lock) for double frees to stay detectable (§4).
   2. ~~The `find_page` class list scan is O(pages).~~ **Done:** a word summary per page and per-class availability bitmaps per segment. **Replaced (2026-09-30)** by per-class lists of pages that may have free blocks, with no summary bits: a list drops pages without free blocks as it is walked, so `find_page` no longer scans pages or segments (see "Page lists" below and [../design-constraints.md](../design-constraints.md)).
   3. ~~Replace the budget-only purge with time-based decay and a background purge thread.~~ **Done:** decay passes purge pages dirty for the purge delay (1 s) and return segments empty that long; `Allocatbelt::start_purge_thread` runs them off the allocating threads. Left: no two-stage (`MADV_FREE` then `MADV_DONTNEED`) purge, no per-class empty-page budget.
   4. Hardening. **Done:** randomized word pick on refill, randomized order within a claimed word, randomized segment placement, a `MADV_GUARD_INSTALL` guard page at the end of every owned segment (with an `mprotect` fallback). Left: optional zero-on-free and a bitmap quarantine.
-  5. ~~fork safety and `loom` models for concurrency.~~ **Done:** `pthread_atfork` handlers take every heap lock across `fork`; loom checks the free/claim/retire, page-run/purge, grow/trim and lock protocols.
-  6. Review soundness of **the core logic itself**: the boundary is narrow, but `purge`/`decommit`/`guard` safety still depends on core invariants such as "no purging ranges that hold live allocations". These are now checked by the mock-`Os` shadow maps (in `model.rs`, shared by the unit tests and a cargo-fuzz target), proptest (including random fuzz programs through several thread caches), loom for the lock-free protocols, and the mewt campaign for `bits`/`class`. Miri has still only been run partially (8/17 tests on commit 0271678; see unsafe-boundary.md). An independent review of the atomic orderings in `proto.rs` would be the next step.
+  5. ~~fork safety and `loom` models for concurrency.~~ **Done:** `pthread_atfork` handlers take every heap lock across `fork`; loom checks the free/claim, page-run/purge, grow/trim and lock protocols.
+  6. Review soundness of **the core logic itself**: the boundary is narrow, but `purge`/`decommit`/`guard` safety still depends on core invariants such as "no purging ranges that hold live allocations". These are now checked by the mock-`Os` shadow maps (in `model.rs`, shared by the unit tests and a cargo-fuzz target), proptest (including random fuzz programs through several thread caches), loom for the protocols in `proto.rs`, and the mewt campaign for `bits`/`class`. Miri has still only been run partially (8/17 tests on commit 0271678; see unsafe-boundary.md). An independent review of the atomic orderings in `proto.rs` would be the next step.
 - Do not use RDRAND, SIMD bitmap scans (a data race on shared atomic bitmaps), or MPK/MTE yet. Use getrandom. MTE is worth considering once ARM64 deployment starts (boundary.md §4).
 
 ## 4. Follow-up implementation (2026-09-28)
@@ -67,9 +67,9 @@ Items 1–5 of the list above, plus fuzzing and loom for item 6. Measurements ar
   - An allocation pops a bit from the claimed word: no atomics, no lock.
   - A free sets a bit in the buffer slot.
   - When a word runs out, the thread takes its shard lock once to claim the next word (up to 64 blocks).
-  - A buffer slot is written back with one `fetch_or`, however many blocks it collected.
+  - A buffer slot is written back in one update, however many blocks it collected: one `fetch_or` until 2026-09-30, since then one locked update under the lock of the shard that owns the page.
   - A class's buffered frees are flushed before its shard takes a new page for it, so buffering never grows the heap.
-- **Why not owner-local free bitmaps** (mimalloc's `local_free`)? With them, a thread could put a freed block straight back into its claimed word. But a second free of the same block from another thread would then land in the shared bitmap unseen, and the block would be handed out twice. Here every free, buffered or not, reaches the shared bitmap through `fetch_or` before the block can be reused. Double frees stay detectable: immediately within one thread's buffer or claimed word, and at write-back time across threads.
+- **Why not owner-local free bitmaps** (mimalloc's `local_free`)? With them, a thread could put a freed block straight back into its claimed word. But a second free of the same block from another thread would then land in the shared bitmap unseen, and the block would be handed out twice. Here every free, buffered or not, reaches the shared bitmap (under the owner's lock since 2026-09-30) before the block can be reused. Double frees stay detectable: immediately within one thread's buffer or claimed word, and at write-back time across threads.
   - What this costs: the owner cannot reuse its own frees without a round trip through the bitmap.
   - What the batching recovers: on the random-free microbenchmark, frees reached the bitmap at about one `fetch_or` per 2.3 frees. Batched producer/consumer frees do much better.
 - **Thread exit.** A cache is flushed and retired at thread exit. Frees in later thread-local destructors take the uncached path. A thread whose destructor never runs leaks at most its cache: 32 claimed words and 64 buffered words.
@@ -81,11 +81,11 @@ The first implementation (2026-09-28) found free blocks through two levels of su
 - **Page level.** A refill reads the page's bitmap words and picks a non-zero one by rank (`proto::claim_word`); there is no summary word.
 - **Shard level.** Every shard keeps, per size class, a doubly linked list of its pages that may have free blocks, linked through the pages' `P_LINK` words, with a listed flag per page. Segments still keep a word of their pages of each class (`SEG_CLS`) for trimming and diagnostics.
 - **Finding blocks.** A shard looking for a page of a class takes the front of its list, dropping pages that have no free block left.
-- **The protocol** (`proto::release_blocks`, `needs_listing`, `claim_word`, `retire_page`):
-  - Frees set bits and raise the page's free counter without a lock. A free that then finds its page unlisted takes the owner's lock and lists it again.
-  - The owner clears the page's listed flag *before* reading the counter, and unlinks the page only if the counter is not positive; the two sides meet in a store-buffering pattern with a fence on each.
+- **The protocol** (`proto::release_blocks`, `claim_word`, `claim_block`):
+  - Since 2026-09-30 (a second design review kept outside this repository), every free and every claim of a small page takes the lock of the shard that owns it and changes the bitmap and the free counter with plain loads and stores, so the counter is exact whenever the lock is free. A free that finds its page unlisted lists it again under that lock; a claim that finds no free block unlinks the page.
+  - Until then, frees set bits with `fetch_or` without a lock and claims took words with `swap(0)`; the owner cleared the listed flag before reading the counter and a free re-listed the page, the two sides meeting in a store-buffering pattern with a fence on each.
   - A listed page can have no free block (costing one wasted look) but a page with free blocks is never left unlisted.
-  - loom checks this, including the page-level counter that page recycling relies on.
+  - loom checks the transitions under the lock, including the page-level counter that page recycling relies on.
 - **Since the theory-driven plan's Stage D** ([theory-driven-implementation-status.md](theory-driven-implementation-status.md)): trimming keeps each shard's per-class cursor unless it releases that page, and finds fully free pages through empty-page candidates that the last free of a page publishes, instead of checking every small page. [class-segment-index.md](class-segment-index.md) was a design for indexing segments above the summaries; it is superseded, as the page lists need no segment level.
 
 ### Delayed purging (`heap/purge.rs`)
@@ -126,7 +126,7 @@ Who runs the passes:
 
 ### Verification added
 
-- **loom:** models of every lock-free protocol in `proto.rs`, run in CI.
+- **loom:** models of every protocol in `proto.rs`, run in CI.
 - **Fuzzing:** the checking mock `Os` moved to `model.rs` with an interpreter for arbitrary byte programs, driven by cargo-fuzz (`fuzz/`, scheduled in CI) and by proptest on stable.
 - **Mutation testing:** the mewt campaign passes after adding tests for what it found.
 - **Integration tests:** thread exit, the maintenance thread, guard faults and fork.
@@ -136,7 +136,7 @@ Who runs the passes:
 | mimalloc | allocatbelt now |
 |---|---|
 | thread-local heap (`mi_heap_t`), page free lists | `ThreadCache`: claimed bitmap word per class + batched frees; shards own pages |
-| `thread_free` / delayed free for cross-thread frees | buffered frees, one `fetch_or` per bitmap word |
+| `thread_free` / delayed free for cross-thread frees | buffered frees, one locked update per bitmap word |
 | page queues per bin | per-shard, per-class lists of pages that may have free blocks |
 | `purge_delay`, arena purge, `mi_collect` | epoch-based decay passes, maintenance thread, dirty budget, `purge()` / `request_purge()` |
 | secure mode: guard pages, randomized free lists and segment placement | guard page per segment (guard markers), randomized words/blocks/segments, bitmaps instead of encoded free lists |

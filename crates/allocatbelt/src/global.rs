@@ -392,8 +392,8 @@ impl Allocatbelt {
   /// cache stays usable. Call it before a worker thread parks or ends an
   /// idle phase: a thread that sleeps holds its cache until it runs again.
   ///
-  /// Bounded (one atomic update per word held) and lock-free on the small
-  /// blocks; purges nothing. Does not initialise the allocator or a cache
+  /// Bounded (one update per word held, under the lock of the shard that
+  /// owns its page); purges nothing. Does not initialise the allocator or a cache
   /// the thread has not used, and allocates nothing. Not async-signal-safe:
   /// do not call it from a signal handler.
   pub fn flush_thread_cache(self) {

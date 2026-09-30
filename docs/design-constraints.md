@@ -4,21 +4,21 @@ Rules that changes to allocatbelt must keep. They come from a preliminary patent
 
 ## Randomized choice of a set bit
 
-Randomized placement among the set bits of a word (where new segments go) picks by **rank**: `bits::pick_bit` ranks the set bits from the lowest and takes the one whose rank the random number selects (`bits::select_bit`). It does not rotate the word or scan from a random starting position. A refill picks the bitmap word it claims the same way, by rank among the page's non-zero words (`proto::claim_word`), and a thread cache picks the next block uniformly from its list (see below), which has no bits to rotate. Besides the review, the rank selection gives every free block the same chance, where a scan from a random start favours blocks that follow long runs of taken ones.
+Randomized placement among the set bits of a word (where new segments go) picks by **rank**: `bits::pick_bit` ranks the set bits from the lowest and takes the one whose rank the random number selects (`bits::select_bit`). It does not rotate the word or scan from a random starting position. A refill picks the bitmap word it claims the same way, by rank among the page's non-zero words (`proto::pick_word`, for `claim_word` and `claim_block`), and a thread cache picks the next block uniformly from its list (see below), which has no bits to rotate. Besides the review, the rank selection gives every free block the same chance, where a scan from a random start favours blocks that follow long runs of taken ones.
 
 Tests: `pick_ranks`, `select_every_rank`, `select_prop`, `pick_prop` (`core/bits/tests.rs`), and the mutation campaign over `bits.rs`.
 
-## Page runs and segments change under a lock
+## Allocation state changes under a lock
 
-A segment's page words (`SEG_PAGES`, occupancy; `SEG_DIRTY`, freed but not purged) change only under the lock of the shard that owns the segment, and the arena's segment words (`seg_used`) only under `seg_lock`. Every change is a plain load and store under that lock, never a compare-and-swap or another read-modify-write instruction on those words; other threads read them only as hints. Page-run allocation, in-place growth, page-run frees, the claims and ends of a purge, and trimming all take the owner's lock (`core/proto.rs`, "Page runs"). A purge holds it only to claim pages and to give them back, not while the `madvise` is in flight.
+A small page's bitmap words and free counter, a segment's words (`SEG_PAGES`, occupancy; `SEG_DIRTY`, freed but not purged; `SEG_EMPTY`, empty-page candidates; `SEG_CLS`, the pages of each class) and the shard's page lists change only under the lock of the shard that owns the segment, and the arena's segment words (`seg_used`) only under `seg_lock`. Every change is a plain load and store under that lock, never a compare-and-swap, `swap`, `fetch_or` or another read-modify-write instruction on those words; other threads read them only as hints. Small-block claims and frees (a thread cache writing back a buffered word included), page-run allocation, in-place growth, page-run frees, the claims and ends of a purge, and trimming all take the owner's lock (`core/proto.rs`, "Block bitmaps" and "Page runs"). A purge holds it only to claim pages and to give them back, not while the `madvise` is in flight. A free checks and clears a page run's header under the owner's lock, and a huge block's segment header under `seg_lock`, with a load and a store.
 
-Small blocks are different and stay lock-free on the free side: frees set bitmap bits with `fetch_or` from any thread, and the owner claims a whole bitmap word at a time under its shard lock. The one exception is a free that finds its page off its shard's page list: it takes the owner's lock to list the page again (see below). A refill takes every free block of the word it claims, whatever the request, and the thread then hands blocks out one by one from its own cache without atomics.
+A refill takes every free block of the word it claims, whatever the request, and the thread then hands blocks out one by one from its own cache without atomics; an uncached small allocation claims a single block under the lock.
 
-Tests: the loom models `page_runs_race_purge`, `async_purge_with_failure` and `grow_races_trim` (`core/proto.rs`) run every page-run transition under the owner's lock; the model tests exercise every caller.
+Tests: the loom models `frees_race_claims`, `two_freers_one_word`, `last_free_publishes_a_candidate`, `a_claim_racing_the_last_free_loses_no_candidate`, `racing_double_free_is_caught`, `page_runs_race_purge`, `async_purge_with_failure` and `grow_races_trim` (`core/proto.rs`) run the transitions under the owner's lock; `Heap::check_indexes` checks that every small page's counter matches its bitmap; the model tests exercise every caller.
 
 ## No allocation in one atomic step
 
-No allocation path completes in a single atomic read-modify-write that both checks the allocation state and yields the address, such as a `fetch_add` bump of a shared offset word. Regions (`Region`) bump through `Cell`s on one thread and never share their cursor; they stay that way.
+No allocation path completes in a single atomic read-modify-write that both checks the allocation state and yields the address, such as a `fetch_add` bump of a shared offset word, and no allocation or free changes allocation state with an atomic read-modify-write at all (see above). The read-modify-write instructions left in the heap are the locks' own, the dirty-page count, statistics, the maintenance request word and the cache-return generation. Regions (`Region`) bump through `Cell`s on one thread and never share their cursor; they stay that way.
 
 ## Free pages are chosen by position
 
@@ -44,9 +44,9 @@ Test: `a_seeded_cache_hands_out_each_claimed_block_once` (`core/tests.rs`).
 
 Small blocks are found without summary bits. Each shard keeps, per size class, a list of its pages that may have free blocks, linked through the pages' metadata and changed only under the shard lock; a page's listed flag says whether it is on the list. A refill takes the page at the front of the list and reads that page's bitmap words to pick one to claim. No bit vector records which bitmap words of a page, which pages of a segment or which segments of a shard have free blocks, and none is to be added: a hint that a group of bitmap bits has a free block is a list entry, not a bit. The segment's word of its pages of each class (`SEG_CLS`) marks what the pages are, not whether they have free blocks, and only trimming and diagnostics read it.
 
-A free that finds its page unlisted takes the owner's lock and lists the page again; the owner clears the flag before it reads the page's free counter and unlinks the page only if the counter is not positive, so no page with free blocks is left off its list.
+Every free takes the owner's lock, and one that finds its page unlisted lists it again; a claim that finds no free block unlinks the page. No page with free blocks is left off its list.
 
-Tests: the loom model `a_free_racing_retirement_relists_the_page` (`core/proto.rs`) and `Heap::check_indexes`, which the model tests and the fuzz programs run after their operations.
+Test: `Heap::check_indexes`, which the model tests and the fuzz programs run after their operations.
 
 ## Addresses carry positions only
 

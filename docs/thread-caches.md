@@ -4,7 +4,7 @@ Each thread that allocates has a cache of its own: the free blocks of one claime
 
 ## The free buffer
 
-A small free sets a bit in the buffer. The buffer has 64 slots, in 32 sets of 2 ways; each slot holds the freed blocks of one bitmap word (up to 64). When a slot is written back, one atomic `fetch_or` returns all of its blocks, so the cost of the shared update is spread over the blocks the slot collected.
+A small free sets a bit in the buffer. The buffer has 64 slots, in 32 sets of 2 ways; each slot holds the freed blocks of one bitmap word (up to 64). When a slot is written back, one update under the lock of the shard that owns the page returns all of its blocks, so the cost of the lock and the shared update is spread over the blocks the slot collected.
 
 - A free goes to the set its word hashes to: into the way that already holds the word, else an empty way, else it evicts the older of the two ways (round robin per set). The evicted word goes back in one update (`CacheStats::evictions`).
 - A word is in at most one slot. A second free of a block still buffered, in either way, or of a block the thread claimed but has not handed out, aborts with "double free". Frees of the same block from two threads are caught when the second reaches the shared bitmap.
@@ -24,7 +24,7 @@ What a cache holds (the rest of each claimed word, and the buffered frees) is un
 
 ### `flush_thread_cache`
 
-Returns every block the calling thread's cache holds, with one atomic update per word: at most 64 buffered words and one claimed word per size class. The cache stays attached and usable. It purges nothing, and it does not initialise the allocator, attach a cache that was never used, or allocate. It is not async-signal-safe: do not call it from a signal handler.
+Returns every block the calling thread's cache holds, with one update per word under the lock of the shard that owns its page: at most 64 buffered words and one claimed word per size class. The cache stays attached and usable. It purges nothing, and it does not initialise the allocator, attach a cache that was never used, or allocate. It is not async-signal-safe: do not call it from a signal handler.
 
 ### `request_cache_return`
 
