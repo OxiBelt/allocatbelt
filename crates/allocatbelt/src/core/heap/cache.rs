@@ -39,13 +39,32 @@ const ATTACHING: u8 = 1;
 const ATTACHED: u8 = 2;
 const RETIRED: u8 = 3;
 
-/// Free blocks of one bitmap word, claimed by a thread.
+/// Free blocks of one bitmap word, claimed by a thread, kept as a list of
+/// block numbers rather than as the word's bits: a refill unpacks the bits
+/// it claimed, and the thread hands blocks out from the list.
 #[derive(Debug)]
-struct CachedWord {
+struct CachedBlocks {
   /// Arena offset of the word's first block.
   base: Cell<usize>,
-  /// Claimed free blocks (bit `i` is block `base + i * size`).
-  bits: Cell<u64>,
+  /// Block numbers (block `i` is at `base + i * size`); the first `len`
+  /// are free, the last of them is handed out next.
+  blocks: [Cell<u8>; 64],
+  len: Cell<u8>,
+}
+
+impl CachedBlocks {
+  /// Whether block `i` of the word is in the list.
+  fn holds(&self, i: u32) -> bool {
+    self.blocks[..usize::from(self.len.get())]
+      .iter()
+      .any(|b| u32::from(b.get()) == i)
+  }
+
+  /// The listed blocks as a mask of the word, emptying the list.
+  fn take_mask(&self) -> u64 {
+    let n = usize::from(self.len.replace(0));
+    self.blocks[..n].iter().fold(0, |m, b| m | 1 << b.get())
+  }
 }
 
 /// Freed blocks of one bitmap word, not yet returned to the bitmap.
@@ -97,7 +116,7 @@ const _: () = assert!(FREE_SLOTS == 64 && FREE_WAYS == 2 && FREE_SETS == 32);
 /// registers its thread-exit hook bypass the cache too.
 #[derive(Debug)]
 pub struct ThreadCache {
-  words: [CachedWord; NUM_CLASSES],
+  words: [CachedBlocks; NUM_CLASSES],
   frees: [FreeSlot; FREE_SLOTS],
   /// Occupied free slots per class (bit `i` = `frees[i]`).
   pending: [Cell<u64>; NUM_CLASSES],
@@ -130,9 +149,10 @@ impl ThreadCache {
   pub const fn new() -> Self {
     Self {
       words: [const {
-        CachedWord {
+        CachedBlocks {
           base: Cell::new(0),
-          bits: Cell::new(0),
+          blocks: [const { Cell::new(0) }; 64],
+          len: Cell::new(0),
         }
       }; NUM_CLASSES],
       frees: [const {
@@ -223,23 +243,25 @@ impl<O: Os> Heap<O> {
   #[inline(always)]
   fn pop(tc: &ThreadCache, c: usize) -> Option<usize> {
     let cw = &tc.words[c];
-    let bits = cw.bits.get();
-    if bits == 0 {
+    let n = usize::from(cw.len.get());
+    if n == 0 {
       return None;
     }
-    // Randomized, consecutive allocations are not adjacent in memory.
+    // Randomized, consecutive allocations are not adjacent in memory: a
+    // uniformly chosen entry trades places with the last one. In order
+    // otherwise (the list is filled highest block first).
     let x = tc.rng.get();
-    let i = if x == 0 {
-      bits.trailing_zeros()
+    let j = if x == 0 {
+      n - 1
     } else {
       let x = xorshift(x);
       tc.rng.set(x);
-      pick_bit(bits, (x >> 32) as u32)
+      (((x >> 32) * n as u64) >> 32) as usize
     };
-    // A pick outside the word would hand the same block out again.
-    debug_assert!(bits & 1 << i != 0, "pick_bit chose a clear bit");
-    cw.bits.set(bits & !(1 << i));
-    Some(cw.base.get() + i as usize * class::size(c))
+    let i = cw.blocks[j].get();
+    cw.blocks[j].set(cw.blocks[n - 1].get());
+    cw.len.set(n as u8 - 1);
+    Some(cw.base.get() + usize::from(i) * class::size(c))
   }
 
   /// Claims a new word of class `c` for the thread and pops from it.
@@ -263,7 +285,17 @@ impl<O: Os> Heap<O> {
     let cw = &tc.words[c];
     cw.base
       .set((page << PAGE_SHIFT) + w as usize * 64 * class::size(c));
-    cw.bits.set(bits);
+    // Highest block first, so an unrandomized cache hands them out from
+    // the lowest.
+    let mut rest = bits;
+    let mut n = 0;
+    while rest != 0 {
+      let i = 63 - rest.leading_zeros();
+      cw.blocks[n].set(i as u8);
+      n += 1;
+      rest &= !(1 << i);
+    }
+    cw.len.set(n as u8);
     self.tick(tc);
     Self::pop(tc, c)
   }
@@ -335,7 +367,7 @@ impl<O: Os> Heap<O> {
       self.flush_slot(tc, i);
     }
     for (c, cw) in tc.words.iter().enumerate() {
-      let bits = cw.bits.replace(0);
+      let bits = cw.take_mask();
       if bits != 0 {
         let base = cw.base.get();
         let w = base % PAGE_SIZE / (64 * class::size(c));
@@ -405,7 +437,9 @@ impl<O: Os> Heap<O> {
   fn buffer_free(&self, tc: &ThreadCache, page: usize, c: usize, w: usize, bit: u64) {
     let cw = &tc.words[c];
     // A block the thread claimed but has not handed out cannot be freed.
-    if cw.bits.get() & bit != 0 && cw.base.get() == (page << PAGE_SHIFT) + w * 64 * class::size(c) {
+    if cw.base.get() == (page << PAGE_SHIFT) + w * 64 * class::size(c)
+      && cw.holds(bit.trailing_zeros())
+    {
       self.os.fatal(DOUBLE_FREE);
     }
     let key = slot_key(page, w, c);
@@ -535,11 +569,7 @@ impl<O: Os> Heap<O> {
     CacheStats {
       attached: tc.is_attached(),
       shard: tc.shard.get(),
-      claimed_blocks: tc
-        .words
-        .iter()
-        .map(|w| u64::from(w.bits.get().count_ones()))
-        .sum(),
+      claimed_blocks: tc.words.iter().map(|w| u64::from(w.len.get())).sum(),
       buffered_blocks,
       buffered_words,
       flushes: flush_sizes.iter().fold(0u64, |a, &n| a.wrapping_add(n)),

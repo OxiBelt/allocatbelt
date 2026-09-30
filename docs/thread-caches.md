@@ -1,6 +1,6 @@
 # Thread caches: batching frees and returning idle caches
 
-Each thread that allocates has a cache of its own: one claimed bitmap word per size class (small blocks, up to 8 KiB), which allocations pop without atomics, and a buffer of frees not yet returned to the shared bitmaps. This page describes the buffer and how a cache gives back what it holds. None of it was tuned by measurement: **performance not measured; benchmark gate intentionally disabled** (see [research/theory-driven-implementation-status.md](research/theory-driven-implementation-status.md)).
+Each thread that allocates has a cache of its own: the free blocks of one claimed bitmap word per size class (small blocks, up to 8 KiB), kept as a list of block numbers that allocations pop without atomics (a refill unpacks the bits it claimed; the cache does not keep the word's bits), and a buffer of frees not yet returned to the shared bitmaps. This page describes the buffer and how a cache gives back what it holds. None of it was tuned by measurement: **performance not measured; benchmark gate intentionally disabled** (see [research/theory-driven-implementation-status.md](research/theory-driven-implementation-status.md)).
 
 ## The free buffer
 

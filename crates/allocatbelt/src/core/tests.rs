@@ -617,6 +617,27 @@ fn free_of_a_claimed_block() {
 }
 
 #[test]
+fn a_seeded_cache_hands_out_each_claimed_block_once() {
+  let h = heap();
+  h.set_seed(0x9E37_79B9_7F4A_7C15);
+  let tc = cache(h);
+  let first = alloc_c(h, &tc, 16, 8);
+  // One refill claimed the rest of a 64-block word; the cache lists them
+  // and hands each out exactly once, in a shuffled order.
+  let claimed = h.cache_stats(&tc).claimed_blocks;
+  let mut got: Vec<_> = (0..claimed).map(|_| alloc_c(h, &tc, 16, 8)).collect();
+  assert_eq!(h.cache_stats(&tc).claimed_blocks, 0);
+  let in_order = got.windows(2).all(|w| w[1] > w[0]);
+  got.push(first);
+  got.sort_unstable();
+  got.dedup();
+  assert_eq!(got.len() as u64, claimed + 1);
+  let base = got[0] / (64 * 16) * (64 * 16);
+  assert!(got.iter().all(|&o| (base..base + 64 * 16).contains(&o)));
+  assert!(!in_order, "a seeded cache handed its blocks out in order");
+}
+
+#[test]
 fn refill_finds_freed_page_without_scanning() {
   let h = heap();
   // Fill many pages of one class, then free one block in an early page.
