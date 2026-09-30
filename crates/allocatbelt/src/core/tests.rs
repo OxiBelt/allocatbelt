@@ -520,7 +520,7 @@ fn freed_small_pages_leave_their_segments() {
   }
 }
 
-// ---- thread caches and summaries -------------------------------------------
+// ---- thread caches and page lists ------------------------------------------
 
 #[test]
 fn cached_round_trip_and_reuse() {
@@ -644,9 +644,12 @@ fn refill_finds_freed_page_without_scanning() {
   let per_page = PAGE_SIZE / 32;
   let offs: Vec<_> = (0..per_page * 40).map(|_| alloc(h, 7, 32, 8)).collect();
   let segs = h.segments_in_use();
+  // The full pages are off the class's page list: the free lists the page
+  // again (under the owner's lock), and the lists stay consistent.
   free(h, offs[5]);
+  h.check_indexes();
   // The next allocation of the class takes the freed block from that page
-  // (found through the availability words) rather than a new page.
+  // (found through the class's page list) rather than a new page.
   let again = alloc(h, 7, 32, 8);
   assert_eq!(again, offs[5]);
   assert_eq!(h.segments_in_use(), segs);
@@ -1683,14 +1686,14 @@ fn refills_count_their_search() {
   let before = h.search_stats();
   let first = alloc_c(h, &tc, 16, 8);
   let s = h.search_stats();
-  // A fresh heap: the refill searches the (empty) segment list for a page of
-  // the class, sets up a new page, and takes a new segment for it.
+  // A fresh heap: the refill searches the (empty) list of pages of the
+  // class, sets up a new page, and takes a new segment for it.
   assert_eq!(
     (
       s.refills - before.refills,
       s.cursor_claims - before.cursor_claims,
       s.page_searches - before.page_searches,
-      s.page_search_segments - before.page_search_segments,
+      s.candidates - before.candidates,
       s.new_pages - before.new_pages,
       s.run_searches - before.run_searches,
       s.new_segments - before.new_segments,

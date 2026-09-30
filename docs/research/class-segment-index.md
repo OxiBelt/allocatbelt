@@ -1,5 +1,7 @@
 # Class-to-segment candidate index: bounded design (Stage D3)
 
+> **Superseded (2026-09-30).** The page summary and availability words this design builds on were removed after a design review kept outside this repository: each shard now keeps a list per size class of its pages that may have free blocks ([../design-constraints.md](../design-constraints.md)), so a page search no longer walks segments and there is no level for this index to sit above. It is kept as a record and is not planned.
+
 Design of the third part of Stage D of the theory-driven plan (brief section 7, D3), delivered as a design, which the brief accepts as an intermediate delivery next to D1 and D2. **Nothing in this document is implemented.** It records what the index would be, what it would cost, how it would stay correct, and what would justify building it.
 
 **Performance not measured; benchmark gate intentionally disabled.** No benchmark was run, and no claim below is a measured speed-up.

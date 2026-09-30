@@ -78,7 +78,7 @@ The allocator's hot scans work on one `u64` bitmap word at a time with `trailing
 
 | Operation | Where the allocator uses it | x86-64-v3 | riscv64 + Zbb | riscv64 (rv64gc) |
 |---|---|---|---|---|
-| `trailing_zeros` | `bits::find_run_aligned`, the summary scans | `tzcnt`, never `bsf` | `ctz` | no `ctz`: a multi-instruction sequence |
+| `trailing_zeros` | `bits::find_run_aligned`, bitmap scans | `tzcnt`, never `bsf` | `ctz` | no `ctz`: a multi-instruction sequence |
 | `count_ones` | free counters (`proto.rs`), dirty-page accounting (`heap.rs`), `bits::pick_bit` (rank selection) | `popcnt` | `cpop` | no `cpop` |
 | `leading_zeros` | `class::class_of` | `lzcnt`, never `bsr` | `clz` | no `clz` |
 

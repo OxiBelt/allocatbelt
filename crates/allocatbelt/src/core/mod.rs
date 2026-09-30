@@ -75,8 +75,8 @@ pub const MAX_ALIGN: usize = SEGMENT_SIZE;
 /// Words of per-page metadata: 4 header words and a 64-word free bitmap.
 pub const PAGE_META_WORDS: usize = 4 + class::MAX_BITMAP_WORDS;
 /// Words of segment header metadata that precede the page records: eight
-/// words of segment state, then two bitmaps per size class.
-pub const SEGMENT_HEADER_WORDS: usize = 8 + 2 * class::NUM_CLASSES;
+/// words of segment state, then one bitmap per size class (its small pages).
+pub const SEGMENT_HEADER_WORDS: usize = 8 + class::NUM_CLASSES;
 /// Metadata words the [`Os`] must provide for every segment.
 pub const META_WORDS: usize = SEGMENT_HEADER_WORDS + PAGES_PER_SEGMENT * PAGE_META_WORDS;
 

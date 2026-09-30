@@ -5,17 +5,23 @@
 //! below) checks exactly the code the heap executes. Callers pass the words
 //! involved; nothing here knows the metadata layout.
 //!
-//! Four protocols live here; all but the page runs are lock-free:
+//! Four protocols live here:
 //!
-//! * **Block bitmaps.** A small page has one bitmap bit per block (1 =
-//!   free), a *summary* word with one bit per bitmap word that may be
-//!   non-zero, and the segment has an *avail* word per size class with one
-//!   bit per page that may have free blocks. Frees (any thread) set bits
-//!   bottom-up and propagate only on a zero → non-zero transition; the page's
-//!   owner (under its shard lock) claims whole words top-down, clearing the
-//!   hint *before* taking the bits, so a racing free either lands in the
-//!   bits it takes or re-sets the hint afterwards. A hint may be stale-set,
-//!   never stale-clear while bits are waiting.
+//! * **Block bitmaps and page lists.** A small page has one bitmap bit per
+//!   block (1 = free) and a counter of its free blocks. There are no
+//!   summary bits above the bitmaps: the owning shard keeps, per size
+//!   class, a list of its pages that may have free blocks, linked through
+//!   the pages' metadata and changed only under the shard lock, and each
+//!   page has a *listed* flag in its list word. Frees (any thread) set bits
+//!   and then raise the counter without a lock; a free that then finds its
+//!   page unlisted takes the owner's lock and lists it ([`needs_listing`]).
+//!   The owner (under its lock) claims whole words, found by scanning the
+//!   page's bitmap words ([`claim_word`]), and takes a page off its list
+//!   only after clearing the flag and then finding the counter at zero
+//!   ([`retire_page`]), so a racing free either shows in the counter or
+//!   sees the flag clear and lists the page again. A listed page may have
+//!   no free blocks left; a page with free blocks is never left unlisted
+//!   once the frees that returned them are done.
 //! * **Empty-page candidates.** A segment has an *empty* word with one bit
 //!   per small page that may have become completely free. The free whose
 //!   counter increment brings the page's free count to its capacity sets
@@ -43,26 +49,22 @@
 //!   reads the cause, so a post that races with a take is either seen by
 //!   the pass that follows or re-posts the bit (and wakes the thread).
 
-use crate::core::bits::{find_run_aligned, pick_bit};
+use crate::core::bits::find_run_aligned;
 use crate::core::sync::Ordering::{AcqRel, Acquire, Relaxed, Release, SeqCst};
 use crate::core::sync::{AtomicU32, AtomicU64, fence};
 
-/// Returns the blocks in `mask` to bitmap `word` (index `w` in its page).
-///
-/// `count` is the page's free-block counter, `summary` its word summary and
-/// `avail`/`page_bit` its bit in the segment's availability word for its
-/// class. Returns the free count this free raised the counter to, or
-/// `None`, having changed only `word`, if a bit of `mask` was already
-/// free: a double free.
-pub(crate) fn release_blocks(
-  word: &AtomicU64,
-  count: &AtomicU64,
-  summary: &AtomicU64,
-  avail: &AtomicU64,
-  w: u32,
-  page_bit: u64,
-  mask: u64,
-) -> Option<u64> {
+/// Set in a small page's list word while the page is on its shard's list
+/// of pages of its class that may have free blocks. The rest of the word
+/// links the list; the whole word changes only under the owning shard's
+/// lock, and other threads read only this flag.
+pub(crate) const LISTED: u64 = 1 << 63;
+
+/// Returns the blocks in `mask` to bitmap `word` of a page whose free-block
+/// counter is `count`. Returns the free count this free raised the counter
+/// to, or `None`, having changed only `word`, if a bit of `mask` was already
+/// free: a double free. The caller then asks [`needs_listing`] whether the
+/// page must go back on its shard's list.
+pub(crate) fn release_blocks(word: &AtomicU64, count: &AtomicU64, mask: u64) -> Option<u64> {
   let old = word.fetch_or(mask, AcqRel);
   if old & mask != 0 {
     return None;
@@ -70,11 +72,19 @@ pub(crate) fn release_blocks(
   // Bits first, then the counter: the counter never overstates the set
   // bits once the owner's claims are subtracted.
   let n = u64::from(mask.count_ones());
-  let now = count.fetch_add(n, Release).wrapping_add(n);
-  if old == 0 && summary.fetch_or(1 << w, AcqRel) == 0 {
-    avail.fetch_or(page_bit, AcqRel);
-  }
-  Some(now)
+  Some(count.fetch_add(n, Release).wrapping_add(n))
+}
+
+/// Whether a page that a free just returned blocks to (with
+/// [`release_blocks`]) is off its shard's list, as its list word `link`
+/// shows. The freer then takes the owner's lock and lists the page if it is
+/// still an unlisted small page of the class.
+pub(crate) fn needs_listing(link: &AtomicU64) -> bool {
+  // Pairs with the fence in `retire_page` (a store-buffering pattern):
+  // either the owner's read of the counter after its fence sees this
+  // free's increment, or this read sees the flag the owner cleared.
+  fence(SeqCst);
+  link.load(Relaxed) & LISTED == 0
 }
 
 /// Publishes a page as an empty-page candidate in its segment's `empty`
@@ -103,45 +113,58 @@ pub(crate) fn take_candidates(empty: &AtomicU64) -> u64 {
   empty.swap(0, AcqRel)
 }
 
-/// Claims every free block of one bitmap word of a page, choosing among the
-/// words its `summary` marks by [`pick_bit`] with `r`. Returns the word index
-/// and the claimed bits, or `None` once the summary is empty. The caller
-/// subtracts the claimed count from the page's counter. Only the page's owner
-/// may call this (claims must not race each other).
-pub(crate) fn claim_word(summary: &AtomicU64, words: &[AtomicU64], r: u32) -> Option<(u32, u64)> {
-  loop {
-    let s = summary.load(Acquire);
-    if s == 0 {
-      return None;
-    }
-    let w = pick_bit(s, r);
-    // A pick outside the summary would clear nothing and spin here.
-    debug_assert!(s & 1 << w != 0, "pick_bit chose a clear bit");
-    // Clear the hint before taking the bits: a free that lands after the
-    // swap sees an empty word and sets the hint again.
-    summary.fetch_and(!(1 << w), AcqRel);
-    let Some(word) = words.get(w as usize) else {
-      continue;
-    };
-    let bits = word.swap(0, AcqRel);
-    if bits != 0 {
-      return Some((w, bits));
-    }
+/// Claims every free block of one bitmap word of a page, choosing among its
+/// non-zero `words` by rank: the non-zero words are counted, and `r`, read
+/// as a fraction of 2^32, picks the rank among them (`r = 0` takes the
+/// first). Returns the word index and the claimed bits, or `None` if every
+/// word is zero. There is no summary of the words: they are read one by
+/// one. The caller subtracts the claimed count from the page's counter.
+/// Only the page's owner may call this (claims must not race each other).
+pub(crate) fn claim_word(words: &[AtomicU64], r: u32) -> Option<(u32, u64)> {
+  // Frees only set bits and only the owner clears them, so a word read as
+  // non-zero stays so until it is taken here: the rank is always found.
+  let k = words.iter().filter(|w| w.load(Relaxed) != 0).count() as u64;
+  if k == 0 {
+    return None;
   }
+  let rank = (u64::from(r) * k) >> 32;
+  let mut seen = 0;
+  for (w, word) in words.iter().enumerate() {
+    if word.load(Relaxed) == 0 {
+      continue;
+    }
+    if seen == rank {
+      let bits = word.swap(0, AcqRel);
+      debug_assert_ne!(bits, 0, "a non-zero word lost its bits");
+      return Some((w as u32, bits));
+    }
+    seen += 1;
+  }
+  None
 }
 
-/// Takes a page whose summary looked empty off its segment's availability
-/// word. Returns `false`, leaving the bit set, if a free refilled the page
-/// meanwhile, in which case the caller should claim from it again.
-pub(crate) fn retire_page(avail: &AtomicU64, page_bit: u64, summary: &AtomicU64) -> bool {
-  avail.fetch_and(!page_bit, AcqRel);
-  // A read-modify-write rather than a load: it reads the latest summary,
-  // and it synchronises with the free whose summary update follows it, so
-  // that free's `avail` update is ordered after the clear above.
-  if summary.fetch_or(0, AcqRel) == 0 {
+/// Prepares to take a page whose claims found no free block off its
+/// shard's list: clears the listed flag in its list word `link`, then reads
+/// its free-block counter `count`. Returns `true` if the page may be
+/// unlinked (a free that has not raised the counter yet will find the flag
+/// clear and list the page again), or `false`, having set the flag again,
+/// if a free raised the counter meanwhile, in which case the caller should
+/// claim from the page again. Only the page's owner, under its lock, may
+/// call this, and the page must be listed.
+pub(crate) fn retire_page(link: &AtomicU64, count: &AtomicU64) -> bool {
+  let l = link.load(Relaxed);
+  link.store(l & !LISTED, Relaxed);
+  // Pairs with the fence in `needs_listing`.
+  fence(SeqCst);
+  // Acquire: a counter raised by a free shows its bits to the claims that
+  // follow. The counter never overstates the set bits (the owner's own
+  // claims are subtracted under its lock), so a positive count means free
+  // blocks. It is below zero while the owner has claimed bits whose frees
+  // have not counted them yet; those frees find the flag clear.
+  if count.load(Acquire).cast_signed() <= 0 {
     return true;
   }
-  avail.fetch_or(page_bit, AcqRel);
+  link.store(l, Relaxed);
   false
 }
 
@@ -246,9 +269,9 @@ mod loom_tests {
   //! Exhaustive interleaving checks of the protocols above. Run with
   //! `RUSTFLAGS="--cfg loom" cargo test -p allocatbelt-core-check --release --lib loom`.
 
-  use loom::sync::Arc;
   use loom::sync::atomic::Ordering::{Acquire, Relaxed};
   use loom::sync::atomic::{AtomicU32, AtomicU64};
+  use loom::sync::{Arc, Mutex};
   use loom::thread;
   use std::vec::Vec;
 
@@ -258,8 +281,9 @@ mod loom_tests {
   struct Page {
     words: [AtomicU64; 2],
     count: AtomicU64,
-    summary: AtomicU64,
-    avail: AtomicU64,
+    link: AtomicU64,
+    /// The owner's shard lock, guarding whether the page is on its list.
+    list: Mutex<bool>,
     /// The segment's empty-page candidates (this page is bit 0).
     empty: AtomicU64,
     /// Blocks of the page.
@@ -267,14 +291,15 @@ mod loom_tests {
   }
 
   impl Page {
-    /// A page of `cap` blocks whose free blocks are `words`.
+    /// A page of `cap` blocks whose free blocks are `words`, listed if it
+    /// has any.
     fn new(words: [u64; 2], cap: u64) -> Self {
-      let summary = u64::from(words[0] != 0) | u64::from(words[1] != 0) << 1;
+      let listed = words != [0, 0];
       Self {
         words: [AtomicU64::new(words[0]), AtomicU64::new(words[1])],
         count: AtomicU64::new(u64::from(words[0].count_ones() + words[1].count_ones())),
-        summary: AtomicU64::new(summary),
-        avail: AtomicU64::new(u64::from(summary != 0)),
+        link: AtomicU64::new(if listed { LISTED } else { 0 }),
+        list: Mutex::new(listed),
         empty: AtomicU64::new(0),
         cap,
       }
@@ -282,18 +307,19 @@ mod loom_tests {
 
     /// A free, as `Heap::free_bits` makes it.
     fn free(&self, w: u32, mask: u64) -> bool {
-      let Some(now) = release_blocks(
-        &self.words[w as usize],
-        &self.count,
-        &self.summary,
-        &self.avail,
-        w,
-        1,
-        mask,
-      ) else {
+      let Some(now) = release_blocks(&self.words[w as usize], &self.count, mask) else {
         return false;
       };
       publish_if_empty(&self.empty, 1, now, self.cap);
+      if needs_listing(&self.link) {
+        // As `Heap::relist_page`: under the owner's lock, list the page
+        // unless it is listed by now.
+        let mut on = self.list.lock().unwrap();
+        if self.link.load(Relaxed) & LISTED == 0 {
+          self.link.store(LISTED, Relaxed);
+          *on = true;
+        }
+      }
       true
     }
 
@@ -304,40 +330,40 @@ mod loom_tests {
       take_candidates(&self.empty) != 0 && all_free(&self.count, self.cap)
     }
 
-    /// The owner's refill loop: claim words until the page is empty and
-    /// retired. Returns the claimed bits per word.
+    /// The owner's refill loop, as `Heap::claim_class_word` runs it on a
+    /// listed page: claim words until the page is empty and taken off the
+    /// list. Returns the claimed bits per word.
     fn drain(&self, r: u32) -> [u64; 2] {
       let mut got = [0; 2];
+      let mut on = self.list.lock().unwrap();
+      if !*on {
+        return got;
+      }
       loop {
-        while let Some((w, b)) = claim_word(&self.summary, &self.words, r) {
+        while let Some((w, b)) = claim_word(&self.words, r) {
           assert_eq!(got[w as usize] & b, 0, "block claimed twice");
           got[w as usize] |= b;
           self.count.fetch_sub(u64::from(b.count_ones()), Relaxed);
         }
-        if retire_page(&self.avail, 1, &self.summary) {
+        if retire_page(&self.link, &self.count) {
+          self.link.store(0, Relaxed);
+          *on = false;
           return got;
         }
       }
     }
 
-    /// No free block may be unreachable: a non-empty word is in the
-    /// summary, and a non-empty summary is in the availability word.
+    /// No free block may be unreachable: a page with a non-empty word is
+    /// on the list, and the flag says so.
     fn check_reachable(&self) {
-      let s = self.summary.load(Acquire);
-      for (w, word) in self.words.iter().enumerate() {
-        if word.load(Acquire) != 0 {
-          assert!(
-            s >> w & 1 == 1,
-            "free blocks in word {w} not in the summary"
-          );
-        }
-      }
-      if s != 0 {
-        assert_eq!(
-          self.avail.load(Acquire),
-          1,
-          "page with free blocks not available"
-        );
+      let on = *self.list.lock().unwrap();
+      assert_eq!(
+        on,
+        self.link.load(Relaxed) & LISTED != 0,
+        "the flag and the list disagree"
+      );
+      if self.words.iter().any(|w| w.load(Acquire) != 0) {
+        assert!(on, "page with free blocks not listed");
       }
     }
   }
@@ -365,6 +391,23 @@ mod loom_tests {
       assert_eq!(all, [0b0011, 0b0100]);
       let claimed = u64::from(got[0].count_ones() + got[1].count_ones());
       assert_eq!(page.count.load(Relaxed), 3 - claimed);
+    });
+  }
+
+  /// The owner claims a page's last free block and takes the page off its
+  /// list while another block of it is freed: the free either shows in the
+  /// counter, keeping the page listed, or lists it again.
+  #[test]
+  fn a_free_racing_retirement_relists_the_page() {
+    loom::model(|| {
+      // Block 0 free, block 1 live.
+      let page = Arc::new(Page::new([0b01, 0], 2));
+      let p = page.clone();
+      let freer = thread::spawn(move || assert!(p.free(0, 0b10)));
+      let got = page.drain(0);
+      freer.join().unwrap();
+      page.check_reachable();
+      assert_eq!(got[0] | page.words[0].load(Relaxed), 0b11);
     });
   }
 
@@ -398,7 +441,7 @@ mod loom_tests {
       // The owner claims what it can and hands it back, as a thread cache
       // does, then decides whether the page is empty (and releasable) from
       // the counter, as `release_empty_pages` does.
-      if let Some((w, b)) = claim_word(&page.summary, &page.words, 0) {
+      if let Some((w, b)) = claim_word(&page.words, 0) {
         page.count.fetch_sub(u64::from(b.count_ones()), Relaxed);
         assert!(page.free(w, b));
       }
@@ -452,7 +495,7 @@ mod loom_tests {
       let page = Arc::new(Page::new([0b01, 0], 2));
       let p = page.clone();
       let freer = thread::spawn(move || assert!(p.free(0, 0b10)));
-      if let Some((w, b)) = claim_word(&page.summary, &page.words, 0) {
+      if let Some((w, b)) = claim_word(&page.words, 0) {
         page.count.fetch_sub(u64::from(b.count_ones()), Relaxed);
         assert!(page.free(w, b));
       }
@@ -477,7 +520,7 @@ mod loom_tests {
       let page = Arc::new(Page::new([0b01, 0], 2));
       let p = page.clone();
       let freer = thread::spawn(move || assert!(p.free(0, 0b10)));
-      let (_, b) = claim_word(&page.summary, &page.words, 0).unwrap();
+      let (_, b) = claim_word(&page.words, 0).unwrap();
       page.count.fetch_sub(u64::from(b.count_ones()), Relaxed);
       assert!(
         !all_free(&page.count, page.cap),
