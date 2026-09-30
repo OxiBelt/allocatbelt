@@ -4,7 +4,7 @@ allocatbelt exposes four read-only diagnostics on `Allocatbelt`. They exist so t
 
 | Method | Type | Scope | Cost of a read |
 |---|---|---|---|
-| `maintenance_stats()` | `MaintenanceStats` | whole heap | 18 atomic loads |
+| `maintenance_stats()` | `MaintenanceStats` | whole heap | 25 atomic loads |
 | `search_stats()` | `SearchStats` | whole heap, summed over the 64 shards | 8 loads per shard |
 | `heap_usage()` | `HeapUsage` | whole heap, a walk over the segments in use | a few loads per segment and per small page |
 | `thread_cache_stats()` | `Option<CacheStats>` | the calling thread's cache only | reads the cache's own cells |
@@ -34,8 +34,8 @@ The reclamation thresholds (by default a 32 MiB trigger and a 64 MiB emergency t
 - passes by kind, counted when the sweep ends, on the maintenance thread and inline (`force_passes`, `budget_passes`, `decay_passes`, `inline_budget_passes`, `inline_decay_passes`);
 - slices: `slices` (all), `inline_slices`, `emergency_slices`; a sweep still in progress is visible in `Allocatbelt::reclaim_status()`;
 - work units: `segments_inspected`, `trimmed_shards`, `trim_pages_inspected` (small pages checked: the empty-page candidates that frees published, and on reconciling sweeps every small page);
-- empty-page candidates: `stale_empty_candidates` (checked and not released: the page was claimed from again, or released or reused, after its last block was freed), `reconciled_pages` (pages a reconciling sweep released without a candidate: 0 unless a free published one while the sweep ran, or a candidate was lost);
-- attempts and results: `purge_batches`, `purged_runs` (attempted), `failed_runs`, `purged_pages`, `released_pages`, `returned_segments`;
+- empty-page candidates: `stale_empty_candidates` (checked and not released: the page was claimed from again, or released or reused, after its last block was freed), `reconciled_pages` (pages a reconciling sweep released without a candidate: 0 unless a free published one while the sweep ran, or a candidate was lost), `kept_newest_pages` (fully free pages checked and kept, each the newest page of its shard and class; a kept page is checked by every sweep until its memory is purged, see [design-constraints.md](design-constraints.md));
+- attempts and results: `purge_batches`, `purged_runs` (attempted), `failed_runs`, `purged_pages` (including kept small pages, purged by trimming outside the batches), `released_pages`, `returned_segments`;
 - lock contention: `busy_shards` (a shard skipped because its lock was held), `skipped_passes` (an inline pass skipped because another pass held the purge lock);
 - foreground intervention: `hard_limit_slices`, the emergency slices a freeing thread ran although a maintenance thread was attached;
 - failed cycles: `stalled_cycles`, budget cycles whose full sweep made no progress (then deferred to the next decay epoch, shown by `reclaim_status().budget_deferred`).

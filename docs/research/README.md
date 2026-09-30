@@ -94,7 +94,7 @@ The page-list design, as it stood before the address-ordered search:
 
 ### Delayed purging (`heap/purge.rs`)
 
-Freed page runs and released small pages stay resident as dirty pages. Three kinds of pass return memory:
+Freed page runs and released small pages stay resident as dirty pages. Trimming releases every fully free small page except the newest page of each shard and class, whose memory it purges in place after the delay ([../design-constraints.md](../design-constraints.md), "The newest page of a class stays"). Three kinds of pass return memory:
 
 - **Decay passes** purge pages that have been dirty for the purge delay (1 s by default) and return segments that have been empty that long, beyond the one each shard keeps.
   - Ages count decay passes (epochs), which are due every quarter delay, so freeing never reads the clock: `Instant::now` costs 28 ns here, which the first version paid on every page-run free and measurably slowed mixed churn.

@@ -503,8 +503,10 @@ fn freed_small_pages_leave_their_segments() {
   let n = 3 * MAX_RUN_PAGES * PAGE_SIZE / 16;
   let offs: Vec<_> = (0..n).map(|_| h.alloc(6, 16, 8).unwrap()).collect();
   assert_eq!(h.segments_in_use(), base + 3);
-  // Keep one block so its page stays behind.
-  for &o in &offs[1..] {
+  // Keep the last block so its page stays behind. It is on the class's
+  // newest page, which trimming keeps anyway.
+  let last = offs[n - 1];
+  for &o in &offs[..n - 1] {
     h.dealloc(o);
   }
   // Pages go back on the first pass, segments on the second. What stays:
@@ -513,9 +515,9 @@ fn freed_small_pages_leave_their_segments() {
   h.purge();
   assert_eq!(h.segments_in_use(), base + 2);
   // The survivor is intact and the class keeps working.
-  assert_eq!(h.usable_size(offs[0]), 16);
+  assert_eq!(h.usable_size(last), 16);
   let again: Vec<_> = (0..1000).map(|_| h.alloc(6, 16, 8).unwrap()).collect();
-  for o in again.into_iter().chain([offs[0]]) {
+  for o in again.into_iter().chain([last]) {
     h.dealloc(o);
   }
 }
@@ -1597,9 +1599,82 @@ fn trimming_counts_released_pages() {
   }
   let before = h.maintenance_stats();
   h.purge();
-  let w = work_since(before, h.maintenance_stats());
-  assert_eq!(w[RELEASED], pages as u64);
-  assert_eq!(h.usage().small_pages, 0);
+  let after = h.maintenance_stats();
+  let w = work_since(before, after);
+  // All but the class's newest page, which trimming keeps.
+  assert_eq!(w[RELEASED], pages as u64 - 1);
+  assert_eq!(after.kept_newest_pages - before.kept_newest_pages, 1);
+  assert_eq!(h.usage().small_pages, 1);
+}
+
+#[test]
+fn a_kept_page_is_purged_once_it_has_been_kept_for_the_delay() {
+  let h = heap();
+  h.set_reconcile_epochs(0);
+  let a = alloc(h, 0, 1000, 8);
+  free(h, a);
+  let purged = || h.os().purged.load(Ordering::Relaxed);
+  // The first decay sweep finds the page fully free and keeps it, the
+  // newest of its class; every sweep checks it again, and the one that
+  // comes a purge delay later purges its memory.
+  for _ in 0..DECAY_AGE {
+    assert_eq!(decay_trim(h), (1, 0, 0, 0, 1));
+    assert_eq!(purged(), 0);
+  }
+  assert_eq!(decay_trim(h), (1, 0, 0, 0, 1));
+  assert_eq!(purged(), PAGE_SIZE);
+  // Purged, it is no candidate any more: later sweeps leave it alone.
+  assert_eq!(decay_trim(h), (0, 0, 0, 0, 0));
+  assert_eq!(h.usage().small_pages, 1);
+  // A block claimed from it makes it an ordinary page again. Freed, it is
+  // kept anew, and a force purge purges it at once, only once.
+  let b = alloc(h, 0, 1000, 8);
+  assert_eq!(b / PAGE_SIZE, a / PAGE_SIZE);
+  free(h, b);
+  h.purge();
+  assert_eq!(purged(), 2 * PAGE_SIZE);
+  h.purge();
+  assert_eq!(purged(), 2 * PAGE_SIZE);
+  h.check_indexes();
+}
+
+#[test]
+fn trimming_keeps_the_newest_page_of_a_class() {
+  let h = heap();
+  // A class size, so that the blocks fill whole pages.
+  let size = 1024;
+  let per_page = PAGE_SIZE / size;
+  // Two pages of the class: the lower one first, then the newest.
+  let offs: Vec<_> = (0..2 * per_page).map(|_| alloc(h, 0, size, 8)).collect();
+  let (low, newest) = (offs[0] / PAGE_SIZE, offs[2 * per_page - 1] / PAGE_SIZE);
+  assert!(low < newest);
+  for o in offs {
+    free(h, o);
+  }
+  let trim = || {
+    let before = h.maintenance_stats();
+    h.purge();
+    h.check_indexes();
+    let after = h.maintenance_stats();
+    (
+      after.released_pages - before.released_pages,
+      after.kept_newest_pages - before.kept_newest_pages,
+    )
+  };
+  assert_eq!(trim(), (1, 1));
+  assert_eq!((h.usage().small_pages, h.newest_pages()), (1, 1));
+  // The kept page still serves its class, but the lower page, now free,
+  // comes first and becomes the newest page of the class.
+  let x = alloc(h, 0, size, 8);
+  assert_eq!(x / PAGE_SIZE, low);
+  // The page that was the newest is released on the next pass, without
+  // another free to make it a candidate.
+  assert_eq!(trim(), (1, 0));
+  assert_eq!(h.usage().small_pages, 1);
+  // The newest page is kept once its last block is freed.
+  free(h, x);
+  assert_eq!(trim(), (0, 1));
+  assert_eq!(h.usage().small_pages, 1);
 }
 
 #[test]
@@ -1757,10 +1832,11 @@ fn usage_tells_memory_apart() {
   assert_eq!((u.pages_in_use, u.dirty_pages, u.clean_pages), (1, 0, 62));
   free(h, small);
   h.purge();
+  // The small page, the newest of its class, stays, with nothing out.
   let u = h.usage();
   assert_eq!(
     (u.pages_in_use, u.small_pages, u.small_bytes_out),
-    (0, 0, 0)
+    (1, 1, 0)
   );
   assert_eq!(u.dirty_pages, h.dirty_pages());
 }
@@ -2047,15 +2123,20 @@ fn wrapped_batches_credit_each_segment_its_own_runs() {
 fn busy_shards_do_not_hold_up_later_ones() {
   let h = heap();
   h.set_slice_work(4);
-  // A fully free small page in shard 40.
-  let o = alloc(h, 40, 1000, 8);
-  free(h, o);
+  // A fully free small page in shard 40, followed by the newest page of
+  // its class, which trimming keeps.
+  let offs: Vec<_> = (0..2 * PAGE_SIZE / 1024)
+    .map(|_| alloc(h, 40, 1024, 8))
+    .collect();
+  for o in offs {
+    free(h, o);
+  }
   let before = h.maintenance_stats();
   // Shard 5 stays locked for a whole force purge of many small slices.
   h.with_shard_held(5, || h.purge());
   let w = work_since(before, h.maintenance_stats());
   assert_eq!((w[BUSY], w[RELEASED]), (1, 1));
-  assert_eq!(h.usage().small_pages, 0);
+  assert_eq!(h.usage().small_pages, 1);
 }
 
 #[test]
@@ -2684,17 +2765,18 @@ fn fork_children_do_not_wait_for_vanished_caches() {
 fn trim_since(
   before: crate::core::MaintenanceStats,
   after: crate::core::MaintenanceStats,
-) -> (u64, u64, u64, u64) {
+) -> (u64, u64, u64, u64, u64) {
   (
     after.trim_pages_inspected - before.trim_pages_inspected,
     after.released_pages - before.released_pages,
     after.stale_empty_candidates - before.stale_empty_candidates,
     after.reconciled_pages - before.reconciled_pages,
+    after.kept_newest_pages - before.kept_newest_pages,
   )
 }
 
 /// Runs a decay sweep and returns its trimming counters.
-fn decay_trim(h: &Heap<MockOs>) -> (u64, u64, u64, u64) {
+fn decay_trim(h: &Heap<MockOs>) -> (u64, u64, u64, u64, u64) {
   let before = h.maintenance_stats();
   h.decay();
   h.check_indexes();
@@ -2736,21 +2818,26 @@ fn trimming_leaves_a_page_it_does_not_release_first_in_line() {
 #[test]
 fn the_lowest_page_is_taken_whether_free_or_partly_used() {
   let h = heap();
-  // Page 0 of the segment for the 1000-byte class, page 1 for the 48-byte
-  // class.
-  let a = alloc(h, 0, 1000, 8);
+  // Pages 0 and 2 of the segment for the 1000-byte class, page 1 for the
+  // 48-byte class.
+  let a: Vec<_> = (0..cap_1000()).map(|_| alloc(h, 0, 1000, 8)).collect();
   let b = alloc(h, 0, 48, 8);
-  assert_eq!(b / PAGE_SIZE, a / PAGE_SIZE + 1);
-  free(h, a);
+  let a2 = alloc(h, 0, 1000, 8);
+  let page = a[0] / PAGE_SIZE;
+  assert_eq!((b / PAGE_SIZE, a2 / PAGE_SIZE), (page + 1, page + 2));
+  for o in a.into_iter().chain([a2]) {
+    free(h, o);
+  }
   h.purge();
-  assert_eq!(h.usage().small_pages, 1);
+  // Page 0 is released; page 2, the newest page of its class, is kept.
+  assert_eq!(h.usage().small_pages, 2);
   h.check_indexes();
   // Page 0 is free again and lies below the partly used page 1: the
   // 48-byte class takes it.
   let s = h.search_stats();
   let b2 = alloc(h, 0, 48, 8);
   let t = h.search_stats();
-  assert_eq!(b2 / PAGE_SIZE, a / PAGE_SIZE);
+  assert_eq!(b2 / PAGE_SIZE, page);
   assert_eq!(
     (
       t.pages_inspected - s.pages_inspected,
@@ -2760,12 +2847,12 @@ fn the_lowest_page_is_taken_whether_free_or_partly_used() {
   );
   // Now page 0 is the class's lowest page with free blocks: taken first.
   let b3 = alloc(h, 0, 48, 8);
-  assert_eq!(b3 / PAGE_SIZE, a / PAGE_SIZE);
-  // A free page above a partly used one waits: page 2 is free, and the
+  assert_eq!(b3 / PAGE_SIZE, page);
+  // A free page above a partly used one waits: page 3 is free, and the
   // class keeps claiming from page 1 once page 0 is full.
   let cap = crate::core::class::capacity(crate::core::class::class_of(48));
   let fill: Vec<_> = (0..cap - 2).map(|_| alloc(h, 0, 48, 8)).collect();
-  assert!(fill.iter().all(|&o| o / PAGE_SIZE == a / PAGE_SIZE));
+  assert!(fill.iter().all(|&o| o / PAGE_SIZE == page));
   let next = alloc(h, 0, 48, 8);
   assert_eq!(next / PAGE_SIZE, b / PAGE_SIZE);
   h.check_indexes();
@@ -2777,14 +2864,18 @@ fn the_lowest_page_is_taken_whether_free_or_partly_used() {
 #[test]
 fn a_released_page_reused_at_the_same_offset_is_not_claimed_from() {
   let h = heap();
-  let a = alloc(h, 0, 1000, 8);
-  let page = a / PAGE_SIZE;
-  free(h, a);
+  // A full page of the class and the class's newest page after it.
+  let offs: Vec<_> = (0..=cap_1000()).map(|_| alloc(h, 0, 1000, 8)).collect();
+  let page = offs[0] / PAGE_SIZE;
+  for o in offs {
+    free(h, o);
+  }
   h.purge();
-  assert_eq!(h.usage().small_pages, 0);
+  // The first page is released, the newest kept.
+  assert_eq!(h.usage().small_pages, 1);
   h.check_indexes();
   // The page's next life is a one-page run at the same offset; the class
-  // takes a new page.
+  // claims from its kept page.
   let run = alloc(h, 0, PAGE_SIZE, 8);
   assert_eq!(run / PAGE_SIZE, page);
   let b = alloc(h, 0, 1000, 8);
@@ -2802,38 +2893,49 @@ fn a_released_page_reused_at_the_same_offset_is_not_claimed_from() {
   free(h, c);
   free(h, d);
   h.purge();
-  assert_eq!(h.usage().small_pages, 0);
+  // Only the newest page of each of the two classes stays.
+  assert_eq!((h.usage().small_pages, h.newest_pages()), (2, 2));
 }
 
 #[test]
 fn a_returned_and_reacquired_segment_is_searched_again() {
   let h = heap();
   h.set_purge_delay_ms(0);
-  // Shard 0's first segment is full of one run; the small page goes to a
-  // second segment.
+  // Shard 0's first two segments are full of one run each; the small page
+  // goes to a third segment.
   let run = alloc(h, 0, MAX_RUN_PAGES * PAGE_SIZE, 8);
-  let a = alloc(h, 0, 1000, 8);
-  let seg = a / SEGMENT_SIZE;
-  assert_ne!(seg, run / SEGMENT_SIZE);
-  free(h, a);
+  let run2 = alloc(h, 0, MAX_RUN_PAGES * PAGE_SIZE, 8);
+  let fill: Vec<_> = (0..cap_1000()).map(|_| alloc(h, 0, 1000, 8)).collect();
+  let seg = fill[0] / SEGMENT_SIZE;
+  assert!(seg != run / SEGMENT_SIZE && seg != run2 / SEGMENT_SIZE);
+  // The class's next page, its newest, which trimming keeps, goes to the
+  // first segment once its run is freed.
   free(h, run);
+  let a = alloc(h, 0, 1000, 8);
+  assert_eq!(a / SEGMENT_SIZE, run / SEGMENT_SIZE);
+  for o in fill {
+    free(h, o);
+  }
+  free(h, run2);
   let before = h.maintenance_stats();
-  // Both segments are empty: one is returned, one kept for the shard.
+  // Two segments are empty: one is returned, one kept for the shard.
   h.purge();
   h.purge();
   assert_eq!(
     h.maintenance_stats().returned_segments - before.returned_segments,
     1
   );
-  assert_eq!(h.usage().small_pages, 0);
+  assert_eq!(h.usage().small_pages, 1);
   h.check_indexes();
-  // The returned segment comes back, whole, as a huge block, then as the
-  // segment of new small pages.
+  // The returned segment comes back, whole, as a huge block, then the
+  // class fills its page and takes a new one.
   let huge = alloc(h, 0, SEGMENT_SIZE, 8);
-  let b = alloc(h, 0, 1000, 8);
+  let b: Vec<_> = (0..cap_1000()).map(|_| alloc(h, 0, 1000, 8)).collect();
   h.check_indexes();
   free(h, huge);
-  free(h, b);
+  for o in b.into_iter().chain([a]) {
+    free(h, o);
+  }
   h.purge();
   h.check_indexes();
 }
@@ -2853,21 +2955,22 @@ fn the_last_free_of_a_page_makes_it_a_candidate() {
     }
   }
   // No page is fully free: no candidate, nothing inspected.
-  assert_eq!(decay_trim(h), (0, 0, 0, 0));
+  assert_eq!(decay_trim(h), (0, 0, 0, 0, 0));
   // Freeing the last block of one page publishes it, and trimming checks
   // that page only.
   free(h, offs[3 * cap]);
-  assert_eq!(decay_trim(h), (1, 1, 0, 0));
+  assert_eq!(decay_trim(h), (1, 1, 0, 0, 0));
   assert_eq!(h.usage().small_pages, 7);
   // A reconciling sweep checks every small page and finds nothing more.
   let before = h.maintenance_stats();
   h.purge();
-  assert_eq!(trim_since(before, h.maintenance_stats()), (7, 0, 0, 0));
+  assert_eq!(trim_since(before, h.maintenance_stats()), (7, 0, 0, 0, 0));
   for p in (0..8).filter(|&p| p != 3) {
     free(h, offs[p * cap]);
   }
-  assert_eq!(decay_trim(h), (7, 7, 0, 0));
-  assert_eq!(h.usage().small_pages, 0);
+  // All are released but the last, the newest page of the class.
+  assert_eq!(decay_trim(h), (7, 6, 0, 0, 1));
+  assert_eq!(h.usage().small_pages, 1);
 }
 
 #[test]
@@ -2878,42 +2981,53 @@ fn stale_candidates_are_checked_and_dropped() {
   let offs: Vec<_> = (0..cap).map(|_| alloc(h, 0, 1000, 8)).collect();
   let page = offs[0] / PAGE_SIZE;
   assert!(offs.iter().all(|o| o / PAGE_SIZE == page));
+  // The class's newest page, above it, stays in use.
+  let newer = alloc(h, 0, 1000, 8);
+  assert_eq!(newer / PAGE_SIZE, page + 1);
   for &o in &offs {
     free(h, o);
   }
   // The page is claimed from again: its candidate is stale.
   let again = alloc(h, 0, 1000, 8);
   assert_eq!(again / PAGE_SIZE, page);
-  assert_eq!(decay_trim(h), (1, 0, 1, 0));
-  assert_eq!(h.usage().small_pages, 1);
+  assert_eq!(decay_trim(h), (1, 0, 1, 0, 0));
+  assert_eq!(h.usage().small_pages, 2);
   // Its last free publishes it again.
   free(h, again);
-  assert_eq!(decay_trim(h), (1, 1, 0, 0));
-  assert_eq!(h.usage().small_pages, 0);
+  assert_eq!(decay_trim(h), (1, 1, 0, 0, 0));
+  assert_eq!(h.usage().small_pages, 1);
+  // The newest page is checked, and kept, once it is fully free.
+  free(h, newer);
+  assert_eq!(decay_trim(h), (1, 0, 0, 0, 1));
+  assert_eq!(h.usage().small_pages, 1);
 }
 
 #[test]
 fn cache_flushes_and_retirement_publish_candidates() {
   let h = heap();
   h.set_reconcile_epochs(0);
+  // Kept pages are purged at the pass that keeps them, so they stop being
+  // candidates there.
+  h.set_purge_delay_ms(0);
   let tc = cache(h);
   let a = alloc_c(h, &tc, 16, 8);
   let b = alloc_c(h, &tc, 1000, 8);
   free_c(h, &tc, a);
   free_c(h, &tc, b);
   // Buffered frees and claimed words keep both pages: no candidate.
-  assert_eq!(decay_trim(h), (0, 0, 0, 0));
+  assert_eq!(decay_trim(h), (0, 0, 0, 0, 0));
   assert_eq!(h.usage().small_pages, 2);
-  // A flush returns them, and the last of each page publishes it.
+  // A flush returns them, and the last of each page publishes it. Each is
+  // the newest page of its class, so trimming checks it and keeps it.
   h.flush(&tc);
-  assert_eq!(decay_trim(h), (2, 2, 0, 0));
+  assert_eq!(decay_trim(h), (2, 0, 0, 0, 2));
   // Again through retirement.
   let c = alloc_c(h, &tc, 48, 8);
   free_c(h, &tc, c);
-  assert_eq!(decay_trim(h), (0, 0, 0, 0));
+  assert_eq!(decay_trim(h), (0, 0, 0, 0, 0));
   h.retire(&tc);
-  assert_eq!(decay_trim(h), (1, 1, 0, 0));
-  assert_eq!(h.usage().small_pages, 0);
+  assert_eq!(decay_trim(h), (1, 0, 0, 0, 1));
+  assert_eq!(h.usage().small_pages, 3);
 }
 
 #[test]
@@ -2921,14 +3035,18 @@ fn reconciling_sweeps_recover_lost_candidates() {
   let h = heap();
   h.set_reconcile_epochs(0);
   for reconcile in [Some(1), None] {
-    let a = alloc(h, 0, 1000, 8);
-    free(h, a);
+    // Two pages of the class: the second of them, whichever it is, is its
+    // newest page, which trimming keeps.
+    let offs: Vec<_> = (0..=cap_1000()).map(|_| alloc(h, 0, 1000, 8)).collect();
+    for o in offs {
+      free(h, o);
+    }
     h.forget_empty_candidates();
-    // (`check_indexes` would catch the lost candidate.)
+    // (`check_indexes` would catch the lost candidates.)
     let before = h.maintenance_stats();
     h.decay();
-    assert_eq!(trim_since(before, h.maintenance_stats()), (0, 0, 0, 0));
-    assert_eq!(h.usage().small_pages, 1);
+    assert_eq!(trim_since(before, h.maintenance_stats()), (0, 0, 0, 0, 0));
+    assert_eq!(h.usage().small_pages, 2);
     let before = h.maintenance_stats();
     match reconcile {
       // A decay sweep on a reconciling epoch...
@@ -2940,8 +3058,8 @@ fn reconciling_sweeps_recover_lost_candidates() {
       // ...or a force purge.
       None => h.purge(),
     }
-    assert_eq!(trim_since(before, h.maintenance_stats()), (1, 1, 0, 1));
-    assert_eq!(h.usage().small_pages, 0);
+    assert_eq!(trim_since(before, h.maintenance_stats()), (2, 1, 0, 1, 1));
+    assert_eq!(h.usage().small_pages, 1);
     h.check_indexes();
   }
 }
@@ -2986,8 +3104,9 @@ fn concurrent_frees_and_trims_lose_no_candidate() {
     }
   });
   h.check_indexes();
-  // Without reconciling, the candidates alone find every fully free page.
-  let (_, _, _, reconciled) = decay_trim(h);
+  // Without reconciling, the candidates alone find every fully free page
+  // but the newest of each shard and class, which trimming keeps.
+  let (_, _, _, reconciled, _) = decay_trim(h);
   assert_eq!(reconciled, 0);
-  assert_eq!(h.usage().small_pages, 0);
+  assert_eq!(h.usage().small_pages, h.newest_pages());
 }

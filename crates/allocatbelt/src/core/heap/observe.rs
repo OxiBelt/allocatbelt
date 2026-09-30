@@ -233,8 +233,10 @@ impl<O: Os> Heap<O> {
   /// running: every shard's segments are its own and listed in address
   /// order, no page of a class with free blocks lies below the class's
   /// bound and no free page below the shard's, every small page's free
-  /// counter is the number of its free bits, and every small page whose
-  /// blocks are all free is an empty-page candidate of its segment.
+  /// counter is the number of its free bits, every small page whose
+  /// blocks are all free is an empty-page candidate of its segment unless
+  /// it is the newest page of its class, and each class's newest page is a
+  /// small page of the class in one of the shard's segments.
   pub fn check_indexes(&self) {
     for (s, sh) in self.shards.iter().enumerate() {
       let mut segs = std::vec::Vec::new();
@@ -296,7 +298,16 @@ impl<O: Os> Heap<O> {
                 "page {i} of segment {seg} (class {c}) has free blocks below the bound {low}"
               );
             }
-            if proto::all_free(pm.free(), class::capacity(c) as u64) {
+            // Only a kept page, or one kept until a newer page was set
+            // up, has an age, and a claim clears it.
+            assert!(
+              pm.since().load(Relaxed) == 0
+                || proto::all_free(pm.free(), class::capacity(c) as u64),
+              "page {i} of segment {seg} (class {c}) has blocks out but an age"
+            );
+            if proto::all_free(pm.free(), class::capacity(c) as u64)
+              && cs.newest.load(Relaxed) != (first + i) as u64
+            {
               assert_ne!(
                 empty & 1 << i,
                 0,
@@ -306,7 +317,29 @@ impl<O: Os> Heap<O> {
           }
         }
       }
+      for (c, cs) in sh.classes.iter().enumerate() {
+        let newest = cs.newest.load(Relaxed);
+        if newest != NO_PAGE {
+          let seg = newest as usize / PAGES_PER_SEGMENT;
+          let bit = 1u64 << (newest as usize % PAGES_PER_SEGMENT);
+          assert!(
+            segs.contains(&seg) && self.seg_meta(seg)[SEG_CLS + c].load(Relaxed) & bit != 0,
+            "newest page {newest} of shard {s} (class {c}) is not a page of the class"
+          );
+        }
+      }
     }
+  }
+
+  /// The pages that are the newest of their shard and class, which
+  /// trimming keeps.
+  pub fn newest_pages(&self) -> usize {
+    self
+      .shards
+      .iter()
+      .flat_map(|sh| &sh.classes)
+      .filter(|cs| cs.newest.load(Relaxed) != NO_PAGE)
+      .count()
   }
 }
 

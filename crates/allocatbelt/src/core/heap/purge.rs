@@ -24,7 +24,10 @@
 //! * an explicit [`Heap::purge`] returns everything it can right away.
 //!
 //! Every pass also releases small pages whose blocks are all free, turning
-//! them into dirty free pages that the time rule then handles. It finds
+//! them into dirty free pages that the time rule then handles, except the
+//! newest page of each shard and class: that page stays a page of its
+//! class, and the same time rule purges its memory in place (see
+//! [`Heap::release_empty_pages`]). It finds
 //! them through the empty-page candidates that frees publish (see
 //! `proto`), not by checking every small page; force sweeps and every
 //! `RECONCILE_EPOCHS`-th decay sweep (see `reclaim`)
@@ -41,11 +44,12 @@
 //! claimed pages are allocated as far as every other thread can tell, so
 //! nothing hands them out while their purge is in flight, however long the
 //! batch takes. Both take the lock of the shard that owns the segment, as
-//! every change to its page words does; the purge itself runs outside it. A run the purger reports as failed stays dirty and is not
-//! reported as zero.
+//! every change to its page words does; the purge itself runs outside it,
+//! except for a kept newest page, purged under that lock. A run the purger
+//! reports as failed stays dirty and is not reported as zero.
 
 use super::maint::PassWork;
-use super::reclaim::Want;
+use super::reclaim::{NO_CUTOFF, Want};
 use super::*;
 
 /// Decay epochs per purge delay.
@@ -340,11 +344,17 @@ impl<O: Os> Heap<O> {
     batch.nsegs = 0;
   }
 
-  /// Releases the small pages of segment `seg` whose blocks are all free
-  /// and returns the number of pages it checked. Checks the segment's
-  /// empty-page candidates; with `reconcile`, every small page of the
-  /// segment instead (counting releases that had no candidate). Caller
-  /// holds the lock of `sh`, the shard that owns the segment.
+  /// Releases the small pages of segment `seg` whose blocks are all free,
+  /// except the newest page of each class, and returns its work: the
+  /// number of pages it checked and of kept pages it purged. Checks the segment's empty-page candidates; with
+  /// `reconcile`, every small page of the segment instead (counting
+  /// releases that had no candidate). Caller holds the lock of `sh`, the
+  /// shard that owns the segment.
+  ///
+  /// A fully free newest page is kept, and its memory purged once it has
+  /// been kept that way since epoch `cutoff` or earlier (at once if
+  /// `cutoff` is `u64::MAX`), `epoch` being the sweep's. Until then it stays
+  /// a candidate, so later sweeps check its age again.
   ///
   /// A candidate is only a request to look: the page is released if it is
   /// still a small page of its class here (`SEG_CLS`, changed under this
@@ -357,6 +367,7 @@ impl<O: Os> Heap<O> {
     seg: usize,
     m: &[AtomicU64],
     reconcile: bool,
+    (cutoff, epoch): (u64, u64),
     work: &mut PassWork,
   ) -> u64 {
     let hinted = proto::take_candidates(&m[SEG_EMPTY]);
@@ -366,7 +377,7 @@ impl<O: Os> Heap<O> {
         pages |= m[SEG_CLS + c].load(Relaxed);
       }
     }
-    let mut inspected = 0;
+    let (mut inspected, mut purges) = (0, 0);
     while pages != 0 {
       let i = pages.trailing_zeros() as usize;
       let bit = 1u64 << i;
@@ -377,8 +388,17 @@ impl<O: Os> Heap<O> {
       let c = ((info >> 8) & 0xFF) as usize;
       let small =
         info & 0xFF == PAGE_SMALL && c < NUM_CLASSES && m[SEG_CLS + c].load(Relaxed) & bit != 0;
+      let page = seg * PAGES_PER_SEGMENT + i;
       if small && proto::all_free(pm.free(), class::capacity(c) as u64) {
-        self.release_small_page(sh, seg * PAGES_PER_SEGMENT + i, m, c);
+        if sh.classes[c].newest.load(Relaxed) == page as u64 {
+          // Kept: the page the shard set up last for the class is not
+          // released. It becomes a candidate again once a newer page of
+          // the class is set up ([`Heap::new_small_page`]).
+          work.kept_newest_pages += 1;
+          purges += u64::from(self.purge_kept_page(page, pm, m, bit, (cutoff, epoch), work));
+          continue;
+        }
+        self.release_small_page(sh, page, m, c);
         work.released_pages += 1;
         if hinted & bit == 0 {
           work.reconciled_pages += 1;
@@ -388,6 +408,42 @@ impl<O: Os> Heap<O> {
       }
     }
     work.trim_pages_inspected += inspected;
-    inspected
+    inspected + purges
+  }
+
+  /// Ages a kept, fully free newest page (bit `bit` of segment metadata
+  /// `m`) and purges its memory once it is old enough, as
+  /// [`Heap::release_empty_pages`] describes. The page stays a page of its
+  /// class with all its blocks free, so the purge runs under the owner's
+  /// lock, which every claim takes: no block of it is handed out while its
+  /// contents are discarded. One page, once per time it is kept fully
+  /// free, so the lock is held for one small `madvise`. Returns whether it
+  /// tried to purge.
+  fn purge_kept_page(
+    &self,
+    page: usize,
+    pm: PageMeta<'_>,
+    m: &[AtomicU64],
+    bit: u64,
+    (cutoff, epoch): (u64, u64),
+    work: &mut PassWork,
+  ) -> bool {
+    let stamp = pm.since().load(Relaxed);
+    if stamp == KEPT_PURGED {
+      return false;
+    }
+    if stamp == 0 {
+      pm.since().store(epoch + 1, Relaxed);
+    }
+    let since = if stamp == 0 { epoch } else { stamp - 1 };
+    let due = cutoff == u64::MAX || (cutoff != NO_CUTOFF && since <= cutoff);
+    if due && self.os.purge(page << PAGE_SHIFT, PAGE_SIZE) {
+      pm.since().store(KEPT_PURGED, Relaxed);
+      work.purged_pages += 1;
+    } else {
+      // Checked again by the next sweep.
+      m[SEG_EMPTY].store(m[SEG_EMPTY].load(Relaxed) | bit, Relaxed);
+    }
+    due
   }
 }

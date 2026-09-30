@@ -106,7 +106,9 @@ pub struct MaintenanceStats {
   /// by a later pass.
   pub failed_runs: u64,
   /// Pages whose purge succeeded: memory handed back to the OS. Not the
-  /// same as a drop in the process's RSS, which the OS decides.
+  /// same as a drop in the process's RSS, which the OS decides. Includes
+  /// kept small pages (see [`MaintenanceStats::kept_newest_pages`]) whose
+  /// memory trimming purged.
   pub purged_pages: u64,
   /// Owned segments whose dirty free pages a pass inspected.
   pub segments_inspected: u64,
@@ -134,6 +136,12 @@ pub struct MaintenanceStats {
   /// decay sweep) released without a candidate. 0 unless a candidate was
   /// lost, or a free published it while the sweep ran.
   pub reconciled_pages: u64,
+  /// Fully free small pages trimming checked and kept because each was
+  /// the page its shard set up last for its class: at most one page per
+  /// shard and class stays until a newer one is set up. A kept page is
+  /// checked by every sweep until its memory is purged, after the purge
+  /// delay.
+  pub kept_newest_pages: u64,
   /// Passes an allocating or freeing thread would have run but skipped,
   /// because another thread held the purge lock.
   pub skipped_passes: u64,
@@ -181,10 +189,11 @@ pub(super) enum Stat {
   StalledCycle,
   StaleEmptyCandidate,
   ReconciledPage,
+  KeptNewestPage,
 }
 
 /// Number of [`Stat`]s.
-pub(super) const STATS: usize = 24;
+pub(super) const STATS: usize = 25;
 
 /// The work of one slice, counted in private and added to the shared
 /// counters once when the slice ends.
@@ -202,6 +211,7 @@ pub(super) struct PassWork {
   pub(super) returned_segments: u64,
   pub(super) stale_empty_candidates: u64,
   pub(super) reconciled_pages: u64,
+  pub(super) kept_newest_pages: u64,
 }
 
 impl PassWork {
@@ -219,6 +229,7 @@ impl PassWork {
       returned_segments: 0,
       stale_empty_candidates: 0,
       reconciled_pages: 0,
+      kept_newest_pages: 0,
     }
   }
 }
@@ -405,6 +416,7 @@ impl<O: Os> Heap<O> {
     self.count_n(Stat::ReturnedSegment, w.returned_segments);
     self.count_n(Stat::StaleEmptyCandidate, w.stale_empty_candidates);
     self.count_n(Stat::ReconciledPage, w.reconciled_pages);
+    self.count_n(Stat::KeptNewestPage, w.kept_newest_pages);
   }
 
   /// The housekeeping counters so far.
@@ -429,6 +441,7 @@ impl<O: Os> Heap<O> {
       returned_segments: s(Stat::ReturnedSegment),
       stale_empty_candidates: s(Stat::StaleEmptyCandidate),
       reconciled_pages: s(Stat::ReconciledPage),
+      kept_newest_pages: s(Stat::KeptNewestPage),
       skipped_passes: s(Stat::SkippedPass),
       slices: s(Stat::Slice),
       inline_slices: s(Stat::InlineSlice),

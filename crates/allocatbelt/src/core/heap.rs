@@ -22,7 +22,10 @@
 //!   [1] P_FREE     number of set bits in the bitmap
 //!   [2]            reserved
 //!   [3] P_SINCE    free pages: decay epoch in which the page was last
-//!                  marked dirty
+//!                  marked dirty; small pages: decay epoch (+ 1) in which
+//!                  trimming first kept the page, the newest of its class,
+//!                  fully free, [`KEPT_PURGED`] once it purged the page's
+//!                  memory, or 0
 //!   [4..68]        free bitmap (1 = free block)
 //! ```
 //!
@@ -240,7 +243,11 @@ const SEG_HUGE_TAIL: u64 = 3;
 const P_INFO: usize = 0;
 const P_FREE: usize = 1;
 /// Free pages: the decay epoch in which the page was last marked dirty.
+/// Small pages: see the layout above.
 const P_SINCE: usize = 3;
+/// `P_SINCE` of a small page kept as the newest of its class whose memory
+/// trimming purged. It stays so until a block is claimed from the page.
+const KEPT_PURGED: u64 = u64::MAX;
 const P_BITMAP: usize = 4;
 
 const PAGE_FREE: u64 = 0;
@@ -284,12 +291,18 @@ struct ClassState {
   /// the last free block of that page raises it past the page, and a free
   /// into a page below it, or a new page below it, lowers it to that page.
   low: AtomicU64,
+  /// The page of this class the shard set up last ([`NO_PAGE`]: none
+  /// yet). Trimming does not release it, so it stays a small page of the
+  /// class in one of the shard's segments until a newer page replaces it.
+  /// Changed under the shard lock, by [`Heap::new_small_page`].
+  newest: AtomicU64,
 }
 
 impl ClassState {
   const fn new() -> Self {
     Self {
       low: AtomicU64::new(NO_PAGE),
+      newest: AtomicU64::new(NO_PAGE),
     }
   }
 }
@@ -780,6 +793,10 @@ impl<O: Os> Heap<O> {
       _ => return Some(None),
     };
     let pm = self.page_meta(page);
+    // Blocks are handed out again: a kept page's age and purge are void.
+    if pm.since().load(Relaxed) != 0 {
+      pm.since().store(0, Relaxed);
+    }
     let words = &pm.bitmaps()[..class::bitmap_words(c)];
     let claimed = if one {
       proto::claim_block(words, pm.free(), sh.random())
@@ -910,6 +927,7 @@ impl<O: Os> Heap<O> {
       pm.bitmap(w).store(v, Relaxed);
     }
     pm.free().store(cap as u64, Relaxed);
+    pm.since().store(0, Relaxed);
     pm.info().store(PAGE_SMALL | (c as u64) << 8, Release);
     m[SEG_CLS + c].store(m[SEG_CLS + c].load(Relaxed) | 1 << in_seg, Relaxed);
     let at = page as u64;
@@ -918,6 +936,23 @@ impl<O: Os> Heap<O> {
     // It was the lowest free page if the bound was on it.
     if sh.free_low.load(Relaxed) == at {
       sh.free_low.store(at + 1, Relaxed);
+    }
+    // The page set up before this one may be released from now on. If its
+    // blocks are all free, trimming dropped its candidate while it was the
+    // newest, so it becomes one again.
+    let prev = cs.newest.load(Relaxed);
+    cs.newest.store(at, Relaxed);
+    if prev != NO_PAGE {
+      let (pm, in_seg) = (
+        self.seg_meta(prev as usize / PAGES_PER_SEGMENT),
+        prev as usize % PAGES_PER_SEGMENT,
+      );
+      proto::publish_if_empty(
+        &pm[SEG_EMPTY],
+        1 << in_seg,
+        PageMeta::new(pm, in_seg).free().load(Relaxed),
+        cap as u64,
+      );
     }
     page
   }

@@ -70,6 +70,8 @@ Added by Stage E ([region.md](../region.md)): the opt-in `Region` API, with `Reg
 
 Added with the Tokio integration ([tokio.md](../tokio.md)): `Allocatbelt::set_thread_shard` and `CacheStats::shard`. The integration itself is the separate crate `allocatbelt-tokio`, `publish = false`; publishing it would be its own decision.
 
+Changed after design reviews kept outside this repository (2026-09-30, [../design-constraints.md](../design-constraints.md)): `SearchStats` replaced `cursor_claims`, `cursor_retired`, `page_searches`, `candidates`, `stale_hints` and `cursor_invalidations` with `pages_inspected` and `full_pages_passed` ("Pages are chosen by address"), and `MaintenanceStats` gained `kept_newest_pages` ("The newest page of a class stays").
+
 Changed in this review, so that later additions are not breaking:
 
 - `#[non_exhaustive]` on `MaintenanceStats`, `PurgeBackend`, `Capabilities`, `RingError`, `RseqStatus` and `RseqUnavailable`: types whose fields or variants are expected to grow (new counters, backends, probe results, rseq failure causes). The other report and policy types already were. Users read these types; they cannot build them with a literal or match them exhaustively any more, which nothing in this repository did.

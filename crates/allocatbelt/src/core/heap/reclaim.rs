@@ -264,7 +264,7 @@ const FORCE: u64 = 3;
 
 /// The purge phase is skipped (a decay sweep before any page is old
 /// enough).
-const NO_CUTOFF: u64 = u64::MAX - 1;
+pub(super) const NO_CUTOFF: u64 = u64::MAX - 1;
 
 /// What the caller of a slice wants done.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -883,7 +883,7 @@ impl<O: Os> Heap<O> {
         let seg = cur as usize - 1;
         let m = self.seg_meta(seg);
         let next = m[SEG_NEXT].load(Relaxed);
-        *work += 1 + self.release_empty_pages(sh, seg, m, st.reconcile, pw);
+        *work += 1 + self.release_empty_pages(sh, seg, m, st.reconcile, (st.cutoff, st.epoch), pw);
         let empty = m[SEG_PAGES].load(Acquire) == GUARD_BIT;
         let expired = if empty && st.kept_empty {
           // Idle since epoch `since - 1`; stamped by the first sweep that

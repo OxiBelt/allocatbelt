@@ -171,20 +171,30 @@ fn exiting_threads_return_their_caches() {
     }
     GLOBAL.purge();
     GLOBAL.purge();
-    GLOBAL.segments_in_use()
+    (GLOBAL.segments_in_use(), GLOBAL.heap_usage().small_pages)
   };
   // Threads are spread over the 64 shards round-robin, and each shard keeps
-  // one empty (purged) segment; warm them all up before measuring.
+  // one empty (purged) segment and the newest page of each size class it
+  // used; warm them all up before measuring.
   for _ in 0..4 {
     round();
   }
-  let first = round();
-  let mut last = first;
+  let (_, first) = round();
   for _ in 0..6 {
-    last = round();
+    let (segments, small) = round();
+    // Other tests allocate concurrently, so allow a little noise. The kept
+    // pages move from round to round, and so do the segments they hold,
+    // but neither accumulates: a segment beyond the one empty segment per
+    // shard holds at least one page.
+    assert!(
+      small <= first + 8,
+      "small pages grew from {first} to {small}"
+    );
+    assert!(
+      segments <= 64 + small + 8,
+      "{segments} segments for {small} small pages"
+    );
   }
-  // Other tests allocate concurrently, so allow a little noise.
-  assert!(last <= first + 8, "segments grew from {first} to {last}");
 }
 
 #[test]

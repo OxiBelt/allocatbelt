@@ -540,17 +540,19 @@ pub fn run(data: &[u8]) {
   if !h.os().purge_fails.load(Ordering::Relaxed) {
     assert_eq!(h.dirty_pages(), 0, "a forced purge left dirty pages");
   }
-  // One (purged) segment per shard at most stays behind.
-  assert!(h.segments_in_use() <= crate::core::SHARDS);
-  check_observations(&h, &caches);
   // Nothing is allocated or cached, and the forced purge released every
-  // small page.
+  // small page but the newest of each shard and class.
+  let newest = h.newest_pages();
   let u = h.usage();
   assert_eq!(
     (u.pages_in_use, u.small_pages, u.small_bytes_out),
-    (0, 0, 0),
+    (newest, newest, 0),
     "{u:?}"
   );
+  // One (purged) segment per shard at most stays behind, besides the
+  // segments holding kept pages.
+  assert!(h.segments_in_use() <= crate::core::SHARDS + newest);
+  check_observations(&h, &caches);
 }
 
 /// Checks the heap's observations (Stage A diagnostics) against each other
@@ -577,7 +579,7 @@ pub fn check_observations(h: &Heap<MockOs>, caches: &[ThreadCache]) {
     "{m:?}"
   );
   assert!(
-    m.released_pages + m.stale_empty_candidates <= m.trim_pages_inspected,
+    m.released_pages + m.stale_empty_candidates + m.kept_newest_pages <= m.trim_pages_inspected,
     "{m:?}"
   );
   // One thread at a time: no free publishes a candidate while a sweep
