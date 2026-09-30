@@ -326,7 +326,9 @@ impl<O: Os> Heap<O> {
       let m = self.seg_meta(seg);
       // The claimed pages keep the segment owned by the same shard.
       let cleared = {
-        let _g = self.owner(m).lock.lock(&self.os);
+        let sh = self.owner(m);
+        let _g = sh.lock.lock(&self.os);
+        sh.lower_free_low(seg * PAGES_PER_SEGMENT + claimed.trailing_zeros() as usize);
         proto::finish_purge(&m[SEG_PAGES], &m[SEG_DIRTY], claimed, done)
       };
       self

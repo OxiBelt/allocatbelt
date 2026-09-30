@@ -862,7 +862,6 @@ impl<O: Os> Heap<O> {
       if st.prev == 0 {
         pw.trimmed_shards += 1;
       }
-      // Class cursors stay: releasing a page drops the cursor on it.
       let mut prev: Option<(usize, &[AtomicU64])> = None;
       let mut cur = sh.segs.load(Relaxed) as u64;
       if st.prev != 0 {

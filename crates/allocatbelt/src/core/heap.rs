@@ -6,7 +6,8 @@
 //! ```text
 //! [0] SEG_HDR    kind | shard << 8 | segment count << 16
 //! [1] SEG_PAGES  occupancy bitmap of the 64 pages (1 = in use)
-//! [2] SEG_NEXT   next segment of the owning shard (index + 1, 0 = end)
+//! [2] SEG_NEXT   next segment of the owning shard (index + 1, 0 = end);
+//!                a shard's segments are listed in address order
 //! [3] SEG_DIRTY  free pages whose memory has not been purged yet; while
 //!                the segment is not owned, non-zero if its memory may hold
 //!                non-zero bytes
@@ -19,9 +20,7 @@
 //! then per page (PAGE_META_WORDS each):
 //!   [0] P_INFO     kind | class << 8 | run length << 16
 //!   [1] P_FREE     number of set bits in the bitmap
-//!   [2] P_LINK     small pages: listed flag | previous page + 1 << 32 |
-//!                  next page + 1, the page's place on its shard's list
-//!                  of pages of its class that may have free blocks
+//!   [2]            reserved
 //!   [3] P_SINCE    free pages: decay epoch in which the page was last
 //!                  marked dirty
 //!   [4..68]        free bitmap (1 = free block)
@@ -31,11 +30,14 @@
 //! free blocks of one claimed bitmap word per size class, as a list of block
 //! numbers, so the fast path is a pop from thread-local `Cell`s with no
 //! atomics and no lock. When the list runs out, the thread takes its shard's
-//! lock and claims the next word of the shard's current page for that
-//! class, found by reading the page's bitmap words. When the page has none
-//! left, the shard takes the next page from its list of pages of the class
-//! that may have free blocks. There are no summary bits over the bitmap
-//! words or the pages.
+//! lock and claims a word from the lowest page by address, among the
+//! shard's segments, that is either a page of the class with free blocks or
+//! a free page (address-ordered first fit); it reads the page's bitmap
+//! words to pick the word. How a page came to qualify (partly used, never
+//! used, used and freed) does not rank it. The search starts from two lower
+//! bounds, one per class and one for free pages, below which nothing
+//! qualifies; they are page numbers, not records of which pages have free
+//! blocks. There are no summary bits over the bitmap words or the pages.
 //!
 //! A thread with a cache buffers its small frees in a small 2-way
 //! set-associative table keyed by (page, bitmap word), and returns a word's
@@ -78,7 +80,6 @@ use crate::core::bits::{pick_bit, run_mask};
 use crate::core::class::{self, MIN_ALIGN, NUM_CLASSES, SMALL_MAX};
 use crate::core::lock::{Guard, Lock, Park};
 use crate::core::proto;
-use crate::core::proto::LISTED;
 use crate::core::{
   ARENA_SIZE, MAX_ALIGN, MAX_SEGMENTS, PAGE_META_WORDS, PAGE_SHIFT, PAGE_SIZE, PAGES_PER_SEGMENT,
   SEGMENT_HEADER_WORDS, SEGMENT_SHIFT, SEGMENT_SIZE, SHARDS,
@@ -238,8 +239,6 @@ const SEG_HUGE_TAIL: u64 = 3;
 
 const P_INFO: usize = 0;
 const P_FREE: usize = 1;
-/// Small pages: the page's place on its shard's list (see [`ClassState`]).
-const P_LINK: usize = 2;
 /// Free pages: the decay epoch in which the page was last marked dirty.
 const P_SINCE: usize = 3;
 const P_BITMAP: usize = 4;
@@ -273,55 +272,39 @@ const SHARD_PROBES: usize = 4;
 const INVALID_FREE: &str = "allocatbelt: invalid or double free (pointer is not allocated)";
 const DOUBLE_FREE: &str = "allocatbelt: double free detected";
 
+/// A search bound at no page: nothing qualifies.
+const NO_PAGE: u64 = u64::MAX;
+
 #[derive(Debug)]
 struct ClassState {
-  /// Page (+ 1) this shard currently claims words of this class from; 0
-  /// when there is none. Changed under the shard lock. A non-zero cursor
-  /// always names a listed small page of this class in a segment the shard
-  /// owns: releasing the page ([`Heap::release_small_page`], the only way a
-  /// small page stops being one, and a precondition of returning its
-  /// segment) clears it, and so does taking it off the list.
-  cursor: AtomicU64,
-  /// First and last page (+ 1) of the shard's list of its pages of this
-  /// class that may have free blocks, in the order they were listed; 0
-  /// when it is empty. The pages link each other through their `P_LINK`
-  /// words. Changed under the shard lock, like the links: a new page is
-  /// listed when it is set up, a page is taken off when a claim finds it
-  /// empty or when it is released, and a free into an unlisted page lists
-  /// it again ([`Heap::free_bits`]).
-  head: AtomicU64,
-  tail: AtomicU64,
+  /// A page number at or below the lowest page of this class with free
+  /// blocks among the shard's segments ([`NO_PAGE`]: no page of the class
+  /// has any). A search for the class starts here. Changed under the shard
+  /// lock: a search raises it to the page it stops at, a claim that takes
+  /// the last free block of that page raises it past the page, and a free
+  /// into a page below it, or a new page below it, lowers it to that page.
+  low: AtomicU64,
 }
 
 impl ClassState {
   const fn new() -> Self {
     Self {
-      cursor: AtomicU64::new(0),
-      head: AtomicU64::new(0),
-      tail: AtomicU64::new(0),
+      low: AtomicU64::new(NO_PAGE),
     }
   }
 }
-
-/// The next page (+ 1) in a `P_LINK` word.
-const fn link_next(l: u64) -> u64 {
-  l & 0xFFFF_FFFF
-}
-
-/// The previous page (+ 1) in a `P_LINK` word.
-const fn link_prev(l: u64) -> u64 {
-  (l >> 32) & 0x7FFF_FFFF
-}
-
-// Page numbers (+ 1) fit the 31 bits of a link.
-const _: () = assert!(MAX_SEGMENTS * PAGES_PER_SEGMENT < 0x7FFF_FFFF);
 
 #[derive(Debug)]
 #[repr(align(128))]
 struct Shard {
   lock: Lock,
-  /// Head of the list of segments owned by this shard (segment + 1).
+  /// Head of the list of segments owned by this shard (segment + 1), in
+  /// address order.
   segs: AtomicU32,
+  /// A page number at or below the lowest free page of the shard's
+  /// segments ([`NO_PAGE`]: none is free). Changed under the lock:
+  /// searches raise it, and every change that frees pages lowers it.
+  free_low: AtomicU64,
   /// Random state for placement decisions, stepped under the lock; 0 while
   /// randomization is off.
   rng: AtomicU64,
@@ -336,10 +319,19 @@ impl Shard {
     Self {
       lock: Lock::new(),
       segs: AtomicU32::new(0),
+      free_low: AtomicU64::new(NO_PAGE),
       rng: AtomicU64::new(0),
       classes: [const { ClassState::new() }; NUM_CLASSES],
       stats: [const { AtomicU64::new(0) }; SEARCH_STATS],
     }
+  }
+
+  /// Lowers the bound on the shard's lowest free page to `page`, which
+  /// just became free. Caller holds the lock.
+  fn lower_free_low(&self, page: usize) {
+    self
+      .free_low
+      .store(self.free_low.load(Relaxed).min(page as u64), Relaxed);
   }
 
   /// Next random number, or 0 if randomization is off. Caller holds the
@@ -352,6 +344,18 @@ impl Shard {
     let x = xorshift(x);
     self.rng.store(x, Relaxed);
     (x >> 32) as u32
+  }
+}
+
+/// The pages of a segment whose first page is `first` that are at or
+/// above page `bound`, as a mask.
+const fn pages_from(bound: u64, first: u64) -> u64 {
+  if bound <= first {
+    u64::MAX
+  } else if bound - first >= PAGES_PER_SEGMENT as u64 {
+    0
+  } else {
+    u64::MAX << (bound - first)
   }
 }
 
@@ -436,9 +440,6 @@ impl<'a> PageMeta<'a> {
   }
   fn free(self) -> &'a AtomicU64 {
     &self.0[P_FREE]
-  }
-  fn link(self) -> &'a AtomicU64 {
-    &self.0[P_LINK]
   }
   fn since(self) -> &'a AtomicU64 {
     &self.0[P_SINCE]
@@ -566,8 +567,8 @@ impl<O: Os> Heap<O> {
   /// As [`Heap::alloc`], but also reports whether the block is known to
   /// read as zero, so a zeroing allocation can skip clearing it.
   ///
-  /// This is the uncached path: a small allocation claims a bitmap word
-  /// under the shard lock and returns the blocks it does not use.
+  /// This is the uncached path: a small allocation claims a single block
+  /// under the shard lock.
   pub fn alloc_block(&self, shard_hint: usize, size: usize, align: usize) -> Option<Block> {
     match Self::kind(size, align)? {
       Kind::Small(c) => self
@@ -754,11 +755,12 @@ impl<O: Os> Heap<O> {
   }
 
   /// Claims free blocks of class `c`, every free block of one bitmap word
-  /// or, with `one`, a single block: from the shard's current page, else
-  /// from another page of the class that has free blocks, else, if `grow`,
-  /// from a new page. Returns the page, the word and the claimed bits;
-  /// `Some(None)` when a new page would be needed but `grow` is false, and
-  /// `None` when out of memory. Caller holds the shard lock.
+  /// or, with `one`, a single block, from the page [`Heap::find_page`]
+  /// finds: a page of the class with free blocks, or a free page, which
+  /// becomes a page of the class if `grow`; if there is neither, a page of
+  /// a new segment, if `grow`. Returns the page, the word and the claimed
+  /// bits; `Some(None)` when a new page would be needed but `grow` is
+  /// false, and `None` when out of memory. Caller holds the shard lock.
   fn claim_class(
     &self,
     s: usize,
@@ -767,79 +769,107 @@ impl<O: Os> Heap<O> {
     grow: bool,
     one: bool,
   ) -> Option<Option<(usize, u32, u64)>> {
-    let cs = &sh.classes[c];
     sh.bump(SearchStat::Refill, 1);
-    // A page just set up for the class must have blocks to claim; if not,
-    // the metadata is corrupt, and retrying would take pages forever.
-    let mut fresh = false;
-    let mut searched = false;
-    loop {
-      let cur = cs.cursor.load(Relaxed);
-      if cur != 0 {
-        let page = cur as usize - 1;
-        let pm = self.page_meta(page);
-        let words = &pm.bitmaps()[..class::bitmap_words(c)];
-        let claimed = if one {
-          proto::claim_block(words, pm.free(), sh.random())
-        } else {
-          proto::claim_word(words, pm.free(), sh.random())
-        };
-        if let Some((w, bits)) = claimed {
-          if !searched {
-            sh.bump(SearchStat::CursorClaim, 1);
-          }
-          return Some(Some((page, w, bits)));
-        }
-        if fresh {
-          self
-            .os
-            .fatal("allocatbelt: a new small page has no free blocks");
-        }
-        // No free block left: every free into the page takes this lock
-        // and lists the page again.
-        self.unlist_page(cs, page);
-        sh.bump(SearchStat::CursorRetired, 1);
-        cs.cursor.store(0, Relaxed);
+    let page = match self.find_page(s, sh, c) {
+      Some((page, false)) => page,
+      Some((page, true)) if grow => self.new_small_page(sh, c, page),
+      None if grow => {
+        let seg = self.add_segment(s, sh)?;
+        self.new_small_page(sh, c, seg * PAGES_PER_SEGMENT)
       }
-      searched = true;
-      let page = match self.find_page(sh, c) {
-        Some(p) => p,
-        None if !grow => return Some(None),
-        None => {
-          fresh = true;
-          self.new_small_page(s, sh, c)?
-        }
-      };
-      cs.cursor.store(page as u64 + 1, Relaxed);
+      _ => return Some(None),
+    };
+    let pm = self.page_meta(page);
+    let words = &pm.bitmaps()[..class::bitmap_words(c)];
+    let claimed = if one {
+      proto::claim_block(words, pm.free(), sh.random())
+    } else {
+      proto::claim_word(words, pm.free(), sh.random())
+    };
+    let Some((w, bits)) = claimed else {
+      // Its counter said it had free blocks, or it was just set up.
+      self
+        .os
+        .fatal("allocatbelt: a small page with free blocks has none in its bitmap");
+    };
+    if pm.free().load(Relaxed) == 0 {
+      // No page of the class below this one has a free block either.
+      sh.classes[c].low.store(page as u64 + 1, Relaxed);
     }
+    Some(Some((page, w, bits)))
   }
 
-  /// Finds a page of class `c` with free blocks on the shard's list for
-  /// the class, taking the pages that have none off the list. Caller holds
-  /// the lock.
-  fn find_page(&self, sh: &Shard, c: usize) -> Option<usize> {
+  /// Finds the lowest page by address, among the shard's segments, that is
+  /// either a page of class `c` with free blocks or a free page, searching
+  /// from the class's and the shard's lower bounds up. Returns the page
+  /// and whether it is a free page, or `None` if there is neither, and
+  /// raises the bounds to where the search stopped. Only the address
+  /// orders the candidates: a partly used page and a free page are equal,
+  /// and so are free pages that were used before and ones that were not.
+  /// Caller holds the lock.
+  fn find_page(&self, s: usize, sh: &Shard, c: usize) -> Option<(usize, bool)> {
     let cs = &sh.classes[c];
+    let (low, free_low) = (cs.low.load(Relaxed), sh.free_low.load(Relaxed));
     // Counted locally and added once: the search holds the lock anyway.
-    let (mut cands, mut stale) = (0, 0);
+    let (mut inspected, mut full) = (0, 0);
     let mut found = None;
-    let mut cur = cs.head.load(Relaxed);
-    while cur != 0 {
-      let page = cur as usize - 1;
-      cands += 1;
-      let pm = self.page_meta(page);
-      // Exact under the lock, which every free and claim takes.
-      if pm.free().load(Relaxed) > 0 {
-        found = Some(page);
-        break;
+    let mut cur = self.first_segment_from(s, sh, low.min(free_low));
+    'segs: while cur != 0 {
+      let seg = cur as usize - 1;
+      let m = self.seg_meta(seg);
+      let first = (seg * PAGES_PER_SEGMENT) as u64;
+      // The segment's pages of the class, and its free pages (the guard
+      // page is always taken), each from its bound up.
+      let small = m[SEG_CLS + c].load(Relaxed) & pages_from(low, first);
+      let free = !m[SEG_PAGES].load(Relaxed) & pages_from(free_low, first);
+      let mut pages = small | free;
+      while pages != 0 {
+        let i = pages.trailing_zeros() as usize;
+        pages &= pages - 1;
+        inspected += 1;
+        if free & 1 << i != 0 {
+          found = Some((seg * PAGES_PER_SEGMENT + i, true));
+          break 'segs;
+        }
+        // Exact under the lock, which every free and claim takes.
+        if PageMeta::new(m, i).free().load(Relaxed) > 0 {
+          found = Some((seg * PAGES_PER_SEGMENT + i, false));
+          break 'segs;
+        }
+        full += 1;
       }
-      cur = link_next(pm.link().load(Relaxed));
-      self.unlist_page(cs, page);
-      stale += 1;
+      cur = m[SEG_NEXT].load(Relaxed) as u32;
     }
-    sh.bump(SearchStat::PageSearch, 1);
-    sh.bump(SearchStat::Candidate, cands);
-    sh.bump(SearchStat::StaleHint, stale);
+    // Nothing below where the search stopped qualifies.
+    let at = found.map_or(NO_PAGE, |(page, _)| page as u64);
+    cs.low.store(low.max(at), Relaxed);
+    sh.free_low.store(free_low.max(at), Relaxed);
+    sh.bump(SearchStat::PageInspected, inspected);
+    sh.bump(SearchStat::FullPagePassed, full);
     found
+  }
+
+  /// The first of shard `s`'s segments (+ 1; 0 if none) that holds `page`
+  /// or lies above it. Caller holds the shard's lock.
+  fn first_segment_from(&self, s: usize, sh: &Shard, page: u64) -> u32 {
+    if page == NO_PAGE {
+      return 0;
+    }
+    let seg = page as usize / PAGES_PER_SEGMENT;
+    // Directly while the shard owns that segment: only this shard, under
+    // its lock, gives a segment a header naming it.
+    if let Some(m) = self.os.meta(seg) {
+      let hdr = m[SEG_HDR].load(Relaxed);
+      if hdr & 0xFF == SEG_OWNED && (hdr >> 8) & 0xFF == s as u64 {
+        return seg as u32 + 1;
+      }
+    }
+    // Otherwise along the list, which is in address order.
+    let mut cur = sh.segs.load(Relaxed);
+    while cur != 0 && (cur as usize - 1) < seg {
+      cur = self.seg_meta(cur as usize - 1)[SEG_NEXT].load(Relaxed) as u32;
+    }
+    cur
   }
 
   /// Metadata of `page`.
@@ -850,49 +880,21 @@ impl<O: Os> Heap<O> {
     )
   }
 
-  /// Appends small page `page`, which is on no list, to the list of `cs`.
-  /// Caller holds the lock of the shard that owns the page and `cs`.
-  fn list_page(&self, cs: &ClassState, page: usize) {
-    let at = page as u64 + 1;
-    let tail = cs.tail.load(Relaxed);
-    self
-      .page_meta(page)
-      .link()
-      .store(LISTED | tail << 32, Relaxed);
-    if tail == 0 {
-      cs.head.store(at, Relaxed);
-    } else {
-      let t = self.page_meta(tail as usize - 1).link();
-      t.store(t.load(Relaxed) & !0xFFFF_FFFF | at, Relaxed);
+  /// Sets up free page `page` of one of the shard's segments as a small
+  /// page of class `c` and returns it. Caller holds the shard lock.
+  fn new_small_page(&self, sh: &Shard, c: usize, page: usize) -> usize {
+    let (m, in_seg) = (
+      self.seg_meta(page / PAGES_PER_SEGMENT),
+      page % PAGES_PER_SEGMENT,
+    );
+    let Some(was_dirty) = proto::claim_exact(&m[SEG_PAGES], &m[SEG_DIRTY], 1 << in_seg) else {
+      self.os.fatal("allocatbelt: a free page to set up is taken");
+    };
+    if was_dirty != 0 {
+      self.dirty_pages.fetch_sub(1, Relaxed);
     }
-    cs.tail.store(at, Relaxed);
-  }
-
-  /// Takes small page `page` off the list of `cs`, which it is on. Caller
-  /// holds the lock of the shard that owns the page and `cs`.
-  fn unlist_page(&self, cs: &ClassState, page: usize) {
-    let link = self.page_meta(page).link();
-    let l = link.load(Relaxed);
-    let (prev, next) = (link_prev(l), link_next(l));
-    if prev == 0 {
-      cs.head.store(next, Relaxed);
-    } else {
-      let p = self.page_meta(prev as usize - 1).link();
-      p.store(p.load(Relaxed) & !0xFFFF_FFFF | next, Relaxed);
-    }
-    if next == 0 {
-      cs.tail.store(prev, Relaxed);
-    } else {
-      let n = self.page_meta(next as usize - 1).link();
-      n.store(n.load(Relaxed) & !(0x7FFF_FFFF << 32) | prev << 32, Relaxed);
-    }
-    link.store(0, Relaxed);
-  }
-
-  fn new_small_page(&self, s: usize, sh: &Shard, c: usize) -> Option<usize> {
-    let (p, _) = self.alloc_pages(s, sh, 1, 1)?;
+    sh.bump(SearchStat::DirtyReuse, u64::from(was_dirty.count_ones()));
     sh.bump(SearchStat::NewPage, 1);
-    let (m, in_seg) = (self.seg_meta(p / PAGES_PER_SEGMENT), p % PAGES_PER_SEGMENT);
     let pm = PageMeta::new(m, in_seg);
     let cap = class::capacity(c);
     // Words past the class's range are zeroed too, so that a claim, which
@@ -910,29 +912,25 @@ impl<O: Os> Heap<O> {
     pm.free().store(cap as u64, Relaxed);
     pm.info().store(PAGE_SMALL | (c as u64) << 8, Release);
     m[SEG_CLS + c].store(m[SEG_CLS + c].load(Relaxed) | 1 << in_seg, Relaxed);
-    self.list_page(&sh.classes[c], p);
-    Some(p)
+    let at = page as u64;
+    let cs = &sh.classes[c];
+    cs.low.store(cs.low.load(Relaxed).min(at), Relaxed);
+    // It was the lowest free page if the bound was on it.
+    if sh.free_low.load(Relaxed) == at {
+      sh.free_low.store(at + 1, Relaxed);
+    }
+    page
   }
 
-  /// Returns a small page whose blocks are all free to its segment, and
-  /// drops the shard's cursor for the class if it is on that page. Caller
+  /// Returns a small page whose blocks are all free to its segment. Caller
   /// holds the lock of `sh`, the owning shard.
   fn release_small_page(&self, sh: &Shard, page: usize, m: &[AtomicU64], c: usize) {
     let in_seg = page % PAGES_PER_SEGMENT;
-    let cs = &sh.classes[c];
-    if cs.cursor.load(Relaxed) == page as u64 + 1 {
-      cs.cursor.store(0, Relaxed);
-      sh.bump(SearchStat::CursorInvalidation, 1);
-    }
-    let pm = PageMeta::new(m, in_seg);
-    if pm.link().load(Relaxed) & LISTED != 0 {
-      self.unlist_page(cs, page);
-    }
     m[SEG_CLS + c].store(m[SEG_CLS + c].load(Relaxed) & !(1 << in_seg), Relaxed);
-    pm.info().store(PAGE_FREE, Release);
+    PageMeta::new(m, in_seg).info().store(PAGE_FREE, Release);
     // Only trimming releases small pages, inside a sweep: the sweep's own
     // freed page does not start another one.
-    self.mark_free_dirty(page, 1);
+    self.mark_free_dirty(sh, page, 1);
   }
 
   /// Bitmap word and bit of the class-`c` block `in_page` bytes into its
@@ -948,10 +946,10 @@ impl<O: Os> Heap<O> {
 
   /// Returns the blocks `mask` of bitmap word `w` of small page `page`
   /// (class `c`) to its bitmap, under the lock of the shard that owns the
-  /// page, and lists the page again if it was off its shard's list. The
-  /// blocks are allocated or held by a thread cache, so the page stays a
-  /// small page of class `c` until they are back; a page found otherwise
-  /// under the lock means they were not: an invalid or double free.
+  /// page, and lowers the class's search bound to the page. The blocks are
+  /// allocated or held by a thread cache, so the page stays a small page of
+  /// class `c` until they are back; a page found otherwise under the lock
+  /// means they were not: an invalid or double free.
   fn free_bits(&self, page: usize, c: usize, w: usize, mask: u64) {
     let (m, in_seg) = (
       self.seg_meta(page / PAGES_PER_SEGMENT),
@@ -966,9 +964,8 @@ impl<O: Os> Heap<O> {
       self.os.fatal(DOUBLE_FREE);
     };
     proto::publish_if_empty(&m[SEG_EMPTY], 1 << in_seg, now, class::capacity(c) as u64);
-    if pm.link().load(Relaxed) & LISTED == 0 {
-      self.list_page(&sh.classes[c], page);
-    }
+    let low = &sh.classes[c].low;
+    low.store(low.load(Relaxed).min(page as u64), Relaxed);
   }
 
   /// Locks the shard that owns the segment of metadata `m`, for a free of a
@@ -1012,7 +1009,7 @@ impl<O: Os> Heap<O> {
   fn free_large(&self, page: usize, m: &[AtomicU64], pm: PageMeta<'_>, info: u64) {
     let n = ((info >> 16) & 0xFF) as usize;
     let dirty = {
-      let _g = self.lock_owner(m).1;
+      let (sh, _g) = self.lock_owner(m);
       if pm.info().load(Relaxed) != info {
         self.os.fatal(DOUBLE_FREE);
       }
@@ -1022,7 +1019,7 @@ impl<O: Os> Heap<O> {
           .info()
           .store(PAGE_FREE, Relaxed);
       }
-      self.mark_free_dirty(page, n)
+      self.mark_free_dirty(sh, page, n)
     };
     self.after_release(dirty);
   }
@@ -1078,12 +1075,13 @@ impl<O: Os> Heap<O> {
   }
 
   /// Claims `n` contiguous pages starting at a multiple of `step` pages from
-  /// a segment owned by shard `s`. Also returns whether the pages read as
-  /// zero.
+  /// a segment owned by shard `s`: first fit by address, from the shard's
+  /// lowest free page up, else from a new segment. Also returns whether the
+  /// pages read as zero.
   fn alloc_pages(&self, s: usize, sh: &Shard, n: usize, step: usize) -> Option<(usize, bool)> {
     sh.bump(SearchStat::RunSearch, 1);
     let mut segs = 0;
-    let mut cur = sh.segs.load(Relaxed);
+    let mut cur = self.first_segment_from(s, sh, sh.free_low.load(Relaxed));
     while cur != 0 {
       let seg = cur as usize - 1;
       segs += 1;
@@ -1096,6 +1094,16 @@ impl<O: Os> Heap<O> {
       cur = m[SEG_NEXT].load(Relaxed) as u32;
     }
     sh.bump(SearchStat::RunSearchSegment, segs);
+    let seg = self.add_segment(s, sh)?;
+    let (start, reused) = self.claim_run(self.seg_meta(seg), n, step)?;
+    sh.bump(SearchStat::DirtyReuse, reused);
+    Some((seg * PAGES_PER_SEGMENT + start, reused == 0))
+  }
+
+  /// Takes a segment from the arena for shard `s`, with every page but the
+  /// guard page free, and inserts it into the shard's list in address
+  /// order. Caller holds the shard lock.
+  fn add_segment(&self, s: usize, sh: &Shard) -> Option<usize> {
     let seg = self.alloc_segments(1, sh.random())?;
     sh.bump(SearchStat::NewSegment, 1);
     let m = self.seg_meta(seg);
@@ -1119,12 +1127,22 @@ impl<O: Os> Heap<O> {
     m[SEG_IDLE].store(0, Relaxed);
     m[SEG_EMPTY].store(0, Relaxed);
     m[SEG_PAGES].store(GUARD_BIT, Release);
-    m[SEG_NEXT].store(u64::from(sh.segs.load(Relaxed)), Relaxed);
     m[SEG_HDR].store(SEG_OWNED | (s as u64) << 8 | 1 << 16, Release);
-    sh.segs.store(seg as u32 + 1, Relaxed);
-    let (start, reused) = self.claim_run(m, n, step)?;
-    sh.bump(SearchStat::DirtyReuse, reused);
-    Some((seg * PAGES_PER_SEGMENT + start, reused == 0))
+    let (mut prev, mut next) = (None::<&[AtomicU64]>, sh.segs.load(Relaxed));
+    while next != 0 && (next as usize - 1) < seg {
+      let p = self.seg_meta(next as usize - 1);
+      next = p[SEG_NEXT].load(Relaxed) as u32;
+      prev = Some(p);
+    }
+    m[SEG_NEXT].store(u64::from(next), Relaxed);
+    match prev {
+      None => sh.segs.store(seg as u32 + 1, Relaxed),
+      Some(p) => p[SEG_NEXT].store(seg as u64 + 1, Relaxed),
+    }
+    let first = (seg * PAGES_PER_SEGMENT) as u64;
+    sh.free_low
+      .store(sh.free_low.load(Relaxed).min(first), Relaxed);
+    Some(seg)
   }
 
   /// Atomically claims a run of `n` free pages starting at a multiple of
@@ -1148,16 +1166,17 @@ impl<O: Os> Heap<O> {
   fn release_pages(&self, page: usize, n: usize) {
     let dirty = {
       let m = self.seg_meta(page / PAGES_PER_SEGMENT);
-      let _g = self.owner(m).lock.lock(&self.os);
-      self.mark_free_dirty(page, n)
+      let sh = self.owner(m);
+      let _g = sh.lock.lock(&self.os);
+      self.mark_free_dirty(sh, page, n)
     };
     self.after_release(dirty);
   }
 
   /// Marks `n` pages dirty and returns them to their segment; returns the
-  /// dirty count after. Caller holds the lock of the shard that owns the
-  /// segment.
-  fn mark_free_dirty(&self, page: usize, n: usize) -> isize {
+  /// dirty count after. Caller holds the lock of `sh`, the shard that owns
+  /// the segment.
+  fn mark_free_dirty(&self, sh: &Shard, page: usize, n: usize) -> isize {
     let m = self.seg_meta(page / PAGES_PER_SEGMENT);
     let in_seg = page % PAGES_PER_SEGMENT;
     // Stamped before the pages are marked dirty, so a purge pass that sees
@@ -1172,6 +1191,7 @@ impl<O: Os> Heap<O> {
       &m[SEG_DIRTY],
       run_mask(in_seg as u32, n as u32),
     );
+    sh.lower_free_low(page);
     self.dirty_pages.fetch_add(n as isize, Relaxed) + n as isize
   }
 

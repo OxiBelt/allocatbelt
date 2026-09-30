@@ -520,7 +520,7 @@ fn freed_small_pages_leave_their_segments() {
   }
 }
 
-// ---- thread caches and page lists ------------------------------------------
+// ---- thread caches and page search ------------------------------------------
 
 #[test]
 fn cached_round_trip_and_reuse() {
@@ -644,15 +644,25 @@ fn refill_finds_freed_page_without_scanning() {
   let per_page = PAGE_SIZE / 32;
   let offs: Vec<_> = (0..per_page * 40).map(|_| alloc(h, 7, 32, 8)).collect();
   let segs = h.segments_in_use();
-  // The full pages are off the class's page list: the free lists the page
-  // again (under the owner's lock), and the lists stay consistent.
+  // The free lowers the class's search bound to that page (under the
+  // owner's lock).
   free(h, offs[5]);
   h.check_indexes();
-  // The next allocation of the class takes the freed block from that page
-  // (found through the class's page list) rather than a new page.
+  // The next allocation of the class takes the freed block from that page,
+  // the lowest with a free block, rather than a new page.
+  let before = h.search_stats();
   let again = alloc(h, 7, 32, 8);
+  let after = h.search_stats();
   assert_eq!(again, offs[5]);
   assert_eq!(h.segments_in_use(), segs);
+  // It is the first page the search looks at.
+  assert_eq!(
+    (
+      after.pages_inspected - before.pages_inspected,
+      after.new_pages - before.new_pages
+    ),
+    (1, 0)
+  );
   for o in offs.into_iter().filter(|&o| o != again).chain([again]) {
     free(h, o);
   }
@@ -1575,7 +1585,7 @@ fn hard_limit_interventions_are_counted() {
 }
 
 #[test]
-fn trimming_counts_released_pages_and_forgotten_cursors() {
+fn trimming_counts_released_pages() {
   let h = heap();
   let size = 1000;
   let n = 2 * PAGE_SIZE / size;
@@ -1585,14 +1595,10 @@ fn trimming_counts_released_pages_and_forgotten_cursors() {
   for o in offs {
     free(h, o);
   }
-  let (before, search) = (h.maintenance_stats(), h.search_stats());
+  let before = h.maintenance_stats();
   h.purge();
   let w = work_since(before, h.maintenance_stats());
   assert_eq!(w[RELEASED], pages as u64);
-  assert_eq!(
-    h.search_stats().cursor_invalidations - search.cursor_invalidations,
-    1
-  );
   assert_eq!(h.usage().small_pages, 0);
 }
 
@@ -1686,31 +1692,31 @@ fn refills_count_their_search() {
   let before = h.search_stats();
   let first = alloc_c(h, &tc, 16, 8);
   let s = h.search_stats();
-  // A fresh heap: the refill searches the (empty) list of pages of the
-  // class, sets up a new page, and takes a new segment for it.
+  // A fresh heap: the refill finds no page (the shard has no segment),
+  // takes a new segment and sets up its first page for the class.
   assert_eq!(
     (
       s.refills - before.refills,
-      s.cursor_claims - before.cursor_claims,
-      s.page_searches - before.page_searches,
-      s.candidates - before.candidates,
+      s.pages_inspected - before.pages_inspected,
+      s.full_pages_passed - before.full_pages_passed,
       s.new_pages - before.new_pages,
       s.run_searches - before.run_searches,
       s.new_segments - before.new_segments,
     ),
-    (1, 0, 1, 0, 1, 1, 1)
+    (1, 0, 0, 1, 0, 1)
   );
   // The next 64 allocations empty the claimed word and claim the next word
-  // of the same page through the cursor, without a search.
+  // of the same page, the first the search looks at.
   let rest: Vec<_> = (0..64).map(|_| alloc_c(h, &tc, 16, 8)).collect();
   let t = h.search_stats();
   assert_eq!(
-    (t.refills - s.refills, t.cursor_claims - s.cursor_claims),
-    (1, 1)
-  );
-  assert_eq!(
-    (t.page_searches, t.new_pages),
-    (s.page_searches, s.new_pages)
+    (
+      t.refills - s.refills,
+      t.pages_inspected - s.pages_inspected,
+      t.full_pages_passed - s.full_pages_passed,
+      t.new_pages - s.new_pages
+    ),
+    (1, 1, 0, 0)
   );
   for o in rest.into_iter().chain([first]) {
     free_c(h, &tc, o);
@@ -2701,28 +2707,26 @@ fn cap_1000() -> usize {
 }
 
 #[test]
-fn trimming_keeps_the_cursor_of_a_page_it_does_not_release() {
+fn trimming_leaves_a_page_it_does_not_release_first_in_line() {
   let h = heap();
   let tc = cache(h);
-  // Two words of the 16-byte class: the second refill claims through the
-  // cursor.
+  // Two words of the 16-byte class, from one page.
   let offs: Vec<_> = (0..65).map(|_| alloc_c(h, &tc, 16, 8)).collect();
-  let s = h.search_stats();
   h.purge();
   let t = h.search_stats();
-  assert_eq!(t.cursor_invalidations, s.cursor_invalidations);
   h.check_indexes();
-  // The next refill still claims from the current page, without a search.
+  // The next refill still claims from that page, the first it looks at.
   let more: Vec<_> = (0..64).map(|_| alloc_c(h, &tc, 16, 8)).collect();
   let u = h.search_stats();
   assert_eq!(
     (
       u.refills - t.refills,
-      u.cursor_claims - t.cursor_claims,
-      u.page_searches - t.page_searches
+      u.pages_inspected - t.pages_inspected,
+      u.new_pages - t.new_pages
     ),
     (1, 1, 0)
   );
+  assert_eq!(more[0] / PAGE_SIZE, offs[0] / PAGE_SIZE);
   for o in offs.into_iter().chain(more) {
     free_c(h, &tc, o);
   }
@@ -2730,29 +2734,44 @@ fn trimming_keeps_the_cursor_of_a_page_it_does_not_release() {
 }
 
 #[test]
-fn releasing_one_class_keeps_the_cursors_of_the_others() {
+fn the_lowest_page_is_taken_whether_free_or_partly_used() {
   let h = heap();
+  // Page 0 of the segment for the 1000-byte class, page 1 for the 48-byte
+  // class.
   let a = alloc(h, 0, 1000, 8);
   let b = alloc(h, 0, 48, 8);
+  assert_eq!(b / PAGE_SIZE, a / PAGE_SIZE + 1);
   free(h, a);
-  let s = h.search_stats();
   h.purge();
-  let t = h.search_stats();
-  // Only the 1000-byte class lost its (released) page.
-  assert_eq!(t.cursor_invalidations - s.cursor_invalidations, 1);
+  assert_eq!(h.usage().small_pages, 1);
   h.check_indexes();
+  // Page 0 is free again and lies below the partly used page 1: the
+  // 48-byte class takes it.
+  let s = h.search_stats();
   let b2 = alloc(h, 0, 48, 8);
-  let u = h.search_stats();
-  assert_eq!(b2 / PAGE_SIZE, b / PAGE_SIZE);
+  let t = h.search_stats();
+  assert_eq!(b2 / PAGE_SIZE, a / PAGE_SIZE);
   assert_eq!(
     (
-      u.cursor_claims - t.cursor_claims,
-      u.page_searches - t.page_searches
+      t.pages_inspected - s.pages_inspected,
+      t.new_pages - s.new_pages
     ),
-    (1, 0)
+    (1, 1)
   );
-  free(h, b);
-  free(h, b2);
+  // Now page 0 is the class's lowest page with free blocks: taken first.
+  let b3 = alloc(h, 0, 48, 8);
+  assert_eq!(b3 / PAGE_SIZE, a / PAGE_SIZE);
+  // A free page above a partly used one waits: page 2 is free, and the
+  // class keeps claiming from page 1 once page 0 is full.
+  let cap = crate::core::class::capacity(crate::core::class::class_of(48));
+  let fill: Vec<_> = (0..cap - 2).map(|_| alloc(h, 0, 48, 8)).collect();
+  assert!(fill.iter().all(|&o| o / PAGE_SIZE == a / PAGE_SIZE));
+  let next = alloc(h, 0, 48, 8);
+  assert_eq!(next / PAGE_SIZE, b / PAGE_SIZE);
+  h.check_indexes();
+  for o in fill.into_iter().chain([b, b2, b3, next]) {
+    free(h, o);
+  }
 }
 
 #[test]
@@ -2761,12 +2780,7 @@ fn a_released_page_reused_at_the_same_offset_is_not_claimed_from() {
   let a = alloc(h, 0, 1000, 8);
   let page = a / PAGE_SIZE;
   free(h, a);
-  let s = h.search_stats();
   h.purge();
-  assert_eq!(
-    h.search_stats().cursor_invalidations - s.cursor_invalidations,
-    1
-  );
   assert_eq!(h.usage().small_pages, 0);
   h.check_indexes();
   // The page's next life is a one-page run at the same offset; the class
@@ -2792,7 +2806,7 @@ fn a_released_page_reused_at_the_same_offset_is_not_claimed_from() {
 }
 
 #[test]
-fn a_returned_and_reacquired_segment_holds_no_cursor() {
+fn a_returned_and_reacquired_segment_is_searched_again() {
   let h = heap();
   h.set_purge_delay_ms(0);
   // Shard 0's first segment is full of one run; the small page goes to a

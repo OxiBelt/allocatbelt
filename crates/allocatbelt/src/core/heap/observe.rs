@@ -27,13 +27,9 @@ use super::*;
 #[derive(Clone, Copy)]
 pub(super) enum SearchStat {
   Refill,
-  CursorClaim,
-  CursorRetired,
-  PageSearch,
-  Candidate,
-  StaleHint,
+  PageInspected,
+  FullPagePassed,
   NewPage,
-  CursorInvalidation,
   RunSearch,
   RunSearchSegment,
   NewSegment,
@@ -41,7 +37,7 @@ pub(super) enum SearchStat {
 }
 
 /// Number of [`SearchStat`]s.
-pub(super) const SEARCH_STATS: usize = 12;
+pub(super) const SEARCH_STATS: usize = 8;
 
 impl Shard {
   /// Adds `n` to a search counter. Caller holds the shard lock, so a load
@@ -58,34 +54,26 @@ impl Shard {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SearchStats {
   /// Claims for a size class: a bitmap word for a cache refill, a single
-  /// block for an uncached small allocation.
+  /// block for an uncached small allocation. Each searches the shard's
+  /// segments by address for the lowest page of the class with free blocks
+  /// or free page, from the class's and the shard's lower bounds.
   pub refills: u64,
-  /// Of those, words found on the shard's current page for the class (its
-  /// cursor), without a search.
-  pub cursor_claims: u64,
-  /// Current pages that had no free block left and were taken off the
-  /// shard's list for the class.
-  pub cursor_retired: u64,
-  /// Searches for another page of the class with free blocks.
-  pub page_searches: u64,
-  /// Pages of the shard's list for the class those searches inspected.
-  pub candidates: u64,
-  /// Of those, pages that had no free block left and were taken off the
-  /// list.
-  pub stale_hints: u64,
-  /// Pages set up for a size class because no page of it had free blocks.
+  /// Pages those searches looked at: pages of the class whose free count
+  /// they read, and the free page they stopped at.
+  pub pages_inspected: u64,
+  /// Of those, pages of the class with no free block, passed over.
+  pub full_pages_passed: u64,
+  /// Free pages set up for a size class because they were the lowest
+  /// candidates, or pages of new segments because there was none.
   pub new_pages: u64,
-  /// Current pages released by trimming (see `release_empty_pages`): their
-  /// cursor is dropped, so the next refill of the class searches again.
-  /// Trimming keeps the cursors of pages it does not release.
-  pub cursor_invalidations: u64,
-  /// Searches for a free page run (large blocks and new small pages).
+  /// Searches for a free page run (large blocks).
   pub run_searches: u64,
   /// Segments those searches visited.
   pub run_search_segments: u64,
-  /// Segments taken from the arena because no owned segment had room.
+  /// Segments taken from the arena because no owned segment had room (for
+  /// a page run or a small page).
   pub new_segments: u64,
-  /// Dirty pages handed out again by page-run claims before a purge
+  /// Dirty pages handed out again (as page runs or new small pages) before a purge
   /// returned them: reuse the retention of freed pages paid for (the
   /// signal of [`Retention::Adaptive`](super::Retention::Adaptive)).
   pub dirty_reused_pages: u64,
@@ -170,7 +158,7 @@ pub struct HeapUsage {
 }
 
 impl<O: Os> Heap<O> {
-  /// The search counters of all shards, summed. Allocation-free; reads 12
+  /// The search counters of all shards, summed. Allocation-free; reads 8
   /// words per shard.
   pub fn search_stats(&self) -> SearchStats {
     let mut t = [0u64; SEARCH_STATS];
@@ -182,13 +170,9 @@ impl<O: Os> Heap<O> {
     let s = |stat: SearchStat| t[stat as usize];
     SearchStats {
       refills: s(SearchStat::Refill),
-      cursor_claims: s(SearchStat::CursorClaim),
-      cursor_retired: s(SearchStat::CursorRetired),
-      page_searches: s(SearchStat::PageSearch),
-      candidates: s(SearchStat::Candidate),
-      stale_hints: s(SearchStat::StaleHint),
+      pages_inspected: s(SearchStat::PageInspected),
+      full_pages_passed: s(SearchStat::FullPagePassed),
       new_pages: s(SearchStat::NewPage),
-      cursor_invalidations: s(SearchStat::CursorInvalidation),
       run_searches: s(SearchStat::RunSearch),
       run_search_segments: s(SearchStat::RunSearchSegment),
       new_segments: s(SearchStat::NewSegment),
@@ -245,13 +229,12 @@ impl<O: Os> Heap<O> {
 
 #[cfg(any(all(test, allocatbelt_core_check), allocatbelt_model))]
 impl<O: Os> Heap<O> {
-  /// Checks the search indexes against the metadata they index, while no
-  /// operation is running: every class list is well formed and holds
-  /// exactly the listed small pages of its class in the shard's segments,
-  /// every such page with a free block is listed, every class cursor names
-  /// a listed page, every small page's free counter is the number of its
-  /// free bits, and every small page whose blocks are all free is an
-  /// empty-page candidate of its segment.
+  /// Checks the search bounds against the metadata, while no operation is
+  /// running: every shard's segments are its own and listed in address
+  /// order, no page of a class with free blocks lies below the class's
+  /// bound and no free page below the shard's, every small page's free
+  /// counter is the number of its free bits, and every small page whose
+  /// blocks are all free is an empty-page candidate of its segment.
   pub fn check_indexes(&self) {
     for (s, sh) in self.shards.iter().enumerate() {
       let mut segs = std::vec::Vec::new();
@@ -265,48 +248,38 @@ impl<O: Os> Heap<O> {
           (SEG_OWNED, s as u64),
           "segment {seg} on the list of shard {s}"
         );
+        assert!(
+          segs.last().is_none_or(|&last| last < seg),
+          "shard {s} lists segment {seg} out of address order"
+        );
         segs.push(seg);
         cur = m[SEG_NEXT].load(Relaxed) as u32;
       }
-      for (c, cs) in sh.classes.iter().enumerate() {
-        let mut listed = std::vec::Vec::new();
-        let (mut prev, mut at) = (0, cs.head.load(Relaxed));
-        while at != 0 {
-          let page = at as usize - 1;
+      let free_low = sh.free_low.load(Relaxed);
+      for &seg in &segs {
+        let m = self.seg_meta(seg);
+        let first = seg * PAGES_PER_SEGMENT;
+        let free = !m[SEG_PAGES].load(Relaxed);
+        if free != 0 {
+          let lowest = (first + free.trailing_zeros() as usize) as u64;
           assert!(
-            listed.len() < MAX_SEGMENTS * PAGES_PER_SEGMENT && !listed.contains(&page),
-            "list of shard {s} class {c} loops at page {page}"
+            lowest >= free_low,
+            "free page {lowest} below the bound {free_low} of shard {s}"
           );
-          let (seg, i) = (page / PAGES_PER_SEGMENT, page % PAGES_PER_SEGMENT);
-          assert!(
-            segs.contains(&seg),
-            "list of shard {s} class {c} holds page {i} of segment {seg}, not the shard's"
-          );
-          let pm = PageMeta::new(self.seg_meta(seg), i);
-          assert_eq!(
-            pm.info().load(Acquire),
-            PAGE_SMALL | (c as u64) << 8,
-            "list of shard {s} class {c} holds page {i} of segment {seg}"
-          );
-          let l = pm.link().load(Relaxed);
-          assert_ne!(
-            l & LISTED,
-            0,
-            "page {i} of segment {seg} is on a list, unflagged"
-          );
-          assert_eq!(link_prev(l), prev, "page {i} of segment {seg}: back link");
-          listed.push(page);
-          prev = at;
-          at = link_next(l);
         }
-        assert_eq!(cs.tail.load(Relaxed), prev, "tail of shard {s} class {c}");
-        for &seg in &segs {
-          let m = self.seg_meta(seg);
+        let empty = m[SEG_EMPTY].load(Relaxed);
+        for (c, cs) in sh.classes.iter().enumerate() {
+          let low = cs.low.load(Relaxed);
           let mut small = m[SEG_CLS + c].load(Relaxed);
           while small != 0 {
             let i = small.trailing_zeros() as usize;
             small &= small - 1;
             let pm = PageMeta::new(m, i);
+            assert_eq!(
+              pm.info().load(Acquire),
+              PAGE_SMALL | (c as u64) << 8,
+              "page {i} of segment {seg} is marked as class {c}"
+            );
             let bits: u64 = pm
               .bitmaps()
               .iter()
@@ -317,56 +290,13 @@ impl<O: Os> Heap<O> {
               bits,
               "page {i} of segment {seg} (class {c}): counter and bitmap disagree"
             );
-            let on = listed.contains(&(seg * PAGES_PER_SEGMENT + i));
-            assert_eq!(
-              on,
-              pm.link().load(Relaxed) & LISTED != 0,
-              "page {i} of segment {seg} (class {c}): flag and list disagree"
-            );
-            if pm.bitmaps()[..class::bitmap_words(c)]
-              .iter()
-              .any(|w| w.load(Relaxed) != 0)
-            {
+            if bits > 0 {
               assert!(
-                on,
-                "page {i} of segment {seg} (class {c}) has free blocks, unlisted"
+                (first + i) as u64 >= low,
+                "page {i} of segment {seg} (class {c}) has free blocks below the bound {low}"
               );
             }
-          }
-        }
-        let cur = cs.cursor.load(Relaxed);
-        if cur == 0 {
-          continue;
-        }
-        assert!(
-          listed.contains(&(cur as usize - 1)),
-          "cursor of shard {s} class {c} is not listed"
-        );
-        let (seg, i) = (
-          (cur as usize - 1) / PAGES_PER_SEGMENT,
-          (cur as usize - 1) % PAGES_PER_SEGMENT,
-        );
-        assert!(
-          segs.contains(&seg),
-          "cursor of shard {s} class {c} in segment {seg}, not the shard's"
-        );
-        let m = self.seg_meta(seg);
-        assert_eq!(
-          PageMeta::new(m, i).info().load(Acquire),
-          PAGE_SMALL | (c as u64) << 8,
-          "cursor of shard {s} class {c} on page {i} of segment {seg}"
-        );
-        assert_ne!(m[SEG_CLS + c].load(Relaxed) & 1 << i, 0);
-      }
-      for &seg in &segs {
-        let m = self.seg_meta(seg);
-        let empty = m[SEG_EMPTY].load(Relaxed);
-        for c in 0..NUM_CLASSES {
-          let mut small = m[SEG_CLS + c].load(Relaxed);
-          while small != 0 {
-            let i = small.trailing_zeros() as usize;
-            small &= small - 1;
-            if proto::all_free(PageMeta::new(m, i).free(), class::capacity(c) as u64) {
+            if proto::all_free(pm.free(), class::capacity(c) as u64) {
               assert_ne!(
                 empty & 1 << i,
                 0,

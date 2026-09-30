@@ -5,7 +5,7 @@ allocatbelt exposes four read-only diagnostics on `Allocatbelt`. They exist so t
 | Method | Type | Scope | Cost of a read |
 |---|---|---|---|
 | `maintenance_stats()` | `MaintenanceStats` | whole heap | 18 atomic loads |
-| `search_stats()` | `SearchStats` | whole heap, summed over the 64 shards | 12 loads per shard |
+| `search_stats()` | `SearchStats` | whole heap, summed over the 64 shards | 8 loads per shard |
 | `heap_usage()` | `HeapUsage` | whole heap, a walk over the segments in use | a few loads per segment and per small page |
 | `thread_cache_stats()` | `Option<CacheStats>` | the calling thread's cache only | reads the cache's own cells |
 
@@ -40,7 +40,7 @@ The reclamation thresholds (by default a 32 MiB trigger and a 64 MiB emergency t
 - foreground intervention: `hard_limit_slices`, the emergency slices a freeing thread ran although a maintenance thread was attached;
 - failed cycles: `stalled_cycles`, budget cycles whose full sweep made no progress (then deferred to the next decay epoch, shown by `reclaim_status().budget_deferred`).
 
-**Search** (`SearchStats`, per shard, updated under the shard lock the counted work already holds): refills and those served from the class's current page (`refills`, `cursor_claims`), current pages found empty and taken off the class's page list (`cursor_retired`), page searches with the pages of the class's list they inspected and those they took off it for having no free block (`page_searches`, `candidates`, `stale_hints`), new small pages, current pages released by trimming, whose cursor it dropped (`cursor_invalidations`; trimming keeps every other cursor), page-run searches with the segments they visited and the segments taken from the arena (`run_searches`, `run_search_segments`, `new_segments`), and dirty pages page-run allocations reused before a purge (`dirty_reused_pages`). A page search walks the shard's list of pages of the class from its front, so `candidates - stale_hints` is at most `page_searches`.
+**Search** (`SearchStats`, per shard, updated under the shard lock the counted work already holds): refills, each a search of the shard's pages by address (`refills`), the pages those searches looked at and the full pages of the class among them (`pages_inspected`, `full_pages_passed`), free pages set up for a class (`new_pages`), page-run searches with the segments they visited and the segments taken from the arena for page runs or small pages (`run_searches`, `run_search_segments`, `new_segments`), and dirty pages reused, as page runs or new small pages, before a purge (`dirty_reused_pages`). A search stops at the first page that qualifies, so `pages_inspected - full_pages_passed` is at most `refills`.
 
 **Free buffering** (`CacheStats`, plain `Cell`s of the thread's cache, updated when a buffered word is flushed, never on a free that is only buffered): `flushes`, `flushed_blocks`, a histogram of blocks per flush (`flush_sizes`, buckets 1, 2-3, 4-7, 8-15, 16-31, 32-63, 64), flushes forced because both ways of a word's set in the 2-way buffer were taken (`evictions`), flushes of a class before a refill would take a new page (`refill_flushes`), and drains for a cache-return request (`pressure_returns`, see [thread-caches.md](thread-caches.md)). `flushed_blocks / flushes` is the batch a shared bitmap update actually carried.
 

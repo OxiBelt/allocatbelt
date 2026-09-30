@@ -18,8 +18,8 @@
 //!   ([`claim_word`]), or an uncached allocation a single block
 //!   ([`claim_block`]), and lowers the counter. The counter is therefore
 //!   exact whenever the lock is free. There are no summary bits above the
-//!   bitmaps: the owning shard keeps, per size class, a list of its pages
-//!   that may have free blocks, changed under the same lock.
+//!   bitmaps: the owning shard finds pages by address, reading the
+//!   counters of its pages of the class (see `heap.rs`).
 //! * **Empty-page candidates.** A segment has an *empty* word with one bit
 //!   per small page that may have become completely free. The free that
 //!   brings a page's counter to its capacity sets the bit
@@ -48,12 +48,6 @@
 use crate::core::bits::find_run_aligned;
 use crate::core::sync::Ordering::{Acquire, Relaxed, Release, SeqCst};
 use crate::core::sync::{AtomicU32, AtomicU64, fence};
-
-/// Set in a small page's list word while the page is on its shard's list
-/// of pages of its class that may have free blocks. The rest of the word
-/// links the list; the whole word changes only under the owning shard's
-/// lock.
-pub(crate) const LISTED: u64 = 1 << 63;
 
 /// Returns the blocks in `mask` to bitmap `word` of a page whose free-block
 /// counter is `count`. Returns the free count after, or `None`, having

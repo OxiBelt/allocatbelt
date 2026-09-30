@@ -585,9 +585,9 @@ pub fn check_observations(h: &Heap<MockOs>, caches: &[ThreadCache]) {
   assert_eq!(m.reconciled_pages, 0, "{m:?}");
   h.check_indexes();
   let s = h.search_stats();
-  assert!(s.stale_hints <= s.candidates, "{s:?}");
-  assert!(s.cursor_claims <= s.refills, "{s:?}");
-  assert!(s.new_segments <= s.run_searches, "{s:?}");
+  assert!(s.full_pages_passed <= s.pages_inspected, "{s:?}");
+  assert!(s.new_pages <= s.refills, "{s:?}");
+  assert!(s.new_segments <= s.run_searches + s.new_pages, "{s:?}");
   let u = h.usage();
   assert_eq!(u.dirty_pages, h.dirty_pages(), "{u:?}");
   assert_eq!(
