@@ -88,6 +88,15 @@ pub(crate) fn publish_if_empty(empty: &AtomicU64, page_bit: u64, now: u64, cap: 
   }
 }
 
+/// Whether a small page of `cap` blocks whose free-block counter is `count`
+/// has every block free, for the owner to decide under its lock whether to
+/// release it. The counter is read as signed: it drops below zero while the
+/// owner holds blocks it claimed from frees that set their bits but have
+/// not counted them yet, and such a page has live (claimed) blocks.
+pub(crate) fn all_free(count: &AtomicU64, cap: u64) -> bool {
+  count.load(Acquire).cast_signed() >= cap.cast_signed()
+}
+
 /// Takes a segment's empty-page candidates, for the owner to check under
 /// its lock. A free that publishes after the take sets its bit again.
 pub(crate) fn take_candidates(empty: &AtomicU64) -> u64 {
@@ -292,7 +301,7 @@ mod loom_tests {
     /// the counter, as `release_empty_pages` does. Returns whether the
     /// page would be released.
     fn trim(&self) -> bool {
-      take_candidates(&self.empty) != 0 && self.count.load(Acquire) >= self.cap
+      take_candidates(&self.empty) != 0 && all_free(&self.count, self.cap)
     }
 
     /// The owner's refill loop: claim words until the page is empty and
@@ -454,6 +463,27 @@ mod loom_tests {
         released || page.empty.load(Relaxed) == 1,
         "a fully free page is neither released nor a candidate"
       );
+    });
+  }
+
+  /// The owner claims a word holding a block whose free has set its bit
+  /// but not counted it yet, which takes the counter below zero, and then
+  /// trimming looks at the page: the owner holds blocks of it, so the page
+  /// is not taken for fully free.
+  #[test]
+  fn a_claim_ahead_of_a_free_keeps_the_page() {
+    loom::model(|| {
+      // Block 0 free, block 1 live and about to be freed.
+      let page = Arc::new(Page::new([0b01, 0], 2));
+      let p = page.clone();
+      let freer = thread::spawn(move || assert!(p.free(0, 0b10)));
+      let (_, b) = claim_word(&page.summary, &page.words, 0).unwrap();
+      page.count.fetch_sub(u64::from(b.count_ones()), Relaxed);
+      assert!(
+        !all_free(&page.count, page.cap),
+        "a page with claimed blocks looked fully free"
+      );
+      freer.join().unwrap();
     });
   }
 

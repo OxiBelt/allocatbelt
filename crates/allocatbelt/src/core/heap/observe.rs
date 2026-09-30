@@ -235,7 +235,9 @@ impl<O: Os> Heap<O> {
             let i = small.trailing_zeros() as usize;
             small &= small - 1;
             let cap = class::capacity(c);
-            let free = (PageMeta::new(m, i).free().load(Relaxed) as usize).min(cap);
+            // Below zero while a claim is ahead of the frees it took from.
+            let free = PageMeta::new(m, i).free().load(Relaxed).cast_signed();
+            let free = usize::try_from(free).unwrap_or(0).min(cap);
             u.small_bytes_out += (cap - free) * class::size(c);
             u.small_bytes_free += free * class::size(c);
           }
@@ -297,7 +299,7 @@ impl<O: Os> Heap<O> {
           while small != 0 {
             let i = small.trailing_zeros() as usize;
             small &= small - 1;
-            if PageMeta::new(m, i).free().load(Relaxed) >= class::capacity(c) as u64 {
+            if proto::all_free(PageMeta::new(m, i).free(), class::capacity(c) as u64) {
               assert_ne!(
                 empty & 1 << i,
                 0,

@@ -349,7 +349,10 @@ impl<O: Os> Heap<O> {
   /// lock) and its free count is its capacity. Frees set bits before
   /// bumping the counter, and our own claims are subtracted under this
   /// lock, so the counter never overstates the free blocks here; blocks
-  /// held in thread caches are claimed, so they keep the page.
+  /// held in thread caches are claimed, so they keep the page. The counter
+  /// is compared as signed ([`proto::all_free`]): a claim that took bits of
+  /// frees that have not counted them yet leaves it below zero, and read as
+  /// unsigned that would look like a full page.
   pub(super) fn release_empty_pages(
     &self,
     sh: &Shard,
@@ -376,7 +379,7 @@ impl<O: Os> Heap<O> {
       let c = ((info >> 8) & 0xFF) as usize;
       let small =
         info & 0xFF == PAGE_SMALL && c < NUM_CLASSES && m[SEG_CLS + c].load(Relaxed) & bit != 0;
-      if small && pm.free().load(Acquire) >= class::capacity(c) as u64 {
+      if small && proto::all_free(pm.free(), class::capacity(c) as u64) {
         self.release_small_page(sh, seg * PAGES_PER_SEGMENT + i, m, c);
         work.released_pages += 1;
         if hinted & bit == 0 {

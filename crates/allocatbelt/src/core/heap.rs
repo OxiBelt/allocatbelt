@@ -19,7 +19,8 @@
 //! [SEG_AVAIL + c]  pages of class c that may have free blocks
 //! then per page (PAGE_META_WORDS each):
 //!   [0] P_INFO     kind | class << 8 | run length << 16
-//!   [1] P_FREE     number of set bits in the bitmap (may transiently lag)
+//!   [1] P_FREE     number of set bits in the bitmap (may transiently lag,
+//!                  and be below zero, read as signed)
 //!   [2] P_SUMMARY  small pages: bitmap words that may be non-zero
 //!   [3] P_SINCE    free pages: decay epoch in which the page was last
 //!                  marked dirty
