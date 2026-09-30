@@ -179,17 +179,15 @@ fn exiting_threads_return_their_caches() {
   for _ in 0..4 {
     round();
   }
-  let (_, first) = round();
   for _ in 0..6 {
     let (segments, small) = round();
-    // Other tests allocate concurrently, so allow a little noise. The kept
-    // pages move from round to round, and so do the segments they hold,
-    // but neither accumulates: a segment beyond the one empty segment per
-    // shard holds at least one page.
-    assert!(
-      small <= first + 8,
-      "small pages grew from {first} to {small}"
-    );
+    // At most one kept page per shard and size class (64 × 32) stays after
+    // a purge. Which pages are kept moves from round to round, so the count
+    // drifts below that bound, and other tests hold a few pages of their
+    // own; a round whose caches were not returned would leave thousands of
+    // pages. A segment beyond the one empty segment per shard holds at
+    // least one page.
+    assert!(small <= 64 * 32 + 256, "{small} small pages after purging");
     assert!(
       segments <= 64 + small + 8,
       "{segments} segments for {small} small pages"
