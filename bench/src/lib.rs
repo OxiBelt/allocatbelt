@@ -4,10 +4,21 @@
 //! Workloads approximate a proxy's allocation pattern: many short-lived
 //! small buffers, cross-thread hand-off (accept thread → worker, worker →
 //! writer), and occasional large bodies.
+//!
+//! Every workload line also carries the CPU time, page faults and storage
+//! bytes the process spent on it (`allocatbelt_profile::Usage`). Arguments,
+//! for profiling one workload at a time (`scripts/profile.sh`):
+//!
+//! - `--quick`: a twentieth of the operations and a shorter idle wait, for
+//!   smoke runs and slow tools such as callgrind. Not for timings.
+//! - `--only KEY[,KEY...]`: run only these workloads, of `single`, `local`,
+//!   `small`, `pairs`, `idle` and `oversubscribed`.
 
 use std::hint::black_box;
 use std::sync::mpsc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
+
+use allocatbelt_profile::Usage;
 
 /// Deterministic xorshift so every allocator sees the same request stream.
 struct Rng(u64);
@@ -69,10 +80,25 @@ fn small_churn(seed: u64, ops: usize, window: usize) -> usize {
   n
 }
 
+/// Spawns a named worker, so per-thread profiles (`threads-by-name.csv`,
+/// `perf-by-thread.txt`) tell the workloads' threads apart.
+fn spawn<'scope, T: Send + 'scope>(
+  s: &'scope std::thread::Scope<'scope, '_>,
+  name: &str,
+  f: impl FnOnce() -> T + Send + 'scope,
+) {
+  std::thread::Builder::new()
+    .name(name.to_owned())
+    .spawn_scoped(s, f)
+    .expect("spawn a benchmark thread");
+}
+
 fn threads_small(threads: usize, ops: usize) {
   std::thread::scope(|s| {
     for t in 0..threads {
-      s.spawn(move || black_box(small_churn(t as u64 * 7919 + 1, ops, 1000)));
+      spawn(s, "small-churn", move || {
+        black_box(small_churn(t as u64 * 7919 + 1, ops, 1000))
+      });
     }
   });
 }
@@ -80,7 +106,9 @@ fn threads_small(threads: usize, ops: usize) {
 fn threads_local(threads: usize, ops: usize) {
   std::thread::scope(|s| {
     for t in 0..threads {
-      s.spawn(move || black_box(churn(t as u64 * 7919 + 1, ops, 1000)));
+      spawn(s, "local-churn", move || {
+        black_box(churn(t as u64 * 7919 + 1, ops, 1000))
+      });
     }
   });
 }
@@ -89,7 +117,7 @@ fn producer_consumer(pairs: usize, batches: usize) {
   std::thread::scope(|s| {
     for p in 0..pairs {
       let (tx, rx) = mpsc::sync_channel::<Vec<Vec<u8>>>(16);
-      s.spawn(move || {
+      spawn(s, "producer", move || {
         let mut rng = Rng(p as u64 * 104_729 + 3);
         for _ in 0..batches {
           let batch = (0..64).map(|_| vec![0u8; rng.size() % 4096 + 1]).collect();
@@ -98,7 +126,7 @@ fn producer_consumer(pairs: usize, batches: usize) {
           }
         }
       });
-      s.spawn(move || {
+      spawn(s, "consumer", move || {
         let mut n = 0usize;
         for b in rx {
           n += b.len();
@@ -121,40 +149,107 @@ fn rss_kib(field: &str) -> u64 {
 }
 
 fn time(label: &str, name: &str, f: impl FnOnce()) {
+  let before = Usage::of_self();
   let t = Instant::now();
   f();
   let ms = t.elapsed().as_secs_f64() * 1e3;
+  let u = Usage::of_self().since(&before);
   println!(
-    "{name}\t{label}\t{ms:.1} ms\tVmRSS {} KiB",
-    rss_kib("VmRSS:")
+    "{name}\t{label}\t{ms:.1} ms\tVmRSS {} KiB\tuser {:.0} ms\tsys {:.0} ms\tminflt {}\tmajflt {}\tdisk read {} B\tdisk write {} B",
+    rss_kib("VmRSS:"),
+    u.user_s * 1e3,
+    u.sys_s * 1e3,
+    u.minflt,
+    u.majflt,
+    u.read_bytes,
+    u.write_bytes,
   );
+}
+
+/// The command-line options of the benchmark binaries.
+struct Options {
+  /// Divides every operation count.
+  scale: usize,
+  idle: Duration,
+  only: Option<Vec<String>>,
+}
+
+impl Options {
+  fn from_args() -> Self {
+    let mut o = Self {
+      scale: 1,
+      idle: Duration::from_secs(3),
+      only: None,
+    };
+    let mut args = std::env::args().skip(1);
+    while let Some(a) = args.next() {
+      match a.as_str() {
+        "--quick" => {
+          o.scale = 20;
+          o.idle = Duration::from_millis(500);
+        }
+        "--only" => {
+          o.only = args
+            .next()
+            .map(|v| v.split(',').map(str::to_owned).collect());
+        }
+        _ => eprintln!("ignoring unknown argument {a:?} (known: --quick, --only KEY[,KEY...])"),
+      }
+    }
+    o
+  }
+
+  fn runs(&self, key: &str) -> bool {
+    self
+      .only
+      .as_ref()
+      .is_none_or(|keys| keys.iter().any(|k| k == key))
+  }
 }
 
 /// Runs every workload and prints one tab-separated line per result.
 pub fn run(name: &str) {
+  let o = Options::from_args();
+  let n = |ops: usize| ops / o.scale;
   let threads = std::thread::available_parallelism()
     .map_or(4, |n| n.get())
     .min(16);
-  time("single-thread churn 2M", name, || {
-    black_box(churn(42, 2_000_000, 1000));
-  });
-  time(
-    &format!("{threads}-thread local churn 1M each"),
-    name,
-    || threads_local(threads, 1_000_000),
-  );
-  time(
-    &format!("{threads}-thread small churn 4M each"),
-    name,
-    || threads_small(threads, 4_000_000),
-  );
-  time(
-    &format!("{} producer/consumer pairs 20k batches", threads / 2),
-    name,
-    || {
-      producer_consumer(threads / 2, 20_000);
-    },
-  );
+  if o.runs("single") {
+    time(
+      &format!("single-thread churn {}", count(n(2_000_000))),
+      name,
+      || {
+        black_box(churn(42, n(2_000_000), 1000));
+      },
+    );
+  }
+  if o.runs("local") {
+    time(
+      &format!("{threads}-thread local churn {} each", count(n(1_000_000))),
+      name,
+      || threads_local(threads, n(1_000_000)),
+    );
+  }
+  if o.runs("small") {
+    time(
+      &format!("{threads}-thread small churn {} each", count(n(4_000_000))),
+      name,
+      || threads_small(threads, n(4_000_000)),
+    );
+  }
+  if o.runs("pairs") {
+    time(
+      &format!(
+        "{} producer/consumer pairs {} batches",
+        threads / 2,
+        count(n(20_000))
+      ),
+      name,
+      || {
+        producer_consumer(threads / 2, n(20_000));
+      },
+    );
+  }
   println!(
     "{name}\tpeak\tVmHWM {} KiB\tVmRSS after {} KiB",
     rss_kib("VmHWM:"),
@@ -162,21 +257,38 @@ pub fn run(name: &str) {
   );
   // What a server keeps after a burst while it waits for the next one: no
   // allocator calls happen during the sleep.
-  std::thread::sleep(std::time::Duration::from_secs(3));
-  println!(
-    "{name}\tidle\tVmRSS after 3 s idle {} KiB",
-    rss_kib("VmRSS:")
-  );
+  if o.runs("idle") {
+    std::thread::sleep(o.idle);
+    println!(
+      "{name}\tidle\tVmRSS after {:.1} s idle {} KiB",
+      o.idle.as_secs_f64(),
+      rss_kib("VmRSS:")
+    );
+  }
   // The local churn's work spread over four times as many threads as
   // CPUs, so lock holders get preempted and waiters must get out of the
   // way (docs/research/benchmarks.md, lock contention). Last, so that it
   // does not change the peak and idle figures above.
-  time(
-    &format!(
-      "{}-thread local churn 250k each (oversubscribed)",
-      4 * threads
-    ),
-    name,
-    || threads_local(4 * threads, 250_000),
-  );
+  if o.runs("oversubscribed") {
+    time(
+      &format!(
+        "{}-thread local churn {} each (oversubscribed)",
+        4 * threads,
+        count(n(250_000))
+      ),
+      name,
+      || threads_local(4 * threads, n(250_000)),
+    );
+  }
+}
+
+/// `2000000` as `2M`, `250000` as `250k`, the way the workload names had them.
+fn count(n: usize) -> String {
+  if n >= 1_000_000 && n.is_multiple_of(1_000_000) {
+    format!("{}M", n / 1_000_000)
+  } else if n >= 1000 && n.is_multiple_of(1000) {
+    format!("{}k", n / 1000)
+  } else {
+    n.to_string()
+  }
 }

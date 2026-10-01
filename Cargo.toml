@@ -6,6 +6,7 @@ members = [
   "crates/allocatbelt-core-check",
   "crates/allocatbelt-tokio",
   "bench",
+  "bench/profile",
   "bench/simd",
 ]
 
@@ -19,6 +20,7 @@ publish = false
 [workspace.dependencies]
 allocatbelt = { path = "crates/allocatbelt" }
 allocatbelt-core-check = { path = "crates/allocatbelt-core-check" }
+allocatbelt-profile = { path = "bench/profile" }
 libc = { version = "0.2.189", default-features = false }
 # Baseline only: OxiBelt currently ships secure mimalloc on x86_64 Linux.
 mimalloc = { version = "0.1.52", default-features = false, features = ["secure"] }

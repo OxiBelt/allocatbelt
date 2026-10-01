@@ -24,6 +24,7 @@ name = "allocatbelt-bench"
 version = "0.1.0"
 dependencies = [
  "allocatbelt",
+ "allocatbelt-profile",
  "mimalloc",
 ]
 
@@ -42,6 +43,10 @@ dependencies = [
  "proptest",
  "rustix",
 ]
+
+[[package]]
+name = "allocatbelt-profile"
+version = "0.1.0"
 
 [[package]]
 name = "allocatbelt-simd-bench"
