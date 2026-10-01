@@ -11,6 +11,7 @@
   - `system`: glibc malloc
   - `mimalloc`: the `mimalloc` 0.1.52 crate with `features = ["secure"]`, the same configuration as OxiBelt's current one
   - `allocatbelt`: this repository
+- **Profiling:** `scripts/profile.sh` records resource use over a run and per-function CPU and page-fault profiles of these binaries ([profiling.md](profiling.md)). Each workload line now also prints its CPU time, page faults and storage bytes; the tables below predate those columns.
 - **Workloads:** size distribution is 70% 16–256 B, 25% 256 B–4 KiB, 4% 4–64 KiB, 1% 64 KiB–1 MiB, mimicking a proxy's small buffers plus occasional bodies.
   1. single-thread churn: 2M alloc/free, 1000-slot live window
   2. 16-thread local churn: 16 threads each doing 1M ops

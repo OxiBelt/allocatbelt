@@ -6,6 +6,7 @@ Date: 2026-09-27. Detailed reports (with sources and verification tags):
 - [designs.md](designs.md): design analysis of mimalloc, snmalloc, jemalloc, Scudo, hardened_malloc and PartitionAlloc (English)
 - [boundary.md](boundary.md): unsafe boundary, reentrancy, provenance, hardware acceleration (English)
 - [benchmarks.md](benchmarks.md): prototype measurements
+- [profiling.md](profiling.md): how to profile the benchmarks' (or any command's) CPU, memory, disk and network use, and their cost per function
 - [simd-benchmarks.md](simd-benchmarks.md): SIMD candidate kernels measured against scalar code, and why none was promoted (plan Phases 4 and 5)
 - [single-package-baseline.md](single-package-baseline.md): the state the single-package directive starts from (`33dfc7b`): correctness suite, unsafe inventory counts, public API (directive Phase A), and what the package consolidation changed (Phase B)
 

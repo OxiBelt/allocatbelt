@@ -115,6 +115,7 @@ RUSTFLAGS="--cfg loom" cargo test --release -p allocatbelt-core-check --lib loom
 (cd fuzz && cargo +nightly fuzz run heap_ops)                   # cargo-fuzz over the checked heap model; see fuzz/README.md
 cargo run --release -p allocatbelt-bench --bin bench-allocatbelt   # also bench-system, bench-mimalloc (built for x86-64-v3)
 cargo run --release -p allocatbelt-simd-bench --bin bench-simd  # SIMD candidates vs scalar; see docs/research/simd-benchmarks.md
+scripts/profile.sh                                              # CPU, memory, disk, network and per-function profiles; see docs/research/profiling.md
 ```
 
 Code style, pinned tool versions and the commit-message format follow OxiBelt; see [CONTRIBUTING.md](CONTRIBUTING.md).
