@@ -64,6 +64,12 @@ jobs:
       - name: SIMD benchmark smoke run
         run: cargo run --release --locked -p allocatbelt-simd-bench --bin bench-simd -- --quick
 
+      # Checks that the resource profiler and the benchmarks' per-workload
+      # usage columns work (docs/research/profiling.md). Hosted-runner
+      # figures are not evidence.
+      - name: Resource profiler smoke run
+        run: scripts/profile.sh --quick --alloc system,allocatbelt --out target/profile/ci resources
+
       # Reports the runner's kernel, whether the maintenance thread's
       # io_uring (and Linux 7.0's SQ_REWIND) can be set up there, and batched
       # purges against one madvise per run (docs/research/benchmarks.md).
