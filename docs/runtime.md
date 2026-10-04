@@ -1,0 +1,137 @@
+# Experimental resource-aware runtime
+
+`allocatbelt-runtime` is an unpublished, Tokio-independent development crate.
+It runs owned blocking jobs on a fixed worker pool. It is **not a Tokio
+replacement**, an async executor, or recommended for production. The allocator
+remains the only package intended for publication.
+
+This page specifies the intended milestone contract. Implementation and
+verification status is recorded in the linked research report.
+
+## First milestone contract
+
+Each submission declares a `Resources` vector. Admission reserves every
+dimension under one scheduler mutex, or rejects the submission without running
+it. A rejected submission returns ownership of the closure. Reservations cover
+queued and running jobs; `max_outstanding` independently bounds their count.
+
+The crate forbids unsafe code. Jobs and results are owned `Send + 'static`
+values; jobs receive a cooperative cancellation token. Rejections distinguish
+closed admission, a full outstanding window, temporarily insufficient resources
+and requests exceeding capacity. Nonblocking means no waiting for capacity,
+not lock-free operation: submission can contend on the scheduler mutex.
+
+| Dimension | Meaning | Not provided |
+|---|---|---|
+| `cpu` | Declared concurrent work units | CPU-time quota, affinity, or preemption |
+| `memory` | Declared working-memory bytes | Enforced allocations, RSS or cgroup limit |
+| `disk` | Declared concurrent disk-operation units | Disk space, IOPS or bandwidth quota |
+| `network` | Declared concurrent network-operation units | Socket reactor or bandwidth quota |
+
+The worker count bounds simultaneous execution separately from admission.
+For example, eight CPU units and four workers admits eight one-unit jobs but
+runs at most four at once. A zero vector is valid: the job count still bounds
+admission. A request greater than capacity is invalid; arithmetic must not wrap
+even at `usize::MAX`.
+
+These are **cooperative declarations**, not measurement or OS enforcement.
+Allocate large working buffers inside admitted jobs, not in their captured
+closures. Caller allocations, thread stacks, scheduler metadata and completed
+results retained by callers are outside the declared memory budget. Returning
+a result that retains a job's buffers also takes them outside that budget.
+A job must declare its entire peak working set honestly.
+
+## Ownership and lifecycle
+
+- Submission is nonblocking. Full queues and temporarily exhausted resources
+  cause explicit rejection rather than an unbounded waiter queue.
+- Dropping a join handle detaches its job. Cancellation is explicit and
+  cooperative for running jobs; it never terminates a thread.
+- A queued cancellation that wins the start transition prevents execution.
+  Its reservation can remain held until the queue entry and closure are dropped.
+- Work, user-owned values and allocator park hooks run outside scheduler locks.
+  With unwinding, ordinary job panics become join errors. Containment must also
+  cover cancellation cleanup and discarded results; a destructor panicking
+  during another unwind can still abort. `panic = "abort"` cannot be recovered.
+- Drain shutdown closes admission, finishes admitted work and joins workers.
+  Cancel-pending shutdown also cancels queued work and requests cancellation
+  of running work. Noncooperative jobs can delay explicit shutdown indefinitely.
+- Dropping the runtime closes and cancels without waiting for running work;
+  detached workers can outlive it. Use explicit shutdown when completion is
+  required and keep captured resources alive through owned values.
+- Blocking joins and shutdown from a worker of its own runtime must be rejected
+  rather than deadlock. Do not depend on nested synchronous work in a saturated
+  pool. Allocator fork support does not make inherited runtime workers usable
+  in a forked child.
+
+Every admitted job has exactly one terminal outcome and releases its vector
+and outstanding slot exactly once after execution or cancellation cleanup.
+Cancellation requested is not capacity released. Cancel-pending shutdown and
+runtime drop remove queued entries; drain leaves them to workers. Joiners
+observe cancellation only after cleanup, not merely after a token is signaled.
+
+Workers prefer allocator shards at startup and return allocator caches before
+parking and at exit. The crate does not install a global allocator. With system
+allocation or mimalloc these hooks do not alter those allocators.
+
+## Measurement gate
+
+Compare the runtime with **Tokio's blocking pool**, not its async scheduler.
+Use identical jobs, worker counts, outstanding windows and completed-job
+checksums. Cross both runtimes with system allocation, secure mimalloc and
+allocatbelt to distinguish allocator costs from scheduling costs.
+
+For uniform jobs, set capacity to the outstanding window times the job's
+request, so the common window enforces equivalent admission. This is not an
+overload or heterogeneous-resource experiment. Future overload comparisons
+must match resource rejection and cancellation policy, count rejected work,
+and measure end-to-end tail latency. Tokio's blocking-thread limit is a ceiling,
+not an eagerly started fixed pool; distinguish startup from warmed execution.
+
+`scripts/bench-runtime.sh` records repeated fresh-process runs. Fully touching
+working buffers is required. A sequential checksum reference is outside the
+job timing; whole-process profiles include it and runtime startup.
+Record each host and toolchain separately, alternate run order, and report
+dispersion as well as medians. KVM guests execute native instructions, but
+uncontrolled host scheduling and frequency remain confounders. Hosted CI and
+qemu timings do not qualify an optimization.
+
+See [the runtime research report](research/runtime-foundation.md) for results
+and [profiling](research/profiling.md) for CPU, RSS and per-function tools.
+Admission counters are not resource-usage measurements.
+
+## Path toward replacing Tokio
+
+These remain separate, unimplemented milestones, not implied APIs:
+
+1. A safe future task-state/waker protocol, cancellation and structured scopes,
+   with model checking before optimizing queues.
+2. Timers and a Linux I/O reactor with bounded submission, completion ownership,
+   sandbox fallback and cancellation-safe buffers.
+3. TCP/UDP, file I/O, synchronization and blocking adapters; define compatibility
+   requirements against real Tokio application workloads.
+4. Resource measurement and optional cgroup-aware feedback, with explicit
+   admission versus enforcement semantics and oscillation/overload tests.
+5. Profile-driven scheduler and ISA variants, promoted only after correctness,
+   tail-latency, throughput and memory gates on native supported platforms.
+
+No default algorithm or ISA dispatch is promoted by this milestone. The
+[platform contract](platform.md), including the allocator's x86-64-v3 floor,
+and [design constraints](design-constraints.md) are unchanged.
+
+## Patent-risk discipline
+
+The constraints are a preliminary technical screen, **not freedom to operate**.
+Rust, familiar primitives and independent implementation do not establish
+non-infringement. Do not copy another library's code without checking its license.
+
+Any allocator change breaking a listed constraint needs its specified review
+before implementation. Runtime admission, scheduling, reactors and adaptive
+control also need claim-level patent review for the jurisdictions and deployment
+in question. Keep sensitive comparisons and unpublished findings in an
+authorized private checkout, not this repository.
+
+A patent non-aggression program is not a patent application, does not confer
+patent protection on this implementation, and does not clear patents outside
+its actual licensed scope. Counsel should verify the applicable agreement
+before relying on OIN or OIN 2.

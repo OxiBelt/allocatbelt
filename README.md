@@ -15,6 +15,7 @@ crates/allocatbelt/                The published package:
   src/global.rs, src/rseq.rs       the #[global_allocator] adapter (Allocatbelt)
 crates/allocatbelt-core-check/     no_std build of src/core with its tests, the checking model and loom (not published)
 crates/allocatbelt-codegen-probes/ out-of-line core helpers for the scalar ISA check (not published)
+crates/allocatbelt-runtime/        experimental bounded resource-aware job runtime (not published)
 fuzz/                              cargo-fuzz over the checking model (not published)
 bench/                    Comparison against system and secure mimalloc.
 bench/simd/               SIMD candidate kernels and their benchmark (not linked into the allocator).
@@ -88,6 +89,12 @@ What it does, in the terms of mimalloc (details in [docs/research/README.md](doc
 - **Regions (opt-in).** `Region` bump allocates `Copy` values, slices and strings that die together, such as one request's temporary data, in chunks of the same heap, and frees them all at a reset; the borrow checker keeps every piece from outliving it. The global allocator never places anything in a region ([docs/region.md](docs/region.md)).
 
 Status: **research prototype**. Not recommended for production.
+
+An unpublished [runtime foundation](docs/runtime.md) also explores a
+Tokio-independent worker pool with cooperative CPU, memory, disk and network
+admission. It runs blocking jobs, not futures; timers, async I/O and Tokio
+compatibility remain future milestones. Its benchmarks compare against Tokio's
+blocking pool, separately from the allocator comparison.
 
 **Platform contract** ([docs/platform.md](docs/platform.md)): Linux 7.0 or newer, 64-bit little-endian userspace, on x86_64 (**x86-64-v3 or newer**), aarch64 or riscv64 (RV64GC, Zbb optional). Every other target, and any x86_64 build below x86-64-v3, fails at compile time with a message saying why. Inside this repository `.cargo/config.toml` builds x86_64 with `-C target-cpu=x86-64-v3`; a `RUSTFLAGS` variable replaces it and must carry that flag too, and crates depending on allocatbelt (OxiBelt) must set it in their own build ([above](#using-it-from-another-crate)). At start-up the allocator probes the kernel facilities it cannot run without (reservation, commit, `MADV_DONTNEED` zeroing) and aborts with a message if one is missing. x86_64 and aarch64 are tested natively in CI (`ubuntu-26.04` and `ubuntu-26.04-arm` runners); riscv64 is tested in CI under qemu-user, with and without Zbb; the `platform-gates` job checks that the supported targets build and the others are rejected. Every supported CPU runs the same scalar code by default: none of the SIMD candidates measured in `bench/simd` qualified ([docs/research/simd-benchmarks.md](docs/research/simd-benchmarks.md)). The experimental SVE/SVE2 and RVV kernels run only when compiled in, exposed to the process and selected by the policy ([docs/features.md](docs/features.md#experimental-isa-kernels)).
 allocatbelt does not depend on OxiBelt, and OxiBelt does not need it: an application opts in with `#[global_allocator]` (above), and any Rust program on a supported platform can use it the same way. OxiBelt keeps secure mimalloc as its default; the research summary recommends adding allocatbelt there only as an experimental option and comparing it under real traffic first ([docs/research/README.md](docs/research/README.md)).
