@@ -62,15 +62,17 @@ done
 
 scenario() {
   # scenario <ALLOCATBELT_SANDBOX> <seccomp profile or ""> <test>
-  local env="$1" profile="$2" test="$3" opts=()
+  local env="$1" profile="$2" test="maintenance::$3" opts=()
   [[ -n "${profile}" ]] && opts=(--security-opt "seccomp=scripts/seccomp/${profile}.json")
   echo "-- ${test} (${env}${profile:+, seccomp ${profile}})"
   docker run "${hardened[@]}" "${opts[@]}" -e "ALLOCATBELT_SANDBOX=${env}" "${image}" \
     "/t/${sandbox}" --exact "${test}" --nocapture --test-threads=1 2>&1 |
     grep -E '^(test |io_uring:|scheduler:|maintenance:)' || true
-  # grep hides the rest; the verdict is the container's exit status.
+  # Require the exact test to run; a misspelled filter otherwise succeeds
+  # with zero tests, even when the container's exit status is zero.
   docker run "${hardened[@]}" "${opts[@]}" -e "ALLOCATBELT_SANDBOX=${env}" "${image}" \
-    "/t/${sandbox}" --exact "${test}" --test-threads=1 -q >/dev/null
+    "/t/${sandbox}" --exact "${test}" --test-threads=1 -q |
+    grep -E '^test result: ok\. 1 passed; 0 failed; 0 ignored;' >/dev/null
 }
 
 echo "== fallback scenarios"
