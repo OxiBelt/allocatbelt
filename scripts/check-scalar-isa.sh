@@ -8,12 +8,15 @@
 #                        leading_zeros -> clz
 #   riscv64 (rv64gc):    none of ctz/cpop/clz, a control showing that the
 #                        check tells the two apart
+#   aarch64 (native):   leading_zeros -> clz, trailing_zeros -> rbit/clz,
+#                        count_ones -> cnt and a lane reduction
 #
 # It compiles `allocatbelt-codegen-probes` (out-of-line wrappers around the
 # core's helpers, built through allocatbelt-core-check) to assembly and
 # looks only at the probe bodies, so unrelated scheduling or inlining
 # changes do not break it.
-# Needs `rustup target add riscv64gc-unknown-linux-gnu`; no linker or qemu.
+# Native ARM64 needs only its host target; the x86/RISC-V matrix needs
+# `rustup target add riscv64gc-unknown-linux-gnu`. No linker or qemu is used.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -80,6 +83,17 @@ reject() {
     echo "ok: ${label}: ${probe} has no Zbb instruction (multi-instruction fallback)"
   fi
 }
+
+# Native ARM64 CI checks named probes, without depending on register choices.
+if [[ "${ISA_ARCH:-$(uname -m)}" == aarch64 ]]; then
+  arm="$(emit aarch64-unknown-linux-gnu aarch64 '')"
+  expect aarch64 "${arm}" probe_class_of 'clz'
+  expect aarch64 "${arm}" probe_find_run 'rbit'
+  expect aarch64 "${arm}" probe_find_run 'clz'
+  expect aarch64 "${arm}" probe_count_ones 'cnt'
+  expect aarch64 "${arm}" probe_count_ones 'addv|uaddlv'
+  exit "${failed}"
+fi
 
 # x86-64-v3 comes from .cargo/config.toml; clear RUSTFLAGS so it applies.
 x86="$(env -u RUSTFLAGS bash -c "$(declare -f emit); target_dir='${target_dir}'; emit x86_64-unknown-linux-gnu x86-64-v3")"

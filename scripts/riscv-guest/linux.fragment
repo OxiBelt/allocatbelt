@@ -1,0 +1,36 @@
+CONFIG_RISCV_ISA_V=y
+CONFIG_SMP=y
+CONFIG_NR_CPUS=4
+CONFIG_BLK_DEV_INITRD=y
+CONFIG_DEVTMPFS=y
+CONFIG_PROC_FS=y
+CONFIG_SYSFS=y
+CONFIG_SYSCTL=y
+CONFIG_FUTEX=y
+CONFIG_SECCOMP=y
+CONFIG_SECCOMP_FILTER=y
+CONFIG_TMPFS=y
+CONFIG_SERIAL_8250=y
+CONFIG_SERIAL_8250_CONSOLE=y
+CONFIG_SERIAL_OF_PLATFORM=y
+CONFIG_RANDOM_TRUST_CPU=y
+# The offline initramfs needs no dynamically loaded or peripheral drivers.
+# Disable their parent families explicitly instead of promoting modules.
+# CONFIG_MODULES is not set
+# CONFIG_DRM is not set
+# CONFIG_SOUND is not set
+# CONFIG_WLAN is not set
+# CONFIG_BT is not set
+# CONFIG_USB_SUPPORT is not set
+# CONFIG_MEDIA_SUPPORT is not set
+# CONFIG_STAGING is not set
+# CONFIG_SCSI is not set
+# CONFIG_ATA is not set
+# CONFIG_NVME_CORE is not set
+# CONFIG_BLK_DEV_NVME is not set
+# CONFIG_NVME_TARGET is not set
+# CONFIG_INFINIBAND is not set
+# CONFIG_WIREGUARD is not set
+# CONFIG_CAN is not set
+# CONFIG_NFC is not set
+# CONFIG_NETDEVICES is not set

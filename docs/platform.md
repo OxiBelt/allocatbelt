@@ -84,7 +84,7 @@ The allocator's hot scans work on one `u64` bitmap word at a time with `trailing
 
 These helpers are small enough that LLVM inlines them into their callers, so they have no symbol of their own. The script builds `crates/allocatbelt-codegen-probes`, which holds one out-of-line wrapper per operation around the real helper of the `core` module (through `allocatbelt-core-check`), with the allocator's own flags, emits assembly, and looks only at those four function bodies, which keeps it independent of scheduling and inlining elsewhere. The rv64gc column is a control: without Zbb none of the three instructions may appear, which shows the check can tell the builds apart and why `-C target-feature=+zbb` matters. A generic x86-64 (v1) build of the probes uses `bsf`/`bsr` and a software popcount, which the check would reject; the platform gate already rules that build out for the allocator itself.
 
-The check needs only `rustup target add riscv64gc-unknown-linux-gnu`, no linker or qemu, since it stops at assembly. It verifies instruction selection only; whether a kernel is faster is a benchmark question for later phases. aarch64 has no scalar popcount before FEAT_CSSC (LLVM uses NEON `cnt`), so it is not part of this check.
+The x86/RISC-V matrix needs only `rustup target add riscv64gc-unknown-linux-gnu`, no linker or qemu, since it stops at assembly. Native ARM64 CI checks `clz`, `rbit`/`clz` and NEON `cnt` with a lane reduction; it needs only the host target. These checks verify instruction selection only; whether a kernel is faster requires native benchmarks.
 
 ## Not covered yet
 

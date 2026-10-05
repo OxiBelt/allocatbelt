@@ -8,7 +8,7 @@ wins for this repository.
 ## Local Checks
 
 Run the checks CI runs from the repository root. The toolchain is pinned by
-`rust-version` in `Cargo.toml` (currently 1.98).
+`rust-version` in `Cargo.toml` (currently 1.99.0).
 
 ```sh
 cargo fmt --all --check
@@ -18,11 +18,16 @@ scripts/check-features.sh    # each supported Cargo feature combination
 scripts/check-package.sh     # the crates.io package and a clean consumer
 scripts/check-sandbox.sh     # hardened container and VM behaviour (docker, qemu-user)
 scripts/check-experimental-isa.sh  # experimental SVE/SVE2 kernels (qemu-user, aarch64 target)
-scripts/check-experimental-rvv.sh  # experimental RVV kernel (pinned nightly, qemu-user, riscv64 target)
+scripts/check-experimental-rvv.sh  # experimental RVV kernel (stable Rust, qemu-user, riscv64 target)
 scripts/check-rseq.sh        # experimental rseq mm_cid: glibc, glibc with rseq off, musl
 cargo audit
 cargo deny check
 ```
+
+The full-system RISC-V CI job also runs `build`, `payload` and `boot` through
+`python3 -B scripts/riscv-guest/check.py`. See the
+[guest recipe](scripts/riscv-guest/README.md) for prerequisites and cache
+validation. Its emulated results establish correctness only.
 
 Changes must keep the rules in
 [docs/design-constraints.md](docs/design-constraints.md); one that would break

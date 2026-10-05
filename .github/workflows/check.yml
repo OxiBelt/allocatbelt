@@ -28,7 +28,7 @@ jobs:
       fail-fast: false
       matrix:
         rust_version:
-          - 1.98.1
+          - 1.99.0
         runner:
           - ubuntu-26.04
           - ubuntu-26.04-arm
@@ -79,6 +79,21 @@ jobs:
           uname -r
           cargo test --release --locked -p allocatbelt --features io-uring --lib ring_benchmark -- --ignored --nocapture
 
+  scalar-isa-arm64:
+    name: ARM64 scalar instruction probes
+    runs-on: ubuntu-26.04-arm
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # 7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Install pinned stable Rust
+        run: rustup toolchain install 1.99.0 --profile minimal
+      - name: Check ARM64 bit scans and population counts
+        run: scripts/check-scalar-isa.sh
+
   # The platform contract (docs/platform.md): x86_64 builds need x86-64-v3,
   # and unsupported architectures, ABIs, byte orders and operating systems
   # fail at compile time with the gates' own messages.
@@ -96,8 +111,8 @@ jobs:
 
       - name: Install Rust toolchain and targets
         run: |
-          rustup toolchain install 1.98.1 --profile minimal
-          rustup default 1.98.1
+          rustup toolchain install 1.99.0 --profile minimal
+          rustup default 1.99.0
           rustup target add \
             x86_64-unknown-linux-musl \
             aarch64-unknown-linux-gnu \
@@ -142,8 +157,8 @@ jobs:
 
       - name: Install Rust toolchain
         run: |
-          rustup toolchain install 1.98.1 --profile minimal
-          rustup default 1.98.1
+          rustup toolchain install 1.99.0 --profile minimal
+          rustup default 1.99.0
 
       - name: Fetch locked Cargo dependency graph
         run: cargo fetch --locked
@@ -174,9 +189,9 @@ jobs:
 
       - name: Install Rust toolchain
         run: |
-          rustup toolchain install 1.98.1 --profile minimal
-          rustup default 1.98.1
-          rustup component add clippy --toolchain 1.98.1
+          rustup toolchain install 1.99.0 --profile minimal
+          rustup default 1.99.0
+          rustup component add clippy --toolchain 1.99.0
 
       - name: Fetch locked Cargo dependency graph
         run: cargo fetch --locked
@@ -210,8 +225,8 @@ jobs:
 
       - name: Install Rust toolchain
         run: |
-          rustup toolchain install 1.98.1 --profile minimal --target "$(uname -m)-unknown-linux-musl"
-          rustup default 1.98.1
+          rustup toolchain install 1.99.0 --profile minimal --target "$(uname -m)-unknown-linux-musl"
+          rustup default 1.99.0
 
       - name: Install qemu-user
         run: |
@@ -250,8 +265,8 @@ jobs:
 
       - name: Install Rust toolchain
         run: |
-          rustup toolchain install 1.98.1 --profile minimal --target "$(uname -m)-unknown-linux-musl"
-          rustup default 1.98.1
+          rustup toolchain install 1.99.0 --profile minimal --target "$(uname -m)-unknown-linux-musl"
+          rustup default 1.99.0
 
       - name: Fetch locked Cargo dependency graph
         run: cargo fetch --locked
@@ -276,8 +291,8 @@ jobs:
 
       - name: Install Rust toolchain
         run: |
-          rustup toolchain install 1.98.1 --profile minimal --component clippy
-          rustup default 1.98.1
+          rustup toolchain install 1.99.0 --profile minimal --component clippy
+          rustup default 1.99.0
 
       - name: Install qemu-user
         run: |
@@ -296,11 +311,10 @@ jobs:
       - name: Kernels and selection under qemu CPU models
         run: scripts/check-experimental-isa.sh
 
-  # Single-package directive Phase G: the experimental RVV kernel. The `v`
-  # target feature is unstable in Rust 1.98, so this is the one job on a
-  # (pinned) nightly; every other job stays on stable 1.98.1.
+  # Single-package directive Phase G: the experimental RVV kernel. Its naked
+  # assembly scopes V locally, so it stays on the pinned stable toolchain.
   experimental-rvv:
-    name: Experimental riscv64 RVV kernel (nightly)
+    name: Experimental riscv64 RVV kernel (stable)
     runs-on: ubuntu-26.04
     timeout-minutes: 30
 
@@ -311,9 +325,9 @@ jobs:
           ref: ${{ github.sha }}
           persist-credentials: false
 
-      - name: Install the pinned nightly toolchain
+      - name: Install pinned stable Rust
         run: |
-          rustup toolchain install nightly-2026-09-27 --profile minimal --component clippy \
+          rustup toolchain install 1.99.0 --profile minimal --component clippy \
             --target riscv64gc-unknown-linux-gnu
 
       - name: Install qemu-user, the riscv64 cross toolchain and llvm-objdump
@@ -325,7 +339,7 @@ jobs:
           command -v llvm-objdump || sudo ln -s "$(ls /usr/bin/llvm-objdump-* | sort -V | tail -1)" /usr/local/bin/llvm-objdump
 
       - name: Fetch locked Cargo dependency graph
-        run: cargo +nightly-2026-09-27 fetch --locked
+        run: cargo +1.99.0 fetch --locked
 
       - name: Lint, isolation and kernel checks under qemu
         run: scripts/check-experimental-rvv.sh
@@ -377,8 +391,8 @@ jobs:
 
       - name: Install Rust toolchain
         run: |
-          rustup toolchain install 1.98.1 --profile minimal --target riscv64gc-unknown-linux-gnu
-          rustup default 1.98.1
+          rustup toolchain install 1.99.0 --profile minimal --target riscv64gc-unknown-linux-gnu
+          rustup default 1.99.0
 
       - name: Fetch locked Cargo dependency graph
         run: cargo fetch --locked
@@ -410,8 +424,8 @@ jobs:
 
       - name: Install Rust toolchain
         run: |
-          rustup toolchain install 1.98.1 --profile minimal --target riscv64gc-unknown-linux-gnu
-          rustup default 1.98.1
+          rustup toolchain install 1.99.0 --profile minimal --target riscv64gc-unknown-linux-gnu
+          rustup default 1.99.0
 
       # qemu-user 8.2 intermittently crashes with "QEMU internal SIGSEGV" on
       # the multithreaded tests; 10.2.1 is the oldest release verified clean.
@@ -460,8 +474,8 @@ jobs:
 
       - name: Install Rust toolchain
         run: |
-          rustup toolchain install 1.98.1 --profile minimal
-          rustup default 1.98.1
+          rustup toolchain install 1.99.0 --profile minimal
+          rustup default 1.99.0
 
       - name: Fetch locked Cargo dependency graph
         run: cargo fetch --locked
@@ -485,8 +499,8 @@ jobs:
       - name: Install Rust toolchains and cargo-fuzz
         run: |
           rustup toolchain install nightly-2026-09-28 --profile minimal
-          rustup toolchain install 1.98.1 --profile minimal
-          cargo +1.98.1 install cargo-fuzz --version 0.13.2 --locked
+          rustup toolchain install 1.99.0 --profile minimal
+          cargo +1.99.0 install cargo-fuzz --version 0.13.2 --locked
 
       - name: Fuzz heap_ops
         working-directory: fuzz
@@ -515,8 +529,8 @@ jobs:
 
       - name: Install Rust toolchain
         run: |
-          rustup toolchain install 1.98.1 --profile minimal
-          rustup default 1.98.1
+          rustup toolchain install 1.99.0 --profile minimal
+          rustup default 1.99.0
 
       - name: Install pinned Rust dependency tools
         run: |
@@ -544,12 +558,12 @@ jobs:
 
       - name: Install Rust toolchain
         run: |
-          rustup toolchain install 1.98.1 --profile minimal
-          rustup default 1.98.1
+          rustup toolchain install 1.99.0 --profile minimal
+          rustup default 1.99.0
 
       - name: Install pinned mewt
         run: |
-          cargo +1.98.1 install mewt --version 4.0.0 --locked
+          cargo +1.99.0 install mewt --version 4.0.0 --locked
           test "$(mewt --version)" = "mewt 4.0.0"
 
       - name: Run mutation campaign

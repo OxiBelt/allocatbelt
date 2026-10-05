@@ -1,0 +1,62 @@
+name: RISC-V Linux guest
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  schedule:
+    - cron: "0 0 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  riscv-linux-guest:
+    name: Linux 7.0 RISC-V baseline and thread vector policy
+    runs-on: ubuntu-26.04
+    timeout-minutes: 120
+    env:
+      CARGO_TERM_COLOR: always
+      CARGO_NET_RETRY: "10"
+      PYTHONDONTWRITEBYTECODE: "1"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # 7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Install build prerequisites and exact Rust
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential bc bison flex cpio file rsync unzip wget curl \
+            python3 libncurses-dev libssl-dev libglib2.0-dev libpixman-1-dev \
+            ninja-build meson patch perl tar xz-utils
+          rustup toolchain install 1.99.0 --profile minimal --target riscv64gc-unknown-linux-musl
+      - name: Check the guest result validator
+        run: python3 -B -m unittest discover -s scripts/riscv-guest -p 'test_*.py'
+      - name: Identify guest configuration and host build tools
+        id: assets
+        run: echo "key=$(python3 -B scripts/riscv-guest/check.py key)" >> "$GITHUB_OUTPUT"
+      # No restore prefix: a guest/toolchain built from other inputs is not reused.
+      - name: Cache pinned guest images and host cross tools
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # 4.3.0
+        with:
+          # Cache runnable assets, not the large intermediate kernel/tool builds.
+          path: |
+            target/riscv-guest/assets/images
+            target/riscv-guest/assets/host
+            target/riscv-guest/assets/.config
+            target/riscv-guest/assets/integrity.json
+          key: riscv-guest-${{ steps.assets.outputs.key }}
+      - name: Build or validate the pinned offline guest
+        run: python3 -B scripts/riscv-guest/check.py build
+      - name: Cross-build the current static test payload
+        run: python3 -B scripts/riscv-guest/check.py payload
+      - name: Boot baseline and vector-enabled Linux guests
+        run: python3 -B scripts/riscv-guest/check.py boot

@@ -1,0 +1,19 @@
+{
+  "format": 1,
+  "buildroot": {
+    "version": "2026.08",
+    "url": "https://buildroot.org/downloads/buildroot-2026.08.tar.xz",
+    "sha256": "87aaca4164ea9d5c8085854953018263f7963f07c22e73a2a2185cc98c581c34"
+  },
+  "linux": {
+    "version": "7.0",
+    "sha256": "bb7f6d80b387c757b7d14bb93028fcb90f793c5c0d367736ee815a100b3891f0"
+  },
+  "opensbi": {
+    "version": "1.6",
+    "sha256": "d11702103f177a2914e94eec57ce5ed820296d874f6b6525c4482e55d71a3667"
+  },
+  "rust": "1.99.0",
+  "target": "riscv64gc-unknown-linux-musl",
+  "guest": { "cpus": 4, "memory_mib": 2048, "deadline_seconds": 300 }
+}
