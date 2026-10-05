@@ -12,7 +12,7 @@
 //! - `--quick`: a twentieth of the operations and a shorter idle wait, for
 //!   smoke runs and slow tools such as callgrind. Not for timings.
 //! - `--only KEY[,KEY...]`: run only these workloads, of `single`, `local`,
-//!   `small`, `pairs`, `idle` and `oversubscribed`.
+//!   `small`, `pairs`, `idle`, `oversubscribed`, `aligned` and `region`.
 
 use std::hint::black_box;
 use std::sync::mpsc;
@@ -80,6 +80,45 @@ fn small_churn(seed: u64, ops: usize, window: usize) -> usize {
   }
   black_box(&live);
   n
+}
+
+#[repr(align(64))]
+struct Aligned64([u8; 192]);
+
+#[repr(align(256))]
+struct Aligned256([u8; 768]);
+
+/// Alignment-sensitive small allocations, with live payload checks.
+fn aligned_churn(ops: usize) {
+  let mut checksum = 0usize;
+  for i in 0..ops {
+    let a = Box::new(Aligned64([i as u8; 192]));
+    let b = Box::new(Aligned256([i as u8; 768]));
+    black_box(&a);
+    black_box(&b);
+    checksum = checksum.wrapping_add(usize::from(a.0[191]) + usize::from(b.0[767]));
+  }
+  black_box(checksum);
+}
+
+/// Bump hits, standard chunk changes, and reuse after reset. This explicit
+/// Region uses allocatbelt even in the system/mimalloc comparison binaries.
+fn region_churn(ops: usize) {
+  let mut region = allocatbelt::Region::new();
+  let mut checksum = 0u64;
+  for i in 0..ops {
+    let value = region.alloc_copy([i as u64; 8]).expect("region piece");
+    checksum = checksum.wrapping_add(black_box(value)[7]);
+    if (i + 1).is_multiple_of(1024) {
+      region.reset();
+    }
+  }
+  assert_eq!(
+    checksum,
+    (ops as u64).wrapping_mul(ops.saturating_sub(1) as u64) / 2
+  );
+  region.release();
+  assert_eq!(region.stats().capacity, 0);
 }
 
 /// Spawns a named worker, so per-thread profiles (`threads-by-name.csv`,
@@ -251,6 +290,16 @@ pub fn run(name: &str) {
         producer_consumer(threads / 2, n(20_000));
       },
     );
+  }
+  if o.runs("aligned") {
+    time("aligned 64/256-byte churn", name, || {
+      aligned_churn(n(4_000_000))
+    });
+  }
+  if o.runs("region") {
+    time("region 64-byte bump/reset", name, || {
+      region_churn(n(10_000_000))
+    });
   }
   println!(
     "{name}\tpeak\tVmHWM {} KiB\tVmRSS after {} KiB",

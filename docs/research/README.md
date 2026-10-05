@@ -9,6 +9,7 @@ Date: 2026-09-27. Detailed reports (with sources and verification tags):
 - [profiling.md](profiling.md): how to profile the benchmarks' (or any command's) CPU, memory, disk and network use, and their cost per function
 - [simd-benchmarks.md](simd-benchmarks.md): SIMD candidate kernels measured against scalar code, and why none was promoted (plan Phases 4 and 5)
 - [single-package-baseline.md](single-package-baseline.md): the state the single-package directive starts from (`33dfc7b`): correctness suite, unsafe inventory counts, public API (directive Phase A), and what the package consolidation changed (Phase B)
+- [rust199-modernization.md](rust199-modernization.md): stable ABI boundaries, Rust 1.99 API selection and native qualification method
 
 > The three detailed reports were written by Claude subagents from web sources. Every claim is tagged
 > **[V]** (checked against a primary source), **[S]**/(secondary) or **[U]/[UNVERIFIED]**; check the tag before relying on a claim.

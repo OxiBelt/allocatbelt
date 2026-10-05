@@ -10,7 +10,7 @@ Verdict: the package `allocatbelt` is technically ready for `cargo publish`. The
 |---|---|---|
 | `name` | `allocatbelt` | Not taken on crates.io (API query on 2026-09-28: "crate `allocatbelt` does not exist"). |
 | `version` | `0.1.0` | Pre-1.0: a later `0.2` may break the API. |
-| `edition`, `rust-version` | 2024, 1.98 | The MSRV CI uses (1.98.1). |
+| `edition`, `rust-version` | 2024, 1.99.0 | The original 2026-09-28 review used 1.98.1; current CI uses 1.99.0. |
 | `license` | `Apache-2.0` | `LICENSE` is in the package. |
 | `description` | updated | It now names the three unsafe boundaries (syscall, CPU detection, `GlobalAlloc`), not two. |
 | `repository`, `readme` | GitHub, the top-level README | See decision 2 for the README's links. |
@@ -42,7 +42,7 @@ On x86_64 the consumer fails without `-C target-cpu=x86-64-v3`, with the gate's 
 
 ## 5. Stable default and optional stable features
 
-Everything except `experimental-riscv-rvv` on riscv64 builds on stable 1.98.1. `scripts/check-features.sh` (CI job "Feature combinations", x86_64 and arm64) lints and tests 11 combinations; `cargo clippy/test --all-features` runs on both (on those architectures the RVV feature compiles nothing, so `--all-features` stays on stable, directive §16).
+All features build on stable Rust 1.99.0, including the RVV naked assembly leaf on riscv64. `scripts/check-features.sh` (CI job "Feature combinations", x86_64 and arm64) lints and tests 11 combinations; `cargo clippy/test --all-features` runs on both. The RISC-V jobs check the RVV implementation separately (directive §16).
 
 ## 6. Experimental target matrix, tested separately
 
@@ -50,7 +50,7 @@ Everything except `experimental-riscv-rvv` on riscv64 builds on stable 1.98.1. `
 |---|---|---|---|---|
 | `experimental-rseq` | stable | glibc 2.35+ on Linux 6.3+ | "Experimental rseq mm_cid" (x86_64, arm64); riscv64 qemu jobs | glibc with registration, with `glibc.pthread.rseq=0`, static musl; fork, cpuset, seccomp refusal |
 | `experimental-aarch64-sve`, `-sve2` | stable | aarch64 with SVE/SVE2 | "Experimental aarch64 SVE/SVE2 kernels" (arm64) | native, and qemu CPU models and vector lengths |
-| `experimental-riscv-rvv` | **nightly** on riscv64 (pinned `nightly-2026-09-27`) | riscv64 with V | "Experimental riscv64 RVV kernel (nightly)" | qemu with VLEN 128/256/1024 and without V; V instructions only in the kernel |
+| `experimental-riscv-rvv` | stable Rust 1.99.0 on riscv64 | riscv64 with V | "Experimental riscv64 RVV kernel (stable)" | qemu with VLEN 128/256/1024 and without V; V instructions only in the kernel |
 
 None of them is a default, and none is selected by `Auto`.
 

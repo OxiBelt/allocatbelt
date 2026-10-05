@@ -14,7 +14,13 @@ scripts/profile.sh --help
 
 Output goes to `target/profile/<UTC time>/` (or `--out DIR`), one directory per profiled binary, plus `environment.txt` (commit, kernel, CPU, rustc, options). The script builds with `cargo --profile bench`, which is `release` with debug info, so the tools can name functions and lines.
 
-`--quick` runs a twentieth of each workload and a shorter idle wait. It is for smoke runs and for callgrind, which is slow; its timings mean nothing. `--only KEYS` runs only the named workloads (`single`, `local`, `small`, `pairs`, `idle`, `oversubscribed`); the benchmark binaries accept the same `--quick` and `--only` arguments when run directly.
+`--quick` runs a twentieth of each workload and a shorter idle wait. It is for smoke runs and for callgrind, which is slow; its timings mean nothing. `--only KEYS` runs only the named workloads (`single`, `local`, `small`, `pairs`, `idle`, `oversubscribed`, `aligned`, `region`); the benchmark binaries accept the same `--quick` and `--only` arguments when run directly.
+
+`aligned` churns boxes aligned to 64 and 256 bytes. `region` exercises explicit
+64-byte region allocations, chunk reuse after reset, and release. The explicit
+region always uses allocatbelt, including in the system and mimalloc binaries;
+those rows compare the same region implementation with different global
+allocators, not three region providers.
 
 ## Modes
 
@@ -75,6 +81,39 @@ runtime comparisons, not isolated async-scheduler costs.
 See [the contract](../runtime.md) and
 [research report](runtime-foundation.md) for admission semantics, comparison
 limits and results. No timing gate is enabled in hosted CI.
+
+### Runtime allocation and rejection diagnostics
+
+```sh
+cargo build --release --locked -p allocatbelt-bench --bin bench-runtime-diagnostic
+target/release/bench-runtime-diagnostic --workers 4 --jobs 512 --window 512 \
+  --reject-iterations 100000
+```
+
+This separate binary wraps `System` to count requested Rust allocation layouts.
+It reports construction and submission allocations, controlled-backlog p99
+submission/start/work-completion times, and retained bytes for inline 4 KiB
+results and returned cancellation tokens. Work completion is the closure's
+timestamp, before admission release and result publication. These percentiles
+describe this backlog workload, not application service latency.
+
+Workers warm up before measurement. A gate holds the first jobs while the
+driver fills the queue, then releases them together. Gate waits have a deadline
+and cleanup releases blocked workers. The outstanding window must hold all jobs.
+Use a larger window with the same job count to inspect sparsely used capacity.
+
+Packet-release snapshots precede destruction of timing buffers. Runtime release
+drops both the runtime and its handle. Token objects and their vector's backing
+allocation are measured separately; surviving tokens also retain one shared
+runtime identity. Counts describe requested heap bytes, excluding allocator
+rounding, thread stacks and resident-memory effects. Use the resource profiler
+for RSS and CPU measurements.
+
+The optional rejection lane measures `Full`, `Closed`, `InvalidRequest` and
+`InsufficientResources` independently, checking error priorities and returned
+closure ownership. Compare identical diagnostic sources in fresh, balanced
+baseline/candidate processes. Keep these observations separate from primary
+throughput runs and from instrumented profiles.
 
 ### Allocator workloads
 

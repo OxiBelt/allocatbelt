@@ -75,8 +75,10 @@ stop matching a surviving mutant fail the gate and must be removed.
   rejects unused workspace dependencies.
 - `unsafe` stays in the `sys` and `arch` modules of `allocatbelt` (CPU feature
   detection and, later, architecture kernels) and the `GlobalAlloc` adapter
-  (`global`, `rseq`); the `core` module keeps `#![forbid(unsafe_code)]`,
-  plus the benchmark-only SIMD candidates in `bench/simd`. Every
+  (`global`, `rseq`) and the region API's owned memory boundary; the `core`
+  module keeps `#![forbid(unsafe_code)]`. Benchmark-only unsafe boundaries
+  are the SIMD candidates in `bench/simd` and the `System` allocation counter
+  in `bench-runtime-diagnostic`. Every
   `unsafe` block holds one unsafe operation and a `// SAFETY:` comment, and
   every change to the boundary updates
   [docs/unsafe-boundary.md](docs/unsafe-boundary.md).

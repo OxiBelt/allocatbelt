@@ -102,6 +102,21 @@ The explicit-lifetime `Region` API. The arithmetic (alignment, fitting, chunk si
 | `RawRegion::alloc_slice_copy` | block ×2 | `copy_nonoverlapping(src, piece, len)`; `slice::from_raw_parts_mut` | As above; the piece is fresh, so it does not overlap `src`. `alloc_zeroed_bytes` and `alloc_str` use these two and add no site (`alloc_str` checks the copy with the safe `str::from_utf8_mut`). |
 | `region/tests.rs` (test only) | `unsafe fn` + block ×3 | `System.alloc`, `System.dealloc`, one write to a piece | A test chunk source over the system allocator (so that Miri can run the region's tests) and a write inside a 24-byte piece. |
 
+## `bench-runtime-diagnostic` (benchmark only)
+
+`bench/src/bin/bench-runtime-diagnostic.rs` wraps `System` with a counting
+global allocator for the separate runtime diagnostic lane. It records sizes
+and call counts but never inspects, retains or changes an allocation pointer.
+This binary is not linked into the allocator or its users.
+
+| Location | Kind | Operation | Why it is sound |
+|---|---|---|---|
+| `CountingSystem` | `unsafe impl GlobalAlloc` | — | Each allocation operation delegates to `System` with the exact pointer and layout from its caller; atomic counters observe only sizes. |
+| `CountingSystem::alloc` | block | `System.alloc(layout)` | Delegates the caller's valid layout to the system allocator and returns its pointer unchanged. |
+| `CountingSystem::alloc_zeroed` | block | `System.alloc_zeroed(layout)` | Delegates the caller's valid layout and zeroing contract to the system allocator and returns its pointer unchanged. |
+| `CountingSystem::dealloc` | block | `System.dealloc(pointer, layout)` | Delegates the pointer and layout supplied by the caller that allocated it through this wrapper. |
+| `CountingSystem::realloc` | block | `System.realloc(pointer, layout, new_size)` | Delegates the caller's live allocation and old layout to the system allocator and returns its pointer unchanged. |
+
 ## allocatbelt-simd-bench (benchmark only)
 
 `bench/simd` holds the Phase 4 SIMD candidates ([research/simd-benchmarks.md](research/simd-benchmarks.md)). It is not a dependency of the allocator and nothing in it runs inside `GlobalAlloc`. Phase 5 promoted none of them; a kernel promoted later moves into the `arch` module of `allocatbelt` and gets its own rows above. Its `unsafe` is listed here so the whole workspace is accounted for.
