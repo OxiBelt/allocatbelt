@@ -37,7 +37,7 @@ const EXHAUSTED: u64 = u64::MAX;
 /// no id equals 0 (none) or `u64::MAX`.
 pub(crate) fn next_id(next: &AtomicU64) -> Option<u64> {
   next
-    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| {
+    .try_update(Ordering::Relaxed, Ordering::Relaxed, |id| {
       id.checked_add(1).filter(|&after| after != EXHAUSTED)
     })
     .ok()
