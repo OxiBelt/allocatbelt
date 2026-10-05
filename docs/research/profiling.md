@@ -117,6 +117,10 @@ throughput runs and from instrumented profiles.
 
 ### Allocator workloads
 
+With an explicit `--only` selection containing `oversubscribed`, the peak and
+retained-RSS summary follows all selected work. The default full suite keeps
+its historical peak/idle measurements before oversubscription.
+
 Each workload line of the benchmark binaries carries, after the time and `VmRSS`, the resources the process spent on that workload: user and system CPU time, minor and major page faults, and bytes read from and written to storage (`allocatbelt_profile::Usage`, from `/proc/self/stat` and `/proc/self/io`). These include every thread the workload started, exited ones too. The CPU times have the kernel's 10 ms resolution. Context switches are not among them: the kernel counts them per thread and drops a thread's count when it exits.
 
 The workload threads are named (`local-churn`, `small-churn`, `producer`, `consumer`), so per-thread profiles (`threads-by-name.csv`, `perf-by-thread.txt`) tell them apart from the main thread and allocatbelt's maintenance thread (`allocatbelt-mnt`).

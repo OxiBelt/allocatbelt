@@ -251,6 +251,9 @@ impl Options {
 /// Runs every workload and prints one tab-separated line per result.
 pub fn run(name: &str) {
   let o = Options::from_args();
+  // A selected workload's retained-memory summary must follow its work.
+  // The default suite keeps its historical peak/idle ordering below.
+  let peak_after_oversubscribed = o.only.is_some() && o.runs("oversubscribed");
   let n = |ops: usize| ops / o.scale;
   let threads = std::thread::available_parallelism()
     .map_or(4, |n| n.get())
@@ -301,11 +304,9 @@ pub fn run(name: &str) {
       region_churn(n(10_000_000))
     });
   }
-  println!(
-    "{name}\tpeak\tVmHWM {} KiB\tVmRSS after {} KiB",
-    rss_kib("VmHWM:"),
-    rss_kib("VmRSS:")
-  );
+  if !peak_after_oversubscribed {
+    peak(name);
+  }
   // What a server keeps after a burst while it waits for the next one: no
   // allocator calls happen during the sleep.
   if o.runs("idle") {
@@ -331,6 +332,17 @@ pub fn run(name: &str) {
       || threads_local(4 * threads, n(250_000)),
     );
   }
+  if peak_after_oversubscribed {
+    peak(name);
+  }
+}
+
+fn peak(name: &str) {
+  println!(
+    "{name}\tpeak\tVmHWM {} KiB\tVmRSS after {} KiB",
+    rss_kib("VmHWM:"),
+    rss_kib("VmRSS:")
+  );
 }
 
 /// `2000000` as `2M`, `250000` as `250k`, the way the workload names had them.
