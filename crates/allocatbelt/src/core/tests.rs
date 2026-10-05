@@ -17,8 +17,15 @@ use crate::core::{
   Block, DIRTY_HARD_LIMIT_PAGES, Heap, PAGE_SIZE, PURGE_BATCH, SEGMENT_SIZE, Task, ThreadCache,
 };
 
+// Keep intentional mock heaps reachable so Miri can still report other leaks.
+#[cfg(miri)]
+static MIRI_HEAP_ROOTS: Mutex<Vec<&'static Heap<MockOs>>> = Mutex::new(Vec::new());
+
 fn heap() -> &'static Heap<MockOs> {
-  Box::leak(Box::new(Heap::new(MockOs::new())))
+  let heap = Box::leak(Box::new(Heap::new(MockOs::new())));
+  #[cfg(miri)]
+  MIRI_HEAP_ROOTS.lock().unwrap().push(heap);
+  heap
 }
 
 const SIZES: &[usize] = &[

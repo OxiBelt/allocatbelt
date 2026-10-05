@@ -441,12 +441,13 @@ enum Target<'a> {
 
 /// View of one page's metadata words.
 #[derive(Clone, Copy)]
-struct PageMeta<'a>(&'a [AtomicU64]);
+struct PageMeta<'a>(&'a [AtomicU64; PAGE_META_WORDS]);
 
 impl<'a> PageMeta<'a> {
   fn new(seg_meta: &'a [AtomicU64], page_in_seg: usize) -> Self {
     let base = SEGMENT_HEADER_WORDS + page_in_seg * PAGE_META_WORDS;
-    Self(&seg_meta[base..base + PAGE_META_WORDS])
+    let (page, _) = seg_meta[base..base + PAGE_META_WORDS].as_chunks::<PAGE_META_WORDS>();
+    Self(&page[0])
   }
   fn info(self) -> &'a AtomicU64 {
     &self.0[P_INFO]
