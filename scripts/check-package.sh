@@ -127,7 +127,7 @@ publish = false
 [dependencies]
 allocatbelt = { path = "${unpacked}", default-features = false }
 
-# `--no-default-features` here builds allocatbelt without its defaults.
+# \`--no-default-features\` here builds allocatbelt without its defaults.
 [features]
 default = ["allocatbelt-default"]
 allocatbelt-default = ["allocatbelt/default"]
