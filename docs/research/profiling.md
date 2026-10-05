@@ -97,7 +97,9 @@ results and returned cancellation tokens. Work completion is the closure's
 timestamp, before admission release and result publication. These percentiles
 describe this backlog workload, not application service latency.
 
-Workers warm up before measurement. A gate holds the first jobs while the
+Construction counters cover the `Runtime::new` call and may include only part
+of asynchronous worker startup. Workers warm up before submission measurement.
+A gate holds the first jobs while the
 driver fills the queue, then releases them together. Gate waits have a deadline
 and cleanup releases blocked workers. The outstanding window must hold all jobs.
 Use a larger window with the same job count to inspect sparsely used capacity.
@@ -110,10 +112,10 @@ rounding, thread stacks and resident-memory effects. Use the resource profiler
 for RSS and CPU measurements.
 
 The optional rejection lane measures `Full`, `Closed`, `InvalidRequest` and
-`InsufficientResources` independently, checking error priorities and returned
-closure ownership. Compare identical diagnostic sources in fresh, balanced
-baseline/candidate processes. Keep these observations separate from primary
-throughput runs and from instrumented profiles.
+`InsufficientResources` independently, checking error priorities. Runtime unit
+tests separately verify returned closure ownership. Compare identical diagnostic
+sources in fresh, balanced baseline/candidate processes. Keep these observations
+separate from primary throughput runs and from instrumented profiles.
 
 ### Allocator workloads
 
