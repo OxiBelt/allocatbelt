@@ -39,6 +39,45 @@ cargo install rustfilt inferno
 
 ## The benchmarks' own columns
 
+### Resource-aware blocking runtime
+
+The runtime matrix uses one binary per allocator and chooses the executor
+at run time. It compares blocking jobs, not Tokio's async scheduling:
+
+```sh
+bash scripts/bench-runtime.sh --reps 12 --start warm --workers 4 --window 16 \
+  --jobs 20000 --bytes 32768 --cpu-iters 1024 --out target/runtime-bench/matrix
+bash scripts/bench-runtime.sh --quick --reps 1 --profile \
+  --out target/runtime-bench/smoke
+scripts/profile.sh perf -- ./target/release/bench-runtime-allocatbelt \
+  --executor bounded --workers 4 --window 16 --jobs 20000 --bytes 32768 --cpu-iters 1024
+```
+
+`--allocs` and `--executors` select matrix entries. The script records fresh
+processes in balanced Williams order, environment metadata, raw per-run files and
+`results.tsv`; `--profile` adds the existing resource profiler to every run.
+Profiled and unprofiled runs are different experiments: do not pool their times.
+Use full balancing cycles (six repetitions for the full matrix). An occupied
+output directory is refused, and every failed attempt retains a results row
+and its raw output. Provenance hashes tracked changes and untracked contents.
+
+Each binary validates completed count and deterministic checksum against a
+sequential reference outside the timed job region. Output includes elapsed
+time, throughput, user/system CPU, RSS, kernel peak RSS, faults and validation
+columns. RSS/HWM are captured before the reference. Whole-process profiles
+include construction, reference work and shutdown, unlike those job-region
+columns. `job_work` is out of line to support function attribution.
+`--start warm` waits for all configured workers before timing; cold mode is an
+asymmetric startup experiment. The bounded runtime includes shard/cache park
+hooks, unlike the plain Tokio blocking-pool baseline, so these are integrated
+runtime comparisons, not isolated async-scheduler costs.
+
+See [the contract](../runtime.md) and
+[research report](runtime-foundation.md) for admission semantics, comparison
+limits and results. No timing gate is enabled in hosted CI.
+
+### Allocator workloads
+
 Each workload line of the benchmark binaries carries, after the time and `VmRSS`, the resources the process spent on that workload: user and system CPU time, minor and major page faults, and bytes read from and written to storage (`allocatbelt_profile::Usage`, from `/proc/self/stat` and `/proc/self/io`). These include every thread the workload started, exited ones too. The CPU times have the kernel's 10 ms resolution. Context switches are not among them: the kernel counts them per thread and drops a thread's count when it exits.
 
 The workload threads are named (`local-churn`, `small-churn`, `producer`, `consumer`), so per-thread profiles (`threads-by-name.csv`, `perf-by-thread.txt`) tell them apart from the main thread and allocatbelt's maintenance thread (`allocatbelt-mnt`).

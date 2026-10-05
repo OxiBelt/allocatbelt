@@ -5,15 +5,16 @@ It runs owned blocking jobs on a fixed worker pool. It is **not a Tokio
 replacement**, an async executor, or recommended for production. The allocator
 remains the only package intended for publication.
 
-This page specifies the intended milestone contract. Implementation and
-verification status is recorded in the linked research report.
+This page specifies the milestone contract. Verification and qualification
+status is recorded in the linked research report.
 
 ## First milestone contract
 
 Each submission declares a `Resources` vector. Admission reserves every
 dimension under one scheduler mutex, or rejects the submission without running
 it. A rejected submission returns ownership of the closure. Reservations cover
-queued and running jobs; `max_outstanding` independently bounds their count.
+queued, running and cancellation-cleanup jobs; `max_outstanding` independently
+bounds their count.
 
 The crate forbids unsafe code. Jobs and results are owned `Send + 'static`
 values; jobs receive a cooperative cancellation token. Rejections distinguish
@@ -57,12 +58,21 @@ A job must declare its entire peak working set honestly.
   Cancel-pending shutdown also cancels queued work and requests cancellation
   of running work. Noncooperative jobs can delay explicit shutdown indefinitely.
 - Dropping the runtime closes and cancels without waiting for running work;
-  detached workers can outlive it. Use explicit shutdown when completion is
-  required and keep captured resources alive through owned values.
+  detached workers can outlive it. Queued capture destructors run synchronously
+  and can themselves block the dropping thread. Use explicit shutdown when
+  completion is required and keep captured resources alive through owned values.
 - Blocking joins and shutdown from a worker of its own runtime must be rejected
   rather than deadlock. Do not depend on nested synchronous work in a saturated
   pool. Allocator fork support does not make inherited runtime workers usable
   in a forked child.
+
+An unfinished same-runtime join returns `JoinError::WouldDeadlock` from a
+worker (including its thread-local destructors at exit) or queued-job cleanup
+on the shutting-down thread. Nested cleanup retains each runtime's identity.
+It consumes and detaches the handle; it does not cancel the job. Already finished
+jobs can be joined there. `Snapshot::cancelling` counts removed queued jobs during
+cleanup, and `outstanding = queued + running + cancelling`. Completed shutdown is a
+no-op in either mode; it does not change completed jobs' cancellation tokens.
 
 Every admitted job has exactly one terminal outcome and releases its vector
 and outstanding slot exactly once after execution or cancellation cleanup.
@@ -95,6 +105,13 @@ Record each host and toolchain separately, alternate run order, and report
 dispersion as well as medians. KVM guests execute native instructions, but
 uncontrolled host scheduling and frequency remain confounders. Hosted CI and
 qemu timings do not qualify an optimization.
+
+The default `--start warm` submits simultaneous warm-up jobs and waits for all
+configured workers before timing. `--start cold` excludes bounded-pool
+construction but includes Tokio's lazy blocking-worker creation, so it is an
+asymmetric startup experiment, not a steady-state comparison. The script uses
+a balanced Williams run-order design; use a complete balancing cycle (six
+repetitions for the full three-allocator/two-executor matrix).
 
 See [the runtime research report](research/runtime-foundation.md) for results
 and [profiling](research/profiling.md) for CPU, RSS and per-function tools.
@@ -131,7 +148,11 @@ control also need claim-level patent review for the jurisdictions and deployment
 in question. Keep sensitive comparisons and unpublished findings in an
 authorized private checkout, not this repository.
 
-A patent non-aggression program is not a patent application, does not confer
-patent protection on this implementation, and does not clear patents outside
-its actual licensed scope. Counsel should verify the applicable agreement
-before relying on OIN or OIN 2.
+A patent non-aggression program is not a patent application and does not grant
+a patent for this implementation or clear patents outside its licensed scope.
+The [OIN 2.0 agreement](https://openinventionnetwork.com/license-agreement-2/)
+describes the OIN patent license and participant cross-license, including
+Linux System scope and good-standing conditions for 2.0 coverage (sections
+1.1–1.2.1). This project makes no membership or coverage claim. Counsel should
+verify the agreement and [Linux System definition](https://openinventionnetwork.com/linux-system/)
+before relying on it. Sources consulted 2026-10-04; no agreement was submitted.

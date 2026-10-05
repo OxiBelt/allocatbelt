@@ -25,7 +25,9 @@ version = "0.1.0"
 dependencies = [
  "allocatbelt",
  "allocatbelt-profile",
+ "allocatbelt-runtime",
  "mimalloc",
+ "tokio",
 ]
 
 [[package]]
@@ -47,6 +49,14 @@ dependencies = [
 [[package]]
 name = "allocatbelt-profile"
 version = "0.1.0"
+
+[[package]]
+name = "allocatbelt-runtime"
+version = "0.1.0"
+dependencies = [
+ "allocatbelt",
+ "loom",
+]
 
 [[package]]
 name = "allocatbelt-simd-bench"

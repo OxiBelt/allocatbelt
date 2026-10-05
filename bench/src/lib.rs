@@ -20,6 +20,8 @@ use std::time::{Duration, Instant};
 
 use allocatbelt_profile::Usage;
 
+pub mod runtime;
+
 /// Deterministic xorshift so every allocator sees the same request stream.
 struct Rng(u64);
 

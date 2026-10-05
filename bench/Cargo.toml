@@ -1,6 +1,6 @@
 [package]
 name = "allocatbelt-bench"
-description = "Throughput and RSS comparison of allocatbelt against the system allocator and secure mimalloc."
+description = "Throughput and RSS comparison of allocatbelt against the system allocator and secure mimalloc, and of allocatbelt-runtime's bounded executor against Tokio's blocking pool."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -10,7 +10,9 @@ publish.workspace = true
 [dependencies]
 allocatbelt = { workspace = true, features = ["io-uring"] }
 allocatbelt-profile.workspace = true
+allocatbelt-runtime.workspace = true
 mimalloc.workspace = true
+tokio.workspace = true
 
 [lints]
 workspace = true

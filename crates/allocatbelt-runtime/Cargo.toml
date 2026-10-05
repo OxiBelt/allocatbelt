@@ -1,0 +1,25 @@
+[package]
+name = "allocatbelt-runtime"
+description = "Development only: a bounded thread-pool job runtime whose workers use allocatbelt's thread-cache and shard hooks."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+# allocatbelt's core swaps its atomics for loom's under `--cfg loom` and does
+# not build there, so the loom models of this crate's protocols
+# (`src/model.rs`) compile without it and the cache hooks become no-ops.
+[target.'cfg(not(loom))'.dependencies]
+allocatbelt.workspace = true
+
+# Model checker for the start/cancel and admission protocols, only under
+# `RUSTFLAGS="--cfg loom"`. Declared here rather than in
+# `[workspace.dependencies]` for the same reason as in
+# `allocatbelt-core-check`: cargo-deny resolves the graph without
+# `--cfg loom` and would reject it there as an unused workspace dependency.
+[target.'cfg(loom)'.dependencies]
+loom = "0.7.2"
+
+[lints]
+workspace = true
