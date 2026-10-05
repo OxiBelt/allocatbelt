@@ -272,7 +272,7 @@ fn isa_availability() -> Availability {
   if !crate::arch::EXPERIMENTAL_COMPILED {
     return Availability::NotCompiled;
   }
-  match crate::arch::experimental(crate::arch::detected_features()) {
+  match crate::arch::experimental_usable(crate::arch::detected_features()) {
     Some(_) => Availability::Available,
     None => Availability::Unavailable {
       step: policy::ISA_STEP,

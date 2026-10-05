@@ -201,8 +201,8 @@ run "$(caps true true false true)" --features rseq
 sve=false
 [[ "$(uname -m)" == aarch64 ]] && sve=true
 run "$(caps true true false false "${sve}" "${sve}")" --features sve2
-# The RVV kernel needs nightly on riscv64 (scripts/check-experimental-rvv.sh);
-# on the stable x86_64 and aarch64 hosts the feature compiles nothing.
+# The RVV kernel uses stable naked assembly on riscv64; on x86_64 and
+# aarch64 the feature compiles nothing.
 if [[ "$(uname -m)" != riscv64 ]]; then
   run "$(caps true true false false)" --features rvv
 fi

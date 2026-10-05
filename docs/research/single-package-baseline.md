@@ -162,6 +162,20 @@ Directive §20 Phase G adds the RVV version of the Phase F kernel ([docs/feature
 - **Not done.** No benchmark was run; no default changes.
 - **unsafe.** Two new sites on riscv64: the call of the V target-feature function (feature-gated) and the `prctl` read in detection (every riscv64 build).
 
+### Rust 1.99 follow-up
+
+The initial Phase G implementation above required nightly because it used
+`#[target_feature(enable = "v")]`. The Rust 1.99.0 implementation replaces
+that function with a stable `#[unsafe(naked)]` C-ABI leaf whose assembler-local
+`.option arch,+v` confines RVV instructions to the leaf. It uses `vsetvli` to
+strip-mine the 64-element snapshot at the hardware's actual VLEN. Hardware
+detection is cached separately from the calling thread's vector permission;
+every execution through the guarded wrapper checks current policy and permission
+before entering the leaf. `scripts/check-experimental-rvv.sh` now runs with
+stable Rust 1.99.0; the current feature and unsafe-boundary descriptions are in
+[`features.md`](../features.md#experimental-isa-kernels) and
+[`unsafe-boundary.md`](../unsafe-boundary.md).
+
 ## 12. Phase H: rseq/mm_cid research
 
 Directive §20 Phase H builds on the Phase 9 experiment (section 5) rather than redoing it: the feature, the policy and the diagnostics were already there, so this phase settles registration ownership and adds the missing fork, cpuset, refusal and concurrency evidence ([docs/platform.md](../platform.md#rseq-mm_cid-shard-selection-experimental)).

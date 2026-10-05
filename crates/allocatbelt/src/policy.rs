@@ -368,7 +368,7 @@ fn validate(p: Policy) -> Result<(), PolicyError> {
     });
   }
   if p.experimental_isa == FeaturePolicy::Require
-    && crate::arch::experimental(crate::arch::detected_features()).is_none()
+    && crate::arch::experimental_usable(crate::arch::detected_features()).is_none()
   {
     return Err(PolicyError::Unavailable {
       capability: Capability::ExperimentalIsa,
@@ -379,9 +379,10 @@ fn validate(p: Policy) -> Result<(), PolicyError> {
   Ok(())
 }
 
-/// The step of an unavailable experimental kernel: the CPU or kernel does
-/// not expose the extension (`AT_HWCAP`).
-pub(crate) const ISA_STEP: &str = "cpu features";
+/// The step of an unavailable experimental kernel: hardware/kernel detection
+/// does not expose the extension, or current-thread execution permission
+/// cannot be verified.
+pub(crate) const ISA_STEP: &str = "cpu features or thread permission";
 
 impl Allocatbelt {
   /// Sets the run-time policy of the optional capabilities, after the

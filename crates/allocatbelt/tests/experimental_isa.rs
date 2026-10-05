@@ -26,11 +26,34 @@ fn selectable() -> KernelSet {
     KernelSet::Sve2
   } else if c.experimental_aarch64_sve && sve {
     KernelSet::Sve
-  } else if c.experimental_riscv_rvv && f.contains(CpuFeatures::RVV) {
+  } else if c.experimental_riscv_rvv && f.contains(CpuFeatures::RVV) && vector_allowed() {
     KernelSet::Rvv
   } else {
     KernelSet::Baseline
   }
+}
+
+/// Independent test-side query: cached hardware support does not grant a
+/// different thread permission to execute V.
+#[cfg(target_arch = "riscv64")]
+fn vector_allowed() -> bool {
+  // SAFETY: GET_CONTROL reads this test thread's control word; no pointers.
+  #[expect(unsafe_code, reason = "test-side Linux vector control query")]
+  let control = unsafe {
+    libc::prctl(
+      70,
+      0 as libc::c_ulong,
+      0 as libc::c_ulong,
+      0 as libc::c_ulong,
+      0 as libc::c_ulong,
+    )
+  };
+  control >= 0 && control & 3 == 2
+}
+
+#[cfg(not(target_arch = "riscv64"))]
+fn vector_allowed() -> bool {
+  false
 }
 
 fn with(experimental_isa: FeaturePolicy) -> Policy {
@@ -91,7 +114,7 @@ fn experimental_kernels_need_compile_time_cpu_and_policy() {
     match expected {
       _ if !compiled => Availability::NotCompiled,
       KernelSet::Baseline => Availability::Unavailable {
-        step: "cpu features",
+        step: "cpu features or thread permission",
         errno: 0,
       },
       _ => Availability::Available,
@@ -122,7 +145,7 @@ fn experimental_kernels_need_compile_time_cpu_and_policy() {
           e,
           PolicyError::Unavailable {
             capability,
-            step: "cpu features",
+            step: "cpu features or thread permission",
             errno: 0,
           }
         );

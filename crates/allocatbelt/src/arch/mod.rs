@@ -57,6 +57,7 @@ mod kernel_tests;
 #[cfg(target_arch = "riscv64")]
 mod riscv64;
 #[cfg(all(target_arch = "riscv64", feature = "experimental-riscv-rvv"))]
+#[expect(unsafe_code, reason = "RVV naked assembly and its guarded call")]
 mod rvv;
 #[cfg(all(target_arch = "aarch64", feature = "experimental-aarch64-sve"))]
 mod sve;
@@ -83,7 +84,7 @@ pub enum KernelSet {
   /// Experimental (feature `experimental-aarch64-sve2`): as `Sve`, compiled
   /// for SVE2. Not measured.
   Sve2,
-  /// Experimental (feature `experimental-riscv-rvv`, nightly): the decay
+  /// Experimental (feature `experimental-riscv-rvv`): the decay
   /// pass's age scan compiled for the RISC-V V extension. Not measured.
   Rvv,
 }
@@ -121,9 +122,24 @@ pub fn initialize_dispatch() -> KernelSet {
 
 /// The kernel set in use: [`KernelSet::Baseline`] before
 /// [`initialize_dispatch`], and afterwards unless the experimental ISA
-/// policy selects one. Two atomic loads; never probes.
+/// policy selects one. RVV is reported only when the current thread's Linux
+/// vector permission query succeeds; that permission is rechecked on every
+/// call because it is thread-local.
 #[must_use]
 pub fn kernel_set() -> KernelSet {
+  let selected = selected_kernel_set();
+  #[cfg(all(target_arch = "riscv64", feature = "experimental-riscv-rvv"))]
+  if selected == KernelSet::Rvv && riscv64::vector_permission().is_err() {
+    return KernelSet::Baseline;
+  }
+  selected
+}
+
+/// The policy/hardware selection before any thread-local execution checks.
+/// The RVV wrapper uses this to avoid querying vector permission twice on the
+/// normal path; the returned function pointer still rechecks via `kernel_set`
+/// before every call, so a cached pointer remains safe across threads.
+fn selected_kernel_set() -> KernelSet {
   if !DISPATCH.load(Ordering::Acquire) {
     return KernelSet::Baseline;
   }
@@ -157,6 +173,18 @@ pub(crate) fn experimental(features: CpuFeatures) -> Option<KernelSet> {
   }
   let _ = features;
   None
+}
+
+/// The best compiled and hardware-detected experimental kernel that this
+/// calling thread can use, if any. The hardware-only `experimental` helper
+/// stays pure for injected feature tests.
+pub(crate) fn experimental_usable(features: CpuFeatures) -> Option<KernelSet> {
+  let selected = experimental(features)?;
+  #[cfg(all(target_arch = "riscv64", feature = "experimental-riscv-rvv"))]
+  if selected == KernelSet::Rvv && riscv64::vector_permission().is_err() {
+    return None;
+  }
+  Some(selected)
 }
 
 /// Whether an experimental kernel set is compiled into this build for this

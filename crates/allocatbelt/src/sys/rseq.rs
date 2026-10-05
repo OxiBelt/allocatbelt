@@ -43,9 +43,10 @@ impl RseqUnavailable {
 }
 
 /// Offset of `cpu_id` in `struct rseq` (`uapi/linux/rseq.h`).
-const CPU_ID: isize = 4;
-/// Offset of `mm_cid` in `struct rseq`.
-const MM_CID: isize = 24;
+enum Field {
+  CpuId = 4,
+  MmCid = 24,
+}
 /// `AT_RSEQ_FEATURE_SIZE`: how much of `struct rseq` the kernel fills in.
 #[cfg(target_env = "gnu")]
 const AT_RSEQ_FEATURE_SIZE: libc::c_ulong = 27;
@@ -115,26 +116,25 @@ impl MmCid {
   pub fn current(self) -> Option<u32> {
     let area = thread_pointer().wrapping_offset(self.offset);
     // Negative `cpu_id`: RSEQ_CPU_ID_UNINITIALIZED or _REGISTRATION_FAILED.
-    if field(area, CPU_ID).load(Ordering::Relaxed) >= 1 << 31 {
+    if load_field(area, Field::CpuId) >= 1 << 31 {
       return None;
     }
-    Some(field(area, MM_CID).load(Ordering::Relaxed))
+    Some(load_field(area, Field::MmCid))
   }
 }
 
-/// The `u32` at `offset` in the rseq area `area` of the calling thread.
+/// Immediately reads one known field of this thread's rseq area.
 #[inline]
-fn field(area: *const u8, offset: isize) -> &'static AtomicU32 {
+fn load_field(area: *const u8, field: Field) -> u32 {
   // SAFETY: glibc places every thread's rseq area (32 bytes, 32-aligned,
   // in its TCB) at the thread pointer plus `__rseq_offset`, whether or not
   // its registration succeeded, and keeps it for the thread's lifetime;
-  // `offset` names an aligned `u32` in it. Only the kernel writes it, and
+  // `field` names an aligned `u32` in it. Only the kernel writes it, and
   // only while this thread is in the kernel, so the loads never race. The
   // reference does not outlive the caller's load on this thread.
   #[expect(unsafe_code, reason = "a u32 of the thread's rseq area")]
-  unsafe {
-    &*area.wrapping_offset(offset).cast::<AtomicU32>()
-  }
+  unsafe { AtomicU32::from_ptr(area.wrapping_offset(field as isize).cast_mut().cast()) }
+    .load(Ordering::Relaxed)
 }
 
 /// The thread pointer that glibc's `__rseq_offset` is relative to

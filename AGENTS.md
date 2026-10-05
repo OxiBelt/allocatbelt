@@ -50,7 +50,7 @@ the local `CONTRIBUTING.md`, follow the local contributor guidance.
 - New features must be additive, contain an implementation, and update
   `CompiledCapabilities`, [feature documentation](docs/features.md) and
   `scripts/check-features.sh`. Preserve the documented toolchain requirements,
-  including the existing experimental RVV nightly exception. Correctness and
+  including the experimental RVV stable assembly check. Correctness and
   hardening are never optional features.
 
 ## Build and Verification

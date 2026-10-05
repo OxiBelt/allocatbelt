@@ -52,7 +52,7 @@ Cargo features pick which optional parts are compiled in; which of them a proces
 | `io-uring` | no | batched purges through a restricted io_uring, off until `set_io_uring(true)`, with a `madvise` fallback |
 | `experimental-rseq` | no | experimental shard selection by the rseq `mm_cid`, off until selected (`RseqPolicy`) |
 | `experimental-aarch64-sve`, `experimental-aarch64-sve2` | no | experimental SVE/SVE2 kernels for the decay pass's age scan (aarch64 only), off until `Policy::experimental_isa` selects them; not measured |
-| `experimental-riscv-rvv` | no | the same scan for RISC-V V (riscv64 only; **needs nightly Rust there**), off until selected; not measured |
+| `experimental-riscv-rvv` | no | the same scan for RISC-V V (riscv64 only; stable naked assembly), off until selected; not measured |
 
 `default-features = false` builds the allocator without the maintenance thread.
 
@@ -111,7 +111,7 @@ scripts/check-features.sh                                       # clippy and tes
 scripts/check-package.sh                                        # cargo package/publish --dry-run, package contents, the unpacked crate's tests and docs.rs build, clean-consumer builds
 scripts/check-sandbox.sh                                        # hardened container, seccomp fallbacks, visible ISA under qemu (docs/sandbox.md)
 scripts/check-experimental-isa.sh                               # experimental SVE/SVE2 kernels under qemu CPU models (docs/features.md)
-scripts/check-experimental-rvv.sh                               # experimental RVV kernel on the pinned nightly, under qemu (docs/features.md)
+scripts/check-experimental-rvv.sh                               # experimental RVV kernel on stable Rust, under qemu (docs/features.md)
 scripts/check-rseq.sh                                           # experimental rseq mm_cid: glibc, glibc with rseq off, musl (docs/platform.md)
 scripts/check-platform-gates.sh                                 # supported targets build, others are rejected (needs `rustup target add`, see the script)
 scripts/check-scalar-isa.sh                                     # bit scans lower to tzcnt/popcnt/lzcnt (x86-64-v3) and ctz/cpop/clz (riscv64 + Zbb)
