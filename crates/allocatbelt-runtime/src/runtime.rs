@@ -19,6 +19,7 @@ pub struct Config {
   pub workers: usize,
   /// Jobs admitted and not yet released (queued, running or cancelling);
   /// at least 1.
+  /// The FIFO queue reserves storage for all configured jobs before workers start.
   pub max_outstanding: usize,
   /// Resources the outstanding jobs may reserve together.
   pub capacity: Resources,
@@ -69,7 +70,10 @@ impl Runtime {
   ///
   /// # Errors
   ///
-  /// `InvalidInput` for zero workers or a zero outstanding bound, or the
+  /// `InvalidInput` for zero workers or a zero outstanding bound;
+  /// `OutOfMemory` if reserving the bounded queue or worker storage fails,
+  /// including when its requested capacity cannot be represented, before any
+  /// worker starts; or the
   /// error of a failed thread spawn, after the workers already started
   /// were stopped and joined. `Other` once the process created
   /// `u64::MAX - 2` runtimes, rather than reuse an id.
@@ -91,10 +95,13 @@ impl Runtime {
       ));
     }
     let id = worker::next_id(&NEXT_ID).ok_or_else(|| io::Error::other("runtime ids exhausted"))?;
-    let mut shared = Shared::new(id, config.workers, config.max_outstanding, config.capacity);
+    let mut shared = Shared::new(id, config.workers, config.max_outstanding, config.capacity)?;
     setup(&mut shared);
     let shared = Arc::new(shared);
-    let mut workers = Vec::with_capacity(config.workers);
+    let mut workers = Vec::new();
+    workers
+      .try_reserve_exact(config.workers)
+      .map_err(|_| io::Error::from(io::ErrorKind::OutOfMemory))?;
     for index in 0..config.workers {
       let worker_shared = Arc::clone(&shared);
       let spawned = spawn(

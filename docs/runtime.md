@@ -16,6 +16,16 @@ it. A rejected submission returns ownership of the closure. Reservations cover
 queued, running and cancellation-cleanup jobs; `max_outstanding` independently
 bounds their count.
 
+Construction reserves queue storage for all `max_outstanding` entries before
+starting workers, so admitted queue insertion does not grow storage under the
+scheduler mutex. With the current 64-bit entry layout this requests roughly
+48 bytes per configured slot, even for an idle runtime, plus allocator overhead
+and separate worker storage. This capacity is outside the declared `Resources`
+budget; it does not reserve closure payloads or results and is not a resident
+physical-memory limit. Choose the outstanding bound with this upfront cost in
+mind. Capacity overflow or failure to reserve queue or worker storage returns
+`OutOfMemory` before workers start.
+
 The crate forbids unsafe code. Jobs and results are owned `Send + 'static`
 values; jobs receive a cooperative cancellation token. Rejections distinguish
 closed admission, a full outstanding window, temporarily insufficient resources

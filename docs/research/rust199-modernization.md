@@ -52,6 +52,15 @@ or fewer assembly instructions alone do not establish an application speedup.
 The allocation-counting diagnostic measures requested heap layouts; use resource
 profiles for RSS, and treat its backlog percentiles as workload-specific.
 
+Full runtime queue reservation has an explicitly accepted capacity-cost
+exception to the retained-memory gate. It reserves storage for every configured
+outstanding slot during construction, currently roughly 48 bytes per slot on
+the supported 64-bit targets, even when idle. This requested storage is outside
+the declared job resource budget and does not promise resident physical memory.
+Other qualification gates remain in force. This constructor contract is
+selected with its capacity cost accepted; its implementation status does not
+establish a qualified throughput or tail-latency improvement.
+
 Raw timings, source archives, CPU/memory profiles, function samples and review
 artifacts remain in the authorized private resources checkout. See
 [profiling](profiling.md) for the public workloads and diagnostic commands and
@@ -67,7 +76,7 @@ artifacts remain in the authorized private resources checkout. See
 | Typed page-metadata array views | Implemented | `as_chunks` exposes one page's fixed word count to the compiler without changing the metadata layout or unsafe boundary. No application speedup is claimed. |
 | Masked size-class selection | Deferred | The native campaign failed its throughput qualification gate and established no repeatable gain across both hosts. The existing class scan remains, with stronger exhaustive tests. |
 | Runtime admission precheck | Deferred | Rejection latency and allocation counts improve, but primary and backlog latency cases remain uncertain at the 36-pair limit. The existing admission path remains. |
-| Eager reservation of the entire runtime queue | Deferred | Storage grows with the configured admission bound even when idle and exceeds the retained-memory limit. The existing lazy queue remains. |
+| Eager reservation of the entire runtime queue | Implemented | Queue growth moves to construction. The upfront capacity cost is explicitly accepted; impossible bounds or reservation failure return `OutOfMemory` before workers start. |
 | Typed Region cursor | Deferred | The isolated native comparison exceeded the throughput regression limit. |
 | Extra Region cursor pointer, larger bitmap snapshot and cold TLS helper | Deferred | These candidates have no qualifying isolated evidence. |
 | Merged task/control allocation | Deferred | Retained control/job handles would keep task/result-sized storage allocated after completion and exceed the memory limit, even if the payload values are dropped. |

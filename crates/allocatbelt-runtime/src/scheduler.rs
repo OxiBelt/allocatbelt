@@ -4,6 +4,7 @@
 //! released.
 
 use std::collections::VecDeque;
+use std::io;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 
 use crate::admission::Admission;
@@ -70,13 +71,27 @@ pub struct Snapshot {
 }
 
 impl Shared {
-  pub(crate) fn new(id: u64, workers: usize, max_outstanding: usize, capacity: Resources) -> Self {
-    Self {
+  pub(crate) fn new(
+    id: u64,
+    workers: usize,
+    max_outstanding: usize,
+    capacity: Resources,
+  ) -> io::Result<Self> {
+    let mut queue = VecDeque::new();
+    queue
+      .try_reserve_exact(max_outstanding)
+      .map_err(reservation_error)?;
+    let mut running = Vec::new();
+    running
+      .try_reserve_exact(workers)
+      .map_err(reservation_error)?;
+    running.resize_with(workers, || None);
+    Ok(Self {
       ident: Ident::new(id),
       state: Mutex::new(State {
         admission: Admission::new(max_outstanding, capacity),
-        queue: VecDeque::new(),
-        running: vec![None; workers],
+        queue,
+        running,
         running_count: 0,
         cancelling: 0,
         idle: 0,
@@ -85,7 +100,7 @@ impl Shared {
       work: Condvar::new(),
       #[cfg(test)]
       park_hook: None,
-    }
+    })
   }
 
   /// The lock never unwinds while held (it runs no user code), so a
@@ -112,6 +127,9 @@ impl Shared {
       drop(state);
       return Err(SubmitError { kind, job: task.f });
     }
+    // queued <= outstanding <= max_outstanding <= reserved capacity.
+    // Admission and insertion hold the same lock, so this cannot grow.
+    debug_assert!(state.queue.len() < state.queue.capacity());
     state.queue.push_back(Entry { request, task });
     drop(state);
     self.work.notify_one();
@@ -155,5 +173,103 @@ impl Shared {
     drop(state);
     self.work.notify_all();
     pending
+  }
+}
+
+fn reservation_error(_: std::collections::TryReserveError) -> io::Error {
+  io::ErrorKind::OutOfMemory.into()
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+  use crate::error::JoinError;
+  use crate::task::Release;
+
+  struct Finish<'a> {
+    shared: &'a Shared,
+    request: Resources,
+  }
+
+  impl Release for Finish<'_> {
+    fn release(&mut self) {
+      assert!(self.shared.lock().admission.release(&self.request));
+    }
+  }
+
+  #[test]
+  fn reserved_fifo_wraps_without_growing_or_losing_admissions() {
+    let shared = Shared::new(
+      1,
+      1,
+      3,
+      Resources {
+        memory: 6,
+        ..Resources::ZERO
+      },
+    )
+    .unwrap();
+    let capacity = shared.lock().queue.capacity();
+    assert!(capacity >= 3);
+    let mut jobs: VecDeque<_> = (1..=3)
+      .map(|memory| {
+        shared
+          .try_spawn(
+            Resources {
+              memory,
+              ..Resources::ZERO
+            },
+            |_| (),
+          )
+          .unwrap()
+      })
+      .collect();
+    let mut split = false;
+    for step in 0..100 {
+      assert_eq!(shared.snapshot().outstanding, 3);
+      assert_eq!(shared.snapshot().queued, 3);
+      let entry = {
+        let mut state = shared.lock();
+        assert_eq!(state.queue.capacity(), capacity);
+        split |= !state.queue.as_slices().1.is_empty();
+        state.queue.pop_front().unwrap()
+      };
+      let memory = step % 3 + 1;
+      assert_eq!(entry.request.memory, memory);
+      entry.task.abandon(&mut Finish {
+        shared: &shared,
+        request: entry.request,
+      });
+      assert!(matches!(
+        jobs.pop_front().unwrap().join(),
+        Err(JoinError::Cancelled)
+      ));
+      jobs.push_back(
+        shared
+          .try_spawn(
+            Resources {
+              memory,
+              ..Resources::ZERO
+            },
+            |_| (),
+          )
+          .unwrap(),
+      );
+    }
+    assert!(split, "the FIFO must cross its ring boundary");
+    loop {
+      let entry = shared.lock().queue.pop_front();
+      let Some(entry) = entry else { break };
+      entry.task.abandon(&mut Finish {
+        shared: &shared,
+        request: entry.request,
+      });
+      assert!(matches!(
+        jobs.pop_front().unwrap().join(),
+        Err(JoinError::Cancelled)
+      ));
+    }
+    assert_eq!(shared.snapshot().outstanding, 0);
+    assert_eq!(shared.snapshot().reserved, Resources::ZERO);
   }
 }

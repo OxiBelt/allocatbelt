@@ -117,7 +117,7 @@ fn rejection_returns_the_closure_and_reserves_nothing() {
 
 #[test]
 fn usize_max_capacity_runs_and_releases() {
-  let mut rt = runtime(2, usize::MAX, MAX);
+  let mut rt = runtime(2, 3, MAX);
   let (blocker, started, gate) = gated(&rt, MAX);
   started.recv().unwrap();
   let e = rt.try_spawn(cpu(1), |_| ()).unwrap_err();
@@ -1039,4 +1039,26 @@ fn workers_take_their_shard_and_flush_before_parking() {
   shards.sort_unstable();
   assert_eq!(shards, [Some(0), Some(1), Some(2)]);
   rt.shutdown(ShutdownMode::Drain).unwrap();
+}
+
+#[test]
+fn impossible_storage_bounds_fail_before_spawning() {
+  for (workers, max_outstanding) in [(1, usize::MAX), (usize::MAX, 1)] {
+    let mut spawned = 0;
+    let error = Runtime::with_spawner(
+      Config {
+        workers,
+        max_outstanding,
+        capacity: Resources::ZERO,
+      },
+      |builder, f| {
+        spawned += 1;
+        builder.spawn(f)
+      },
+      |_| panic!("setup must not run after failed reservation"),
+    )
+    .unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::OutOfMemory);
+    assert_eq!(spawned, 0);
+  }
 }
