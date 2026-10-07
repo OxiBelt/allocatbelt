@@ -12,6 +12,25 @@ module does not install a global allocator or change allocator-only defaults.
 This page specifies the milestone contract. Verification and qualification
 status is recorded in the linked research report.
 
+## Initialized-buffer asynchronous I/O
+
+`runtime::io` defines safe `AsyncRead`, `AsyncWrite` and `AsyncSeek` traits
+over initialized caller-owned slices. Named futures provide read, write,
+read-exact, write-all, flush, shutdown and seek operations. `SliceReader` and
+`SliceWriter` supply in-memory implementations. These are explicit ports:
+Tokio's uninitialized-buffer and seek APIs are not source compatible.
+
+`copy_with_buffer` borrows a caller-supplied buffer, flushes at EOF and when
+the reader waits after writing, and exposes transferred and unwritten bytes
+for cancellation recovery. The transferred count saturates at `u64::MAX`.
+Exact reads, full writes and copies retain partial progress across polls;
+dropping them does not restore stream position. Helpers reject an endpoint's
+reported count when it exceeds the offered slice, retry interrupted calls,
+and yield with a self-wake after 64 endpoint calls in one poll. This requests
+rescheduling without guaranteeing another task's turn. Simple helpers do not
+allocate or implicitly reserve managed-storage charges. Buffered adapters,
+vectored operations and networking integration remain pending.
+
 ## Managed buffers and operation permits
 
 `runtime::managed::ResourceScope` provides a separate shared ledger for managed

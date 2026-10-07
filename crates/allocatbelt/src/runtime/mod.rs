@@ -75,6 +75,7 @@ pub mod asynchronous;
 mod blocking;
 mod cache;
 mod error;
+pub mod io;
 mod job;
 pub mod managed;
 #[cfg(all(test, loom))]
