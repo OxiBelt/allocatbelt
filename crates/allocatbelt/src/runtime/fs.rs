@@ -8,8 +8,10 @@
 //! [`Job`] detaches the operation; cancelling a queued job prevents the
 //! operation from starting.
 //!
-//! Submitted filesystem operations use `std::fs` on the blocking pool. This
-//! module does not start a runtime or restrict paths. Its recursive walk has
+//! Most submitted filesystem operations use `std::fs` on the blocking pool;
+//! named FIFO creation/open uses safe Rustix syscalls to request nonblocking,
+//! close-on-exec descriptors before reactor registration. This module does
+//! not start a runtime or restrict paths. Its recursive walk has
 //! explicit entry, depth, and path-length ceilings; ordinary directory
 //! iteration still yields one entry per submitted call. Neither API imposes
 //! disk-space, IOPS, or byte-rate limits.
@@ -47,6 +49,12 @@ const IO_CHUNK: usize = 64 * 1024;
 mod fs_walk;
 pub use fs_walk::{TreeWalk, WalkEntryKind, WalkLimits, WalkNextOutcome, WalkStep};
 
+#[path = "fs_fifo.rs"]
+mod fs_fifo;
+pub use fs_fifo::{
+  FifoOpenError, FifoOpenOptions, FifoOpenSubmissionError, FifoReceiverJob, FifoSenderJob,
+};
+
 #[cfg(all(test, not(loom)))]
 #[path = "fs_tests.rs"]
 mod tests;
@@ -55,6 +63,8 @@ mod tests;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum FsSubmissionErrorKind {
+  /// Input validation rejected the operation before admission.
+  InvalidInput,
   /// The scope could not reserve one disk-operation slot.
   Resource(ResourceError),
   /// The blocking runtime rejected the job.
@@ -64,6 +74,7 @@ pub enum FsSubmissionErrorKind {
 impl std::fmt::Display for FsSubmissionErrorKind {
   fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
     match self {
+      Self::InvalidInput => f.write_str("filesystem operation rejected invalid input"),
       Self::Resource(error) => write!(f, "filesystem operation refused: {error}"),
       Self::Runtime(error) => write!(f, "filesystem operation refused: {error}"),
     }

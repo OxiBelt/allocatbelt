@@ -711,6 +711,7 @@ fn service_failure(error: JoinError) -> io::Error {
 
 fn submission_error(error: FsSubmissionErrorKind) -> io::Error {
   let kind = match error {
+    FsSubmissionErrorKind::InvalidInput => io::ErrorKind::InvalidInput,
     FsSubmissionErrorKind::Runtime(
       crate::runtime::error::SubmitErrorKind::Full
       | crate::runtime::error::SubmitErrorKind::InsufficientResources,

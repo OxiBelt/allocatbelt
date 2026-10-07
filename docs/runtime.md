@@ -247,6 +247,34 @@ handling process-wide. Native regressions cover fd type/access recovery,
 registration rollback, partial transfer, EOF, backpressure, waiter
 cancellation, cooperative gating and the inherited signal policy.
 
+## Named Unix FIFOs
+
+`FsHandle::create_fifo`, `open_fifo_receiver` and `open_fifo_sender` use the
+existing bounded blocking pool and disk-operation ledger. Creation validates
+permission bits before admission and returns the original path and mode on
+rejection. Opens use `NONBLOCK | CLOEXEC | NOCTTY`, validate the resulting
+descriptor as a FIFO, and register it with the supplied reactor before
+publishing the endpoint. Import or registration failure returns the opened
+descriptor. The disk permit survives through that operation and registration;
+the endpoint then uses the reactor's registration and waiter bounds.
+
+A read-only open succeeds without a writer. A raw nonblocking read may return
+EOF before any writer has opened, while the readiness-backed `AsyncRead` may
+remain pending until writer activity because Linux emits no initial readiness
+event. The same reader can receive later data. A write-only open without a
+reader returns `ENXIO`. `FifoOpenOptions::read_write(true)` selects Linux
+`O_RDWR`: the descriptor keeps its own peer open, suppressing ordinary EOF and
+allowing a writer open without an external reader. These are explicit peer
+semantics, and endpoint shutdown still closes only its descriptor.
+
+Queued cancellation prevents the operation from starting. Dropping an admitted
+job detaches it; a started syscall retains its inputs and disk permit until
+completion. Kernel path resolution, symlink traversal and process umask apply.
+No operation unlinks a path on failure, confines path resolution, or replays an
+attempted syscall. Kernel pipe buffers remain outside managed storage.
+Native tests cover rejection recovery, FIFO type checks, registration recovery,
+queued cancellation, peer modes and data after the initial no-writer state.
+
 ## Managed buffers and operation permits
 
 `runtime::managed::ResourceScope` provides a separate shared ledger for managed
@@ -1513,16 +1541,15 @@ baseline still requires these implementation and qualification steps:
 1. Extend automatic cooperative progress beyond the currently listed
    operations. Verify application ports across the explicit-address nonblocking
    connect, listen and Linux socket-option capabilities.
-2. Add FIFO path constructors. Owned blocking streams, standard I/O adapters,
-   anonymous Unix pipes, managed
-   in-memory simplex/duplex pipes and caller-buffered bidirectional copy are
-   implemented with explicit partial-progress and half-close contracts. The initialized-buffer `Take`/`Chain`/`Empty`/`Sink`/`Repeat` family,
-   bounded delimiter/line and whole-stream reads, and fixed managed buffered
-   endpoints are implemented; these do not include those remaining operations.
-3. Exercise realistic application ports covering cancellation, bounded
-   rejection recovery, resource/dependency quotas, retained managed storage,
-   partial I/O and explicit driver/process shutdown. The existing CPU, memory,
-   limited TCP/HTTP and disk examples establish functional ports only.
+2. Qualify application migrations through the implemented bounded I/O ports:
+   owned blocking and standard streams, anonymous pipes and named FIFOs,
+   managed simplex/duplex pipes, caller-buffered bidirectional copy,
+   initialized-buffer utilities and bounded delimiter/line and whole-stream
+   reads. Preserve their explicit partial-progress and peer-close contracts.
+3. Extend application qualification to realistic workloads and matched Tokio
+   comparisons. The CPU, memory, limited TCP/HTTP and disk ports cover bounded
+   rejection recovery, cancellation, retained storage and driver/process
+   cleanup; these functional checks do not establish application performance.
 4. Finish complete isolated core Miri and supported platform, feature, package
    and security-tool qualification, preserving failures and model-coverage
    limits. Complete per-host retained-memory, allocator, executor and application
