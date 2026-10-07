@@ -726,10 +726,11 @@ allocation or mimalloc these hooks do not alter those allocators.
 
 ## Measurement gate
 
-Compare the runtime with **Tokio's blocking pool**, not its async scheduler.
-Use identical jobs, worker counts, outstanding windows and completed-job
-checksums. Cross both runtimes with system allocation, secure mimalloc and
-allocatbelt to distinguish allocator costs from scheduling costs.
+Compare blocking jobs with Tokio's blocking pool and owned asynchronous tasks
+with its multithread executor. Use identical jobs, worker counts, outstanding
+windows and completed-job checksums. Cross both runtimes with the same global
+allocator to distinguish allocator costs from scheduling costs. Results from
+one lane do not qualify the other.
 
 For uniform jobs, set capacity to the outstanding window times the job's
 request, so the common window enforces equivalent admission. This is not an
@@ -756,6 +757,27 @@ repetitions for the full three-allocator/two-executor matrix).
 See [the runtime research report](research/runtime-foundation.md) for results
 and [profiling](research/profiling.md) for CPU, RSS and per-function tools.
 Admission counters are not resource-usage measurements.
+
+The latency binaries also provide `--lane async --executor bounded|tokio`
+with `ready`, `yielding` and `mixed` workloads. Both executors run the same
+future body: immediate deterministic results, eight self-waking yield turns,
+or eight yields with fully touched ordinary vector chunks. Mixed storage uses
+each binary's global allocator, with no implicit managed-buffer reservation.
+Choose `--workers`, `--window`, `--bytes`, `--jobs` and `--arrival-rate`
+explicitly. The window must cover every worker and cannot exceed the requested
+job count; construction warms all workers before timing and cleans up partial
+warm-up failures. CSV records the admission window and byte count.
+
+An independent producer uses intended arrival deadlines and a separate observer
+polls each public join to ready. One common external admission window remains
+held until that observation on either executor, including panic outcomes.
+Latency includes producer lateness; rejections and lateness are reported
+separately. Throughput mode avoids per-result latency samples but retains the
+specified arrival schedule, so it measures completed work at that offered load
+rather than establishing an executor's maximum capacity. Metadata, collector
+and workload allocations contribute to whole-process CPU/RSS. These probes
+require fresh native processes and the preregistered per-host confirmation
+gates; functional tests and output smokes establish no speedup.
 
 ## Path toward replacing Tokio
 
