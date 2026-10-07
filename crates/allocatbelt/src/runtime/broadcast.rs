@@ -632,39 +632,41 @@ impl<T: Clone> Future for Recv<'_, T> {
   type Output = Result<T, RecvError>;
 
   fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-    let this = self.get_mut();
-    if this.completed {
-      return Poll::Ready(Err(RecvError::Closed));
-    }
-    let mut new_waker = Some(cx.waker().clone());
-    let action = prepare_read(&this.receiver.shared, this.receiver.key, &mut new_waker);
-    drop_waker(new_waker);
-    match action {
-      ReadAction::Value {
-        sequence,
-        value,
-        old_waker,
-      } => {
-        drop_waker(old_waker);
-        let result = clone_and_commit(&this.receiver.shared, this.receiver.key, sequence, value);
-        this.completed = true;
-        Poll::Ready(result)
+    super::asynchronous::poll_cooperative(cx, |cx| {
+      let this = self.get_mut();
+      if this.completed {
+        return Poll::Ready(Err(RecvError::Closed));
       }
-      ReadAction::Empty(old_waker) => {
-        drop_waker(old_waker);
-        Poll::Pending
+      let mut new_waker = Some(cx.waker().clone());
+      let action = prepare_read(&this.receiver.shared, this.receiver.key, &mut new_waker);
+      drop_waker(new_waker);
+      match action {
+        ReadAction::Value {
+          sequence,
+          value,
+          old_waker,
+        } => {
+          drop_waker(old_waker);
+          let result = clone_and_commit(&this.receiver.shared, this.receiver.key, sequence, value);
+          this.completed = true;
+          Poll::Ready(result)
+        }
+        ReadAction::Empty(old_waker) => {
+          drop_waker(old_waker);
+          Poll::Pending
+        }
+        ReadAction::Closed(old_waker) => {
+          drop_waker(old_waker);
+          this.completed = true;
+          Poll::Ready(Err(RecvError::Closed))
+        }
+        ReadAction::Lagged(skipped, old_waker) => {
+          drop_waker(old_waker);
+          this.completed = true;
+          Poll::Ready(Err(RecvError::Lagged(skipped)))
+        }
       }
-      ReadAction::Closed(old_waker) => {
-        drop_waker(old_waker);
-        this.completed = true;
-        Poll::Ready(Err(RecvError::Closed))
-      }
-      ReadAction::Lagged(skipped, old_waker) => {
-        drop_waker(old_waker);
-        this.completed = true;
-        Poll::Ready(Err(RecvError::Lagged(skipped)))
-      }
-    }
+    })
   }
 }
 
@@ -672,58 +674,61 @@ impl<T> Future for SenderClosed<'_, T> {
   type Output = Result<(), ClosedError>;
 
   fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-    let this = self.get_mut();
-    if this.completed {
-      return Poll::Ready(Err(ClosedError::Completed));
-    }
-    let mut rearmed = 0;
-    loop {
-      if this.sender.is_closed() {
-        this.completed = true;
-        this.notified.take();
-        return Poll::Ready(Ok(()));
-      }
-      let Some(notified) = this.notified.as_mut() else {
-        this.completed = true;
+    super::asynchronous::poll_cooperative(cx, |cx| {
+      let this = self.get_mut();
+      if this.completed {
         return Poll::Ready(Err(ClosedError::Completed));
-      };
-      let result = panic::catch_unwind(AssertUnwindSafe(|| Pin::new(notified).poll(cx)));
-      match result {
-        Ok(Poll::Pending) => return Poll::Pending,
-        Ok(Poll::Ready(Ok(()))) => {
-          // Capture the next broadcast before checking the live receiver
-          // count, avoiding a lost zero transition during this poll.
-          this.notified = Some(this.sender.shared.closed_notify.notified_owned());
-          rearmed += 1;
-          if rearmed == CLOSED_POLL_BUDGET {
-            if let Err(payload) = panic::catch_unwind(AssertUnwindSafe(|| cx.waker().wake_by_ref()))
-            {
-              drop_contained(payload);
-              this.completed = true;
-              this.notified.take();
-              return Poll::Ready(Err(ClosedError::WakerPanicked));
+      }
+      let mut rearmed = 0;
+      loop {
+        if this.sender.is_closed() {
+          this.completed = true;
+          this.notified.take();
+          return Poll::Ready(Ok(()));
+        }
+        let Some(notified) = this.notified.as_mut() else {
+          this.completed = true;
+          return Poll::Ready(Err(ClosedError::Completed));
+        };
+        let result = panic::catch_unwind(AssertUnwindSafe(|| Pin::new(notified).poll(cx)));
+        match result {
+          Ok(Poll::Pending) => return Poll::Pending,
+          Ok(Poll::Ready(Ok(()))) => {
+            // Capture the next broadcast before checking the live receiver
+            // count, avoiding a lost zero transition during this poll.
+            this.notified = Some(this.sender.shared.closed_notify.notified_owned());
+            rearmed += 1;
+            if rearmed == CLOSED_POLL_BUDGET {
+              if let Err(payload) =
+                panic::catch_unwind(AssertUnwindSafe(|| cx.waker().wake_by_ref()))
+              {
+                drop_contained(payload);
+                this.completed = true;
+                this.notified.take();
+                return Poll::Ready(Err(ClosedError::WakerPanicked));
+              }
+              return Poll::Pending;
             }
-            return Poll::Pending;
+          }
+          Ok(Poll::Ready(Err(NotifyError::Full))) => {
+            this.completed = true;
+            this.notified.take();
+            return Poll::Ready(Err(ClosedError::Full));
+          }
+          Ok(Poll::Ready(Err(NotifyError::Closed | NotifyError::GenerationExhausted))) => {
+            this.completed = true;
+            this.notified.take();
+            return Poll::Ready(Err(ClosedError::Exhausted));
+          }
+          Err(payload) => {
+            drop_contained(payload);
+            this.completed = true;
+            this.notified.take();
+            return Poll::Ready(Err(ClosedError::WakerPanicked));
           }
         }
-        Ok(Poll::Ready(Err(NotifyError::Full))) => {
-          this.completed = true;
-          this.notified.take();
-          return Poll::Ready(Err(ClosedError::Full));
-        }
-        Ok(Poll::Ready(Err(NotifyError::Closed | NotifyError::GenerationExhausted))) => {
-          this.completed = true;
-          this.notified.take();
-          return Poll::Ready(Err(ClosedError::Exhausted));
-        }
-        Err(payload) => {
-          drop_contained(payload);
-          this.completed = true;
-          this.notified.take();
-          return Poll::Ready(Err(ClosedError::WakerPanicked));
-        }
       }
-    }
+    })
   }
 }
 

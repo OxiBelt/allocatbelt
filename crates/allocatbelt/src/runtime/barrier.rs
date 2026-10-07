@@ -220,52 +220,54 @@ impl Future for BarrierWait {
   type Output = Result<BarrierOutcome, BarrierError>;
 
   fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-    let this = self.get_mut();
-    if this.completed {
-      return Poll::Ready(Err(BarrierError::Completed));
-    }
+    super::asynchronous::poll_cooperative(cx, |cx| {
+      let this = self.get_mut();
+      if this.completed {
+        return Poll::Ready(Err(BarrierError::Completed));
+      }
 
-    // Waker cloning may invoke user RawWaker code, so do it before taking the
-    // ledger lock. A panicking clone is contained and leaves no arrival.
-    let mut new_waker = match panic::catch_unwind(AssertUnwindSafe(|| cx.waker().clone())) {
-      Ok(waker) => Some(waker),
-      Err(payload) => {
-        drop_contained(payload);
-        if let Some(key) = this.key.take() {
-          // A failed clone on a later poll must not strand the enrolled slot.
-          // Treat it like cancellation so the unfinished round is broken and
-          // its other arrivals can make progress.
-          cancel_enrolled(&this.shared, key);
+      // Waker cloning may invoke user RawWaker code, so do it before taking the
+      // ledger lock. A panicking clone is contained and leaves no arrival.
+      let mut new_waker = match panic::catch_unwind(AssertUnwindSafe(|| cx.waker().clone())) {
+        Ok(waker) => Some(waker),
+        Err(payload) => {
+          drop_contained(payload);
+          if let Some(key) = this.key.take() {
+            // A failed clone on a later poll must not strand the enrolled slot.
+            // Treat it like cancellation so the unfinished round is broken and
+            // its other arrivals can make progress.
+            cancel_enrolled(&this.shared, key);
+          }
+          this.completed = true;
+          return Poll::Ready(Err(BarrierError::WakerPanicked));
         }
-        this.completed = true;
-        return Poll::Ready(Err(BarrierError::WakerPanicked));
-      }
-    };
+      };
 
-    let action = match this.key {
-      Some(key) => poll_enrolled(&this.shared, key, &mut new_waker),
-      None => poll_first(&this.shared, &mut new_waker),
-    };
-    match action {
-      PollAction::Pending(key, old_waker) => {
-        this.key = Some(key);
-        drop_waker(old_waker);
-        drop_waker(new_waker.take());
-        Poll::Pending
+      let action = match this.key {
+        Some(key) => poll_enrolled(&this.shared, key, &mut new_waker),
+        None => poll_first(&this.shared, &mut new_waker),
+      };
+      match action {
+        PollAction::Pending(key, old_waker) => {
+          this.key = Some(key);
+          drop_waker(old_waker);
+          drop_waker(new_waker.take());
+          Poll::Pending
+        }
+        PollAction::Ready(result, old_waker) => {
+          this.key = None;
+          this.completed = true;
+          drop_waker(old_waker);
+          drop_waker(new_waker.take());
+          Poll::Ready(result)
+        }
+        PollAction::Immediate(result) => {
+          this.completed = true;
+          drop_waker(new_waker.take());
+          Poll::Ready(result)
+        }
       }
-      PollAction::Ready(result, old_waker) => {
-        this.key = None;
-        this.completed = true;
-        drop_waker(old_waker);
-        drop_waker(new_waker.take());
-        Poll::Ready(result)
-      }
-      PollAction::Immediate(result) => {
-        this.completed = true;
-        drop_waker(new_waker.take());
-        Poll::Ready(result)
-      }
-    }
+    })
   }
 }
 

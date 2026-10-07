@@ -771,19 +771,20 @@ await it, and it does not impose a fairness or latency bound.
 Runtime-owned outer polls also use a shared 64-operation budget for ready
 `channel` send/receive/reservation/closed-wait, oneshot receive/close,
 semaphore acquisition, mutex acquisition and reader-writer-lock acquisition
-polls. A synchronous
-primitive-to-primitive chain charges once; a primitive poll that returns
-Pending restores its provisional charge. Once exhausted, the next supported
-primitive arranges a wake and returns Pending before it dequeues a message,
-accepts a send, or transfers a permit/lock guard. This applies only while the
-runtime is polling an owned Send/local task or a borrowed `block_on` root.
+polls, plus `Notify`, watch change/closure, broadcast receive/closure and
+barrier waits. A synchronous primitive-to-primitive chain charges once; a
+primitive poll that returns `Pending` restores its provisional charge. Once
+exhausted, the next supported primitive arranges a wake and returns `Pending`
+before it dequeues a message, accepts a send, or transfers a permit/lock guard.
+This applies only while the runtime is polling an owned Send/local task or a
+borrowed `block_on` root.
 Manual polls and futures driven by external executors bypass automatic
-accounting. Notifications, watch/broadcast, barriers, timers, and other
-arbitrary futures are not yet automatically cooperative; long-running work
-outside the listed primitives still needs explicit checkpoints or its own
-bounded polling. Direct I/O endpoint polls, including `AsyncBufRead`, are also
-outside this automatic accounting; the looping I/O helpers and buffered
-endpoints enforce their own 64-call-per-poll limits.
+accounting. Timers and other arbitrary futures are not automatically
+cooperative; long-running work outside the listed primitives still needs
+explicit checkpoints or its own bounded polling. Direct I/O endpoint polls,
+including `AsyncBufRead`, are also outside this automatic accounting; the
+looping I/O helpers and buffered endpoints enforce their own 64-call-per-poll
+limits.
 
 `AsyncJob` is awaitable; dropping it detaches, while `abort` requests cleanup
 after any in-flight poll returns. Owned scopes cancel their children on drop;
@@ -1322,7 +1323,7 @@ processes, signals, concurrency helpers and explicit cgroup feedback are
 implemented with the contracts above. The stable Linux Tokio 1.53.1 capability
 baseline still requires these implementation and qualification steps:
 
-1. Extend automatic cooperative progress beyond the listed channel and lock
+1. Extend automatic cooperative progress beyond the currently listed
    operations. Expand TCP socket-option and listen-builder coverage beyond the
    explicit single-address nonblocking connect and bound-socket operations.
 2. Add standard I/O adapters, general pipe construction, managed in-memory

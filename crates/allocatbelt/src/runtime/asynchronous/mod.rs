@@ -3,9 +3,10 @@
 //! [`AsyncRuntime::block_on`] may poll one borrowed or non-`Send` root future
 //! on its caller thread. Spawned work remains owned and `Send + 'static`.
 //! Runtime-owned outer polls enable a shared 64-operation cooperative budget
-//! for ready channel, oneshot, semaphore, mutex, and reader-writer-lock
-//! futures. The budget is scoped to those polls; manually polled primitives
-//! and futures polled by another executor bypass automatic accounting.
+//! for ready channel, oneshot, semaphore, mutex, reader-writer-lock, notify,
+//! watch, broadcast, and barrier futures. The budget is scoped to those polls;
+//! manually polled primitives and futures polled by another executor bypass
+//! automatic accounting.
 //! [`yield_now`] schedules one self-wake; [`consume_budget`] remains an
 //! explicit checkpoint for other long-running future work. No checkpoint
 //! preempts synchronous code or arbitrary futures that never yield.
@@ -27,6 +28,8 @@ mod scheduler;
 mod task;
 mod task_set;
 
+#[cfg(all(test, not(loom)))]
+mod cooperative_tests;
 #[cfg(all(test, not(loom)))]
 mod handoff_tests;
 #[cfg(all(test, not(loom)))]

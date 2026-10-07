@@ -315,17 +315,19 @@ impl Future for OwnedNotifiedFuture {
   type Output = Result<(), NotifyError>;
 
   fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-    let this = self.get_mut();
-    if let Some(outcome) = this.outcome {
-      return Poll::Ready(outcome);
-    }
-    // RawWaker clone code is user code. Do it before acquiring the state lock.
-    let mut waker = Some(cx.waker().clone());
-    let result = poll_inner(this, Some(&mut waker));
-    if result.is_ready() {
-      drop_waker(waker.take());
-    }
-    result
+    super::asynchronous::poll_cooperative(cx, |cx| {
+      let this = self.get_mut();
+      if let Some(outcome) = this.outcome {
+        return Poll::Ready(outcome);
+      }
+      // RawWaker clone code is user code. Do it before acquiring the state lock.
+      let mut waker = Some(cx.waker().clone());
+      let result = poll_inner(this, Some(&mut waker));
+      if result.is_ready() {
+        drop_waker(waker.take());
+      }
+      result
+    })
   }
 }
 
