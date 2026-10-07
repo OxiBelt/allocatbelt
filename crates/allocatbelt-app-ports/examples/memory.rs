@@ -34,7 +34,13 @@ fn main() -> PortResult<()> {
   let work = runtime.block_on(memory::run(&scope, resources.clone(), config));
   let close = runtime.block_on(scope.close());
   let shutdown = runtime.shutdown(AsyncShutdown::Drain);
-  let report = work??;
+  let output = work??;
+  let report = output.report;
+  println!(
+    "memory_checksum={:016x} charged_after_growth={} peak_replacement_enforced={}",
+    report.checksum, report.charged_after_growth, report.peak_replacement_was_enforced
+  );
+  drop(output);
   close?;
   shutdown?;
   if resources.snapshot().managed_memory != 0 {
@@ -42,9 +48,5 @@ fn main() -> PortResult<()> {
       std::io::Error::other("memory workload retained managed bytes after shutdown").into(),
     );
   }
-  println!(
-    "memory_checksum={:016x} charged_after_growth={} peak_replacement_enforced={}",
-    report.checksum, report.charged_after_growth, report.peak_replacement_was_enforced
-  );
   Ok(())
 }

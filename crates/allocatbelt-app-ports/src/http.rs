@@ -5,7 +5,7 @@ use std::net::{SocketAddr, TcpListener as StdTcpListener};
 use std::ops::{Deref, DerefMut};
 
 use allocatbelt::runtime::Handle as BlockingHandle;
-use allocatbelt::runtime::asynchronous::{AsyncJoinError, OwnedTaskScope};
+use allocatbelt::runtime::asynchronous::{AbortHandle, AsyncJob, AsyncJoinError, OwnedTaskScope};
 use allocatbelt::runtime::io::AsyncWriteExt;
 use allocatbelt::runtime::managed::{OperationPermit, OperationRequest, ResourceScope};
 use allocatbelt::runtime::net::{NetHandle, TcpListener, TcpStream};
@@ -33,6 +33,42 @@ const RESPONSE_READ_CHUNK: usize = 7;
 struct NetworkEndpoint {
   stream: TcpStream,
   _permit: OperationPermit,
+}
+
+struct AbortOnDrop<T> {
+  job: Option<AsyncJob<T>>,
+  abort: Option<AbortHandle>,
+}
+
+impl<T> AbortOnDrop<T> {
+  fn new(job: AsyncJob<T>) -> Self {
+    let abort = job.abort_handle();
+    Self {
+      job: Some(job),
+      abort: Some(abort),
+    }
+  }
+
+  fn abort(&self) {
+    if let Some(abort) = &self.abort {
+      abort.abort();
+    }
+  }
+
+  async fn join(&mut self) -> Result<T, AsyncJoinError> {
+    let result = match self.job.take() {
+      Some(job) => job.await,
+      None => return Err(AsyncJoinError::Cancelled),
+    };
+    self.abort = None;
+    result
+  }
+}
+
+impl<T> Drop for AbortOnDrop<T> {
+  fn drop(&mut self) {
+    self.abort();
+  }
 }
 
 impl NetworkEndpoint {
@@ -392,10 +428,12 @@ pub async fn loopback_transaction(
       serve_connection(stream, server_resources).await
     })
     .map_err(|error| join_message(error.kind))?;
+  let mut server = AbortOnDrop::new(server);
   let client_result = transact_client(blocking, reactor, resources.clone(), address, config).await;
   match client_result {
     Ok(client_checksum) => {
       let server_checksum = server
+        .join()
         .await
         .map_err(|error: AsyncJoinError| join_message(error))??;
       if client_checksum != server_checksum {
@@ -405,7 +443,7 @@ pub async fn loopback_transaction(
     }
     Err(error) => {
       server.abort();
-      match server.await {
+      match server.join().await {
         Ok(Err(server_error)) => {
           Err(message(format!("{}; HTTP server failed: {server_error}", error)).into())
         }

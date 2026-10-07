@@ -43,6 +43,18 @@ pub struct MemoryReport {
   pub checksum: u64,
 }
 
+/// A completed memory workload and its still-live managed allocation.
+///
+/// The buffer remains charged while this value or any clone of the buffer is
+/// alive. Exact ledger observations require an otherwise-idle resource scope.
+#[derive(Debug)]
+pub struct MemoryOutput {
+  /// The verified workload results.
+  pub report: MemoryReport,
+  /// The grown, initialized managed allocation retained by the caller.
+  pub buffer: ManagedBuf,
+}
+
 /// A deterministic byte shared by allocator and executor adapters.
 #[must_use]
 pub fn pattern_byte(seed: u64, index: usize) -> u8 {
@@ -72,7 +84,7 @@ fn fill(buf: &mut ManagedBuf, seed: u64) -> PortResult<()> {
   Ok(())
 }
 
-fn managed_work(resources: &ResourceScope, config: MemoryConfig) -> PortResult<MemoryReport> {
+fn managed_work(resources: &ResourceScope, config: MemoryConfig) -> PortResult<MemoryOutput> {
   if config.initial_bytes == 0
     || config.grown_bytes <= config.initial_bytes
     || config.grown_bytes > MAX_BUFFER_BYTES
@@ -144,11 +156,7 @@ fn managed_work(resources: &ResourceScope, config: MemoryConfig) -> PortResult<M
     charged_after_growth,
     checksum: checksum(buffer.as_slice()),
   };
-  drop(buffer);
-  if resources.snapshot().managed_memory != 0 {
-    return Err(message("grown managed buffer charge was not released").into());
-  }
-  Ok(report)
+  Ok(MemoryOutput { report, buffer })
 }
 
 /// Runs the managed allocation, replacement-growth, byte-validation and
@@ -157,7 +165,7 @@ pub async fn run(
   scope: &OwnedTaskScope,
   resources: ResourceScope,
   config: MemoryConfig,
-) -> PortResult<MemoryReport> {
+) -> PortResult<MemoryOutput> {
   let job = scope
     .spawn(async move { managed_work(&resources, config) })
     .map_err(|error| join_message(error.kind))?;

@@ -86,12 +86,26 @@ examples are `memory`, `tcp_http` and `disk`.
 
 The ports separate reusable workload kernels from the runtime adapters. HTTP
 uses a deliberately limited bounded framing parser and capped reads to exercise
-incremental progress. Disk creates its private directory and initial file
-synchronously before cancellable asynchronous I/O; later detached opens cannot
-recreate a deleted payload. Exact managed-ledger checks require an otherwise-idle
-resource scope. Each example explicitly closes its task scope and shuts down
-its drivers. These functional checks establish neither general HTTP capability
-nor application performance qualification.
+incremental progress. Its qualification tests cancel the outer transaction
+while a connect is queued and require the admitted server task to release its
+scope slot; they also exercise two live endpoints competing for a one-slot
+network ledger under a watchdog. Disk creates its private directory and initial
+file synchronously before cancellable asynchronous I/O; later detached opens
+cannot recreate a deleted payload. Qualification also recovers original file
+and managed-buffer inputs and prepared path/options after disk-permit and
+blocking-queue rejection, and holds a detached multi-chunk write behind a gate
+to verify that its storage charge and disk permit remain live until worker
+completion. Memory returns its initialized
+managed buffer so tests can verify that its charge survives result publication
+and buffer cloning until the final owner drops. CPU retries only a recovered
+`Full` submission after one of its own admitted jobs releases capacity, then
+checks the stable digest against the serial kernel. A bounded process-driver
+test retains a rejected command until the first child is actually reaped and
+explicitly shuts the driver down; it is lifecycle qualification, not a fifth
+workload lane. Exact managed-ledger checks require an otherwise-idle resource
+scope. Each example explicitly closes its task scope and shuts down its drivers.
+These functional checks establish neither general HTTP capability nor
+application performance qualification.
 
 The [runtime contract](../runtime.md) documents accepted implementation. The
 [foundation report](runtime-foundation.md) contains earlier measurements, whose

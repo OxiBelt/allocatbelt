@@ -8,9 +8,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(unix)]
 use std::os::unix::fs::DirBuilderExt;
 
+use allocatbelt::runtime::Job;
 use allocatbelt::runtime::asynchronous::{AsyncJoinError, OwnedTaskScope};
-use allocatbelt::runtime::fs::{FileIoOutcome, FsHandle, OwnedFile};
-use allocatbelt::runtime::managed::{ResourceScope, ResourceSnapshot};
+use allocatbelt::runtime::fs::{FileIoOutcome, FsHandle, FsSubmissionError, OwnedFile};
+use allocatbelt::runtime::managed::{ManagedBuf, ResourceScope, ResourceSnapshot};
 
 use crate::memory::{checksum, pattern_byte};
 use crate::{PortResult, join_message, message};
@@ -20,6 +21,13 @@ pub const MAX_DISK_BYTES: usize = 1 << 20;
 /// Maximum sparse offset for the functional example.
 pub const MAX_DISK_OFFSET: u64 = 1 << 20;
 const MAX_TEMP_DIR_TRIES: usize = 32;
+
+/// Owned inputs returned unchanged if opening a prepared file is rejected
+/// before a blocking job is admitted.
+pub type PreparedOpenInput = (PathBuf, OpenOptions);
+/// Owned inputs returned unchanged if a positional write is rejected before
+/// a blocking job is admitted.
+pub type PositionalWriteInput = (OwnedFile, ManagedBuf, u64);
 
 static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -37,7 +45,9 @@ pub struct DiskConfig {
 impl Default for DiskConfig {
   fn default() -> Self {
     Self {
-      bytes: 16 * 1024,
+      // Exceeds two current 64 KiB filesystem chunks so the example exercises
+      // repeated bounded positional operations.
+      bytes: 3 * 64 * 1024 + 17,
       offset: 4096,
       seed: 0xa409_3822_299f_31d0,
     }
@@ -131,10 +141,36 @@ fn existing_file_options() -> OpenOptions {
   options
 }
 
+/// Submits an open for a caller-prepared path without losing retry inputs.
+///
+/// A returned error is a pre-admission rejection; callers can inspect its
+/// kind and recover the exact path/options with
+/// [`FsSubmissionError::into_input`].
+/// Once this returns a job, dropping the job detaches the open and its owned
+/// inputs remain with the blocking worker until completion or queue cancel.
+pub fn submit_prepared_open(
+  fs_handle: &FsHandle,
+  path: PathBuf,
+  options: OpenOptions,
+) -> Result<Job<io::Result<OwnedFile>>, FsSubmissionError<PreparedOpenInput>> {
+  fs_handle.open(path, options)
+}
+
+/// Submits a positional write with an explicit recoverable pre-admission
+/// boundary. A rejection returns the original file, managed buffer and offset;
+/// an admitted operation's partial count or I/O error is instead returned in
+/// [`FileIoOutcome`] and must not be replayed automatically.
+pub fn submit_positional_write(
+  fs_handle: &FsHandle,
+  file: OwnedFile,
+  buffer: ManagedBuf,
+  offset: u64,
+) -> Result<Job<FileIoOutcome>, FsSubmissionError<PositionalWriteInput>> {
+  fs_handle.write_at(file, buffer, offset)
+}
+
 async fn open_prepared_file(fs_handle: &FsHandle, path: PathBuf) -> PortResult<OwnedFile> {
-  fs_handle
-    .open(path, existing_file_options())
-    .map_err(|error| message(format!("filesystem open rejected: {:?}", error.kind)))?
+  submit_prepared_open(fs_handle, path, existing_file_options())?
     .await
     .map_err(join_message)?
     .map_err(Into::into)
@@ -181,9 +217,7 @@ async fn transaction(
     buffer: payload,
     bytes: written,
     error,
-  } = fs_handle
-    .write_at(file, payload, config.offset)
-    .map_err(|error| message(format!("filesystem write rejected: {:?}", error.kind)))?
+  } = submit_positional_write(fs_handle, file, payload, config.offset)?
     .await
     .map_err(join_message)?;
   if written != config.bytes {

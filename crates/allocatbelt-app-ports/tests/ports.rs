@@ -56,8 +56,13 @@ fn cpu_and_managed_growth_complete_under_owned_scopes() {
     .expect("root should complete")
     .expect("managed growth should complete");
   assert_ne!(cpu_result, 0);
-  assert!(memory_report.peak_replacement_was_enforced);
-  assert!(memory_report.charged_after_growth >= MemoryConfig::default().grown_bytes);
+  assert!(memory_report.report.peak_replacement_was_enforced);
+  assert!(memory_report.report.charged_after_growth >= MemoryConfig::default().grown_bytes);
+  assert_eq!(
+    ledger.snapshot().managed_memory,
+    memory_report.report.charged_after_growth
+  );
+  drop(memory_report);
   runtime
     .block_on(scope.close())
     .expect("scope cleanup should finish");
@@ -147,7 +152,12 @@ fn loopback_http_uses_reactor_tcp_and_releases_all_charges() {
     ))
     .expect("root should complete")
     .expect("loopback request should succeed");
-  assert_ne!(digest, 0);
+  let expected_http_checksum = memory::checksum(
+    &(0..1739)
+      .map(|index| memory::pattern_byte(91, index))
+      .collect::<Vec<_>>(),
+  );
+  assert_eq!(digest, expected_http_checksum);
   runtime
     .block_on(scope.close())
     .expect("scope cleanup should finish");
@@ -183,14 +193,14 @@ fn disk_transaction_uses_owned_offsets_syncs_reads_back_and_removes_temp_tree() 
       fs,
       ledger.clone(),
       DiskConfig {
-        bytes: 2049,
+        bytes: 192 * 1024 + 17,
         offset: 1027,
         seed: 33,
       },
     ))
     .expect("root should complete")
     .expect("disk transaction should succeed");
-  assert_eq!(report.bytes, 2049);
+  assert_eq!(report.bytes, 192 * 1024 + 17);
   assert_eq!(report.offset, 1027);
   assert!(report.temp_directory_removed);
   runtime

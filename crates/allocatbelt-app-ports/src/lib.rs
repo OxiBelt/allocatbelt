@@ -11,6 +11,10 @@
 //! `ResourceScope`; unrelated live buffers or operation permits contribute to
 //! the same ledger and can change those observations. Runtime, reactor and
 //! filesystem handles remain caller-owned and must be shut down explicitly.
+//! The qualification tests exercise recovered bounded-admission inputs,
+//! returned managed-buffer clone lifetime, canceled HTTP server cleanup,
+//! detached multi-chunk filesystem work, and explicit process reaping. These
+//! tests make no timing or executor-superiority claim.
 
 #![forbid(unsafe_code)]
 #![cfg_attr(not(test), deny(clippy::expect_used, clippy::unwrap_used))]
