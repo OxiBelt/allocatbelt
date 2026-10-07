@@ -108,6 +108,7 @@ pub mod process;
 mod process_completion;
 #[cfg(not(loom))]
 pub mod reactor;
+mod reactor_release;
 mod resources;
 pub mod rwlock;
 mod scheduler;

@@ -173,6 +173,7 @@ use rustix::event::{EventfdFlags, eventfd};
 use rustix::fs::{self as rfs, OFlags};
 use rustix::io::Errno;
 
+use crate::runtime::reactor_release::begin_if_no_waiters;
 use crate::runtime::task::drop_contained;
 
 /// Events taken per `epoll_wait`.
@@ -708,6 +709,12 @@ impl State {
     }
   }
 
+  fn has_waiters(&self, index: u32, generation: u64) -> bool {
+    self
+      .entry(index, generation)
+      .is_some_and(|entry| entry.lists.iter().any(|list| !list.is_empty()))
+  }
+
   /// Takes a free slot with a fresh generation. Retires slots whose
   /// generations are used up instead of wrapping.
   fn reserve(&mut self) -> Result<(u32, u64), ReactorError> {
@@ -1151,13 +1158,37 @@ impl Shared {
   /// Releases a registration: stale at once, deleted from epoll and closed
   /// outside the lock, and only then uncharged.
   fn release(&self, index: u32, generation: u64) {
-    let mut wakers = Vec::with_capacity(self.max_waiters);
-    let (fd, expected_callbacks) = {
+    let without_waiters = {
       let mut state = lock(&self.state);
-      let fd = state.begin_release(index, generation, &mut wakers);
-      let callbacks = wakers.len();
-      state.callbacks_pending += callbacks;
-      (fd, callbacks)
+      begin_if_no_waiters(
+        &mut state,
+        |state| state.has_waiters(index, generation),
+        |state| {
+          let mut wakers = Vec::new();
+          let fd = state.begin_release(index, generation, &mut wakers);
+          let callbacks = wakers.len();
+          state.callbacks_pending += callbacks;
+          (wakers, fd, callbacks)
+        },
+      )
+    };
+    let (mut wakers, fd, expected_callbacks) = match without_waiters {
+      Some(released) => released,
+      None => {
+        // A waiter was present at the first locked inspection. Reserve the
+        // bounded storage outside the lock, then revalidate and release
+        // under the lock as before. Cancellation may empty the queues while
+        // this reservation is made; the unused capacity is harmless.
+        let mut wakers = Vec::with_capacity(self.max_waiters);
+        let (fd, callbacks) = {
+          let mut state = lock(&self.state);
+          let fd = state.begin_release(index, generation, &mut wakers);
+          let callbacks = wakers.len();
+          state.callbacks_pending += callbacks;
+          (fd, callbacks)
+        };
+        (wakers, fd, callbacks)
+      }
     };
     if let Some(fd) = fd {
       let _ = epoll::delete(&self.epoll, &fd);
@@ -3022,6 +3053,59 @@ mod tests {
       .install(index, generation, OwnedFd::from(stream))
       .unwrap();
     (state, index, generation, peer)
+  }
+
+  #[test]
+  fn release_reserves_waker_storage_only_for_matching_live_waiters() {
+    let (mut state, index, generation, _peer) = live_state(1);
+    let empty_release = begin_if_no_waiters(
+      &mut state,
+      |state| state.has_waiters(index, generation),
+      |state| {
+        let mut wakers = Vec::new();
+        let fd = state.begin_release(index, generation, &mut wakers);
+        (wakers, fd)
+      },
+    )
+    .unwrap();
+    assert_eq!(empty_release.0.capacity(), 0);
+    assert!(empty_release.1.is_some());
+    drop(empty_release.1);
+    state.finish_release(index);
+
+    let (next_index, next_generation) = state.reserve().unwrap();
+    let (stream, _peer) = UnixStream::pair().unwrap();
+    state
+      .install(next_index, next_generation, OwnedFd::from(stream))
+      .unwrap();
+    let (_, waker) = counter();
+    let mut key = None;
+    let mut candidate = Some(waker.clone());
+    let polled = state.poll_ready(
+      next_index,
+      next_generation,
+      Direction::Read,
+      &mut key,
+      &waker,
+      &mut candidate,
+    );
+    assert!(matches!(polled.step, Step::Pending(Some(_))));
+
+    let not_released = begin_if_no_waiters(
+      &mut state,
+      |state| state.has_waiters(next_index, next_generation),
+      |_| (),
+    );
+    assert!(not_released.is_none());
+    assert!(state.has_waiters(next_index, next_generation));
+
+    let mut wakers = Vec::with_capacity(1);
+    let fd = state.begin_release(next_index, next_generation, &mut wakers);
+    assert!(fd.is_some());
+    assert_eq!(wakers.len(), 1);
+    drop(fd);
+    drop(wakers);
+    state.finish_release(next_index);
   }
 
   #[test]
