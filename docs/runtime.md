@@ -212,6 +212,39 @@ Tokio's lock guards and omits mutation callbacks under a lock. Twenty native
 tests, two compile-fail examples and five actual-source Loom models cover
 observation, replacement, cancellation, closure registration and trait bounds.
 
+## Broadcast channels
+
+`runtime::broadcast::channel` fixes a nonzero message capacity and receiver
+bound, including receiver slots still releasing their unread values. Every
+receiver has one cursor and one pending receive waker. New subscriptions and
+`resubscribe` begin at the current send sequence; lagged receivers report the
+exact number skipped before resuming at the oldest retained message. Closing
+or dropping the last sender allows each receiver to drain retained messages
+before EOF. Sequence counters are checked and receiver generations retire.
+
+Sending with no receivers, after closure or at sequence exhaustion returns
+the unchanged input. Message slots retain owned `Arc<T>` values; receiving
+clones `T` outside the state lock and protects a concurrently overwritten
+replacement from the previous receive's bookkeeping. Retained snapshots and
+managed payload clones keep their charges until final release. Cloning,
+formatting, waking and payload destruction happen outside the state lock.
+Metadata is ordinary storage rather than a managed charge; threaded handles
+require `T: Send + Sync`, while local values need no `'static` bound.
+
+`Sender::closed` observes zero active receivers and uses a separate bounded
+notification table with the same ceiling as receivers. Completion and
+cancellation release their waiter immediately; repeated zero-receiver and
+resubscription races yield after 64 rearms. Closure notification is published
+before unread payload destruction, while the dropping receiver slot remains
+reserved until cleanup completes. A new receiver can reopen this condition
+while senders remain alive. Explicit channel closure does not complete this
+wait until all active receivers leave.
+
+This port uses the exact requested ring capacity; subscriptions reject after
+channel closure. It currently has no weak-sender API. Native and actual-source
+Loom checks cover lag, drain, cancellation, reentrant cloning and destruction,
+retained managed charges, receiver registration and closure lost wakes.
+
 ## Bounded notifications
 
 `runtime::notify::Notify` reserves its complete waiter table at construction.

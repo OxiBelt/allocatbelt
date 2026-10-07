@@ -74,6 +74,7 @@ mod admission;
 pub mod asynchronous;
 pub mod barrier;
 mod blocking;
+pub mod broadcast;
 pub mod buffered_io;
 mod cache;
 pub mod channel;
