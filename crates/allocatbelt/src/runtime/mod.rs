@@ -72,6 +72,7 @@
 
 mod admission;
 pub mod asynchronous;
+pub mod barrier;
 mod blocking;
 pub mod buffered_io;
 mod cache;

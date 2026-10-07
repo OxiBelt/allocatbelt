@@ -196,6 +196,30 @@ outside the ledger lock. The fixed metadata is outside the managed-buffer
 ledger. Seventeen native tests and four actual-source Loom models cover
 registration, cancellation order, close races and generation reuse.
 
+## Bounded reusable barrier
+
+`runtime::barrier::Barrier` fixes a nonzero participant count and a waiter-table
+capacity large enough for one complete round. Wait futures enroll on first
+poll. Unobserved completed results still occupy slots, and `Full` rejects an
+arrival without counting it. Each completed round returns its checked round
+number and exactly one leader.
+
+Canceling an enrolled wait before completion breaks that round: its peers
+receive `Broken` and the barrier advances to a fresh round. Explicit application
+ports must handle that result and retry or abandon their operation. Tokio's
+barrier wait is not cancellation safe and retains canceled arrivals; this
+interface deliberately has different cancellation and zero-participant
+behavior. Close rejects unfinished rounds but preserves completed successes.
+Round counters do not wrap. Waiter slots retire rather than reuse a wrapped
+generation; if usable capacity drops below the participant count, unfinished
+waits receive `Exhausted` instead of waiting for an impossible round.
+
+Metadata is preallocated ordinary runtime storage. Waker callbacks and debug
+formatting run outside the ledger lock; wake panics and panicking payload
+destructors are contained. Twelve native tests cover rounds, bounds, cleanup,
+retirement and reentrant callbacks. Three actual-source Loom models exercise
+cancellation/arrival, close/completion and round separation races.
+
 ## Bounded fair semaphore
 
 `runtime::semaphore::Semaphore` has an explicit preallocated waiter bound.
