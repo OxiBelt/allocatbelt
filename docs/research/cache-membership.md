@@ -1,0 +1,75 @@
+# Cache membership candidate qualification
+
+The inverse-position candidate replaces a linear search of cached block
+numbers with a checked list position. It still stores block lists, validates
+stale positions against the live list, and preserves uniform randomized
+selection. It adds 64 bytes per class, or 2,048 bytes per thread cache. No
+shared allocation bitmap, lock protocol or design constraint changes.
+
+Status: native change-comparison gates passed on three hosts; complete core
+Miri qualification is still running. This candidate has not established the
+library's required superiority over either mimalloc baseline or Tokio.
+
+## Fixed comparison
+
+The unchanged allocator baseline is revision
+`95500ea59c1145cac1deec535255fb3a011744eb`. Both variants use the same
+`bench-latency-allocatbelt` harness, Rust 1.99 and Linux 7.0. Six exploratory
+pairs preceded an independent fixed campaign of 36 fresh-process pairs per
+workload and measurement mode. Variant order alternated. All three hosts
+executed native instructions: one Ryzen 9700X bare-metal host and separate
+Ryzen 8845HS and 7840HS guests. Hosts were analyzed separately.
+
+The allocator lane uses CPU affinity 0–7 and `--bytes 256`. Local and aligned
+workloads run 1,000,000 iterations; mixed runs 100,000. The local workload
+touches and frees 64-byte allocations; aligned creates 256- and 4,096-byte
+aligned objects; mixed cycles through eight sizes from 16 to 262,144 bytes.
+The harness warms 1,000 iterations outside timing. Throughput and per-iteration
+latency use separate processes. Latency includes payload access, freeing and
+timer overhead. It is distinct from open-loop application response p99.
+
+Each host contributes 432 processes: three workloads, two modes, two variants
+and 36 pairs. Checksums, argument records, binary hashes and process outcomes
+were checked. Failed and slower variants remain in private evidence.
+
+Paired log-ratio percentile bootstrap uses 50,000 resamples, fixed seed
+20261007 and Bonferroni adjustment for fourteen contrasts per host. This is
+approximate simultaneous 95% coverage per host. It does not establish global
+coverage across all three hosts.
+
+## Results and limits
+
+The aggregate is an equal-weight geometric mean across workloads. Workloads
+ran in separate batches, so matching their repetition indices does not
+establish cross-workload pairing. The original preregistered aggregate
+bootstrap analyses are preserved; acceptance below uses the more conservative
+geometric mean of the simultaneous per-workload bounds instead.
+
+All ratios are candidate divided by baseline; higher throughput and lower
+p99 are favorable.
+
+| Host | Throughput ratio | Conservative lower bound | p99 ratio | Conservative upper bound |
+|---|---:|---:|---:|---:|
+| 9700X | 1.341 | 1.324 | 0.870 | 0.887 |
+| 8845HS guest | 1.267 | 1.252 | 0.881 | 0.889 |
+| 7840HS guest | 1.258 | 1.227 | 0.869 | 0.877 |
+
+Each host passes the change gates of throughput lower bound at least 1.05
+and p99 upper bound at most 0.95. Every measured workload also passes the
+throughput lower-bound guard of 0.98, process-CPU upper bound of 1.02, p99 upper
+bound of 1.05 and peak-RSS upper bound of 1.05. These results compare the
+candidate with the unchanged allocatbelt baseline.
+
+`perf stat` task-clock in throughput processes measures whole-process CPU,
+including work outside the timed trace. The RSS guard uses the worse paired
+ratio from latency and throughput modes. Peak RSS includes the latency sample
+vector and does not qualify
+retained idle thread-cache memory. The added 2 KiB per cache remains an explicit
+cost. Timer quantization can produce identical p99 ratios and zero-width
+bootstrap intervals; these are not exact physical latency bounds. Guest host
+scheduling and frequency remain potential confounders.
+
+Complete Miri, retained-memory/application checks and the separate mimalloc
+and matched-allocator Tokio qualification remain required. Raw logs, hashes,
+profiles and analyses are held in the private resources checkout. The
+[implementation plan](resource-runtime-plan.md) specifies the broader gates.
