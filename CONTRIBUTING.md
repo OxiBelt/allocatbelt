@@ -83,6 +83,11 @@ contention benchmark as failed but its zero-exit log contains the exact
 `recorded_status`, sets `verified_status` to `approved_ignored_benchmark`, and
 prints a warning. Other failures, timeouts, missing tests or different skip
 reasons remain failures.
+The same correction is allowed for a historical failed record whose zero-exit
+log proves an exact passing `- should panic ... ok` outcome and matching
+one-test summary. Earlier parsers omitted libtest's expected-panic annotation.
+The auditor retains the original failed status and warns; a nonzero exit or
+ordinary passing log cannot use that correction.
 New runner manifests contain absolute log paths. For an older manifest whose
 log paths were relative to the original working directory, add
 `--log-root ORIGINAL_WORKING_DIRECTORY`. Without that option, relative log

@@ -109,7 +109,11 @@ if [[ "${FAKE_MODE:-}" == ignored && "${test_name}" == core::second_case ]]; the
   echo 'test result: ok. 0 passed; 0 failed; 1 ignored; 0 measured; 2 filtered out; finished in 0.00s'
   exit 0
 fi
-echo "test ${test_name} ... ok"
+if [[ "${FAKE_MODE:-}" == expected_panic ]]; then
+  echo "test ${test_name} - should panic ... ok"
+else
+  echo "test ${test_name} ... ok"
+fi
 if [[ "${FAKE_MODE:-}" == duplicate_outcome && "${test_name}" == core::second_case ]]; then
   echo "test ${test_name} ... ok"
 fi
@@ -238,6 +242,13 @@ if grep -q -- '-C target-cpu=x86-64-v3' "${tmp}/cargo.log"; then
 fi
 unset FAKE_UNAME
 
+export FAKE_MODE=expected_panic
+if ! run_checker expected_panic; then
+  cat "${tmp}/expected_panic.log" >&2
+  echo "FAIL: runner rejected passing expected-panic outcomes" >&2
+  exit 1
+fi
+
 export FAKE_MODE=normal
 export FAKE_LIST_MODE=duplicate
 expect_failure duplicate_list normal 'duplicate test in Miri list'
@@ -339,6 +350,26 @@ for encoded_exit in 08 00 010 18446744073709551616; do
 done
 
 cp "${tmp}/audit/results.tsv" "${tmp}/audit/pristine.tsv"
+cp "${tmp}/audit/1.log" "${tmp}/audit/ordinary-first.log"
+sed 's/core::first_case ... ok/core::first_case - should panic ... ok/' \
+  "${tmp}/audit/ordinary-first.log" >"${tmp}/audit/1.log"
+sed 's/core::first_case\tpassed/core::first_case\tfailed/' \
+  "${tmp}/audit/pristine.tsv" >"${tmp}/audit/results.tsv"
+verify_audit "${tmp}/audit/expected-panic-verified.tsv" \
+  >"${tmp}/audit/expected-panic.out" 2>"${tmp}/audit/expected-panic.err"
+grep -q 'exact passing expected-panic outcome' "${tmp}/audit/expected-panic.err" \
+  || { echo "FAIL: expected-panic correction omitted its warning" >&2; exit 1; }
+awk -F '\t' '$1 == "core::first_case" && $2 == "failed" && $3 == "passed" { found++ } END { exit found != 1 }' \
+  "${tmp}/audit/expected-panic-verified.tsv" \
+  || { echo "FAIL: expected-panic correction did not retain original status" >&2; exit 1; }
+for statuses in '101:0' '0:1'; do
+  if miri_classify_log "${tmp}/audit/1.log" core::first_case 3 \
+    "${statuses%:*}" "${statuses#*:}" core::lock::tests::contention_benchmark; then
+    echo "FAIL: expected-panic outcome bypassed exit-status checks" >&2
+    exit 1
+  fi
+done
+mv "${tmp}/audit/ordinary-first.log" "${tmp}/audit/1.log"
 for case_name in ordinary_failed duplicate_record unlisted_record ignored_nonzero ignored_writer_nonzero; do
   cp "${tmp}/audit/pristine.tsv" "${tmp}/audit/results.tsv"
   case "${case_name}" in

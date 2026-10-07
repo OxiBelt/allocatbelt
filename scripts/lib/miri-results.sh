@@ -17,6 +17,7 @@ miri_classify_log() {
 
   MIRI_CLASS="failed"
   MIRI_DIAGNOSTIC=""
+  MIRI_EXPECTED_PANIC=false
   if [[ ! "${listed_count}" =~ ^[1-9][0-9]*$ ]]; then
     MIRI_DIAGNOSTIC="invalid listed test count"
     return 1
@@ -35,10 +36,13 @@ miri_classify_log() {
   fi
 
   while IFS= read -r line || [[ -n "${line}" ]]; do
-    if [[ "${line}" =~ ^test[[:space:]]+([^[:space:]]+)[[:space:]]+\.\.\.([[:space:]]+(.*))?$ ]]; then
+    if [[ "${line}" =~ ^test[[:space:]]+([^[:space:]]+)([[:space:]]+-[[:space:]]should[[:space:]]panic)?[[:space:]]+\.\.\.([[:space:]]+(.*))?$ ]]; then
       output_count=$((output_count + 1))
       line_name="${BASH_REMATCH[1]}"
-      outcome="${BASH_REMATCH[3]:-}"
+      if [[ -n "${BASH_REMATCH[2]:-}" ]]; then
+        MIRI_EXPECTED_PANIC=true
+      fi
+      outcome="${BASH_REMATCH[4]:-}"
       reason=""
       if [[ "${outcome}" =~ ^(ok|ignored)(,[[:space:]].*)?$ ]]; then
         outcome="${BASH_REMATCH[1]}"

@@ -169,6 +169,15 @@ for test_name in "${tests[@]}"; do
         verified_status=passed
         passed_count=$((passed_count + 1))
         ;;
+      failed:passed)
+        if [[ "${MIRI_EXPECTED_PANIC}" == true ]]; then
+          verified_status=passed
+          passed_count=$((passed_count + 1))
+          echo "warning: ${test_name} was recorded failed but its zero-exit log proves an exact passing expected-panic outcome; original status retained in verified manifest" >&2
+        else
+          diagnostic="failed record cannot be reclassified"
+        fi
+        ;;
       approved_ignored_benchmark:approved_ignored_benchmark)
         verified_status=approved_ignored_benchmark
         approved_skip_count=$((approved_skip_count + 1))
