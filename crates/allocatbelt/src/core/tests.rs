@@ -5,7 +5,7 @@
 use std::boxed::Box;
 use std::collections::BTreeSet;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::vec::Vec;
 
 use crate::core::heap::DIRTY_BUDGET_PAGES;
@@ -61,11 +61,23 @@ const SIZES: &[usize] = &[
 fn every_size_round_trips() {
   let h = heap();
   for &size in SIZES {
-    let offs: Vec<_> = (0..if size > PAGE_SIZE { 3 } else { 200 })
-      .map(|_| alloc(h, 0, size, 8))
-      .collect();
+    let count = if cfg!(miri) || size > PAGE_SIZE {
+      3
+    } else {
+      200
+    };
+    let offs: Vec<_> = (0..count).map(|_| alloc(h, 0, size, 8)).collect();
+    if cfg!(miri) {
+      assert_eq!(offs.iter().copied().collect::<BTreeSet<_>>().len(), count);
+    }
     for o in offs {
       free(h, o);
+    }
+    if cfg!(miri) {
+      assert!(h.os().live.lock().unwrap().is_empty(), "size {size}");
+      let usage = h.usage();
+      assert_eq!(usage.small_bytes_out, 0, "size {size}: {usage:?}");
+      h.check_indexes();
     }
   }
 }
@@ -90,16 +102,72 @@ fn alignments() {
 #[test]
 fn freed_small_blocks_are_reused() {
   let h = heap();
-  let a = alloc(h, 0, 32, 8);
+  // The native stress path keeps its original request size and count. Under
+  // Miri, 512-byte blocks still occupy two bitmap words per 64 KiB page but
+  // reach the reuse check with 129 allocations instead of 2,049 tiny ones.
+  let size = if cfg!(miri) { 512 } else { 32 };
+  assert!(size <= crate::core::class::SMALL_MAX);
+  let blocks_per_page = PAGE_SIZE / size;
+  let allocation_count = if cfg!(miri) {
+    blocks_per_page + 1
+  } else {
+    PAGE_SIZE / 32 + 1
+  };
+  assert!(allocation_count <= PAGE_SIZE / 32 + 1);
+  if cfg!(miri) {
+    assert_eq!(blocks_per_page, 128);
+    assert_eq!(allocation_count, 129);
+  }
+  let a = alloc(h, 0, size, 8);
   free(h, a);
-  // Churn through a full page worth of blocks; the freed slot must come back.
-  let offs: Vec<_> = (0..PAGE_SIZE / 32 + 1)
-    .map(|_| alloc(h, 0, 32, 8))
+  // Churn past a full page worth of blocks; the freed slot must come back.
+  let offs: Vec<_> = (0..allocation_count)
+    .map(|_| alloc(h, 0, size, 8))
     .collect();
   assert!(offs.contains(&a));
+  let unique_offsets: BTreeSet<_> = offs.iter().copied().collect();
+  assert_eq!(unique_offsets.len(), allocation_count);
+
+  if cfg!(miri) {
+    let pages: BTreeSet<_> = offs.iter().map(|offset| offset / PAGE_SIZE).collect();
+    assert_eq!(pages.len(), 2);
+    let mut occupancy: Vec<_> = pages
+      .iter()
+      .map(|page| {
+        offs
+          .iter()
+          .filter(|offset| **offset / PAGE_SIZE == *page)
+          .count()
+      })
+      .collect();
+    occupancy.sort_unstable();
+    assert_eq!(occupancy, [1, blocks_per_page]);
+
+    let full_page = pages
+      .iter()
+      .copied()
+      .find(|page| {
+        offs
+          .iter()
+          .filter(|offset| **offset / PAGE_SIZE == *page)
+          .count()
+          == blocks_per_page
+      })
+      .unwrap();
+    let full_page_words: BTreeSet<_> = offs
+      .iter()
+      .filter(|offset| **offset / PAGE_SIZE == full_page)
+      .map(|offset| offset % PAGE_SIZE / (64 * size))
+      .collect();
+    assert_eq!(full_page_words, BTreeSet::from([0, 1]));
+  }
+
+  h.check_indexes();
   for o in offs {
     free(h, o);
   }
+  assert!(h.os().live.lock().unwrap().is_empty());
+  h.check_indexes();
 }
 
 #[test]
@@ -118,17 +186,42 @@ fn empty_pages_are_recycled_across_classes() {
   // Fill several pages of one class, free everything, then allocate a
   // different class: its pages must come from the recycled ones rather
   // than a new segment.
-  let offs: Vec<_> = (0..PAGE_SIZE / 64 * 8)
-    .map(|_| alloc(h, 3, 64, 8))
+  // Miri retains eight completely filled source pages and six destination
+  // pages of a different class, with the same kept-newest exclusion. Larger
+  // small classes avoid repeating 8,192 tiny allocations under interpretation;
+  // the separate multiword fixture covers bitmap-word boundaries.
+  let source_size = if cfg!(miri) { 8192 } else { 64 };
+  let destination_size = if cfg!(miri) { 4096 } else { 1024 };
+  assert!(source_size <= crate::core::class::SMALL_MAX);
+  assert!(destination_size <= crate::core::class::SMALL_MAX);
+  assert_ne!(
+    crate::core::class::class_of(source_size),
+    crate::core::class::class_of(destination_size)
+  );
+  let offs: Vec<_> = (0..PAGE_SIZE / source_size * 8)
+    .map(|_| alloc(h, 3, source_size, 8))
     .collect();
+  let source_pages: BTreeSet<_> = offs.iter().map(|offset| offset / PAGE_SIZE).collect();
+  assert_eq!(source_pages.len(), 8);
+  let kept_newest_page = offs.last().copied().expect("eight full source pages") / PAGE_SIZE;
   let segs = h.segments_in_use();
   for o in offs {
     free(h, o);
   }
-  let _ = alloc(h, 3, 64, 8); // triggers the scan that recycles empty pages
-  let more: Vec<_> = (0..PAGE_SIZE / 1024 * 6)
-    .map(|_| alloc(h, 3, 1024, 8))
+  // Explicitly recycle candidates: merely reusing the source class can find
+  // a free block before any trim, so unchanged segment count alone would also
+  // pass if the next class used previously untouched pages of the segment.
+  h.purge();
+  assert_eq!(h.maintenance_stats().released_pages, 7);
+  let trigger = alloc(h, 3, source_size, 8);
+  let more: Vec<_> = (0..PAGE_SIZE / destination_size * 6)
+    .map(|_| alloc(h, 3, destination_size, 8))
     .collect();
+  let destination_pages: BTreeSet<_> = more.iter().map(|offset| offset / PAGE_SIZE).collect();
+  assert_eq!(destination_pages.len(), 6);
+  assert!(destination_pages.is_subset(&source_pages));
+  assert!(!destination_pages.contains(&kept_newest_page));
+  assert!(!destination_pages.contains(&(trigger / PAGE_SIZE)));
   assert_eq!(h.segments_in_use(), segs);
   for o in more {
     free(h, o);
@@ -568,20 +661,162 @@ fn cached_round_trip_and_reuse() {
 fn caches_free_each_others_blocks() {
   let h = heap();
   let (a, b) = (cache(h), cache(h));
-  let from_a: Vec<_> = (0..3000).map(|i| alloc_c(h, &a, 8 + i % 3000, 8)).collect();
-  for &o in &from_a {
-    free_c(h, &b, o);
+  if cfg!(miri) {
+    let max_class = crate::core::class::class_of(3007);
+    let mut bounds = Vec::new();
+    bounds.resize(max_class + 1, (None, None));
+    for size in 8..=3007 {
+      let c = crate::core::class::class_of(size);
+      let bound = &mut bounds[c];
+      if bound.0.is_none() {
+        bound.0 = Some(size);
+      }
+      bound.1 = Some(size);
+    }
+    let represented: BTreeSet<_> = (8..=3007).map(crate::core::class::class_of).collect();
+    assert_eq!(represented, (0..=max_class).collect());
+
+    // Keep one request from every size class in the native request range,
+    // including its endpoints in the first and last classes. Then extend the
+    // smallest class across three bitmap words and add 70 full pages of the
+    // largest small class. Those pages provide more than 64 distinct free
+    // keys and exercise free-buffer evictions without repeating all 3,000
+    // native requests. The class-31 helper is additional topology, not part
+    // of the native request distribution.
+    let mut requests = Vec::new();
+    for (c, bound) in bounds.iter().enumerate() {
+      let (Some(lower), Some(upper)) = *bound else {
+        panic!("represented class {c} has no request bound");
+      };
+      requests.push(if c == max_class { upper } else { lower });
+    }
+    assert_eq!(crate::core::class::class_of(requests[0]), 0);
+    assert_eq!(requests[0], 8);
+    assert!(requests.contains(&3007));
+
+    let class_zero = crate::core::class::class_of(8);
+    let class_zero_count = 129;
+    requests.extend(core::iter::repeat_n(8, class_zero_count - 1));
+    assert_eq!(
+      requests
+        .iter()
+        .filter(|&&size| crate::core::class::class_of(size) == class_zero)
+        .count(),
+      class_zero_count
+    );
+
+    let helper_class = crate::core::class::NUM_CLASSES - 1;
+    let helper_size = crate::core::class::size(helper_class);
+    let helper_pages = 70;
+    let helper_blocks = helper_pages * crate::core::class::capacity(helper_class);
+    assert_eq!(crate::core::class::class_of(helper_size), helper_class);
+    requests.extend(core::iter::repeat_n(helper_size, helper_blocks));
+    assert_eq!(requests.len(), 714);
+
+    let from_a: Vec<_> = requests
+      .iter()
+      .map(|&size| alloc_c(h, &a, size, 8))
+      .collect();
+    let offsets: BTreeSet<_> = from_a.iter().copied().collect();
+    assert_eq!(
+      offsets.len(),
+      from_a.len(),
+      "live allocations must be unique"
+    );
+    assert!(h.usage().small_bytes_out > 0);
+
+    let pages: BTreeSet<_> = from_a.iter().map(|offset| offset / PAGE_SIZE).collect();
+    assert_eq!(pages.len(), represented.len() + helper_pages);
+    assert_eq!(h.segments_in_use(), 2);
+
+    let mut keys = BTreeSet::new();
+    let mut keys_by_set: Vec<BTreeSet<_>> = (0..32).map(|_| BTreeSet::new()).collect();
+    for (&offset, &size) in from_a.iter().zip(&requests) {
+      let c = crate::core::class::class_of(size);
+      let page = offset / PAGE_SIZE;
+      let word = offset % PAGE_SIZE / (64 * crate::core::class::size(c));
+      let key = (page, word, c);
+      keys.insert(key);
+      let set = Heap::<MockOs>::free_set_of(offset, c);
+      keys_by_set[set].insert(key);
+    }
+    let mut expected_classes = represented.clone();
+    expected_classes.insert(helper_class);
+    assert_eq!(
+      keys.iter().map(|key| key.2).collect::<BTreeSet<_>>(),
+      expected_classes
+    );
+    assert!(keys.len() > 64, "{} keys: {keys:?}", keys.len());
+    assert!(
+      keys.len() >= represented.len() + helper_pages + 2,
+      "{keys:?}"
+    );
+    assert!(
+      keys_by_set.iter().any(|set| set.len() >= 3),
+      "the fixture should observe three distinct keys in one set: {keys_by_set:?}"
+    );
+
+    for &o in &from_a {
+      free_c(h, &b, o);
+    }
+    let buffered = h.cache_stats(&b);
+    assert!(buffered.evictions > 0, "{buffered:?}");
+    assert_eq!(
+      buffered.flushed_blocks + buffered.buffered_blocks,
+      from_a.len() as u64
+    );
+    h.flush(&b);
+    let flushed = h.cache_stats(&b);
+    assert_eq!((flushed.buffered_blocks, flushed.buffered_words), (0, 0));
+    Heap::<MockOs>::check_free_buffer(&b);
+    for c in 0..crate::core::class::NUM_CLASSES {
+      assert_eq!(Heap::<MockOs>::pending_slots(&b, c), 0);
+    }
+
+    // Every block freed through `b` is available to `a` again. Use the exact
+    // same request multiset, and ensure no new segment was needed.
+    let before = h.segments_in_use();
+    let again: Vec<_> = requests
+      .iter()
+      .map(|&size| alloc_c(h, &a, size, 8))
+      .collect();
+    assert_eq!(h.segments_in_use(), before);
+    assert_eq!(
+      again.iter().copied().collect::<BTreeSet<_>>().len(),
+      again.len()
+    );
+    for o in again {
+      free_c(h, &a, o);
+    }
+    h.retire(&a);
+    h.retire(&b);
+    let (a_stats, b_stats) = (h.cache_stats(&a), h.cache_stats(&b));
+    assert_eq!((a_stats.claimed_blocks, a_stats.buffered_blocks), (0, 0));
+    assert_eq!((b_stats.claimed_blocks, b_stats.buffered_blocks), (0, 0));
+    Heap::<MockOs>::check_free_buffer(&a);
+    Heap::<MockOs>::check_free_buffer(&b);
+    for c in 0..crate::core::class::NUM_CLASSES {
+      assert_eq!(Heap::<MockOs>::pending_slots(&a, c), 0);
+      assert_eq!(Heap::<MockOs>::pending_slots(&b, c), 0);
+    }
+    assert_eq!(h.usage().small_bytes_out, 0);
+    h.check_indexes();
+  } else {
+    let from_a: Vec<_> = (0..3000).map(|i| alloc_c(h, &a, 8 + i % 3000, 8)).collect();
+    for &o in &from_a {
+      free_c(h, &b, o);
+    }
+    h.flush(&b);
+    // Every block freed through `b` is available to `a` again.
+    let before = h.segments_in_use();
+    let again: Vec<_> = (0..3000).map(|i| alloc_c(h, &a, 8 + i % 3000, 8)).collect();
+    assert_eq!(h.segments_in_use(), before);
+    for o in again {
+      free_c(h, &a, o);
+    }
+    h.retire(&a);
+    h.retire(&b);
   }
-  h.flush(&b);
-  // Every block freed through `b` is available to `a` again.
-  let before = h.segments_in_use();
-  let again: Vec<_> = (0..3000).map(|i| alloc_c(h, &a, 8 + i % 3000, 8)).collect();
-  assert_eq!(h.segments_in_use(), before);
-  for o in again {
-    free_c(h, &a, o);
-  }
-  h.retire(&a);
-  h.retire(&b);
 }
 
 #[test]
@@ -846,22 +1081,38 @@ fn decay_with_an_age_kernel_purges_the_same_pages() {
   kernel.os().age_kernel.store(true, Ordering::Relaxed);
   let mut held: [Vec<usize>; 2] = [Vec::new(), Vec::new()];
   let mut x = 0x9E37_79B9_7F4A_7C15u64;
-  for step in 0..3000 {
+  // The deterministic Miri prefix exercises all 24 page-count/shard pairs,
+  // every branch, and repeated purge epochs while preserving every-step
+  // comparison. Native runs retain the full 3000-step stress walk.
+  let steps = if cfg!(miri) { 192 } else { 3000 };
+  let mut allocations = [[false; 4]; 6];
+  let mut branches = [false; 8];
+  let mut decay_steps = 0;
+  let mut frees = 0;
+  for step in 0..steps {
     x ^= x << 13;
     x ^= x >> 7;
     x ^= x << 17;
-    for (h, held) in [plain, kernel].into_iter().zip(held.iter_mut()) {
+    branches[(x % 8) as usize] = true;
+    for (side, (h, held)) in [plain, kernel].into_iter().zip(held.iter_mut()).enumerate() {
       match x % 8 {
         0..=3 => {
           let pages = 1 + (x >> 8) as usize % 6;
           let shard = (x >> 16) as usize % 4;
+          allocations[pages - 1][shard] = true;
           held.push(alloc(h, shard, pages * PAGE_SIZE, 8));
         }
         4..=6 if !held.is_empty() => {
           let o = held.swap_remove((x >> 24) as usize % held.len());
           free(h, o);
+          if side == 0 {
+            frees += 1;
+          }
         }
         _ => {
+          if side == 0 {
+            decay_steps += 1;
+          }
           h.os().advance(h.decay_interval_ms());
           h.decay();
         }
@@ -876,6 +1127,10 @@ fn decay_with_an_age_kernel_purges_the_same_pages() {
     );
     assert_eq!(plain.segments_in_use(), kernel.segments_in_use());
   }
+  assert!(allocations.iter().flatten().all(|&seen| seen));
+  assert!(branches.into_iter().all(|seen| seen));
+  assert!(frees >= 60);
+  assert!(decay_steps >= 30);
   assert!(kernel.os().purged.load(Ordering::Relaxed) > 0);
   assert_eq!(kernel.dirty_pages(), kernel.dirty_pages_recounted());
 }
@@ -1343,8 +1598,428 @@ proptest::proptest! {
   /// The fuzz target's interpreter (see `fuzz/`), on random programs.
   #[test]
   fn fuzz_programs(data in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..3000)) {
-    crate::core::model::run(&data);
+    #[cfg(miri)]
+    {
+      crate::core::model::run(&bounded_miri_program(&data));
+    }
+    #[cfg(not(miri))]
+    {
+      crate::core::model::run(&data);
+    }
   }
+}
+
+#[cfg(miri)]
+fn bounded_miri_program(seed_bytes: &[u8]) -> Vec<u8> {
+  struct Program {
+    bytes: Vec<u8>,
+    live: Vec<(usize, u8)>,
+    page_credit: usize,
+    instructions: usize,
+    maintenance_attached: bool,
+  }
+
+  impl Program {
+    fn instruction(&mut self, op: u8) {
+      assert!(self.instructions < 96, "program exceeded instruction bound");
+      self.instructions += 1;
+      self.bytes.push(op);
+    }
+
+    fn alloc(&mut self, route: u8, size: usize, align_shift: u8) {
+      let (kind, value) = if size <= 256 {
+        (0u8, size)
+      } else if size <= 8192 {
+        (1, size)
+      } else if size <= 65_520 && size.is_multiple_of(16) {
+        (2, size / 16)
+      } else {
+        assert!(size.is_multiple_of(1024), "unsupported encoded size {size}");
+        (3, size / 1024)
+      };
+      assert!(value <= 0x3fff, "size encoding overflow: {size}");
+      let hi = (kind << 6) | ((value >> 8) as u8 & 0x3f);
+      let lo = value as u8;
+      let align_shift = align_shift.min(16);
+      let decoded = match kind {
+        0 => value % 257,
+        1 => value % 8193,
+        2 => value * 16,
+        _ => value * 1024,
+      };
+      assert_eq!(decoded, size);
+      self.page_credit += size
+        .max(1)
+        .saturating_add((1usize << align_shift) - 1)
+        .div_ceil(PAGE_SIZE);
+      assert!(self.page_credit <= 256, "page-credit bound exceeded");
+      self.instruction((route << 5) | 0);
+      self.bytes.extend([hi, lo, align_shift]);
+      self.live.push((route as usize, align_shift));
+    }
+
+    fn free(&mut self, route: u8, index: usize) {
+      assert!(!self.live.is_empty());
+      self.instruction((route << 5) | 12);
+      let index = index % self.live.len();
+      self.bytes.push(index as u8);
+      self.live.swap_remove(index);
+    }
+
+    fn resize(&mut self, route: u8, index: usize, size: usize) {
+      assert!(!self.live.is_empty());
+      let (kind, value) = if size <= 256 {
+        (0u8, size)
+      } else if size <= 8192 {
+        (1, size)
+      } else if size <= 65_520 && size.is_multiple_of(16) {
+        (2, size / 16)
+      } else {
+        assert!(size.is_multiple_of(1024), "unsupported encoded size {size}");
+        (3, size / 1024)
+      };
+      assert!(value <= 0x3fff, "size encoding overflow: {size}");
+      let hi = (kind << 6) | ((value >> 8) as u8 & 0x3f);
+      let lo = value as u8;
+      let decoded = match kind {
+        0 => value % 257,
+        1 => value % 8193,
+        2 => value * 16,
+        _ => value * 1024,
+      };
+      assert_eq!(decoded, size);
+      let align_shift = self.live[index % self.live.len()].1;
+      self.page_credit += size
+        .max(1)
+        .saturating_add((1usize << align_shift) - 1)
+        .div_ceil(PAGE_SIZE);
+      assert!(self.page_credit <= 256, "page-credit bound exceeded");
+      self.instruction((route << 5) | 20);
+      self
+        .bytes
+        .extend([index as u8 % self.live.len() as u8, hi, lo]);
+    }
+
+    fn op(&mut self, route: u8, op: u8) {
+      self.instruction((route << 5) | op);
+    }
+
+    fn configured(&mut self, route: u8, selector: u8) {
+      self.op(route, 26);
+      self.bytes.push(selector);
+      match selector % 4 {
+        0 | 1 => self.bytes.push(selector.wrapping_mul(7)),
+        2 => self.bytes.extend([16, 32, 64]),
+        _ => self.bytes.extend([8, 2]),
+      }
+    }
+  }
+
+  let mut program = Program {
+    bytes: std::vec![seed_bytes.iter().fold(0u8, |a, b| a.rotate_left(1) ^ b)],
+    live: Vec::new(),
+    page_credit: 0,
+    instructions: 0,
+    maintenance_attached: false,
+  };
+
+  // Exercise all four allocator routes, then cross-route free and resize.
+  for (route, size) in [1, 8192, 65_536, 131_072].into_iter().enumerate() {
+    program.alloc(route as u8, size, route as u8);
+  }
+  program.free(1, 0);
+  program.resize(2, 1, 4096);
+  program.op(1, 22); // flush the cross-route free through an attached cache
+  program.op(0, 23); // purge
+  program.op(1, 24); // decay
+  program.op(2, 25);
+  program.bytes.push(7);
+  program.configured(0, 0); // purge delay
+  program.configured(3, 1); // alternate purge-delay mode
+  program.configured(1, 2); // reclaim thresholds
+  program.configured(2, 3); // slicing and retention
+  program.op(2, 27); // retire the detached cache
+  program.op(0, 28); // attach maintenance
+  program.maintenance_attached = true;
+  program.op(1, 30); // request purge
+
+  // A representable >4 MiB request is released before randomized work begins.
+  program.alloc(3, (4 << 20) + 1024, 10);
+  let last = program.live.len() - 1;
+  program.free(0, last);
+  program.alloc(3, 200_704, 8);
+  let dirty_run = program.live.len() - 1;
+  program.free(3, dirty_run);
+  program.op(3, 31); // batched purge with configured failures
+  program.bytes.extend([4, 1]);
+  program.op(2, 29); // maintenance round
+  program.op(0, 28); // detach maintenance
+  program.maintenance_attached = false;
+  let random_start = program.bytes.len();
+
+  let mut random = seed_bytes.iter().fold(0xA341_316Cu32, |state, byte| {
+    state.rotate_left(5) ^ u32::from(*byte).wrapping_add(0x9E37_79B9)
+  });
+  let mut next = || {
+    random ^= random << 13;
+    random ^= random >> 17;
+    random ^= random << 5;
+    random as u8
+  };
+  let random_sizes = [
+    1,
+    16,
+    256,
+    512,
+    4096,
+    8192,
+    8192 + 16,
+    65_520,
+    65_536,
+    131_072,
+  ];
+  for _ in 0..32 {
+    match next() % 8 {
+      0..=2 => {
+        let size = random_sizes[usize::from(next()) % random_sizes.len()];
+        program.alloc(next() % 4, size, next() % 17);
+      }
+      3 if !program.live.is_empty() => {
+        program.free(next() % 4, usize::from(next()));
+      }
+      4 if !program.live.is_empty() => {
+        let size = random_sizes[usize::from(next()) % random_sizes.len()];
+        program.resize(next() % 4, usize::from(next()), size);
+      }
+      5 => program.configured(next() % 4, next()),
+      6 => {
+        let route = next() % 4;
+        program.op(route, 22 + next() % 4);
+        if program.bytes.last().is_some_and(|op| op & 0x1f == 25) {
+          program.bytes.push(next());
+        }
+      }
+      _ => {
+        let route = next() % 4;
+        if program.maintenance_attached {
+          program.op(route, 29 + next() % 3);
+          if program.bytes.last().is_some_and(|op| op & 0x1f == 31) {
+            program.bytes.extend([next(), next()]);
+          }
+        } else {
+          program.op(route, 28);
+          program.maintenance_attached = true;
+        }
+      }
+    }
+  }
+  assert!(program.instructions <= 96);
+  assert!(program.page_credit <= 256);
+  validate_bounded_miri_program(&program.bytes, random_start);
+  program.bytes
+}
+
+#[cfg(miri)]
+fn validate_bounded_miri_program(bytes: &[u8], random_start: usize) {
+  fn take(bytes: &[u8], cursor: &mut usize) -> u8 {
+    let byte = *bytes.get(*cursor).expect("truncated bounded program");
+    *cursor += 1;
+    byte
+  }
+
+  fn decoded_size(hi: u8, lo: u8) -> usize {
+    let value = usize::from(hi & 0x3f) << 8 | usize::from(lo);
+    match hi >> 6 {
+      0 => value % 257,
+      1 => value % 8193,
+      2 => value * 16,
+      _ => value * 1024,
+    }
+  }
+
+  assert!(random_start <= bytes.len());
+  let mut cursor = 1; // model::run consumes the first byte as its seed
+  let mut live: Vec<(u8, bool, usize)> = Vec::new();
+  let mut instructions = 0usize;
+  let mut prefix_instructions = 0usize;
+  let mut suffix_instructions = 0usize;
+  let mut page_credit = 0usize;
+  let mut prefix_routes = [false; 4];
+  let mut cross_route_free = false;
+  let mut saw_resize = false;
+  let mut saw_flush = false;
+  let mut saw_purge = false;
+  let mut saw_decay = false;
+  let mut saw_clock = false;
+  let mut config_kinds = [false; 4];
+  let mut saw_retire = false;
+  let mut attached = false;
+  let mut saw_attach = false;
+  let mut saw_detach = false;
+  let mut saw_request = false;
+  let mut saw_failing_batch = false;
+  let mut saw_large = false;
+  let mut saw_dirty_run_free = false;
+  let mut saw_successful_resize_shape = false;
+
+  while cursor < bytes.len() {
+    let in_prefix = cursor < random_start;
+    let op = take(bytes, &mut cursor);
+    let route = op >> 5;
+    let operation = op & 0x1f;
+    instructions += 1;
+    if in_prefix {
+      prefix_instructions += 1;
+    } else {
+      suffix_instructions += 1;
+    }
+
+    match operation {
+      0..=11 => {
+        let size = decoded_size(take(bytes, &mut cursor), take(bytes, &mut cursor));
+        let align_shift = take(bytes, &mut cursor);
+        assert!(align_shift <= 16, "alignment shift {align_shift}");
+        if !in_prefix {
+          assert!(size <= 2 * PAGE_SIZE, "random allocation too large: {size}");
+        }
+        page_credit += size
+          .max(1)
+          .saturating_add((1usize << align_shift) - 1)
+          .div_ceil(PAGE_SIZE);
+        if in_prefix {
+          prefix_routes[usize::from(route)] = true;
+          if size > 4 << 20 {
+            saw_large = true;
+          }
+          live.push((route, size > 4 << 20, size));
+        } else {
+          live.push((route, false, size));
+        }
+      }
+      12..=19 if !live.is_empty() => {
+        let index = usize::from(take(bytes, &mut cursor)) % live.len();
+        let (allocation_route, was_large, allocation_size) = live.swap_remove(index);
+        if in_prefix && route != allocation_route {
+          cross_route_free = true;
+        }
+        if in_prefix && allocation_size > PAGE_SIZE && allocation_size <= 4 << 20 {
+          saw_dirty_run_free = true;
+        }
+        if was_large {
+          assert!(in_prefix, "large request crossed into randomized suffix");
+        }
+      }
+      20 | 21 if !live.is_empty() => {
+        let index = usize::from(take(bytes, &mut cursor)) % live.len();
+        let size = decoded_size(take(bytes, &mut cursor), take(bytes, &mut cursor));
+        if !in_prefix {
+          assert!(size <= 2 * PAGE_SIZE, "random resize too large: {size}");
+        }
+        if in_prefix && live[index].2 == 8192 && size == 4096 {
+          saw_successful_resize_shape = true;
+        }
+        page_credit += size
+          .max(1)
+          .saturating_add((1usize << 16) - 1)
+          .div_ceil(PAGE_SIZE);
+        let _ = index;
+        saw_resize |= in_prefix;
+      }
+      22 => saw_flush |= in_prefix,
+      23 => saw_purge |= in_prefix,
+      24 => saw_decay |= in_prefix,
+      25 => {
+        let _ = take(bytes, &mut cursor);
+        saw_clock |= in_prefix;
+      }
+      26 => {
+        let selector = take(bytes, &mut cursor);
+        let kind = usize::from(selector % 4);
+        config_kinds[kind] |= in_prefix;
+        let operand_count = match kind {
+          0 | 1 => 1,
+          2 => 3,
+          _ => 2,
+        };
+        for _ in 0..operand_count {
+          let _ = take(bytes, &mut cursor);
+        }
+      }
+      27 => saw_retire |= in_prefix,
+      28 => {
+        attached = !attached;
+        if in_prefix {
+          if attached {
+            saw_attach = true;
+          } else {
+            saw_detach = true;
+          }
+        }
+      }
+      30 => saw_request |= in_prefix,
+      31 => {
+        let batch_size = take(bytes, &mut cursor);
+        let fail_every = take(bytes, &mut cursor);
+        saw_failing_batch |= in_prefix && batch_size == 4 && fail_every % 4 == 1;
+      }
+      _ => {}
+    }
+    if in_prefix {
+      assert!(
+        cursor <= random_start,
+        "prefix operand crossed suffix boundary"
+      );
+      if cursor == random_start {
+        assert!(saw_large && live.iter().all(|(_, large, _)| !large));
+      }
+    }
+    assert!(page_credit <= 256, "decoded page-credit bound exceeded");
+    assert!(instructions <= 96, "decoded instruction bound exceeded");
+  }
+
+  assert_eq!(cursor, bytes.len());
+  assert!(prefix_routes.into_iter().all(|seen| seen));
+  assert!(
+    cross_route_free && saw_resize && saw_successful_resize_shape,
+    "cross-route free={cross_route_free}, resize={saw_resize}, successful resize shape={saw_successful_resize_shape}"
+  );
+  assert!(saw_flush && saw_purge && saw_decay && saw_clock);
+  assert!(config_kinds.into_iter().all(|seen| seen));
+  assert!(saw_retire && saw_attach && saw_detach && saw_request && saw_failing_batch);
+  assert!(saw_large && saw_dirty_run_free && live.iter().all(|(_, large, _)| !large));
+  assert!(prefix_instructions <= 64);
+  assert!(suffix_instructions <= 32);
+}
+
+#[cfg(miri)]
+#[test]
+fn bounded_program_resize_witness_succeeds() {
+  let h = heap();
+  let offset = alloc(h, 1, 8192, 8);
+  assert!(resize(h, offset, 4096));
+  free(h, offset);
+}
+
+#[cfg(miri)]
+#[test]
+fn bounded_program_batch_witness_fails_a_dirty_run() {
+  let h = heap();
+  h.attach_maintenance();
+  h.request_purge();
+  let offset = alloc(h, 0, 200_704, 8);
+  free(h, offset);
+  let dirty_before = h.dirty_pages();
+  assert!(dirty_before > 0);
+
+  let mut purger = MockPurger::new(h.os(), 4);
+  purger.fail_every = 1;
+  let _ = h.maintain_with(&mut purger);
+  assert!(purger.batches > 0);
+  assert!(purger.runs > 0);
+  assert_eq!(h.dirty_pages(), dirty_before);
+
+  h.detach_maintenance();
+  h.purge();
 }
 
 #[test]
@@ -1746,24 +2421,50 @@ fn small_classes_claim_across_bitmap_word_boundaries() {
   assert_eq!(h.usage().small_bytes_out, 0);
 }
 
-/// Words of the 16-byte class (64 blocks each, allocated through `tc`) of
-/// which `k` share a set of the free buffer: `k` distinct words, in the
-/// order they were claimed.
+/// Allocated bitmap words of which `k` share a free-buffer set: `k` distinct
+/// words, in the order they were claimed. Under Miri, use full pages of the
+/// largest small class so the same 70-word pigeonhole topology needs 560
+/// allocations instead of 4,480; the separate 129-block fixture covers the
+/// small-class word boundaries.
 fn words_in_one_set(h: &Heap<MockOs>, tc: &ThreadCache, k: usize) -> (Vec<usize>, Vec<Vec<usize>>) {
-  let c = crate::core::class::class_of(16);
-  // 70 words in 32 sets: some set gets at least three.
-  let offs: Vec<_> = (0..64 * 70).map(|_| alloc_c(h, tc, 16, 8)).collect();
+  let c = if cfg!(miri) {
+    crate::core::class::NUM_CLASSES - 1
+  } else {
+    crate::core::class::class_of(16)
+  };
+  let size = crate::core::class::size(c);
+  let blocks_per_word = crate::core::class::capacity(c).min(64);
+  // Seventy words in 32 sets: some set gets at least three.
+  let offs: Vec<_> = (0..blocks_per_word * 70)
+    .map(|_| alloc_c(h, tc, size, 8))
+    .collect();
+  let pages: BTreeSet<_> = offs.iter().map(|offset| offset / PAGE_SIZE).collect();
+  if cfg!(miri) {
+    assert_eq!(size, 8192);
+    assert_eq!(pages.len(), 70);
+    assert_eq!(blocks_per_word, crate::core::class::capacity(c));
+  }
   let mut by_set: std::collections::BTreeMap<usize, Vec<Vec<usize>>> = Default::default();
-  for w in offs.chunks(64) {
+  let mut distinct_words = BTreeSet::new();
+  for w in offs.chunks(blocks_per_word) {
+    assert_eq!(w.len(), blocks_per_word);
+    let page = w[0] / PAGE_SIZE;
+    let word = w[0] % PAGE_SIZE / (64 * size);
+    assert!(
+      w.iter()
+        .all(|offset| { offset / PAGE_SIZE == page && offset % PAGE_SIZE / (64 * size) == word })
+    );
+    assert!(distinct_words.insert((page, word)));
     by_set
       .entry(Heap::<MockOs>::free_set_of(w[0], c))
       .or_default()
       .push(w.to_vec());
   }
+  assert_eq!(distinct_words.len(), 70);
   let words = by_set
     .into_values()
     .find(|v| v.len() >= k)
-    .expect("70 words in 32 sets of two")
+    .expect("70 distinct words in 32 sets of two")
     .into_iter()
     .take(k)
     .collect();
@@ -2455,21 +3156,31 @@ fn interleaved_frees_of_one_set_batch_without_evictions() {
   let tc = cache(h);
   let (offs, w) = words_in_one_set(h, &tc, 2);
   let (a, b) = (&w[0], &w[1]);
-  // Every block of two words of one set, alternately: 128 frees. A
-  // direct-mapped buffer would flush on every free after the first (127
-  // one-block updates); two ways keep both words.
-  for i in 0..64 {
+  assert_eq!(a.len(), b.len());
+  let blocks_per_word = a.len();
+  // Every block of two words of one set, alternately. A direct-mapped buffer
+  // would flush on every free after the first; two ways keep both words.
+  for i in 0..blocks_per_word {
     free_c(h, &tc, a[i]);
     free_c(h, &tc, b[i]);
   }
   let s = h.cache_stats(&tc);
   assert_eq!((s.evictions, s.flushes), (0, 0));
-  assert_eq!((s.buffered_blocks, s.buffered_words), (128, 2));
+  assert_eq!(
+    (s.buffered_blocks, s.buffered_words),
+    (2 * blocks_per_word as u64, 2)
+  );
   h.flush(&tc);
   let s = h.cache_stats(&tc);
-  // Two shared updates of 64 blocks each.
-  assert_eq!((s.flushes, s.flushed_blocks), (2, 128));
-  assert_eq!(s.flush_sizes, [0, 0, 0, 0, 0, 0, 2]);
+  // Two shared updates, one for each complete bitmap word.
+  assert_eq!(
+    (s.flushes, s.flushed_blocks),
+    (2, 2 * blocks_per_word as u64)
+  );
+  let bucket = (usize::BITS - 1 - blocks_per_word.leading_zeros()) as usize;
+  let mut expected_flush_sizes = [0; 7];
+  expected_flush_sizes[bucket] = 2;
+  assert_eq!(s.flush_sizes, expected_flush_sizes);
   let freed: Vec<usize> = a.iter().chain(b).copied().collect();
   free_rest(h, &tc, &offs, &freed);
 }
@@ -3120,28 +3831,64 @@ fn concurrent_frees_and_trims_lose_no_candidate() {
   h.set_reconcile_epochs(0);
   h.set_purge_delay_ms(0);
   let done = AtomicBool::new(false);
+  let active_batches = AtomicUsize::new(0);
+  let trimmer_passes = AtomicUsize::new(0);
+  let overlapping_passes = AtomicUsize::new(0);
+  let workers_count = 4;
+  let start = std::sync::Barrier::new(workers_count + 1);
+  let rounds = if cfg!(miri) { 4 } else { 40 };
+  let blocks_per_batch = if cfg!(miri) { 129 } else { 300 };
   std::thread::scope(|s| {
     // Stops the trimmer even when a worker panics (the join below then
     // panics too), so a failure does not hang the scope.
     let _done = SetOnDrop(&done);
     // The trimmer: decay sweeps (all trimming, delay 0) until the workers
     // are done.
-    s.spawn(|| {
-      while !done.load(Ordering::Relaxed) {
+    let start = &start;
+    let done_ref = &done;
+    let active_batches = &active_batches;
+    let trimmer_passes = &trimmer_passes;
+    let overlapping_passes = &overlapping_passes;
+    s.spawn(move || {
+      start.wait();
+      while !done_ref.load(Ordering::Relaxed) {
         h.decay();
+        if active_batches.load(Ordering::SeqCst) != 0 {
+          overlapping_passes.fetch_add(1, Ordering::SeqCst);
+        }
+        trimmer_passes.fetch_add(1, Ordering::SeqCst);
       }
     });
-    let workers: Vec<_> = (0..4usize)
+    let workers: Vec<_> = (0..workers_count)
       .map(|t| {
         s.spawn(move || {
+          start.wait();
           let tc = cache(h);
-          for round in 0..40 {
+          for round in 0..rounds {
             let size = [16, 48, 1000, 4000][(t + round) % 4];
-            let offs: Vec<_> = (0..300).map(|_| alloc_c(h, &tc, size, 8)).collect();
-            for o in offs {
-              free_c(h, &tc, o);
+            let offs: Vec<_> = (0..blocks_per_batch)
+              .map(|_| alloc_c(h, &tc, size, 8))
+              .collect();
+            let observe_overlap = cfg!(miri) && round == 0;
+            let overlap_before = overlapping_passes.load(Ordering::SeqCst);
+            if observe_overlap {
+              active_batches.fetch_add(1, Ordering::SeqCst);
             }
-            if round % 3 == 0 {
+            for (i, o) in offs.into_iter().enumerate() {
+              free_c(h, &tc, o);
+              if observe_overlap && i == 0 {
+                while overlapping_passes.load(Ordering::SeqCst) == overlap_before {
+                  std::thread::yield_now();
+                }
+                active_batches.fetch_sub(1, Ordering::SeqCst);
+              }
+            }
+            let flush = if cfg!(miri) {
+              round == 0 || round == 3
+            } else {
+              round % 3 == 0
+            };
+            if flush {
               h.flush(&tc);
             }
           }
@@ -3153,6 +3900,13 @@ fn concurrent_frees_and_trims_lose_no_candidate() {
       w.join().unwrap();
     }
   });
+  if cfg!(miri) {
+    assert!(trimmer_passes.load(Ordering::SeqCst) > 0);
+    assert!(
+      overlapping_passes.load(Ordering::SeqCst) > 0,
+      "the trimmer must make an observed pass while a worker batch is live"
+    );
+  }
   h.check_indexes();
   // Without reconciling, the candidates alone find every fully free page
   // but the newest of each shard and class, which trimming keeps.

@@ -61,9 +61,17 @@ uses the CI-pinned nightly and runs each test in its own process with a
 30-minute ceiling. It records the test outcome, process exit (including Miri
 teardown checks) and log-writer exit, and accepts only the existing intentional
 contention-benchmark skip. Keep raw evidence in the private resources checkout.
-The two large page-topology fixtures preserve native stress counts and use
-bounded, topology-equivalent sizes under Miri; a separate test covers small
-classes across bitmap-word boundaries. A timeout or cancellation is not a pass.
+Large pressure and page-topology fixtures preserve native stress counts and
+use bounded, topology-equivalent sizes under Miri; separate tests cover small
+classes across bitmap-word boundaries. Size round trips still visit every
+representative size under Miri, with three simultaneous allocations per size.
+The Miri model workload uses at most 96 semantic instructions and a bounded
+cumulative allocation-page allowance, checked by an independent decoder. Its
+deterministic prefix covers route changes, cross-cache frees, resize, maintenance and failed
+batches; two Miri-only tests witness successful resize and a failed dirty-run
+batch. Native arbitrary-byte model generation keeps its original stress
+counts. Derive the full test manifest from the selected configuration because
+Miri-only witnesses add tests. A timeout or cancellation is not a pass.
 To re-audit a captured campaign without rerunning Miri, use its recorded
 manifest and exact Cargo test list:
 
