@@ -146,6 +146,37 @@ poll; completing that direction, including with an empty buffer, removes it.
 and shutdown do not remove a pending read/write waiter. Named async methods
 keep their immediate waiter cancellation on future drop.
 
+## Message channels
+
+`runtime::channel::channel` constructs a bounded multi-sender, single-receiver
+channel with separate message and sender-waiter limits. Private permits reserve
+slots through enqueue until receive. Slot admission is FIFO; concurrently
+granted sends may enqueue in a different scheduling order. `try_send` rejects
+immediately, and named `send` futures wait within the waiter bound. Rejections
+return the original value. An unsubmitted send retains its value across polls;
+`into_inner` recovers it, while cancellation drops it outside queue locks.
+
+Receiver close rejects further sends and allows queued messages to drain.
+Receiver destruction closes admission and drops messages individually outside
+locks, containing destructor panics. Receive futures remove their stored waker
+on cancellation. EOF follows the last sender and unfinished owned send future;
+a completed retained send future does not delay EOF. Managed-buffer charges
+survive pending sends, queued messages and returned results until final release.
+Queue metadata and arbitrary message allocations are outside that ledger.
+
+`runtime::oneshot::channel` transfers one value through a consuming synchronous
+sender and an awaitable receiver. Send rejection returns the value unchanged.
+Receiver close retains an already-sent value; receiver destruction discards it
+outside the state lock. Dropping an unused sender wakes the receiver with
+closure. `Sender::closed` uses a mutable borrow to bound closure notification to
+one waiter, and dropping that future removes its waker.
+
+Native tests cover message uniqueness, FIFO admission, cancellation, close/drain,
+EOF, reentrant and panicking callbacks, retained charges and Send/Sync bounds.
+Actual-source Loom models cover queue close versus enqueue, single-message send
+versus receiver registration, and send versus receiver destruction. They do not
+model every channel/executor combination or arbitrary user callback behavior.
+
 ## Bounded fair semaphore
 
 `runtime::semaphore::Semaphore` has an explicit preallocated waiter bound.

@@ -75,16 +75,18 @@ pub mod asynchronous;
 mod blocking;
 pub mod buffered_io;
 mod cache;
+pub mod channel;
 mod error;
 pub mod fs;
 pub mod io;
 mod job;
 pub mod managed;
-pub mod mutex;
 #[cfg(all(test, loom))]
 mod model;
+pub mod mutex;
 #[cfg(not(loom))]
 pub mod net;
+pub mod oneshot;
 #[cfg(not(loom))]
 pub mod reactor;
 mod resources;
