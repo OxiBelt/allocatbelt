@@ -56,6 +56,15 @@ MIRIFLAGS=-Zmiri-disable-isolation cargo +nightly miri test -p allocatbelt-core-
 scripts/run-mutation-testing.sh
 ```
 
+For a complete bounded core campaign, `scripts/check-miri.sh --output DIR`
+uses the CI-pinned nightly and runs each test in its own process with a
+30-minute ceiling. It records the test outcome, process exit (including Miri
+teardown checks) and log-writer exit, and accepts only the existing intentional
+contention-benchmark skip. Keep raw evidence in the private resources checkout.
+The two large page-topology fixtures preserve native stress counts and use
+bounded, topology-equivalent sizes under Miri; a separate test covers small
+classes across bitmap-word boundaries. A timeout or cancellation is not a pass.
+
 The mutation campaign is configured in `mewt.toml` and must catch every
 mutant with no skips or timeouts. Add a test rather than narrowing the
 targets when a mutant survives. Only a mutant that provably cannot change

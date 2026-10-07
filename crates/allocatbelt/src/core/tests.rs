@@ -506,9 +506,12 @@ fn freed_small_pages_leave_their_segments() {
   let h = heap();
   let base = h.segments_in_use();
   // Enough 16-byte blocks for three segments (all pages but the guard
-  // pages), then free them all.
-  let n = 3 * MAX_RUN_PAGES * PAGE_SIZE / 16;
-  let offs: Vec<_> = (0..n).map(|_| h.alloc(6, 16, 8).unwrap()).collect();
+  // pages), then free them all. Under Miri the same three-segment topology
+  // uses the largest small class, avoiding hundreds of thousands of tiny
+  // modeled allocations while preserving every page and trim transition.
+  let size = if cfg!(miri) { 8192 } else { 16 };
+  let n = 3 * MAX_RUN_PAGES * PAGE_SIZE / size;
+  let offs: Vec<_> = (0..n).map(|_| h.alloc(6, size, 8).unwrap()).collect();
   assert_eq!(h.segments_in_use(), base + 3);
   // Keep the last block so its page stays behind. It is on the class's
   // newest page, which trimming keeps anyway.
@@ -522,8 +525,15 @@ fn freed_small_pages_leave_their_segments() {
   h.purge();
   assert_eq!(h.segments_in_use(), base + 2);
   // The survivor is intact and the class keeps working.
-  assert_eq!(h.usable_size(last), 16);
-  let again: Vec<_> = (0..1000).map(|_| h.alloc(6, 16, 8).unwrap()).collect();
+  assert_eq!(h.usable_size(last), size);
+  // The reuse phase checks that the retained class still allocates. Miri
+  // uses two pages rather than adding another thousand large-class calls;
+  // the native stress count remains unchanged. Multiword small-class claims
+  // are checked separately below.
+  let reuse_count = if cfg!(miri) { 16 } else { 1000 };
+  let again: Vec<_> = (0..reuse_count)
+    .map(|_| h.alloc(6, size, 8).unwrap())
+    .collect();
   for o in again.into_iter().chain([last]) {
     h.dealloc(o);
   }
@@ -649,9 +659,12 @@ fn a_seeded_cache_hands_out_each_claimed_block_once() {
 #[test]
 fn refill_finds_freed_page_without_scanning() {
   let h = heap();
-  // Fill many pages of one class, then free one block in an early page.
-  let per_page = PAGE_SIZE / 32;
-  let offs: Vec<_> = (0..per_page * 40).map(|_| alloc(h, 7, 32, 8)).collect();
+  // Fill 40 pages of one class, then free one block in an early page. Under
+  // Miri, use the largest small class so the same page-search topology takes
+  // 320 allocations instead of tens of thousands.
+  let size = if cfg!(miri) { 8192 } else { 32 };
+  let per_page = PAGE_SIZE / size;
+  let offs: Vec<_> = (0..per_page * 40).map(|_| alloc(h, 7, size, 8)).collect();
   let segs = h.segments_in_use();
   // The free lowers the class's search bound to that page (under the
   // owner's lock).
@@ -660,7 +673,7 @@ fn refill_finds_freed_page_without_scanning() {
   // The next allocation of the class takes the freed block from that page,
   // the lowest with a free block, rather than a new page.
   let before = h.search_stats();
-  let again = alloc(h, 7, 32, 8);
+  let again = alloc(h, 7, size, 8);
   let after = h.search_stats();
   assert_eq!(again, offs[5]);
   assert_eq!(h.segments_in_use(), segs);
@@ -1701,6 +1714,36 @@ fn a_full_word_is_flushed_in_one_update() {
   assert_eq!((s.buffered_blocks, s.flushes, s.flushed_blocks), (0, 1, 64));
   assert_eq!(s.flush_sizes, [0, 0, 0, 0, 0, 0, 1]);
   assert_eq!((s.evictions, s.refill_flushes), (0, 0));
+}
+
+#[test]
+fn small_classes_claim_across_bitmap_word_boundaries() {
+  let h = heap();
+  for size in [16, 32] {
+    let tc = cache(h);
+    // 129 blocks cross both 64-bit bitmap-word boundaries while remaining
+    // small enough to stay within one page for either class.
+    let offs: Vec<_> = (0..129).map(|_| alloc_c(h, &tc, size, 8)).collect();
+    assert_eq!(
+      offs.iter().copied().collect::<BTreeSet<_>>().len(),
+      offs.len()
+    );
+    let pages: BTreeSet<_> = offs.iter().map(|o| o / PAGE_SIZE).collect();
+    let mut words = std::collections::BTreeMap::<usize, usize>::new();
+    for o in &offs {
+      *words.entry(o % PAGE_SIZE / (64 * size)).or_default() += 1;
+    }
+    let mut word_counts: Vec<_> = words.values().copied().collect();
+    word_counts.sort_unstable();
+    assert_eq!(pages.len(), 1);
+    assert_eq!(word_counts, [1, 64, 64]);
+    for o in offs {
+      free_c(h, &tc, o);
+    }
+    h.retire(&tc);
+    h.check_indexes();
+  }
+  assert_eq!(h.usage().small_bytes_out, 0);
 }
 
 /// Words of the 16-byte class (64 blocks each, allocated through `tc`) of
