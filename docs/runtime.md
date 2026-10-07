@@ -454,10 +454,22 @@ waiter; a later wait still observes the cached terminal result.
 The latter reads cached status rather than probing the kernel and may lag
 exit by the fallback polling interval. `id` retains the original numeric PID
 after reaping for diagnostics; the OS may reuse it. Handle kill methods use
-the driver's guarded ownership checks. The current pipe accessors transfer
-ordinary synchronous standard handles; callers must drain piped output to
-avoid blocking the child. Async pipes and bounded output collection are
-subsequent ports.
+the driver's guarded ownership checks. Pipe accessors transfer standard
+handles. `runtime::process::pipe` converts them into `AsyncChildStdin`,
+`AsyncChildStdout` and `AsyncChildStderr` through a supplied bounded reactor.
+Callers must drain piped stdout and stderr concurrently to avoid blocking the
+child. Bounded output collection is a subsequent port.
+
+Pipe endpoints use initialized scalar and vectored I/O without allocating
+userspace byte buffers. Each poll limits interrupted/readiness retries to
+64 calls and retains one direction waiter when pending. Terminal or empty
+read/write endpoint polls, explicit `cancel_io_waits`, endpoint drop and
+stdin shutdown release the waiter. Flush has no buffered work and does not
+cancel an earlier write waiter. Shutdown closes stdin to deliver EOF; it does
+not stop or reap the child. Registration rejection returns the original
+standard handle and reports both the primary error and any failure to restore
+its original status flags. Five native tests cover simultaneous large output
+drains, vector progress/EOF, stdin shutdown, waiter reuse and input recovery.
 
 The driver requires exclusive child wait ownership. Foreign `waitpid`, a
 chained `SIGCHLD` handler that reaps children, and `SIG_IGN` or `SA_NOCLDWAIT`

@@ -18,8 +18,9 @@
 //! its table slot can be reused even while its handle remains alive: each
 //! handle owns an `Arc` completion record containing its stable status. A
 //! child that inherits a piped output stream can still block if the caller
-//! does not take and drain that stream. This first port exposes the standard
-//! child pipe handles; it does not collect output or provide async pipe I/O.
+//! does not take and drain that stream. Pipe accessors transfer the standard
+//! child handles; [`pipe`] registers them with an explicit reactor for async
+//! I/O. Bounded output collection is a subsequent port.
 //! The driver requires exclusive wait ownership: unrelated `waitpid` calls,
 //! a chained `SIGCHLD` handler that reaps children, and `SIGCHLD` auto-reaping
 //! (`SIG_IGN` or `SA_NOCLDWAIT`) are outside its contract. Observed `ECHILD`
@@ -48,6 +49,7 @@ use rustix::process::{Pid, PidfdFlags, Signal, pidfd_open, pidfd_send_signal};
 use super::reactor::{AsyncFd, OwnedReadiness, Reactor, ReactorConfig};
 use super::task::drop_contained;
 mod completion;
+pub mod pipe;
 pub use completion::WaitError;
 use completion::{Completion, Registration, wake_contained};
 
