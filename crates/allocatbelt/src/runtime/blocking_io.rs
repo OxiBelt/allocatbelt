@@ -7,7 +7,7 @@
 //! queue. The caller declares the [`Resources`] reserved by each submitted
 //! operation; those declarations are runtime accounting, not measurements or
 //! enforcement. The staging buffer is charged independently by its
-//! [`ResourceScope`].
+//! [`ResourceScope`](crate::runtime::managed::ResourceScope).
 //!
 //! A dropped borrowing I/O future does not cancel an admitted blocking job or
 //! discard its progress. The adapter keeps the job and its read-ahead or
