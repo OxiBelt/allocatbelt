@@ -73,6 +73,27 @@ free order. Under Miri it exhausts 24 one-word pages of each of the 4096-,
 6144- and 8192-byte classes (816 live blocks), then frees one block per page
 in a fixed class-interleaved prefix that must evict another class's word. The
 remaining blocks follow the same seeded shuffle through final reclamation.
+The lowest-page search test keeps its native 1000- and 48-byte requests (64
+and 1,365 blocks per page, 1,432 allocations). Under Miri it uses 8192- and
+4096-byte requests (8 and 16 blocks per page, one bitmap word each, 27
+allocations) for the same four-page topology: a full primary page 0, a
+secondary page 1 and the primary class's newest page 2 below an untouched free
+page 3. Both configurations check that purging releases page 0 and keeps page
+2, that the secondary class takes free page 0 below its partly used page 1,
+and that, once page 0 is full, it claims from page 1 without setting up page 3.
+The concurrent frees/trim fixture keeps its native 4-worker × 40-round ×
+300-block stress. Under Miri it uses 4 workers × 4 rounds × 129 blocks and a
+request/acknowledgement ticket for each worker’s first-round overlapping
+sweep. Each of four actual decay sweeps acknowledges exactly one live batch
+before that worker continues. This bounds the number of concurrent sweeps,
+not a sweep’s own duration. Both configurations retain class rotation, their
+flush schedule, cache retirement and final candidate/index/live-block checks.
+The lost-candidate reconciliation fixture keeps its 65 allocations, frees,
+reconciliation epoch and force-purge assertions in both builds. Native tests
+retain the helper's full segment scan; under Miri, the test proves that those
+blocks occupy two pages in its only owned segment and clears that segment's
+empty-candidate metadata directly, preserving the same owned-segment
+corruption without scanning every possible segment.
 The Miri model workload uses at most 96 semantic instructions and a bounded
 cumulative allocation-page allowance, checked by an independent decoder. Its
 deterministic prefix covers route changes, cross-cache frees, resize, maintenance and failed

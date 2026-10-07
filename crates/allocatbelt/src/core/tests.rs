@@ -3,13 +3,14 @@
 //! promises against shadow maps.
 
 use std::boxed::Box;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::vec::Vec;
 
 use crate::core::heap::DIRTY_BUDGET_PAGES;
 use crate::core::heap::MAX_RUN_PAGES;
+use crate::core::heap::Os;
 use crate::core::model::{
   MockOs, MockPurger, alloc, alloc_block, alloc_c, cache, free, free_c, resize,
 };
@@ -302,6 +303,15 @@ struct SetOnDrop<'a>(&'a AtomicBool);
 impl Drop for SetOnDrop<'_> {
   fn drop(&mut self) {
     self.0.store(true, Ordering::Relaxed);
+  }
+}
+
+/// Decrements a live worker-batch count without panicking during unwind.
+struct ActiveCountOnDrop<'a>(&'a AtomicUsize);
+
+impl Drop for ActiveCountOnDrop<'_> {
+  fn drop(&mut self) {
+    self.0.fetch_sub(1, Ordering::SeqCst);
   }
 }
 
@@ -3705,24 +3715,61 @@ fn trimming_leaves_a_page_it_does_not_release_first_in_line() {
 #[test]
 fn the_lowest_page_is_taken_whether_free_or_partly_used() {
   let h = heap();
-  // Pages 0 and 2 of the segment for the 1000-byte class, page 1 for the
-  // 48-byte class.
-  let a: Vec<_> = (0..cap_1000()).map(|_| alloc(h, 0, 1000, 8)).collect();
-  let b = alloc(h, 0, 48, 8);
-  let a2 = alloc(h, 0, 1000, 8);
+  // Pages 0 and 2 of the segment for the primary class, page 1 for the
+  // secondary class; page 3 stays an untouched free page above them. Native
+  // keeps the 1000-byte (64 per page) and 48-byte (1,365 per page) classes.
+  // Miri keeps the same four-page topology and event order with the
+  // 8192-byte (8 per page) and 4096-byte (16 per page) classes: 27
+  // allocation calls instead of 1,432. Both Miri classes fit one bitmap
+  // word; only native covers a multiword secondary page.
+  let primary_size = if cfg!(miri) { 8192 } else { 1000 };
+  let secondary_size = if cfg!(miri) { 4096 } else { 48 };
+  assert!(primary_size <= crate::core::class::SMALL_MAX);
+  assert!(secondary_size <= crate::core::class::SMALL_MAX);
+  let primary_class = crate::core::class::class_of(primary_size);
+  let secondary_class = crate::core::class::class_of(secondary_size);
+  assert_ne!(primary_class, secondary_class);
+  let primary_cap = crate::core::class::capacity(primary_class);
+  let cap = crate::core::class::capacity(secondary_class);
+  assert!(primary_cap >= 2 && cap >= 2);
+  if cfg!(miri) {
+    assert_eq!(
+      (
+        crate::core::class::size(primary_class),
+        crate::core::class::size(secondary_class)
+      ),
+      (8192, 4096)
+    );
+    assert_eq!((primary_cap, cap), (8, 16));
+  } else {
+    assert_eq!(primary_cap, cap_1000());
+  }
+  let a: Vec<_> = (0..primary_cap)
+    .map(|_| alloc(h, 0, primary_size, 8))
+    .collect();
   let page = a[0] / PAGE_SIZE;
+  assert!(a.iter().all(|&o| o / PAGE_SIZE == page));
+  assert_eq!(
+    a.iter().copied().collect::<BTreeSet<_>>().len(),
+    primary_cap
+  );
+  let b = alloc(h, 0, secondary_size, 8);
+  let a2 = alloc(h, 0, primary_size, 8);
   assert_eq!((b / PAGE_SIZE, a2 / PAGE_SIZE), (page + 1, page + 2));
   for o in a.into_iter().chain([a2]) {
     free(h, o);
   }
+  let before = h.maintenance_stats();
   h.purge();
+  let (_, released, _, _, kept_newest) = trim_since(before, h.maintenance_stats());
   // Page 0 is released; page 2, the newest page of its class, is kept.
+  assert_eq!((released, kept_newest), (1, 1));
   assert_eq!(h.usage().small_pages, 2);
   h.check_indexes();
   // Page 0 is free again and lies below the partly used page 1: the
-  // 48-byte class takes it.
+  // secondary class takes it.
   let s = h.search_stats();
-  let b2 = alloc(h, 0, 48, 8);
+  let b2 = alloc(h, 0, secondary_size, 8);
   let t = h.search_stats();
   assert_eq!(b2 / PAGE_SIZE, page);
   assert_eq!(
@@ -3732,20 +3779,39 @@ fn the_lowest_page_is_taken_whether_free_or_partly_used() {
     ),
     (1, 1)
   );
+  assert_eq!(h.usage().small_pages, 3);
   // Now page 0 is the class's lowest page with free blocks: taken first.
-  let b3 = alloc(h, 0, 48, 8);
+  let b3 = alloc(h, 0, secondary_size, 8);
   assert_eq!(b3 / PAGE_SIZE, page);
   // A free page above a partly used one waits: page 3 is free, and the
   // class keeps claiming from page 1 once page 0 is full.
-  let cap = crate::core::class::capacity(crate::core::class::class_of(48));
-  let fill: Vec<_> = (0..cap - 2).map(|_| alloc(h, 0, 48, 8)).collect();
+  let fill: Vec<_> = (0..cap - 2)
+    .map(|_| alloc(h, 0, secondary_size, 8))
+    .collect();
   assert!(fill.iter().all(|&o| o / PAGE_SIZE == page));
-  let next = alloc(h, 0, 48, 8);
+  let s = h.search_stats();
+  let next = alloc(h, 0, secondary_size, 8);
+  let t = h.search_stats();
   assert_eq!(next / PAGE_SIZE, b / PAGE_SIZE);
+  assert_eq!(
+    (
+      t.refills - s.refills,
+      t.pages_inspected - s.pages_inspected,
+      t.new_pages - s.new_pages
+    ),
+    (1, 1, 0)
+  );
+  assert_eq!(h.usage().small_pages, 3);
   h.check_indexes();
-  for o in fill.into_iter().chain([b, b2, b3, next]) {
+  // Every simultaneously live secondary block is distinct: page 0's
+  // `cap` blocks plus `b` and `next` on page 1.
+  let live: Vec<_> = fill.into_iter().chain([b, b2, b3, next]).collect();
+  assert_eq!(live.iter().copied().collect::<BTreeSet<_>>().len(), cap + 2);
+  for o in live {
     free(h, o);
   }
+  assert!(h.os().live.lock().unwrap().is_empty());
+  h.check_indexes();
 }
 
 #[test]
@@ -3921,13 +3987,61 @@ fn cache_flushes_and_retirement_publish_candidates() {
 fn reconciling_sweeps_recover_lost_candidates() {
   let h = heap();
   h.set_reconcile_epochs(0);
+  assert_eq!(cap_1000(), 64);
   for reconcile in [Some(1), None] {
-    // Two pages of the class: the second of them, whichever it is, is its
-    // newest page, which trimming keeps.
+    // Keep the original two-page 1000-byte-class topology in both builds.
     let offs: Vec<_> = (0..=cap_1000()).map(|_| alloc(h, 0, 1000, 8)).collect();
+    assert_eq!(offs.len(), 65);
+    assert_eq!(
+      offs.iter().copied().collect::<BTreeSet<_>>().len(),
+      offs.len()
+    );
+    let segment = offs[0] / SEGMENT_SIZE;
+    assert!(offs.iter().all(|offset| offset / SEGMENT_SIZE == segment));
+    let mut blocks_per_page = BTreeMap::new();
+    let mut page_indices = BTreeSet::new();
+    for &offset in &offs {
+      let page = (offset % SEGMENT_SIZE) / PAGE_SIZE;
+      assert!(page < 64);
+      page_indices.insert(page);
+      *blocks_per_page.entry(page).or_insert(0usize) += 1;
+    }
+    let mut page_occupancy: Vec<_> = blocks_per_page.values().copied().collect();
+    page_occupancy.sort_unstable();
+    assert_eq!(page_occupancy, [1, cap_1000()]);
+    assert_eq!(page_indices.len(), 2);
+    let usage = h.usage();
+    assert_eq!(h.segments_in_use(), 1);
+    assert_eq!(usage.owned_segments, 1);
+    assert_eq!(usage.huge_segments, 0);
+    assert_eq!(usage.small_pages, 2);
     for o in offs {
       free(h, o);
     }
+    assert!(h.os().live.lock().unwrap().is_empty());
+    let usage = h.usage();
+    assert_eq!(usage.owned_segments, 1);
+    assert_eq!(usage.huge_segments, 0);
+    assert_eq!(usage.small_pages, 2);
+    assert_eq!(usage.small_bytes_out, 0);
+    // The sole owned segment contains exactly the two empty pages. Witness
+    // their publications before injecting the same lost-candidate state.
+    let mut candidate_pages = 0u64;
+    for page in page_indices {
+      candidate_pages |= 1u64 << page;
+    }
+    assert_eq!(candidate_pages.count_ones(), 2);
+    // SEG_EMPTY is metadata slot 5 in heap.rs. The direct Miri path below
+    // changes only this owned segment; native keeps the original global scan.
+    const SEG_EMPTY_METADATA_SLOT: usize = 5;
+    let meta = h.os().meta(segment).expect("owned segment metadata");
+    assert_eq!(
+      meta[SEG_EMPTY_METADATA_SLOT].load(Ordering::Relaxed),
+      candidate_pages
+    );
+    #[cfg(miri)]
+    meta[SEG_EMPTY_METADATA_SLOT].store(0, Ordering::Relaxed);
+    #[cfg(not(miri))]
     h.forget_empty_candidates();
     // (`check_indexes` would catch the lost candidates.)
     let before = h.maintenance_stats();
@@ -3960,6 +4074,8 @@ fn concurrent_frees_and_trims_lose_no_candidate() {
   let active_batches = AtomicUsize::new(0);
   let trimmer_passes = AtomicUsize::new(0);
   let overlapping_passes = AtomicUsize::new(0);
+  let requested_passes = AtomicUsize::new(0);
+  let completed_passes = AtomicUsize::new(0);
   let workers_count = 4;
   let start = std::sync::Barrier::new(workers_count + 1);
   let rounds = if cfg!(miri) { 4 } else { 40 };
@@ -3975,14 +4091,45 @@ fn concurrent_frees_and_trims_lose_no_candidate() {
     let active_batches = &active_batches;
     let trimmer_passes = &trimmer_passes;
     let overlapping_passes = &overlapping_passes;
+    let requested_passes = &requested_passes;
+    let completed_passes = &completed_passes;
     s.spawn(move || {
+      // If an assertion or sweep panics, release workers waiting on tickets.
+      let _trimmer_done = SetOnDrop(done_ref);
       start.wait();
-      while !done_ref.load(Ordering::Relaxed) {
-        h.decay();
-        if active_batches.load(Ordering::SeqCst) != 0 {
-          overlapping_passes.fetch_add(1, Ordering::SeqCst);
+      if cfg!(miri) {
+        while !done_ref.load(Ordering::Relaxed) {
+          let completed = completed_passes.load(Ordering::SeqCst);
+          let requested = requested_passes.load(Ordering::SeqCst);
+          if completed < requested && active_batches.load(Ordering::SeqCst) != 0 {
+            let active_before = active_batches.load(Ordering::SeqCst);
+            assert!(
+              active_before > 0,
+              "a requested sweep must have an active batch"
+            );
+            h.decay();
+            let active_after = active_batches.load(Ordering::SeqCst);
+            trimmer_passes.fetch_add(1, Ordering::SeqCst);
+            assert!(
+              active_after > 0,
+              "ticket owner must remain active until acknowledgement"
+            );
+            overlapping_passes.fetch_add(1, Ordering::SeqCst);
+            // A sweep acknowledges exactly one worker ticket only after the
+            // real decay operation and its overlap witness have completed.
+            completed_passes.fetch_add(1, Ordering::SeqCst);
+          } else {
+            std::thread::yield_now();
+          }
         }
-        trimmer_passes.fetch_add(1, Ordering::SeqCst);
+      } else {
+        while !done_ref.load(Ordering::Relaxed) {
+          h.decay();
+          if active_batches.load(Ordering::SeqCst) != 0 {
+            overlapping_passes.fetch_add(1, Ordering::SeqCst);
+          }
+          trimmer_passes.fetch_add(1, Ordering::SeqCst);
+        }
       }
     });
     let workers: Vec<_> = (0..workers_count)
@@ -3995,18 +4142,30 @@ fn concurrent_frees_and_trims_lose_no_candidate() {
             let offs: Vec<_> = (0..blocks_per_batch)
               .map(|_| alloc_c(h, &tc, size, 8))
               .collect();
-            let observe_overlap = cfg!(miri) && round == 0;
-            let overlap_before = overlapping_passes.load(Ordering::SeqCst);
-            if observe_overlap {
+            if cfg!(miri) && round == 0 {
               active_batches.fetch_add(1, Ordering::SeqCst);
-            }
-            for (i, o) in offs.into_iter().enumerate() {
-              free_c(h, &tc, o);
-              if observe_overlap && i == 0 {
-                while overlapping_passes.load(Ordering::SeqCst) == overlap_before {
-                  std::thread::yield_now();
+              let _active_batch = ActiveCountOnDrop(active_batches);
+              let mut remaining = offs.into_iter();
+              free_c(h, &tc, remaining.next().expect("nonempty batch"));
+              let ticket = requested_passes.fetch_add(1, Ordering::SeqCst);
+              loop {
+                if completed_passes.load(Ordering::SeqCst) > ticket {
+                  break;
                 }
-                active_batches.fetch_sub(1, Ordering::SeqCst);
+                if done_ref.load(Ordering::Relaxed) {
+                  if completed_passes.load(Ordering::SeqCst) > ticket {
+                    break;
+                  }
+                  panic!("trimmer abandoned a requested overlap ticket");
+                }
+                std::thread::yield_now();
+              }
+              for o in remaining {
+                free_c(h, &tc, o);
+              }
+            } else {
+              for o in offs {
+                free_c(h, &tc, o);
               }
             }
             let flush = if cfg!(miri) {
@@ -4027,11 +4186,15 @@ fn concurrent_frees_and_trims_lose_no_candidate() {
     }
   });
   if cfg!(miri) {
-    assert!(trimmer_passes.load(Ordering::SeqCst) > 0);
-    assert!(
-      overlapping_passes.load(Ordering::SeqCst) > 0,
-      "the trimmer must make an observed pass while a worker batch is live"
+    assert_eq!(requested_passes.load(Ordering::SeqCst), workers_count);
+    assert_eq!(completed_passes.load(Ordering::SeqCst), workers_count);
+    assert_eq!(trimmer_passes.load(Ordering::SeqCst), workers_count);
+    assert_eq!(
+      overlapping_passes.load(Ordering::SeqCst),
+      workers_count,
+      "each ticketed decay must overlap a live worker batch"
     );
+    assert_eq!(active_batches.load(Ordering::SeqCst), 0);
   }
   h.check_indexes();
   // Without reconciling, the candidates alone find every fully free page
@@ -4039,4 +4202,5 @@ fn concurrent_frees_and_trims_lose_no_candidate() {
   let (_, _, _, reconciled, _) = decay_trim(h);
   assert_eq!(reconciled, 0);
   assert_eq!(h.usage().small_pages, h.newest_pages());
+  assert!(h.os().live.lock().unwrap().is_empty());
 }
