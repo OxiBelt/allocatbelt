@@ -421,7 +421,8 @@ Named read, write, accept and datagram methods preserve partial progress,
 EOF and message boundaries. They retry interrupted calls and stale readiness
 after clearing `WouldBlock`, yielding after 64 endpoint calls per poll.
 Dropping a pending named method removes its waiter; transferred bytes remain
-transferred. Binding and socket options use standard-library calls directly.
+transferred. Binding and standard-stream socket options use standard-library
+calls directly; `TcpSocket` also exposes safe, synchronous Rustix-backed options.
 Filesystem-path Unix datagram APIs do not support abstract addresses.
 
 `NetHandle::connect` keeps its blocking-pool behavior. The additive
@@ -439,6 +440,16 @@ listening standard-library socket for recovery or later registration. The
 kernel may clamp backlog to `somaxconn`; it describes the pending-connection
 queue and does not reserve runtime operations or managed memory.
 
+`TcpSocket` exposes `SO_REUSEADDR`, Linux `SO_REUSEPORT`, `SO_KEEPALIVE`,
+`TCP_NODELAY`, send/receive buffer sizes and `take_error`. Setters act on the
+socket immediately; descriptor aliases observe the same kernel state. Buffer
+sizes are requested and reported in bytes, but getters return kernel-observed
+sizes, which may be clamped or adjusted (Linux may double them for bookkeeping).
+Kernel socket buffers are not `ManagedBuf` storage and are not charged to
+`ResourceScope`. `take_error` reads and clears `SO_ERROR`, so aliases must
+coordinate that observation. These methods make no runtime-capacity or
+buffer-accounting promise.
+
 Supplied-socket connect admission or registration rejection returns the
 original socket; after connect is attempted, errors close it and never replay
 the syscall. Cancellation drops the readiness waiter and local socket, then
@@ -447,8 +458,8 @@ observed by the remote peer. Imported descriptors must be nonblocking,
 close-on-exec, unconnected TCP stream sockets that are not listening. The
 runtime cannot detect an external alias with an earlier connect in progress or
 one that consumes `SO_ERROR`; callers must coordinate aliases. These methods
-perform no DNS, address retry or timeout policy. The builder still lacks the
-full `TcpSocket` option family.
+perform no DNS, address retry or timeout policy. Specialized socket options
+including linger, IP traffic class/TOS and interface binding remain pending.
 
 The blocking `connect` and DNS resolver use the explicit bounded blocking
 handle. A blocking network permit remains held while work is queued or running;
@@ -1486,8 +1497,8 @@ implemented with the contracts above. The stable Linux Tokio 1.53.1 capability
 baseline still requires these implementation and qualification steps:
 
 1. Extend automatic cooperative progress beyond the currently listed
-   operations. Expand TCP socket-option coverage beyond the explicit-address
-   nonblocking connect, listen and bound-socket operations.
+   operations. Complete specialized TCP socket-option coverage beyond the
+   explicit-address nonblocking connect, listen and common option operations.
 2. Add FIFO path constructors. Owned blocking streams, standard I/O adapters,
    anonymous Unix pipes, managed
    in-memory simplex/duplex pipes and caller-buffered bidirectional copy are

@@ -786,6 +786,84 @@ fn tcp_socket_import_accepts_a_nonblocking_unconnected_tcp_descriptor() {
 }
 
 #[test]
+fn tcp_socket_common_options_round_trip_kernel_values() {
+  let socket = TcpSocket::new_v4().unwrap();
+
+  socket.set_reuseaddr(true).unwrap();
+  assert!(socket.reuseaddr().unwrap());
+  socket.set_reuseaddr(false).unwrap();
+  assert!(!socket.reuseaddr().unwrap());
+
+  socket.set_reuseport(true).unwrap();
+  assert!(socket.reuseport().unwrap());
+  socket.set_reuseport(false).unwrap();
+  assert!(!socket.reuseport().unwrap());
+
+  socket.set_keepalive(true).unwrap();
+  assert!(socket.keepalive().unwrap());
+  socket.set_keepalive(false).unwrap();
+  assert!(!socket.keepalive().unwrap());
+
+  socket.set_nodelay(true).unwrap();
+  assert!(socket.nodelay().unwrap());
+  socket.set_nodelay(false).unwrap();
+  assert!(!socket.nodelay().unwrap());
+
+  socket.set_send_buffer_size(4096).unwrap();
+  let send_size = socket.send_buffer_size().unwrap();
+  assert!(send_size > 0);
+  assert_eq!(
+    socket.set_send_buffer_size(u32::MAX).unwrap_err().kind(),
+    std::io::ErrorKind::InvalidInput
+  );
+  assert_eq!(socket.send_buffer_size().unwrap(), send_size);
+  socket.set_recv_buffer_size(4096).unwrap();
+  let receive_size = socket.recv_buffer_size().unwrap();
+  assert!(receive_size > 0);
+  assert_eq!(
+    socket.set_recv_buffer_size(u32::MAX).unwrap_err().kind(),
+    std::io::ErrorKind::InvalidInput
+  );
+  assert_eq!(socket.recv_buffer_size().unwrap(), receive_size);
+
+  assert!(socket.take_error().unwrap().is_none());
+}
+
+#[test]
+fn tcp_socket_take_error_consumes_a_completed_refusal_once() {
+  let reactor = reactor(2);
+  let handle = reactor.handle();
+  let target = TcpSocket::new_v4().unwrap();
+  target.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+  let address = target.local_addr().unwrap();
+
+  let socket = TcpSocket::new_v4().unwrap();
+  let alias_fd = socket.fd.try_clone().unwrap();
+  let alias = TcpSocket::from_owned_fd(alias_fd).unwrap();
+  let alias = super::TcpStream::from_std(alias.into_stream(), &handle).unwrap();
+
+  assert_eq!(
+    rustix::net::connect(&socket.fd, &address),
+    Err(rustix::io::Errno::INPROGRESS)
+  );
+  let ready = block_on(alias.fd.writable()).unwrap();
+  drop(ready);
+
+  let error = socket.take_error().unwrap().unwrap();
+  assert_eq!(error.kind(), std::io::ErrorKind::ConnectionRefused);
+  assert!(socket.take_error().unwrap().is_none());
+  drop(alias);
+  drop(target);
+  reactor.shutdown().unwrap();
+}
+
+#[test]
+fn socket_buffer_size_conversion_rejects_kernel_values_above_u32() {
+  let error = super::kernel_buffer_size_u32(u32::MAX as usize + 1).unwrap_err();
+  assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+}
+
+#[test]
 fn tcp_connect_rejections_before_connect_return_the_supplied_socket() {
   let mut blocking = Runtime::new(Config {
     workers: 1,

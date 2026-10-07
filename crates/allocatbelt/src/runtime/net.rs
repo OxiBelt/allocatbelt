@@ -246,6 +246,115 @@ impl TcpSocket {
     })
   }
 
+  /// Sets whether the socket may bind to an address that is already in use.
+  ///
+  /// Configure this before [`TcpSocket::bind`]. The kernel determines the
+  /// exact address-reuse behavior.
+  pub fn set_reuseaddr(&self, reuseaddr: bool) -> io::Result<()> {
+    rnet::sockopt::set_socket_reuseaddr(&self.fd, reuseaddr).map_err(Into::into)
+  }
+
+  /// Returns the current `SO_REUSEADDR` setting.
+  pub fn reuseaddr(&self) -> io::Result<bool> {
+    rnet::sockopt::socket_reuseaddr(&self.fd).map_err(Into::into)
+  }
+
+  /// Sets whether this socket may share a local address and port with other
+  /// sockets using `SO_REUSEPORT`.
+  ///
+  /// Configure this before binding. Linux applies its normal `SO_REUSEPORT`
+  /// ownership and group rules; this does not reserve runtime capacity.
+  pub fn set_reuseport(&self, reuseport: bool) -> io::Result<()> {
+    rnet::sockopt::set_socket_reuseport(&self.fd, reuseport).map_err(Into::into)
+  }
+
+  /// Returns the current `SO_REUSEPORT` setting.
+  pub fn reuseport(&self) -> io::Result<bool> {
+    rnet::sockopt::socket_reuseport(&self.fd).map_err(Into::into)
+  }
+
+  /// Sets the TCP keepalive toggle (`SO_KEEPALIVE`). This does not configure
+  /// the kernel's keepalive interval or probe count.
+  pub fn set_keepalive(&self, keepalive: bool) -> io::Result<()> {
+    rnet::sockopt::set_socket_keepalive(&self.fd, keepalive).map_err(Into::into)
+  }
+
+  /// Returns the current `SO_KEEPALIVE` setting.
+  pub fn keepalive(&self) -> io::Result<bool> {
+    rnet::sockopt::socket_keepalive(&self.fd).map_err(Into::into)
+  }
+
+  /// Sets whether the socket disables Nagle's algorithm (`TCP_NODELAY`).
+  pub fn set_nodelay(&self, nodelay: bool) -> io::Result<()> {
+    rnet::sockopt::set_tcp_nodelay(&self.fd, nodelay).map_err(Into::into)
+  }
+
+  /// Returns the current `TCP_NODELAY` setting.
+  pub fn nodelay(&self) -> io::Result<bool> {
+    rnet::sockopt::tcp_nodelay(&self.fd).map_err(Into::into)
+  }
+
+  /// Sets the requested TCP send-buffer size in bytes.
+  ///
+  /// The kernel may clamp this request. On Linux it may account for
+  /// bookkeeping by doubling the value reported by [`TcpSocket::send_buffer_size`].
+  /// The kernel buffer is not managed-memory storage and is not charged to a
+  /// [`ResourceScope`].
+  pub fn set_send_buffer_size(&self, size: u32) -> io::Result<()> {
+    let size = usize::try_from(size).map_err(|_| {
+      io::Error::new(
+        io::ErrorKind::InvalidInput,
+        "send-buffer size is not representable",
+      )
+    })?;
+    rnet::sockopt::set_socket_send_buffer_size(&self.fd, size).map_err(Into::into)
+  }
+
+  /// Returns the kernel-observed TCP send-buffer size in bytes.
+  ///
+  /// This may differ from the value requested with
+  /// [`TcpSocket::set_send_buffer_size`] because of kernel minimums, maximums
+  /// and Linux bookkeeping adjustments.
+  pub fn send_buffer_size(&self) -> io::Result<u32> {
+    let size = rnet::sockopt::socket_send_buffer_size(&self.fd).map_err(io::Error::from)?;
+    kernel_buffer_size_u32(size)
+  }
+
+  /// Sets the requested TCP receive-buffer size in bytes.
+  ///
+  /// The kernel may clamp this request. On Linux it may account for
+  /// bookkeeping by doubling the value reported by [`TcpSocket::recv_buffer_size`].
+  /// The kernel buffer is not managed-memory storage and is not charged to a
+  /// [`ResourceScope`].
+  pub fn set_recv_buffer_size(&self, size: u32) -> io::Result<()> {
+    let size = usize::try_from(size).map_err(|_| {
+      io::Error::new(
+        io::ErrorKind::InvalidInput,
+        "receive-buffer size is not representable",
+      )
+    })?;
+    rnet::sockopt::set_socket_recv_buffer_size(&self.fd, size).map_err(Into::into)
+  }
+
+  /// Returns the kernel-observed TCP receive-buffer size in bytes.
+  ///
+  /// This may differ from the value requested with
+  /// [`TcpSocket::set_recv_buffer_size`] because of kernel minimums, maximums
+  /// and Linux bookkeeping adjustments.
+  pub fn recv_buffer_size(&self) -> io::Result<u32> {
+    let size = rnet::sockopt::socket_recv_buffer_size(&self.fd).map_err(io::Error::from)?;
+    kernel_buffer_size_u32(size)
+  }
+
+  /// Reads and clears the pending `SO_ERROR` value, if any.
+  ///
+  /// Socket aliases share this destructive observation; callers must
+  /// coordinate aliases that can also inspect or consume the pending error.
+  pub fn take_error(&self) -> io::Result<Option<io::Error>> {
+    let status = rnet::sockopt::socket_error(&self.fd).map_err(io::Error::from)?;
+    Ok(status.err().map(io::Error::from))
+  }
+
   /// Recovers the original descriptor before submitting a connect operation.
   #[must_use]
   pub fn into_owned_fd(self) -> OwnedFd {
@@ -255,6 +364,15 @@ impl TcpSocket {
   fn into_stream(self) -> StdTcpStream {
     self.fd.into()
   }
+}
+
+fn kernel_buffer_size_u32(size: usize) -> io::Result<u32> {
+  u32::try_from(size).map_err(|_| {
+    io::Error::new(
+      io::ErrorKind::InvalidData,
+      "kernel socket-buffer size exceeds the public u32 range",
+    )
+  })
 }
 
 fn address_family(address: SocketAddr) -> AddressFamily {
