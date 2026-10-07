@@ -28,7 +28,7 @@
 #![cfg_attr(not(test), deny(clippy::expect_used, clippy::unwrap_used))]
 
 use std::fmt;
-use std::io::{self, Read, Write};
+use std::io::{self, IoSlice, IoSliceMut, Read, Write};
 use std::net::{
   Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6, TcpListener as StdTcpListener,
   TcpStream as StdTcpStream, ToSocketAddrs, UdpSocket as StdUdpSocket,
@@ -136,6 +136,11 @@ impl TcpStream {
     }
   }
 
+  /// Reads once into initialized buffers after readable readiness.
+  pub async fn read_vectored(&self, bufs: &mut [IoSliceMut<'_>]) -> io::Result<usize> {
+    stream_read_vectored(&self.fd, bufs).await
+  }
+
   /// Writes once after writable readiness, preserving partial-write counts.
   pub async fn write(&self, buf: &[u8]) -> io::Result<usize> {
     if buf.is_empty() {
@@ -158,6 +163,11 @@ impl TcpStream {
         result => return result,
       }
     }
+  }
+
+  /// Writes once from initialized buffers after writable readiness.
+  pub async fn write_vectored(&self, bufs: &[IoSlice<'_>]) -> io::Result<usize> {
+    stream_write_vectored(&self.fd, bufs).await
   }
 
   /// TCP flush is a no-op because writes go directly to the socket.
@@ -224,6 +234,64 @@ impl AsyncRead for TcpStream {
       }
     }
   }
+
+  fn poll_read_vectored(
+    mut self: Pin<&mut Self>,
+    cx: &mut Context<'_>,
+    bufs: &mut [IoSliceMut<'_>],
+  ) -> Poll<io::Result<usize>> {
+    let this = self.as_mut().get_mut();
+    let offered = match read_vectored_len(bufs) {
+      Ok(len) => len,
+      Err(error) => {
+        this.read_waiter = None;
+        return Poll::Ready(Err(error));
+      }
+    };
+    if offered == 0 {
+      this.read_waiter = None;
+      return Poll::Ready(Ok(0));
+    }
+    let mut attempts = 0;
+    loop {
+      if attempts == IO_BUDGET {
+        cx.waker().wake_by_ref();
+        return Poll::Pending;
+      }
+      if this.read_waiter.is_none() {
+        this.read_waiter = Some(this.fd.readable_owned());
+      }
+      let readiness = match this.read_waiter.as_mut() {
+        Some(readiness) => Pin::new(readiness).poll(cx),
+        None => unreachable!("read waiter was just created"),
+      };
+      match readiness {
+        Poll::Pending => return Poll::Pending,
+        Poll::Ready(Err(error)) => {
+          this.read_waiter = None;
+          return Poll::Ready(Err(error));
+        }
+        Poll::Ready(Ok(guard)) => {
+          this.read_waiter = None;
+          attempts += 1;
+          match guard.try_io(|stream| {
+            let mut stream = stream;
+            stream.read_vectored(bufs)
+          }) {
+            Err(error)
+              if matches!(
+                error.kind(),
+                io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock
+              ) => {}
+            Ok(count) if count > offered => {
+              return Poll::Ready(Err(io::ErrorKind::InvalidData.into()));
+            }
+            result => return Poll::Ready(result),
+          }
+        }
+      }
+    }
+  }
 }
 
 impl AsyncWrite for TcpStream {
@@ -270,6 +338,68 @@ impl AsyncWrite for TcpStream {
         }
       }
     }
+  }
+
+  fn poll_write_vectored(
+    mut self: Pin<&mut Self>,
+    cx: &mut Context<'_>,
+    bufs: &[IoSlice<'_>],
+  ) -> Poll<io::Result<usize>> {
+    let this = self.as_mut().get_mut();
+    let offered = match write_vectored_len(bufs) {
+      Ok(len) => len,
+      Err(error) => {
+        this.write_waiter = None;
+        return Poll::Ready(Err(error));
+      }
+    };
+    if offered == 0 {
+      this.write_waiter = None;
+      return Poll::Ready(Ok(0));
+    }
+    let mut attempts = 0;
+    loop {
+      if attempts == IO_BUDGET {
+        cx.waker().wake_by_ref();
+        return Poll::Pending;
+      }
+      if this.write_waiter.is_none() {
+        this.write_waiter = Some(this.fd.writable_owned());
+      }
+      let readiness = match this.write_waiter.as_mut() {
+        Some(readiness) => Pin::new(readiness).poll(cx),
+        None => unreachable!("write waiter was just created"),
+      };
+      match readiness {
+        Poll::Pending => return Poll::Pending,
+        Poll::Ready(Err(error)) => {
+          this.write_waiter = None;
+          return Poll::Ready(Err(error));
+        }
+        Poll::Ready(Ok(guard)) => {
+          this.write_waiter = None;
+          attempts += 1;
+          match guard.try_io(|stream| {
+            let mut stream = stream;
+            stream.write_vectored(bufs)
+          }) {
+            Err(error)
+              if matches!(
+                error.kind(),
+                io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock
+              ) => {}
+            Ok(count) if count > offered => {
+              return Poll::Ready(Err(io::ErrorKind::InvalidData.into()));
+            }
+            result => return Poll::Ready(result),
+          }
+        }
+      }
+    }
+  }
+
+  fn is_write_vectored(&self) -> bool {
+    true
   }
 
   fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -928,9 +1058,17 @@ mod unix {
     pub async fn read(&self, buf: &mut [u8]) -> io::Result<usize> {
       stream_read(&self.fd, buf).await
     }
+    /// Reads once into initialized buffers after readable readiness.
+    pub async fn read_vectored(&self, bufs: &mut [IoSliceMut<'_>]) -> io::Result<usize> {
+      stream_read_vectored(&self.fd, bufs).await
+    }
     /// Writes once after writable readiness.
     pub async fn write(&self, buf: &[u8]) -> io::Result<usize> {
       stream_write(&self.fd, buf).await
+    }
+    /// Writes once from initialized buffers after writable readiness.
+    pub async fn write_vectored(&self, bufs: &[IoSlice<'_>]) -> io::Result<usize> {
+      stream_write_vectored(&self.fd, bufs).await
     }
     /// Flushes the direct socket writer.
     pub async fn flush(&self) -> io::Result<()> {
@@ -995,6 +1133,64 @@ mod unix {
         }
       }
     }
+
+    fn poll_read_vectored(
+      mut self: Pin<&mut Self>,
+      cx: &mut Context<'_>,
+      bufs: &mut [IoSliceMut<'_>],
+    ) -> Poll<io::Result<usize>> {
+      let this = self.as_mut().get_mut();
+      let offered = match read_vectored_len(bufs) {
+        Ok(len) => len,
+        Err(error) => {
+          this.read_waiter = None;
+          return Poll::Ready(Err(error));
+        }
+      };
+      if offered == 0 {
+        this.read_waiter = None;
+        return Poll::Ready(Ok(0));
+      }
+      let mut attempts = 0;
+      loop {
+        if attempts == IO_BUDGET {
+          cx.waker().wake_by_ref();
+          return Poll::Pending;
+        }
+        if this.read_waiter.is_none() {
+          this.read_waiter = Some(this.fd.readable_owned());
+        }
+        let readiness = match this.read_waiter.as_mut() {
+          Some(readiness) => Pin::new(readiness).poll(cx),
+          None => unreachable!("read waiter was just created"),
+        };
+        match readiness {
+          Poll::Pending => return Poll::Pending,
+          Poll::Ready(Err(error)) => {
+            this.read_waiter = None;
+            return Poll::Ready(Err(error));
+          }
+          Poll::Ready(Ok(guard)) => {
+            this.read_waiter = None;
+            attempts += 1;
+            match guard.try_io(|stream| {
+              let mut stream = stream;
+              stream.read_vectored(bufs)
+            }) {
+              Err(error)
+                if matches!(
+                  error.kind(),
+                  io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock
+                ) => {}
+              Ok(count) if count > offered => {
+                return Poll::Ready(Err(io::ErrorKind::InvalidData.into()));
+              }
+              result => return Poll::Ready(result),
+            }
+          }
+        }
+      }
+    }
   }
 
   impl AsyncWrite for UnixStream {
@@ -1041,6 +1237,68 @@ mod unix {
           }
         }
       }
+    }
+
+    fn poll_write_vectored(
+      mut self: Pin<&mut Self>,
+      cx: &mut Context<'_>,
+      bufs: &[IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+      let this = self.as_mut().get_mut();
+      let offered = match write_vectored_len(bufs) {
+        Ok(len) => len,
+        Err(error) => {
+          this.write_waiter = None;
+          return Poll::Ready(Err(error));
+        }
+      };
+      if offered == 0 {
+        this.write_waiter = None;
+        return Poll::Ready(Ok(0));
+      }
+      let mut attempts = 0;
+      loop {
+        if attempts == IO_BUDGET {
+          cx.waker().wake_by_ref();
+          return Poll::Pending;
+        }
+        if this.write_waiter.is_none() {
+          this.write_waiter = Some(this.fd.writable_owned());
+        }
+        let readiness = match this.write_waiter.as_mut() {
+          Some(readiness) => Pin::new(readiness).poll(cx),
+          None => unreachable!("write waiter was just created"),
+        };
+        match readiness {
+          Poll::Pending => return Poll::Pending,
+          Poll::Ready(Err(error)) => {
+            this.write_waiter = None;
+            return Poll::Ready(Err(error));
+          }
+          Poll::Ready(Ok(guard)) => {
+            this.write_waiter = None;
+            attempts += 1;
+            match guard.try_io(|stream| {
+              let mut stream = stream;
+              stream.write_vectored(bufs)
+            }) {
+              Err(error)
+                if matches!(
+                  error.kind(),
+                  io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock
+                ) => {}
+              Ok(count) if count > offered => {
+                return Poll::Ready(Err(io::ErrorKind::InvalidData.into()));
+              }
+              result => return Poll::Ready(result),
+            }
+          }
+        }
+      }
+    }
+
+    fn is_write_vectored(&self) -> bool {
+      true
     }
 
     fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -1309,4 +1567,204 @@ async fn yield_once() {
     }
   })
   .await
+}
+
+fn read_vectored_len(bufs: &[IoSliceMut<'_>]) -> io::Result<usize> {
+  bufs.iter().try_fold(0_usize, |total, buf| {
+    total
+      .checked_add(buf.len())
+      .ok_or_else(|| io::ErrorKind::InvalidInput.into())
+  })
+}
+
+fn write_vectored_len(bufs: &[IoSlice<'_>]) -> io::Result<usize> {
+  bufs.iter().try_fold(0_usize, |total, buf| {
+    total
+      .checked_add(buf.len())
+      .ok_or_else(|| io::ErrorKind::InvalidInput.into())
+  })
+}
+
+fn checked_vectored_count(count: usize, offered: usize) -> io::Result<usize> {
+  if count <= offered {
+    Ok(count)
+  } else {
+    Err(io::ErrorKind::InvalidData.into())
+  }
+}
+
+async fn stream_read_vectored<T>(fd: &AsyncFd<T>, bufs: &mut [IoSliceMut<'_>]) -> io::Result<usize>
+where
+  for<'a> &'a T: Read,
+{
+  let offered = read_vectored_len(bufs)?;
+  if offered == 0 {
+    return Ok(0);
+  }
+  let mut attempts = 0;
+  loop {
+    if attempts == IO_BUDGET {
+      yield_once().await;
+      attempts = 0;
+    }
+    let guard = fd.readable().await?;
+    attempts += 1;
+    match guard.try_io(|stream| {
+      let mut stream = stream;
+      stream.read_vectored(bufs)
+    }) {
+      Err(error)
+        if matches!(
+          error.kind(),
+          io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock
+        ) => {}
+      Ok(count) => return checked_vectored_count(count, offered),
+      Err(error) => return Err(error),
+    }
+  }
+}
+
+async fn stream_write_vectored<T>(fd: &AsyncFd<T>, bufs: &[IoSlice<'_>]) -> io::Result<usize>
+where
+  for<'a> &'a T: Write,
+{
+  let offered = write_vectored_len(bufs)?;
+  if offered == 0 {
+    return Ok(0);
+  }
+  let mut attempts = 0;
+  loop {
+    if attempts == IO_BUDGET {
+      yield_once().await;
+      attempts = 0;
+    }
+    let guard = fd.writable().await?;
+    attempts += 1;
+    match guard.try_io(|stream| {
+      let mut stream = stream;
+      stream.write_vectored(bufs)
+    }) {
+      Err(error)
+        if matches!(
+          error.kind(),
+          io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock
+        ) => {}
+      Ok(count) => return checked_vectored_count(count, offered),
+      Err(error) => return Err(error),
+    }
+  }
+}
+
+#[cfg(all(test, not(loom)))]
+mod vectored_tests {
+  use std::future::Future;
+  use std::io::{IoSlice, IoSliceMut, Read, Write};
+  use std::net::{TcpListener as StdTcpListener, TcpStream as StdTcpStream};
+  use std::pin::pin;
+  use std::task::{Context, Poll, Waker};
+  use std::thread;
+  use std::time::{Duration, Instant};
+
+  use super::*;
+  use crate::runtime::io::{AsyncReadExt, AsyncWriteExt};
+  use crate::runtime::reactor::{Reactor, ReactorConfig};
+
+  const TIMEOUT: Duration = Duration::from_secs(5);
+
+  fn reactor() -> Reactor {
+    Reactor::new(ReactorConfig {
+      max_registrations: 2,
+      max_waiters: 8,
+    })
+    .unwrap()
+  }
+
+  fn block_on<F: Future>(future: F) -> F::Output {
+    let mut future = pin!(future);
+    let mut cx = Context::from_waker(Waker::noop());
+    let deadline = Instant::now() + TIMEOUT;
+    loop {
+      match future.as_mut().poll(&mut cx) {
+        Poll::Ready(output) => return output,
+        Poll::Pending => {
+          assert!(
+            Instant::now() < deadline,
+            "vectored network operation timed out"
+          );
+          thread::sleep(Duration::from_millis(1));
+        }
+      }
+    }
+  }
+
+  #[test]
+  fn tcp_trait_vectored_io_uses_scatter_gather_readiness_paths() {
+    let reactor = reactor();
+    let handle = reactor.handle();
+    let listener = StdTcpListener::bind("127.0.0.1:0").unwrap();
+    let peer_address = listener.local_addr().unwrap();
+    let mut stream =
+      TcpStream::from_std(StdTcpStream::connect(peer_address).unwrap(), &handle).unwrap();
+    let (mut peer, _) = listener.accept().unwrap();
+    peer.set_read_timeout(Some(TIMEOUT)).unwrap();
+    peer.set_write_timeout(Some(TIMEOUT)).unwrap();
+
+    let outgoing = [IoSlice::new(b"tcp-"), IoSlice::new(b"vectors")];
+    assert!(stream.is_write_vectored());
+    assert_eq!(
+      block_on(AsyncWriteExt::write_vectored(&mut stream, &outgoing)).unwrap(),
+      11
+    );
+    let mut received = [0_u8; 11];
+    peer.read_exact(&mut received).unwrap();
+    assert_eq!(&received, b"tcp-vectors");
+
+    let mut first = [0_u8; 7];
+    let mut second = [0_u8; 5];
+    let mut incoming = [IoSliceMut::new(&mut first), IoSliceMut::new(&mut second)];
+    {
+      let mut waiting = Box::pin(AsyncReadExt::read_vectored(&mut stream, &mut incoming));
+      let mut cx = Context::from_waker(Waker::noop());
+      assert!(waiting.as_mut().poll(&mut cx).is_pending());
+    }
+    assert!(stream.read_waiter.is_some());
+    stream.cancel_io_waits();
+    assert!(stream.read_waiter.is_none());
+
+    peer.write_all(b"scatter-read").unwrap();
+    assert_eq!(
+      block_on(AsyncReadExt::read_vectored(&mut stream, &mut incoming)).unwrap(),
+      12
+    );
+    assert_eq!(&incoming[0][..], b"scatter");
+    assert_eq!(&incoming[1][..], b"-read");
+  }
+
+  #[cfg(unix)]
+  #[test]
+  fn unix_inherent_vectored_io_uses_scatter_gather_readiness_paths() {
+    use std::os::unix::net::UnixStream as StdUnixStream;
+
+    let reactor = reactor();
+    let handle = reactor.handle();
+    let (registered, mut peer) = StdUnixStream::pair().unwrap();
+    peer.set_read_timeout(Some(TIMEOUT)).unwrap();
+    peer.set_write_timeout(Some(TIMEOUT)).unwrap();
+    let stream = UnixStream::from_std(registered, &handle).unwrap();
+
+    let outgoing = [IoSlice::new(b"unix"), IoSlice::new(b"-vectors")];
+    assert!(stream.is_write_vectored());
+    assert_eq!(block_on(stream.write_vectored(&outgoing)).unwrap(), 12);
+    let mut received = [0_u8; 12];
+    peer.read_exact(&mut received).unwrap();
+    assert_eq!(&received, b"unix-vectors");
+
+    peer.write_all(b"unix-scatter").unwrap();
+    let mut first = [0_u8; 4];
+    let mut second = [0_u8; 8];
+    let mut incoming = [IoSliceMut::new(&mut first), IoSliceMut::new(&mut second)];
+    assert_eq!(block_on(stream.read_vectored(&mut incoming)).unwrap(), 12);
+    assert_eq!(&incoming[0][..], b"unix");
+    assert_eq!(&incoming[1][..], b"-scatter");
+  }
 }

@@ -87,7 +87,8 @@
 //! runs out with work left, they wake their own task and return `Pending`, so
 //! an endpoint that is always ready cannot hold a worker indefinitely. These
 //! loops retry `ErrorKind::Interrupted`, counting each attempt against the
-//! budget; the single-operation futures return it.
+//! budget. [`ReadVectored`] and [`WriteVectored`] also retry interruptions
+//! within that budget; scalar single-operation futures return them.
 //!
 //! # Cancellation and partial progress
 //!
@@ -107,8 +108,8 @@
 //!
 //! # Limitations
 //!
-//! This is not complete I/O parity with Tokio: there is no vectored or
-//! uninitialized-buffer I/O, stream splitting,
+//! This is not complete I/O parity with Tokio: vectored I/O uses initialized
+//! slices, and there is no uninitialized-buffer I/O, stream splitting,
 //! line or delimiter reads, or reads that grow a buffer. [`AsyncSeek`] is a
 //! single `poll_seek` that is polled again with the same position after
 //! `Pending`, instead of a separate start and completion.
@@ -120,7 +121,7 @@
 
 use std::fmt;
 use std::future::Future;
-use std::io::{self, ErrorKind, SeekFrom};
+use std::io::{self, ErrorKind, IoSlice, IoSliceMut, SeekFrom};
 use std::ops::Range;
 use std::pin::Pin;
 use std::task::{Context, Poll};
@@ -145,6 +146,30 @@ pub trait AsyncRead {
     cx: &mut Context<'_>,
     buf: &mut [u8],
   ) -> Poll<io::Result<usize>>;
+
+  /// Attempts to read into a list of initialized buffers in order.
+  ///
+  /// The default forwards to the first nonempty buffer, or an empty buffer if
+  /// none exists. An empty list or list of empty buffers therefore preserves
+  /// the endpoint's ordinary empty-read behavior. Implementations may
+  /// override this with scatter I/O. A successful count must not exceed the
+  /// combined offered length; the extension future validates it.
+  fn poll_read_vectored(
+    self: Pin<&mut Self>,
+    cx: &mut Context<'_>,
+    bufs: &mut [IoSliceMut<'_>],
+  ) -> Poll<io::Result<usize>> {
+    if let Some(buf) = bufs.iter_mut().find(|buf| !buf.is_empty()) {
+      let offered = buf.len();
+      self
+        .poll_read(cx, buf)
+        .map(|result| result.and_then(|count| checked_count(count, offered)))
+    } else {
+      self
+        .poll_read(cx, &mut [])
+        .map(|result| result.and_then(|count| checked_count(count, 0)))
+    }
+  }
 }
 
 /// Writes bytes from a buffer, and flushes and shuts down the write side.
@@ -158,6 +183,32 @@ pub trait AsyncWrite {
   /// count must not exceed `buf.len()`; the futures here reject a larger
   /// count with `InvalidData`.
   fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>>;
+
+  /// Attempts to write from a list of buffers in order.
+  ///
+  /// The default forwards to the first nonempty buffer, or an empty buffer if
+  /// none exists. Implementations may override this with gather I/O. A
+  /// successful count must not exceed the combined offered length; the
+  /// extension future validates it.
+  fn poll_write_vectored(
+    self: Pin<&mut Self>,
+    cx: &mut Context<'_>,
+    bufs: &[IoSlice<'_>],
+  ) -> Poll<io::Result<usize>> {
+    let buf = bufs
+      .iter()
+      .find(|buf| !buf.is_empty())
+      .map_or(&[][..], |buf| &**buf);
+    self
+      .poll_write(cx, buf)
+      .map(|result| result.and_then(|count| checked_count(count, buf.len())))
+  }
+
+  /// Whether `poll_write_vectored` uses an efficient scatter/gather path.
+  /// Defaults to false when the implementation only forwards one buffer.
+  fn is_write_vectored(&self) -> bool {
+    false
+  }
 
   /// Attempts to deliver every accepted byte the endpoint still buffers.
   fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>>;
@@ -185,11 +236,31 @@ impl<T: AsyncRead + Unpin + ?Sized> AsyncRead for &mut T {
   ) -> Poll<io::Result<usize>> {
     Pin::new(&mut **self.get_mut()).poll_read(cx, buf)
   }
+
+  fn poll_read_vectored(
+    self: Pin<&mut Self>,
+    cx: &mut Context<'_>,
+    bufs: &mut [IoSliceMut<'_>],
+  ) -> Poll<io::Result<usize>> {
+    Pin::new(&mut **self.get_mut()).poll_read_vectored(cx, bufs)
+  }
 }
 
 impl<T: AsyncWrite + Unpin + ?Sized> AsyncWrite for &mut T {
   fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
     Pin::new(&mut **self.get_mut()).poll_write(cx, buf)
+  }
+
+  fn poll_write_vectored(
+    self: Pin<&mut Self>,
+    cx: &mut Context<'_>,
+    bufs: &[IoSlice<'_>],
+  ) -> Poll<io::Result<usize>> {
+    Pin::new(&mut **self.get_mut()).poll_write_vectored(cx, bufs)
+  }
+
+  fn is_write_vectored(&self) -> bool {
+    (**self).is_write_vectored()
   }
 
   fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -235,6 +306,23 @@ pub trait AsyncReadExt: AsyncRead {
     Read { reader: self, buf }
   }
 
+  /// Reads into initialized buffers in order, returning the total byte count.
+  ///
+  /// An empty list, or a list containing only empty buffers, completes with
+  /// zero without polling the reader. `Interrupted` is retried up to
+  /// [`POLL_BUDGET`] times per poll; other errors, including `WouldBlock`, are
+  /// returned. A count beyond the combined buffer lengths fails with
+  /// `InvalidData`.
+  fn read_vectored<'a, 'b>(
+    &'a mut self,
+    bufs: &'a mut [IoSliceMut<'b>],
+  ) -> ReadVectored<'a, 'b, Self>
+  where
+    Self: Unpin,
+  {
+    ReadVectored { reader: self, bufs }
+  }
+
   /// Reads until `buf` is full, completing with its length. End of stream
   /// first fails with `UnexpectedEof`. An empty buffer completes at once
   /// without polling the reader. See the module documentation for partial
@@ -262,6 +350,20 @@ pub trait AsyncWriteExt: AsyncWrite {
     Self: Unpin,
   {
     Write { writer: self, buf }
+  }
+
+  /// Writes from buffers in order, returning the total accepted byte count.
+  ///
+  /// An empty list, or a list containing only empty buffers, completes with
+  /// zero without polling the writer. `Interrupted` is retried up to
+  /// [`POLL_BUDGET`] times per poll; other errors, including `WouldBlock`, are
+  /// returned. A count beyond the combined buffer lengths fails with
+  /// `InvalidData`.
+  fn write_vectored<'a, 'b>(&'a mut self, bufs: &'a [IoSlice<'b>]) -> WriteVectored<'a, 'b, Self>
+  where
+    Self: Unpin,
+  {
+    WriteVectored { writer: self, bufs }
   }
 
   /// Writes until every byte of `buf` is accepted. A write accepting none
@@ -297,6 +399,100 @@ pub trait AsyncWriteExt: AsyncWrite {
 }
 
 impl<W: AsyncWrite + ?Sized> AsyncWriteExt for W {}
+
+/// One vectored read; see [`AsyncReadExt::read_vectored`].
+#[must_use = "futures do nothing unless polled"]
+pub struct ReadVectored<'a, 'b, R: ?Sized> {
+  reader: &'a mut R,
+  bufs: &'a mut [IoSliceMut<'b>],
+}
+
+impl<R: ?Sized> fmt::Debug for ReadVectored<'_, '_, R> {
+  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    f.debug_struct("ReadVectored")
+      .field("buffers", &self.bufs.len())
+      .finish_non_exhaustive()
+  }
+}
+
+impl<R: AsyncRead + Unpin + ?Sized> Future for ReadVectored<'_, '_, R> {
+  type Output = io::Result<usize>;
+
+  fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+    let this = self.get_mut();
+    let offered = match read_vectored_len(this.bufs) {
+      Ok(len) => len,
+      Err(error) => return Poll::Ready(Err(error)),
+    };
+    if offered == 0 {
+      return Poll::Ready(Ok(0));
+    }
+    for _ in 0..POLL_BUDGET {
+      match Pin::new(&mut *this.reader).poll_read_vectored(cx, this.bufs) {
+        Poll::Pending => return Poll::Pending,
+        Poll::Ready(Ok(count)) => return Poll::Ready(checked_count(count, offered)),
+        Poll::Ready(Err(error)) if error.kind() == ErrorKind::Interrupted => {}
+        Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+      }
+    }
+    yield_now(cx)
+  }
+}
+
+/// One vectored write; see [`AsyncWriteExt::write_vectored`].
+#[must_use = "futures do nothing unless polled"]
+pub struct WriteVectored<'a, 'b, W: ?Sized> {
+  writer: &'a mut W,
+  bufs: &'a [IoSlice<'b>],
+}
+
+impl<W: ?Sized> fmt::Debug for WriteVectored<'_, '_, W> {
+  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    f.debug_struct("WriteVectored")
+      .field("buffers", &self.bufs.len())
+      .finish_non_exhaustive()
+  }
+}
+
+impl<W: AsyncWrite + Unpin + ?Sized> Future for WriteVectored<'_, '_, W> {
+  type Output = io::Result<usize>;
+
+  fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+    let this = self.get_mut();
+    let offered = match write_vectored_len(this.bufs) {
+      Ok(len) => len,
+      Err(error) => return Poll::Ready(Err(error)),
+    };
+    if offered == 0 {
+      return Poll::Ready(Ok(0));
+    }
+    for _ in 0..POLL_BUDGET {
+      match Pin::new(&mut *this.writer).poll_write_vectored(cx, this.bufs) {
+        Poll::Pending => return Poll::Pending,
+        Poll::Ready(Ok(count)) => return Poll::Ready(checked_count(count, offered)),
+        Poll::Ready(Err(error)) if error.kind() == ErrorKind::Interrupted => {}
+        Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+      }
+    }
+    yield_now(cx)
+  }
+}
+
+fn read_vectored_len(bufs: &[IoSliceMut<'_>]) -> io::Result<usize> {
+  bufs.iter().try_fold(0_usize, |total, buf| {
+    total
+      .checked_add(buf.len())
+      .ok_or_else(|| ErrorKind::InvalidInput.into())
+  })
+}
+
+fn write_vectored_len(bufs: &[IoSlice<'_>]) -> io::Result<usize> {
+  bufs.iter().try_fold(0_usize, |total, buf| {
+    total
+      .checked_add(buf.len())
+      .ok_or_else(|| ErrorKind::InvalidInput.into())
+  })
+}
 
 /// Futures over [`AsyncSeek`]; implemented for every seekable stream.
 pub trait AsyncSeekExt: AsyncSeek {
@@ -758,6 +954,26 @@ impl AsyncRead for SliceReader<'_> {
     this.pos += count;
     Poll::Ready(Ok(count))
   }
+
+  fn poll_read_vectored(
+    self: Pin<&mut Self>,
+    _cx: &mut Context<'_>,
+    bufs: &mut [IoSliceMut<'_>],
+  ) -> Poll<io::Result<usize>> {
+    let this = self.get_mut();
+    let mut copied = 0;
+    for buf in bufs {
+      let remaining = this.remaining();
+      let count = remaining.len().min(buf.len());
+      (**buf)[..count].copy_from_slice(&remaining[..count]);
+      this.pos += count;
+      copied += count;
+      if count < buf.len() {
+        break;
+      }
+    }
+    Poll::Ready(Ok(copied))
+  }
 }
 
 /// Seeks only within `0..=len`: a target outside the slice, or one that
@@ -854,6 +1070,30 @@ impl AsyncWrite for SliceWriter<'_> {
     spare[..count].copy_from_slice(&buf[..count]);
     this.pos += count;
     Poll::Ready(Ok(count))
+  }
+
+  fn poll_write_vectored(
+    self: Pin<&mut Self>,
+    _cx: &mut Context<'_>,
+    bufs: &[IoSlice<'_>],
+  ) -> Poll<io::Result<usize>> {
+    let this = self.get_mut();
+    let mut copied = 0;
+    for buf in bufs {
+      let spare = &mut this.data[this.pos..];
+      let count = spare.len().min(buf.len());
+      spare[..count].copy_from_slice(&buf[..count]);
+      this.pos += count;
+      copied += count;
+      if count < buf.len() {
+        break;
+      }
+    }
+    Poll::Ready(Ok(copied))
+  }
+
+  fn is_write_vectored(&self) -> bool {
+    true
   }
 
   fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -1102,8 +1342,10 @@ mod tests {
   fn futures_are_unpin() {
     fn assert_unpin<T: Unpin>() {}
     assert_unpin::<Read<'static, dyn AsyncRead>>();
+    assert_unpin::<ReadVectored<'static, 'static, dyn AsyncRead>>();
     assert_unpin::<ReadExact<'static, dyn AsyncRead>>();
     assert_unpin::<Write<'static, dyn AsyncWrite>>();
+    assert_unpin::<WriteVectored<'static, 'static, dyn AsyncWrite>>();
     assert_unpin::<WriteAll<'static, dyn AsyncWrite>>();
     assert_unpin::<Flush<'static, dyn AsyncWrite>>();
     assert_unpin::<Shutdown<'static, dyn AsyncWrite>>();
@@ -1122,6 +1364,197 @@ mod tests {
     let result = run(reader.read(&mut buf), 1);
     assert_eq!(kind(result), Err(ErrorKind::InvalidData));
     assert_eq!(kind(run(reader.read(&mut buf), 1)), Ok(0));
+  }
+
+  #[test]
+  fn vectored_trait_defaults_select_first_nonempty_and_keep_empty_reads_ready() {
+    let mut reader = ScriptReader::new([ReadStep::Bytes(b"ab")]);
+    let mut empty = [];
+    let mut first = [0_u8; 0];
+    let mut second = [0_u8; 2];
+    let mut third = [0_u8; 3];
+    let mut buffers = [
+      IoSliceMut::new(&mut first),
+      IoSliceMut::new(&mut second),
+      IoSliceMut::new(&mut third),
+    ];
+    assert_eq!(kind(run(reader.read_vectored(&mut empty), 1)), Ok(0));
+    assert_eq!(kind(run(reader.read_vectored(&mut buffers), 1)), Ok(2));
+    assert_eq!(&buffers[1][..], b"ab");
+    assert_eq!(reader.polls, 1);
+
+    let mut writer = ScriptWriter::default();
+    assert!(!writer.is_write_vectored());
+    let buffers = [
+      IoSlice::new(b""),
+      IoSlice::new(b"first"),
+      IoSlice::new(b"second"),
+    ];
+    assert_eq!(kind(run(writer.write_vectored(&buffers), 1)), Ok(5));
+    assert_eq!(writer.data, b"first");
+    assert_eq!(writer.polls, 1);
+  }
+
+  #[test]
+  fn slice_endpoints_scatter_and_gather_across_empty_and_partial_buffers() {
+    let mut reader = SliceReader::new(b"abcdef");
+    let mut empty = [];
+    let mut first = [0_u8; 0];
+    let mut second = [0_u8; 2];
+    let mut third = [0_u8; 3];
+    let mut fourth = [0_u8; 4];
+    let mut buffers = [
+      IoSliceMut::new(&mut first),
+      IoSliceMut::new(&mut second),
+      IoSliceMut::new(&mut third),
+      IoSliceMut::new(&mut fourth),
+    ];
+    assert_eq!(kind(run(reader.read_vectored(&mut empty), 1)), Ok(0));
+    assert_eq!(kind(run(reader.read_vectored(&mut buffers), 1)), Ok(6));
+    assert_eq!(&buffers[1][..], b"ab");
+    assert_eq!(&buffers[2][..], b"cde");
+    assert_eq!(&buffers[3][..1], b"f");
+
+    let mut output = [0_u8; 5];
+    let mut writer = SliceWriter::new(&mut output);
+    assert!(writer.is_write_vectored());
+    let buffers = [
+      IoSlice::new(b""),
+      IoSlice::new(b"ab"),
+      IoSlice::new(b"cdef"),
+      IoSlice::new(b"ignored"),
+    ];
+    assert_eq!(kind(run(writer.write_vectored(&buffers), 1)), Ok(5));
+    assert_eq!(writer.written(), b"abcde");
+  }
+
+  #[test]
+  fn vectored_helpers_reject_overreported_counts_and_propagate_would_block() {
+    struct Overreport;
+    impl AsyncRead for Overreport {
+      fn poll_read(
+        self: Pin<&mut Self>,
+        _: &mut Context<'_>,
+        _: &mut [u8],
+      ) -> Poll<io::Result<usize>> {
+        unreachable!()
+      }
+      fn poll_read_vectored(
+        self: Pin<&mut Self>,
+        _: &mut Context<'_>,
+        _: &mut [IoSliceMut<'_>],
+      ) -> Poll<io::Result<usize>> {
+        Poll::Ready(Ok(4))
+      }
+    }
+    let mut reader = Overreport;
+    let mut first = [0_u8; 1];
+    let mut second = [0_u8; 2];
+    let mut bufs = [IoSliceMut::new(&mut first), IoSliceMut::new(&mut second)];
+    assert_eq!(
+      kind(run(reader.read_vectored(&mut bufs), 1)),
+      Err(ErrorKind::InvalidData)
+    );
+
+    struct Overwrite;
+    impl AsyncWrite for Overwrite {
+      fn poll_write(
+        self: Pin<&mut Self>,
+        _: &mut Context<'_>,
+        _: &[u8],
+      ) -> Poll<io::Result<usize>> {
+        unreachable!()
+      }
+      fn poll_write_vectored(
+        self: Pin<&mut Self>,
+        _: &mut Context<'_>,
+        _: &[IoSlice<'_>],
+      ) -> Poll<io::Result<usize>> {
+        Poll::Ready(Ok(4))
+      }
+      fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+        unreachable!()
+      }
+      fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+        unreachable!()
+      }
+    }
+    let mut writer = Overwrite;
+    let bufs = [IoSlice::new(b"a"), IoSlice::new(b"bc")];
+    assert_eq!(
+      kind(run(writer.write_vectored(&bufs), 1)),
+      Err(ErrorKind::InvalidData)
+    );
+
+    let mut reader = ScriptReader::new([ReadStep::Fail(ErrorKind::WouldBlock)]);
+    let mut read_buf = [0_u8; 1];
+    let mut bufs = [IoSliceMut::new(&mut read_buf)];
+    assert_eq!(
+      kind(run(reader.read_vectored(&mut bufs), 1)),
+      Err(ErrorKind::WouldBlock)
+    );
+    let mut writer = ScriptWriter::new([WriteStep::Fail(ErrorKind::WouldBlock)]);
+    let bufs = [IoSlice::new(b"x")];
+    assert_eq!(
+      kind(run(writer.write_vectored(&bufs), 1)),
+      Err(ErrorKind::WouldBlock)
+    );
+  }
+
+  #[test]
+  fn vectored_defaults_validate_the_actual_forwarded_slice() {
+    let mut first = [0_u8; 1];
+    let mut later = [0_u8; 2];
+    let mut bufs = [IoSliceMut::new(&mut first), IoSliceMut::new(&mut later)];
+    let mut reader = ScriptReader::new([ReadStep::Claim(2)]);
+    assert_eq!(
+      kind(run(reader.read_vectored(&mut bufs), 1)),
+      Err(ErrorKind::InvalidData)
+    );
+    let bufs = [IoSlice::new(b"a"), IoSlice::new(b"bc")];
+    let mut writer = ScriptWriter::new([WriteStep::Claim(2)]);
+    assert_eq!(
+      kind(run(writer.write_vectored(&bufs), 1)),
+      Err(ErrorKind::InvalidData)
+    );
+
+    let mut cx = Context::from_waker(Waker::noop());
+    let mut reader = ScriptReader::new([ReadStep::Claim(1)]);
+    assert_eq!(
+      kinds(Pin::new(&mut reader).poll_read_vectored(&mut cx, &mut [])),
+      Poll::Ready(Err(ErrorKind::InvalidData))
+    );
+    let mut writer = ScriptWriter::new([WriteStep::Claim(1)]);
+    assert_eq!(
+      kinds(Pin::new(&mut writer).poll_write_vectored(&mut cx, &[])),
+      Poll::Ready(Err(ErrorKind::InvalidData))
+    );
+  }
+
+  #[test]
+  fn vectored_helpers_retry_interrupted_with_a_bounded_budget() {
+    let steps = iter::repeat_n(ReadStep::Fail(ErrorKind::Interrupted), POLL_BUDGET);
+    let mut reader = ScriptReader::new(steps);
+    let mut bytes = [0_u8; 1];
+    let mut bufs = [IoSliceMut::new(&mut bytes)];
+    let (wake, waker) = counting_waker();
+    assert_eq!(
+      kinds(poll(&mut reader.read_vectored(&mut bufs), &waker)),
+      Poll::Pending
+    );
+    assert_eq!((reader.polls, wake.count()), (POLL_BUDGET, 1));
+    assert_eq!(kind(run(reader.read_vectored(&mut bufs), 1)), Ok(0));
+
+    let steps = iter::repeat_n(WriteStep::Fail(ErrorKind::Interrupted), POLL_BUDGET);
+    let mut writer = ScriptWriter::new(steps);
+    let bufs = [IoSlice::new(b"x")];
+    let (wake, waker) = counting_waker();
+    assert_eq!(
+      kinds(poll(&mut writer.write_vectored(&bufs), &waker)),
+      Poll::Pending
+    );
+    assert_eq!((writer.polls, wake.count()), (POLL_BUDGET, 1));
+    assert_eq!(kind(run(writer.write_vectored(&bufs), 1)), Ok(1));
   }
 
   #[test]

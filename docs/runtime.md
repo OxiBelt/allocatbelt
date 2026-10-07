@@ -30,7 +30,15 @@ reported count when it exceeds the offered slice, retry interrupted calls,
 and yield with a self-wake after 64 endpoint calls in one poll. This requests
 rescheduling without guaranteeing another task's turn. Simple helpers do not
 allocate or implicitly reserve managed-storage charges. TCP and Unix stream
-endpoints implement these traits. Vectored operations remain pending.
+endpoints implement these traits. `read_vectored` and `write_vectored` borrow
+initialized `IoSliceMut` and `IoSlice` arrays. Trait defaults forward only the
+first nonempty slice and validate the count against that slice; TCP, Unix
+streams and in-memory slices use scatter/gather implementations. The helpers
+check the combined offered length, reject overflow with `InvalidInput`, and
+validate the returned count. Vectored helpers retry interruptions within the
+same 64-call budget; ordinary single-operation scalar helpers return them.
+Empty vectored helpers return zero without polling the endpoint. These
+operations do not allocate buffers or reserve implicit managed charges.
 
 `runtime::buffered_io` supplies `BufferedReader`, `BufferedWriter` and
 `AsyncBufRead`. Constructors take a nonempty, uniquely owned `ManagedBuf` and
@@ -141,7 +149,10 @@ DNS memory, network bandwidth or descriptor quota beyond reactor admission.
 TCP and Unix streams implement the initialized-buffer I/O traits. A pending
 trait read/write retains one waiter of that direction in the endpoint. Dropping
 the borrowing helper leaves this waiter available to a subsequent read/write
-poll; completing that direction, including with an empty buffer, removes it.
+poll. Completing an endpoint trait poll for that direction, including an
+empty-buffer endpoint poll, removes it. Scalar and vectored extension helpers
+may return for empty input or a length error without polling the endpoint;
+those short circuits retain any waiter already stored in the endpoint.
 `cancel_io_waits` or endpoint drop also removes both directions' waiters. Flush
 and shutdown do not remove a pending read/write waiter. Named async methods
 keep their immediate waiter cancellation on future drop.
