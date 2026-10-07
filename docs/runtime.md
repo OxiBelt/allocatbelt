@@ -85,6 +85,30 @@ RSS and arbitrary allocations. It supplies neither CPU quotas nor byte-rate
 limits. The existing blocking pool's declared `Resources` reservations remain
 separate from this ledger.
 
+`AsyncRuntime::scope_with_resources(&ledger)` and
+`scope_with_config_and_resources(config, &ledger)` explicitly bind a managed
+ledger to an owned Send scope. `LocalRuntime::scope_with_resources(&ledger)`
+does the same for local tasks. Construction borrows the caller's ledger handle;
+rejection retains that handle. Existing runtime roots and unbound scope
+constructors keep their unbound behavior. `LocalSendHandle` imports into its
+unbound local root.
+
+During a bound task's poll and runtime-owned cleanup,
+`try_current_resource_scope()` returns a clone of its ledger;
+`current_resource_scope()` panics if no ledger is bound. This context also
+covers producer-side destruction of detached results. Spawning follows the
+target handle's explicit scope binding, never the spawning task's current
+ledger. Rejection returns the unchanged future without installing the target
+context. Nested calls and unwind restore the enclosing resource context.
+
+A bound `AsyncHandle::block_on` exposes that handle's ledger to its borrowed
+root, with no task ID. Runtime-root `block_on` clears the resource context
+during its borrowed root and restores an enclosing context afterward. Values
+returned to user code become caller-owned; dropping them later does not install
+their producer's task context. Managed charges still follow their buffers and
+permits through task completion, scope close and final release. Binding alone
+charges no storage and imposes no accounting on ordinary allocations.
+
 ## Owned filesystem operations
 
 `runtime::fs::FsHandle` submits work to an explicit blocking handle. Each

@@ -8,6 +8,11 @@ use std::task::{Context, Poll, Wake, Waker};
 use std::thread;
 use std::time::Duration;
 
+use crate::runtime::asynchronous::{
+  current_resource_scope, try_current_resource_scope, try_task_id,
+};
+use crate::runtime::managed::{ResourceLimits, ResourceScope};
+
 use super::*;
 
 struct CloseCallbackState {
@@ -764,4 +769,140 @@ fn panicking_local_future_destructor_is_published_as_join_error() {
     runtime.block_on(job),
     Ok(Err(AsyncJoinError::Panicked(_)))
   ));
+}
+
+#[test]
+fn local_resource_binding_charges_buffers_through_close_and_final_drop() {
+  let resources = ResourceScope::new(ResourceLimits {
+    managed_memory: 20,
+    disk_concurrent_ops: 0,
+    network_concurrent_ops: 0,
+  });
+  let mut runtime = runtime(4, 3);
+  let scope = runtime
+    .scope_with_resources(&resources)
+    .unwrap_or_else(|e| panic!("resource scope failed: {e}"));
+  let job = scope
+    .spawn_local(async {
+      assert_eq!(current_resource_scope().limits().managed_memory, 20);
+      current_resource_scope()
+        .try_alloc_zeroed(15)
+        .unwrap_or_else(|e| panic!("managed buffer allocation failed: {e}"))
+    })
+    .unwrap_or_else(|e| panic!("bound local task spawn failed: {e}"));
+  let buffer = runtime
+    .block_on(job)
+    .unwrap()
+    .unwrap_or_else(|e| panic!("bound local task failed: {e}"));
+  assert_eq!(resources.snapshot().managed_memory, 15);
+
+  runtime
+    .block_on(scope.close())
+    .unwrap_or_else(|e| panic!("scope close failed: {e}"));
+  assert_eq!(resources.snapshot().managed_memory, 15);
+  drop(buffer);
+  assert_eq!(resources.snapshot().managed_memory, 0);
+}
+
+#[test]
+fn local_task_context_restores_and_covers_cleanup_without_inheritance() {
+  use super::super::entry::TaskContextGuard;
+
+  let outer = ResourceScope::new(ResourceLimits {
+    managed_memory: 3,
+    disk_concurrent_ops: 0,
+    network_concurrent_ops: 0,
+  });
+  let resources = ResourceScope::new(ResourceLimits {
+    managed_memory: 29,
+    disk_concurrent_ops: 0,
+    network_concurrent_ops: 0,
+  });
+  let mut runtime = runtime(6, 3);
+  let scope = runtime
+    .scope_with_resources(&resources)
+    .unwrap_or_else(|e| panic!("resource scope failed: {e}"));
+  let root = runtime.handle();
+
+  let _outer = TaskContextGuard::enter_with_resource(None, Some(outer.clone()));
+  assert!(
+    runtime
+      .block_on(async { try_current_resource_scope().is_none() && try_task_id().is_none() })
+      .unwrap()
+  );
+  let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    let _ = runtime.block_on(async { panic!("local root poll panic") });
+  }));
+  assert!(unwind.is_err());
+  assert_eq!(current_resource_scope().limits().managed_memory, 3);
+
+  let (child_tx, child_rx) = mpsc::channel();
+  let child_producer = scope
+    .spawn_local(async move {
+      assert_eq!(current_resource_scope().limits().managed_memory, 29);
+      let child = root
+        .spawn_local(async { try_current_resource_scope().is_none() })
+        .unwrap_or_else(|e| panic!("unbound child spawn failed: {e}"));
+      child_tx
+        .send(child)
+        .unwrap_or_else(|_| panic!("child receiver disconnected"));
+    })
+    .unwrap_or_else(|e| panic!("bound parent spawn failed: {e}"));
+  assert!(runtime.block_on(child_producer).unwrap().is_ok());
+  let child = child_rx
+    .recv()
+    .unwrap_or_else(|e| panic!("unbound child was not submitted: {e}"));
+  assert!(runtime.block_on(child).unwrap().unwrap());
+
+  struct DropProbe(mpsc::Sender<Option<usize>>);
+  impl Future for DropProbe {
+    type Output = ();
+    fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<()> {
+      Poll::Pending
+    }
+  }
+  impl Drop for DropProbe {
+    fn drop(&mut self) {
+      let observed = try_current_resource_scope().map(|scope| scope.limits().managed_memory);
+      let _ = self.0.send(observed);
+    }
+  }
+  let (future_tx, future_rx) = mpsc::channel();
+  let pending = scope
+    .spawn_local(DropProbe(future_tx))
+    .unwrap_or_else(|e| panic!("cleanup probe spawn failed: {e}"));
+  pending.abort();
+  assert!(matches!(
+    runtime.block_on(pending),
+    Ok(Err(AsyncJoinError::Cancelled))
+  ));
+  assert_eq!(future_rx.recv().unwrap(), Some(29));
+
+  struct OutputProbe(mpsc::Sender<Option<usize>>);
+  impl Drop for OutputProbe {
+    fn drop(&mut self) {
+      let observed = try_current_resource_scope().map(|scope| scope.limits().managed_memory);
+      let _ = self.0.send(observed);
+    }
+  }
+  let (output_tx, output_rx) = mpsc::channel();
+  let detached = scope
+    .spawn_local(async move { OutputProbe(output_tx) })
+    .unwrap_or_else(|e| panic!("detached output spawn failed: {e}"));
+  drop(detached);
+  let observed = runtime
+    .block_on(std::future::poll_fn(move |cx| match output_rx.try_recv() {
+      Ok(value) => Poll::Ready(value),
+      Err(mpsc::TryRecvError::Empty) => {
+        cx.waker().wake_by_ref();
+        Poll::Pending
+      }
+      Err(mpsc::TryRecvError::Disconnected) => panic!("output probe disconnected"),
+    }))
+    .unwrap();
+  assert_eq!(observed, Some(29));
+
+  runtime
+    .block_on(scope.close())
+    .unwrap_or_else(|e| panic!("scope close failed: {e}"));
 }

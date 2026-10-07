@@ -6,6 +6,7 @@ use std::task::{Context, Poll, Wake, Waker};
 use std::time::{Duration, Instant};
 
 use super::{AsyncConfig, AsyncJoinError, AsyncRuntime, AsyncScopeConfig, AsyncShutdown};
+use crate::runtime::managed::{ResourceLimits, ResourceScope};
 
 fn runtime(workers: usize, max_outstanding: usize, max_scopes: usize) -> AsyncRuntime {
   AsyncRuntime::new(AsyncConfig {
@@ -946,6 +947,267 @@ fn cancel_pending_shutdown_reactivates_quota_blocked_work() {
     .unwrap_or_else(|_| panic!("gate releaser panicked"));
   assert!(matches!(block_on(queued), Err(AsyncJoinError::Cancelled)));
   assert!(matches!(block_on(blocker), Ok(())));
+}
+
+#[test]
+fn native_resource_scope_binding_survives_task_and_buffer_lifetimes() {
+  let resources = ResourceScope::new(ResourceLimits {
+    managed_memory: 32,
+    disk_concurrent_ops: 0,
+    network_concurrent_ops: 0,
+  });
+  let runtime = runtime(2, 8, 3);
+  let scope = runtime
+    .scope_with_resources(&resources)
+    .unwrap_or_else(|e| panic!("resource scope failed: {e}"));
+  let handle = scope.handle();
+
+  assert!(
+    runtime
+      .block_on(async { super::try_current_resource_scope().is_none() })
+      .unwrap()
+  );
+  let bound_root = handle
+    .block_on(async {
+      (
+        super::current_resource_scope().limits().managed_memory,
+        super::try_task_id(),
+      )
+    })
+    .unwrap();
+  assert_eq!(bound_root, (32, None));
+
+  let job = scope
+    .spawn(async {
+      assert_eq!(super::current_resource_scope().limits().managed_memory, 32);
+      super::current_resource_scope()
+        .try_alloc_zeroed(24)
+        .unwrap_or_else(|e| panic!("managed buffer allocation failed: {e}"))
+    })
+    .unwrap_or_else(|e| panic!("bound task spawn failed: {e}"));
+  let buffer = runtime
+    .block_on(job)
+    .unwrap()
+    .unwrap_or_else(|e| panic!("bound task failed: {e}"));
+  assert_eq!(resources.snapshot().managed_memory, 24);
+
+  runtime
+    .block_on(scope.close())
+    .unwrap_or_else(|e| panic!("scope close failed: {e}"));
+  assert_eq!(resources.snapshot().managed_memory, 24);
+  drop(buffer);
+  assert_eq!(resources.snapshot().managed_memory, 0);
+}
+
+#[test]
+fn native_resource_context_is_explicit_restored_on_unwind_and_not_inherited() {
+  use super::entry::TaskContextGuard;
+
+  let outer = ResourceScope::new(ResourceLimits {
+    managed_memory: 5,
+    disk_concurrent_ops: 0,
+    network_concurrent_ops: 0,
+  });
+  let bound = ResourceScope::new(ResourceLimits {
+    managed_memory: 17,
+    disk_concurrent_ops: 0,
+    network_concurrent_ops: 0,
+  });
+  let runtime = runtime(2, 8, 3);
+  let scope = runtime
+    .scope_with_config_and_resources(
+      AsyncScopeConfig {
+        max_active_polls: 1,
+      },
+      &bound,
+    )
+    .unwrap_or_else(|e| panic!("resource scope failed: {e}"));
+  let second_resources = ResourceScope::new(ResourceLimits {
+    managed_memory: 23,
+    disk_concurrent_ops: 0,
+    network_concurrent_ops: 0,
+  });
+  let second_scope = runtime
+    .scope_with_resources(&second_resources)
+    .unwrap_or_else(|e| panic!("second resource scope failed: {e}"));
+  let handle = scope.handle();
+  let root_handle = runtime.handle();
+
+  let _outer = TaskContextGuard::enter_with_resource(None, Some(outer.clone()));
+  let bound_limits = handle
+    .block_on(async { super::current_resource_scope().limits().managed_memory })
+    .unwrap();
+  assert_eq!(bound_limits, 17);
+  assert_eq!(
+    super::try_current_resource_scope()
+      .unwrap_or_else(|| panic!("outer binding was not restored"))
+      .limits()
+      .managed_memory,
+    5
+  );
+
+  let first_limits = scope
+    .spawn(async { super::current_resource_scope().limits().managed_memory })
+    .unwrap_or_else(|e| panic!("first resource task failed admission: {e}"));
+  let second_limits = second_scope
+    .spawn(async { super::current_resource_scope().limits().managed_memory })
+    .unwrap_or_else(|e| panic!("second resource task failed admission: {e}"));
+  assert_eq!(runtime.block_on(first_limits).unwrap().unwrap(), 17);
+  assert_eq!(runtime.block_on(second_limits).unwrap().unwrap(), 23);
+
+  let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    let _ = handle.block_on(async { panic!("root poll panic") });
+  }));
+  assert!(unwind.is_err());
+  assert_eq!(
+    super::current_resource_scope().limits().managed_memory,
+    5,
+    "resource context was not restored after root-poll unwind"
+  );
+
+  let (child_tx, child_rx) = std::sync::mpsc::channel();
+  let child_producer = scope
+    .spawn(async move {
+      assert_eq!(super::current_resource_scope().limits().managed_memory, 17);
+      let child = root_handle
+        .spawn(async { super::try_current_resource_scope().is_none() })
+        .unwrap_or_else(|e| panic!("unbound child spawn failed: {e}"));
+      child_tx
+        .send(child)
+        .unwrap_or_else(|_| panic!("child receiver disconnected"));
+    })
+    .unwrap_or_else(|e| panic!("bound task spawn failed: {e}"));
+  assert!(runtime.block_on(child_producer).unwrap().is_ok());
+  let child = child_rx
+    .recv()
+    .unwrap_or_else(|e| panic!("unbound child was not submitted: {e}"));
+  assert!(runtime.block_on(child).unwrap().unwrap());
+  runtime
+    .block_on(scope.close())
+    .unwrap_or_else(|e| panic!("scope close failed: {e}"));
+  runtime
+    .block_on(second_scope.close())
+    .unwrap_or_else(|e| panic!("second scope close failed: {e}"));
+}
+
+#[test]
+fn resource_bound_scope_rejection_returns_the_original_unpolled_future() {
+  let resources = ResourceScope::new(ResourceLimits {
+    managed_memory: 13,
+    disk_concurrent_ops: 0,
+    network_concurrent_ops: 0,
+  });
+  let runtime = runtime(1, 1, 2);
+  let scope = runtime
+    .scope_with_resources(&resources)
+    .unwrap_or_else(|e| panic!("resource scope failed: {e}"));
+  let gate = Arc::new((Mutex::new(false), Condvar::new()));
+  let _release_gate = ReleaseGate(Arc::clone(&gate));
+  let started = Arc::new((Mutex::new(false), Condvar::new()));
+  let blocker = scope
+    .spawn(Gate {
+      gate: Arc::clone(&gate),
+      started: Arc::clone(&started),
+    })
+    .unwrap_or_else(|e| panic!("blocker spawn failed: {e}"));
+  {
+    let (lock, cv) = &*started;
+    let mut value = lock.lock().unwrap_or_else(|e| e.into_inner());
+    while !*value {
+      value = cv.wait(value).unwrap_or_else(|e| e.into_inner());
+    }
+  }
+
+  struct TokenFuture {
+    token: Arc<AtomicBool>,
+    polled: Arc<AtomicBool>,
+  }
+  impl Future for TokenFuture {
+    type Output = ();
+    fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<()> {
+      self.polled.store(true, Ordering::SeqCst);
+      Poll::Ready(())
+    }
+  }
+  let token = Arc::new(AtomicBool::new(false));
+  let polled = Arc::new(AtomicBool::new(false));
+  let rejected = scope
+    .spawn(TokenFuture {
+      token: Arc::clone(&token),
+      polled: Arc::clone(&polled),
+    })
+    .err()
+    .unwrap_or_else(|| panic!("full scope admitted another task"));
+  assert_eq!(rejected.kind, super::AsyncError::Full);
+  let returned = rejected.into_future();
+  assert!(Arc::ptr_eq(&returned.token, &token));
+  assert!(!polled.load(Ordering::SeqCst));
+  drop(returned);
+
+  let (lock, cv) = &*gate;
+  *lock.lock().unwrap_or_else(|e| e.into_inner()) = true;
+  cv.notify_all();
+  assert!(matches!(runtime.block_on(blocker).unwrap(), Ok(())));
+  runtime
+    .shutdown(AsyncShutdown::Drain)
+    .unwrap_or_else(|e| panic!("shutdown failed: {e}"));
+}
+
+#[test]
+fn native_runtime_owned_future_and_detached_output_drops_keep_scope_binding() {
+  let resources = ResourceScope::new(ResourceLimits {
+    managed_memory: 41,
+    disk_concurrent_ops: 0,
+    network_concurrent_ops: 0,
+  });
+  let runtime = runtime(2, 8, 3);
+  let scope = runtime
+    .scope_with_resources(&resources)
+    .unwrap_or_else(|e| panic!("resource scope failed: {e}"));
+
+  struct DropProbe(std::sync::mpsc::Sender<Option<usize>>);
+  impl Future for DropProbe {
+    type Output = ();
+    fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<()> {
+      Poll::Pending
+    }
+  }
+  impl Drop for DropProbe {
+    fn drop(&mut self) {
+      let observed = super::try_current_resource_scope().map(|scope| scope.limits().managed_memory);
+      let _ = self.0.send(observed);
+    }
+  }
+  let (future_tx, future_rx) = std::sync::mpsc::channel();
+  let pending = scope
+    .spawn(DropProbe(future_tx))
+    .unwrap_or_else(|e| panic!("future-drop task spawn failed: {e}"));
+  pending.abort_handle().abort();
+  assert!(matches!(
+    runtime.block_on(pending).unwrap(),
+    Err(AsyncJoinError::Cancelled)
+  ));
+  assert_eq!(future_rx.recv().unwrap(), Some(41));
+
+  struct OutputProbe(std::sync::mpsc::Sender<Option<usize>>);
+  impl Drop for OutputProbe {
+    fn drop(&mut self) {
+      let observed = super::try_current_resource_scope().map(|scope| scope.limits().managed_memory);
+      let _ = self.0.send(observed);
+    }
+  }
+  let (output_tx, output_rx) = std::sync::mpsc::channel();
+  let detached = scope
+    .spawn(async move { OutputProbe(output_tx) })
+    .unwrap_or_else(|e| panic!("detached task spawn failed: {e}"));
+  drop(detached);
+  assert_eq!(
+    output_rx.recv_timeout(Duration::from_secs(3)).unwrap(),
+    Some(41)
+  );
+  runtime
+    .block_on(scope.close())
+    .unwrap_or_else(|e| panic!("scope close failed: {e}"));
 }
 
 #[test]

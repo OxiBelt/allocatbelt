@@ -24,6 +24,7 @@ use super::identity::{self, TaskId};
 use super::join::{AsyncJob, AsyncJoinError, JoinState};
 use super::protocol::{PollFinish, PollProtocol};
 use super::task::drop_contained;
+use crate::runtime::managed::ResourceScope;
 
 #[cfg(all(test, not(loom)))]
 #[path = "local_tests.rs"]
@@ -551,6 +552,7 @@ impl Wake for LocalTaskWake {
 
 struct ScopeCell {
   reference: ScopeRef,
+  resources: Option<ResourceScope>,
   active: Cell<usize>,
   closed: Cell<bool>,
   reclaimed: Cell<bool>,
@@ -558,9 +560,10 @@ struct ScopeCell {
 }
 
 impl ScopeCell {
-  fn new(reference: ScopeRef) -> Rc<Self> {
+  fn new(reference: ScopeRef, resources: Option<ResourceScope>) -> Rc<Self> {
     Rc::new(Self {
       reference,
+      resources,
       active: Cell::new(0),
       closed: Cell::new(false),
       reclaimed: Cell::new(reference.index == 0),
@@ -736,6 +739,7 @@ struct Task<F: Future + 'static> {
   id: TaskId,
   admission: Option<AdmissionPermit>,
   scope: Rc<ScopeCell>,
+  resources: Option<ResourceScope>,
 }
 
 impl<F: Future + 'static> Task<F> {
@@ -747,7 +751,8 @@ impl<F: Future + 'static> Task<F> {
 
 impl<F: Future + 'static> LocalTask for Task<F> {
   fn poll(&mut self, context: &mut Context<'_>) -> Poll<()> {
-    let _task_context = TaskContextGuard::enter(Some(self.id));
+    let _task_context =
+      TaskContextGuard::enter_with_resource(Some(self.id), self.resources.clone());
     let Some(mut future) = self.future.take() else {
       return Poll::Ready(());
     };
@@ -776,7 +781,8 @@ impl<F: Future + 'static> LocalTask for Task<F> {
   }
 
   fn cancel(&mut self) {
-    let _task_context = TaskContextGuard::enter(Some(self.id));
+    let _task_context =
+      TaskContextGuard::enter_with_resource(Some(self.id), self.resources.clone());
     let outcome = match self.drop_future() {
       Some(payload) => Err(AsyncJoinError::Panicked(payload)),
       None => Err(AsyncJoinError::Cancelled),
@@ -789,12 +795,14 @@ impl<F: Future + 'static> LocalTask for Task<F> {
   }
 
   fn complete_scope(&mut self, core: &LocalCore) {
-    let _task_context = TaskContextGuard::enter(Some(self.id));
+    let _task_context =
+      TaskContextGuard::enter_with_resource(Some(self.id), self.resources.clone());
     core.complete_scope(self.scope.reference);
   }
 
   fn publish(&mut self) {
-    let _task_context = TaskContextGuard::enter(Some(self.id));
+    let _task_context =
+      TaskContextGuard::enter_with_resource(Some(self.id), self.resources.clone());
     if let Some(outcome) = self.staged.take()
       && let Some(unclaimed) = self.join.publish(outcome)
     {
@@ -841,6 +849,7 @@ where
       join,
       id,
       admission: Some(admission),
+      resources: scope.resources.clone(),
       scope: Rc::clone(&scope),
     };
     core.insert_task(task_ref, scope, Arc::clone(&abort), Box::new(task));
@@ -860,7 +869,7 @@ where
       abort_target: _,
       admission,
     } = *self;
-    let _task_context = TaskContextGuard::enter(Some(id));
+    let _task_context = TaskContextGuard::enter_with_resource(Some(id), None);
     let outcome = match panic::catch_unwind(AssertUnwindSafe(|| drop(future))) {
       Ok(()) => Err(AsyncJoinError::Cancelled),
       Err(payload) => Err(AsyncJoinError::Panicked(payload)),
@@ -922,7 +931,7 @@ impl LocalRuntime {
       .try_reserve_exact(config.max_scopes)
       .map_err(|_| LocalError::InvalidConfig)?;
     scopes.resize_with(config.max_scopes, || None);
-    let root = ScopeCell::new(root_scope);
+    let root = ScopeCell::new(root_scope, None);
     scopes[0] = Some(Rc::clone(&root));
     let owner = thread::current();
     let notifier = Notifier::new(owner.clone());
@@ -955,7 +964,9 @@ impl LocalRuntime {
   }
 
   /// Returns a cross-thread handle that accepts only `Send` futures and
-  /// outputs. Its admissions share `max_outstanding` with local tasks.
+  /// outputs. Its admissions share `max_outstanding` with local tasks and use
+  /// the unbound implicit root scope; the submitting thread's resource context
+  /// is never inherited.
   #[must_use]
   pub fn send_handle(&self) -> LocalSendHandle {
     LocalSendHandle {
@@ -968,9 +979,23 @@ impl LocalRuntime {
 
   /// Creates an independently cancellable owner-thread scope.
   pub fn scope(&self) -> Result<LocalTaskScope, LocalError> {
+    self.create_scope(None)
+  }
+
+  /// Creates a local task scope whose futures and runtime-owned cleanup can
+  /// explicitly access `resources` through `current_resource_scope`. Only
+  /// managed buffers and operation permits are charged.
+  pub fn scope_with_resources(
+    &self,
+    resources: &ResourceScope,
+  ) -> Result<LocalTaskScope, LocalError> {
+    self.create_scope(Some(resources.clone()))
+  }
+
+  fn create_scope(&self, resources: Option<ResourceScope>) -> Result<LocalTaskScope, LocalError> {
     self.core.check_owner()?;
     let reference = self.core.control.admit_scope()?;
-    let cell = ScopeCell::new(reference);
+    let cell = ScopeCell::new(reference, resources);
     self.core.scopes.borrow_mut()[reference.index] = Some(Rc::clone(&cell));
     Ok(LocalTaskScope {
       handle: LocalHandle {
@@ -985,7 +1010,10 @@ impl LocalRuntime {
 
   /// Polls a caller-owned root future and runs ready local tasks one poll turn
   /// at a time until the root completes. The root may borrow data and need not
-  /// be `Send`; spawned local futures must be `'static`.
+  /// be `Send`; spawned local futures must be `'static`. The borrowed runtime
+  /// root has no task ID or managed-resource binding, even when called while
+  /// another task's resource context is active; that context is restored on
+  /// return or unwind.
   pub fn block_on<F: Future>(&mut self, future: F) -> Result<F::Output, LocalError> {
     self.core.check_owner()?;
     if self.closed {
@@ -1226,6 +1254,7 @@ impl LocalHandle {
       id,
       admission: Some(permit),
       scope: Rc::clone(&scope),
+      resources: scope.resources.clone(),
     };
     self
       .core

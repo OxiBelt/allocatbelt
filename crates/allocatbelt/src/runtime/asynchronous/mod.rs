@@ -24,11 +24,12 @@ use std::fmt;
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 
+use crate::runtime::managed::ResourceScope;
 use scheduler::{ScopeRef, Shared};
 
 pub use entry::{
-  ConsumeBudget, EnterGuard, YieldNow, consume_budget, current, task_id, try_current, try_task_id,
-  yield_now,
+  ConsumeBudget, EnterGuard, YieldNow, consume_budget, current, current_resource_scope, task_id,
+  try_current, try_current_resource_scope, try_task_id, yield_now,
 };
 pub use identity::TaskId;
 pub use join::{AbortHandle, AsyncJob, AsyncJoinError};
@@ -210,13 +211,16 @@ impl AsyncRuntime {
     AsyncHandle {
       shared: Arc::clone(&self.shared),
       scope: self.root,
+      resources: None,
     }
   }
 
   /// Polls a caller-owned future on this thread until it completes. The root
   /// future need not be `Send` or `'static`; spawned tasks remain owned and
   /// `Send + 'static`. Calling this from an executor worker or from another
-  /// `block_on` on the same thread returns an error.
+  /// `block_on` on the same thread returns an error. This runtime-root poll
+  /// has no task ID or managed-resource binding, and clears any enclosing
+  /// task's resource context until it returns.
   pub fn block_on<F: std::future::Future>(&self, future: F) -> Result<F::Output, AsyncError> {
     self.handle().block_on(future)
   }
@@ -225,13 +229,37 @@ impl AsyncRuntime {
   pub fn scope(&self) -> Result<OwnedTaskScope, AsyncError> {
     self
       .shared
-      .new_scope(self.shared.default_scope_poll_limit())
+      .new_scope(self.shared.default_scope_poll_limit(), None)
   }
 
   /// Creates an independently cancellable owned scope with a per-scope
   /// simultaneous polling limit.
   pub fn scope_with_config(&self, config: AsyncScopeConfig) -> Result<OwnedTaskScope, AsyncError> {
-    self.shared.new_scope(config.max_active_polls)
+    self.shared.new_scope(config.max_active_polls, None)
+  }
+
+  /// Creates an owned scope whose tasks may explicitly access `resources`
+  /// through [`current_resource_scope`]. Only managed buffers and operation
+  /// permits are charged; ordinary Rust allocations are unaffected.
+  pub fn scope_with_resources(
+    &self,
+    resources: &ResourceScope,
+  ) -> Result<OwnedTaskScope, AsyncError> {
+    self.shared.new_scope(
+      self.shared.default_scope_poll_limit(),
+      Some(resources.clone()),
+    )
+  }
+
+  /// Creates a resource-bound owned scope with an explicit active-poll limit.
+  pub fn scope_with_config_and_resources(
+    &self,
+    config: AsyncScopeConfig,
+    resources: &ResourceScope,
+  ) -> Result<OwnedTaskScope, AsyncError> {
+    self
+      .shared
+      .new_scope(config.max_active_polls, Some(resources.clone()))
   }
 
   /// Closes admission and joins every worker.
@@ -266,11 +294,15 @@ impl Drop for AsyncRuntime {
 pub struct AsyncHandle {
   shared: Arc<Shared>,
   scope: ScopeRef,
+  resources: Option<ResourceScope>,
 }
 
 impl AsyncHandle {
-  /// Polls a caller-owned future on this thread until it completes. See
-  /// [`AsyncRuntime::block_on`] for the root-future and reentrancy contract.
+  /// Polls a caller-owned future on this thread until it completes. This
+  /// borrowed root poll has no spawned task ID; if this handle belongs to a
+  /// resource-bound scope, it exposes that explicitly bound resource ledger
+  /// for the duration of the poll. See [`AsyncRuntime::block_on`] for the
+  /// root-future and reentrancy contract.
   pub fn block_on<F: std::future::Future>(&self, future: F) -> Result<F::Output, AsyncError> {
     entry::block_on(self, future)
   }

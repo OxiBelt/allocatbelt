@@ -10,6 +10,7 @@ use super::entry::TaskContextGuard;
 use super::identity::TaskId;
 use super::join::{AsyncJob, AsyncJoinError, JoinState};
 use super::scheduler::{PollPermit, Shared, TaskRef};
+use crate::runtime::managed::ResourceScope;
 
 pub(super) enum PollResult {
   Pending,
@@ -35,6 +36,7 @@ pub(super) struct Task<F: Future + Send + 'static> {
   staged: Mutex<Option<Result<F::Output, AsyncJoinError>>>,
   join: Arc<JoinState<F::Output>>,
   id: TaskId,
+  resources: Option<ResourceScope>,
 }
 
 impl<F: Future + Send + 'static> Task<F> {
@@ -59,7 +61,8 @@ where
   F::Output: Send + 'static,
 {
   fn poll(&self, cx: &mut Context<'_>, permit: PollPermit) -> PollResult {
-    let _task_context = TaskContextGuard::enter(Some(self.id));
+    let _task_context =
+      TaskContextGuard::enter_with_resource(Some(self.id), self.resources.clone());
     let Some(mut future) = self.lock_future().take() else {
       return PollResult::Ready;
     };
@@ -95,7 +98,8 @@ where
   }
 
   fn cancel(&self) {
-    let _task_context = TaskContextGuard::enter(Some(self.id));
+    let _task_context =
+      TaskContextGuard::enter_with_resource(Some(self.id), self.resources.clone());
     let panic = self.finish_future();
     let outcome = match panic {
       Some(payload) => Err(AsyncJoinError::Panicked(payload)),
@@ -105,7 +109,8 @@ where
   }
 
   fn publish(&self) {
-    let _task_context = TaskContextGuard::enter(Some(self.id));
+    let _task_context =
+      TaskContextGuard::enter_with_resource(Some(self.id), self.resources.clone());
     let staged = self
       .staged
       .lock()
@@ -135,6 +140,7 @@ where
   pub(super) fn create(
     future: F,
     id: TaskId,
+    resources: Option<ResourceScope>,
     shared: Weak<Shared>,
     task: TaskRef,
   ) -> (Arc<dyn ErasedTask>, AsyncJob<F::Output>) {
@@ -150,6 +156,7 @@ where
       staged: Mutex::new(None),
       join: Arc::clone(&join),
       id,
+      resources,
     });
     let erased: Arc<dyn ErasedTask> = task;
     (erased, AsyncJob::new(join, abort))

@@ -15,6 +15,7 @@ use super::protocol::{PollFinish, PollProtocol, PollQuota, ScopeProtocol};
 use super::task::{ErasedTask, PollResult, Task};
 use super::{AsyncConfig, AsyncError, AsyncSpawnError};
 use crate::runtime::cache;
+use crate::runtime::managed::ResourceScope;
 
 thread_local! {
   static WORKER_RUNTIME: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
@@ -68,6 +69,7 @@ struct ScopeCell {
   reference: Option<ScopeRef>,
   shared: Option<Weak<Shared>>,
   max_active_polls: usize,
+  resources: Option<ResourceScope>,
   protocol: ScopeProtocol,
   completion: Mutex<Option<Waker>>,
 }
@@ -77,11 +79,13 @@ impl ScopeCell {
     reference: Option<ScopeRef>,
     shared: Option<Weak<Shared>>,
     max_active_polls: usize,
+    resources: Option<ResourceScope>,
   ) -> Self {
     Self {
       reference,
       shared,
       max_active_polls,
+      resources,
       protocol: ScopeProtocol::new(reference.is_none()),
       completion: Mutex::new(None),
     }
@@ -147,7 +151,7 @@ impl Shared {
     else {
       return Err(AsyncError::InvalidConfig);
     };
-    let root_scope = Arc::new(ScopeCell::new(None, None, config.workers));
+    let root_scope = Arc::new(ScopeCell::new(None, None, config.workers, None));
     scopes[0] = ScopeSlot {
       generation: 1,
       scope: Some(root_scope),
@@ -207,6 +211,7 @@ impl Shared {
   pub(super) fn new_scope(
     self: &Arc<Self>,
     max_active_polls: usize,
+    resources: Option<ResourceScope>,
   ) -> Result<OwnedTaskScope, AsyncError> {
     if max_active_polls == 0 {
       return Err(AsyncError::InvalidConfig);
@@ -226,6 +231,7 @@ impl Shared {
       Some(scope_ref),
       Some(Arc::downgrade(self)),
       max_active_polls,
+      resources,
     ));
     state.scopes[index].generation = generation;
     state.scopes[index].scope = Some(Arc::clone(&cell));
@@ -319,7 +325,13 @@ impl Shared {
       return Err(AsyncSpawnError::new(AsyncError::TaskIdExhausted, future));
     };
     let task_ref = TaskRef { index, generation };
-    let (task, job) = Task::create(future, task_id, Arc::downgrade(self), task_ref);
+    let (task, job) = Task::create(
+      future,
+      task_id,
+      scope_cell.resources.clone(),
+      Arc::downgrade(self),
+      task_ref,
+    );
     state.tasks[index].protocol.admit(generation);
     state.tasks[index].scope = Some(scope);
     state.tasks[index].task = Some(task);
@@ -450,6 +462,7 @@ impl OwnedTaskScope {
     super::AsyncHandle {
       shared: Arc::clone(&self.shared),
       scope: self.scope,
+      resources: self.cell.resources.clone(),
     }
   }
 
@@ -783,6 +796,7 @@ pub(super) fn worker(shared: Arc<Shared>, index: usize) {
       index: 0,
       generation: 1,
     },
+    resources: None,
   };
   let _runtime_context = super::entry::EnterGuard::enter(&worker_handle);
   loop {
@@ -898,7 +912,7 @@ mod tests {
     })
     .unwrap_or_else(|error| panic!("shared construction failed: {error}"));
     let scope = shared
-      .new_scope(2)
+      .new_scope(2, None)
       .unwrap_or_else(|error| panic!("scope construction failed: {error}"));
     let old_reference = scope.scope;
     let cell = Arc::clone(&scope.cell);
@@ -923,7 +937,7 @@ mod tests {
     ));
 
     let replacement = shared
-      .new_scope(1)
+      .new_scope(1, None)
       .unwrap_or_else(|error| panic!("reclaimed scope slot unavailable: {error}"));
     assert_eq!(replacement.scope.index, old_reference.index);
     assert!(replacement.scope.generation > old_reference.generation);

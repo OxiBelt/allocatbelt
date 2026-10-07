@@ -14,6 +14,7 @@ use std::thread::{self, Thread};
 
 use super::identity::TaskId;
 use super::{AsyncError, AsyncHandle};
+use crate::runtime::managed::ResourceScope;
 
 const DEFAULT_BUDGET: u16 = 64;
 
@@ -23,6 +24,7 @@ thread_local! {
   static EXECUTOR_WORKER: Cell<bool> = const { Cell::new(false) };
   static COOPERATIVE_BUDGET: Cell<u16> = const { Cell::new(DEFAULT_BUDGET) };
   static CURRENT_TASK_ID: Cell<Option<TaskId>> = const { Cell::new(None) };
+  static CURRENT_RESOURCE_SCOPE: RefCell<Option<ResourceScope>> = const { RefCell::new(None) };
 }
 
 struct ContextNode {
@@ -134,14 +136,24 @@ impl Drop for WorkerContextGuard {
 /// Restores the previous task identity after polling, callbacks, or unwind.
 pub(super) struct TaskContextGuard {
   previous: Option<TaskId>,
+  previous_resources: Option<ResourceScope>,
   _not_send: PhantomData<Rc<()>>,
 }
 
 impl TaskContextGuard {
   pub(super) fn enter(task_id: Option<TaskId>) -> Self {
+    Self::enter_with_resource(task_id, None)
+  }
+
+  pub(super) fn enter_with_resource(
+    task_id: Option<TaskId>,
+    resources: Option<ResourceScope>,
+  ) -> Self {
     let previous = CURRENT_TASK_ID.with(|current| current.replace(task_id));
+    let previous_resources = CURRENT_RESOURCE_SCOPE.with(|current| current.replace(resources));
     Self {
       previous,
+      previous_resources,
       _not_send: PhantomData,
     }
   }
@@ -150,7 +162,35 @@ impl TaskContextGuard {
 impl Drop for TaskContextGuard {
   fn drop(&mut self) {
     let _ = CURRENT_TASK_ID.try_with(|current| current.set(self.previous));
+    let _ = CURRENT_RESOURCE_SCOPE.try_with(|current| {
+      let replaced = current.replace(self.previous_resources.take());
+      drop(replaced);
+    });
   }
+}
+
+/// Returns the explicitly bound managed-resource ledger during a task poll,
+/// runtime-owned future cleanup/publication, or a resource-bound handle's
+/// borrowed root poll. Returns `None` for unbound tasks and runtime roots.
+#[must_use]
+pub fn try_current_resource_scope() -> Option<ResourceScope> {
+  CURRENT_RESOURCE_SCOPE
+    .try_with(|current| current.borrow().clone())
+    .unwrap_or(None)
+}
+
+/// Returns the explicitly bound managed-resource ledger for the current
+/// task or bound-handle root poll.
+///
+/// # Panics
+///
+/// Panics when the current task or root poll has no resource binding. This
+/// accessor exposes only the managed ledger; ordinary allocations remain
+/// outside its accounting.
+#[must_use]
+pub fn current_resource_scope() -> ResourceScope {
+  try_current_resource_scope()
+    .unwrap_or_else(|| panic!("no managed resource scope is bound to this async context"))
 }
 
 /// Returns the identity of the task currently being polled or cleaned up.
@@ -201,7 +241,7 @@ pub(super) fn block_on<F: Future>(
   future: F,
 ) -> Result<F::Output, AsyncError> {
   let _block = BlockOnGuard::enter()?;
-  let _task_context = TaskContextGuard::enter(None);
+  let _task_context = TaskContextGuard::enter_with_resource(None, handle.resources.clone());
   let _context = EnterGuard::enter(handle);
   Ok(block_on_caller_thread(future))
 }
