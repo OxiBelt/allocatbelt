@@ -177,6 +177,30 @@ Actual-source Loom models cover queue close versus enqueue, single-message send
 versus receiver registration, and send versus receiver destruction. They do not
 model every channel/executor combination or arbitrary user callback behavior.
 
+`runtime::watch::channel` retains the latest value in an owned `Arc` and fixes
+the receiver bound at construction. Construction failures preserve the initial
+value. `subscribe` starts at the current version; receiver `try_clone` copies
+the observed version. `borrow` returns an owned snapshot without consuming a
+change, while `borrow_and_update`, receiver marking and successful `changed`
+calls control observation. Updates coalesce. An unread final version remains
+observable once before closure or version exhaustion.
+
+`send` rejects without receivers and returns its unchanged input; `send_replace`
+can retain a new value for later subscribers. `Sender::closed` has a separate
+waiter table with the same configured bound as receivers. Completion and
+cancellation promptly release its slots; repeated closure/reopen notifications
+yield after 64 rearms. Predicate `wait_for` executes outside locks, drops rejected
+snapshots before waiting and yields after 64 rejected candidates. Cancellation
+at that yield does not consume the next unexamined update.
+
+These snapshots require `T: Send + Sync` for threaded use. Local borrowed values
+need no `'static` bound. They keep managed-storage charges through final release,
+including after replacement or channel destruction; arbitrary values and
+metadata remain outside that ledger. This port uses owned snapshots instead of
+Tokio's lock guards and omits mutation callbacks under a lock. Twenty native
+tests, two compile-fail examples and five actual-source Loom models cover
+observation, replacement, cancellation, closure registration and trait bounds.
+
 ## Bounded notifications
 
 `runtime::notify::Notify` reserves its complete waiter table at construction.

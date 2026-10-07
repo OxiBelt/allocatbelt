@@ -105,6 +105,7 @@ mod tests;
 #[cfg(all(test, not(loom)))]
 mod tests_guard;
 pub mod time;
+pub mod watch;
 mod worker;
 
 pub use crate::runtime::blocking::{Config, Handle, Runtime, ShutdownMode};
