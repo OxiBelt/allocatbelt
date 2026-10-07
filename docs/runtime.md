@@ -1187,8 +1187,12 @@ observations cannot write until explicit `resume_from_readback` finds a known
 tier with the original memory.max. No rollback, retry or replay occurs.
 The caller must coordinate descriptor aliases and other writers: readback can
 detect observed drift but cannot prevent a race between different control
-files. Pure policy/fault-injection tests cover these limits; actual delegated
-kernel-controller qualification and native application benefits are separate.
+files. Pure policy/fault-injection tests cover these limits. A correctness-only
+native integration in a private container cgroup descendant verified actual
+CPU and `memory.high` promotion/recovery, cooldown, floor/ceiling, drift faulting
+without replay and explicit readback recovery. The fixture uses synthetic
+caller-clock samples and does not establish response under real resource
+pressure or a native application benefit.
 
 ## Path toward replacing Tokio
 

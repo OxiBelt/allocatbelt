@@ -6,8 +6,9 @@ stale positions against the live list, and preserves uniform randomized
 selection. It adds 64 bytes per class, or 2,048 bytes per thread cache. No
 shared allocation bitmap, lock protocol or design constraint changes.
 
-Status: native change-comparison gates passed on three hosts; complete core
-Miri qualification is still running. This candidate has not established the
+Status: native throughput/p99 change-comparison gates passed on three hosts;
+complete core Miri and retained-memory qualification are still running.
+This candidate has not established the
 library's required superiority over either mimalloc baseline or Tokio.
 
 ## Fixed comparison
@@ -56,15 +57,17 @@ p99 are favorable.
 
 Each host passes the change gates of throughput lower bound at least 1.05
 and p99 upper bound at most 0.95. Every measured workload also passes the
-throughput lower-bound guard of 0.98, process-CPU upper bound of 1.02, p99 upper
-bound of 1.05 and peak-RSS upper bound of 1.05. These results compare the
+throughput lower-bound guard of 0.98, process-CPU upper bound of 1.02 and p99 upper
+bound of 1.05. These results compare the
 candidate with the unchanged allocatbelt baseline.
 
 `perf stat` task-clock in throughput processes measures whole-process CPU,
-including work outside the timed trace. The RSS guard uses the worse paired
-ratio from latency and throughput modes. Peak RSS includes the latency sample
-vector and does not qualify
-retained idle thread-cache memory. The added 2 KiB per cache remains an explicit
+including work outside the timed trace. The original RSS analysis used the
+worse paired ratio from latency and throughput modes. Those modes ran in
+separate batches, so their repetition indices do not establish cross-mode
+pairing. Separate mode bounds remain required for that guard. Peak RSS includes
+the latency sample vector and does not qualify retained idle thread-cache
+memory. The added 2 KiB per cache remains an explicit
 cost. Timer quantization can produce identical p99 ratios and zero-width
 bootstrap intervals; these are not exact physical latency bounds. Guest host
 scheduling and frequency remain potential confounders.
@@ -73,6 +76,41 @@ Complete Miri, retained-memory/application checks and the separate mimalloc
 and matched-allocator Tokio qualification remain required. Raw logs, hashes,
 profiles and analyses are held in the private resources checkout. The
 [implementation plan](resource-runtime-plan.md) specifies the broader gates.
+
+## Compact list comparison
+
+A separate candidate compares eight cached block numbers at a time with safe
+byte-to-word operations, then scans any remainder. It queries the actual live
+list and adds no persistent metadata; stale entries outside the live prefix
+are ignored. Return packing and randomized block selection are unchanged.
+Its thread-cache layout remains 3,960 bytes, compared with 6,008 bytes for the
+inverse-position candidate. Those sizes are layout facts, not resident-memory
+measurements.
+
+On the 8845HS guest, six exploratory pairs per workload/mode preceded an independent fixed
+36-pair confirmation against signed baseline
+`cad3a129b1ebce7d21c3058a608277c9f16f0ec7`. The workloads, affinity and iteration
+counts match the configuration above, using the current 22-column harness.
+All 432 fresh processes passed argument, completion-count, checksum and source
+hash validation. Throughput and latency modes ran separately.
+
+| Ratio | Point estimate | Conservative acceptance bound |
+|---|---:|---:|
+| Aggregate throughput | 1.200 | Lower 1.177 |
+| Aggregate p99 | 0.930 | Upper 0.946 |
+
+Paired log-ratio percentile bootstrap uses 50,000 resamples, seed 20261007 and
+Bonferroni adjustment for seventeen contrasts. Approximate simultaneous bounds
+are computed separately for each workload and each RSS mode; aggregate bounds
+are conservative geometric means of the individual bounds. Every measured
+workload passes its throughput, whole-process task-clock, p99 and separate-mode
+peak-RSS guard. Independent review corrected a preliminary CPU analysis that
+read event-runtime metadata instead of the measured `perf` task-clock counter;
+the corrected analysis is the acceptance result.
+
+This is a one-host allocator-change result. Other-host confirmation, complete
+Miri, parked-cache retention and application qualification remain required.
+Neither cache candidate has established superiority over mimalloc or Tokio.
 
 ## Separate retained-cache memory probe
 
