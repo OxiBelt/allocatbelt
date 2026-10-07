@@ -6,10 +6,12 @@ stale positions against the live list, and preserves uniform randomized
 selection. It adds 64 bytes per class, or 2,048 bytes per thread cache. No
 shared allocation bitmap, lock protocol or design constraint changes.
 
-Status: native throughput/p99 change-comparison gates passed on three hosts;
-complete core Miri and retained-memory qualification are still running.
-This candidate has not established the
-library's required superiority over either mimalloc baseline or Tokio.
+Status: withdrawn from the working implementation. Native throughput/p99
+change-comparison gates passed on three hosts, but the independent retained-cache
+probe showed memory regressions. It was withdrawn before completing
+qualification. The original full Miri campaigns were stopped incomplete and do not establish a full-suite pass. The working allocator uses
+the unchanged baseline cache. Neither candidate has established the library's
+required superiority over either mimalloc baseline or Tokio.
 
 ## Fixed comparison
 
@@ -72,8 +74,8 @@ cost. Timer quantization can produce identical p99 ratios and zero-width
 bootstrap intervals; these are not exact physical latency bounds. Guest host
 scheduling and frequency remain potential confounders.
 
-Complete Miri, retained-memory/application checks and the separate mimalloc
-and matched-allocator Tokio qualification remain required. Raw logs, hashes,
+Complete Miri, passing retained-memory/application checks and the separate mimalloc
+and matched-allocator Tokio qualification remain required before promotion. Raw logs, hashes,
 profiles and analyses are held in the private resources checkout. The
 [implementation plan](resource-runtime-plan.md) specifies the broader gates.
 
@@ -108,9 +110,21 @@ peak-RSS guard. Independent review corrected a preliminary CPU analysis that
 read event-runtime metadata instead of the measured `perf` task-clock counter;
 the corrected analysis is the acceptance result.
 
-This is a one-host allocator-change result. Other-host confirmation, complete
-Miri, parked-cache retention and application qualification remain required.
-Neither cache candidate has established superiority over mimalloc or Tokio.
+This is a one-host allocator-change result. A separate fixed retained-cache
+campaign completed every process but failed three of its twenty-four simultaneous
+memory bounds; the failing bounds concern PSS or combined private memory.
+Those failures remain failures. A smaller diagnostic using per-mapping samples
+did not reproduce the earlier private-clean fluctuation and does not explain
+or overturn those bounds. The compact candidate remains unpromoted.
+
+Fifteen focused actual-Miri cases passed, including the two formerly cancelled
+page fixtures, with ordinary leak checking and a thirty-minute limit per case.
+That focused result is not a full-suite pass. Native stress counts are retained
+while Miri fixtures bound allocation pressure and model-program work. A new
+complete campaign checks the repaired baseline separately from either candidate.
+Other-host confirmation, passing retained-memory bounds and application
+qualification remain required. Neither cache candidate has established
+superiority over mimalloc or Tokio.
 
 ## Separate retained-cache memory probe
 
