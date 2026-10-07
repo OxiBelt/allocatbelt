@@ -39,6 +39,7 @@ use std::os::fd::OwnedFd;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::task::{Context, Poll};
+use std::time::Duration;
 
 use rustix::fs::{self as rfs, OFlags};
 use rustix::io::{Errno, FdFlags};
@@ -122,6 +123,111 @@ impl TcpSocket {
       Some(rnet::ipproto::TCP),
     )?;
     Ok(Self { fd, family })
+  }
+
+  /// Returns the kernel-observed IPv4 type-of-service value.
+  ///
+  /// The value is in `0..=255`. Linux preserves the socket's two low ECN bits;
+  /// setting TOS controls the upper six DSCP bits but does not clear ECN.
+  /// This option may not affect IPv6 sockets. Socket aliases share the option
+  /// state.
+  pub fn tos_v4(&self) -> io::Result<u32> {
+    crate::sys::runtime_net_options::get_traffic_class(
+      &self.fd,
+      crate::sys::runtime_net_options::TrafficClass::Ipv4Tos,
+    )
+  }
+
+  /// Sets the IPv4 type-of-service value used for packets sent by this socket.
+  ///
+  /// Values outside `0..=255` are rejected before the syscall. Linux preserves
+  /// the two low ECN bits; the kernel preserves their prior value while this
+  /// setter controls the upper six DSCP bits. Socket aliases share the option
+  /// state.
+  pub fn set_tos_v4(&self, tos: u32) -> io::Result<()> {
+    crate::sys::runtime_net_options::set_traffic_class(
+      &self.fd,
+      crate::sys::runtime_net_options::TrafficClass::Ipv4Tos,
+      tos,
+    )
+  }
+
+  /// Returns the kernel-observed IPv6 traffic-class value.
+  ///
+  /// Values are in `0..=255`. Linux preserves the socket's two low ECN bits;
+  /// setting the traffic class controls the upper six DSCP bits but does not
+  /// clear ECN. Socket aliases share the option state.
+  pub fn tclass_v6(&self) -> io::Result<u32> {
+    crate::sys::runtime_net_options::get_traffic_class(
+      &self.fd,
+      crate::sys::runtime_net_options::TrafficClass::Ipv6Class,
+    )
+  }
+
+  /// Sets the IPv6 traffic-class value used for packets sent by this socket.
+  ///
+  /// Values outside `0..=255` are rejected before the syscall. Linux preserves
+  /// the two low ECN bits; the kernel preserves their prior value while this
+  /// setter controls the upper six DSCP bits. Socket aliases share the option
+  /// state.
+  pub fn set_tclass_v6(&self, tclass: u32) -> io::Result<()> {
+    crate::sys::runtime_net_options::set_traffic_class(
+      &self.fd,
+      crate::sys::runtime_net_options::TrafficClass::Ipv6Class,
+      tclass,
+    )
+  }
+
+  /// Returns the bound interface name, if `SO_BINDTODEVICE` is set.
+  ///
+  /// The returned `Vec` is ordinary caller-owned metadata and is not charged
+  /// to a [`ResourceScope`]. The kernel limits names to `IFNAMSIZ`; aliases
+  /// share this setting.
+  pub fn device(&self) -> io::Result<Option<Vec<u8>>> {
+    let mut bytes = [0_u8; libc::IFNAMSIZ];
+    let Some(length) = crate::sys::runtime_net_options::get_device(&self.fd, &mut bytes)? else {
+      return Ok(None);
+    };
+    Ok(Some(bytes[..length].to_vec()))
+  }
+
+  /// Binds this socket to a network interface, or clears the binding with
+  /// `None` or an empty name.
+  ///
+  /// A binding restricts packet handling to the selected interface where the
+  /// kernel supports it. The kernel may require a network capability to set
+  /// this option. It is not a sandbox or runtime resource reservation, and
+  /// aliases share the setting. Names containing NUL or at least `IFNAMSIZ`
+  /// bytes are rejected before the syscall.
+  pub fn bind_device(&self, interface: Option<&[u8]>) -> io::Result<()> {
+    crate::sys::runtime_net_options::set_device(&self.fd, interface)
+  }
+
+  /// Returns the configured `SO_LINGER` duration, if any.
+  pub fn linger(&self) -> io::Result<Option<Duration>> {
+    rnet::sockopt::socket_linger(&self.fd).map_err(Into::into)
+  }
+
+  /// Configures `SO_LINGER` for this socket.
+  ///
+  /// A positive duration can make synchronous socket close or `Drop` block on
+  /// the calling thread while the kernel sends queued data, even though this
+  /// socket is nonblocking. It can therefore block an executor worker. This
+  /// setting does not make `shutdown` an asynchronous linger operation. The
+  /// Rustix adapter rounds positive durations up to whole seconds; it may
+  /// reject values that do not fit the kernel option representation. Socket
+  /// aliases share the setting.
+  pub fn set_linger(&self, duration: Option<Duration>) -> io::Result<()> {
+    rnet::sockopt::set_socket_linger(&self.fd, duration).map_err(Into::into)
+  }
+
+  /// Enables abortive close for this socket by setting `SO_LINGER` to zero.
+  ///
+  /// Closing or dropping the socket discards unsent data in the kernel send
+  /// buffer and sends a reset instead of a normal close handshake. This is
+  /// destructive; aliases share the setting.
+  pub fn set_zero_linger(&self) -> io::Result<()> {
+    self.set_linger(Some(Duration::ZERO))
   }
 
   /// Imports an owned descriptor after checking its family, type, protocol,
@@ -446,6 +552,52 @@ impl TcpStream {
   #[must_use]
   pub fn get_ref(&self) -> &StdTcpStream {
     self.fd.get_ref()
+  }
+
+  /// Returns the configured `SO_LINGER` duration, if any.
+  pub fn linger(&self) -> io::Result<Option<Duration>> {
+    rnet::sockopt::socket_linger(self.fd.get_ref()).map_err(Into::into)
+  }
+
+  /// Configures `SO_LINGER` for this stream.
+  ///
+  /// A positive duration can make synchronous stream close or `Drop` block on
+  /// the calling thread while the kernel sends queued data, even though this
+  /// stream is nonblocking. It can therefore block an executor worker. This
+  /// setting does not make `shutdown` an asynchronous linger operation. The
+  /// Rustix adapter rounds positive durations up to whole seconds; it may
+  /// reject values that do not fit the kernel option representation. Socket
+  /// aliases share the setting.
+  pub fn set_linger(&self, duration: Option<Duration>) -> io::Result<()> {
+    rnet::sockopt::set_socket_linger(self.fd.get_ref(), duration).map_err(Into::into)
+  }
+
+  /// Enables abortive close by setting `SO_LINGER` to zero.
+  ///
+  /// Closing or dropping the stream discards unsent data in the kernel send
+  /// buffer and sends a reset instead of a normal close handshake. This is
+  /// destructive; aliases share the setting.
+  pub fn set_zero_linger(&self) -> io::Result<()> {
+    self.set_linger(Some(Duration::ZERO))
+  }
+
+  /// Returns whether Linux `TCP_QUICKACK` is enabled for this stream.
+  ///
+  /// This is a socket option, not a persistent mode: Linux may reset it after
+  /// later socket operations. Aliases of this socket observe the same setting.
+  #[cfg(target_os = "linux")]
+  pub fn quickack(&self) -> io::Result<bool> {
+    rnet::sockopt::tcp_quickack(self.fd.get_ref()).map_err(Into::into)
+  }
+
+  /// Enables or disables Linux `TCP_QUICKACK` for this stream.
+  ///
+  /// Enabling it asks Linux to send acknowledgments promptly rather than
+  /// delaying them. Linux may reset the option after later socket operations;
+  /// aliases of this socket share the setting.
+  #[cfg(target_os = "linux")]
+  pub fn set_quickack(&self, quickack: bool) -> io::Result<()> {
+    rnet::sockopt::set_tcp_quickack(self.fd.get_ref(), quickack).map_err(Into::into)
   }
 
   /// Reads once after readable readiness, preserving the standard stream's

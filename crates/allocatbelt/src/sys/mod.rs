@@ -32,6 +32,8 @@ mod platform;
 mod ring;
 #[cfg(feature = "experimental-rseq")]
 mod rseq;
+#[cfg(feature = "runtime")]
+pub(crate) mod runtime_net_options;
 #[cfg(feature = "runtime-io-uring")]
 pub(crate) mod runtime_ring;
 #[cfg(feature = "runtime")]

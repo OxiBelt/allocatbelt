@@ -501,6 +501,78 @@ fn tcp_socket_listen_autobinds_and_accepts_with_zero_backlog() {
 }
 
 #[test]
+fn tcp_socket_ip_traffic_class_round_trips_ds_values_and_rejects_overflow() {
+  let ipv4 = TcpSocket::new_v4().unwrap();
+  let ipv4_ecn = ipv4.tos_v4().unwrap() & 0x03;
+  ipv4.set_tos_v4(0x2c).unwrap();
+  let observed_ipv4 = ipv4.tos_v4().unwrap();
+  assert_eq!(observed_ipv4 & 0xfc, 0x2c);
+  assert_eq!(observed_ipv4 & 0x03, ipv4_ecn);
+  assert_eq!(
+    ipv4.set_tos_v4(256).unwrap_err().kind(),
+    std::io::ErrorKind::InvalidInput
+  );
+  assert_eq!(ipv4.tos_v4().unwrap(), observed_ipv4);
+
+  let ipv6 = TcpSocket::new_v6().unwrap();
+  let ipv6_ecn = ipv6.tclass_v6().unwrap() & 0x03;
+  ipv6.set_tclass_v6(0x38).unwrap();
+  let observed_ipv6 = ipv6.tclass_v6().unwrap();
+  assert_eq!(observed_ipv6 & 0xfc, 0x38);
+  assert_eq!(observed_ipv6 & 0x03, ipv6_ecn);
+  assert_eq!(
+    ipv6.set_tclass_v6(u32::MAX).unwrap_err().kind(),
+    std::io::ErrorKind::InvalidInput
+  );
+  assert_eq!(ipv6.tclass_v6().unwrap(), observed_ipv6);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn tcp_socket_device_binding_validates_inputs_and_reads_back_kernel_state() {
+  let socket = TcpSocket::new_v4().unwrap();
+  assert_eq!(socket.device().unwrap(), None);
+  socket.bind_device(None).unwrap();
+  socket.bind_device(Some(b"")).unwrap();
+  for invalid in [b"lo\0bad".as_slice(), vec![b'x'; libc::IFNAMSIZ].as_slice()] {
+    assert_eq!(
+      socket.bind_device(Some(invalid)).unwrap_err().kind(),
+      std::io::ErrorKind::InvalidInput
+    );
+  }
+  assert_eq!(socket.device().unwrap(), None);
+
+  match socket.bind_device(Some(b"lo")) {
+    Ok(()) => {
+      assert_eq!(socket.device().unwrap().as_deref(), Some(b"lo".as_slice()));
+      socket.bind_device(None).unwrap();
+      assert_eq!(socket.device().unwrap(), None);
+    }
+    Err(error) if matches!(error.raw_os_error(), Some(libc::EPERM | libc::EACCES)) => {
+      // Some containers do not grant the network capability needed for this option.
+      assert_eq!(socket.device().unwrap(), None);
+    }
+    Err(error) => panic!("binding to loopback failed unexpectedly: {error}"),
+  }
+}
+
+#[test]
+fn tcp_socket_linger_is_checked_and_reset_before_drop() {
+  let socket = TcpSocket::new_v4().unwrap();
+  assert_eq!(socket.linger().unwrap(), None);
+
+  socket.set_linger(Some(Duration::from_millis(1))).unwrap();
+  assert_eq!(socket.linger().unwrap(), Some(Duration::from_secs(1)));
+  assert!(socket.set_linger(Some(Duration::MAX)).is_err());
+  assert_eq!(socket.linger().unwrap(), Some(Duration::from_secs(1)));
+
+  socket.set_zero_linger().unwrap();
+  assert_eq!(socket.linger().unwrap(), Some(Duration::ZERO));
+  socket.set_linger(None).unwrap();
+  assert_eq!(socket.linger().unwrap(), None);
+}
+
+#[test]
 fn negative_listen_backlog_returns_unchanged_socket_for_retry() {
   let reactor = reactor(2);
   let handle = reactor.handle();
@@ -666,6 +738,33 @@ fn connect_runs_on_the_blocking_pool_and_releases_its_network_permit() {
   assert_eq!(scope.snapshot().network_ops, 0);
   assert_eq!(stream.get_ref().peer_addr().unwrap(), address);
   runtime.shutdown(ShutdownMode::Drain).unwrap();
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn tcp_stream_quickack_round_trips_kernel_value() {
+  let reactor = reactor(1);
+  let handle = reactor.handle();
+  let listener = StdTcpListener::bind("127.0.0.1:0").unwrap();
+  let client = StdTcpStream::connect(listener.local_addr().unwrap()).unwrap();
+  let (accepted, _) = listener.accept().unwrap();
+  let stream = super::TcpStream::from_std(accepted, &handle).unwrap();
+
+  stream.set_quickack(true).unwrap();
+  assert!(stream.quickack().unwrap());
+  stream.set_quickack(false).unwrap();
+  assert!(!stream.quickack().unwrap());
+
+  stream.set_linger(Some(Duration::from_millis(1))).unwrap();
+  assert_eq!(stream.linger().unwrap(), Some(Duration::from_secs(1)));
+  stream.set_zero_linger().unwrap();
+  assert_eq!(stream.linger().unwrap(), Some(Duration::ZERO));
+  stream.set_linger(None).unwrap();
+  assert_eq!(stream.linger().unwrap(), None);
+
+  drop(stream);
+  drop(client);
+  reactor.shutdown().unwrap();
 }
 
 #[test]

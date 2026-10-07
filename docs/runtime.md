@@ -458,8 +458,22 @@ observed by the remote peer. Imported descriptors must be nonblocking,
 close-on-exec, unconnected TCP stream sockets that are not listening. The
 runtime cannot detect an external alias with an earlier connect in progress or
 one that consumes `SO_ERROR`; callers must coordinate aliases. These methods
-perform no DNS, address retry or timeout policy. Specialized socket options
-including linger, IP traffic class/TOS and interface binding remain pending.
+perform no DNS, address retry or timeout policy.
+
+`TcpStream::quickack` and `set_quickack` expose Linux `TCP_QUICKACK`; the kernel
+may reset it after later socket operations, and aliases observe the same
+setting. `TcpSocket` also exposes IPv4 TOS, IPv6 traffic class, interface
+binding and `SO_LINGER`; `TcpStream` exposes `SO_LINGER` as well. Traffic-class
+values are restricted to `0..=255`: Linux preserves the previously installed
+low two ECN bits and applies the requested upper six bits. Interface names
+must be shorter than `IFNAMSIZ` and contain no embedded NUL; binding may require
+a network capability. Returned interface-name vectors are ordinary caller-owned
+metadata outside managed-memory accounting. Linger is synchronous: a positive
+duration can block close or drop despite nonblocking socket mode, while zero
+linger requests an abortive close that discards unsent data. Ordinary write-side
+`SHUT_WR` does not perform that close-time linger wait. Duration rounding is the
+Rustix adapter's contract. These socket options reserve no runtime capacity or
+managed memory.
 
 The blocking `connect` and DNS resolver use the explicit bounded blocking
 handle. A blocking network permit remains held while work is queued or running;
@@ -1497,8 +1511,8 @@ implemented with the contracts above. The stable Linux Tokio 1.53.1 capability
 baseline still requires these implementation and qualification steps:
 
 1. Extend automatic cooperative progress beyond the currently listed
-   operations. Complete specialized TCP socket-option coverage beyond the
-   explicit-address nonblocking connect, listen and common option operations.
+   operations. Verify application ports across the explicit-address nonblocking
+   connect, listen and Linux socket-option capabilities.
 2. Add FIFO path constructors. Owned blocking streams, standard I/O adapters,
    anonymous Unix pipes, managed
    in-memory simplex/duplex pipes and caller-buffered bidirectional copy are

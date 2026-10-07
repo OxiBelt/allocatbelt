@@ -2,8 +2,13 @@
 
 `allocatbelt` is one package with responsibility-focused modules. `core` (`crates/allocatbelt/src/core/`) carries `#![forbid(unsafe_code)]` as an inner attribute, so it contains **0** `unsafe` sites, and the `publish = false` package `allocatbelt-core-check` compiles the same source as a `#![no_std]`, `#![forbid(unsafe_code)]` crate of its own, which runs the core's tests, the checking model and loom. The optional `runtime` module also carries `#![forbid(unsafe_code)]`; its
 blocking and owned-future implementations are shared with the unpublished runtime façade
-and remains safe. Runtime signal installation adds the narrow `sys` boundary
-listed below. Library `unsafe` is in `sys`, `arch`, `global` (with `rseq`) and the opt-in `region` API; benchmark-only `unsafe` is limited to the diagnostic allocator wrapper and SIMD candidates, listed below. Every `unsafe` block holds exactly one unsafe operation and carries a `// SAFETY:` comment (`clippy::undocumented_unsafe_blocks` and `multiple_unsafe_ops_per_block` are deny).
+and remains safe. Runtime signal installation and fixed TCP option syscalls add
+narrow `sys` boundaries listed below. Library `unsafe` is in `sys`, `arch`,
+`global` (with `rseq`) and the opt-in `region` API; benchmark-only `unsafe` is
+limited to the diagnostic allocator wrapper and SIMD candidates, listed below.
+Every `unsafe` block holds exactly one unsafe operation and carries a
+`// SAFETY:` comment (`clippy::undocumented_unsafe_blocks` and
+`multiple_unsafe_ops_per_block` are deny).
 
 Regenerate: `grep -rn "unsafe" crates/allocatbelt/src bench/src/bin/bench-runtime-diagnostic.rs bench/simd/src | grep -E "unsafe (\{|fn|impl|extern)"`
 
@@ -45,6 +50,19 @@ tests change dispositions only in subprocesses; actual listener-table Loom
 models cover cancellation, slot reuse and registration versus delivery/close.
 Handlers persist after subscriptions drop; unrelated concurrent application
 handler replacement has the registry's installation-race limitations.
+
+### `sys/runtime_net_options.rs` (optional `runtime`)
+
+This module contains only fixed Linux TCP/IP socket-option calls not available
+through rustix's safe option API. The runtime passes owned descriptors or
+borrowed interface bytes for one synchronous call; the wrappers allocate no
+memory and expose no generic raw-option function.
+
+| Location | Kind | Operation | Why it is sound |
+|---|---|---|---|
+| `get_traffic_class` / `set_traffic_class` | block each | `getsockopt` / `setsockopt` for the closed IPv4 TOS or IPv6 traffic-class enum | The enum selects the matching level/name pair. The descriptor stays borrowed and open; values are initialized `c_int`s; the checked `socklen_t` is exactly their size; the setter bounds values to 0–255. |
+| `get_device` | block | `getsockopt(SO_BINDTODEVICE)` | The kernel writes into a fully initialized, fixed `IFNAMSIZ` array. The reported length is checked against capacity and terminal-NUL structure before runtime code constructs its caller-owned `Vec`. |
+| `set_device` | block | `setsockopt(SO_BINDTODEVICE)` | The descriptor remains borrowed. A validated input slice lives through the call and the checked length covers only that slice; clearing uses a null pointer and zero length. |
 
 ### `sys/runtime_ring.rs` (feature `runtime-io-uring`)
 
@@ -110,7 +128,10 @@ The directive's Phase H added no `unsafe` site to the library: the tests it adde
 
 `futex_wait`/`futex_wake` (the heap locks' sleep and wake-up, and the maintenance thread's timed sleep) use rustix's safe futex functions and add no `unsafe` site.
 
-`libc` is used only for what rustix does not cover: the guard-marker advice values (not in rustix's `Advice` enum), `pthread_atfork`, `sched_setscheduler` (feature `scheduler`) and, with `experimental-rseq`, `getauxval`.
+`libc` is used only for what rustix does not cover: the guard-marker advice
+values (not in rustix's `Advice` enum), `pthread_atfork`, `sched_setscheduler`
+(feature `scheduler`), `getauxval` (with `experimental-rseq`), and the typed
+runtime TCP/IP option syscalls below.
 
 The `sys` module **does not use** `rustix::param::page_size()`: reading auxv may allocate when rustix's `alloc` feature gets unified in, which would re-enter the allocator. Instead every range uses a fixed 64 KiB granule, a multiple of all Linux page sizes.
 
