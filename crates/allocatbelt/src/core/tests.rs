@@ -3213,9 +3213,111 @@ fn pending_masks_follow_evictions_across_classes() {
   let tc = cache(h);
   // Blocks of three classes, freed in an order that fills sets and evicts
   // across classes; the masks must name exactly each class's slots.
+  //
+  // Native stress keeps 2,560 blocks of each of three tiny classes and frees
+  // all 7,680 in one seeded shuffle. Miri uses 24 full one-word pages of each
+  // of three large small classes (816 blocks, all live together). Page runs
+  // above `SMALL_MAX` never reach the free buffer. A fixed prefix frees one
+  // block of every page, interleaving the classes, and must evict a word of
+  // another class; the rest follow the same seeded shuffle. The separate
+  // bitmap-word boundary tests keep multiword and 64-block flush coverage.
+  let (sizes, counts) = if cfg!(miri) {
+    ([4096, 6144, 8192], [24 * 16, 24 * 10, 24 * 8])
+  } else {
+    ([16, 48, 256], [64 * 40; 3])
+  };
+  let classes = sizes.map(crate::core::class::class_of);
+  if cfg!(miri) {
+    assert!(
+      sizes
+        .iter()
+        .all(|&size| size <= crate::core::class::SMALL_MAX)
+    );
+    assert_eq!(classes.iter().collect::<BTreeSet<_>>().len(), 3);
+    assert_eq!(classes.map(crate::core::class::size), sizes);
+    assert_eq!(classes.map(crate::core::class::capacity), [16, 10, 8]);
+    assert_eq!(classes.map(crate::core::class::bitmap_words), [1; 3]);
+  }
   let mut offs: Vec<usize> = Vec::new();
-  for size in [16, 48, 256] {
-    offs.extend((0..64 * 40).map(|_| alloc_c(h, &tc, size, 8)));
+  // The position in `sizes` of each allocation's class.
+  let mut kinds: Vec<usize> = Vec::new();
+  for (k, (&size, &count)) in sizes.iter().zip(&counts).enumerate() {
+    offs.extend((0..count).map(|_| alloc_c(h, &tc, size, 8)));
+    kinds.resize(offs.len(), k);
+  }
+  // Miri: a fixed prefix of one block per page, by page ordinal and then
+  // class, so that sets fill with words of all three classes.
+  let mut prefix: Vec<usize> = Vec::new();
+  let mut cross_class_evictions = 0;
+  let mut freed = std::vec![false; offs.len()];
+  if cfg!(miri) {
+    assert_eq!(offs.len(), 816);
+    assert_eq!(offs.iter().collect::<BTreeSet<_>>().len(), offs.len());
+    // Every claimed word was exhausted: nothing is left in the cache.
+    assert_eq!(h.cache_stats(&tc).claimed_blocks, 0);
+    let mut pages: [std::collections::BTreeMap<usize, Vec<usize>>; 3] = Default::default();
+    let mut keys = BTreeSet::new();
+    for (i, (&o, &k)) in offs.iter().zip(&kinds).enumerate() {
+      let (page, word) = (o / PAGE_SIZE, o % PAGE_SIZE / (64 * sizes[k]));
+      assert_eq!(word, 0);
+      keys.insert((page, word, classes[k]));
+      pages[k].entry(page).or_default().push(i);
+    }
+    assert_eq!(keys.len(), 72);
+    for (k, by_page) in pages.iter().enumerate() {
+      assert_eq!(keys.iter().filter(|key| key.2 == classes[k]).count(), 24);
+      assert_eq!(by_page.len(), 24);
+      let capacity = crate::core::class::capacity(classes[k]);
+      assert!(by_page.values().all(|blocks| blocks.len() == capacity));
+    }
+    // `BTreeMap` order: each class's pages by address.
+    let firsts = pages.map(|by_page| {
+      by_page
+        .into_values()
+        .map(|blocks| blocks[0])
+        .collect::<Vec<_>>()
+    });
+    for ordinal in 0..24 {
+      prefix.extend(firsts.iter().map(|class_firsts| class_firsts[ordinal]));
+    }
+    assert_eq!(prefix.iter().collect::<BTreeSet<_>>().len(), 72);
+    let pending = || classes.map(|c| Heap::<MockOs>::pending_slots(&tc, c));
+    for &i in &prefix {
+      let k = kinds[i];
+      let (before, evictions) = (pending(), h.cache_stats(&tc).evictions);
+      free_c(h, &tc, offs[i]);
+      assert!(!std::mem::replace(&mut freed[i], true));
+      let (after, s) = (pending(), h.cache_stats(&tc));
+      assert_ne!(after[k], 0, "{s:?}");
+      // Nothing but this free changes the buffer: other classes can only
+      // lose a slot, and only to an eviction.
+      let mut other_lost = false;
+      for (j, (b, a)) in before.iter().zip(&after).enumerate() {
+        if j != k {
+          assert_eq!(a & !b, 0, "class {j} gained a slot: {s:?}");
+          other_lost |= b & !a != 0;
+        }
+      }
+      if s.evictions == evictions {
+        assert!(!other_lost, "{s:?}");
+      } else {
+        assert_eq!(s.evictions, evictions + 1, "{s:?}");
+        if other_lost {
+          cross_class_evictions += 1;
+        }
+      }
+    }
+    Heap::<MockOs>::check_free_buffer(&tc);
+    let s = h.cache_stats(&tc);
+    assert!(cross_class_evictions > 0, "{s:?}");
+    assert!(s.evictions > 0 && s.flushes > 0, "{s:?}");
+    // Partial-word flushes: no word holds more than 16 blocks here.
+    assert!(s.flush_sizes[..6].iter().any(|&n| n > 0), "{s:?}");
+    assert_eq!(s.flush_sizes[6], 0, "{s:?}");
+  }
+  let mut in_prefix = std::vec![false; offs.len()];
+  for &i in &prefix {
+    in_prefix[i] = true;
   }
   let mut x = 0x9E37_79B9u64;
   let mut order: Vec<usize> = (0..offs.len()).collect();
@@ -3225,8 +3327,12 @@ fn pending_masks_follow_evictions_across_classes() {
     x ^= x << 17;
     order.swap(i, (x % (i as u64 + 1)) as usize);
   }
-  for (n, &i) in order.iter().enumerate() {
+  // Native has no prefix, so this is the whole shuffled order.
+  for (n, &i) in order.iter().filter(|&&i| !in_prefix[i]).enumerate() {
     free_c(h, &tc, offs[i]);
+    if cfg!(miri) {
+      assert!(!std::mem::replace(&mut freed[i], true));
+    }
     if n % 97 == 0 {
       Heap::<MockOs>::check_free_buffer(&tc);
     }
@@ -3240,11 +3346,23 @@ fn pending_masks_follow_evictions_across_classes() {
     offs.len() as u64,
     "{s:?}"
   );
+  if cfg!(miri) {
+    assert!(freed.iter().all(|&f| f));
+    assert!(cross_class_evictions > 0, "{s:?}");
+    assert_eq!(s.flush_sizes[6], 0, "{s:?}");
+    assert!(h.os().live.lock().unwrap().is_empty());
+  }
   h.retire(&tc);
   for c in 0..crate::core::class::NUM_CLASSES {
     assert_eq!(Heap::<MockOs>::pending_slots(&tc, c), 0);
   }
   assert_eq!(h.usage().small_bytes_out, 0);
+  if cfg!(miri) {
+    let s = h.cache_stats(&tc);
+    assert_eq!((s.claimed_blocks, s.buffered_blocks), (0, 0), "{s:?}");
+    Heap::<MockOs>::check_free_buffer(&tc);
+    h.check_indexes();
+  }
 }
 
 #[test]

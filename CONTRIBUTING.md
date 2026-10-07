@@ -68,6 +68,11 @@ representative size under Miri, with three simultaneous allocations per size.
 The class-selective refill test exhausts a 128-block, two-word page under Miri
 and retains its full 4096-block page in native tests. Both configurations verify
 the exact buffered-block reuse, other-class isolation and final reclamation.
+The cross-class pending-mask test keeps its 7,680 native allocations, seed and
+free order. Under Miri it exhausts 24 one-word pages of each of the 4096-,
+6144- and 8192-byte classes (816 live blocks), then frees one block per page
+in a fixed class-interleaved prefix that must evict another class's word. The
+remaining blocks follow the same seeded shuffle through final reclamation.
 The Miri model workload uses at most 96 semantic instructions and a bounded
 cumulative allocation-page allowance, checked by an independent decoder. Its
 deterministic prefix covers route changes, cross-cache frees, resize, maintenance and failed
