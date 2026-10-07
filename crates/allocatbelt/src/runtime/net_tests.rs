@@ -1429,20 +1429,24 @@ fn refused_nonblocking_connect_releases_its_permit_and_registration() {
     network_concurrent_ops: 1,
   });
   let net = NetHandle::new(blocking.handle(), scope.clone(), reactor.handle(), 1).unwrap();
-  let listener = StdTcpListener::bind("127.0.0.1:0").unwrap();
-  let address = listener.local_addr().unwrap();
-  drop(listener);
+  // A bound, non-listening socket reserves the refusal address throughout
+  // this check, so parallel tests cannot turn it into a live listener.
+  let reservation = TcpSocket::new_v4().unwrap();
+  rustix::net::sockopt::set_socket_reuseaddr(&reservation.fd, false).unwrap();
+  reservation.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+  let address = reservation.local_addr().unwrap();
 
   match block_on(net.connect_nonblocking(address)) {
     Err(TcpConnectError::Operation(NetworkError::Io(error))) => {
       assert_eq!(error.kind(), std::io::ErrorKind::ConnectionRefused);
     }
     Err(error) => panic!("unexpected connect error: {error}"),
-    Ok(_) => panic!("connection to a closed loopback port unexpectedly succeeded"),
+    Ok(_) => panic!("connection to a non-listening loopback socket unexpectedly succeeded"),
   }
   assert_eq!(scope.snapshot().network_ops, 0);
   assert_eq!(reactor.handle().registrations(), 0);
   assert_eq!(reactor.handle().waiters(), 0);
+  drop(reservation);
   blocking.shutdown(ShutdownMode::Drain).unwrap();
 
   let mut blocking = Runtime::new(Config {
