@@ -76,6 +76,23 @@ Use independent specification/correctness reviews before signed commits. Every
 commit includes the required assistance trailer. A passing milestone does not
 establish full capability parity or performance qualification.
 
+## Functional application ports
+
+The unpublished `allocatbelt-app-ports` workspace package contains deterministic
+CPU, managed-memory, loopback TCP/HTTP and filesystem ports. Its normal/build
+dependencies contain no Tokio. Run an example with
+`cargo run --release --locked -p allocatbelt-app-ports --example cpu`; the other
+examples are `memory`, `tcp_http` and `disk`.
+
+The ports separate reusable workload kernels from the runtime adapters. HTTP
+uses a deliberately limited bounded framing parser and capped reads to exercise
+incremental progress. Disk creates its private directory and initial file
+synchronously before cancellable asynchronous I/O; later detached opens cannot
+recreate a deleted payload. Exact managed-ledger checks require an otherwise-idle
+resource scope. Each example explicitly closes its task scope and shuts down
+its drivers. These functional checks establish neither general HTTP capability
+nor application performance qualification.
+
 The [runtime contract](../runtime.md) documents accepted implementation. The
 [foundation report](runtime-foundation.md) contains earlier measurements, whose
 limitations remain in force. This roadmap records acceptance requirements,

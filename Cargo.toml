@@ -6,6 +6,7 @@ members = [
   "crates/allocatbelt-core-check",
   "crates/allocatbelt-runtime",
   "crates/allocatbelt-tokio",
+  "crates/allocatbelt-app-ports",
   "bench",
   "bench/profile",
   "bench/simd",
