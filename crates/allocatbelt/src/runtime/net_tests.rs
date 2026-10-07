@@ -979,7 +979,7 @@ fn negative_listen_backlog_returns_unchanged_socket_for_retry() {
 }
 
 #[test]
-fn failed_listen_returns_socket_for_explicit_retry() {
+fn kernel_listen_conflict_returns_the_same_socket() {
   let reactor = reactor(2);
   let handle = reactor.handle();
   let reusable_socket = || {
@@ -1000,11 +1000,50 @@ fn failed_listen_returns_socket_for_explicit_retry() {
     other => panic!("expected listen syscall failure with socket recovery, got {other:?}"),
   };
   assert_eq!(error.kind(), std::io::ErrorKind::AddrInUse);
+  assert_eq!(
+    error.raw_os_error(),
+    Some(rustix::io::Errno::ADDRINUSE.raw_os_error())
+  );
   assert_eq!(second.fd.as_raw_fd(), second_fd);
   assert_eq!(second.local_addr().unwrap(), address);
 
   drop(listener);
-  let listener = second.listen(8, &handle).unwrap();
+  reactor.shutdown().unwrap();
+}
+
+#[test]
+fn injected_listen_failure_returns_socket_for_real_retry() {
+  let reactor = reactor(2);
+  let handle = reactor.handle();
+  let socket = TcpSocket::new_v4().unwrap();
+  socket.set_reuseaddr(false).unwrap();
+  socket.set_reuseport(false).unwrap();
+  assert!(!socket.reuseaddr().unwrap());
+  assert!(!socket.reuseport().unwrap());
+  socket.bind(SocketAddr::from(([127, 0, 0, 1], 0))).unwrap();
+  let address = socket.local_addr().unwrap();
+  let socket_fd = socket.fd.as_raw_fd();
+  let mut injected_calls = 0;
+
+  let (error, socket) = match socket.listen_with(8, &handle, |fd, backlog| {
+    injected_calls += 1;
+    assert_eq!(fd.as_raw_fd(), socket_fd);
+    assert_eq!(backlog, 8);
+    Err(rustix::io::Errno::ADDRINUSE)
+  }) {
+    Err(TcpListenError::Listen { error, socket }) => (error, socket),
+    other => panic!("expected injected listen syscall failure, got {other:?}"),
+  };
+  assert_eq!(injected_calls, 1);
+  assert_eq!(error.kind(), std::io::ErrorKind::AddrInUse);
+  assert_eq!(
+    error.raw_os_error(),
+    Some(rustix::io::Errno::ADDRINUSE.raw_os_error())
+  );
+  assert_eq!(socket.fd.as_raw_fd(), socket_fd);
+  assert_eq!(socket.local_addr().unwrap(), address);
+
+  let listener = socket.listen(8, &handle).unwrap();
   assert_eq!(listener.get_ref().local_addr().unwrap(), address);
   drop(listener);
   reactor.shutdown().unwrap();

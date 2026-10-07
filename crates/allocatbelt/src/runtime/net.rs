@@ -337,13 +337,22 @@ impl TcpSocket {
     backlog: i32,
     reactor: &ReactorHandle,
   ) -> Result<TcpListener, TcpListenError> {
+    self.listen_with(backlog, reactor, |fd, backlog| rnet::listen(fd, backlog))
+  }
+
+  fn listen_with(
+    self,
+    backlog: i32,
+    reactor: &ReactorHandle,
+    listen: impl FnOnce(&OwnedFd, i32) -> Result<(), Errno>,
+  ) -> Result<TcpListener, TcpListenError> {
     if backlog < 0 {
       return Err(TcpListenError::InvalidBacklog {
         backlog,
         socket: self,
       });
     }
-    if let Err(error) = rnet::listen(&self.fd, backlog) {
+    if let Err(error) = listen(&self.fd, backlog) {
       return Err(TcpListenError::Listen {
         error: error.into(),
         socket: self,
