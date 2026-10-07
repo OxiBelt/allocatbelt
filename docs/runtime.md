@@ -98,6 +98,31 @@ not managed-storage charges or a total memory budget. Socket wrappers and their
 I/O-trait integration require separate APIs. Reactor protocol behavior is
 covered by native tests, not by the current Loom helper models.
 
+## Network endpoints and DNS
+
+`runtime::net` supplies explicitly registered TCP, UDP and Unix endpoints.
+Named read, write, accept and datagram methods preserve partial progress,
+EOF and message boundaries. They retry interrupted calls and stale readiness
+after clearing `WouldBlock`, yielding after 64 endpoint calls per poll.
+Dropping a pending named method removes its waiter; transferred bytes remain
+transferred. Binding and socket options use standard-library calls directly.
+Filesystem-path Unix datagram APIs do not support abstract addresses.
+
+`NetHandle` offloads TCP connection and DNS through an explicit bounded
+blocking handle. A network permit remains held while work is queued or running;
+detaching a future retains worker captures until actual cleanup. DNS rejection
+returns the original hostname and port. Registration rejection returns the
+connected or accepted socket for recovery.
+
+DNS output pre-reserves `(address_limit + 1) * 27` managed bytes. Fixed records
+preserve both address families and IPv6 flow and scope identifiers. An overflow
+returns the bounded observed prefix, including one extra address, and result
+clones retain the storage charge until their final release. Caller hostname
+storage and the resolver's internal allocations are outside that charge.
+This bounds collected output and operation concurrency; it supplies no total
+DNS memory, network bandwidth or descriptor quota beyond reactor admission.
+Socket integration with the I/O traits is a separate milestone.
+
 ## Bounded fair semaphore
 
 `runtime::semaphore::Semaphore` has an explicit preallocated waiter bound.

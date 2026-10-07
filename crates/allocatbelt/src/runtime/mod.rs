@@ -82,6 +82,8 @@ pub mod managed;
 #[cfg(all(test, loom))]
 mod model;
 #[cfg(not(loom))]
+pub mod net;
+#[cfg(not(loom))]
 pub mod reactor;
 mod resources;
 mod scheduler;

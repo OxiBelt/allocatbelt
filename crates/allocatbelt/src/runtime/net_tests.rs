@@ -1,0 +1,507 @@
+use std::future::Future;
+use std::io::{Read, Write};
+use std::net::{
+  Ipv6Addr, SocketAddr, SocketAddrV6, TcpListener as StdTcpListener, TcpStream as StdTcpStream,
+  UdpSocket as StdUdpSocket,
+};
+use std::pin::pin;
+use std::sync::mpsc;
+use std::task::{Context, Poll, Waker};
+use std::thread;
+use std::time::{Duration, Instant};
+
+use super::{NetHandle, NetworkError, ResolveError, ResolveSubmissionKind, TcpListener, UdpSocket};
+use crate::runtime::blocking::{Config, Runtime, ShutdownMode};
+use crate::runtime::managed::{ResourceLimits, ResourceScope};
+use crate::runtime::reactor::{Reactor, ReactorConfig};
+use crate::runtime::resources::Resources;
+
+fn reactor(registrations: usize) -> Reactor {
+  Reactor::new(ReactorConfig {
+    max_registrations: registrations,
+    max_waiters: 16,
+  })
+  .unwrap()
+}
+
+const IO_TIMEOUT: Duration = Duration::from_secs(10);
+
+fn set_tcp_timeouts(stream: &StdTcpStream) {
+  stream.set_read_timeout(Some(IO_TIMEOUT)).unwrap();
+  stream.set_write_timeout(Some(IO_TIMEOUT)).unwrap();
+}
+
+fn block_on<F: Future>(future: F) -> F::Output {
+  let mut future = pin!(future);
+  let mut context = Context::from_waker(Waker::noop());
+  let deadline = Instant::now() + IO_TIMEOUT;
+  loop {
+    match future.as_mut().poll(&mut context) {
+      Poll::Ready(value) => return value,
+      Poll::Pending => {
+        assert!(
+          Instant::now() < deadline,
+          "network future exceeded its test deadline"
+        );
+        thread::sleep(Duration::from_millis(1));
+      }
+    }
+  }
+}
+
+#[cfg(unix)]
+#[test]
+fn unix_stream_preserves_data_eof_and_write_half_shutdown() {
+  use std::io::Read;
+  use std::os::unix::net::UnixStream as StdUnixStream;
+
+  let reactor = reactor(4);
+  let handle = reactor.handle();
+  let (runtime_side, mut peer) = StdUnixStream::pair().unwrap();
+  peer.set_read_timeout(Some(IO_TIMEOUT)).unwrap();
+  peer.set_write_timeout(Some(IO_TIMEOUT)).unwrap();
+  let stream = super::UnixStream::from_std(runtime_side, &handle).unwrap();
+
+  assert_eq!(block_on(stream.write(b"hello")).unwrap(), 5);
+  let mut received = [0; 5];
+  peer.read_exact(&mut received).unwrap();
+  assert_eq!(&received, b"hello");
+
+  block_on(stream.shutdown()).unwrap();
+  let mut byte = [0; 1];
+  assert_eq!(peer.read(&mut byte).unwrap(), 0);
+
+  peer.shutdown(std::net::Shutdown::Write).unwrap();
+  assert_eq!(block_on(stream.read(&mut byte)).unwrap(), 0);
+}
+
+#[cfg(unix)]
+#[test]
+fn read_waiter_observes_data_arriving_after_pending() {
+  use std::os::unix::net::UnixStream as StdUnixStream;
+
+  let reactor = reactor(2);
+  let handle = reactor.handle();
+  let (runtime_side, mut peer) = StdUnixStream::pair().unwrap();
+  peer.set_write_timeout(Some(IO_TIMEOUT)).unwrap();
+  let stream = super::UnixStream::from_std(runtime_side, &handle).unwrap();
+  let mut byte = [0; 1];
+  {
+    let mut future = pin!(stream.read(&mut byte));
+    let mut context = Context::from_waker(Waker::noop());
+    assert!(matches!(future.as_mut().poll(&mut context), Poll::Pending));
+    peer.write_all(b"x").unwrap();
+    assert_eq!(block_on(future.as_mut()).unwrap(), 1);
+  }
+  assert_eq!(byte, *b"x");
+}
+
+#[cfg(unix)]
+#[test]
+fn stale_socket_readiness_is_cleared_and_waits_again() {
+  use std::os::unix::net::UnixStream as StdUnixStream;
+
+  let reactor = reactor(4);
+  let handle = reactor.handle();
+  let (runtime_side, mut peer) = StdUnixStream::pair().unwrap();
+  peer.set_write_timeout(Some(IO_TIMEOUT)).unwrap();
+  let duplicate = runtime_side.try_clone().unwrap();
+  let stream = super::UnixStream::from_std(runtime_side, &handle).unwrap();
+  let other_reader = super::UnixStream::from_std(duplicate, &handle).unwrap();
+  peer.write_all(b"a").unwrap();
+  drop(block_on(stream.fd.readable()).unwrap());
+
+  let mut first = [0; 1];
+  assert_eq!(block_on(other_reader.read(&mut first)).unwrap(), 1);
+  assert_eq!(first, *b"a");
+
+  let mut next = [0; 1];
+  {
+    let mut future = pin!(stream.read(&mut next));
+    let mut context = Context::from_waker(Waker::noop());
+    assert!(matches!(future.as_mut().poll(&mut context), Poll::Pending));
+    peer.write_all(b"b").unwrap();
+    assert_eq!(block_on(future.as_mut()).unwrap(), 1);
+  }
+  assert_eq!(next, *b"b");
+}
+
+#[cfg(unix)]
+#[test]
+fn dropping_pending_read_reclaims_its_waiter() {
+  use std::os::unix::net::UnixStream as StdUnixStream;
+
+  let reactor = reactor(2);
+  let handle = reactor.handle();
+  let (runtime_side, _peer) = StdUnixStream::pair().unwrap();
+  let stream = super::UnixStream::from_std(runtime_side, &handle).unwrap();
+  let mut byte = [0; 1];
+  {
+    let mut future = pin!(stream.read(&mut byte));
+    let mut context = Context::from_waker(Waker::noop());
+    assert!(matches!(future.as_mut().poll(&mut context), Poll::Pending));
+    assert_eq!(handle.waiters(), 1);
+  }
+  assert_eq!(handle.waiters(), 0);
+}
+
+#[test]
+fn udp_keeps_datagram_boundaries() {
+  let reactor = reactor(4);
+  let handle = reactor.handle();
+  let left = StdUdpSocket::bind("127.0.0.1:0").unwrap();
+  let right = StdUdpSocket::bind("127.0.0.1:0").unwrap();
+  let right_addr = right.local_addr().unwrap();
+  let left = UdpSocket::from_std(left, &handle).unwrap();
+  let right = UdpSocket::from_std(right, &handle).unwrap();
+
+  assert_eq!(block_on(left.send_to(b"one", right_addr)).unwrap(), 3);
+  assert_eq!(block_on(left.send_to(b"second", right_addr)).unwrap(), 6);
+  let mut buf = [0; 16];
+  let (first_len, from) = block_on(right.recv_from(&mut buf)).unwrap();
+  assert_eq!(&buf[..first_len], b"one");
+  assert_eq!(from, left.get_ref().local_addr().unwrap());
+  let (second_len, _) = block_on(right.recv_from(&mut buf)).unwrap();
+  assert_eq!(&buf[..second_len], b"second");
+}
+
+#[cfg(unix)]
+#[test]
+fn unix_datagram_preserves_each_send_as_one_message() {
+  use std::os::unix::net::UnixDatagram as StdUnixDatagram;
+
+  let reactor = reactor(2);
+  let handle = reactor.handle();
+  let (left, right) = StdUnixDatagram::pair().unwrap();
+  let left = super::UnixDatagram::from_std(left, &handle).unwrap();
+  let right = super::UnixDatagram::from_std(right, &handle).unwrap();
+  assert_eq!(block_on(left.send(b"a")).unwrap(), 1);
+  assert_eq!(block_on(left.send(b"bc")).unwrap(), 2);
+  let mut buf = [0; 8];
+  let first = block_on(right.recv(&mut buf)).unwrap();
+  assert_eq!(&buf[..first], b"a");
+  let second = block_on(right.recv(&mut buf)).unwrap();
+  assert_eq!(&buf[..second], b"bc");
+}
+
+#[test]
+fn accepted_socket_is_returned_when_registration_table_is_full() {
+  let reactor = reactor(1);
+  let handle = reactor.handle();
+  let listener = StdTcpListener::bind("127.0.0.1:0").unwrap();
+  let address = listener.local_addr().unwrap();
+  let listener = TcpListener::from_std(listener, &handle).unwrap();
+  let mut peer = StdTcpStream::connect_timeout(&address, IO_TIMEOUT).unwrap();
+  set_tcp_timeouts(&peer);
+  peer.write_all(b"kept").unwrap();
+
+  let error = block_on(listener.accept()).unwrap_err();
+  let super::AcceptError::Registration(error) = error else {
+    panic!("expected registration refusal");
+  };
+  let mut accepted = error.socket;
+  set_tcp_timeouts(&accepted);
+  let mut received = [0; 4];
+  accepted.read_exact(&mut received).unwrap();
+  assert_eq!(&received, b"kept");
+}
+
+#[test]
+fn stale_accept_readiness_is_cleared_then_rearmed() {
+  let reactor = reactor(4);
+  let handle = reactor.handle();
+  let listener = StdTcpListener::bind("127.0.0.1:0").unwrap();
+  let address = listener.local_addr().unwrap();
+  let duplicate = listener.try_clone().unwrap();
+  let listener = TcpListener::from_std(listener, &handle).unwrap();
+  let other_listener = TcpListener::from_std(duplicate, &handle).unwrap();
+  let _first_client = StdTcpStream::connect_timeout(&address, IO_TIMEOUT).unwrap();
+  drop(block_on(listener.fd.readable()).unwrap());
+  let (consumed, _) = other_listener.get_ref().accept().unwrap();
+  drop(consumed);
+
+  {
+    let mut future = pin!(listener.accept());
+    let mut context = Context::from_waker(Waker::noop());
+    assert!(matches!(future.as_mut().poll(&mut context), Poll::Pending));
+    let _second_client = StdTcpStream::connect_timeout(&address, IO_TIMEOUT).unwrap();
+    let (stream, _) = block_on(future.as_mut()).unwrap();
+    drop(stream);
+  }
+}
+
+#[test]
+fn rejected_registration_returns_the_socket() {
+  let reactor = reactor(1);
+  let handle = reactor.handle();
+  let held = StdUdpSocket::bind("127.0.0.1:0").unwrap();
+  let _held = UdpSocket::from_std(held, &handle).unwrap();
+  let socket = StdUdpSocket::bind("127.0.0.1:0").unwrap();
+  let address = socket.local_addr().unwrap();
+  let error = UdpSocket::from_std(socket, &handle).unwrap_err();
+  assert_eq!(error.socket.local_addr().unwrap(), address);
+}
+
+#[test]
+fn connect_runs_on_the_blocking_pool_and_releases_its_network_permit() {
+  let mut runtime = Runtime::new(Config {
+    workers: 1,
+    max_outstanding: 2,
+    capacity: Resources::ZERO,
+  })
+  .unwrap();
+  let reactor = reactor(2);
+  let scope = ResourceScope::new(ResourceLimits {
+    managed_memory: 0,
+    disk_concurrent_ops: 0,
+    network_concurrent_ops: 1,
+  });
+  let net = NetHandle::new(runtime.handle(), scope.clone(), reactor.handle(), 4).unwrap();
+  let listener = StdTcpListener::bind("127.0.0.1:0").unwrap();
+  let address = listener.local_addr().unwrap();
+  listener.set_nonblocking(true).unwrap();
+
+  let stream = block_on(net.connect(address)).unwrap();
+  let deadline = Instant::now() + IO_TIMEOUT;
+  let (mut peer, _) = loop {
+    match listener.accept() {
+      Ok(accepted) => break accepted,
+      Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+        assert!(
+          Instant::now() < deadline,
+          "blocking-pool connect was not accepted"
+        );
+        thread::sleep(Duration::from_millis(1));
+      }
+      Err(error) => panic!("TCP accept failed: {error}"),
+    }
+  };
+  set_tcp_timeouts(&peer);
+  assert_eq!(block_on(stream.write(b"hello")).unwrap(), 5);
+  let mut received = [0; 5];
+  peer.read_exact(&mut received).unwrap();
+  assert_eq!(&received, b"hello");
+  peer.write_all(b"reply").unwrap();
+  let mut response = [0; 5];
+  assert_eq!(block_on(stream.read(&mut response)).unwrap(), 5);
+  assert_eq!(&response, b"reply");
+  block_on(stream.shutdown()).unwrap();
+  assert_eq!(peer.read(&mut response).unwrap(), 0);
+  assert_eq!(scope.snapshot().network_ops, 0);
+  assert_eq!(stream.get_ref().peer_addr().unwrap(), address);
+  runtime.shutdown(ShutdownMode::Drain).unwrap();
+}
+
+#[test]
+fn resolver_output_never_exceeds_its_bound_plus_one_overflow_item() {
+  let mut runtime = Runtime::new(Config {
+    workers: 1,
+    max_outstanding: 2,
+    capacity: Resources::ZERO,
+  })
+  .unwrap();
+  let reactor = reactor(1);
+  let scope = ResourceScope::new(ResourceLimits {
+    managed_memory: 2 * super::ADDRESS_RECORD_BYTES,
+    disk_concurrent_ops: 0,
+    network_concurrent_ops: 1,
+  });
+  let net = NetHandle::new(runtime.handle(), scope.clone(), reactor.handle(), 1).unwrap();
+
+  let addresses = match block_on(net.resolve("localhost".to_owned(), 80)) {
+    Ok(addresses) => addresses,
+    Err(ResolveError::Operation(NetworkError::TooManyAddresses(addresses))) => addresses,
+    Err(ResolveError::Operation(NetworkError::Io(error))) => {
+      panic!("localhost resolution failed: {error}")
+    }
+    Err(error) => panic!("unexpected resolver error: {error}"),
+  };
+  assert!(addresses.len() <= 2);
+  let charged = addresses.charged_bytes();
+  assert_eq!(scope.snapshot().managed_memory, charged);
+  assert_eq!(scope.snapshot().network_ops, 0);
+  let clone = addresses.clone();
+  drop(addresses);
+  assert_eq!(scope.snapshot().managed_memory, charged);
+  drop(clone);
+  assert_eq!(scope.snapshot().managed_memory, 0);
+  runtime.shutdown(ShutdownMode::Drain).unwrap();
+}
+
+#[test]
+fn dns_memory_rejection_returns_the_owned_hostname() {
+  let mut runtime = Runtime::new(Config {
+    workers: 1,
+    max_outstanding: 2,
+    capacity: Resources::ZERO,
+  })
+  .unwrap();
+  let reactor = reactor(1);
+  let scope = ResourceScope::new(ResourceLimits {
+    managed_memory: 0,
+    disk_concurrent_ops: 0,
+    network_concurrent_ops: 1,
+  });
+  let net = NetHandle::new(runtime.handle(), scope.clone(), reactor.handle(), 1).unwrap();
+
+  let error = block_on(net.resolve("keep-this-host".to_owned(), 443)).unwrap_err();
+  let ResolveError::Submission(error) = error else {
+    panic!("expected DNS memory admission failure");
+  };
+  assert_eq!(error.host, "keep-this-host");
+  assert_eq!(error.port, 443);
+  assert!(matches!(error.kind, ResolveSubmissionKind::Resource(_)));
+  assert_eq!(scope.snapshot().managed_memory, 0);
+  assert_eq!(scope.snapshot().network_ops, 0);
+  runtime.shutdown(ShutdownMode::Drain).unwrap();
+}
+
+#[test]
+fn dns_runtime_rejection_returns_the_owned_hostname() {
+  let mut runtime = Runtime::new(Config {
+    workers: 1,
+    max_outstanding: 1,
+    capacity: Resources::ZERO,
+  })
+  .unwrap();
+  let reactor = reactor(1);
+  let scope = ResourceScope::new(ResourceLimits {
+    managed_memory: 2 * super::ADDRESS_RECORD_BYTES,
+    disk_concurrent_ops: 0,
+    network_concurrent_ops: 1,
+  });
+  let handle = runtime.handle();
+  runtime.shutdown(ShutdownMode::Drain).unwrap();
+  let net = NetHandle::new(handle, scope.clone(), reactor.handle(), 1).unwrap();
+
+  let error = block_on(net.resolve("retry.this.host".to_owned(), 53)).unwrap_err();
+  let ResolveError::Submission(error) = error else {
+    panic!("expected runtime admission failure");
+  };
+  assert_eq!(error.host, "retry.this.host");
+  assert_eq!(error.port, 53);
+  assert!(matches!(error.kind, ResolveSubmissionKind::Runtime(_)));
+  assert_eq!(scope.snapshot().network_ops, 0);
+  assert_eq!(scope.snapshot().managed_memory, 0);
+}
+
+#[test]
+fn dropping_dns_future_keeps_charges_until_blocking_worker_cleanup() {
+  let mut runtime = Runtime::new(Config {
+    workers: 1,
+    max_outstanding: 2,
+    capacity: Resources::ZERO,
+  })
+  .unwrap();
+  let reactor = reactor(1);
+  let scope = ResourceScope::new(ResourceLimits {
+    managed_memory: 2 * super::ADDRESS_RECORD_BYTES,
+    disk_concurrent_ops: 0,
+    network_concurrent_ops: 1,
+  });
+  let net = NetHandle::new(runtime.handle(), scope.clone(), reactor.handle(), 1).unwrap();
+  let (started_tx, started_rx) = mpsc::channel();
+  let (release_tx, release_rx) = mpsc::channel();
+  let blocker = runtime
+    .try_spawn(Resources::ZERO, move |_token| {
+      started_tx.send(()).unwrap();
+      release_rx.recv_timeout(IO_TIMEOUT).unwrap();
+    })
+    .unwrap();
+  started_rx.recv_timeout(IO_TIMEOUT).unwrap();
+
+  {
+    let mut future = pin!(net.resolve("127.0.0.1".to_owned(), 80));
+    let mut context = Context::from_waker(Waker::noop());
+    assert!(matches!(future.as_mut().poll(&mut context), Poll::Pending));
+    assert_eq!(scope.snapshot().network_ops, 1);
+    assert_eq!(
+      scope.snapshot().managed_memory,
+      2 * super::ADDRESS_RECORD_BYTES
+    );
+  }
+  release_tx.send(()).unwrap();
+  blocker.join().unwrap();
+
+  let deadline = Instant::now() + Duration::from_secs(3);
+  loop {
+    let snapshot = scope.snapshot();
+    if snapshot.network_ops == 0 && snapshot.managed_memory == 0 {
+      break;
+    }
+    assert!(
+      Instant::now() < deadline,
+      "detached resolver did not release charges"
+    );
+    thread::yield_now();
+  }
+  runtime.shutdown(ShutdownMode::Drain).unwrap();
+}
+
+#[test]
+fn malformed_dns_records_are_rejected_without_unsafe_decoding() {
+  assert_eq!(
+    super::decode_address(&[0; super::ADDRESS_RECORD_BYTES]),
+    None
+  );
+  assert_eq!(
+    super::decode_address(&[4; super::ADDRESS_RECORD_BYTES - 1]),
+    None
+  );
+  assert_eq!(
+    super::decode_address(&[9; super::ADDRESS_RECORD_BYTES]),
+    None
+  );
+}
+
+#[test]
+fn bounded_resolver_retains_only_one_overflow_address() {
+  let addresses = [
+    "127.0.0.1:80".parse::<SocketAddr>().unwrap(),
+    "127.0.0.2:80".parse::<SocketAddr>().unwrap(),
+    "127.0.0.3:80".parse::<SocketAddr>().unwrap(),
+  ];
+  let scope = ResourceScope::new(ResourceLimits {
+    managed_memory: 1024,
+    disk_concurrent_ops: 0,
+    network_concurrent_ops: 0,
+  });
+  let storage = scope
+    .try_alloc_zeroed(2 * super::ADDRESS_RECORD_BYTES)
+    .unwrap();
+  let error = super::collect_bounded(addresses.into_iter(), 1, storage, 0).unwrap_err();
+  let NetworkError::TooManyAddresses(observed) = error else {
+    panic!("expected bounded overflow");
+  };
+  assert_eq!(observed.len(), 2);
+  assert_eq!(observed.get(0), Some(addresses[0]));
+  assert_eq!(observed.get(1), Some(addresses[1]));
+}
+
+#[test]
+fn resolved_ipv6_preserves_flow_scope_and_shared_memory_charge() {
+  let address = SocketAddr::V6(SocketAddrV6::new(
+    Ipv6Addr::LOCALHOST,
+    4321,
+    0x1234_5678,
+    0x8765_4321,
+  ));
+  let scope = ResourceScope::new(ResourceLimits {
+    managed_memory: 2 * super::ADDRESS_RECORD_BYTES,
+    disk_concurrent_ops: 0,
+    network_concurrent_ops: 0,
+  });
+  let storage = scope
+    .try_alloc_zeroed(2 * super::ADDRESS_RECORD_BYTES)
+    .unwrap();
+  let addresses = super::collect_bounded([address].into_iter(), 1, storage, 0).unwrap();
+  assert_eq!(addresses.get(0), Some(address));
+  let charge = addresses.charged_bytes();
+  assert_eq!(scope.snapshot().managed_memory, charge);
+
+  let clone = addresses.clone();
+  drop(addresses);
+  assert_eq!(scope.snapshot().managed_memory, charge);
+  drop(clone);
+  assert_eq!(scope.snapshot().managed_memory, 0);
+}
