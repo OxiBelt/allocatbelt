@@ -587,8 +587,7 @@ consuming inputs, then pin each active future in an ordinary box. Bookkeeping
 reservation failure is recoverable; box allocation follows ordinary Rust
 allocation-failure behavior. Managed storage is not implicitly charged.
 Twenty native tests cover ownership, ordering, pinning, rejection and panic
-cleanup. Heterogeneous macros and randomized selection remain subsequent
-ports.
+cleanup. Randomized selection is outside these deterministic ports.
 
 A completed input is destroyed before its output is retained. Failure or
 selection destroys unfinished inputs and unused partial outputs before
@@ -598,6 +597,46 @@ cleanup panics contained. When normal cleanup first panics, that primary panic
 resumes after all other values are disposed. Cleanup during an existing unwind
 preserves that unwind. Fifteen native tests cover polling order, cancellation,
 borrowed and pinned inputs, retained terminal helpers and adversarial cleanup.
+
+`runtime::concurrency_macros` exports `join!`, `try_join!`, `select!` and the
+standard stack `pin!` macro. The composition macros also appear at the crate
+root and accept two to sixteen heterogeneous branches. Joins return flat
+tuples in source order; error joins require one error type. Each branch is
+pinned in one ordinary box and partial join outputs are retained independently
+until final tuple publication. No managed storage is implicitly reserved.
+
+Selection uses an explicit policy and bracketed branch groups:
+
+```rust,ignore
+let result = allocatbelt::select! {
+  round_robin;
+  [
+    (value = first_future, if first_enabled => use_first(value).await),
+    (value = second_future => use_second(value).await),
+  ];
+  else => no_enabled_branch(),
+}.await;
+```
+
+Patterns must be irrefutable and handlers must produce one common result type.
+`biased;` starts in source order; `round_robin;` rotates priority among enabled
+original branch indices after pending polls. All branch futures, including
+disabled ones, are constructed and owned; disabled futures are never polled.
+Every branch future is disposed before the winning handler or mandatory
+all-disabled `else` runs. Handlers can borrow shared state and await. Captures
+used only by losing handlers or `else` follow the enclosing async future's
+lifetime and are not released early by selection.
+
+These macros evaluate expressions once during their first poll, in source
+order; selection evaluates each future before its enabled guard. Construction
+expression/guard panics and captured values dropped before first poll follow
+ordinary Rust cleanup. Once the complete branch set is owned, polling,
+cancellation and branch/output cleanup contain secondary destructor panics
+and preserve the primary panic. Published output tuples become caller-owned
+and follow ordinary Rust destruction. Fourteen native tests include bounded
+arity, pinning, trait propagation, disabled-branch rotation and subprocess
+regressions for multiple panicking partial outputs. This syntax requires an
+explicit application port; it does not claim Tokio macro compatibility.
 
 ## Owned asynchronous tasks
 

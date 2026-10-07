@@ -81,6 +81,7 @@ mod cache;
 pub mod cgroup;
 pub mod channel;
 pub mod concurrency;
+pub mod concurrency_macros;
 pub mod concurrency_many;
 mod error;
 pub mod fs;
