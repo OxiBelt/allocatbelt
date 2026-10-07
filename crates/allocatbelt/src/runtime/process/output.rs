@@ -696,6 +696,18 @@ mod tests {
       assert!(std::time::Instant::now() < deadline);
       thread::sleep(Duration::from_millis(5));
     }
+    // Stage a real stdout overflow as the valid state between collector
+    // polls. Child completion does not imply the reactor has published both
+    // readiness events, so their first-observed order is not deterministic.
+    let first_probe = block_on(std::future::poll_fn(|cx| {
+      future.poll_one_stream(OutputStream::Stdout, cx)
+    }))
+    .unwrap();
+    assert!(matches!(first_probe, ReadStep::Overflow(b'a')));
+    let parts = future.parts.as_mut().unwrap();
+    parts.stdout_truncated = true;
+    parts.overflow_byte = Some((OutputStream::Stdout, b'a'));
+    future.next_stream = OutputStream::Stderr;
     let output = block_on(future).unwrap();
     assert!(output.parts.stdout_truncated);
     assert!(output.parts.stderr_truncated);
