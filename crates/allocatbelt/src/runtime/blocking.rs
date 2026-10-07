@@ -6,11 +6,11 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::thread::{self, JoinHandle};
 
-use crate::error::SubmitError;
-use crate::job::{CancellationToken, Job};
-use crate::resources::Resources;
-use crate::scheduler::{Shared, Snapshot};
-use crate::worker;
+use crate::runtime::error::SubmitError;
+use crate::runtime::job::{CancellationToken, Job};
+use crate::runtime::resources::Resources;
+use crate::runtime::scheduler::{Shared, Snapshot};
+use crate::runtime::worker;
 
 /// A runtime's size and bounds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -32,7 +32,7 @@ pub enum ShutdownMode {
   /// and wait for them.
   Drain,
   /// Drop the queued jobs unstarted (their joins return
-  /// [`JoinError::Cancelled`](crate::JoinError::Cancelled) once each
+  /// [`JoinError::Cancelled`](crate::runtime::JoinError::Cancelled) once each
   /// closure is dropped and its admission released). Signal the
   /// [`CancellationToken`]s of the jobs queued or running at that point,
   /// and wait for the running ones to return. Cancellation is cooperative:
@@ -57,7 +57,7 @@ pub struct Runtime {
 
 /// A cloneable, thread-safe submission handle. Submissions after the
 /// runtime closed (or was dropped) are rejected as
-/// [`SubmitErrorKind::Closed`](crate::SubmitErrorKind::Closed).
+/// [`SubmitErrorKind::Closed`](crate::runtime::SubmitErrorKind::Closed).
 #[derive(Clone)]
 pub struct Handle {
   shared: Arc<Shared>,
@@ -197,7 +197,7 @@ impl Handle {
   ///
   /// # Errors
   ///
-  /// [`SubmitErrorKind`](crate::SubmitErrorKind): `Closed`, then
+  /// [`SubmitErrorKind`](crate::runtime::SubmitErrorKind): `Closed`, then
   /// `InvalidRequest` (exceeds the capacity), `Full` (the outstanding bound
   /// is reached), `InsufficientResources` (does not fit what is free now).
   pub fn try_spawn<F, T>(&self, request: Resources, f: F) -> Result<Job<T>, SubmitError<F>>

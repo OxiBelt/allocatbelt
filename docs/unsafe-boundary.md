@@ -1,6 +1,8 @@
 # unsafe boundary inventory
 
-`allocatbelt` is one package with four modules. `core` (`crates/allocatbelt/src/core/`) carries `#![forbid(unsafe_code)]` as an inner attribute, so it contains **0** `unsafe` sites, and the `publish = false` package `allocatbelt-core-check` compiles the same source as a `#![no_std]`, `#![forbid(unsafe_code)]` crate of its own, which runs the core's tests, the checking model and loom. Library `unsafe` is in `sys`, `arch`, `global` (with `rseq`) and the opt-in `region` API; benchmark-only `unsafe` is limited to the diagnostic allocator wrapper and SIMD candidates, listed below. Every `unsafe` block holds exactly one unsafe operation and carries a `// SAFETY:` comment (`clippy::undocumented_unsafe_blocks` and `multiple_unsafe_ops_per_block` are deny).
+`allocatbelt` is one package with responsibility-focused modules. `core` (`crates/allocatbelt/src/core/`) carries `#![forbid(unsafe_code)]` as an inner attribute, so it contains **0** `unsafe` sites, and the `publish = false` package `allocatbelt-core-check` compiles the same source as a `#![no_std]`, `#![forbid(unsafe_code)]` crate of its own, which runs the core's tests, the checking model and loom. The optional `runtime` module also carries `#![forbid(unsafe_code)]`; its
+blocking worker implementation is shared with the unpublished runtime façade
+and adds no unsafe boundary. Library `unsafe` is in `sys`, `arch`, `global` (with `rseq`) and the opt-in `region` API; benchmark-only `unsafe` is limited to the diagnostic allocator wrapper and SIMD candidates, listed below. Every `unsafe` block holds exactly one unsafe operation and carries a `// SAFETY:` comment (`clippy::undocumented_unsafe_blocks` and `multiple_unsafe_ops_per_block` are deny).
 
 Regenerate: `grep -rn "unsafe" crates/allocatbelt/src bench/src/bin/bench-runtime-diagnostic.rs bench/simd/src | grep -E "unsafe (\{|fn|impl|extern)"`
 

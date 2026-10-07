@@ -8,8 +8,8 @@ use std::sync::{Arc, Barrier, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::cache;
-use crate::{
+use crate::runtime::cache;
+use crate::runtime::{
   CancellationToken, Config, Handle, Job, JoinError, Resources, Runtime, ShutdownMode, Snapshot,
   SubmitErrorKind,
 };

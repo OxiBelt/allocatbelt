@@ -18,7 +18,9 @@ the other workspace packages are development tools.
 - `crates/allocatbelt-core-check/`: compiles the same core source as a safe
   `no_std` crate and runs its tests, checking model, Miri and loom checks.
 - `crates/allocatbelt-codegen-probes/`: helpers for scalar instruction checks.
-- `crates/allocatbelt-tokio/`: Tokio worker cache and shard hooks.
+- `crates/allocatbelt/src/runtime/`: optional safe blocking-runtime implementation.
+- `crates/allocatbelt-runtime/`: unpublished façade and same-source Loom checker.
+- `crates/allocatbelt-tokio/`: development-only Tokio worker cache and shard hooks.
 - `bench/`: allocator comparisons, resource profiling and SIMD candidates.
 - `fuzz/`: cargo-fuzz targets over the checking model.
 - `docs/`: design constraints, platform and API documentation, research and

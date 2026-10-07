@@ -42,7 +42,7 @@ run() {
 export ALLOCATBELT_EXPECT_KERNEL=Baseline
 run platform /guest/platform --test-threads=2
 run region /guest/allocator-lib region:: --test-threads=2
-run runtime /guest/runtime-lib --test-threads=2
+run runtime /guest/runtime-lib runtime:: --test-threads=2
 if [ "$scenario" = v-off ]; then
   run dispatch-off /guest/experimental_isa --test-threads=1
 else

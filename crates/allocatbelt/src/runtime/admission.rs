@@ -1,8 +1,8 @@
 //! Admission accounting: the outstanding-job bound and the reserved
 //! resource vector. Plain data, kept under the scheduler lock.
 
-use crate::error::SubmitErrorKind;
-use crate::resources::Resources;
+use crate::runtime::error::SubmitErrorKind;
+use crate::runtime::resources::Resources;
 
 /// What the runtime has admitted and not yet released.
 ///
@@ -87,8 +87,8 @@ impl Admission {
 #[cfg(test)]
 mod tests {
   use super::Admission;
-  use crate::error::SubmitErrorKind;
-  use crate::resources::Resources;
+  use crate::runtime::error::SubmitErrorKind;
+  use crate::runtime::resources::Resources;
 
   const MAX: Resources = Resources {
     cpu: usize::MAX,

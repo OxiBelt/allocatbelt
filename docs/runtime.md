@@ -1,9 +1,12 @@
 # Experimental resource-aware runtime
 
-`allocatbelt-runtime` is an unpublished, Tokio-independent development crate.
-It runs owned blocking jobs on a fixed worker pool. It is **not a Tokio
-replacement**, an async executor, or recommended for production. The allocator
-remains the only package intended for publication.
+`allocatbelt::runtime` is an optional module of the single published package,
+compiled by the additive `runtime` feature. The unpublished
+`allocatbelt-runtime` crate forwards to the same implementation for development
+and compiles that source directly for Loom. It runs owned blocking jobs on a
+fixed worker pool. It is **not a Tokio
+replacement**, an async executor, or recommended for production. `allocatbelt` remains the only package intended for publication; enabling the
+module does not install a global allocator or change allocator-only defaults.
 
 This page specifies the milestone contract. Verification and qualification
 status is recorded in the linked research report.

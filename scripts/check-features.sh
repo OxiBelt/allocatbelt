@@ -24,6 +24,9 @@ combos=(
   "--no-default-features --features experimental-aarch64-sve"
   "--features experimental-aarch64-sve2"
   "--features experimental-riscv-rvv"
+  "--no-default-features --features runtime"
+  "--features runtime"
+  "--features runtime,io-uring"
   "--all-features"
 )
 

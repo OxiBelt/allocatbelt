@@ -48,7 +48,7 @@ crate="${root}/target/package/allocatbelt-${version}.crate"
 # Contents: required files present, nothing from other packages.
 list="$(tar -tzf "${crate}" | sed "s|^allocatbelt-${version}/||")"
 for f in Cargo.toml LICENSE README.md src/lib.rs src/global.rs src/core/mod.rs \
-  src/sys/mod.rs src/sys/platform.rs src/arch/mod.rs; do
+  src/sys/mod.rs src/sys/platform.rs src/arch/mod.rs src/runtime/mod.rs; do
   grep -qxF "${f}" <<<"${list}" || fail "the package lacks ${f}"
 done
 if grep -E '^(bench|fuzz|scripts|docs|crates|\.cargo|\.github)/' <<<"${list}"; then
@@ -90,7 +90,7 @@ unpacked_test() {
     RUSTDOCFLAGS="${unpacked_flags}" cargo test --release --quiet --target-dir "${work}/target" "$@")
 }
 unpacked_test 2>&1 | grep -E '^test result' | sort | uniq -c
-unpacked_test >/dev/null 2>&1 || fail "the unpacked crate's tests fail"
+unpacked_test --all-features >/dev/null 2>&1 || fail "the unpacked crate's all-feature tests fail"
 echo "ok: the unpacked crate's tests pass"
 
 # docs.rs builds the documentation with `[package.metadata.docs.rs]` and
@@ -131,6 +131,7 @@ allocatbelt = { path = "${unpacked}", default-features = false }
 [features]
 default = ["allocatbelt-default"]
 allocatbelt-default = ["allocatbelt/default"]
+runtime = ["allocatbelt/runtime"]
 io-uring = ["allocatbelt/io-uring"]
 rseq = ["allocatbelt/experimental-rseq"]
 sve2 = ["allocatbelt/experimental-aarch64-sve2"]
@@ -143,6 +144,15 @@ cat >"${consumer}/src/main.rs" <<'EOF'
 static GLOBAL: allocatbelt::Allocatbelt = allocatbelt::Allocatbelt;
 
 fn main() {
+  #[cfg(feature = "runtime")]
+  {
+    use allocatbelt::runtime::{Config, Resources, Runtime, ShutdownMode};
+    let mut rt = Runtime::new(Config {
+      workers: 1, max_outstanding: 4, capacity: Resources::ZERO,
+    }).unwrap();
+    assert_eq!(rt.try_spawn(Resources::ZERO, |_| 42).unwrap().join().unwrap(), 42);
+    rt.shutdown(ShutdownMode::Drain).unwrap();
+  }
   let v: Vec<Box<[u8]>> = (1..2000).map(|n| vec![7u8; n * 3].into()).collect();
   assert!(v.iter().all(|b| b.iter().all(|&x| x == 7)));
   drop(v);
@@ -186,8 +196,8 @@ run() {
   echo "ok: consumer builds and runs (${*:-default features})"
 }
 caps() {
-  # caps <maintenance> <scheduler> <io_uring> <rseq> [<sve> <sve2> <rvv>]
-  echo "CompiledCapabilities { maintenance: $1, scheduler: $2, io_uring: $3, rseq: $4," \
+  # caps <maintenance> <scheduler> <io_uring> <rseq> [<sve> <sve2> <rvv> <runtime>]
+  echo "CompiledCapabilities { runtime: ${8:-false}, maintenance: $1, scheduler: $2, io_uring: $3, rseq: $4," \
     "experimental_aarch64_sve: ${5:-false}, experimental_aarch64_sve2: ${6:-false}," \
     "experimental_riscv_rvv: ${7:-false} }"
 }
@@ -206,3 +216,27 @@ run "$(caps true true false false "${sve}" "${sve}")" --features sve2
 if [[ "$(uname -m)" != riscv64 ]]; then
   run "$(caps true true false false)" --features rvv
 fi
+
+run "$(caps false false false false false false false true)" --no-default-features --features runtime
+run "$(caps true true false false false false false true)" --features runtime
+# Traverse only production edges from the unpacked package with every feature.
+(cd "${unpacked}" && cargo metadata --all-features --format-version 1) >"${work}/consumer-graph.json"
+python3 - "${work}/consumer-graph.json" <<'PYGRAPH'
+import json, sys
+m = json.load(open(sys.argv[1]))
+nodes = {node["id"]: node for node in m["resolve"]["nodes"]}
+names = {package["id"]: package["name"] for package in m["packages"]}
+pending = [m["resolve"]["root"]]
+seen = set()
+while pending:
+    ident = pending.pop()
+    if ident in seen:
+        continue
+    seen.add(ident)
+    if names[ident] == "tokio" or names[ident].startswith("tokio-"):
+        sys.exit("Tokio production dependency: " + names[ident])
+    for dep in nodes[ident]["deps"]:
+        if any(kind["kind"] != "dev" for kind in dep["dep_kinds"]):
+            pending.append(dep["pkg"])
+print("ok: packaged production dependency graph contains no Tokio")
+PYGRAPH

@@ -9,9 +9,9 @@ publish = false
 
 # allocatbelt's core swaps its atomics for loom's under `--cfg loom` and does
 # not build there, so the loom models of this crate's protocols
-# (`src/model.rs`) compile without it and the cache hooks become no-ops.
+# (`../allocatbelt/src/runtime/model.rs`) compile without it and the cache hooks become no-ops.
 [target.'cfg(not(loom))'.dependencies]
-allocatbelt.workspace = true
+allocatbelt = { workspace = true, features = ["runtime"] }
 
 # Model checker for the start/cancel and admission protocols, only under
 # `RUSTFLAGS="--cfg loom"`. Declared here rather than in

@@ -44,6 +44,7 @@
 //!
 //! | Feature | Default | Status | Adds |
 //! |---|---|---|---|
+//! | `runtime` | no | experimental blocking foundation | the safe bounded worker pool (`allocatbelt::runtime`) |
 //! | `maintenance` | yes | stable | the background maintenance thread (`start_maintenance_thread`, `purge_backend`, `PurgeBackend`) |
 //! | `scheduler` | yes | stable | runs that thread as `SCHED_BATCH`; implies `maintenance` |
 //! | `io-uring` | no | stable, off at run time until `set_io_uring(true)` | batched purges through a restricted io_uring, falling back to `madvise` (`set_io_uring`, `io_uring_error`, `RingError`); implies `maintenance` |
@@ -80,6 +81,8 @@ mod region;
 mod report;
 #[cfg(feature = "experimental-rseq")]
 mod rseq;
+#[cfg(all(feature = "runtime", target_os = "linux"))]
+pub mod runtime;
 mod sys;
 
 pub use crate::arch::{CpuFeatures, KernelSet};

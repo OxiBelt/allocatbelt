@@ -18,10 +18,10 @@ use loom::sync::atomic::{AtomicUsize, Ordering};
 use loom::sync::{Arc, Mutex};
 use loom::thread;
 
-use crate::admission::Admission;
-use crate::error::SubmitErrorKind;
-use crate::resources::Resources;
-use crate::state::StartState;
+use crate::runtime::admission::Admission;
+use crate::runtime::error::SubmitErrorKind;
+use crate::runtime::resources::Resources;
+use crate::runtime::state::StartState;
 
 const ONE: Resources = Resources {
   cpu: 1,

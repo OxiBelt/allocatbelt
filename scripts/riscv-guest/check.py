@@ -213,9 +213,9 @@ def payload():
   allocator = cargo_artifacts(["-p", "allocatbelt", "--features", "experimental-riscv-rvv",
                               "--lib", "--test", "platform", "--test", "experimental_isa",
                               "--test", "riscv_vector_control"], env)
-  runtime = cargo_artifacts(["-p", "allocatbelt-runtime", "--lib"], env)
+  runtime = cargo_artifacts(["-p", "allocatbelt", "--features", "runtime", "--lib"], env)
   binaries = {"allocator-lib": allocator.pop("allocatbelt"),
-              "runtime-lib": runtime["allocatbelt_runtime"], **allocator}
+              "runtime-lib": runtime["allocatbelt"], **allocator}
   stage = WORK / "payload"
   if stage.exists():
     shutil.rmtree(stage)

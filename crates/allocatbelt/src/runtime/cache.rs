@@ -15,7 +15,7 @@ thread_local! {
 
 pub(crate) fn set_shard(index: usize) {
   #[cfg(not(loom))]
-  allocatbelt::Allocatbelt.set_thread_shard(index);
+  crate::Allocatbelt.set_thread_shard(index);
   #[cfg(test)]
   SHARD.set(Some(index));
   #[cfg(all(loom, not(test)))]
@@ -24,7 +24,7 @@ pub(crate) fn set_shard(index: usize) {
 
 pub(crate) fn flush() {
   #[cfg(not(loom))]
-  allocatbelt::Allocatbelt.flush_thread_cache();
+  crate::Allocatbelt.flush_thread_cache();
   #[cfg(test)]
   FLUSHES.set(FLUSHES.get() + 1);
 }

@@ -5,9 +5,9 @@ use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 
-use crate::error::JoinError;
-use crate::state::StartState;
-use crate::worker::{self, Ident};
+use crate::runtime::error::JoinError;
+use crate::runtime::state::StartState;
+use crate::runtime::worker::{self, Ident};
 
 /// Shared by a job's handle, its token and its queued task. Holds no user
 /// data, so dropping it under a lock runs no user code.
@@ -37,7 +37,7 @@ impl Control {
 }
 
 /// Lets a running job observe cancellation of its own handle, or a
-/// [`ShutdownMode::CancelPending`](crate::ShutdownMode) shutdown or runtime
+/// [`ShutdownMode::CancelPending`](crate::runtime::ShutdownMode) shutdown or runtime
 /// drop that happened while it was queued or running. A job that was
 /// already released when the runtime was cancelled keeps an uncancelled
 /// token. Cancellation is cooperative: the runtime never interrupts a

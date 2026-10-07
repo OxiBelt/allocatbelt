@@ -36,6 +36,8 @@ rustix.workspace = true
 # build on stable Rust. See docs/features.md and `CompiledCapabilities`.
 [features]
 default = ["maintenance", "scheduler"]
+# Safe bounded blocking runtime; allocator-only defaults are unchanged.
+runtime = []
 # The background maintenance thread (`start_maintenance_thread`). Without
 # it, allocating threads run every housekeeping pass inline.
 maintenance = []
@@ -89,3 +91,7 @@ libc.workspace = true
 
 [lints]
 workspace = true
+
+[[test]]
+name = "runtime_allocator"
+required-features = ["runtime"]

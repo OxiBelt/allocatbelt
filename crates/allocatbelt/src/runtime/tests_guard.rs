@@ -12,8 +12,8 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::worker::{self, Cleaning, Ident};
-use crate::{
+use crate::runtime::worker::{self, Cleaning, Ident};
+use crate::runtime::{
   CancellationToken, Config, Handle, Job, JoinError, Resources, Runtime, ShutdownMode, Snapshot,
 };
 

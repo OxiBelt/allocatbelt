@@ -459,7 +459,7 @@ jobs:
         run: cargo test --release --locked --target riscv64gc-unknown-linux-gnu -p allocatbelt-simd-bench
 
   loom-models:
-    name: loom models of the core's atomic protocols
+    name: loom models of allocator and runtime protocols
     runs-on: ubuntu-26.04
     timeout-minutes: 30
     env:
@@ -481,7 +481,9 @@ jobs:
         run: cargo fetch --locked
 
       - name: Cargo test (loom)
-        run: cargo test --release --locked -p allocatbelt-core-check --lib loom
+        run: |
+          cargo test --release --locked -p allocatbelt-core-check --lib loom
+          cargo test --release --locked -p allocatbelt-runtime --lib runtime::model
 
   fuzz:
     name: Fuzz the heap model (cargo-fuzz, 10 minutes)

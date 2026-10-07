@@ -90,7 +90,7 @@ What it does, in the terms of mimalloc (details in [docs/research/README.md](doc
 
 Status: **research prototype**. Not recommended for production.
 
-An unpublished [runtime foundation](docs/runtime.md) also explores a
+The optional [runtime foundation](docs/runtime.md) also provides a
 Tokio-independent worker pool with cooperative CPU, memory, disk and network
 admission. It runs blocking jobs, not futures; timers, async I/O and Tokio
 compatibility remain future milestones. Its benchmarks compare against Tokio's
@@ -141,3 +141,12 @@ RUSTFLAGS="-C target-feature=+zbb" cargo test --release --target riscv64gc-unkno
 - Build with `-C target-feature=+zbb` (part of the RVA22 profile) when the hardware has it. Without Zbb, the bitmap scans' `trailing_zeros`/`count_ones`/`leading_zeros` compile to multi-instruction sequences instead of `ctz`/`cpop`/`clz`.
 - The fixed 64 KiB granule is a multiple of every Linux page size (4, 16 and 64 KiB), so the kernel's page size does not matter. Under Sv39 the user address space is 256 GiB, so the 64 GiB arena reservation (`PROT_NONE`, `MAP_NORESERVE`, no RSS) takes a quarter of it. Sv48/Sv57 leave plenty of room.
 - The `bench` crate builds secure mimalloc from C, so cross-building it needs a riscv64 C compiler (`CC_riscv64gc_unknown_linux_gnu=riscv64-linux-gnu-gcc`). Throughput on riscv64 has not been measured, since qemu numbers are meaningless.
+
+## Optional blocking runtime
+
+The additive `runtime` feature exposes the bounded blocking worker pool as
+`allocatbelt::runtime`. Allocator-only defaults and hardening are unchanged.
+The production dependency graph contains no Tokio dependency. This foundation
+is experimental: it does not yet provide async execution or replace Tokio.
+See [the runtime contract](docs/runtime.md) for admission, cancellation,
+shutdown and memory-accounting limits.

@@ -41,6 +41,7 @@ fn dispatch_is_initialised_with_the_arena() {
 #[test]
 fn compiled_capabilities_follow_the_features() {
   let c = GLOBAL.compiled_capabilities();
+  assert_eq!(c.runtime, cfg!(feature = "runtime"));
   assert_eq!(c, allocatbelt::CompiledCapabilities::CURRENT);
   assert_eq!(c.maintenance, cfg!(feature = "maintenance"));
   assert_eq!(c.scheduler, cfg!(feature = "scheduler"));
@@ -72,6 +73,7 @@ fn compiled_capabilities_follow_the_features() {
 #[test]
 fn policy_moves_only_within_the_build() {
   let c = GLOBAL.compiled_capabilities();
+  assert_eq!(c.runtime, cfg!(feature = "runtime"));
   let mut p = allocatbelt::Policy::DEFAULT;
   p.io_uring = allocatbelt::FeaturePolicy::Require;
   let r = GLOBAL.configure(p);

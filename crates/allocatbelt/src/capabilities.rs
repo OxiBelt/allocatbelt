@@ -16,6 +16,8 @@ use crate::Allocatbelt;
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CompiledCapabilities {
+  /// Feature `runtime`: the safe bounded blocking worker runtime.
+  pub runtime: bool,
   /// Feature `maintenance`: the background maintenance thread
   /// ([`Allocatbelt::start_maintenance_thread`]). Without it, allocating
   /// threads run every housekeeping pass inline.
@@ -45,6 +47,7 @@ pub struct CompiledCapabilities {
 impl CompiledCapabilities {
   /// The capabilities of this build.
   pub const CURRENT: Self = Self {
+    runtime: cfg!(feature = "runtime"),
     maintenance: cfg!(feature = "maintenance"),
     scheduler: cfg!(feature = "scheduler"),
     io_uring: cfg!(feature = "io-uring"),

@@ -7,12 +7,12 @@ use std::collections::VecDeque;
 use std::io;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 
-use crate::admission::Admission;
-use crate::error::{SubmitError, SubmitErrorKind};
-use crate::job::{CancellationToken, Control, Job, Packet};
-use crate::resources::Resources;
-use crate::task::{Runnable, Task};
-use crate::worker::Ident;
+use crate::runtime::admission::Admission;
+use crate::runtime::error::{SubmitError, SubmitErrorKind};
+use crate::runtime::job::{CancellationToken, Control, Job, Packet};
+use crate::runtime::resources::Resources;
+use crate::runtime::task::{Runnable, Task};
+use crate::runtime::worker::Ident;
 
 /// A queued job and the resources it reserved.
 pub(crate) struct Entry {
@@ -153,7 +153,7 @@ impl Shared {
   /// signals the tokens of the jobs queued or running now (never of jobs
   /// already released) and takes the queue. The taken jobs stay admitted,
   /// counted as cancelling, until the caller abandons them outside the
-  /// lock ([`crate::worker::abandon`]).
+  /// lock ([`crate::runtime::worker::abandon`]).
   pub(crate) fn close(&self, cancel: bool) -> VecDeque<Entry> {
     let mut state = self.lock();
     state.closed = true;
@@ -183,8 +183,8 @@ fn reservation_error(_: std::collections::TryReserveError) -> io::Error {
 #[cfg(test)]
 mod tests {
   use super::*;
-  use crate::error::JoinError;
-  use crate::task::Release;
+  use crate::runtime::error::JoinError;
+  use crate::runtime::task::Release;
 
   struct Finish<'a> {
     shared: &'a Shared,

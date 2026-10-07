@@ -70,7 +70,7 @@ impl<F> fmt::Display for SubmitError<F> {
 
 impl<F> std::error::Error for SubmitError<F> {}
 
-/// Why [`Job::join`](crate::Job::join) has no result.
+/// Why [`Job::join`](crate::runtime::Job::join) has no result.
 #[non_exhaustive]
 pub enum JoinError {
   /// The job was cancelled before it started, or dropped unstarted by a
@@ -82,7 +82,7 @@ pub enum JoinError {
   Panicked(Box<dyn Any + Send + 'static>),
   /// The outcome was not ready, and the join was called from one of the
   /// job's runtime's workers or from the thread dropping its queued jobs.
-  /// Waiting there could deadlock (see [`Job::join`](crate::Job::join)).
+  /// Waiting there could deadlock (see [`Job::join`](crate::runtime::Job::join)).
   /// The job is unaffected; its result is lost because the handle was
   /// consumed.
   WouldDeadlock,

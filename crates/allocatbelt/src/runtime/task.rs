@@ -3,8 +3,8 @@
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::Arc;
 
-use crate::error::JoinError;
-use crate::job::{CancellationToken, Control, Packet};
+use crate::runtime::error::JoinError;
+use crate::runtime::job::{CancellationToken, Control, Packet};
 
 /// Returns a job's admission. The worker calls it again after the job if
 /// the job did not, so it releases exactly once.
@@ -14,7 +14,7 @@ pub(crate) trait Release {
 
 /// A queued job with its result type erased.
 pub(crate) trait Runnable: Send {
-  /// The job's flags and start state (see [`crate::state`]).
+  /// The job's flags and start state (see [`crate::runtime::state`]).
   fn control(&self) -> &Arc<Control>;
 
   /// Runs a started job: calls the closure, releases the admission once the

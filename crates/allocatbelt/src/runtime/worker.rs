@@ -8,10 +8,10 @@ use std::panic::{self, AssertUnwindSafe};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::cache;
-use crate::resources::Resources;
-use crate::scheduler::{Entry, Shared};
-use crate::task::Release;
+use crate::runtime::cache;
+use crate::runtime::resources::Resources;
+use crate::runtime::scheduler::{Entry, Shared};
+use crate::runtime::task::Release;
 
 // Both cells are const-initialized and have no `Drop`, so they stay
 // readable while the thread's other thread-locals are destroyed.

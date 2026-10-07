@@ -6,7 +6,7 @@
 //! called). That swap is the linearization point; whichever loses sees the
 //! other's state and does nothing.
 
-use crate::sync::{AtomicU8, Ordering};
+use crate::runtime::sync::{AtomicU8, Ordering};
 
 const QUEUED: u8 = 0;
 const RUNNING: u8 = 1;
