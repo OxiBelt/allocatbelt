@@ -8,6 +8,7 @@ set -euo pipefail
 
 repo="$(cd "$(dirname "$0")/.." && pwd)"
 cd "${repo}"
+source "${repo}/scripts/lib/miri-results.sh"
 
 toolchain="nightly-2026-09-27"
 package="allocatbelt-core-check"
@@ -52,6 +53,7 @@ if [[ -z "${output_dir}" ]]; then
   output_dir="target/miri/core-check-$(date -u +%Y%m%dT%H%M%SZ)-$$"
 fi
 mkdir -p -- "${output_dir}" || exit 2
+output_dir="$(cd -- "${output_dir}" && pwd -P)" || exit 2
 if [[ -n "$(find "${output_dir}" -mindepth 1 -maxdepth 1 -print -quit)" ]]; then
   echo "error: output directory is not empty: ${output_dir}" >&2
   exit 2
@@ -152,51 +154,25 @@ for test_name in "${tests[@]}"; do
   fi
 
   # The harness may print a test as successful and then fail during process
-  # teardown. Require the exact test outcome and one-test success summary,
-  # as well as zero process and log-writer exit codes.
-  if ! output_count="$(awk '$1 == "test" && $3 == "..." { count++ } END { print count + 0 }' \
-    "${log_file}")"; then
-    echo "error: could not parse output count for ${test_name}" >&2
-    exit 1
-  fi
-  if ! outcome_count="$(awk -v name="${test_name}" \
-    '$1 == "test" && $2 == name && $3 == "..." { count++ } END { print count + 0 }' \
-    "${log_file}")"; then
-    echo "error: could not parse test outcome for ${test_name}" >&2
-    exit 1
-  fi
-  if ! outcome="$(awk -v name="${test_name}" \
-    '$1 == "test" && $2 == name && $3 == "..." { print $4 }' "${log_file}")"; then
-    echo "error: could not parse test result for ${test_name}" >&2
-    exit 1
-  fi
-  if ! summary="$(sed -n '/^test result:/p' "${log_file}")"; then
-    echo "error: could not parse test summary for ${test_name}" >&2
-    exit 1
-  fi
-  expected_filtered=$((listed_count - 1))
-  passed_pattern="^test result: ok\. 1 passed; 0 failed; 0 ignored; 0 measured; ${expected_filtered} filtered out; finished in ([0-9]+([.][0-9]+)?s)$"
-  ignored_pattern="^test result: ok\. 0 passed; 0 failed; 1 ignored; 0 measured; ${expected_filtered} filtered out; finished in ([0-9]+([.][0-9]+)?s)$"
-
-  if ((status == 0 && tee_status == 0 && output_count == 1 && outcome_count == 1)) \
-    && [[ "${test_name}" != "${approved_benchmark}" && "${outcome}" == ok \
-      && "${summary}" =~ ${passed_pattern} ]]; then
-    if ! printf '%s\tpassed\t0\t0\t%s\n' "${test_name}" "${log_file}" >>"${manifest}"; then
-      echo "error: could not record test result in ${manifest}" >&2
-      exit 1
+  # teardown. The shared parser requires exact output, summary, and exit codes.
+  if miri_classify_log "${log_file}" "${test_name}" "${listed_count}" \
+    "${status}" "${tee_status}" "${approved_benchmark}"; then
+    if [[ "${MIRI_CLASS}" == passed ]]; then
+      if ! printf '%s\tpassed\t0\t0\t%s\n' "${test_name}" "${log_file}" >>"${manifest}"; then
+        echo "error: could not record test result in ${manifest}" >&2
+        exit 1
+      fi
+      passed_count=$((passed_count + 1))
+    else
+      if ! printf '%s\tapproved_ignored_benchmark\t0\t0\t%s\n' \
+        "${test_name}" "${log_file}" >>"${manifest}"; then
+        echo "error: could not record approved ignored benchmark in ${manifest}" >&2
+        exit 1
+      fi
+      approved_skip_count=$((approved_skip_count + 1))
     fi
-    passed_count=$((passed_count + 1))
-  elif ((status == 0 && tee_status == 0 && output_count == 1 && outcome_count == 1)) \
-    && [[ "${test_name}" == "${approved_benchmark}" && "${outcome}" == ignored \
-      && "${summary}" =~ ${ignored_pattern} ]]; then
-    if ! printf '%s\tapproved_ignored_benchmark\t0\t0\t%s\n' \
-      "${test_name}" "${log_file}" >>"${manifest}"; then
-      echo "error: could not record approved ignored benchmark in ${manifest}" >&2
-      exit 1
-    fi
-    approved_skip_count=$((approved_skip_count + 1))
   else
-    echo "FAIL: ${test_name} (exit ${status}, log exit ${tee_status}, outputs ${output_count}, outcomes ${outcome_count}, outcome ${outcome:-missing}, summary ${summary:-missing})" >&2
+    echo "FAIL: ${test_name} (${MIRI_DIAGNOSTIC})" >&2
     if ! printf '%s\tfailed\t%s\t0\t%s\n' "${test_name}" "${status}" "${log_file}" >>"${manifest}"; then
       echo "error: could not record failure in ${manifest}" >&2
       exit 1

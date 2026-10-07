@@ -64,6 +64,29 @@ contention-benchmark skip. Keep raw evidence in the private resources checkout.
 The two large page-topology fixtures preserve native stress counts and use
 bounded, topology-equivalent sizes under Miri; a separate test covers small
 classes across bitmap-word boundaries. A timeout or cancellation is not a pass.
+To re-audit a captured campaign without rerunning Miri, use its recorded
+manifest and exact Cargo test list:
+
+```sh
+scripts/verify-miri-results.sh \
+  --manifest DIR/results.tsv \
+  --tests-list DIR/tests.list \
+  --tests-names DIR/tests.names \
+  --output DIR/verified-results.tsv
+```
+
+The auditor checks every listed test exactly once, both exit codes, and the
+outcome and summary in each log. It writes a separate verified manifest and
+never edits the captured inputs. If the raw runner recorded the one approved
+contention benchmark as failed but its zero-exit log contains the exact
+`ignored, benchmark; prints timings` outcome, the auditor keeps `failed` in
+`recorded_status`, sets `verified_status` to `approved_ignored_benchmark`, and
+prints a warning. Other failures, timeouts, missing tests or different skip
+reasons remain failures.
+New runner manifests contain absolute log paths. For an older manifest whose
+log paths were relative to the original working directory, add
+`--log-root ORIGINAL_WORKING_DIRECTORY`. Without that option, relative log
+paths resolve from the manifest's directory.
 
 The mutation campaign is configured in `mewt.toml` and must catch every
 mutant with no skips or timeouts. Add a test rather than narrowing the
