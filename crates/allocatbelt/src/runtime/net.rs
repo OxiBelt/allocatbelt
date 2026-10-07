@@ -206,6 +206,46 @@ impl TcpSocket {
     })
   }
 
+  /// Starts listening with the requested kernel backlog and registers the
+  /// resulting listener with `reactor`.
+  ///
+  /// A negative `backlog` is rejected before the syscall and returns this
+  /// unchanged socket. Zero is valid. On Linux an unbound socket is
+  /// automatically bound to a local address; the kernel may clamp the
+  /// requested backlog to its `somaxconn` setting. The backlog describes the
+  /// kernel's pending-connection queue and is not a runtime admission or
+  /// managed-memory limit.
+  ///
+  /// If the listen syscall fails, the error returns the same owned socket.
+  /// The syscall was attempted, so its address or other kernel state may have
+  /// changed; this method does not roll back or retry it. If listen succeeds
+  /// but reactor registration fails, the error returns the listening standard
+  /// library listener for recovery or later registration.
+  pub fn listen(
+    self,
+    backlog: i32,
+    reactor: &ReactorHandle,
+  ) -> Result<TcpListener, TcpListenError> {
+    if backlog < 0 {
+      return Err(TcpListenError::InvalidBacklog {
+        backlog,
+        socket: self,
+      });
+    }
+    if let Err(error) = rnet::listen(&self.fd, backlog) {
+      return Err(TcpListenError::Listen {
+        error: error.into(),
+        socket: self,
+      });
+    }
+    let Self { fd, family: _ } = self;
+    let listener: StdTcpListener = fd.into();
+    TcpListener::from_std(listener, reactor).map_err(|error| TcpListenError::Registration {
+      error: error.error,
+      listener: error.socket,
+    })
+  }
+
   /// Recovers the original descriptor before submitting a connect operation.
   #[must_use]
   pub fn into_owned_fd(self) -> OwnedFd {
@@ -664,6 +704,57 @@ pub enum AcceptError {
   Io(io::Error),
   /// Registration failed and the accepted socket remains available.
   Registration(FromStdError<StdTcpStream>),
+}
+
+/// Failure while converting a [`TcpSocket`] into a registered
+/// [`TcpListener`]. Each variant retains the owned socket or listener that
+/// remains available at that stage.
+#[derive(Debug)]
+pub enum TcpListenError {
+  /// The negative backlog was rejected before calling the kernel.
+  InvalidBacklog {
+    /// The rejected backlog value.
+    backlog: i32,
+    /// The unchanged socket.
+    socket: TcpSocket,
+  },
+  /// The listen syscall failed after it was attempted.
+  Listen {
+    /// The syscall error.
+    error: io::Error,
+    /// The same socket, whose kernel state may have changed.
+    socket: TcpSocket,
+  },
+  /// Listening succeeded but reactor registration was refused.
+  Registration {
+    /// Why registration failed.
+    error: io::Error,
+    /// The live listener returned by the standard library conversion.
+    listener: StdTcpListener,
+  },
+}
+
+impl fmt::Display for TcpListenError {
+  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    match self {
+      Self::InvalidBacklog { backlog, .. } => {
+        write!(f, "TCP listen backlog {backlog} is negative")
+      }
+      Self::Listen { error, .. } => write!(f, "TCP listen syscall failed: {error}"),
+      Self::Registration { error, .. } => {
+        write!(f, "TCP listener registration failed: {error}")
+      }
+    }
+  }
+}
+
+impl std::error::Error for TcpListenError {
+  fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+    match self {
+      Self::InvalidBacklog { .. } => None,
+      Self::Listen { error, .. } | Self::Registration { error, .. } => Some(error),
+    }
+  }
 }
 
 impl fmt::Display for AcceptError {

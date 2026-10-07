@@ -14,8 +14,9 @@ use std::time::{Duration, Instant};
 
 use super::{
   ConnectAttempt, ConnectProbeResult, NetHandle, NetworkError, ResolveError, ResolveSubmissionKind,
-  TcpConnectError, TcpConnectRejectKind, TcpListener, TcpSocket, UdpSocket, classify_connect_probe,
-  classify_connect_start, finish_connect_probe, initiate_tcp_connect, wait_for_tcp_connect,
+  TcpConnectError, TcpConnectRejectKind, TcpListenError, TcpListener, TcpSocket, UdpSocket,
+  classify_connect_probe, classify_connect_start, finish_connect_probe, initiate_tcp_connect,
+  wait_for_tcp_connect,
 };
 use crate::runtime::blocking::{Config, Runtime, ShutdownMode};
 use crate::runtime::io::{AsyncRead, AsyncWrite, copy_with_buffer};
@@ -476,6 +477,109 @@ fn accepted_socket_is_returned_when_registration_table_is_full() {
   let mut received = [0; 4];
   accepted.read_exact(&mut received).unwrap();
   assert_eq!(&received, b"kept");
+}
+
+#[test]
+fn tcp_socket_listen_autobinds_and_accepts_with_zero_backlog() {
+  let reactor = reactor(2);
+  let handle = reactor.handle();
+  let socket = TcpSocket::new_v4().unwrap();
+  let listener = socket.listen(0, &handle).unwrap();
+  let address = listener.get_ref().local_addr().unwrap();
+  assert_ne!(
+    address.port(),
+    0,
+    "listen should autobind an unbound socket"
+  );
+
+  let peer = StdTcpStream::connect_timeout(&address, IO_TIMEOUT).unwrap();
+  set_tcp_timeouts(&peer);
+  let (accepted, peer_address) = block_on(listener.accept()).unwrap();
+  assert_eq!(peer_address, peer.local_addr().unwrap());
+  drop((accepted, peer));
+  reactor.shutdown().unwrap();
+}
+
+#[test]
+fn negative_listen_backlog_returns_unchanged_socket_for_retry() {
+  let reactor = reactor(2);
+  let handle = reactor.handle();
+  let socket = TcpSocket::new_v4().unwrap();
+  socket.bind(SocketAddr::from(([127, 0, 0, 1], 0))).unwrap();
+  let before = socket.local_addr().unwrap();
+
+  let socket = match socket.listen(-1, &handle) {
+    Err(TcpListenError::InvalidBacklog {
+      backlog: -1,
+      socket,
+    }) => socket,
+    other => panic!("expected preflight backlog rejection, got {other:?}"),
+  };
+  assert_eq!(socket.local_addr().unwrap(), before);
+
+  let listener = socket.listen(1, &handle).unwrap();
+  assert_eq!(listener.get_ref().local_addr().unwrap(), before);
+  reactor.shutdown().unwrap();
+}
+
+#[test]
+fn failed_listen_returns_socket_for_explicit_retry() {
+  let reactor = reactor(2);
+  let handle = reactor.handle();
+  let reusable_socket = || {
+    let socket = TcpSocket::new_v4().unwrap();
+    rustix::net::sockopt::set_socket_reuseaddr(&socket.fd, true).unwrap();
+    socket
+  };
+  let first = reusable_socket();
+  first.bind(SocketAddr::from(([127, 0, 0, 1], 0))).unwrap();
+  let address = first.local_addr().unwrap();
+  let second = reusable_socket();
+  second.bind(address).unwrap();
+  let listener = first.listen(8, &handle).unwrap();
+  let second_fd = second.fd.as_raw_fd();
+
+  let (error, second) = match second.listen(8, &handle) {
+    Err(TcpListenError::Listen { error, socket }) => (error, socket),
+    other => panic!("expected listen syscall failure with socket recovery, got {other:?}"),
+  };
+  assert_eq!(error.kind(), std::io::ErrorKind::AddrInUse);
+  assert_eq!(second.fd.as_raw_fd(), second_fd);
+  assert_eq!(second.local_addr().unwrap(), address);
+
+  drop(listener);
+  let listener = second.listen(8, &handle).unwrap();
+  assert_eq!(listener.get_ref().local_addr().unwrap(), address);
+  drop(listener);
+  reactor.shutdown().unwrap();
+}
+
+#[test]
+fn listen_registration_failure_returns_listener_for_another_reactor() {
+  let full_reactor = reactor(1);
+  let full_handle = full_reactor.handle();
+  let held = StdUdpSocket::bind("127.0.0.1:0").unwrap();
+  let _held = UdpSocket::from_std(held, &full_handle).unwrap();
+
+  let socket = TcpSocket::new_v4().unwrap();
+  socket.bind(SocketAddr::from(([127, 0, 0, 1], 0))).unwrap();
+  let error = socket.listen(8, &full_handle).unwrap_err();
+  let listener = match error {
+    TcpListenError::Registration { listener, .. } => listener,
+    other => panic!("expected registration failure with listener recovery, got {other:?}"),
+  };
+  let address = listener.local_addr().unwrap();
+
+  let replacement_reactor = reactor(2);
+  let replacement_handle = replacement_reactor.handle();
+  let listener = TcpListener::from_std(listener, &replacement_handle).unwrap();
+  let peer = StdTcpStream::connect_timeout(&address, IO_TIMEOUT).unwrap();
+  set_tcp_timeouts(&peer);
+  let (accepted, _) = block_on(listener.accept()).unwrap();
+  drop((accepted, peer));
+
+  replacement_reactor.shutdown().unwrap();
+  full_reactor.shutdown().unwrap();
 }
 
 #[test]

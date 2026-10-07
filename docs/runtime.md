@@ -429,16 +429,26 @@ Filesystem-path Unix datagram APIs do not support abstract addresses.
 created or supplied nonblocking TCP socket, register it with the reactor, then
 issue one connect syscall and wait for writable readiness. `TcpSocket` supports
 IPv4/IPv6 creation, binding, local-address inspection, and import/recovery of
-owned descriptors. Supplied-socket admission or registration rejection returns
-the original socket; after connect is attempted, errors close it and never
-replay the syscall. Cancellation drops the readiness waiter and local socket,
-then releases its network-operation permit. It cannot undo a handshake already
+owned descriptors. `TcpSocket::listen` accepts a kernel backlog and returns a
+registered `TcpListener`; an unbound IPv4/IPv6 socket may be autobound by the
+kernel. Negative backlog values return the unchanged socket before the syscall.
+A listen syscall error returns the same descriptor, but the syscall was
+attempted and its kernel state may have changed; no rollback or retry occurs.
+If reactor registration fails after listen succeeds, the error returns the
+listening standard-library socket for recovery or later registration. The
+kernel may clamp backlog to `somaxconn`; it describes the pending-connection
+queue and does not reserve runtime operations or managed memory.
+
+Supplied-socket connect admission or registration rejection returns the
+original socket; after connect is attempted, errors close it and never replay
+the syscall. Cancellation drops the readiness waiter and local socket, then
+releases its network-operation permit. It cannot undo a handshake already
 observed by the remote peer. Imported descriptors must be nonblocking,
 close-on-exec, unconnected TCP stream sockets that are not listening. The
 runtime cannot detect an external alias with an earlier connect in progress or
 one that consumes `SO_ERROR`; callers must coordinate aliases. These methods
-perform no DNS, address retry or timeout policy. The builder does not yet offer
-the full `TcpSocket` option family or a listen conversion.
+perform no DNS, address retry or timeout policy. The builder still lacks the
+full `TcpSocket` option family.
 
 The blocking `connect` and DNS resolver use the explicit bounded blocking
 handle. A blocking network permit remains held while work is queued or running;
@@ -1476,8 +1486,8 @@ implemented with the contracts above. The stable Linux Tokio 1.53.1 capability
 baseline still requires these implementation and qualification steps:
 
 1. Extend automatic cooperative progress beyond the currently listed
-   operations. Expand TCP socket-option and listen-builder coverage beyond the
-   explicit single-address nonblocking connect and bound-socket operations.
+   operations. Expand TCP socket-option coverage beyond the explicit-address
+   nonblocking connect, listen and bound-socket operations.
 2. Add FIFO path constructors. Owned blocking streams, standard I/O adapters,
    anonymous Unix pipes, managed
    in-memory simplex/duplex pipes and caller-buffered bidirectional copy are
