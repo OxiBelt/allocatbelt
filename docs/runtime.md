@@ -166,6 +166,28 @@ Native tests and three Loom models exercise the production ledger, immediate
 acquisition, queued cancellation/grant races, close and slot-generation reuse.
 The models do not cover arbitrary user waker behavior or every scheduler path.
 
+## Bounded asynchronous mutex
+
+`runtime::mutex::AsyncMutex` uses a private one-permit FIFO semaphore with an
+explicit waiter bound. It returns borrowed or owned lock futures and guards;
+full or closed admission returns a typed error. Constructor failures return
+the original protected value. Closing rejects queued and granted-but-unclaimed
+locks, while already-issued guards remain valid.
+
+The guard owns the protected value during access. Unlock restores that value
+under a short standard mutex lock, releases the lock, then returns the permit.
+No standard lock survives an await or covers caller code or callbacks. A guard
+can move between threads when the value is `Send`, without requiring `Sync`;
+owned guards and futures keep the mutex state alive. This interface does not
+promise a stable address for the protected value. User panics while holding a
+guard do not poison the mutex; forgetting a guard can leak the value and prevent
+further acquisition.
+
+Metadata uses ordinary runtime storage outside the managed-buffer ledger.
+Native tests cover FIFO order, queued/granted cancellation, close, reentrant
+unlock wakes, panic cleanup and ownership. A Loom model uses the actual mutex
+and semaphore implementation to check serialized updates.
+
 ## Owned asynchronous tasks
 
 `runtime::asynchronous::AsyncRuntime` runs owned `Send + 'static` futures on a

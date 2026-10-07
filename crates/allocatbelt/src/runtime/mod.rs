@@ -80,6 +80,7 @@ pub mod fs;
 pub mod io;
 mod job;
 pub mod managed;
+pub mod mutex;
 #[cfg(all(test, loom))]
 mod model;
 #[cfg(not(loom))]
