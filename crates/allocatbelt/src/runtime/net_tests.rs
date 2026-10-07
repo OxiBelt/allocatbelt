@@ -4,6 +4,7 @@ use std::net::{
   Ipv6Addr, SocketAddr, SocketAddrV6, TcpListener as StdTcpListener, TcpStream as StdTcpStream,
   UdpSocket as StdUdpSocket,
 };
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::pin::Pin;
 use std::pin::pin;
 use std::sync::{Arc, mpsc};
@@ -11,10 +12,14 @@ use std::task::{Context, Poll, Wake, Waker};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use super::{NetHandle, NetworkError, ResolveError, ResolveSubmissionKind, TcpListener, UdpSocket};
+use super::{
+  ConnectAttempt, ConnectProbeResult, NetHandle, NetworkError, ResolveError, ResolveSubmissionKind,
+  TcpConnectError, TcpConnectRejectKind, TcpListener, TcpSocket, UdpSocket, classify_connect_probe,
+  classify_connect_start, finish_connect_probe, initiate_tcp_connect, wait_for_tcp_connect,
+};
 use crate::runtime::blocking::{Config, Runtime, ShutdownMode};
 use crate::runtime::io::{AsyncRead, AsyncWrite, copy_with_buffer};
-use crate::runtime::managed::{ResourceLimits, ResourceScope};
+use crate::runtime::managed::{OperationRequest, ResourceLimits, ResourceScope};
 use crate::runtime::reactor::{Reactor, ReactorConfig};
 use crate::runtime::resources::Resources;
 
@@ -557,6 +562,371 @@ fn connect_runs_on_the_blocking_pool_and_releases_its_network_permit() {
   assert_eq!(scope.snapshot().network_ops, 0);
   assert_eq!(stream.get_ref().peer_addr().unwrap(), address);
   runtime.shutdown(ShutdownMode::Drain).unwrap();
+}
+
+#[test]
+fn nonblocking_tcp_connect_preserves_bound_port_and_transfers_data() {
+  let mut blocking = Runtime::new(Config {
+    workers: 1,
+    max_outstanding: 2,
+    capacity: Resources::ZERO,
+  })
+  .unwrap();
+  let reactor = reactor(4);
+  let scope = ResourceScope::new(ResourceLimits {
+    managed_memory: 0,
+    disk_concurrent_ops: 0,
+    network_concurrent_ops: 1,
+  });
+  let net = NetHandle::new(blocking.handle(), scope.clone(), reactor.handle(), 4).unwrap();
+  let listener = StdTcpListener::bind("127.0.0.1:0").unwrap();
+  let address = listener.local_addr().unwrap();
+  listener.set_nonblocking(true).unwrap();
+
+  let socket = TcpSocket::new_v4().unwrap();
+  socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+  let local = socket.local_addr().unwrap();
+  let stream = block_on(net.connect_socket(socket, address)).unwrap();
+  let deadline = Instant::now() + IO_TIMEOUT;
+  let (mut peer, peer_address) = loop {
+    match listener.accept() {
+      Ok(accepted) => break accepted,
+      Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+        assert!(
+          Instant::now() < deadline,
+          "nonblocking connection not accepted"
+        );
+        thread::sleep(Duration::from_millis(1));
+      }
+      Err(error) => panic!("TCP accept failed: {error}"),
+    }
+  };
+  set_tcp_timeouts(&peer);
+  assert_eq!(peer_address, local);
+  assert_eq!(stream.get_ref().peer_addr().unwrap(), address);
+  assert_eq!(reactor.handle().registrations(), 1);
+  assert_eq!(scope.snapshot().network_ops, 0);
+
+  assert_eq!(block_on(stream.write(b"ping")).unwrap(), 4);
+  let mut received = [0; 4];
+  peer.read_exact(&mut received).unwrap();
+  assert_eq!(&received, b"ping");
+  peer.write_all(b"pong").unwrap();
+  assert_eq!(block_on(stream.read(&mut received)).unwrap(), 4);
+  assert_eq!(&received, b"pong");
+  drop(stream);
+  assert_eq!(reactor.handle().registrations(), 0);
+  blocking.shutdown(ShutdownMode::Drain).unwrap();
+}
+
+#[test]
+fn nonblocking_ipv6_tcp_connect_works_when_loopback_is_available() {
+  let listener = match StdTcpListener::bind("[::1]:0") {
+    Ok(listener) => listener,
+    Err(error)
+      if matches!(
+        error.kind(),
+        std::io::ErrorKind::AddrNotAvailable
+          | std::io::ErrorKind::PermissionDenied
+          | std::io::ErrorKind::Unsupported
+      ) =>
+    {
+      eprintln!("IPv6 loopback unavailable; IPv6 connect test skipped: {error}");
+      return;
+    }
+    Err(error) => panic!("IPv6 loopback setup failed unexpectedly: {error}"),
+  };
+  let address = listener.local_addr().unwrap();
+  let reactor = reactor(2);
+  let mut blocking = Runtime::new(Config {
+    workers: 1,
+    max_outstanding: 1,
+    capacity: Resources::ZERO,
+  })
+  .unwrap();
+  let scope = ResourceScope::new(ResourceLimits {
+    managed_memory: 0,
+    disk_concurrent_ops: 0,
+    network_concurrent_ops: 1,
+  });
+  let net = NetHandle::new(blocking.handle(), scope, reactor.handle(), 1).unwrap();
+  let stream = block_on(net.connect_nonblocking(address)).unwrap();
+  let (peer, _) = listener.accept().unwrap();
+  assert_eq!(stream.get_ref().peer_addr().unwrap(), address);
+  drop(peer);
+  drop(stream);
+  blocking.shutdown(ShutdownMode::Drain).unwrap();
+}
+
+#[test]
+fn tcp_socket_import_rejection_returns_the_same_listening_descriptor() {
+  let listener = StdTcpListener::bind("127.0.0.1:0").unwrap();
+  let address = listener.local_addr().unwrap();
+  let fd: OwnedFd = listener.into();
+  let raw = fd.as_raw_fd();
+  let rejected = TcpSocket::from_owned_fd(fd).unwrap_err();
+  assert_eq!(rejected.socket.as_raw_fd(), raw);
+  let returned = StdTcpListener::from(rejected.socket);
+  assert_eq!(returned.local_addr().unwrap(), address);
+}
+
+#[test]
+fn tcp_socket_import_accepts_a_nonblocking_unconnected_tcp_descriptor() {
+  let socket = TcpSocket::new_v4().unwrap();
+  let imported = TcpSocket::from_owned_fd(socket.into_owned_fd()).unwrap();
+  imported.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+  assert_eq!(
+    imported.local_addr().unwrap().ip(),
+    "127.0.0.1".parse::<std::net::IpAddr>().unwrap()
+  );
+}
+
+#[test]
+fn tcp_connect_rejections_before_connect_return_the_supplied_socket() {
+  let mut blocking = Runtime::new(Config {
+    workers: 1,
+    max_outstanding: 1,
+    capacity: Resources::ZERO,
+  })
+  .unwrap();
+  let reactor = reactor(1);
+  let scope = ResourceScope::new(ResourceLimits {
+    managed_memory: 0,
+    disk_concurrent_ops: 0,
+    network_concurrent_ops: 0,
+  });
+  let net = NetHandle::new(blocking.handle(), scope, reactor.handle(), 1).unwrap();
+  let socket = TcpSocket::new_v4().unwrap();
+  socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+  let local = socket.local_addr().unwrap();
+  let error = block_on(net.connect_socket(socket, "127.0.0.1:9".parse().unwrap())).unwrap_err();
+  match error {
+    TcpConnectError::Submission(error) => {
+      assert!(matches!(error.kind, TcpConnectRejectKind::Resource(_)));
+      assert_eq!(error.socket.local_addr().unwrap(), local);
+    }
+    TcpConnectError::Operation(error) => panic!("unexpected operation error: {error}"),
+  }
+  assert_eq!(reactor.handle().registrations(), 0);
+  assert_eq!(reactor.handle().waiters(), 0);
+  blocking.shutdown(ShutdownMode::Drain).unwrap();
+
+  let mut blocking = Runtime::new(Config {
+    workers: 1,
+    max_outstanding: 1,
+    capacity: Resources::ZERO,
+  })
+  .unwrap();
+  let reactor = self::reactor(1);
+  let scope = ResourceScope::new(ResourceLimits {
+    managed_memory: 0,
+    disk_concurrent_ops: 0,
+    network_concurrent_ops: 1,
+  });
+  let handle = reactor.handle();
+  let _registered =
+    TcpListener::from_std(StdTcpListener::bind("127.0.0.1:0").unwrap(), &handle).unwrap();
+  let net = NetHandle::new(blocking.handle(), scope, handle.clone(), 1).unwrap();
+  let socket = TcpSocket::new_v4().unwrap();
+  socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+  let local = socket.local_addr().unwrap();
+  let error = block_on(net.connect_socket(socket, "127.0.0.1:9".parse().unwrap())).unwrap_err();
+  match error {
+    TcpConnectError::Submission(error) => {
+      assert!(matches!(error.kind, TcpConnectRejectKind::Registration(_)));
+      assert_eq!(error.socket.local_addr().unwrap(), local);
+      assert!(matches!(
+        rustix::net::getpeername(&error.socket.fd),
+        Ok(None) | Err(rustix::io::Errno::NOTCONN)
+      ));
+    }
+    TcpConnectError::Operation(error) => panic!("unexpected operation error: {error}"),
+  }
+  assert_eq!(handle.registrations(), 1);
+  assert_eq!(handle.waiters(), 0);
+  drop(_registered);
+  assert_eq!(handle.registrations(), 0);
+  blocking.shutdown(ShutdownMode::Drain).unwrap();
+}
+
+#[test]
+fn refused_nonblocking_connect_releases_its_permit_and_registration() {
+  let mut blocking = Runtime::new(Config {
+    workers: 1,
+    max_outstanding: 1,
+    capacity: Resources::ZERO,
+  })
+  .unwrap();
+  let reactor = reactor(2);
+  let scope = ResourceScope::new(ResourceLimits {
+    managed_memory: 0,
+    disk_concurrent_ops: 0,
+    network_concurrent_ops: 1,
+  });
+  let net = NetHandle::new(blocking.handle(), scope.clone(), reactor.handle(), 1).unwrap();
+  let listener = StdTcpListener::bind("127.0.0.1:0").unwrap();
+  let address = listener.local_addr().unwrap();
+  drop(listener);
+
+  match block_on(net.connect_nonblocking(address)) {
+    Err(TcpConnectError::Operation(NetworkError::Io(error))) => {
+      assert_eq!(error.kind(), std::io::ErrorKind::ConnectionRefused);
+    }
+    Err(error) => panic!("unexpected connect error: {error}"),
+    Ok(_) => panic!("connection to a closed loopback port unexpectedly succeeded"),
+  }
+  assert_eq!(scope.snapshot().network_ops, 0);
+  assert_eq!(reactor.handle().registrations(), 0);
+  assert_eq!(reactor.handle().waiters(), 0);
+  blocking.shutdown(ShutdownMode::Drain).unwrap();
+
+  let mut blocking = Runtime::new(Config {
+    workers: 1,
+    max_outstanding: 1,
+    capacity: Resources::ZERO,
+  })
+  .unwrap();
+  let reactor = self::reactor(1);
+  let scope = ResourceScope::new(ResourceLimits {
+    managed_memory: 0,
+    disk_concurrent_ops: 0,
+    network_concurrent_ops: 1,
+  });
+  let net = NetHandle::new(blocking.handle(), scope, reactor.handle(), 1).unwrap();
+  let socket = TcpSocket::new_v4().unwrap();
+  socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+  let local = socket.local_addr().unwrap();
+  let error = block_on(net.connect_socket(socket, "[::1]:9".parse().unwrap())).unwrap_err();
+  match error {
+    TcpConnectError::Submission(error) => {
+      assert!(matches!(error.kind, TcpConnectRejectKind::Socket(_)));
+      assert_eq!(error.socket.local_addr().unwrap(), local);
+    }
+    TcpConnectError::Operation(error) => panic!("unexpected operation error: {error}"),
+  }
+  assert_eq!(reactor.handle().registrations(), 0);
+  blocking.shutdown(ShutdownMode::Drain).unwrap();
+}
+
+#[test]
+fn connect_probe_errors_are_terminal_except_peer_not_connected_after_zero_so_error() {
+  assert!(matches!(classify_connect_start(Ok(())), Ok(false)));
+  assert!(matches!(
+    classify_connect_start(Err(rustix::io::Errno::INPROGRESS)),
+    Ok(true)
+  ));
+  for error in [rustix::io::Errno::AGAIN, rustix::io::Errno::ALREADY] {
+    let returned = classify_connect_start(Err(error)).unwrap_err();
+    assert_eq!(returned.raw_os_error(), Some(error.raw_os_error()));
+  }
+
+  let peer_called = std::sync::atomic::AtomicBool::new(false);
+  let not_connected = classify_connect_probe(Err(rustix::io::Errno::NOTCONN), || {
+    peer_called.store(true, std::sync::atomic::Ordering::SeqCst);
+    Ok("127.0.0.1:80".parse().unwrap())
+  })
+  .unwrap();
+  let not_connected_error = finish_connect_probe(Ok(not_connected)).unwrap_err();
+  assert_eq!(
+    not_connected_error.raw_os_error(),
+    Some(rustix::io::Errno::NOTCONN.raw_os_error())
+  );
+  assert!(!peer_called.load(std::sync::atomic::Ordering::SeqCst));
+
+  let pending = classify_connect_probe(Ok(()), || {
+    Err(std::io::Error::from(rustix::io::Errno::NOTCONN))
+  })
+  .unwrap_err();
+  assert_eq!(pending.kind(), std::io::ErrorKind::WouldBlock);
+  assert!(matches!(finish_connect_probe(Err(pending)), Ok(false)));
+
+  for error in [
+    rustix::io::Errno::CONNREFUSED,
+    rustix::io::Errno::AGAIN,
+    rustix::io::Errno::INTR,
+  ] {
+    let probe = classify_connect_probe(Err(error), || {
+      panic!("peer lookup must not follow nonzero SO_ERROR")
+    })
+    .unwrap();
+    assert!(matches!(probe, ConnectProbeResult::SocketError(_)));
+    let returned = finish_connect_probe(Ok(probe)).unwrap_err();
+    assert_eq!(returned.raw_os_error(), Some(error.raw_os_error()));
+  }
+  assert!(matches!(
+    finish_connect_probe(Err(std::io::Error::from(rustix::io::Errno::INTR))),
+    Ok(false)
+  ));
+}
+
+#[test]
+fn terminal_connect_start_error_is_not_replayed_and_releases_owners() {
+  let reactor = reactor(1);
+  let handle = reactor.handle();
+  let scope = ResourceScope::new(ResourceLimits {
+    managed_memory: 0,
+    disk_concurrent_ops: 0,
+    network_concurrent_ops: 1,
+  });
+  let permit = scope
+    .try_acquire(OperationRequest {
+      disk: 0,
+      network: 1,
+    })
+    .unwrap();
+  let socket = TcpSocket::new_v4().unwrap();
+  let stream = super::TcpStream::from_std(socket.into_stream(), &handle).unwrap();
+  let attempt = ConnectAttempt::new(stream, permit);
+  let calls = std::sync::atomic::AtomicUsize::new(0);
+  let error = initiate_tcp_connect(
+    attempt.stream_ref(),
+    &"127.0.0.1:80".parse().unwrap(),
+    |_, _| {
+      calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+      Err(rustix::io::Errno::AGAIN)
+    },
+  )
+  .unwrap_err();
+  assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+  assert_eq!(
+    error.raw_os_error(),
+    Some(rustix::io::Errno::AGAIN.raw_os_error())
+  );
+  drop(attempt);
+  assert_eq!(scope.snapshot().network_ops, 0);
+  assert_eq!(handle.registrations(), 0);
+  assert_eq!(handle.waiters(), 0);
+}
+
+#[test]
+fn cancellation_drops_stale_connect_waiter_before_socket_and_permit() {
+  let reactor = reactor(2);
+  let handle = reactor.handle();
+  let scope = ResourceScope::new(ResourceLimits {
+    managed_memory: 0,
+    disk_concurrent_ops: 0,
+    network_concurrent_ops: 1,
+  });
+  let permit = scope
+    .try_acquire(OperationRequest {
+      disk: 0,
+      network: 1,
+    })
+    .unwrap();
+  let socket = TcpSocket::new_v4().unwrap();
+  let stream = super::TcpStream::from_std(socket.into_stream(), &handle).unwrap();
+  let mut attempt = ConnectAttempt::new(stream, permit);
+  assert_eq!(handle.registrations(), 1);
+  {
+    let mut waiting = pin!(wait_for_tcp_connect(&mut attempt, 1));
+    let mut context = Context::from_waker(Waker::noop());
+    assert!(matches!(waiting.as_mut().poll(&mut context), Poll::Pending));
+    assert_eq!(handle.waiters(), 1);
+  }
+  drop(attempt);
+  assert_eq!(scope.snapshot().network_ops, 0);
+  assert_eq!(handle.waiters(), 0);
+  assert_eq!(handle.registrations(), 0);
 }
 
 #[test]

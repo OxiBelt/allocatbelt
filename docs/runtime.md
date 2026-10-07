@@ -250,11 +250,27 @@ Dropping a pending named method removes its waiter; transferred bytes remain
 transferred. Binding and socket options use standard-library calls directly.
 Filesystem-path Unix datagram APIs do not support abstract addresses.
 
-`NetHandle` offloads TCP connection and DNS through an explicit bounded
-blocking handle. A network permit remains held while work is queued or running;
+`NetHandle::connect` keeps its blocking-pool behavior. The additive
+`connect_nonblocking` and `connect_socket` methods instead use one explicitly
+created or supplied nonblocking TCP socket, register it with the reactor, then
+issue one connect syscall and wait for writable readiness. `TcpSocket` supports
+IPv4/IPv6 creation, binding, local-address inspection, and import/recovery of
+owned descriptors. Supplied-socket admission or registration rejection returns
+the original socket; after connect is attempted, errors close it and never
+replay the syscall. Cancellation drops the readiness waiter and local socket,
+then releases its network-operation permit. It cannot undo a handshake already
+observed by the remote peer. Imported descriptors must be nonblocking,
+close-on-exec, unconnected TCP stream sockets that are not listening. The
+runtime cannot detect an external alias with an earlier connect in progress or
+one that consumes `SO_ERROR`; callers must coordinate aliases. These methods
+perform no DNS, address retry or timeout policy. The builder does not yet offer
+the full `TcpSocket` option family or a listen conversion.
+
+The blocking `connect` and DNS resolver use the explicit bounded blocking
+handle. A blocking network permit remains held while work is queued or running;
 detaching a future retains worker captures until actual cleanup. DNS rejection
-returns the original hostname and port. Registration rejection returns the
-connected or accepted socket for recovery.
+returns the original hostname and port. Registration rejection from blocking
+connect returns the connected socket for recovery.
 
 DNS output pre-reserves `(address_limit + 1) * 27` managed bytes. Fixed records
 preserve both address families and IPv6 flow and scope identifiers. An overflow
@@ -1280,8 +1296,8 @@ implemented with the contracts above. The stable Linux Tokio 1.53.1 capability
 baseline still requires these implementation and qualification steps:
 
 1. Extend automatic cooperative progress beyond the listed channel and lock
-   operations. Add cancellation-friendly nonblocking connect and supplied/bound
-   socket ports.
+   operations. Expand TCP socket-option and listen-builder coverage beyond the
+   explicit single-address nonblocking connect and bound-socket operations.
 2. Add bounded delimiter, line and whole-stream reads, managed in-memory pipes
    and bidirectional copy with explicit partial-progress and half-close rules.
    The initialized-buffer `Take`/`Chain`/`Empty`/`Sink`/`Repeat` family and

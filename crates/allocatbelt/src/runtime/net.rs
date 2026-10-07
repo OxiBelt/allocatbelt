@@ -5,12 +5,13 @@
 //! readiness and then make one standard-library syscall through the
 //! readiness guard. They do not start a runtime or a blocking pool.
 //!
-//! Socket creation and binding use the standard library synchronously.
-//! Callers should perform operations that can block (notably hostname
-//! resolution and TCP connect) through an explicitly supplied blocking
-//! runtime. `from_std` takes ownership only on success; a rejected socket is
-//! returned intact. Registering sets `O_NONBLOCK` on the shared open file
-//! description, which also affects other descriptors sharing it.
+//! Standard endpoint creation and binding are synchronous. `NetHandle::connect`
+//! uses its explicitly supplied blocking runtime; the named nonblocking TCP
+//! connect methods register before initiating one connect syscall and wait on
+//! the explicit reactor. `from_std` takes ownership only on success; a
+//! rejected socket is returned intact. Registering sets `O_NONBLOCK` on the
+//! shared open file description, which also affects other descriptors sharing
+//! it.
 //!
 //! The async methods preserve partial byte counts and retry `Interrupted`
 //! and stale-readiness `WouldBlock`. They make at most 64 endpoint calls per
@@ -28,14 +29,20 @@
 #![cfg_attr(not(test), deny(clippy::expect_used, clippy::unwrap_used))]
 
 use std::fmt;
+use std::future::poll_fn;
 use std::io::{self, IoSlice, IoSliceMut, Read, Write};
 use std::net::{
   Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6, TcpListener as StdTcpListener,
   TcpStream as StdTcpStream, ToSocketAddrs, UdpSocket as StdUdpSocket,
 };
+use std::os::fd::OwnedFd;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::task::{Context, Poll};
+
+use rustix::fs::{self as rfs, OFlags};
+use rustix::io::{Errno, FdFlags};
+use rustix::net::{self as rnet, AddressFamily, SocketFlags, SocketType};
 
 use super::blocking::Handle as BlockingHandle;
 use super::error::{JoinError, SubmitErrorKind};
@@ -81,6 +88,178 @@ impl<T> fmt::Display for FromStdError<T> {
 }
 
 impl<T: 'static> std::error::Error for FromStdError<T> {}
+
+/// An owned, nonblocking IP TCP socket that is not registered with a reactor.
+///
+/// New sockets are created with `SOCK_NONBLOCK | SOCK_CLOEXEC`. Importing an
+/// existing descriptor requires those flags, an IPv4 or IPv6 TCP stream
+/// socket, and a socket that is not listening or currently connected. The
+/// import checks cannot detect another descriptor alias that has an earlier
+/// connect in progress, changes `O_NONBLOCK`, or consumes `SO_ERROR`; callers
+/// must coordinate such aliases for the duration of a connect operation.
+#[derive(Debug)]
+pub struct TcpSocket {
+  fd: OwnedFd,
+  family: AddressFamily,
+}
+
+impl TcpSocket {
+  /// Creates an unbound, nonblocking IPv4 TCP socket.
+  pub fn new_v4() -> io::Result<Self> {
+    Self::new(AddressFamily::INET)
+  }
+
+  /// Creates an unbound, nonblocking IPv6 TCP socket.
+  pub fn new_v6() -> io::Result<Self> {
+    Self::new(AddressFamily::INET6)
+  }
+
+  fn new(family: AddressFamily) -> io::Result<Self> {
+    let fd = rnet::socket_with(
+      family,
+      SocketType::STREAM,
+      SocketFlags::NONBLOCK | SocketFlags::CLOEXEC,
+      Some(rnet::ipproto::TCP),
+    )?;
+    Ok(Self { fd, family })
+  }
+
+  /// Imports an owned descriptor after checking its family, type, protocol,
+  /// nonblocking and close-on-exec flags, and listening/connected state.
+  ///
+  /// On every rejection, the exact original descriptor is returned. Import
+  /// does not alter shared open-file-description flags.
+  pub fn from_owned_fd(fd: OwnedFd) -> Result<Self, TcpSocketImportError> {
+    let family = match rnet::sockopt::socket_domain(&fd) {
+      Ok(family @ (AddressFamily::INET | AddressFamily::INET6)) => family,
+      Ok(_) => return Err(TcpSocketImportError::new(invalid_tcp_socket(), fd)),
+      Err(error) => return Err(TcpSocketImportError::new(error.into(), fd)),
+    };
+    let reject = |error, fd| TcpSocketImportError::new(error, fd);
+    let socket_type = match rnet::sockopt::socket_type(&fd) {
+      Ok(socket_type) => socket_type,
+      Err(error) => return Err(reject(error.into(), fd)),
+    };
+    if socket_type != SocketType::STREAM {
+      return Err(reject(invalid_tcp_socket(), fd));
+    }
+    let protocol = match rnet::sockopt::socket_protocol(&fd) {
+      Ok(protocol) => protocol,
+      Err(error) => return Err(reject(error.into(), fd)),
+    };
+    if protocol != Some(rnet::ipproto::TCP) {
+      return Err(reject(invalid_tcp_socket(), fd));
+    }
+    let listening = match rnet::sockopt::socket_acceptconn(&fd) {
+      Ok(listening) => listening,
+      Err(error) => return Err(reject(error.into(), fd)),
+    };
+    if listening {
+      return Err(reject(invalid_tcp_socket(), fd));
+    }
+    let connected = match rnet::getpeername(&fd) {
+      Ok(peer) => peer.is_some(),
+      Err(Errno::NOTCONN) => false,
+      Err(error) => return Err(reject(error.into(), fd)),
+    };
+    if connected {
+      return Err(reject(invalid_tcp_socket(), fd));
+    }
+    let status_flags = match rfs::fcntl_getfl(&fd) {
+      Ok(flags) => flags,
+      Err(error) => return Err(reject(error.into(), fd)),
+    };
+    let descriptor_flags = match rustix::io::fcntl_getfd(&fd) {
+      Ok(flags) => flags,
+      Err(error) => return Err(reject(error.into(), fd)),
+    };
+    if !status_flags.contains(OFlags::NONBLOCK) || !descriptor_flags.contains(FdFlags::CLOEXEC) {
+      return Err(reject(
+        io::Error::new(
+          io::ErrorKind::InvalidInput,
+          "imported TCP socket must be nonblocking and close-on-exec",
+        ),
+        fd,
+      ));
+    }
+    Ok(Self { fd, family })
+  }
+
+  /// Binds this socket to an address of its family.
+  pub fn bind(&self, address: SocketAddr) -> io::Result<()> {
+    if address_family(address) != self.family {
+      return Err(io::Error::new(
+        io::ErrorKind::InvalidInput,
+        "TCP socket and bind address families differ",
+      ));
+    }
+    rnet::bind(&self.fd, &address).map_err(Into::into)
+  }
+
+  /// Returns the current local address, including an assigned ephemeral port.
+  pub fn local_addr(&self) -> io::Result<SocketAddr> {
+    SocketAddr::try_from(rnet::getsockname(&self.fd)?).map_err(|_| {
+      io::Error::new(
+        io::ErrorKind::InvalidData,
+        "TCP socket returned a non-IP address",
+      )
+    })
+  }
+
+  /// Recovers the original descriptor before submitting a connect operation.
+  #[must_use]
+  pub fn into_owned_fd(self) -> OwnedFd {
+    self.fd
+  }
+
+  fn into_stream(self) -> StdTcpStream {
+    self.fd.into()
+  }
+}
+
+fn address_family(address: SocketAddr) -> AddressFamily {
+  match address {
+    SocketAddr::V4(_) => AddressFamily::INET,
+    SocketAddr::V6(_) => AddressFamily::INET6,
+  }
+}
+
+fn invalid_tcp_socket() -> io::Error {
+  io::Error::new(
+    io::ErrorKind::InvalidInput,
+    "descriptor is not an unconnected IPv4 or IPv6 TCP stream socket",
+  )
+}
+
+/// A rejected descriptor import, retaining the unchanged owned descriptor.
+pub struct TcpSocketImportError {
+  /// Why the descriptor did not satisfy the TCP socket requirements.
+  pub error: io::Error,
+  /// The descriptor returned unchanged for recovery or another use.
+  pub socket: OwnedFd,
+}
+
+impl TcpSocketImportError {
+  fn new(error: io::Error, socket: OwnedFd) -> Self {
+    Self { error, socket }
+  }
+}
+
+impl fmt::Debug for TcpSocketImportError {
+  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    f.debug_struct("TcpSocketImportError")
+      .field("error", &self.error)
+      .finish_non_exhaustive()
+  }
+}
+
+impl fmt::Display for TcpSocketImportError {
+  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    write!(f, "TCP socket import rejected: {}", self.error)
+  }
+}
+
+impl std::error::Error for TcpSocketImportError {}
 
 /// A registered nonblocking TCP stream.
 pub struct TcpStream {
@@ -519,7 +698,7 @@ pub enum NetworkError {
   Runtime(SubmitErrorKind),
   /// The job was cancelled before it started or panicked.
   Join(JoinError),
-  /// The operating system refused TCP connect or name resolution.
+  /// A network endpoint syscall or resolver operation failed.
   Io(io::Error),
   /// The connected socket could not be registered; ownership is retained.
   Registration(FromStdError<StdTcpStream>),
@@ -546,6 +725,64 @@ impl fmt::Display for NetworkError {
 }
 
 impl std::error::Error for NetworkError {}
+
+/// A pre-connect rejection or an error from a nonblocking TCP connect.
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum TcpConnectError {
+  /// Admission or reactor registration rejected a supplied socket before the
+  /// connect syscall. The socket is returned unchanged.
+  Submission(TcpConnectSubmissionError),
+  /// Socket creation or a connect operation failed after admission.
+  Operation(NetworkError),
+}
+
+impl fmt::Display for TcpConnectError {
+  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    match self {
+      Self::Submission(error) => error.fmt(f),
+      Self::Operation(error) => error.fmt(f),
+    }
+  }
+}
+
+impl std::error::Error for TcpConnectError {}
+
+/// The reason a supplied socket was rejected before connect was attempted.
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum TcpConnectRejectKind {
+  /// The scope had no network operation slot available.
+  Resource(ResourceError),
+  /// The supplied socket and destination address are incompatible.
+  Socket(io::Error),
+  /// The reactor refused registration before connect began.
+  Registration(io::Error),
+}
+
+/// A pre-connect rejection that retains the caller's supplied socket.
+pub struct TcpConnectSubmissionError {
+  /// Why admission or registration was rejected.
+  pub kind: TcpConnectRejectKind,
+  /// The original socket, still available to the caller.
+  pub socket: TcpSocket,
+}
+
+impl fmt::Debug for TcpConnectSubmissionError {
+  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    f.debug_struct("TcpConnectSubmissionError")
+      .field("kind", &self.kind)
+      .finish_non_exhaustive()
+  }
+}
+
+impl fmt::Display for TcpConnectSubmissionError {
+  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    write!(f, "TCP connect rejected before connect: {:?}", self.kind)
+  }
+}
+
+impl std::error::Error for TcpConnectSubmissionError {}
 
 /// A DNS request rejected before the blocking worker accepts ownership.
 /// The original hostname and port are returned unchanged for retry.
@@ -735,6 +972,100 @@ impl NetHandle {
     }
   }
 
+  /// Connects to one address using a newly created nonblocking socket and
+  /// this handle's reactor. No DNS or address retry is performed. Cancellation
+  /// drops the local socket and waiter; it does not undo a handshake already
+  /// observed by the remote peer.
+  pub async fn connect_nonblocking(
+    &self,
+    address: SocketAddr,
+  ) -> Result<TcpStream, TcpConnectError> {
+    let permit = self.acquire().map_err(TcpConnectError::Operation)?;
+    let socket = match address_family(address) {
+      AddressFamily::INET => TcpSocket::new_v4(),
+      AddressFamily::INET6 => TcpSocket::new_v6(),
+      _ => unreachable!("IP socket address has an IP family"),
+    }
+    .map_err(|error| TcpConnectError::Operation(NetworkError::Io(error)))?;
+    self.connect_with_permit(socket, address, permit).await
+  }
+
+  /// Connects one supplied unregistered socket to one address.
+  ///
+  /// The scope slot and reactor registration are acquired before the single
+  /// connect syscall. A rejection at either step returns the same socket in
+  /// [`TcpConnectError::Submission`]. Once connect has been attempted, an
+  /// error closes the socket; the operation is never replayed. Dropping this
+  /// future closes its waiter and registered descriptor before releasing the
+  /// network operation slot. The caller must prevent descriptor aliases from
+  /// mutating connection state or flags, or consuming `SO_ERROR` while the
+  /// operation is active.
+  pub async fn connect_socket(
+    &self,
+    socket: TcpSocket,
+    address: SocketAddr,
+  ) -> Result<TcpStream, TcpConnectError> {
+    if socket.family != address_family(address) {
+      return Err(TcpConnectError::Submission(TcpConnectSubmissionError {
+        kind: TcpConnectRejectKind::Socket(io::Error::new(
+          io::ErrorKind::InvalidInput,
+          "TCP socket and connect address families differ",
+        )),
+        socket,
+      }));
+    }
+    let permit = match self.acquire() {
+      Ok(permit) => permit,
+      Err(NetworkError::Resource(error)) => {
+        return Err(TcpConnectError::Submission(TcpConnectSubmissionError {
+          kind: TcpConnectRejectKind::Resource(error),
+          socket,
+        }));
+      }
+      Err(error) => return Err(TcpConnectError::Operation(error)),
+    };
+    self.connect_with_permit(socket, address, permit).await
+  }
+
+  async fn connect_with_permit(
+    &self,
+    socket: TcpSocket,
+    address: SocketAddr,
+    permit: OperationPermit,
+  ) -> Result<TcpStream, TcpConnectError> {
+    let family = socket.family;
+    let stream = match TcpStream::from_std(socket.into_stream(), &self.reactor) {
+      Ok(stream) => stream,
+      Err(error) => {
+        let (stream, error) = (error.socket, error.error);
+        return Err(TcpConnectError::Submission(TcpConnectSubmissionError {
+          kind: TcpConnectRejectKind::Registration(error),
+          socket: TcpSocket {
+            fd: stream.into(),
+            family,
+          },
+        }));
+      }
+    };
+    let mut attempt = ConnectAttempt::new(stream, permit);
+    let pending = match initiate_tcp_connect(attempt.stream_ref(), &address, |stream, address| {
+      rnet::connect(stream, address)
+    }) {
+      Ok(pending) => pending,
+      Err(error) => {
+        return Err(TcpConnectError::Operation(NetworkError::Io(error)));
+      }
+    };
+    if !pending {
+      return Ok(attempt.finish());
+    }
+
+    wait_for_tcp_connect(&mut attempt, 1)
+      .await
+      .map_err(|error| TcpConnectError::Operation(NetworkError::Io(error)))?;
+    Ok(attempt.finish())
+  }
+
   /// Resolves `(host, port)` on the supplied blocking pool and collects no
   /// more than the configured cap plus one address into memory charged to the
   /// resource scope. If rejected before the worker accepts it, the original
@@ -826,6 +1157,156 @@ impl NetHandle {
         network: 1,
       })
       .map_err(NetworkError::Resource)
+  }
+}
+
+/// Owns the local socket and permit through cancellation and completion.
+/// The waiter is dropped first so its registration clone is gone before the
+/// original stream closes; the permit is released last.
+struct ConnectAttempt {
+  waiter: Option<OwnedReadiness<StdTcpStream>>,
+  stream: Option<TcpStream>,
+  permit: Option<OperationPermit>,
+}
+
+impl ConnectAttempt {
+  fn new(stream: TcpStream, permit: OperationPermit) -> Self {
+    Self {
+      waiter: None,
+      stream: Some(stream),
+      permit: Some(permit),
+    }
+  }
+
+  fn stream_ref(&self) -> &StdTcpStream {
+    match self.stream.as_ref() {
+      Some(stream) => stream.get_ref(),
+      None => unreachable!("connect attempt stream was already transferred"),
+    }
+  }
+
+  fn stream_fd(&self) -> &AsyncFd<StdTcpStream> {
+    match self.stream.as_ref() {
+      Some(stream) => &stream.fd,
+      None => unreachable!("connect attempt stream was already transferred"),
+    }
+  }
+
+  fn finish(mut self) -> TcpStream {
+    drop(self.waiter.take());
+    let stream = match self.stream.take() {
+      Some(stream) => stream,
+      None => unreachable!("connect attempt stream was already transferred"),
+    };
+    drop(self.permit.take());
+    stream
+  }
+}
+
+impl Drop for ConnectAttempt {
+  fn drop(&mut self) {
+    drop(self.waiter.take());
+    drop(self.stream.take());
+    drop(self.permit.take());
+  }
+}
+
+fn classify_connect_start(result: Result<(), Errno>) -> io::Result<bool> {
+  match result {
+    Ok(()) => Ok(false),
+    Err(Errno::INPROGRESS) => Ok(true),
+    Err(error) => Err(error.into()),
+  }
+}
+
+fn initiate_tcp_connect(
+  stream: &StdTcpStream,
+  address: &SocketAddr,
+  connect: impl FnOnce(&StdTcpStream, &SocketAddr) -> Result<(), Errno>,
+) -> io::Result<bool> {
+  classify_connect_start(connect(stream, address))
+}
+
+#[derive(Debug)]
+enum ConnectProbeResult {
+  Connected,
+  SocketError(io::Error),
+}
+
+fn classify_connect_probe(
+  socket_error: Result<(), Errno>,
+  peer_address: impl FnOnce() -> io::Result<SocketAddr>,
+) -> io::Result<ConnectProbeResult> {
+  if let Err(error) = socket_error {
+    return Ok(ConnectProbeResult::SocketError(error.into()));
+  }
+  match peer_address() {
+    Ok(_) => Ok(ConnectProbeResult::Connected),
+    Err(error) if error.kind() == io::ErrorKind::NotConnected => Err(io::Error::new(
+      io::ErrorKind::WouldBlock,
+      "TCP peer address is not available yet",
+    )),
+    Err(error) => Err(error),
+  }
+}
+
+fn finish_connect_probe(probe: io::Result<ConnectProbeResult>) -> io::Result<bool> {
+  match probe {
+    Ok(ConnectProbeResult::Connected) => Ok(true),
+    Ok(ConnectProbeResult::SocketError(error)) => Err(error),
+    Err(error)
+      if matches!(
+        error.kind(),
+        io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock
+      ) =>
+    {
+      Ok(false)
+    }
+    Err(error) => Err(error),
+  }
+}
+
+async fn wait_for_tcp_connect(
+  attempt: &mut ConnectAttempt,
+  mut endpoint_calls: usize,
+) -> io::Result<()> {
+  loop {
+    if endpoint_calls + 2 > IO_BUDGET {
+      yield_once().await;
+      endpoint_calls = 0;
+    }
+    let guard = poll_fn(|cx| {
+      if attempt.waiter.is_none() {
+        attempt.waiter = Some(attempt.stream_fd().writable_owned());
+      }
+      let waiter = match attempt.waiter.as_mut() {
+        Some(waiter) => waiter,
+        None => unreachable!("connect readiness waiter was just created"),
+      };
+      match Pin::new(waiter).poll(cx) {
+        Poll::Pending => Poll::Pending,
+        Poll::Ready(Err(error)) => {
+          drop(attempt.waiter.take());
+          Poll::Ready(Err(error))
+        }
+        Poll::Ready(Ok(guard)) => {
+          drop(attempt.waiter.take());
+          Poll::Ready(Ok(guard))
+        }
+      }
+    })
+    .await?;
+    let connected = finish_connect_probe(guard.try_io(|stream| {
+      let socket_error = rnet::sockopt::socket_error(stream)?;
+      classify_connect_probe(socket_error, || stream.peer_addr())
+    }));
+    match connected {
+      Ok(true) => return Ok(()),
+      Ok(false) => {
+        endpoint_calls += 2;
+      }
+      Err(error) => return Err(error),
+    }
   }
 }
 
