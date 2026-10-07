@@ -176,6 +176,15 @@ Future cleanup and admission release precede join publication. Scheduler locks
 never cover user polling, destructors or completion callbacks. Generation tags
 make retained stale wakers harmless without retaining completed futures.
 
+`AsyncJob::abort_handle` returns a clonable thread-safe control handle,
+including for local jobs whose outputs are `!Send`. It retains cancellation
+metadata rather than the future or result. `is_finished` becomes true when the
+terminal outcome is published after future destruction and admission release.
+Detaching a join alone leaves it false. It does not wait for completion callbacks,
+discarded-output destruction or the later scope-close publication/reclamation.
+The completion flag has native publication and cross-thread cancellation tests;
+it is outside the existing Loom transition models.
+
 The blocking pool's `Job` is also a future, so an asynchronous caller can await
 blocking work without blocking an executor worker. Its existing consuming
 `join` and deadlock checks remain available.

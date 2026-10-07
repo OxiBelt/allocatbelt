@@ -5,6 +5,7 @@ use std::fmt;
 use std::future::Future;
 use std::panic::{self, AssertUnwindSafe};
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::task::{Context, Poll, Waker};
 
@@ -44,12 +45,14 @@ enum Slot<T> {
 
 pub(super) struct JoinState<T> {
   slot: Mutex<Slot<T>>,
+  finished: Arc<AtomicBool>,
 }
 
 impl<T> JoinState<T> {
   pub(super) fn new() -> Arc<Self> {
     Arc::new(Self {
       slot: Mutex::new(Slot::Pending(None)),
+      finished: Arc::new(AtomicBool::new(false)),
     })
   }
 
@@ -67,6 +70,7 @@ impl<T> JoinState<T> {
     match std::mem::replace(&mut *slot, Slot::Taken) {
       Slot::Pending(waker) => {
         *slot = Slot::Ready(Some(result));
+        self.finished.store(true, Ordering::Release);
         drop(slot);
         if let Some(waker) = waker
           && let Err(payload) = panic::catch_unwind(AssertUnwindSafe(|| waker.wake()))
@@ -82,6 +86,7 @@ impl<T> JoinState<T> {
       }
       Slot::Taken => {
         *slot = Slot::Taken;
+        self.finished.store(true, Ordering::Release);
         drop(slot);
         Some(result)
       }
@@ -118,6 +123,53 @@ impl<T> AsyncJob<T> {
   /// current poll returns; it is never preempted.
   pub fn abort(&self) {
     (self.abort)();
+  }
+
+  /// Returns a clonable cancellation handle independent of the output type.
+  /// The handle does not retain the task's future or result.
+  #[must_use]
+  pub fn abort_handle(&self) -> AbortHandle {
+    AbortHandle {
+      abort: Arc::clone(&self.abort),
+      finished: Arc::clone(&self.state.finished),
+    }
+  }
+
+  /// Whether the terminal join outcome has been published after task cleanup.
+  #[must_use]
+  pub fn is_finished(&self) -> bool {
+    self.state.finished.load(Ordering::Acquire)
+  }
+}
+
+/// A clonable, thread-safe cancellation handle, including for local tasks
+/// whose outputs are not `Send`. Dropping it neither cancels nor detaches work.
+#[derive(Clone)]
+pub struct AbortHandle {
+  abort: Arc<dyn Fn() + Send + Sync>,
+  finished: Arc<AtomicBool>,
+}
+
+impl AbortHandle {
+  /// Requests cleanup after any current poll returns. This does not wait for
+  /// cleanup and cannot preempt a running poll.
+  pub fn abort(&self) {
+    (self.abort)();
+  }
+
+  /// Whether the terminal join outcome has been published. Detaching the join
+  /// alone does not make this true; actual task completion still must occur.
+  #[must_use]
+  pub fn is_finished(&self) -> bool {
+    self.finished.load(Ordering::Acquire)
+  }
+}
+
+impl fmt::Debug for AbortHandle {
+  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    f.debug_struct("AbortHandle")
+      .field("finished", &self.is_finished())
+      .finish_non_exhaustive()
   }
 }
 
@@ -167,5 +219,83 @@ impl<T> Drop for AsyncJob<T> {
 impl<T> fmt::Debug for AsyncJob<T> {
   fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
     f.debug_struct("AsyncJob").finish_non_exhaustive()
+  }
+}
+
+#[cfg(all(test, not(loom)))]
+mod tests {
+  use super::{AbortHandle, AsyncJob, JoinState};
+  use std::future::Future;
+  use std::pin::Pin;
+  use std::rc::Rc;
+  use std::sync::Arc;
+  use std::sync::atomic::{AtomicUsize, Ordering};
+  use std::task::{Context, Poll, Wake, Waker};
+
+  #[test]
+  fn local_output_does_not_restrict_abort_handle_thread_safety() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let captured = Arc::clone(&calls);
+    let state = JoinState::<Rc<()>>::new();
+    let job = AsyncJob::new(
+      Arc::clone(&state),
+      Arc::new(move || {
+        captured.fetch_add(1, Ordering::SeqCst);
+      }),
+    );
+    let control = job.abort_handle();
+    assert!(!job.is_finished());
+    assert!(!control.is_finished());
+    std::thread::spawn({
+      let control = control.clone();
+      move || control.abort()
+    })
+    .join()
+    .unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert!(!control.is_finished());
+    assert!(state.publish(Ok(Rc::new(()))).is_none());
+    assert!(job.is_finished());
+    assert!(control.is_finished());
+  }
+
+  #[test]
+  fn detached_join_stays_unfinished_until_actual_publication() {
+    let state = JoinState::<usize>::new();
+    let job = AsyncJob::new(Arc::clone(&state), Arc::new(|| {}));
+    let control = job.abort_handle();
+    drop(job);
+    assert!(!control.is_finished());
+    assert_eq!(state.publish(Ok(9)).unwrap().unwrap(), 9);
+    assert!(control.is_finished());
+  }
+
+  struct ObserveCompletion(AbortHandle, Arc<AtomicUsize>);
+
+  impl Wake for ObserveCompletion {
+    fn wake(self: Arc<Self>) {
+      assert!(self.0.is_finished());
+      self.1.fetch_add(1, Ordering::SeqCst);
+    }
+  }
+
+  #[test]
+  fn completion_waker_observes_finished_and_ready_outcome() {
+    let state = JoinState::<usize>::new();
+    let mut job = AsyncJob::new(Arc::clone(&state), Arc::new(|| {}));
+    let wakes = Arc::new(AtomicUsize::new(0));
+    let waker = Waker::from(Arc::new(ObserveCompletion(
+      job.abort_handle(),
+      Arc::clone(&wakes),
+    )));
+    let mut context = Context::from_waker(&waker);
+    assert!(Pin::new(&mut job).poll(&mut context).is_pending());
+    assert!(state.publish(Ok(7)).is_none());
+    assert_eq!(wakes.load(Ordering::SeqCst), 1);
+    assert!(matches!(
+      Pin::new(&mut job).poll(&mut context),
+      Poll::Ready(Ok(7))
+    ));
+    assert!(job.is_finished());
   }
 }

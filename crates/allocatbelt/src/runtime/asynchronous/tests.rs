@@ -174,11 +174,16 @@ fn abort_before_start_drops_future_on_a_worker_and_publishes_cancelled() {
     .handle()
     .spawn(DropMark(Arc::clone(&dropped)))
     .unwrap_or_else(|error| panic!("spawn failed: {error}"));
-  second.abort();
+  let control = second.abort_handle();
+  assert!(!second.is_finished());
+  let external = control.clone();
+  std::thread::spawn(move || external.abort()).join().unwrap();
+  assert!(!control.is_finished());
   let (lock, cv) = &*gate;
   *lock.lock().unwrap_or_else(|e| e.into_inner()) = true;
   cv.notify_all();
   assert!(matches!(block_on(second), Err(AsyncJoinError::Cancelled)));
+  assert!(control.is_finished());
   assert!(dropped.load(Ordering::SeqCst));
   assert!(matches!(block_on(first), Ok(())));
   runtime

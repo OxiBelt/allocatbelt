@@ -27,7 +27,7 @@ use scheduler::{ScopeRef, Shared};
 pub use entry::{
   ConsumeBudget, EnterGuard, YieldNow, consume_budget, current, try_current, yield_now,
 };
-pub use join::{AsyncJob, AsyncJoinError};
+pub use join::{AbortHandle, AsyncJob, AsyncJoinError};
 pub use local::{
   LocalConfig, LocalEnterGuard, LocalError, LocalHandle, LocalRuntime, LocalScopeClose,
   LocalSendHandle, LocalSpawnError, LocalTaskScope,
