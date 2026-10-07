@@ -247,7 +247,10 @@ pub mod pipes {
 
       let waker = match clone_waker(cx.waker()) {
         Ok(waker) => waker,
-        Err(error) => return Poll::Ready(Err(error)),
+        Err(error) => {
+          self.cancel_read_wait();
+          return Poll::Ready(Err(error));
+        }
       };
       let mut state = self.lock();
       match state.read(output) {
@@ -312,7 +315,10 @@ pub mod pipes {
 
       let waker = match clone_waker(cx.waker()) {
         Ok(waker) => waker,
-        Err(error) => return Poll::Ready(Err(error)),
+        Err(error) => {
+          self.cancel_write_wait();
+          return Poll::Ready(Err(error));
+        }
       };
       let mut state = self.lock();
       match state.write(input, own_shutdown) {
