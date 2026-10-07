@@ -82,13 +82,14 @@
 //!
 //! # Fairness
 //!
-//! The looping futures ([`ReadExact`], [`WriteAll`], [`CopyWithBuffer`]) poll
-//! their endpoints at most [`POLL_BUDGET`] times per poll. When the budget
-//! runs out with work left, they wake their own task and return `Pending`, so
-//! an endpoint that is always ready cannot hold a worker indefinitely. These
-//! loops retry `ErrorKind::Interrupted`, counting each attempt against the
-//! budget. [`ReadVectored`] and [`WriteVectored`] also retry interruptions
-//! within that budget; scalar single-operation futures return them.
+//! The looping futures ([`ReadExact`], [`WriteAll`], [`CopyWithBuffer`],
+//! [`ReadToEndBounded`], [`ReadUntilBounded`]) poll their endpoints at most
+//! [`POLL_BUDGET`] times per poll. When the budget runs out with work left,
+//! they wake their own task and return `Pending`. These loops retry
+//! `ErrorKind::Interrupted`, counting each attempt against the budget.
+//! [`ReadVectored`] and [`WriteVectored`] also retry interruptions within
+//! that budget; scalar single-operation futures return them. This is local
+//! loop bounding, not automatic runtime cooperation for arbitrary I/O polls.
 //!
 //! # Cancellation and partial progress
 //!
@@ -102,9 +103,13 @@
 //! beginning of whatever buffer it is given, so the exact offset of the
 //! operation is lost unless the caller read it from the old future first
 //! ([`ReadExact::filled`], [`WriteAll::written`],
-//! [`CopyWithBuffer::transferred`], [`CopyWithBuffer::unwritten`]). An error
-//! does not carry that progress either; read it from the same accessors
-//! before dropping the future.
+//! [`CopyWithBuffer::transferred`], [`CopyWithBuffer::unwritten`]). Bounded
+//! read futures expose [`filled`](ReadToEndBounded::filled) while pending or
+//! before cancellation; their result and [`BoundedReadError`] also carry the
+//! count after completion. Bytes consumed by delimiter reads stay consumed,
+//! while any unconsumed buffered suffix remains available to the endpoint.
+//! A panicking endpoint can leave its own state partially changed; callers
+//! must not assume that polling the operation again replays safely.
 //!
 //! # Limitations
 //!
@@ -119,10 +124,11 @@
 //! copying or reading a whole stream. Their vectored reads use the scalar
 //! fallback. These adapters neither allocate nor reserve managed storage.
 //!
-//! This is not complete I/O parity with Tokio: vectored I/O uses initialized
-//! slices, and there is no uninitialized-buffer I/O, line or delimiter reads,
-//! or reads that grow a buffer. Endpoint splitting is available separately
-//! through [`split_io::split`](crate::runtime::split_io::split).
+//! Bounded delimiter, line and whole-stream reads use caller-owned initialized
+//! slices and report capacity separately from EOF. These reads never grow a
+//! `Vec` or `String`; UTF-8 ports validate the bytes left in the slice. A full
+//! destination is not probed for an additional byte. Endpoint splitting is
+//! available separately through [`split_io::split`](crate::runtime::split_io::split).
 //! [`AsyncSeek`] is a single `poll_seek` that is polled again with the same
 //! position after `Pending`, instead of a separate start and completion.
 //! Managed buffered readers and writers live in
@@ -141,6 +147,18 @@ use std::task::{Context, Poll};
 #[path = "io_adapters.rs"]
 mod adapters;
 pub use adapters::{Chain, Empty, Repeat, Sink, Take, empty, repeat, sink};
+
+#[path = "io_bounded.rs"]
+mod bounded;
+pub use bounded::AsyncBufReadExt;
+pub use bounded::{
+  BoundedRead, BoundedReadError, BoundedReadStop, ReadLineBounded, ReadToEndBounded,
+  ReadToStringBounded, ReadUntilBounded,
+};
+
+#[cfg(test)]
+#[path = "io_bounded_tests.rs"]
+mod bounded_tests;
 
 /// Endpoint operations a looping future ([`ReadExact`], [`WriteAll`],
 /// [`CopyWithBuffer`]) performs in one poll before it wakes its own task and
@@ -328,6 +346,31 @@ pub trait AsyncReadExt: AsyncRead {
     Self: Sized,
   {
     Chain::new(self, next)
+  }
+
+  /// Reads into fixed caller-owned storage until EOF or the slice fills.
+  ///
+  /// A full slice stops immediately with `Capacity`; the endpoint is not
+  /// probed for EOF and no additional byte is consumed. Progress is available
+  /// from the future while pending or before cancellation and from the
+  /// returned result or error after completion.
+  fn read_to_end_bounded<'a>(&'a mut self, buffer: &'a mut [u8]) -> ReadToEndBounded<'a, Self>
+  where
+    Self: Unpin,
+  {
+    ReadToEndBounded::new(self, buffer)
+  }
+
+  /// Reads to EOF or capacity and validates the bytes as UTF-8.
+  ///
+  /// The destination remains an initialized byte slice; no `String` is grown.
+  /// Invalid UTF-8 returns `InvalidData` with the byte count while preserving
+  /// the bytes in the caller's slice.
+  fn read_to_string_bounded<'a>(&'a mut self, buffer: &'a mut [u8]) -> ReadToStringBounded<'a, Self>
+  where
+    Self: Unpin,
+  {
+    ReadToStringBounded::new(self, buffer)
   }
 
   /// Reads once into `buf`, completing with the count; `0` for a non-empty

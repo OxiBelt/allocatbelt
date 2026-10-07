@@ -40,6 +40,27 @@ same 64-call budget; ordinary single-operation scalar helpers return them.
 Empty vectored helpers return zero without polling the endpoint. These
 operations do not allocate buffers or reserve implicit managed charges.
 
+`AsyncReadExt::read_to_end_bounded` and `AsyncBufReadExt::read_until_bounded`
+copy into a fixed initialized slice and return the filled count plus a stop
+reason that distinguishes delimiter, EOF and capacity. A full destination
+(including an empty one) returns Capacity immediately: the future makes no
+lookahead poll, so an exact fit cannot be distinguished from additional input.
+Delimiter reads include the delimiter and consume only bytes copied, leaving
+the buffered tail untouched. Each future exposes progress while pending or
+before cancellation; completed I/O and consumed bytes are not rolled back.
+Endpoint errors retain their kind and report partial progress. Each future
+polls its endpoint at most 64 times per poll, including Interrupted retries,
+then self-wakes and returns Pending.
+
+`read_line_bounded` includes LF when present, while
+`read_to_string_bounded` reads a whole stream. Line reads validate UTF-8 at
+delimiter, EOF or capacity; whole-stream string reads validate at EOF or
+capacity. They write into byte slices rather than growing a `String`. Invalid
+UTF-8, including a code point cut by capacity, returns InvalidData with the
+filled count while preserving the bytes in the destination. These helpers
+provide bounded application ports, not global automatic cooperation for
+arbitrary direct I/O polls.
+
 `AsyncReadExt::take` owns a reader and caps reads at a replaceable remaining
 byte allowance without consuming bytes beyond it. `chain` owns two readers
 and switches to the second only after a nonempty first read reports EOF.
@@ -1304,11 +1325,11 @@ baseline still requires these implementation and qualification steps:
 1. Extend automatic cooperative progress beyond the listed channel and lock
    operations. Expand TCP socket-option and listen-builder coverage beyond the
    explicit single-address nonblocking connect and bound-socket operations.
-2. Add bounded delimiter, line and whole-stream reads, managed in-memory pipes
-   and bidirectional copy with explicit partial-progress and half-close rules.
-   The initialized-buffer `Take`/`Chain`/`Empty`/`Sink`/`Repeat` family and
-   fixed managed buffered endpoints are implemented; this does not include
-   those broader stream operations.
+2. Add standard I/O adapters, general pipe construction, managed in-memory
+   pipes and bidirectional copy with explicit partial-progress and half-close
+   rules. The initialized-buffer `Take`/`Chain`/`Empty`/`Sink`/`Repeat` family,
+   bounded delimiter/line and whole-stream reads, and fixed managed buffered
+   endpoints are implemented; these do not include those remaining operations.
 3. Add bounded recursive traversal.
 4. Exercise realistic application ports covering cancellation, bounded
    rejection recovery, resource/dependency quotas, retained managed storage,
