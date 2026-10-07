@@ -70,6 +70,8 @@
 #![forbid(unsafe_code)]
 #![cfg_attr(not(test), deny(clippy::expect_used, clippy::unwrap_used))]
 
+#[cfg(not(loom))]
+pub mod adaptive;
 mod admission;
 pub mod asynchronous;
 pub mod barrier;

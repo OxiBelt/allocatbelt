@@ -250,6 +250,24 @@ impl CgroupCeilings {
     }
   }
 
+  /// The immutable finite CPU ceiling.
+  #[must_use]
+  pub const fn cpu_max(&self) -> CpuMax {
+    self.cpu_max
+  }
+
+  /// The immutable finite `memory.high` ceiling in bytes.
+  #[must_use]
+  pub const fn memory_high_bytes(&self) -> u64 {
+    self.memory_high_bytes
+  }
+
+  /// The immutable finite `memory.max` ceiling in bytes.
+  #[must_use]
+  pub const fn memory_max_bytes(&self) -> u64 {
+    self.memory_max_bytes
+  }
+
   /// Adds one finite device ceiling. Duplicate devices and excess entries
   /// are rejected without changing this value.
   pub fn add_io_device(&mut self, ceiling: IoMax) -> Result<(), CeilingError> {

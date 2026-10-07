@@ -1157,6 +1157,39 @@ bounded lifecycle transitions, not kernel execution. Real-kernel tests with
 failure from a successful kernel transfer/fail-stop qualification. No native
 performance benefit has been established for this optional service.
 
+## Explicit adaptive cgroup feedback
+
+`runtime::adaptive::AdaptiveController` takes an already-delegated `CgroupV2`
+capability and copies two to sixteen strictly increasing finite CPU/
+`memory.high` tiers. All CPU periods must match. Every tier is validated
+against the capability's immutable caller ceilings and the already-established
+finite `memory.max`, which must itself fit its caller ceiling. Startup only
+reads controls and requires the current CPU/high pair to match a configured
+tier. The controller never changes `memory.max` or I/O limits.
+
+The caller supplies measured p99 and CPU/memory utilization on a monotonic
+`Instant` clock. High/low bands, sustained sample counts, minimum sampling
+interval, maximum gap and nonzero bounded cooldown limit oscillation. A
+sustained breach raises one tier; sustained healthy recovery lowers one tier;
+neutral samples and long gaps reset streaks. The floor and ceiling stop further
+changes. Invalid/early/stale samples do not advance policy; explicit resume
+retains the timestamp watermark and resets interval/cooldown requirements.
+No sensor or background thread is created, and this policy has not established
+a p99 improvement.
+
+Before a transition, readback must still match the tracked tier and original
+`memory.max`. CPU is applied before `memory.high`, as separate synchronous
+writes with separate nontransactional snapshots. Lowering memory.high may
+reclaim or block. Any failed setter, readback, cross-control mismatch or drift
+latches the controller faulted, preserving confirmed partial progress and the
+last observed snapshot separately from unknown current state. Later automatic
+observations cannot write until explicit `resume_from_readback` finds a known
+tier with the original memory.max. No rollback, retry or replay occurs.
+The caller must coordinate descriptor aliases and other writers: readback can
+detect observed drift but cannot prevent a race between different control
+files. Pure policy/fault-injection tests cover these limits; actual delegated
+kernel-controller qualification and native application benefits are separate.
+
 ## Path toward replacing Tokio
 
 The lifecycle foundation above is implemented. Remaining milestones include:
