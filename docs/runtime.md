@@ -1003,6 +1003,25 @@ and workload allocations contribute to whole-process CPU/RSS. These probes
 require fresh native processes and the preregistered per-host confirmation
 gates; functional tests and output smokes establish no speedup.
 
+`--mode capacity` is available only for the blocking and async lanes. It
+keeps the configured outstanding window full without an arrival schedule,
+refilling only after the observer sees a public join ready and releases its
+handle. A full window waits on a condition variable. Both executors warm all
+workers and run the same job body; any rejection, panic, checksum mismatch or
+completion loss fails the run. Blocking capacity accepts `--window`; paced
+blocking retains its existing admission bound. Capacity rejects an explicit
+arrival rate and reports `NA` for arrival rate, lateness, timer overhead and
+all percentiles. Its throughput includes submission and collection costs.
+It establishes no p99 result; use the separate paced latency lane for tails.
+
+`scripts/bench-latency.sh` supports these lanes and validates all 22 binary
+CSV fields, checksums and explicit worker/window/byte configuration. It
+alternates fresh-process comparator order and records source and binary
+fingerprints. Supplying `--bin-dir` labels rows as unverified prebuilt evidence,
+even when functional validation passes. Capacity tests and small process
+smokes verify accounting and cleanup, including cleanup before window refill;
+they are not native performance qualification.
+
 ## Path toward replacing Tokio
 
 The lifecycle foundation above is implemented. Remaining milestones include:
