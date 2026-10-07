@@ -919,17 +919,21 @@ Runtime-owned outer polls also use a shared 64-operation budget for ready
 `channel` send/receive/reservation/closed-wait, oneshot receive/close,
 semaphore acquisition, mutex acquisition and reader-writer-lock acquisition
 polls, plus `Notify`, watch change/closure, broadcast receive/closure and
-barrier waits, and managed-pipe, Unix-pipe and blocking-stream I/O polls.
-A synchronous primitive-to-primitive chain charges once; a
-primitive poll that returns `Pending` restores its provisional charge. Once
+barrier waits, managed-pipe, Unix-pipe and blocking-stream I/O polls, and
+`Sleep`, `Timeout` and interval tick polls. A synchronous primitive-to-primitive
+chain charges once; a primitive poll that returns `Pending` restores its
+provisional charge. `Timeout` checks the budget before touching its timer or
+inner future. Its ready result consumes one unit unless a ready supported
+primitive inside the inner future already consumed one; charges made by inner
+primitives remain spent when the timeout poll returns `Pending` or unwinds. Once
 exhausted, the next supported primitive arranges a wake and returns `Pending`
 before it dequeues a message, accepts a send, or transfers a permit/lock guard.
 This applies only while the runtime is polling an owned Send/local task or a
 borrowed `block_on` root.
 Manual polls and futures driven by external executors bypass automatic
-accounting. Timers and other arbitrary futures are not automatically
-cooperative; long-running work outside the listed primitives still needs
-explicit checkpoints or its own bounded polling. Other direct I/O endpoint
+accounting. Other arbitrary futures are not automatically cooperative; long-running
+work outside the listed primitives still needs explicit checkpoints or its own
+bounded polling. Other direct I/O endpoint
 polls, including `AsyncBufRead`, are outside this automatic accounting; the
 looping I/O helpers and buffered endpoints enforce their own 64-call-per-poll
 limits.

@@ -115,6 +115,7 @@ use std::task::{Context, Poll, Waker};
 use std::thread::{self, JoinHandle, ThreadId};
 use std::time::{Duration, Instant};
 
+use crate::runtime::asynchronous::{poll_cooperative, poll_cooperative_composed};
 use crate::runtime::task::drop_contained;
 
 /// Registrations taken off the queue per driver lock acquisition, by the
@@ -1157,12 +1158,8 @@ impl Sleep {
     self.shared.finish(armed);
     Ok(())
   }
-}
 
-impl Future for Sleep {
-  type Output = Result<(), TimerError>;
-
-  fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+  fn poll_inner(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), TimerError>> {
     let slot = &self.slot;
     {
       let armed = lock(&slot.state);
@@ -1183,6 +1180,14 @@ impl Future for Sleep {
     drop(armed);
     drop_contained(unused);
     poll
+  }
+}
+
+impl Future for Sleep {
+  type Output = Result<(), TimerError>;
+
+  fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+    poll_cooperative(cx, |cx| self.get_mut().poll_inner(cx))
   }
 }
 
@@ -1235,11 +1240,17 @@ impl<F: Future> Future for Timeout<F> {
   type Output = Result<F::Output, TimeoutError>;
 
   fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-    let this = self.get_mut();
+    poll_cooperative_composed(cx, |cx| self.get_mut().poll_inner(cx))
+  }
+}
+
+impl<F: Future> Timeout<F> {
+  fn poll_inner(&mut self, cx: &mut Context<'_>) -> Poll<Result<F::Output, TimeoutError>> {
+    let this = self;
     let Some((sleep, future)) = this.inner.as_mut() else {
       panic!("`Timeout` polled after completion");
     };
-    let timer = Pin::new(&mut *sleep).poll(cx);
+    let timer = sleep.poll_inner(cx);
     let output = match timer {
       Poll::Ready(Ok(())) => Err(TimeoutError::Elapsed),
       Poll::Ready(Err(error)) => Err(TimeoutError::Timer(error)),
@@ -1387,7 +1398,7 @@ impl Interval {
   /// `Full` or `Invalid` (its deadline cannot be represented). On an error
   /// the tick stays due.
   pub fn poll_tick(&mut self, cx: &mut Context<'_>) -> Poll<Result<Instant, TimerError>> {
-    match Pin::new(&mut self.sleep).poll(cx) {
+    poll_cooperative(cx, |cx| match Pin::new(&mut self.sleep).poll(cx) {
       Poll::Pending => Poll::Pending,
       Poll::Ready(Err(error)) => Poll::Ready(Err(error)),
       Poll::Ready(Ok(())) => {
@@ -1400,7 +1411,7 @@ impl Interval {
         }
         Poll::Ready(Ok(std::mem::replace(&mut self.next, following)))
       }
-    }
+    })
   }
 
   /// The period between scheduled ticks.
@@ -1445,6 +1456,10 @@ impl fmt::Debug for Tick<'_> {
     f.debug_struct("Tick").finish_non_exhaustive()
   }
 }
+
+#[cfg(all(test, not(loom)))]
+#[path = "time_cooperative_tests.rs"]
+mod cooperative_tests;
 
 #[cfg(all(test, loom))]
 mod loom_tests {

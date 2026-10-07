@@ -4,9 +4,10 @@
 //! on its caller thread. Spawned work remains owned and `Send + 'static`.
 //! Runtime-owned outer polls enable a shared 64-operation cooperative budget
 //! for ready channel, oneshot, semaphore, mutex, reader-writer-lock, notify,
-//! watch, broadcast, and barrier futures. The budget is scoped to those polls;
-//! manually polled primitives and futures polled by another executor bypass
-//! automatic accounting.
+//! watch, broadcast, barrier, sleep, timeout, and interval-tick futures. The
+//! budget is scoped to those polls; a timeout coalesces its charge with a
+//! ready supported primitive in its inner future. Manual polls and
+//! futures polled by another executor bypass automatic accounting.
 //! [`yield_now`] schedules one self-wake; [`consume_budget`] remains an
 //! explicit checkpoint for other long-running future work. No checkpoint
 //! preempts synchronous code or arbitrary futures that never yield.
@@ -42,11 +43,11 @@ use std::thread::{self, JoinHandle};
 use crate::runtime::managed::ResourceScope;
 use scheduler::{ScopeRef, Shared};
 
-pub(super) use entry::poll_cooperative;
 pub use entry::{
   ConsumeBudget, EnterGuard, YieldNow, consume_budget, current, current_resource_scope, task_id,
   try_current, try_current_resource_scope, try_task_id, yield_now,
 };
+pub(super) use entry::{poll_cooperative, poll_cooperative_composed};
 pub use handoff::{BlockInPlaceError, BlockInPlaceErrorKind, HandoffConfig, try_block_in_place};
 pub use identity::TaskId;
 pub use join::{AbortHandle, AsyncJob, AsyncJoinError};

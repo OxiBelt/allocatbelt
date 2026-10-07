@@ -416,6 +416,35 @@ pub(in crate::runtime) fn poll_cooperative<T>(
   result
 }
 
+/// Polls a composite primitive without hiding cooperative operations inside
+/// its closure. At an active outer poll boundary, the closure is gated on a
+/// nonzero budget. If it completes without a descendant primitive consuming
+/// a unit, the composite consumes one unit itself. Descendant charges remain
+/// intact on `Pending` and unwind; no nesting frame or reservation is held
+/// while arbitrary user future code runs.
+pub(in crate::runtime) fn poll_cooperative_composed<T>(
+  context: &mut Context<'_>,
+  poll: impl FnOnce(&mut Context<'_>) -> Poll<T>,
+) -> Poll<T> {
+  if !COOPERATIVE_POLL_ACTIVE.try_with(Cell::get).unwrap_or(false)
+    || COOPERATIVE_POLL_DEPTH.with(Cell::get) != 0
+  {
+    return poll(context);
+  }
+
+  let before = COOPERATIVE_BUDGET.with(Cell::get);
+  if before == 0 {
+    context.waker().wake_by_ref();
+    return Poll::Pending;
+  }
+
+  let result = poll(context);
+  if result.is_ready() && COOPERATIVE_BUDGET.with(Cell::get) == before {
+    COOPERATIVE_BUDGET.with(|budget| budget.set(before - 1));
+  }
+  result
+}
+
 /// Returns the identity of the task currently being polled or cleaned up.
 #[must_use]
 pub fn try_task_id() -> Option<TaskId> {
@@ -844,6 +873,112 @@ mod tests {
     });
     assert_eq!(result, Poll::Ready(()));
     assert_eq!(budget_remaining(), DEFAULT_BUDGET - 1);
+  }
+
+  #[test]
+  fn composed_poll_charges_ready_leaf_or_descendant_once() {
+    reset_budget();
+    let _outer = CooperativePollGuard::enter();
+    let mut context = Context::from_waker(Waker::noop());
+
+    assert_eq!(
+      poll_cooperative_composed(&mut context, |_| Poll::Ready(())),
+      Poll::Ready(())
+    );
+    assert_eq!(budget_remaining(), DEFAULT_BUDGET - 1);
+
+    assert_eq!(
+      poll_cooperative_composed(&mut context, |context| {
+        assert_eq!(
+          poll_cooperative(context, |_| Poll::Ready(7)),
+          Poll::Ready(7)
+        );
+        Poll::Ready(())
+      }),
+      Poll::Ready(())
+    );
+    assert_eq!(budget_remaining(), DEFAULT_BUDGET - 2);
+
+    assert_eq!(
+      poll_cooperative(&mut context, |context| {
+        assert_eq!(
+          poll_cooperative_composed(context, |_| Poll::Ready(())),
+          Poll::Ready(())
+        );
+        Poll::Ready(())
+      }),
+      Poll::Ready(())
+    );
+    assert_eq!(budget_remaining(), DEFAULT_BUDGET - 3);
+    reset_budget();
+  }
+
+  #[test]
+  fn composed_pending_and_unwind_preserve_descendant_charges() {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    reset_budget();
+    let _outer = CooperativePollGuard::enter();
+    let mut context = Context::from_waker(Waker::noop());
+    assert!(
+      poll_cooperative_composed(&mut context, |context| {
+        assert_eq!(
+          poll_cooperative(context, |_| Poll::Ready(7)),
+          Poll::Ready(7)
+        );
+        Poll::<()>::Pending
+      })
+      .is_pending()
+    );
+    assert_eq!(budget_remaining(), DEFAULT_BUDGET - 1);
+
+    let panic = catch_unwind(AssertUnwindSafe(|| {
+      let _ = poll_cooperative_composed::<()>(&mut context, |context| {
+        assert_eq!(
+          poll_cooperative(context, |_| Poll::Ready(8)),
+          Poll::Ready(8)
+        );
+        panic!("injected composed poll panic");
+      });
+    }));
+    assert!(panic.is_err());
+    assert_eq!(budget_remaining(), DEFAULT_BUDGET - 2);
+    reset_budget();
+  }
+
+  #[test]
+  fn composed_poll_gates_before_running_at_zero_budget() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::task::Wake;
+
+    struct WakeCounter(AtomicUsize);
+    impl Wake for WakeCounter {
+      fn wake(self: Arc<Self>) {
+        self.wake_by_ref();
+      }
+      fn wake_by_ref(self: &Arc<Self>) {
+        self.0.fetch_add(1, Ordering::SeqCst);
+      }
+    }
+
+    reset_budget();
+    let _outer = CooperativePollGuard::enter();
+    COOPERATIVE_BUDGET.set(0);
+    let wake = Arc::new(WakeCounter(AtomicUsize::new(0)));
+    let waker = Waker::from(Arc::clone(&wake));
+    let mut context = Context::from_waker(&waker);
+    let calls = Cell::new(0);
+    assert!(
+      poll_cooperative_composed(&mut context, |_| {
+        calls.set(calls.get() + 1);
+        Poll::Ready(())
+      })
+      .is_pending()
+    );
+    assert_eq!(calls.get(), 0);
+    assert_eq!(wake.0.load(Ordering::SeqCst), 1);
+    assert_eq!(budget_remaining(), 0);
+    reset_budget();
   }
 
   #[test]
