@@ -40,6 +40,29 @@ same 64-call budget; ordinary single-operation scalar helpers return them.
 Empty vectored helpers return zero without polling the endpoint. These
 operations do not allocate buffers or reserve implicit managed charges.
 
+`AsyncReadExt::take` owns a reader and caps reads at a replaceable remaining
+byte allowance without consuming bytes beyond it. `chain` owns two readers
+and switches to the second only after a nonempty first read reports EOF.
+Empty reads poll neither inner reader and do not switch sides; first EOF is
+sticky, while Pending and errors do not switch. Both adapters require `Unpin`
+endpoints for polling, expose recovery of their original endpoints and use
+the trait's scalar vectored-read fallback. They also implement `AsyncBufRead`:
+`take` caps the slice returned by `poll_fill_buf` and clamps `consume` to that
+slice and its remaining limit, while `chain` returns the first available
+buffer and routes consumption to that side. Pending and errors leave the
+current side unchanged; an empty first buffer marks sticky EOF before the
+second is polled. Pending reads do not spend the take limit, and cancellation
+does not undo completed reads or a completed switch. Direct mutable access can
+bypass the logical limit.
+
+`empty`, `sink` and `repeat` are allocation-free ready endpoints. `Empty`
+implements buffered reading, writing and seeking: it reports EOF, accepts and
+discards all offered bytes, and returns position zero for every seek. Its
+flush and shutdown are no-ops and later writes remain valid. `Sink` provides
+the same stateless write behavior; `Repeat` fills initialized buffers with
+its byte and needs an explicit limit for operations that wait for EOF. These
+ports do not reserve managed storage or create any background work.
+
 `runtime::buffered_io` supplies `BufferedReader`, `BufferedWriter` and
 `AsyncBufRead`. Constructors take a nonempty, uniquely owned `ManagedBuf` and
 return both original inputs on rejection. Readers and writers use this fixed
@@ -715,7 +738,9 @@ Manual polls and futures driven by external executors bypass automatic
 accounting. Notifications, watch/broadcast, barriers, timers, and other
 arbitrary futures are not yet automatically cooperative; long-running work
 outside the listed primitives still needs explicit checkpoints or its own
-bounded polling.
+bounded polling. Direct I/O endpoint polls, including `AsyncBufRead`, are also
+outside this automatic accounting; the looping I/O helpers and buffered
+endpoints enforce their own 64-call-per-poll limits.
 
 `AsyncJob` is awaitable; dropping it detaches, while `abort` requests cleanup
 after any in-flight poll returns. Owned scopes cancel their children on drop;
@@ -1257,9 +1282,11 @@ baseline still requires these implementation and qualification steps:
 1. Extend automatic cooperative progress beyond the listed channel and lock
    operations. Add cancellation-friendly nonblocking connect and supplied/bound
    socket ports.
-2. Add standard I/O adapters and general pipe construction, bounded delimiter,
-   line and whole-stream reads, stream composition, managed in-memory pipes
+2. Add bounded delimiter, line and whole-stream reads, managed in-memory pipes
    and bidirectional copy with explicit partial-progress and half-close rules.
+   The initialized-buffer `Take`/`Chain`/`Empty`/`Sink`/`Repeat` family and
+   fixed managed buffered endpoints are implemented; this does not include
+   those broader stream operations.
 3. Add file-copy operations and bounded recursive traversal.
 4. Exercise realistic application ports covering cancellation, bounded
    rejection recovery, resource/dependency quotas, retained managed storage,

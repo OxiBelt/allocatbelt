@@ -108,11 +108,23 @@
 //!
 //! # Limitations
 //!
+//! [`AsyncReadExt::take`] caps reads without consuming bytes past the limit;
+//! [`AsyncReadExt::chain`] advances to a second reader after a nonempty first
+//! read reports EOF. Both adapters own their endpoints and require `Unpin`
+//! endpoints when polled, and both implement
+//! [`AsyncBufRead`](crate::runtime::buffered_io::AsyncBufRead). [`empty`]
+//! implements buffered reading, writing and seeking as a stateless ready
+//! endpoint; [`sink`] and [`repeat`] provide the separate write-only and
+//! repeating-read behaviors. The repeating reader has no EOF; cap it when
+//! copying or reading a whole stream. Their vectored reads use the scalar
+//! fallback. These adapters neither allocate nor reserve managed storage.
+//!
 //! This is not complete I/O parity with Tokio: vectored I/O uses initialized
-//! slices, and there is no uninitialized-buffer I/O, stream splitting,
-//! line or delimiter reads, or reads that grow a buffer. [`AsyncSeek`] is a
-//! single `poll_seek` that is polled again with the same position after
-//! `Pending`, instead of a separate start and completion.
+//! slices, and there is no uninitialized-buffer I/O, line or delimiter reads,
+//! or reads that grow a buffer. Endpoint splitting is available separately
+//! through [`split_io::split`](crate::runtime::split_io::split).
+//! [`AsyncSeek`] is a single `poll_seek` that is polled again with the same
+//! position after `Pending`, instead of a separate start and completion.
 //! Managed buffered readers and writers live in
 //! [`buffered_io`](crate::runtime::buffered_io).
 
@@ -125,6 +137,10 @@ use std::io::{self, ErrorKind, IoSlice, IoSliceMut, SeekFrom};
 use std::ops::Range;
 use std::pin::Pin;
 use std::task::{Context, Poll};
+
+#[path = "io_adapters.rs"]
+mod adapters;
+pub use adapters::{Chain, Empty, Repeat, Sink, Take, empty, repeat, sink};
 
 /// Endpoint operations a looping future ([`ReadExact`], [`WriteAll`],
 /// [`CopyWithBuffer`]) performs in one poll before it wakes its own task and
@@ -296,6 +312,24 @@ fn yield_now<T>(cx: &Context<'_>) -> Poll<T> {
 
 /// Futures over [`AsyncRead`]; implemented for every reader.
 pub trait AsyncReadExt: AsyncRead {
+  /// Limits reads to `limit` bytes without allocating or consuming bytes
+  /// beyond that boundary. Use [`Take::into_inner`] to recover the reader.
+  fn take(self, limit: u64) -> Take<Self>
+  where
+    Self: Sized,
+  {
+    Take::new(self, limit)
+  }
+
+  /// Reads this endpoint to EOF before reading `next`. An empty read does
+  /// not advance from the first endpoint; see [`Chain`].
+  fn chain<R: AsyncRead>(self, next: R) -> Chain<Self, R>
+  where
+    Self: Sized,
+  {
+    Chain::new(self, next)
+  }
+
   /// Reads once into `buf`, completing with the count; `0` for a non-empty
   /// buffer means end of stream. An empty buffer completes with `0` without
   /// polling the reader.
