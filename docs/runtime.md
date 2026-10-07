@@ -47,6 +47,29 @@ RSS and arbitrary allocations. It supplies neither CPU quotas nor byte-rate
 limits. The existing blocking pool's declared `Resources` reservations remain
 separate from this ledger.
 
+## Owned filesystem operations
+
+`runtime::fs::FsHandle` submits work to an explicit blocking handle. Each
+accepted operation holds a disk permit while queued or running; rejection
+returns its original inputs, queued cancellation drops captures before permit
+release, and detaching a running job retains its resources until completion.
+Returned managed buffers keep their storage charge until the final owner drops.
+
+An `OwnedFile` moves into each read, write, seek or synchronization job and
+returns in its outcome, preserving cursor sequencing and ownership on I/O
+errors. Reads and writes use at most 64 KiB per syscall and check cancellation
+between calls; a blocked syscall cannot be preempted. Positional operations
+preserve the cursor. Linux append-open files still append during `write_at`,
+regardless of its supplied offset. `flush` is not a durability operation;
+`sync_data` and `sync_all` forward the filesystem's synchronization calls.
+
+Directory iteration yields one entry per job. Entry metadata and type wrappers
+also use disk permits. Returned raw `std::fs::DirEntry` methods can perform
+blocking I/O directly if callers bypass these wrappers. Paths and open options
+retain standard-library semantics; this API supplies no path sandbox, descriptor
+quota, IOPS, bandwidth or disk-space enforcement. It does not collect whole
+files or directories implicitly. Borrowed I/O-trait adapters remain pending.
+
 ## Owned asynchronous tasks
 
 `runtime::asynchronous::AsyncRuntime` runs owned `Send + 'static` futures on a
