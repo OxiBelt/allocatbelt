@@ -1598,9 +1598,31 @@ impl<T> AsyncFd<T> {
     self.readiness(Direction::Write)
   }
 
+  /// Waits for read readiness while owning a clone of this registration.
+  /// The returned future and its guard keep the registration alive if this
+  /// `AsyncFd` is dropped. Dropping a pending future cancels its waiter.
+  pub fn readable_owned(&self) -> OwnedReadiness<T> {
+    self.owned_readiness(Direction::Read)
+  }
+
+  /// Waits for write readiness while owning a clone of this registration.
+  /// The returned future and its guard keep the registration alive if this
+  /// `AsyncFd` is dropped. Dropping a pending future cancels its waiter.
+  pub fn writable_owned(&self) -> OwnedReadiness<T> {
+    self.owned_readiness(Direction::Write)
+  }
+
   const fn readiness(&self, dir: Direction) -> Readiness<'_, T> {
     Readiness {
       fd: self,
+      dir,
+      key: None,
+    }
+  }
+
+  fn owned_readiness(&self, dir: Direction) -> OwnedReadiness<T> {
+    OwnedReadiness {
+      fd: self.clone(),
       dir,
       key: None,
     }
@@ -1675,6 +1697,93 @@ impl<T> fmt::Debug for Readiness<'_, T> {
     f.debug_struct("Readiness")
       .field("direction", &self.dir)
       .field("waiting", &self.key.is_some())
+      .finish_non_exhaustive()
+  }
+}
+
+/// Waits for one direction of an [`AsyncFd`] while owning its registration.
+/// Dropping a pending future frees its waiter. Once ready, the resulting
+/// [`OwnedReadinessGuard`] keeps the registration alive until the guard is
+/// consumed or dropped.
+#[must_use = "futures do nothing unless polled"]
+pub struct OwnedReadiness<T> {
+  fd: AsyncFd<T>,
+  dir: Direction,
+  key: Option<WaiterKey>,
+}
+
+impl<T> Future for OwnedReadiness<T> {
+  type Output = io::Result<OwnedReadinessGuard<T>>;
+
+  fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+    let this = self.get_mut();
+    let inner = &this.fd.inner;
+    let shared = &inner.shared;
+    let polled = shared.poll_ready(inner.index, inner.generation, this.dir, &mut this.key, cx);
+    polled.map(|outcome| {
+      outcome.map_err(io::Error::from)?;
+      Ok(OwnedReadinessGuard {
+        fd: this.fd.clone(),
+        dir: this.dir,
+      })
+    })
+  }
+}
+
+impl<T> Drop for OwnedReadiness<T> {
+  fn drop(&mut self) {
+    if let Some(key) = self.key.take() {
+      self.fd.inner.shared.cancel(key);
+    }
+  }
+}
+
+impl<T> fmt::Debug for OwnedReadiness<T> {
+  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    f.debug_struct("OwnedReadiness")
+      .field("direction", &self.dir)
+      .field("waiting", &self.key.is_some())
+      .finish_non_exhaustive()
+  }
+}
+
+/// Cached readiness observed by an [`OwnedReadiness`] future. The owned
+/// registration remains live until this guard is consumed or dropped.
+#[must_use = "readiness is used through `try_io` or `clear_ready`"]
+pub struct OwnedReadinessGuard<T> {
+  fd: AsyncFd<T>,
+  dir: Direction,
+}
+
+impl<T> OwnedReadinessGuard<T> {
+  /// The registered value.
+  #[must_use]
+  pub fn get_ref(&self) -> &T {
+    self.fd.get_ref()
+  }
+
+  /// Calls `f` once with no reactor lock held. `WouldBlock` clears this
+  /// direction's cached readiness. Nothing is retried by the guard.
+  pub fn try_io<R>(self, f: impl FnOnce(&T) -> io::Result<R>) -> io::Result<R> {
+    let result = f(self.fd.get_ref());
+    if let Err(error) = &result
+      && error.kind() == io::ErrorKind::WouldBlock
+    {
+      self.fd.clear(self.dir);
+    }
+    result
+  }
+
+  /// Clears the cached readiness for this direction.
+  pub fn clear_ready(self) {
+    self.fd.clear(self.dir);
+  }
+}
+
+impl<T> fmt::Debug for OwnedReadinessGuard<T> {
+  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    f.debug_struct("OwnedReadinessGuard")
+      .field("direction", &self.dir)
       .finish_non_exhaustive()
   }
 }
@@ -1807,7 +1916,7 @@ mod tests {
 
   /// Parks until `done` holds. The wakers it waits on unpark this thread
   /// after recording their effect; the watchdog only bounds a lost wakeup.
-  fn wait_until(done: impl Fn() -> bool) {
+  fn wait_until(mut done: impl FnMut() -> bool) {
     let limit = Instant::now() + WATCHDOG;
     while !done() {
       let now = Instant::now();
@@ -2015,6 +2124,8 @@ mod tests {
     check::<AsyncFd<UnixStream>>();
     check::<Readiness<'static, UnixStream>>();
     check::<ReadinessGuard<'static, UnixStream>>();
+    check::<OwnedReadiness<UnixStream>>();
+    check::<OwnedReadinessGuard<UnixStream>>();
     let bounds = [(0, 1), (1, 0), (MAX_TABLE + 1, 1), (1, MAX_TABLE + 1)];
     for (max_registrations, max_waiters) in bounds {
       let config = ReactorConfig {
@@ -2349,6 +2460,49 @@ mod tests {
     wait_until(|| woken.wakes() == 1);
     assert_eq!(cancelled_woken.wakes(), 0);
     drop(ready(poll_with(&mut readable, Waker::noop())));
+    reactor.shutdown().unwrap();
+  }
+
+  #[test]
+  fn owned_readiness_cancellation_releases_its_waiter() {
+    let (reactor, handle) = reactor(1, 1);
+    let (fd, _peer) = registered(&handle);
+    let (woken, waker) = counter();
+    let mut readiness = fd.readable_owned();
+    assert!(poll_with(&mut readiness, &waker).is_pending());
+    assert_eq!(handle.waiters(), 1);
+    drop(readiness);
+    assert_eq!(handle.waiters(), 0);
+    assert_eq!(woken.wakes(), 0);
+    reactor.shutdown().unwrap();
+  }
+
+  #[test]
+  fn owned_guard_keeps_registration_until_guard_is_dropped() {
+    let (reactor, handle) = reactor(1, 1);
+    let (fd, mut peer) = registered(&handle);
+    let (woken, waker) = counter();
+    let mut readiness = fd.readable_owned();
+    assert!(poll_with(&mut readiness, &waker).is_pending());
+    assert_eq!(handle.waiters(), 1);
+    drop(fd);
+    assert_eq!(handle.registrations(), 1);
+
+    peer.write_all(b"x").unwrap();
+    let mut guard = None;
+    wait_until(|| match poll_with(&mut readiness, &waker) {
+      Poll::Ready(Ok(ready)) => {
+        guard = Some(ready);
+        true
+      }
+      Poll::Ready(Err(error)) => panic!("owned readiness failed: {error}"),
+      Poll::Pending => false,
+    });
+    assert_eq!(woken.wakes(), 1);
+    drop(readiness);
+    assert_eq!(handle.registrations(), 1);
+    drop(guard);
+    assert_eq!(handle.registrations(), 0);
     reactor.shutdown().unwrap();
   }
 

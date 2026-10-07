@@ -29,8 +29,9 @@ dropping them does not restore stream position. Helpers reject an endpoint's
 reported count when it exceeds the offered slice, retry interrupted calls,
 and yield with a self-wake after 64 endpoint calls in one poll. This requests
 rescheduling without guaranteeing another task's turn. Simple helpers do not
-allocate or implicitly reserve managed-storage charges. Buffered adapters,
-vectored operations and networking integration remain pending.
+allocate or implicitly reserve managed-storage charges. TCP and Unix stream
+endpoints implement these traits. Buffered adapters and vectored operations
+remain pending.
 
 ## Managed buffers and operation permits
 
@@ -95,7 +96,10 @@ Callbacks run outside driver and callback-tracking locks, including during
 thread-local teardown. Registration and waiter tables are preallocated; close
 scratch and per-thread callback ownership tracking allocate separately and are
 not managed-storage charges or a total memory budget. Socket wrappers and their
-I/O-trait integration require separate APIs. Reactor protocol behavior is
+I/O-trait integration are provided by the network module. Owned readiness
+futures and guards retain an `AsyncFd` clone, keeping the registration and
+underlying value alive until their final release. Dropping a pending owned
+future cancels its waiter. Reactor protocol behavior is
 covered by native tests, not by the current Loom helper models.
 
 ## Network endpoints and DNS
@@ -121,7 +125,13 @@ clones retain the storage charge until their final release. Caller hostname
 storage and the resolver's internal allocations are outside that charge.
 This bounds collected output and operation concurrency; it supplies no total
 DNS memory, network bandwidth or descriptor quota beyond reactor admission.
-Socket integration with the I/O traits is a separate milestone.
+TCP and Unix streams implement the initialized-buffer I/O traits. A pending
+trait read/write retains one waiter of that direction in the endpoint. Dropping
+the borrowing helper leaves this waiter available to a subsequent read/write
+poll; completing that direction, including with an empty buffer, removes it.
+`cancel_io_waits` or endpoint drop also removes both directions' waiters. Flush
+and shutdown do not remove a pending read/write waiter. Named async methods
+keep their immediate waiter cancellation on future drop.
 
 ## Bounded fair semaphore
 

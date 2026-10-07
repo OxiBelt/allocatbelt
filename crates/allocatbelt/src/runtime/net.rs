@@ -15,8 +15,14 @@
 //! The async methods preserve partial byte counts and retry `Interrupted`
 //! and stale-readiness `WouldBlock`. They make at most 64 endpoint calls per
 //! poll before yielding. Readiness waits do not count as endpoint calls.
-//! Dropping a method future releases its readiness waiter; bytes already
-//! transferred remain transferred.
+//! Dropping a named async-method future releases its readiness waiter; bytes
+//! already transferred remain transferred. `TcpStream` and Unix `UnixStream`
+//! also implement [`AsyncRead`] and [`AsyncWrite`]. Their pending waiter is
+//! retained by the endpoint when the caller drops a poll future; it is freed
+//! when a later read or write poll in that direction completes (including an
+//! empty-buffer poll), by [`TcpStream::cancel_io_waits`] or
+//! [`UnixStream::cancel_io_waits`], or when the endpoint is dropped. Flush and
+//! shutdown polls do not clear read or write waiters.
 
 #![forbid(unsafe_code)]
 #![cfg_attr(not(test), deny(clippy::expect_used, clippy::unwrap_used))]
@@ -27,13 +33,15 @@ use std::net::{
   Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6, TcpListener as StdTcpListener,
   TcpStream as StdTcpStream, ToSocketAddrs, UdpSocket as StdUdpSocket,
 };
+use std::pin::Pin;
 use std::sync::{Arc, Mutex, PoisonError};
-use std::task::Poll;
+use std::task::{Context, Poll};
 
 use super::blocking::Handle as BlockingHandle;
 use super::error::{JoinError, SubmitErrorKind};
+use super::io::{AsyncRead, AsyncWrite};
 use super::managed::{ManagedBuf, OperationPermit, OperationRequest, ResourceError, ResourceScope};
-use super::reactor::{AsyncFd, ReactorHandle, RegisterError};
+use super::reactor::{AsyncFd, OwnedReadiness, ReactorHandle, RegisterError};
 use super::resources::Resources;
 
 const IO_BUDGET: usize = 64;
@@ -77,6 +85,8 @@ impl<T: 'static> std::error::Error for FromStdError<T> {}
 /// A registered nonblocking TCP stream.
 pub struct TcpStream {
   fd: AsyncFd<StdTcpStream>,
+  read_waiter: Option<OwnedReadiness<StdTcpStream>>,
+  write_waiter: Option<OwnedReadiness<StdTcpStream>>,
 }
 
 impl TcpStream {
@@ -87,7 +97,11 @@ impl TcpStream {
   ) -> Result<Self, FromStdError<StdTcpStream>> {
     reactor
       .register(stream)
-      .map(|fd| Self { fd })
+      .map(|fd| Self {
+        fd,
+        read_waiter: None,
+        write_waiter: None,
+      })
       .map_err(FromStdError::from_register)
   }
 
@@ -154,6 +168,116 @@ impl TcpStream {
   /// Shuts down the local write half. The read half remains usable.
   pub async fn shutdown(&self) -> io::Result<()> {
     self.get_ref().shutdown(std::net::Shutdown::Write)
+  }
+
+  /// Cancels readiness waits retained by [`AsyncRead`] or [`AsyncWrite`]
+  /// after their poll futures were dropped. Call after dropping those
+  /// futures; named async methods cancel their waits when dropped.
+  pub fn cancel_io_waits(&mut self) {
+    self.read_waiter = None;
+    self.write_waiter = None;
+  }
+}
+
+impl AsyncRead for TcpStream {
+  fn poll_read(
+    mut self: Pin<&mut Self>,
+    cx: &mut Context<'_>,
+    buf: &mut [u8],
+  ) -> Poll<io::Result<usize>> {
+    let this = self.as_mut().get_mut();
+    if buf.is_empty() {
+      this.read_waiter = None;
+      return Poll::Ready(Ok(0));
+    }
+    let mut attempts = 0;
+    loop {
+      if attempts == IO_BUDGET {
+        cx.waker().wake_by_ref();
+        return Poll::Pending;
+      }
+      if this.read_waiter.is_none() {
+        this.read_waiter = Some(this.fd.readable_owned());
+      }
+      let readiness = match this.read_waiter.as_mut() {
+        Some(readiness) => Pin::new(readiness).poll(cx),
+        None => unreachable!("read waiter was just created"),
+      };
+      match readiness {
+        Poll::Pending => return Poll::Pending,
+        Poll::Ready(Err(error)) => {
+          this.read_waiter = None;
+          return Poll::Ready(Err(error));
+        }
+        Poll::Ready(Ok(guard)) => {
+          this.read_waiter = None;
+          attempts += 1;
+          match guard.try_io(|stream| (&*stream).read(buf)) {
+            Err(error)
+              if matches!(
+                error.kind(),
+                io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock
+              ) => {}
+            result => return Poll::Ready(result),
+          }
+        }
+      }
+    }
+  }
+}
+
+impl AsyncWrite for TcpStream {
+  fn poll_write(
+    mut self: Pin<&mut Self>,
+    cx: &mut Context<'_>,
+    buf: &[u8],
+  ) -> Poll<io::Result<usize>> {
+    let this = self.as_mut().get_mut();
+    if buf.is_empty() {
+      this.write_waiter = None;
+      return Poll::Ready(Ok(0));
+    }
+    let mut attempts = 0;
+    loop {
+      if attempts == IO_BUDGET {
+        cx.waker().wake_by_ref();
+        return Poll::Pending;
+      }
+      if this.write_waiter.is_none() {
+        this.write_waiter = Some(this.fd.writable_owned());
+      }
+      let readiness = match this.write_waiter.as_mut() {
+        Some(readiness) => Pin::new(readiness).poll(cx),
+        None => unreachable!("write waiter was just created"),
+      };
+      match readiness {
+        Poll::Pending => return Poll::Pending,
+        Poll::Ready(Err(error)) => {
+          this.write_waiter = None;
+          return Poll::Ready(Err(error));
+        }
+        Poll::Ready(Ok(guard)) => {
+          this.write_waiter = None;
+          attempts += 1;
+          match guard.try_io(|stream| (&*stream).write(buf)) {
+            Err(error)
+              if matches!(
+                error.kind(),
+                io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock
+              ) => {}
+            result => return Poll::Ready(result),
+          }
+        }
+      }
+    }
+  }
+
+  fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+    Poll::Ready(Ok(()))
+  }
+
+  fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+    Poll::Ready(self.get_mut().get_ref().shutdown(std::net::Shutdown::Write))
   }
 }
 
@@ -776,6 +900,8 @@ mod unix {
   /// Registered nonblocking Unix stream.
   pub struct UnixStream {
     pub(super) fd: AsyncFd<StdUnixStream>,
+    read_waiter: Option<OwnedReadiness<StdUnixStream>>,
+    write_waiter: Option<OwnedReadiness<StdUnixStream>>,
   }
 
   impl UnixStream {
@@ -786,7 +912,11 @@ mod unix {
     ) -> Result<Self, FromStdError<StdUnixStream>> {
       reactor
         .register(stream)
-        .map(|fd| Self { fd })
+        .map(|fd| Self {
+          fd,
+          read_waiter: None,
+          write_waiter: None,
+        })
         .map_err(FromStdError::from_register)
     }
     /// The underlying standard stream.
@@ -809,6 +939,116 @@ mod unix {
     /// Shuts down the local write half.
     pub async fn shutdown(&self) -> io::Result<()> {
       self.get_ref().shutdown(std::net::Shutdown::Write)
+    }
+
+    /// Cancels readiness waits retained by [`AsyncRead`] or [`AsyncWrite`]
+    /// after their poll futures were dropped. Call after dropping those
+    /// futures; named async methods cancel their waits when dropped.
+    pub fn cancel_io_waits(&mut self) {
+      self.read_waiter = None;
+      self.write_waiter = None;
+    }
+  }
+
+  impl AsyncRead for UnixStream {
+    fn poll_read(
+      mut self: Pin<&mut Self>,
+      cx: &mut Context<'_>,
+      buf: &mut [u8],
+    ) -> Poll<io::Result<usize>> {
+      let this = self.as_mut().get_mut();
+      if buf.is_empty() {
+        this.read_waiter = None;
+        return Poll::Ready(Ok(0));
+      }
+      let mut attempts = 0;
+      loop {
+        if attempts == IO_BUDGET {
+          cx.waker().wake_by_ref();
+          return Poll::Pending;
+        }
+        if this.read_waiter.is_none() {
+          this.read_waiter = Some(this.fd.readable_owned());
+        }
+        let readiness = match this.read_waiter.as_mut() {
+          Some(readiness) => Pin::new(readiness).poll(cx),
+          None => unreachable!("read waiter was just created"),
+        };
+        match readiness {
+          Poll::Pending => return Poll::Pending,
+          Poll::Ready(Err(error)) => {
+            this.read_waiter = None;
+            return Poll::Ready(Err(error));
+          }
+          Poll::Ready(Ok(guard)) => {
+            this.read_waiter = None;
+            attempts += 1;
+            match guard.try_io(|stream| (&*stream).read(buf)) {
+              Err(error)
+                if matches!(
+                  error.kind(),
+                  io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock
+                ) => {}
+              result => return Poll::Ready(result),
+            }
+          }
+        }
+      }
+    }
+  }
+
+  impl AsyncWrite for UnixStream {
+    fn poll_write(
+      mut self: Pin<&mut Self>,
+      cx: &mut Context<'_>,
+      buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+      let this = self.as_mut().get_mut();
+      if buf.is_empty() {
+        this.write_waiter = None;
+        return Poll::Ready(Ok(0));
+      }
+      let mut attempts = 0;
+      loop {
+        if attempts == IO_BUDGET {
+          cx.waker().wake_by_ref();
+          return Poll::Pending;
+        }
+        if this.write_waiter.is_none() {
+          this.write_waiter = Some(this.fd.writable_owned());
+        }
+        let readiness = match this.write_waiter.as_mut() {
+          Some(readiness) => Pin::new(readiness).poll(cx),
+          None => unreachable!("write waiter was just created"),
+        };
+        match readiness {
+          Poll::Pending => return Poll::Pending,
+          Poll::Ready(Err(error)) => {
+            this.write_waiter = None;
+            return Poll::Ready(Err(error));
+          }
+          Poll::Ready(Ok(guard)) => {
+            this.write_waiter = None;
+            attempts += 1;
+            match guard.try_io(|stream| (&*stream).write(buf)) {
+              Err(error)
+                if matches!(
+                  error.kind(),
+                  io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock
+                ) => {}
+              result => return Poll::Ready(result),
+            }
+          }
+        }
+      }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+      Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+      Poll::Ready(self.get_mut().get_ref().shutdown(std::net::Shutdown::Write))
     }
   }
   impl fmt::Debug for UnixStream {

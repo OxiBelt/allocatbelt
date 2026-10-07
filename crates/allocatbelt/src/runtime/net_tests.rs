@@ -4,14 +4,16 @@ use std::net::{
   Ipv6Addr, SocketAddr, SocketAddrV6, TcpListener as StdTcpListener, TcpStream as StdTcpStream,
   UdpSocket as StdUdpSocket,
 };
+use std::pin::Pin;
 use std::pin::pin;
-use std::sync::mpsc;
-use std::task::{Context, Poll, Waker};
+use std::sync::{Arc, mpsc};
+use std::task::{Context, Poll, Wake, Waker};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use super::{NetHandle, NetworkError, ResolveError, ResolveSubmissionKind, TcpListener, UdpSocket};
 use crate::runtime::blocking::{Config, Runtime, ShutdownMode};
+use crate::runtime::io::{AsyncRead, AsyncWrite, copy_with_buffer};
 use crate::runtime::managed::{ResourceLimits, ResourceScope};
 use crate::runtime::reactor::{Reactor, ReactorConfig};
 use crate::runtime::resources::Resources;
@@ -25,6 +27,18 @@ fn reactor(registrations: usize) -> Reactor {
 }
 
 const IO_TIMEOUT: Duration = Duration::from_secs(10);
+
+struct UnparkWaker(thread::Thread);
+
+impl Wake for UnparkWaker {
+  fn wake(self: Arc<Self>) {
+    self.0.unpark();
+  }
+
+  fn wake_by_ref(self: &Arc<Self>) {
+    self.0.unpark();
+  }
+}
 
 fn set_tcp_timeouts(stream: &StdTcpStream) {
   stream.set_read_timeout(Some(IO_TIMEOUT)).unwrap();
@@ -73,6 +87,192 @@ fn unix_stream_preserves_data_eof_and_write_half_shutdown() {
 
   peer.shutdown(std::net::Shutdown::Write).unwrap();
   assert_eq!(block_on(stream.read(&mut byte)).unwrap(), 0);
+}
+
+#[cfg(unix)]
+#[test]
+fn unix_stream_traits_mix_with_named_methods_and_wake_on_readiness() {
+  use std::os::unix::net::UnixStream as StdUnixStream;
+
+  let reactor = reactor(2);
+  let handle = reactor.handle();
+  let (runtime_side, mut peer) = StdUnixStream::pair().unwrap();
+  peer.set_read_timeout(Some(IO_TIMEOUT)).unwrap();
+  peer.set_write_timeout(Some(IO_TIMEOUT)).unwrap();
+  let mut stream = super::UnixStream::from_std(runtime_side, &handle).unwrap();
+  let mut incoming = [0; 4];
+
+  let current = thread::current();
+  let waker = Waker::from(Arc::new(UnparkWaker(current)));
+  let mut context = Context::from_waker(&waker);
+  assert!(
+    Pin::new(&mut stream)
+      .poll_read(&mut context, &mut incoming)
+      .is_pending()
+  );
+  assert_eq!(handle.waiters(), 1);
+  peer.write_all(b"read").unwrap();
+  let deadline = Instant::now() + IO_TIMEOUT;
+  let read = loop {
+    thread::park_timeout(Duration::from_millis(10));
+    match Pin::new(&mut stream).poll_read(&mut context, &mut incoming) {
+      Poll::Ready(result) => break result.unwrap(),
+      Poll::Pending => assert!(Instant::now() < deadline, "trait read was not woken"),
+    }
+  };
+  assert_eq!(read, 4);
+  assert_eq!(&incoming, b"read");
+
+  peer.shutdown(std::net::Shutdown::Write).unwrap();
+  let eof = block_on(std::future::poll_fn(|cx| {
+    Pin::new(&mut stream).poll_read(cx, &mut incoming)
+  }))
+  .unwrap();
+  assert_eq!(eof, 0);
+
+  assert_eq!(block_on(stream.write(b"named")).unwrap(), 5);
+  let mut named = [0; 5];
+  peer.read_exact(&mut named).unwrap();
+  assert_eq!(&named, b"named");
+
+  let written = block_on(std::future::poll_fn(|cx| {
+    Pin::new(&mut stream).poll_write(cx, b"trait")
+  }))
+  .unwrap();
+  assert_eq!(written, 5);
+  let mut trait_bytes = [0; 5];
+  peer.read_exact(&mut trait_bytes).unwrap();
+  assert_eq!(&trait_bytes, b"trait");
+
+  block_on(std::future::poll_fn(|cx| {
+    Pin::new(&mut stream).poll_shutdown(cx)
+  }))
+  .unwrap();
+  assert_eq!(peer.read(&mut named).unwrap(), 0);
+}
+
+#[cfg(unix)]
+#[test]
+fn trait_cancel_io_waits_releases_read_and_write_waiters() {
+  use std::os::unix::net::UnixStream as StdUnixStream;
+
+  let reactor = reactor(1);
+  let handle = reactor.handle();
+  let (runtime_side, _peer) = StdUnixStream::pair().unwrap();
+  let mut stream = super::UnixStream::from_std(runtime_side, &handle).unwrap();
+  let chunk = [0u8; 4096];
+  let mut writer = stream.get_ref();
+  loop {
+    match writer.write(&chunk) {
+      Ok(_) => {}
+      Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+      Err(error) => panic!("filling nonblocking socket failed: {error}"),
+    }
+  }
+
+  let mut byte = [0; 1];
+  let mut context = Context::from_waker(Waker::noop());
+  assert!(
+    Pin::new(&mut stream)
+      .poll_read(&mut context, &mut byte)
+      .is_pending()
+  );
+  assert!(
+    Pin::new(&mut stream)
+      .poll_write(&mut context, b"x")
+      .is_pending()
+  );
+  assert_eq!(handle.waiters(), 2);
+  stream.cancel_io_waits();
+  assert_eq!(handle.waiters(), 0);
+  assert_eq!(handle.registrations(), 1);
+}
+
+#[cfg(unix)]
+#[test]
+fn empty_trait_polls_release_stored_waiters_for_their_direction() {
+  use std::os::unix::net::UnixStream as StdUnixStream;
+
+  let reactor = reactor(1);
+  let handle = reactor.handle();
+  let (runtime_side, _peer) = StdUnixStream::pair().unwrap();
+  let mut stream = super::UnixStream::from_std(runtime_side, &handle).unwrap();
+  let mut context = Context::from_waker(Waker::noop());
+  let mut byte = [0; 1];
+
+  assert!(
+    Pin::new(&mut stream)
+      .poll_read(&mut context, &mut byte)
+      .is_pending()
+  );
+  assert_eq!(handle.waiters(), 1);
+  assert_eq!(
+    Pin::new(&mut stream)
+      .poll_read(&mut context, &mut [])
+      .map(Result::unwrap),
+    Poll::Ready(0)
+  );
+  assert_eq!(handle.waiters(), 0);
+
+  let chunk = [0u8; 4096];
+  let mut writer = stream.get_ref();
+  loop {
+    match writer.write(&chunk) {
+      Ok(_) => {}
+      Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+      Err(error) => panic!("filling nonblocking socket failed: {error}"),
+    }
+  }
+  assert!(
+    Pin::new(&mut stream)
+      .poll_write(&mut context, b"x")
+      .is_pending()
+  );
+  assert_eq!(handle.waiters(), 1);
+  assert_eq!(
+    Pin::new(&mut stream)
+      .poll_write(&mut context, &[])
+      .map(Result::unwrap),
+    Poll::Ready(0)
+  );
+  assert_eq!(handle.waiters(), 0);
+}
+
+#[cfg(unix)]
+#[test]
+fn stream_traits_copy_large_input_through_partial_progress() {
+  use std::os::unix::net::UnixStream as StdUnixStream;
+
+  let reactor = reactor(4);
+  let handle = reactor.handle();
+  let (source_runtime, mut source_peer) = StdUnixStream::pair().unwrap();
+  let (destination_runtime, mut destination_peer) = StdUnixStream::pair().unwrap();
+  source_peer.set_write_timeout(Some(IO_TIMEOUT)).unwrap();
+  destination_peer.set_read_timeout(Some(IO_TIMEOUT)).unwrap();
+  let mut source = super::UnixStream::from_std(source_runtime, &handle).unwrap();
+  let mut destination = super::UnixStream::from_std(destination_runtime, &handle).unwrap();
+  let payload: Vec<u8> = (0..1_000_000).map(|index| (index % 251) as u8).collect();
+  let writer = thread::spawn(move || {
+    source_peer.write_all(&payload).unwrap();
+    source_peer.shutdown(std::net::Shutdown::Write).unwrap();
+    payload
+  });
+  let reader = thread::spawn(move || {
+    let mut received = Vec::new();
+    destination_peer.read_to_end(&mut received).unwrap();
+    received
+  });
+
+  let mut scratch = [0; 8192];
+  let copied = block_on(copy_with_buffer(
+    &mut source,
+    &mut destination,
+    &mut scratch,
+  ))
+  .unwrap();
+  block_on(destination.shutdown()).unwrap();
+  assert_eq!(copied, 1_000_000);
+  assert_eq!(reader.join().unwrap(), writer.join().unwrap());
 }
 
 #[cfg(unix)]
