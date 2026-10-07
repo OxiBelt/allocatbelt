@@ -4,8 +4,9 @@
 compiled by the additive `runtime` feature. The unpublished
 `allocatbelt-runtime` crate forwards to the same implementation for development
 and compiles that source directly for Loom. It provides bounded blocking and
-owned-future worker pools, plus cooperative managed-storage ledgers. Full Tokio
-capability parity and native performance qualification remain pending. It is
+owned-future worker pools, a current-thread executor for local futures, and
+cooperative managed-storage ledgers. Full Tokio capability parity and native
+performance qualification remain pending. It is
 not recommended for production. `allocatbelt` remains the only package intended for publication; enabling the
 module does not install a global allocator or change allocator-only defaults.
 
@@ -87,7 +88,57 @@ Loom exercises production task transition helpers and managed-ledger methods.
 Some scope models are capped at 10,000 permutations and use a small generation
 table. Full queues, worker parking, actual wakers, ownership and scope pointer
 identity are outside those models; native lifecycle tests cover these paths.
-This foundation supplies no current-thread/local executor or I/O reactor yet.
+This foundation supplies no I/O reactor yet.
+
+## Current-thread local tasks
+
+`runtime::asynchronous::LocalRuntime` polls owned local futures on the thread
+that constructs it. Local futures and outputs may be `!Send`, but spawned
+futures must be `'static`; the root future passed to `block_on` may borrow
+caller data. The runtime, local handles, scopes, joins with local outputs, and
+entry guards are thread-affine. `block_on` rejects nesting shared with the
+multi-thread runtime.
+
+`LocalHandle::enter` sets a separate local current context. The current value
+is the most recently entered still-live guard, and dropping nested guards out
+of order removes only the dropped context. During a spawned task's poll and
+cleanup, `LocalHandle::current` refers to that task's scope.
+Queued external tasks cancelled before import enter the root local context
+while their futures are dropped.
+
+`LocalConfig::max_outstanding` is one bound shared by local admissions and
+queued cross-thread submissions. `max_scopes` includes the root scope. The
+external `LocalSendHandle` accepts only `Send + 'static` futures and outputs;
+its bounded channel is imported by the owner while `block_on` progresses. A
+send handle cannot make progress when the owner is not polling. Rejected
+submissions return the original future.
+
+Each scope keeps FIFO order for tasks becoming ready, and ready scopes rotate
+after one poll turn. Repeated wakes coalesce while a task is queued or polling.
+Aborting requests cleanup after an active poll returns. Dropping a scope
+requests cancellation; `close` waits for child cleanup, result publication
+and scope-slot reclamation.
+Dropping the runtime synchronously cancels and drops imported local futures on
+its owner thread, so their destructors may run user code. All task polling,
+future/output destruction, and join callbacks happen outside scheduler and
+admission locks. The executor has no I/O reactor and does not provide borrowed
+spawned tasks, preemption, or a CPU-time quota.
+Future cleanup occurs on the owner thread. A join with a `Send` output can
+move to another thread, where that output may be observed or dropped.
+
+Native tests cover local FIFO/round-robin dispatch, stale task wakers, close
+publication order and retained parking notifications. Existing Loom models
+exercise shared task transition helpers; the local owner loop, admission gate
+and notifier integration are not fully modeled.
+
+The local runtime and its task-scoped types are deliberately `!Send`:
+
+```compile_fail
+use allocatbelt::runtime::asynchronous::LocalRuntime;
+
+fn require_send<T: Send>() {}
+require_send::<LocalRuntime>();
+```
 
 ## Bounded timers
 
@@ -248,8 +299,7 @@ Admission counters are not resource-usage measurements.
 
 The lifecycle foundation above is implemented. Remaining milestones include:
 
-1. Runtime entry/context, current-thread and local execution, task utilities,
-   and integration of resource permits into active polling.
+1. Task utilities and integration of resource permits into active polling.
 2. Timers and a Linux I/O reactor with bounded submission, completion ownership,
    sandbox fallback and cancellation-safe buffers.
 3. TCP/UDP, file I/O, synchronization and blocking adapters; define compatibility

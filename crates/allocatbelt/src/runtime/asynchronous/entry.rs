@@ -164,10 +164,10 @@ pub(super) fn block_on<F: Future>(
   Ok(block_on_caller_thread(future))
 }
 
-struct BlockOnGuard;
+pub(super) struct BlockOnGuard;
 
 impl BlockOnGuard {
-  fn enter() -> Result<Self, AsyncError> {
+  pub(super) fn enter() -> Result<Self, AsyncError> {
     if EXECUTOR_WORKER.with(Cell::get) {
       return Err(AsyncError::BlockOnFromWorker);
     }

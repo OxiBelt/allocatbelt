@@ -10,6 +10,7 @@
 
 mod entry;
 mod join;
+mod local;
 mod protocol;
 mod scheduler;
 mod task;
@@ -27,6 +28,10 @@ pub use entry::{
   ConsumeBudget, EnterGuard, YieldNow, consume_budget, current, try_current, yield_now,
 };
 pub use join::{AsyncJob, AsyncJoinError};
+pub use local::{
+  LocalConfig, LocalEnterGuard, LocalError, LocalHandle, LocalRuntime, LocalScopeClose,
+  LocalSendHandle, LocalSpawnError, LocalTaskScope,
+};
 pub use scheduler::{OwnedTaskScope, ScopeClose};
 
 /// Fixed limits for an [`AsyncRuntime`].
