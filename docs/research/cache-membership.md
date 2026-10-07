@@ -73,3 +73,28 @@ Complete Miri, retained-memory/application checks and the separate mimalloc
 and matched-allocator Tokio qualification remain required. Raw logs, hashes,
 profiles and analyses are held in the private resources checkout. The
 [implementation plan](resource-runtime-plan.md) specifies the broader gates.
+
+## Separate retained-cache memory probe
+
+`bench-cache-retained-allocatbelt` samples process memory before workers,
+while every worker remains alive after explicitly flushing its cache, and
+after workers join and the main thread purges. Run the identical probe source
+against each frozen allocator variant. It uses fixed 2 MiB requested stacks,
+16 rounds and either one small class (`minimal`) or all 32 (`all-classes`).
+Native qualification uses 32, 128 and 512 workers in both traces; a smaller
+functional smoke is not a retention guard.
+
+The probe checks each worker's payload checksum and the full parked cohort.
+Its bounded parser requires RSS, PSS, private-clean, private-dirty and anonymous
+fields from `/proc/self/smaps_rollup`. Missing data, partial spawn, worker panic,
+checksum mismatch or an enrollment timeout fail the process. Cleanup releases
+the park gate before joining all successfully spawned workers. Enrollment has
+a 60-second limit; qualification also needs an outer process deadline because
+joining and purge may block in the kernel.
+
+The CSV includes explicit source-variant/compiler labels and executable size,
+plus optional caller-supplied logical cache bytes. That optional value is a
+model, not measured retention. Process samples include stacks, libc thread
+state, mappings and residency effects; report those limits alongside paired
+native comparisons. The probe measures no throughput or latency, and adding
+it establishes no memory improvement or completed retention qualification.

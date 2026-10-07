@@ -357,3 +357,5 @@ fn count(n: usize) -> String {
 }
 
 pub mod latency;
+
+pub mod cache_retention;
