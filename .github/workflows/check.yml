@@ -507,6 +507,7 @@ jobs:
           cargo test --release --locked -p allocatbelt-runtime --lib runtime::rwlock::loom_tests
           cargo test --release --locked -p allocatbelt-runtime --lib runtime::channel::loom_tests
           cargo test --release --locked -p allocatbelt-runtime --lib runtime::oneshot::model
+          cargo test --release --locked -p allocatbelt-runtime --lib runtime::notify::loom_tests
 
   fuzz:
     name: Fuzz the heap model (cargo-fuzz, 10 minutes)

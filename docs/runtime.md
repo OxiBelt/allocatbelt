@@ -177,6 +177,25 @@ Actual-source Loom models cover queue close versus enqueue, single-message send
 versus receiver registration, and send versus receiver destruction. They do not
 model every channel/executor combination or arbitrary user callback behavior.
 
+## Bounded notifications
+
+`runtime::notify::Notify` reserves its complete waiter table at construction.
+Named owned futures capture the broadcast generation when created; `enable`
+arms a future before the caller checks its condition. Table exhaustion returns
+`Full`. `notify_one` assigns the oldest waiter and `notify_last` the newest;
+canceling an unobserved assignment transfers it using the same order. With no
+waiter, either operation stores one coalescing permit.
+
+`notify_waiters` completes futures created before the broadcast, including
+unpolled futures, without storing a new permit. A broadcast is observed before
+an existing single permit, preserving that permit for another future. Close
+rejects unobserved single assignments while preserving prior broadcast
+eligibility. Broadcast generations are checked and waiter slots retire rather
+than wrap; exhaustion is explicit. Waker callbacks and debug formatting run
+outside the ledger lock. The fixed metadata is outside the managed-buffer
+ledger. Seventeen native tests and four actual-source Loom models cover
+registration, cancellation order, close races and generation reuse.
+
 ## Bounded fair semaphore
 
 `runtime::semaphore::Semaphore` has an explicit preallocated waiter bound.
