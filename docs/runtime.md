@@ -213,8 +213,7 @@ copy from starting; a running copy cannot be interrupted or rolled back and
 retains its disk permit until completion.
 They retain standard filesystem semantics, including relative symlink
 targets and path races. Canonicalization and existence are snapshots, not
-security checks for later operations. Recursive traversal remains separate
-implementation work.
+security checks for later operations.
 
 Directory iteration yields one entry per job. Entry metadata and type wrappers
 also use disk permits. Returned raw `std::fs::DirEntry` methods can perform
@@ -222,6 +221,21 @@ blocking I/O directly if callers bypass these wrappers. Paths and open options
 retain standard-library semantics; this API supplies no path sandbox, descriptor
 quota, IOPS, bandwidth or disk-space enforcement. It does not collect whole
 files or directories implicitly.
+
+`FsHandle::walk_dir` and `walk_next` provide a depth-first path stream. The
+caller sets finite entry, depth and path-byte ceilings and supplies a uniquely
+owned charged `ManagedBuf` for each emitted path. The root is the first entry
+at depth zero; symlinks are emitted but not descended. An entry-limit result
+means traversal may be incomplete, while completion reports whether a
+depth-limited directory was left unopened. The cursor bounds logical path
+lengths and directory-frame count, while standard-library allocation rounding,
+iterator state and temporary entry names remain uncharged. The output paths are
+raw Unix bytes, so non-UTF-8 names are preserved. These ordinary path-based
+operations reject a symlink at the final root component even with a trailing
+slash, but an earlier component such as `link/.` can still resolve through a
+symlink. Path replacement races remain, so this is not descriptor-relative
+confinement. A `walk_next` call processes at most 64 frame/iterator steps;
+terminal cleanup may additionally drop the bounded stack of up to 257 frames.
 
 `runtime::fs_io::AsyncFile` implements initialized-buffer read/write/seek
 traits over one `OwnedFile`, an explicit `FsHandle` and two caller-sized,
@@ -1358,17 +1372,16 @@ baseline still requires these implementation and qualification steps:
    simplex and duplex pipes are implemented. The initialized-buffer `Take`/`Chain`/`Empty`/`Sink`/`Repeat` family,
    bounded delimiter/line and whole-stream reads, and fixed managed buffered
    endpoints are implemented; these do not include those remaining operations.
-3. Add bounded recursive traversal.
-4. Exercise realistic application ports covering cancellation, bounded
+3. Exercise realistic application ports covering cancellation, bounded
    rejection recovery, resource/dependency quotas, retained managed storage,
    partial I/O and explicit driver/process shutdown. The existing CPU, memory,
    limited TCP/HTTP and disk examples establish functional ports only.
-5. Finish complete isolated core Miri and supported platform, feature, package
+4. Finish complete isolated core Miri and supported platform, feature, package
    and security-tool qualification, preserving failures and model-coverage
    limits. Complete per-host retained-memory, allocator, executor and application
    gates against both mimalloc baselines and matched-allocator Tokio, separating
    saturated capacity from open-loop tail-latency workloads.
-6. Qualify adaptive controls under real resource pressure, overload and
+5. Qualify adaptive controls under real resource pressure, overload and
    readback failures. Synthetic policy samples and control-write integration
    establish correctness, not pressure response or application performance.
    Promote scheduler, allocator and ISA candidates only after their required

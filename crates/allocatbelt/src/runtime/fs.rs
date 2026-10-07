@@ -9,9 +9,10 @@
 //! operation from starting.
 //!
 //! Submitted filesystem operations use `std::fs` on the blocking pool. This
-//! module does not start a runtime, restrict paths, or impose disk-space,
-//! entry-count, or byte-rate limits. Directory iteration yields one entry per
-//! submitted call, so it does not eagerly collect an unbounded listing.
+//! module does not start a runtime or restrict paths. Its recursive walk has
+//! explicit entry, depth, and path-length ceilings; ordinary directory
+//! iteration still yields one entry per submitted call. Neither API imposes
+//! disk-space, IOPS, or byte-rate limits.
 //! Returned standard-library `DirEntry` values can perform further blocking
 //! I/O when their methods are called directly; those calls bypass the pool
 //! and its disk permits.
@@ -41,6 +42,10 @@ use crate::runtime::managed::{
 use crate::runtime::resources::Resources;
 
 const IO_CHUNK: usize = 64 * 1024;
+
+#[path = "fs_walk.rs"]
+mod fs_walk;
+pub use fs_walk::{TreeWalk, WalkEntryKind, WalkLimits, WalkNextOutcome, WalkStep};
 
 #[cfg(all(test, not(loom)))]
 #[path = "fs_tests.rs"]
