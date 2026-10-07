@@ -6,6 +6,8 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use std::task::Context;
 
+use super::entry::TaskContextGuard;
+use super::identity::TaskId;
 use super::join::{AsyncJob, AsyncJoinError, JoinState};
 use super::scheduler::{Shared, TaskRef};
 
@@ -32,6 +34,7 @@ pub(super) struct Task<F: Future + Send + 'static> {
   future: Mutex<Option<Pin<Box<F>>>>,
   staged: Mutex<Option<Result<F::Output, AsyncJoinError>>>,
   join: Arc<JoinState<F::Output>>,
+  id: TaskId,
 }
 
 impl<F: Future + Send + 'static> Task<F> {
@@ -56,6 +59,7 @@ where
   F::Output: Send + 'static,
 {
   fn poll(&self, cx: &mut Context<'_>) -> PollResult {
+    let _task_context = TaskContextGuard::enter(Some(self.id));
     let Some(mut future) = self.lock_future().take() else {
       return PollResult::Ready;
     };
@@ -88,6 +92,7 @@ where
   }
 
   fn cancel(&self) {
+    let _task_context = TaskContextGuard::enter(Some(self.id));
     let panic = self.finish_future();
     let outcome = match panic {
       Some(payload) => Err(AsyncJoinError::Panicked(payload)),
@@ -97,6 +102,7 @@ where
   }
 
   fn publish(&self) {
+    let _task_context = TaskContextGuard::enter(Some(self.id));
     let staged = self
       .staged
       .lock()
@@ -125,10 +131,11 @@ where
 {
   pub(super) fn create(
     future: F,
+    id: TaskId,
     shared: Weak<Shared>,
     task: TaskRef,
   ) -> (Arc<dyn ErasedTask>, AsyncJob<F::Output>) {
-    let join = JoinState::new();
+    let join = JoinState::with_id(id);
     let abort_shared = shared;
     let abort = Arc::new(move || {
       if let Some(shared) = abort_shared.upgrade() {
@@ -139,6 +146,7 @@ where
       future: Mutex::new(Some(Box::pin(future))),
       staged: Mutex::new(None),
       join: Arc::clone(&join),
+      id,
     });
     let erased: Arc<dyn ErasedTask> = task;
     (erased, AsyncJob::new(join, abort))

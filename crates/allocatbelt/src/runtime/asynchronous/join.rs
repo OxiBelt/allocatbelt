@@ -16,6 +16,8 @@ use std::sync::{Arc, PoisonError};
 use std::sync::{Mutex, MutexGuard};
 use std::task::{Context, Poll, Waker};
 
+use super::identity::TaskId;
+
 /// Why an async task did not produce its output.
 pub enum AsyncJoinError {
   /// The task was aborted or its scope/runtime was cancelled.
@@ -58,17 +60,26 @@ enum Slot<T> {
 pub(super) struct JoinState<T> {
   slot: Mutex<Slot<T>>,
   finished: Arc<AtomicBool>,
+  id: TaskId,
 }
 
 impl<T> JoinState<T> {
-  pub(super) fn new() -> Arc<Self> {
+  pub(super) fn with_id(id: TaskId) -> Arc<Self> {
     Arc::new(Self {
       slot: Mutex::new(Slot::Pending(PendingWakers {
         join: None,
         finished: None,
       })),
       finished: Arc::new(AtomicBool::new(false)),
+      id,
     })
+  }
+
+  #[cfg(test)]
+  pub(super) fn new() -> Arc<Self> {
+    // Synthetic jobs used by internal state-machine tests are not spawned
+    // tasks and never escape those tests.
+    Self::with_id(TaskId::test_sentinel())
   }
 
   fn lock(&self) -> MutexGuard<'_, Slot<T>> {
@@ -145,6 +156,12 @@ impl<T> AsyncJob<T> {
     (self.abort)();
   }
 
+  /// The process-wide identity assigned when this task was admitted.
+  #[must_use]
+  pub fn id(&self) -> TaskId {
+    self.state.id
+  }
+
   /// Returns a clonable cancellation handle independent of the output type.
   /// The handle does not retain the task's future or result.
   #[must_use]
@@ -152,6 +169,7 @@ impl<T> AsyncJob<T> {
     AbortHandle {
       abort: Arc::clone(&self.abort),
       finished: Arc::clone(&self.state.finished),
+      id: self.state.id,
     }
   }
 
@@ -218,6 +236,7 @@ impl<T> AsyncJob<T> {
 pub struct AbortHandle {
   abort: Arc<dyn Fn() + Send + Sync>,
   finished: Arc<AtomicBool>,
+  id: TaskId,
 }
 
 impl AbortHandle {
@@ -225,6 +244,12 @@ impl AbortHandle {
   /// cleanup and cannot preempt a running poll.
   pub fn abort(&self) {
     (self.abort)();
+  }
+
+  /// The process-wide identity of the task this handle can abort.
+  #[must_use]
+  pub const fn id(&self) -> TaskId {
+    self.id
   }
 
   /// Whether the terminal join outcome has been published. Detaching the join
@@ -238,6 +263,7 @@ impl AbortHandle {
 impl fmt::Debug for AbortHandle {
   fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
     f.debug_struct("AbortHandle")
+      .field("id", &self.id)
       .field("finished", &self.is_finished())
       .finish_non_exhaustive()
   }
@@ -288,7 +314,9 @@ impl<T> Drop for AsyncJob<T> {
 
 impl<T> fmt::Debug for AsyncJob<T> {
   fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-    f.debug_struct("AsyncJob").finish_non_exhaustive()
+    f.debug_struct("AsyncJob")
+      .field("id", &self.id())
+      .finish_non_exhaustive()
   }
 }
 

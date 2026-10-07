@@ -614,6 +614,18 @@ metadata rather than the future or result. `is_finished` becomes true when the
 terminal outcome is published after future destruction and admission release.
 Detaching a join alone leaves it false. It does not wait for completion callbacks,
 discarded-output destruction or the later scope-close publication/reclamation.
+`AsyncJob::id` and `AbortHandle::id` return the same opaque process-wide
+`TaskId`, retained after completion and task-slot reuse. Native, owner-local
+and cross-thread local submissions share a checked nonwrapping identifier
+allocator; accepted cross-thread handles already have an ID before import.
+Exhaustion rejects submission with the original future, and rejected attempts
+may leave numeric gaps. `try_task_id` reports the spawned task during polling,
+future cleanup and producer-side discarded-result cleanup; `task_id` panics outside that
+context. Borrowed `block_on` roots have no spawned-task ID and restore an
+inherited context afterward. Task IDs are distinct from `SetTaskId` membership
+tokens. Four native identity tests and independent detached-cleanup cases
+verify this contract; existing Loom models do not prove numeric uniqueness
+or counter exhaustion.
 The completion flag has native publication and cross-thread cancellation tests.
 A Loom model races completion-observer registration against join publication;
 it does not model the executor's entire cleanup and scope-close sequence.

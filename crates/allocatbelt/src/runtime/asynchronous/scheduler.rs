@@ -9,6 +9,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, Weak};
 use std::task::{Context, Wake, Waker};
 
+use super::identity;
 use super::join::AsyncJob;
 use super::protocol::{PollFinish, PollProtocol, ScopeProtocol};
 use super::task::{ErasedTask, PollResult, Task};
@@ -247,8 +248,12 @@ impl Shared {
       drop(state);
       return Err(AsyncSpawnError::new(AsyncError::Full, future));
     };
+    let Some(task_id) = identity::allocate() else {
+      drop(state);
+      return Err(AsyncSpawnError::new(AsyncError::TaskIdExhausted, future));
+    };
     let task_ref = TaskRef { index, generation };
-    let (task, job) = Task::create(future, Arc::downgrade(self), task_ref);
+    let (task, job) = Task::create(future, task_id, Arc::downgrade(self), task_ref);
     state.tasks[index].protocol.admit(generation);
     state.tasks[index].scope = Some(scope);
     state.tasks[index].task = Some(task);

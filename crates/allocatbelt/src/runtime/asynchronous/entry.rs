@@ -12,6 +12,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context, Poll, Wake, Waker};
 use std::thread::{self, Thread};
 
+use super::identity::TaskId;
 use super::{AsyncError, AsyncHandle};
 
 const DEFAULT_BUDGET: u16 = 64;
@@ -21,6 +22,7 @@ thread_local! {
   static BLOCK_ON_ACTIVE: Cell<bool> = const { Cell::new(false) };
   static EXECUTOR_WORKER: Cell<bool> = const { Cell::new(false) };
   static COOPERATIVE_BUDGET: Cell<u16> = const { Cell::new(DEFAULT_BUDGET) };
+  static CURRENT_TASK_ID: Cell<Option<TaskId>> = const { Cell::new(None) };
 }
 
 struct ContextNode {
@@ -129,6 +131,45 @@ impl Drop for WorkerContextGuard {
   }
 }
 
+/// Restores the previous task identity after polling, callbacks, or unwind.
+pub(super) struct TaskContextGuard {
+  previous: Option<TaskId>,
+  _not_send: PhantomData<Rc<()>>,
+}
+
+impl TaskContextGuard {
+  pub(super) fn enter(task_id: Option<TaskId>) -> Self {
+    let previous = CURRENT_TASK_ID.with(|current| current.replace(task_id));
+    Self {
+      previous,
+      _not_send: PhantomData,
+    }
+  }
+}
+
+impl Drop for TaskContextGuard {
+  fn drop(&mut self) {
+    let _ = CURRENT_TASK_ID.try_with(|current| current.set(self.previous));
+  }
+}
+
+/// Returns the identity of the task currently being polled or cleaned up.
+#[must_use]
+pub fn try_task_id() -> Option<TaskId> {
+  CURRENT_TASK_ID.try_with(Cell::get).unwrap_or(None)
+}
+
+/// Returns the identity of the task currently being polled or cleaned up.
+///
+/// # Panics
+///
+/// Panics when called outside a spawned task's poll or cleanup context. A
+/// caller-owned root future passed to `block_on` has no task ID.
+#[must_use]
+pub fn task_id() -> TaskId {
+  try_task_id().unwrap_or_else(|| panic!("no allocatbelt async task is active"))
+}
+
 /// Returns the currently entered runtime handle, if any.
 #[must_use]
 pub fn try_current() -> Option<AsyncHandle> {
@@ -160,6 +201,7 @@ pub(super) fn block_on<F: Future>(
   future: F,
 ) -> Result<F::Output, AsyncError> {
   let _block = BlockOnGuard::enter()?;
+  let _task_context = TaskContextGuard::enter(None);
   let _context = EnterGuard::enter(handle);
   Ok(block_on_caller_thread(future))
 }

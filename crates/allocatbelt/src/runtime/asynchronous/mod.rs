@@ -9,6 +9,7 @@
 #![cfg_attr(not(test), deny(clippy::expect_used, clippy::unwrap_used))]
 
 mod entry;
+mod identity;
 mod join;
 mod local;
 mod protocol;
@@ -26,8 +27,10 @@ use std::thread::{self, JoinHandle};
 use scheduler::{ScopeRef, Shared};
 
 pub use entry::{
-  ConsumeBudget, EnterGuard, YieldNow, consume_budget, current, try_current, yield_now,
+  ConsumeBudget, EnterGuard, YieldNow, consume_budget, current, task_id, try_current, try_task_id,
+  yield_now,
 };
+pub use identity::TaskId;
 pub use join::{AbortHandle, AsyncJob, AsyncJoinError};
 pub use local::{
   LocalConfig, LocalEnterGuard, LocalError, LocalHandle, LocalRuntime, LocalScopeClose,
@@ -70,6 +73,8 @@ pub enum AsyncError {
   NestedBlockOn,
   /// A worker exited unexpectedly.
   WorkerPanicked,
+  /// The process-wide task identifier space is exhausted.
+  TaskIdExhausted,
 }
 
 impl fmt::Display for AsyncError {
@@ -84,6 +89,7 @@ impl fmt::Display for AsyncError {
       Self::BlockOnFromWorker => "block_on from an async executor worker is not allowed",
       Self::NestedBlockOn => "nested block_on on one thread is not allowed",
       Self::WorkerPanicked => "an async worker exited unexpectedly",
+      Self::TaskIdExhausted => "process-wide async task identifiers are exhausted",
     })
   }
 }

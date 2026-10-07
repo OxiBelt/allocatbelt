@@ -19,7 +19,8 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use std::task::{Context, Poll, Wake, Waker};
 use std::thread::{self, Thread, ThreadId};
 
-use super::entry::BlockOnGuard;
+use super::entry::{BlockOnGuard, TaskContextGuard};
+use super::identity::{self, TaskId};
 use super::join::{AsyncJob, AsyncJoinError, JoinState};
 use super::protocol::{PollFinish, PollProtocol};
 use super::task::drop_contained;
@@ -54,6 +55,8 @@ pub enum LocalError {
   TooManyScopes,
   /// `block_on` was nested on this thread or called from a worker.
   BlockOnRejected,
+  /// The process-wide task identifier space is exhausted.
+  TaskIdExhausted,
 }
 
 impl fmt::Display for LocalError {
@@ -65,6 +68,7 @@ impl fmt::Display for LocalError {
       Self::WrongThread => "local runtime used from a non-owner thread",
       Self::TooManyScopes => "local scope bound reached",
       Self::BlockOnRejected => "local block_on is nested or called from a worker",
+      Self::TaskIdExhausted => "process-wide async task identifiers are exhausted",
     })
   }
 }
@@ -729,6 +733,7 @@ struct Task<F: Future + 'static> {
   future: Option<Pin<Box<F>>>,
   staged: Option<Result<F::Output, AsyncJoinError>>,
   join: Arc<JoinState<F::Output>>,
+  id: TaskId,
   admission: Option<AdmissionPermit>,
   scope: Rc<ScopeCell>,
 }
@@ -742,6 +747,7 @@ impl<F: Future + 'static> Task<F> {
 
 impl<F: Future + 'static> LocalTask for Task<F> {
   fn poll(&mut self, context: &mut Context<'_>) -> Poll<()> {
+    let _task_context = TaskContextGuard::enter(Some(self.id));
     let Some(mut future) = self.future.take() else {
       return Poll::Ready(());
     };
@@ -770,6 +776,7 @@ impl<F: Future + 'static> LocalTask for Task<F> {
   }
 
   fn cancel(&mut self) {
+    let _task_context = TaskContextGuard::enter(Some(self.id));
     let outcome = match self.drop_future() {
       Some(payload) => Err(AsyncJoinError::Panicked(payload)),
       None => Err(AsyncJoinError::Cancelled),
@@ -782,10 +789,12 @@ impl<F: Future + 'static> LocalTask for Task<F> {
   }
 
   fn complete_scope(&mut self, core: &LocalCore) {
+    let _task_context = TaskContextGuard::enter(Some(self.id));
     core.complete_scope(self.scope.reference);
   }
 
   fn publish(&mut self) {
+    let _task_context = TaskContextGuard::enter(Some(self.id));
     if let Some(outcome) = self.staged.take()
       && let Some(unclaimed) = self.join.publish(outcome)
     {
@@ -805,6 +814,7 @@ where
   F::Output: Send + 'static,
 {
   future: F,
+  id: TaskId,
   join: Arc<JoinState<F::Output>>,
   abort: Arc<AtomicBool>,
   abort_target: Arc<Mutex<Option<TaskRef>>>,
@@ -819,6 +829,7 @@ where
   fn import(self: Box<Self>, core: &LocalCore, task_ref: TaskRef, scope: Rc<ScopeCell>) {
     let Self {
       future,
+      id,
       join,
       abort,
       abort_target,
@@ -828,6 +839,7 @@ where
       future: Some(Box::pin(future)),
       staged: None,
       join,
+      id,
       admission: Some(admission),
       scope: Rc::clone(&scope),
     };
@@ -842,11 +854,13 @@ where
   fn cancel_on_owner(self: Box<Self>) {
     let Self {
       future,
+      id,
       join,
       abort: _,
       abort_target: _,
       admission,
     } = *self;
+    let _task_context = TaskContextGuard::enter(Some(id));
     let outcome = match panic::catch_unwind(AssertUnwindSafe(|| drop(future))) {
       Ok(()) => Err(AsyncJoinError::Cancelled),
       Err(payload) => Err(AsyncJoinError::Panicked(payload)),
@@ -860,6 +874,7 @@ where
   fn reject(self: Box<Self>) -> Box<dyn Any + Send> {
     let Self {
       future,
+      id: _,
       join: _,
       abort: _,
       abort_target: _,
@@ -977,6 +992,7 @@ impl LocalRuntime {
       return Err(LocalError::Closed);
     }
     let _block_on = BlockOnGuard::enter().map_err(|_| LocalError::BlockOnRejected)?;
+    let _task_context = TaskContextGuard::enter(None);
     let _context = LocalEnterGuard::enter(&self.handle());
     let root_waker = Waker::from(Arc::clone(&self.core.notifier));
     let mut context = Context::from_waker(&root_waker);
@@ -1194,16 +1210,20 @@ impl LocalHandle {
       Some(scope) if !scope.closed.get() => scope,
       _ => return Err(LocalSpawnError::new(LocalError::Closed, future)),
     };
+    let Some(id) = identity::allocate() else {
+      return Err(LocalSpawnError::new(LocalError::TaskIdExhausted, future));
+    };
     let task_ref = match self.core.control.admit(self.scope) {
       Ok(task_ref) => task_ref,
       Err(error) => return Err(LocalSpawnError::new(error, future)),
     };
-    let join = JoinState::new();
+    let join = JoinState::with_id(id);
     let abort = Arc::new(AtomicBool::new(false));
     let task = Task {
       future: Some(Box::pin(future)),
       staged: None,
       join: Arc::clone(&join),
+      id,
       admission: Some(permit),
       scope: Rc::clone(&scope),
     };
@@ -1274,11 +1294,17 @@ impl LocalSendHandle {
       Ok(admission) => admission,
       Err(error) => return Err(LocalSpawnError::new(error, future)),
     };
-    let join = JoinState::new();
+    let Some(id) = identity::allocate() else {
+      drop(gate);
+      drop(admission);
+      return Err(LocalSpawnError::new(LocalError::TaskIdExhausted, future));
+    };
+    let join = JoinState::with_id(id);
     let abort = Arc::new(AtomicBool::new(false));
     let abort_target = Arc::new(Mutex::new(None));
     let request = SendRequest {
       future,
+      id,
       join: Arc::clone(&join),
       abort: Arc::clone(&abort),
       abort_target: Arc::clone(&abort_target),
