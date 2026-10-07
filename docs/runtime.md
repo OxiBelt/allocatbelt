@@ -409,9 +409,54 @@ No API here is intended to be called from an application signal handler.
 Unrelated concurrent handler replacement retains the registry's race limits.
 This is a coalescing event port, with no exact signal-count or payload queue.
 Metadata and the kernel socket buffer are outside managed-storage accounting.
-Eight native tests, four real-signal subprocess cases and four actual-table
+Registration preserves the previous handler's calling convention, but does
+not preserve every `sigaction` flag or an ignored disposition. In particular,
+registering `SIGCHLD` must be coordinated with process wait ownership and any
+existing auto-reap policy.
+Eight native tests, five real-signal subprocess cases and four actual-table
 Loom models qualify the implemented contract; they do not model kernel delivery
 or arbitrary application handlers.
+
+## Child processes
+
+`runtime::process::ProcessDriver` reserves a fixed child slot before spawning
+an owned standard `Command`. Full or closed admission returns the untouched
+command. After an accepted spawn, setup failure retains the child and uses a
+25-millisecond polling fallback if pidfd readiness cannot be registered.
+A dedicated reaper owns admitted children independently of executor workers,
+blocking-pool saturation, driver drop and application handle lifetime.
+
+Dropping `ProcessChild` detaches by default; `set_kill_on_drop` opts into a
+termination request. Explicit driver shutdown closes admission and either
+waits or requests termination before waiting for actual reaping. A running
+child or kernel operation can delay shutdown indefinitely. A slot remains
+occupied through reaping, then becomes reusable while old handles retain
+their own stable completion record. Dropping a pending `wait` removes its
+waiter; a later wait still observes the cached terminal result.
+
+`wait` closes stdin still owned by the handle, whereas `try_wait` does not.
+The latter reads cached status rather than probing the kernel and may lag
+exit by the fallback polling interval. `id` retains the original numeric PID
+after reaping for diagnostics; the OS may reuse it. Handle kill methods use
+the driver's guarded ownership checks. The current pipe accessors transfer
+ordinary synchronous standard handles; callers must drain piped output to
+avoid blocking the child. Async pipes and bounded output collection are
+subsequent ports.
+
+The driver requires exclusive child wait ownership. Foreign `waitpid`, a
+chained `SIGCHLD` handler that reaps children, and `SIG_IGN` or `SA_NOCLDWAIT`
+auto-reaping are outside that contract. Observed `ECHILD` produces a tracking
+error and releases the slot; it cannot prove the identity of a post-spawn
+pidfd after foreign reaping permits PID reuse. Ordinary signal subscriptions
+that do not reap children can coexist with the driver. Child memory, command
+arguments/environment, standard pipes and fixed service metadata are outside
+managed-storage accounting; the configured bound counts unreaped children.
+
+Fourteen native tests cover lifecycle and completion, including saturation,
+pidfd fallback, retained status, cancellation and reentrant waker destruction.
+Three Loom models compile the production completion ledger and cover waiter
+registration, publication, cancellation and retained completion identity.
+They do not model OS spawn/wait/kill, pidfd identity or the reaper slot table.
 
 ## Composing two futures
 

@@ -93,6 +93,11 @@ pub mod notify;
 pub mod once_cell;
 pub mod oneshot;
 #[cfg(not(loom))]
+pub mod process;
+#[cfg(all(test, loom))]
+#[path = "process/completion.rs"]
+mod process_completion;
+#[cfg(not(loom))]
 pub mod reactor;
 mod resources;
 pub mod rwlock;

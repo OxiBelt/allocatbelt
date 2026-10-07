@@ -170,3 +170,32 @@ fn signal_driver_capacity_is_fixed_and_invalid_kinds_have_no_side_effects() {
     },
   );
 }
+
+#[test]
+fn child_signal_subscription_coexists_with_owned_reaping() {
+  isolated(
+    "child_signal_subscription_coexists_with_owned_reaping",
+    || {
+      use allocatbelt::runtime::process::{ProcessDriver, ProcessShutdownMode};
+
+      let signals = SignalDriver::new(1).unwrap();
+      let mut signal = signals.subscribe(SignalKind::child()).unwrap();
+      let mut processes = ProcessDriver::new(1).unwrap();
+      let mut command = Command::new("/bin/sh");
+      command.args(["-c", "exit 7"]);
+      let mut child = processes.spawn(command).unwrap();
+      await_signal(&mut signal);
+      let deadline = Instant::now() + LIMIT;
+      let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+          break status;
+        }
+        assert!(Instant::now() < deadline, "managed child was not reaped");
+        thread::sleep(Duration::from_millis(5));
+      };
+      assert_eq!(status.code(), Some(7));
+      assert_eq!(processes.active_children(), 0);
+      processes.shutdown(ProcessShutdownMode::Wait).unwrap();
+    },
+  );
+}
