@@ -73,6 +73,7 @@ mod blocking;
 mod cache;
 mod error;
 mod job;
+pub mod managed;
 #[cfg(all(test, loom))]
 mod model;
 mod resources;

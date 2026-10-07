@@ -11,6 +11,21 @@ module does not install a global allocator or change allocator-only defaults.
 This page specifies the milestone contract. Verification and qualification
 status is recorded in the linked research report.
 
+## Managed buffers and operation permits
+
+`runtime::managed::ResourceScope` provides a separate shared ledger for managed
+buffer capacity and concurrent disk/network operation permits. `ManagedBuf`
+clones share one charge, held until the last owner frees the storage, including
+when a job returns the buffer or the runtime shuts down. Shrinking retains its
+capacity and charge. Growth reserves the full replacement while the old storage
+is still live; the peak must fit the budget before replacement proceeds.
+
+This is cooperative accounting of explicit managed storage and operation slots.
+It excludes allocator metadata, the shared buffer header, physical rounding,
+RSS and arbitrary allocations. It supplies neither CPU quotas nor byte-rate
+limits. The existing blocking pool's declared `Resources` reservations remain
+separate from this ledger.
+
 ## First milestone contract
 
 Each submission declares a `Resources` vector. Admission reserves every
