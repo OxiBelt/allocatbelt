@@ -900,8 +900,58 @@ fn terminal_connect_start_error_is_not_replayed_and_releases_owners() {
 
 #[test]
 fn cancellation_drops_stale_connect_waiter_before_socket_and_permit() {
+  struct PausedService {
+    entered: mpsc::SyncSender<()>,
+    release: std::sync::Mutex<mpsc::Receiver<()>>,
+  }
+
+  impl Wake for PausedService {
+    fn wake(self: Arc<Self>) {
+      self.wake_by_ref();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+      let _ = self.entered.try_send(());
+      // A failed test must never leave the reactor service blocked forever.
+      let _ = self.release.lock().unwrap().recv_timeout(IO_TIMEOUT);
+    }
+  }
+
+  struct ReleaseService(mpsc::SyncSender<()>);
+
+  impl Drop for ReleaseService {
+    fn drop(&mut self) {
+      let _ = self.0.try_send(());
+    }
+  }
+
   let reactor = reactor(2);
   let handle = reactor.handle();
+  let (control, mut peer) = std::os::unix::net::UnixStream::pair().unwrap();
+  control.set_nonblocking(true).unwrap();
+  let control = handle.register(control).unwrap();
+  let (entered, entered_rx) = mpsc::sync_channel(1);
+  let (release, release_rx) = mpsc::sync_channel(1);
+  // Declared after the reactor: release runs first, including during unwind.
+  let release_service = ReleaseService(release);
+  let control_waker = Waker::from(Arc::new(PausedService {
+    entered,
+    release: std::sync::Mutex::new(release_rx),
+  }));
+  let mut control_wait = pin!(control.readable());
+  assert!(matches!(
+    control_wait
+      .as_mut()
+      .poll(&mut Context::from_waker(&control_waker)),
+    Poll::Pending
+  ));
+  peer.write_all(b"pause").unwrap();
+  entered_rx.recv_timeout(IO_TIMEOUT).unwrap();
+
+  // An unconnected TCP socket can repeatedly deliver stale EPOLLOUT. With
+  // the service paused, this fresh registration has no cached readiness and
+  // its Pending poll deterministically stores one waiter rather than merely
+  // yielding after the endpoint-call budget is exhausted.
   let scope = ResourceScope::new(ResourceLimits {
     managed_memory: 0,
     disk_concurrent_ops: 0,
@@ -916,7 +966,7 @@ fn cancellation_drops_stale_connect_waiter_before_socket_and_permit() {
   let socket = TcpSocket::new_v4().unwrap();
   let stream = super::TcpStream::from_std(socket.into_stream(), &handle).unwrap();
   let mut attempt = ConnectAttempt::new(stream, permit);
-  assert_eq!(handle.registrations(), 1);
+  assert_eq!(handle.registrations(), 2);
   {
     let mut waiting = pin!(wait_for_tcp_connect(&mut attempt, 1));
     let mut context = Context::from_waker(Waker::noop());
@@ -926,7 +976,8 @@ fn cancellation_drops_stale_connect_waiter_before_socket_and_permit() {
   drop(attempt);
   assert_eq!(scope.snapshot().network_ops, 0);
   assert_eq!(handle.waiters(), 0);
-  assert_eq!(handle.registrations(), 0);
+  assert_eq!(handle.registrations(), 1);
+  drop(release_service);
 }
 
 #[test]
