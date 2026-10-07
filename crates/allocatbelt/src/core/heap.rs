@@ -1,7 +1,7 @@
 //! The heap: segment allocation, page runs, small-object bitmaps, per-thread
 //! caches and frees.
 //!
-//! Metadata layout (all `AtomicU64`, one slice of [`META_WORDS`] per segment):
+//! Metadata layout (all `AtomicU64`, one slice of `META_WORDS` per segment):
 //!
 //! ```text
 //! [0] SEG_HDR    kind | shard << 8 | segment count << 16
@@ -54,7 +54,7 @@
 //! The bitmaps and counters of small pages and a segment's page words
 //! (`SEG_PAGES`, `SEG_DIRTY`) change only under the lock of the shard that
 //! owns the segment, and the arena's segment words only under `seg_lock`,
-//! each as a plain load and store (see [`crate::core::proto`]); other
+//! each as a plain load and store (see `crate::core::proto`); other
 //! threads read them only as hints. A free of a page run checks and clears
 //! the run's header under the owner's lock, and a free of a huge block its
 //! segment header under `seg_lock`, so of two frees of one block the second
