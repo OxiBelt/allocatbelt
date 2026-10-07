@@ -1,4 +1,6 @@
-//! A bounded thread-pool job runtime for allocatbelt research: a fixed set
+//! Bounded blocking and owned-future runtime foundations for allocatbelt.
+//! See [`asynchronous`] for owned futures and [`managed`] for storage ledgers.
+//! The blocking pool uses a fixed set
 //! of worker threads runs submitted closures in FIFO order under an
 //! outstanding-job bound and a declared resource capacity, and each worker
 //! prefers its own allocatbelt shard and returns its thread cache before it
@@ -69,6 +71,7 @@
 #![cfg_attr(not(test), deny(clippy::expect_used, clippy::unwrap_used))]
 
 mod admission;
+pub mod asynchronous;
 mod blocking;
 mod cache;
 mod error;

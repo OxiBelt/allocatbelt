@@ -92,8 +92,9 @@ Status: **research prototype**. Not recommended for production.
 
 The optional [runtime foundation](docs/runtime.md) also provides a
 Tokio-independent worker pool with cooperative CPU, memory, disk and network
-admission. It runs blocking jobs, not futures; timers, async I/O and Tokio
-compatibility remain future milestones. Its benchmarks compare against Tokio's
+admission, managed storage ledgers, and a bounded owned-future executor. Async
+I/O and full Tokio capability parity remain future milestones. Its existing
+runtime benchmarks compare against Tokio's
 blocking pool, separately from the allocator comparison.
 
 **Platform contract** ([docs/platform.md](docs/platform.md)): Linux 7.0 or newer, 64-bit little-endian userspace, on x86_64 (**x86-64-v3 or newer**), aarch64 or riscv64 (RV64GC, Zbb optional). Every other target, and any x86_64 build below x86-64-v3, fails at compile time with a message saying why. Inside this repository `.cargo/config.toml` builds x86_64 with `-C target-cpu=x86-64-v3`; a `RUSTFLAGS` variable replaces it and must carry that flag too, and crates depending on allocatbelt (OxiBelt) must set it in their own build ([above](#using-it-from-another-crate)). At start-up the allocator probes the kernel facilities it cannot run without (reservation, commit, `MADV_DONTNEED` zeroing) and aborts with a message if one is missing. x86_64 and aarch64 are tested natively in CI (`ubuntu-26.04` and `ubuntu-26.04-arm` runners); riscv64 is tested in CI under qemu-user, with and without Zbb, and in [offline Linux 7.0 full-system guests](scripts/riscv-guest/README.md) with V disabled and enabled; the `platform-gates` job checks that the supported targets build and the others are rejected. Every supported CPU runs the same scalar code by default: none of the SIMD candidates measured in `bench/simd` qualified ([docs/research/simd-benchmarks.md](docs/research/simd-benchmarks.md)). The experimental SVE/SVE2 and RVV kernels run only when compiled in, exposed to the process and selected by the policy ([docs/features.md](docs/features.md#experimental-isa-kernels)).

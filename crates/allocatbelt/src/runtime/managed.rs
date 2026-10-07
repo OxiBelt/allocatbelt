@@ -47,6 +47,10 @@ use std::fmt;
 use std::ops::Deref;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
+#[cfg(all(test, loom))]
+#[path = "managed_model.rs"]
+mod model;
+
 /// The largest storage a buffer can request: a Rust allocation is at most
 /// `isize::MAX` bytes.
 const MAX_STORAGE: usize = isize::MAX.unsigned_abs();

@@ -3,9 +3,10 @@
 `allocatbelt::runtime` is an optional module of the single published package,
 compiled by the additive `runtime` feature. The unpublished
 `allocatbelt-runtime` crate forwards to the same implementation for development
-and compiles that source directly for Loom. It runs owned blocking jobs on a
-fixed worker pool. It is **not a Tokio
-replacement**, an async executor, or recommended for production. `allocatbelt` remains the only package intended for publication; enabling the
+and compiles that source directly for Loom. It provides bounded blocking and
+owned-future worker pools, plus cooperative managed-storage ledgers. Full Tokio
+capability parity and native performance qualification remain pending. It is
+not recommended for production. `allocatbelt` remains the only package intended for publication; enabling the
 module does not install a global allocator or change allocator-only defaults.
 
 This page specifies the milestone contract. Verification and qualification
@@ -25,6 +26,32 @@ It excludes allocator metadata, the shared buffer header, physical rounding,
 RSS and arbitrary allocations. It supplies neither CPU quotas nor byte-rate
 limits. The existing blocking pool's declared `Resources` reservations remain
 separate from this ledger.
+
+## Owned asynchronous tasks
+
+`runtime::asynchronous::AsyncRuntime` runs owned `Send + 'static` futures on a
+fixed worker pool. An outstanding bound covers queued, polling, sleeping and
+cancellation-cleanup tasks. A separate scope bound includes the implicit root
+scope. Rejection returns the original future. Each scope has FIFO ready order;
+dispatch rotates ready scopes with one poll per turn. A future that never
+returns from `poll` cannot be preempted.
+
+`AsyncJob` is awaitable; dropping it detaches, while `abort` requests cleanup
+after any in-flight poll returns. Owned scopes cancel their children on drop;
+`close` waits for cleanup, result publication and scope-slot reclamation.
+Future cleanup and admission release precede join publication. Scheduler locks
+never cover user polling, destructors or completion callbacks. Generation tags
+make retained stale wakers harmless without retaining completed futures.
+
+The blocking pool's `Job` is also a future, so an asynchronous caller can await
+blocking work without blocking an executor worker. Its existing consuming
+`join` and deadlock checks remain available.
+
+Loom exercises production task transition helpers and managed-ledger methods.
+Some scope models are capped at 10,000 permutations and use a small generation
+table. Full queues, worker parking, actual wakers, ownership and scope pointer
+identity are outside those models; native lifecycle tests cover these paths.
+This foundation supplies no current-thread/local executor or I/O reactor yet.
 
 ## First milestone contract
 
@@ -147,10 +174,10 @@ Admission counters are not resource-usage measurements.
 
 ## Path toward replacing Tokio
 
-These remain separate, unimplemented milestones, not implied APIs:
+The lifecycle foundation above is implemented. Remaining milestones include:
 
-1. A safe future task-state/waker protocol, cancellation and structured scopes,
-   with model checking before optimizing queues.
+1. Runtime entry/context, current-thread and local execution, task utilities,
+   and integration of resource permits into active polling.
 2. Timers and a Linux I/O reactor with bounded submission, completion ownership,
    sandbox fallback and cancellation-safe buffers.
 3. TCP/UDP, file I/O, synchronization and blocking adapters; define compatibility

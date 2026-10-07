@@ -2,12 +2,20 @@
 //! and the slot its outcome is published to.
 
 use std::fmt;
+use std::future::Future;
+use std::panic::{self, AssertUnwindSafe};
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
+use std::task::{Context, Poll, Waker};
 
 use crate::runtime::error::JoinError;
 use crate::runtime::state::StartState;
 use crate::runtime::worker::{self, Ident};
+
+#[cfg(all(test, not(loom)))]
+#[path = "job_future_tests.rs"]
+mod future_tests;
 
 /// Shared by a job's handle, its token and its queued task. Holds no user
 /// data, so dropping it under a lock runs no user code.
@@ -66,7 +74,7 @@ impl fmt::Debug for CancellationToken {
 }
 
 enum Slot<T> {
-  Pending,
+  Pending(Option<Waker>),
   Ready(Result<T, JoinError>),
   Taken,
 }
@@ -81,7 +89,7 @@ pub(crate) struct Packet<T> {
 impl<T> Packet<T> {
   pub(crate) fn new() -> Arc<Self> {
     Arc::new(Self {
-      slot: Mutex::new(Slot::Pending),
+      slot: Mutex::new(Slot::Pending(None)),
       ready: Condvar::new(),
     })
   }
@@ -98,12 +106,17 @@ impl<T> Packet<T> {
     outcome: Result<T, JoinError>,
   ) -> Option<Result<T, JoinError>> {
     let mut slot = self.lock();
-    if !matches!(*slot, Slot::Pending) {
+    if !matches!(*slot, Slot::Pending(_)) {
       return Some(outcome);
     }
-    *slot = Slot::Ready(outcome);
+    let prior = std::mem::replace(&mut *slot, Slot::Ready(outcome));
     drop(slot);
     self.ready.notify_all();
+    if let Slot::Pending(Some(waker)) = prior
+      && let Err(payload) = panic::catch_unwind(AssertUnwindSafe(|| waker.wake()))
+    {
+      crate::runtime::task::drop_contained(payload);
+    }
     None
   }
 }
@@ -112,6 +125,7 @@ impl<T> Packet<T> {
 ///
 /// Dropping a `Job` detaches it: the job still runs (or stays cancelled)
 /// and its result is dropped on the worker; dropping is not cancellation.
+/// The handle can also be awaited without blocking an executor thread.
 pub struct Job<T> {
   control: Arc<Control>,
   packet: Arc<Packet<T>>,
@@ -140,7 +154,7 @@ impl<T> Job<T> {
   /// Whether an outcome is ready, so that [`Job::join`] does not wait.
   #[must_use]
   pub fn is_finished(&self) -> bool {
-    !matches!(*self.packet.lock(), Slot::Pending)
+    !matches!(*self.packet.lock(), Slot::Pending(_))
   }
 
   /// Waits for the job's outcome.
@@ -162,20 +176,45 @@ impl<T> Job<T> {
   /// that is ready returns the outcome from any thread.
   pub fn join(self) -> Result<T, JoinError> {
     let mut slot = self.packet.lock();
-    if matches!(*slot, Slot::Pending) && worker::would_deadlock(&self.control.runtime) {
+    if matches!(*slot, Slot::Pending(_)) && worker::would_deadlock(&self.control.runtime) {
       return Err(JoinError::WouldDeadlock);
     }
-    while matches!(*slot, Slot::Pending) {
+    while matches!(*slot, Slot::Pending(_)) {
       slot = self
         .packet
         .ready
         .wait(slot)
         .unwrap_or_else(PoisonError::into_inner);
     }
-    match std::mem::replace(&mut *slot, Slot::Taken) {
+    let taken = std::mem::replace(&mut *slot, Slot::Taken);
+    drop(slot);
+    match taken {
       Slot::Ready(outcome) => outcome,
       // `join` consumes the only handle, so nothing took it before.
-      Slot::Pending | Slot::Taken => Err(JoinError::Cancelled),
+      Slot::Pending(_) | Slot::Taken => Err(JoinError::Cancelled),
+    }
+  }
+}
+
+impl<T> Future for Job<T> {
+  type Output = Result<T, JoinError>;
+
+  fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+    // Custom waker clone/drop operations may execute user code. Keep them
+    // outside the packet lock, including when an outcome is already ready.
+    let replacement = cx.waker().clone();
+    let mut slot = self.packet.lock();
+    if let Slot::Pending(waker) = &mut *slot {
+      let old = waker.replace(replacement);
+      drop(slot);
+      drop(old);
+      return Poll::Pending;
+    }
+    let taken = std::mem::replace(&mut *slot, Slot::Taken);
+    drop(slot);
+    match taken {
+      Slot::Ready(outcome) => Poll::Ready(outcome),
+      Slot::Pending(_) | Slot::Taken => Poll::Ready(Err(JoinError::Cancelled)),
     }
   }
 }
