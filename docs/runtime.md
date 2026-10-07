@@ -114,6 +114,32 @@ The pinning box and fixed shared metadata are ordinary allocations. Six
 native tests cover pinning, ownership, callbacks and panic cleanup; one
 actual-source Loom model checks poll exclusion and busy-waiter notification.
 
+`runtime::io::pipes::pipe` accepts one nonempty, uniquely owned `ManagedBuf`
+and returns unique reader/writer endpoints. `duplex` accepts two such buffers,
+one per direction, and returns two bidirectional endpoints. Constructor
+rejection returns every original buffer unchanged. Rings never grow or allocate
+additional payload storage; their fixed shared metadata uses ordinary
+allocations. Each buffer remains charged until both endpoints release it.
+
+Reads and writes copy at most two contiguous ring spans under one direction's
+mutex. A full ring waits for reads; an empty ring waits for writes or closure.
+Writer shutdown closes only its outgoing direction: accepted bytes drain before
+EOF, and duplex reverse reads remain usable. Dropping a duplex endpoint also
+closes its incoming reader, discards that direction's queued bytes, and wakes
+blocked peer writers to observe `BrokenPipe`. Empty admitted reads/writes
+return zero and clear only their own retained waiter. Flush is immediately
+ready and provides no durability guarantee.
+
+A dropped borrowing future leaves accepted bytes committed and may retain one
+bounded direction waiter. A later corresponding read or write poll that
+completes, explicit `cancel_io_waits`, or endpoint drop releases it. Waker cloning, callbacks and destruction run
+outside ring locks with panic containment. These endpoints participate in the
+runtime's shared cooperative budget before changing state. Native tests cover
+zero-budget preservation and bounded hot loops; three actual-source Loom
+models cover ring transitions and lost-wake registration, not TLS budgeting.
+The endpoints use scalar I/O and its vectored fallback; they do not expose a
+borrowed buffered ring view across lock release.
+
 ## Managed buffers and operation permits
 
 `runtime::managed::ResourceScope` provides a separate shared ledger for managed
@@ -772,7 +798,8 @@ Runtime-owned outer polls also use a shared 64-operation budget for ready
 `channel` send/receive/reservation/closed-wait, oneshot receive/close,
 semaphore acquisition, mutex acquisition and reader-writer-lock acquisition
 polls, plus `Notify`, watch change/closure, broadcast receive/closure and
-barrier waits. A synchronous primitive-to-primitive chain charges once; a
+barrier waits, and managed-pipe read/write/flush/shutdown polls. A synchronous
+primitive-to-primitive chain charges once; a
 primitive poll that returns `Pending` restores its provisional charge. Once
 exhausted, the next supported primitive arranges a wake and returns `Pending`
 before it dequeues a message, accepts a send, or transfers a permit/lock guard.
@@ -781,8 +808,8 @@ borrowed `block_on` root.
 Manual polls and futures driven by external executors bypass automatic
 accounting. Timers and other arbitrary futures are not automatically
 cooperative; long-running work outside the listed primitives still needs
-explicit checkpoints or its own bounded polling. Direct I/O endpoint polls,
-including `AsyncBufRead`, are also outside this automatic accounting; the
+explicit checkpoints or its own bounded polling. Other direct I/O endpoint
+polls, including `AsyncBufRead`, are outside this automatic accounting; the
 looping I/O helpers and buffered endpoints enforce their own 64-call-per-poll
 limits.
 
@@ -1326,9 +1353,9 @@ baseline still requires these implementation and qualification steps:
 1. Extend automatic cooperative progress beyond the currently listed
    operations. Expand TCP socket-option and listen-builder coverage beyond the
    explicit single-address nonblocking connect and bound-socket operations.
-2. Add standard I/O adapters, general pipe construction, managed in-memory
-   pipes and bidirectional copy with explicit partial-progress and half-close
-   rules. The initialized-buffer `Take`/`Chain`/`Empty`/`Sink`/`Repeat` family,
+2. Add standard I/O adapters, general kernel-pipe construction and bidirectional
+   copy with explicit partial-progress and half-close rules. Managed in-memory
+   simplex and duplex pipes are implemented. The initialized-buffer `Take`/`Chain`/`Empty`/`Sink`/`Repeat` family,
    bounded delimiter/line and whole-stream reads, and fixed managed buffered
    endpoints are implemented; these do not include those remaining operations.
 3. Add bounded recursive traversal.

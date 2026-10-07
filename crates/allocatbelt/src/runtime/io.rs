@@ -1,7 +1,8 @@
 //! Runtime-neutral asynchronous I/O over initialized byte buffers: the
 //! [`AsyncRead`], [`AsyncWrite`] and [`AsyncSeek`] traits, the futures their
 //! extension traits return, a bounded [`copy_with_buffer`] and endpoints over
-//! borrowed slices. Like the rest of the runtime this is an experimental
+//! borrowed slices. The [`pipes`] module also provides bounded endpoints over
+//! caller-owned managed buffers. Like the rest of the runtime this is an experimental
 //! research foundation. It provides the capabilities the runtime's tasks
 //! need, not Tokio's API, and it implements no files, sockets or other
 //! operating-system endpoints.
@@ -143,6 +144,10 @@ use std::io::{self, ErrorKind, IoSlice, IoSliceMut, SeekFrom};
 use std::ops::Range;
 use std::pin::Pin;
 use std::task::{Context, Poll};
+
+#[path = "io_pipes.rs"]
+mod io_pipes;
+pub use io_pipes::pipes;
 
 #[path = "io_adapters.rs"]
 mod adapters;
