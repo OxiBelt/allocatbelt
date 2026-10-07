@@ -3251,11 +3251,19 @@ fn pending_masks_follow_evictions_across_classes() {
 fn a_refill_flushes_only_its_class_and_flush_the_rest() {
   let h = heap();
   let tc = cache(h);
-  let c = crate::core::class::class_of(16);
+  // Miri exhausts the same page topology using two bitmap words rather
+  // than interpreting a 4096-allocation small-class page. Native stress
+  // retains the 16-byte class and its full allocation count.
+  let size = if cfg!(miri) { 512 } else { 16 };
+  let c = crate::core::class::class_of(size);
+  assert_eq!(crate::core::class::size(c), size);
+  assert_ne!(c, crate::core::class::class_of(48));
   let y = alloc_c(h, &tc, 48, 8);
-  // One whole page of the 16-byte class, all handed out.
+  // One whole page of the selected class, all handed out.
   let n = crate::core::class::capacity(c);
-  let offs: Vec<_> = (0..n).map(|_| alloc_c(h, &tc, 16, 8)).collect();
+  assert_eq!(n, if cfg!(miri) { 128 } else { 4096 });
+  assert!(n / u64::BITS as usize >= 2);
+  let offs: Vec<_> = (0..n).map(|_| alloc_c(h, &tc, size, 8)).collect();
   assert_eq!(
     offs
       .iter()
@@ -3270,7 +3278,7 @@ fn a_refill_flushes_only_its_class_and_flush_the_rest() {
   // The class has no free block but the buffered one: the refill returns
   // the class's buffered frees (not the other class's) and takes x again,
   // instead of a new page.
-  let again = alloc_c(h, &tc, 16, 8);
+  let again = alloc_c(h, &tc, size, 8);
   assert_eq!(again, x);
   let s = h.cache_stats(&tc);
   assert_eq!((s.refill_flushes, s.flushes), (1, 1));

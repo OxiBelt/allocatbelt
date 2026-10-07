@@ -65,6 +65,9 @@ Large pressure and page-topology fixtures preserve native stress counts and
 use bounded, topology-equivalent sizes under Miri; separate tests cover small
 classes across bitmap-word boundaries. Size round trips still visit every
 representative size under Miri, with three simultaneous allocations per size.
+The class-selective refill test exhausts a 128-block, two-word page under Miri
+and retains its full 4096-block page in native tests. Both configurations verify
+the exact buffered-block reuse, other-class isolation and final reclamation.
 The Miri model workload uses at most 96 semantic instructions and a bounded
 cumulative allocation-page allowance, checked by an independent decoder. Its
 deterministic prefix covers route changes, cross-cache frees, resize, maintenance and failed
