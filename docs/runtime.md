@@ -70,6 +70,34 @@ retain standard-library semantics; this API supplies no path sandbox, descriptor
 quota, IOPS, bandwidth or disk-space enforcement. It does not collect whole
 files or directories implicitly. Borrowed I/O-trait adapters remain pending.
 
+## Bounded epoll readiness
+
+`runtime::reactor::Reactor` owns a Linux epoll service thread and explicit
+registration/waiter bounds. `ReactorHandle::register` returns `AsyncFd<T>` or
+the original value on rejection. It watches an owned duplicate with checked
+generation tokens, sets nonblocking mode while preserving other flags, and
+releases the duplicate before reclaiming registration capacity. Nonblocking
+mode affects every descriptor sharing that open-file description. The caller's
+`AsFd` must keep identifying the same underlying descriptor while registered.
+
+Read and write waits use separate FIFO queues. Level-triggered one-shot
+interest arms only directions with waiters and no cached readiness. Readiness
+is a hint: `ReadinessGuard::try_io` calls the operation exactly once and clears
+its cached direction on `WouldBlock`. Hang-up and error notify both directions;
+rearm failures complete waiting futures. Cancelled and forgotten waits are
+reclaimed when their registrations are released; generation tags reject stale
+events after reuse. Idle writable descriptors do not cause continuous polling.
+
+External close waits for claimed callback drains before returning; callbacks
+closing their own reactor and the service thread avoid waiting for themselves.
+External shutdown also joins the service; self-joining returns `WouldDeadlock`.
+Callbacks run outside driver and callback-tracking locks, including during
+thread-local teardown. Registration and waiter tables are preallocated; close
+scratch and per-thread callback ownership tracking allocate separately and are
+not managed-storage charges or a total memory budget. Socket wrappers and their
+I/O-trait integration require separate APIs. Reactor protocol behavior is
+covered by native tests, not by the current Loom helper models.
+
 ## Owned asynchronous tasks
 
 `runtime::asynchronous::AsyncRuntime` runs owned `Send + 'static` futures on a
