@@ -267,9 +267,7 @@ mod loom_tests {
             state.finish_cancel();
           }
         } else if let Some(aborting) = state.begin_poll() {
-          if aborting {
-            state.finish_cancel();
-          } else if state.finish_poll(false, false) == PollFinish::CancelCleanup {
+          if aborting || state.finish_poll(false, false) == PollFinish::CancelCleanup {
             state.finish_cancel();
           }
         } else {
@@ -425,9 +423,9 @@ mod loom_tests {
     bounded_model(|| {
       let mut state = admitted();
       assert_eq!(state.begin_poll(), Some(false));
-      assert_eq!(state.abort(), false);
-      assert_eq!(state.wake(), false);
-      assert_eq!(state.wake(), false);
+      assert!(!state.abort());
+      assert!(!state.wake());
+      assert!(!state.wake());
       assert_eq!(state.finish_poll(false, false), PollFinish::CancelCleanup);
       assert!(!state.queue());
       assert!(!state.wake());
