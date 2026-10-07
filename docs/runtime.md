@@ -106,7 +106,39 @@ also use disk permits. Returned raw `std::fs::DirEntry` methods can perform
 blocking I/O directly if callers bypass these wrappers. Paths and open options
 retain standard-library semantics; this API supplies no path sandbox, descriptor
 quota, IOPS, bandwidth or disk-space enforcement. It does not collect whole
-files or directories implicitly. Borrowed I/O-trait adapters remain pending.
+files or directories implicitly.
+
+`runtime::fs_io::AsyncFile` implements initialized-buffer read/write/seek
+traits over one `OwnedFile`, an explicit `FsHandle` and two caller-sized,
+nonempty, uniquely owned managed staging buffers. Constructor rejection
+returns every original input. It targets ordinary seekable files: the owned
+read operation fills staging until full, EOF or error, so device/FIFO partial
+availability does not imply completion. Use readiness-backed pipes for those
+streams. Writes are accepted into fixed staging and submitted by flush,
+buffer pressure, seek, read-after-write or shutdown.
+
+The adapter retains admitted jobs and progress when a borrowing future is
+dropped. Reading after accepted writes first completes those writes.
+Write-after-read and relative seeks compensate for unread read-ahead to
+preserve the logical cursor. Successful seeks discard old staging; failed
+seeks retain it for retry. Partial write errors preserve only the unsent
+suffix, so subsequent flush/shutdown does not replay committed bytes.
+Pre-admission pool or disk-budget rejection restores the file/buffer and
+returns `WouldBlock` with the typed submission cause; retry after capacity
+becomes available.
+
+Starting shutdown permanently rejects other operations. Retrying shutdown
+drains accepted bytes and performs the underlying flush before closing;
+admission or write errors retain retryable state. Once closed, later polls
+return `BrokenPipe`. Dropping the adapter does not flush unsubmitted staging.
+An already admitted operation retains its owned file, buffer and permit until
+actual completion or queued cancellation cleanup. Runtime-wide
+`CancelPending` can discard those queued inputs; the adapter then reports a
+terminal service error and cannot recover them. Managed charges follow the
+final buffer owner, including detached jobs. Job metadata and error values
+are outside byte accounting. Eleven native tests cover cursor ordering,
+partial/error retry, future cancellation, queued service cancellation,
+shutdown and panicking waker destruction.
 
 ## Bounded epoll readiness
 

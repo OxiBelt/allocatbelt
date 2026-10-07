@@ -81,6 +81,8 @@ pub mod channel;
 pub mod concurrency;
 mod error;
 pub mod fs;
+#[cfg(not(loom))]
+pub mod fs_io;
 pub mod io;
 mod job;
 pub mod managed;
