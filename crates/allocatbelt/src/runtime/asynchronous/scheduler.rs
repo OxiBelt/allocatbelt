@@ -589,9 +589,19 @@ fn take_next(shared: &Arc<Shared>, worker_index: usize) -> Work {
 pub(super) fn worker(shared: Arc<Shared>, index: usize) {
   WORKER_RUNTIME.set(shared.id);
   cache::set_shard(index);
+  let _worker_context = super::entry::WorkerContextGuard::enter();
+  let worker_handle = super::AsyncHandle {
+    shared: Arc::clone(&shared),
+    scope: ScopeRef {
+      index: 0,
+      generation: 1,
+    },
+  };
+  let _runtime_context = super::entry::EnterGuard::enter(&worker_handle);
   loop {
     match take_next(&shared, index) {
       Work::Poll(task_ref, task) => {
+        super::entry::reset_budget();
         let waker = task_waker(&shared, task_ref);
         let mut context = Context::from_waker(&waker);
         let result = task.poll(&mut context);

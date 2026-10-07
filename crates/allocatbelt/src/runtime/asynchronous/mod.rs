@@ -1,9 +1,14 @@
-//! A bounded, owned-future executor. This is an experimental foundation:
-//! it does not provide timers, I/O, borrowed tasks, or Tokio compatibility.
+//! A bounded, owned-future executor. This is an experimental foundation;
+//! it does not provide I/O, borrowed spawned tasks, or Tokio compatibility.
+//! [`AsyncRuntime::block_on`] may poll one borrowed or non-`Send` root future
+//! on its caller thread. Spawned work remains owned and `Send + 'static`.
+//! [`yield_now`] schedules one self-wake; [`consume_budget`] is an opt-in
+//! checkpoint and cannot preempt code that does not await it.
 
 #![forbid(unsafe_code)]
 #![cfg_attr(not(test), deny(clippy::expect_used, clippy::unwrap_used))]
 
+mod entry;
 mod join;
 mod protocol;
 mod scheduler;
@@ -18,6 +23,9 @@ use std::thread::{self, JoinHandle};
 
 use scheduler::{ScopeRef, Shared};
 
+pub use entry::{
+  ConsumeBudget, EnterGuard, YieldNow, consume_budget, current, try_current, yield_now,
+};
 pub use join::{AsyncJob, AsyncJoinError};
 pub use scheduler::{OwnedTaskScope, ScopeClose};
 
@@ -33,7 +41,7 @@ pub struct AsyncConfig {
   pub max_scopes: usize,
 }
 
-/// Construction, admission, or shutdown failure.
+/// Construction, admission, block-on entry, or shutdown failure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum AsyncError {
@@ -49,6 +57,10 @@ pub enum AsyncError {
   TooManyScopes,
   /// Joining workers from one of those workers would deadlock.
   WouldDeadlock,
+  /// `block_on` was called from an executor worker.
+  BlockOnFromWorker,
+  /// A nested `block_on` was attempted on the same thread.
+  NestedBlockOn,
   /// A worker exited unexpectedly.
   WorkerPanicked,
 }
@@ -62,6 +74,8 @@ impl fmt::Display for AsyncError {
       Self::Closed => "async runtime or task scope is closed",
       Self::TooManyScopes => "async scope bound reached",
       Self::WouldDeadlock => "async shutdown from a worker would deadlock",
+      Self::BlockOnFromWorker => "block_on from an async executor worker is not allowed",
+      Self::NestedBlockOn => "nested block_on on one thread is not allowed",
       Self::WorkerPanicked => "an async worker exited unexpectedly",
     })
   }
@@ -163,6 +177,14 @@ impl AsyncRuntime {
     }
   }
 
+  /// Polls a caller-owned future on this thread until it completes. The root
+  /// future need not be `Send` or `'static`; spawned tasks remain owned and
+  /// `Send + 'static`. Calling this from an executor worker or from another
+  /// `block_on` on the same thread returns an error.
+  pub fn block_on<F: std::future::Future>(&self, future: F) -> Result<F::Output, AsyncError> {
+    self.handle().block_on(future)
+  }
+
   /// Creates an independently cancellable owned scope.
   pub fn scope(&self) -> Result<OwnedTaskScope, AsyncError> {
     self.shared.new_scope()
@@ -203,6 +225,32 @@ pub struct AsyncHandle {
 }
 
 impl AsyncHandle {
+  /// Polls a caller-owned future on this thread until it completes. See
+  /// [`AsyncRuntime::block_on`] for the root-future and reentrancy contract.
+  pub fn block_on<F: std::future::Future>(&self, future: F) -> Result<F::Output, AsyncError> {
+    entry::block_on(self, future)
+  }
+
+  /// Enters this handle as the current runtime context on the calling thread.
+  /// The current context is the most recently entered live guard. Dropping
+  /// guards out of order removes only the dropped context.
+  #[must_use]
+  pub fn enter(&self) -> EnterGuard {
+    EnterGuard::enter(self)
+  }
+
+  /// Returns the current entered handle, panicking when no context is active.
+  #[must_use]
+  pub fn current() -> Self {
+    current()
+  }
+
+  /// Returns the current entered handle, if any.
+  #[must_use]
+  pub fn try_current() -> Option<Self> {
+    try_current()
+  }
+
   /// Admits an owned future, returning that unchanged future in the error
   /// when the runtime is closed or its outstanding-task bound is full.
   pub fn spawn<F>(&self, future: F) -> Result<AsyncJob<F::Output>, AsyncSpawnError<F>>

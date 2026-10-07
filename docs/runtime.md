@@ -36,6 +36,23 @@ scope. Rejection returns the original future. Each scope has FIFO ready order;
 dispatch rotates ready scopes with one poll per turn. A future that never
 returns from `poll` cannot be preempted.
 
+`AsyncRuntime::block_on` and `AsyncHandle::block_on` poll one root future on
+the caller's thread; that future may borrow local data and need not be `Send`.
+Spawned futures remain owned, `Send + 'static` tasks. The caller parks between
+pending polls, so workers can progress and wake it. Nested `block_on` calls on
+one thread and calls from executor workers return explicit errors. `enter`
+sets a thread-local current handle. The current value is the most recently
+entered still-live guard; dropping guards out of order removes only the
+dropped context. A guard returned from `block_on` remains current until that
+guard is dropped. Worker polls also enter the runtime's implicit root handle.
+`current` panics without an entered context, while `try_current` returns
+`None`.
+
+`yield_now` schedules one self-wake and completes on the next poll; it does not
+guarantee another task runs first. `consume_budget` is an opt-in checkpoint
+that yields after 64 completed checkpoints within one poll. It cannot preempt
+code that does not await it, and it does not impose a fairness or latency bound.
+
 `AsyncJob` is awaitable; dropping it detaches, while `abort` requests cleanup
 after any in-flight poll returns. Owned scopes cancel their children on drop;
 `close` waits for cleanup, result publication and scope-slot reclamation.

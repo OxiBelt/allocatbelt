@@ -812,3 +812,181 @@ fn concurrent_last_scope_children_release_scope_capacity() {
     .shutdown(AsyncShutdown::Drain)
     .unwrap_or_else(|e| panic!("shutdown failed: {e}"));
 }
+
+#[test]
+fn block_on_accepts_borrowed_non_send_root_future() {
+  use super::AsyncHandle;
+
+  let runtime = runtime(1, 4, 2);
+  let local = std::cell::Cell::new(0);
+  let result = runtime
+    .block_on(async {
+      local.set(41);
+      (local.get() + 1, AsyncHandle::try_current().is_some())
+    })
+    .unwrap_or_else(|error| panic!("block_on failed: {error}"));
+  assert_eq!(result, (42, true));
+  assert!(AsyncHandle::try_current().is_none());
+  runtime
+    .shutdown(AsyncShutdown::Drain)
+    .unwrap_or_else(|error| panic!("shutdown failed: {error}"));
+}
+
+#[test]
+fn block_on_parks_while_workers_progress_and_wake_it() {
+  let runtime = runtime(2, 4, 2);
+  let job = runtime
+    .handle()
+    .spawn(async {
+      std::thread::sleep(Duration::from_millis(10));
+      42
+    })
+    .unwrap_or_else(|error| panic!("spawn failed: {error}"));
+  let joined = runtime
+    .block_on(job)
+    .unwrap_or_else(|error| panic!("block_on failed: {error}"));
+  assert!(matches!(joined, Ok(42)));
+  runtime
+    .shutdown(AsyncShutdown::Drain)
+    .unwrap_or_else(|error| panic!("shutdown failed: {error}"));
+}
+
+#[test]
+fn nested_block_on_returns_error_and_entered_context_restores_after_unwind() {
+  use super::AsyncHandle;
+
+  let first = runtime(1, 4, 2);
+  let second = runtime(1, 4, 2);
+  let first_handle = first.handle();
+  let second_handle = second.handle();
+  assert!(AsyncHandle::try_current().is_none());
+  {
+    let _outer = first_handle.enter();
+    assert!(Arc::ptr_eq(
+      &AsyncHandle::current().shared,
+      &first_handle.shared
+    ));
+    let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+      let _inner = second_handle.enter();
+      assert!(Arc::ptr_eq(
+        &AsyncHandle::current().shared,
+        &second_handle.shared
+      ));
+      panic!("exercise context guard unwind");
+    }));
+    assert!(panic.is_err());
+    assert!(Arc::ptr_eq(
+      &AsyncHandle::current().shared,
+      &first_handle.shared
+    ));
+  }
+  assert!(AsyncHandle::try_current().is_none());
+
+  let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    let _ = first.block_on(async { panic!("exercise block_on unwind guards") });
+  }));
+  assert!(panic.is_err());
+  assert!(AsyncHandle::try_current().is_none());
+  assert!(matches!(first.block_on(async { 3 }), Ok(3)));
+
+  let nested = first
+    .block_on(async { second_handle.block_on(async { 7 }) })
+    .unwrap_or_else(|error| panic!("outer block_on failed: {error}"));
+  assert!(matches!(nested, Err(super::AsyncError::NestedBlockOn)));
+  first
+    .shutdown(AsyncShutdown::Drain)
+    .unwrap_or_else(|error| panic!("shutdown failed: {error}"));
+  second
+    .shutdown(AsyncShutdown::Drain)
+    .unwrap_or_else(|error| panic!("shutdown failed: {error}"));
+}
+
+#[test]
+fn entered_context_guards_restore_when_dropped_out_of_order() {
+  use super::AsyncHandle;
+
+  let first_runtime = runtime(1, 4, 2);
+  let second_runtime = runtime(1, 4, 2);
+  let first = first_runtime.handle();
+  let second = second_runtime.handle();
+  let first_guard = first.enter();
+  let second_guard = second.enter();
+  drop(first_guard);
+  assert!(Arc::ptr_eq(&AsyncHandle::current().shared, &second.shared));
+  drop(second_guard);
+  assert!(AsyncHandle::try_current().is_none());
+  first_runtime
+    .shutdown(AsyncShutdown::Drain)
+    .unwrap_or_else(|error| panic!("shutdown failed: {error}"));
+  second_runtime
+    .shutdown(AsyncShutdown::Drain)
+    .unwrap_or_else(|error| panic!("shutdown failed: {error}"));
+}
+
+#[test]
+fn block_on_can_return_an_enter_guard_without_resurrecting_the_root_context() {
+  use super::AsyncHandle;
+
+  let runtime = runtime(1, 2, 1);
+  let handle = runtime.handle();
+  let guard = runtime
+    .block_on(async move { handle.enter() })
+    .unwrap_or_else(|error| panic!("block_on failed: {error}"));
+  assert!(Arc::ptr_eq(
+    &AsyncHandle::current().shared,
+    &runtime.handle().shared
+  ));
+  drop(guard);
+  assert!(AsyncHandle::try_current().is_none());
+  runtime
+    .shutdown(AsyncShutdown::Drain)
+    .unwrap_or_else(|error| panic!("shutdown failed: {error}"));
+}
+
+#[test]
+fn worker_context_is_entered_and_block_on_is_rejected_there() {
+  use super::AsyncHandle;
+
+  let primary_runtime = runtime(1, 4, 2);
+  let other_runtime = runtime(1, 4, 2);
+  let handle = primary_runtime.handle();
+  let other_handle = other_runtime.handle();
+  let worker_handle = handle.clone();
+  let block_on_handle = other_handle.clone();
+  let job = handle
+    .spawn(async move {
+      (
+        AsyncHandle::try_current()
+          .is_some_and(|current| Arc::ptr_eq(&current.shared, &worker_handle.shared)),
+        block_on_handle.block_on(async { 9 }),
+      )
+    })
+    .unwrap_or_else(|error| panic!("spawn failed: {error}"));
+  let result = block_on(job).unwrap_or_else(|error| panic!("join failed: {error}"));
+  assert!(result.0);
+  assert!(matches!(
+    result.1,
+    Err(super::AsyncError::BlockOnFromWorker)
+  ));
+  primary_runtime
+    .shutdown(AsyncShutdown::Drain)
+    .unwrap_or_else(|error| panic!("shutdown failed: {error}"));
+  other_runtime
+    .shutdown(AsyncShutdown::Drain)
+    .unwrap_or_else(|error| panic!("shutdown failed: {error}"));
+}
+
+#[test]
+fn a_handle_retained_after_shutdown_rejects_spawn_and_returns_future() {
+  let runtime = runtime(1, 2, 1);
+  let handle = runtime.handle();
+  runtime
+    .shutdown(AsyncShutdown::Drain)
+    .unwrap_or_else(|error| panic!("shutdown failed: {error}"));
+  let error = handle
+    .spawn(async { 19 })
+    .err()
+    .unwrap_or_else(|| panic!("closed handle unexpectedly admitted a task"));
+  assert!(matches!(error.kind, super::AsyncError::Closed));
+  assert_eq!(block_on(error.into_future()), 19);
+}
