@@ -528,6 +528,17 @@ struct Executors {
   bytes: usize,
 }
 
+impl Drop for Executors {
+  fn drop(&mut self) {
+    // An observer error can drop the producer's finished return packet on
+    // this thread. Preserve the bounded error path instead of letting
+    // Tokio's ordinary runtime destructor wait for blocking jobs.
+    if let Some(runtime) = self.tokio.take() {
+      runtime.shutdown_background();
+    }
+  }
+}
+
 impl Executors {
   fn new(
     kind: ExecutorKind,
@@ -752,8 +763,10 @@ fn run_blocking(allocator: &str, o: &Options, overhead: u64) -> Result<(), Strin
       lateness_sum,
       lateness_max,
     });
-    let mut executors = executors;
-    let _ = executors.shutdown();
+    // The thread's return packet owns both executors until the observer has
+    // consumed every public join. Shutting Tokio down here would cancel
+    // accepted jobs that are still queued behind the final submission.
+    executors
   });
   if let Err(error) = ready_rx.recv_timeout(COMPLETION_TIMEOUT) {
     start_gate.open(Instant::now());
@@ -822,9 +835,10 @@ fn run_blocking(allocator: &str, o: &Options, overhead: u64) -> Result<(), Strin
   let (attempted, dropped, lateness_sum, lateness_max) =
     submission_stats.ok_or("submission statistics missing")?;
   let elapsed = base.elapsed().as_nanos().min(u64::MAX as u128) as u64;
-  producer
+  let mut executors = producer
     .join()
     .map_err(|_| "submission producer panicked")?;
+  executors.shutdown()?;
   if attempted != o.count {
     return Err(format!(
       "producer attempted {attempted} of {} jobs",
@@ -1076,5 +1090,53 @@ mod tests {
     assert!(samples[0] >= 1_000_000_000);
     assert!(slots[0].is_none());
     executors.shutdown().unwrap();
+  }
+
+  #[test]
+  fn accepted_tokio_jobs_finish_before_executor_shutdown() {
+    // Offer a burst to one worker so the last accepted jobs remain queued
+    // when submission ends. The observer must retain the runtime owner until
+    // their public joins resolve, rather than cancelling that backlog.
+    let options = Options {
+      lane: Lane::Blocking,
+      workload: Workload::Local,
+      mode: Mode::Latency,
+      executor: Some(ExecutorKind::Tokio),
+      count: 128,
+      workers: 1,
+      arrival_rate: 1_000_000_000,
+      bytes: 1_048_576,
+    };
+    run_blocking("test", &options, 0).unwrap();
+  }
+
+  #[test]
+  fn error_cleanup_does_not_wait_for_a_running_tokio_job() {
+    let executors = Executors::new(ExecutorKind::Tokio, 1, 1, 1, Duration::from_secs(60)).unwrap();
+    let (started_tx, started_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let handle = executors
+      .submit(
+        ExecutorKind::Tokio,
+        Box::new(move || {
+          started_tx.send(()).unwrap();
+          release_rx.recv().unwrap();
+          0
+        }),
+      )
+      .unwrap();
+    started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    let (dropped_tx, dropped_rx) = mpsc::channel();
+    let cleanup = std::thread::spawn(move || {
+      drop(executors);
+      dropped_tx.send(()).unwrap();
+    });
+    let completed_without_release = dropped_rx.recv_timeout(Duration::from_secs(2));
+    // Rescue a blocking destructor before asserting, so a regression fails
+    // finitely instead of stranding the test worker and its captured channel.
+    release_tx.send(()).unwrap();
+    cleanup.join().unwrap();
+    assert!(completed_without_release.is_ok());
+    drop(handle);
   }
 }
