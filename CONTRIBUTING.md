@@ -88,6 +88,15 @@ sweep. Each of four actual decay sweeps acknowledges exactly one live batch
 before that worker continues. This bounds the number of concurrent sweeps,
 not a sweep’s own duration. Both configurations retain class rotation, their
 flush schedule, cache retirement and final candidate/index/live-block checks.
+The three-segment small-page fixture keeps its 774,144 uncached 16-byte
+allocations and frees in native tests. Under Miri it retains 1,512 distinct
+8,192-byte allocations across 189 small pages and three segments, but uses an
+attached cache on preferred shard 6; it frees all but the final allocation
+through that cache and retires the cache before the same two forced purges.
+The cached construction batches bitmap updates without reducing the retained
+page or segment topology. This fixture adjustment changes the Miri allocation
+path only; it does not qualify a complete Miri campaign or predict that the
+case will meet its timeout.
 The lost-candidate reconciliation fixture keeps its 65 allocations, frees,
 reconciliation epoch and force-purge assertions in both builds. Native tests
 retain the helper's full segment scan; under Miri, the test proves that those

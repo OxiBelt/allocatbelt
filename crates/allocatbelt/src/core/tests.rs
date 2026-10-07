@@ -614,11 +614,59 @@ fn freed_small_pages_leave_their_segments() {
   // modeled allocations while preserving every page and trim transition.
   let size = if cfg!(miri) { 8192 } else { 16 };
   let n = 3 * MAX_RUN_PAGES * PAGE_SIZE / size;
+  #[cfg(miri)]
+  let offs: Vec<_> = {
+    let tc = cache(h);
+    h.set_preferred_shard(&tc, 6);
+    let offsets: Vec<_> = (0..n)
+      .map(|_| h.alloc_cached(&tc, size, 8).unwrap().offset)
+      .collect();
+
+    // Keep the same complete topology as the uncached native fixture:
+    // 1512 live offsets fill 189 pages (63 per segment, 8 blocks per page).
+    let distinct: BTreeSet<_> = offsets.iter().copied().collect();
+    assert_eq!(distinct.len(), n);
+    let mut blocks_per_page = BTreeMap::<usize, usize>::new();
+    let mut pages_per_segment = BTreeMap::<usize, BTreeSet<usize>>::new();
+    for &offset in &offsets {
+      let page = offset / PAGE_SIZE;
+      let segment = offset / SEGMENT_SIZE;
+      *blocks_per_page.entry(page).or_default() += 1;
+      pages_per_segment.entry(segment).or_default().insert(page);
+    }
+    assert_eq!(blocks_per_page.len(), 189);
+    assert!(blocks_per_page.values().all(|&blocks| blocks == 8));
+    assert_eq!(pages_per_segment.len(), 3);
+    assert!(
+      pages_per_segment
+        .values()
+        .all(|pages| pages.len() == MAX_RUN_PAGES)
+    );
+    assert_eq!(h.segments_in_use(), base + 3);
+    assert_eq!(h.usage().small_pages, 189);
+
+    let last = offsets[n - 1];
+    for &offset in &offsets[..n - 1] {
+      h.dealloc_cached(&tc, offset);
+    }
+    // Retirement drains buffered frees and any remaining claimed blocks
+    // before the same two forced purge passes used in the native fixture.
+    h.retire(&tc);
+    let stats = h.cache_stats(&tc);
+    assert!(!stats.attached);
+    assert_eq!(stats.claimed_blocks, 0);
+    assert_eq!(stats.buffered_blocks, 0);
+    assert_eq!(stats.buffered_words, 0);
+    assert_eq!(h.usable_size(last), size);
+    offsets
+  };
+  #[cfg(not(miri))]
   let offs: Vec<_> = (0..n).map(|_| h.alloc(6, size, 8).unwrap()).collect();
   assert_eq!(h.segments_in_use(), base + 3);
   // Keep the last block so its page stays behind. It is on the class's
   // newest page, which trimming keeps anyway.
   let last = offs[n - 1];
+  #[cfg(not(miri))]
   for &o in &offs[..n - 1] {
     h.dealloc(o);
   }
