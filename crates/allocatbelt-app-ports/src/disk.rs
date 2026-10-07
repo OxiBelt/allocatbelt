@@ -20,6 +20,9 @@ use crate::{PortResult, join_message, message};
 pub const MAX_DISK_BYTES: usize = 1 << 20;
 /// Maximum sparse offset for the functional example.
 pub const MAX_DISK_OFFSET: u64 = 1 << 20;
+/// Maximum byte span used by one positional filesystem chunk in the
+/// development executor adapter.
+pub const IO_CHUNK_BYTES: usize = 64 * 1024;
 const MAX_TEMP_DIR_TRIES: usize = 32;
 
 /// Owned inputs returned unchanged if opening a prepared file is rejected

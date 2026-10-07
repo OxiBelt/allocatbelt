@@ -12,9 +12,17 @@ publish = false
 
 [dependencies]
 allocatbelt = { path = "../../crates/allocatbelt", features = ["io-uring", "runtime"] }
+allocatbelt-app-ports = { path = "../../crates/allocatbelt-app-ports" }
 mimalloc = { version = "=0.1.52", default-features = false }
-tokio = { version = "=1.53.1", default-features = false, features = ["rt", "rt-multi-thread"] }
+tokio = { version = "=1.53.1", default-features = false, features = ["rt", "rt-multi-thread", "sync", "net", "io-util", "time"] }
 
 [[bin]]
 name = "bench-latency-standard"
 path = "src/main.rs"
+
+[[bin]]
+name = "bench-application-standard-mimalloc"
+path = "src/application.rs"
+
+[lints.rust]
+unsafe_code = "deny"

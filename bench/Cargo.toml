@@ -11,6 +11,7 @@ publish.workspace = true
 allocatbelt = { workspace = true, features = ["io-uring", "runtime"] }
 allocatbelt-profile.workspace = true
 allocatbelt-runtime.workspace = true
+allocatbelt-app-ports.workspace = true
 mimalloc.workspace = true
 tokio.workspace = true
 

@@ -107,6 +107,12 @@ scope. Each example explicitly closes its task scope and shuts down its drivers.
 These functional checks establish neither general HTTP capability nor
 application performance qualification.
 
+The development [application comparator](application-comparator.md) runs these
+shared kernels through either executor with the same allocator, bounded window
+and resource ceilings. Its independent arrivals, completion observations and
+phase reports prepare native qualification; passing functional tests establish
+no performance advantage.
+
 The [runtime contract](../runtime.md) documents accepted implementation. The
 [foundation report](runtime-foundation.md) contains earlier measurements, whose
 limitations remain in force. This roadmap records acceptance requirements,
