@@ -125,6 +125,21 @@ preserve the cursor. Linux append-open files still append during `write_at`,
 regardless of its supplied offset. `flush` is not a durability operation;
 `sync_data` and `sync_all` forward the filesystem's synchronization calls.
 
+`OwnedFile::from_std` and `into_std` transfer ownership without I/O or a
+disk-operation reservation. Existing descriptor aliases remain the caller's
+responsibility; direct standard-file operations bypass the pool and ledger.
+Open-file metadata, length and permission jobs return the same file on I/O
+error. Metadata remains available after unlink; truncation preserves the
+sequential cursor even beyond the new EOF. Once a one-call mutation starts,
+its side effects cannot be cancelled or rolled back.
+
+Path jobs include canonicalization, existence checks that preserve errors,
+hard and symbolic links, permission changes and empty-directory removal.
+They retain standard filesystem semantics, including relative symlink
+targets and path races. Canonicalization and existence are snapshots, not
+security checks for later operations. Recursive traversal and file-copy
+ports remain separate implementation work.
+
 Directory iteration yields one entry per job. Entry metadata and type wrappers
 also use disk permits. Returned raw `std::fs::DirEntry` methods can perform
 blocking I/O directly if callers bypass these wrappers. Paths and open options
@@ -1222,8 +1237,7 @@ baseline still requires these implementation and qualification steps:
 2. Add standard I/O adapters and general pipe construction, bounded delimiter,
    line and whole-stream reads, stream composition, managed in-memory pipes
    and bidirectional copy with explicit partial-progress and half-close rules.
-3. Add supplied-file conversion/recovery, open-file metadata and mutations,
-   missing path operations and bounded recursive traversal. Add channel capacity
+3. Add file-copy operations and bounded recursive traversal. Add channel capacity
    reservation before message construction and sender closure notification.
 4. Exercise realistic application ports covering cancellation, bounded
    rejection recovery, resource/dependency quotas, retained managed storage,

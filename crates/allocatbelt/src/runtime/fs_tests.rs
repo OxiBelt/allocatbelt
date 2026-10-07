@@ -2,7 +2,9 @@ use super::{DirectoryEntryOutcome, FsHandle, FsSubmissionErrorKind, OwnedFile};
 use crate::runtime::managed::{ResourceLimits, ResourceScope};
 use crate::runtime::{Config, JoinError, Resources, Runtime, ShutdownMode, SubmitErrorKind};
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, SeekFrom};
+use std::io::{Read, Seek, SeekFrom};
+use std::os::fd::AsRawFd;
+use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -12,6 +14,181 @@ use std::time::{Duration, Instant};
 
 const WATCHDOG: Duration = Duration::from_secs(8);
 static NEXT_PATH: AtomicU64 = AtomicU64::new(1);
+
+#[test]
+fn supplied_file_survives_unlink_mutations_and_recovery_without_cursor_reset() {
+  let scratch = Scratch::new();
+  let path = scratch.child("owned");
+  fs::write(&path, b"abcdefgh").unwrap();
+  let mut standard = open_options(true, true, false).open(&path).unwrap();
+  standard.seek(SeekFrom::Start(5)).unwrap();
+  let descriptor = standard.as_raw_fd();
+  let mut runtime = runtime(1, 2);
+  let scope = scope(0, 1);
+  let handle = FsHandle::new(runtime.handle(), scope.clone());
+  let file = OwnedFile::from_std(standard);
+  fs::remove_file(&path).unwrap();
+  let (file, metadata) = handle.file_metadata(file).unwrap().join().unwrap();
+  assert_eq!(metadata.unwrap().len(), 8);
+  let (file, truncated) = handle.set_len(file, 3).unwrap().join().unwrap();
+  truncated.unwrap();
+  let (file, changed) = handle
+    .file_set_permissions(file, fs::Permissions::from_mode(0o600))
+    .unwrap()
+    .join()
+    .unwrap();
+  changed.unwrap();
+  let mut recovered = file.into_std();
+  assert_eq!(recovered.as_raw_fd(), descriptor);
+  assert_eq!(recovered.stream_position().unwrap(), 5);
+  let metadata = recovered.metadata().unwrap();
+  assert_eq!(metadata.len(), 3);
+  assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+  assert_eq!(scope.snapshot().disk_ops, 0);
+  runtime.shutdown(ShutdownMode::Drain).unwrap();
+}
+
+#[test]
+fn rejected_and_queued_cancelled_file_mutations_have_no_side_effects() {
+  let scratch = Scratch::new();
+  let path = scratch.child("unchanged");
+  fs::write(&path, b"unchanged").unwrap();
+  let mut runtime = runtime(1, 1);
+  let (blocker, started, release) = gated_job(&runtime);
+  started.recv_timeout(WATCHDOG).unwrap();
+  let scope = scope(0, 1);
+  let handle = FsHandle::new(runtime.handle(), scope.clone());
+  let supplied = open_options(true, true, false).open(&path).unwrap();
+  let descriptor = supplied.as_raw_fd();
+  let error = handle
+    .set_len(OwnedFile::from_std(supplied), 0)
+    .unwrap_err();
+  assert_eq!(
+    error.kind,
+    FsSubmissionErrorKind::Runtime(SubmitErrorKind::Full)
+  );
+  let (returned, length) = error.into_input();
+  assert_eq!(length, 0);
+  assert_eq!(returned.into_std().as_raw_fd(), descriptor);
+  assert_eq!(fs::read(&path).unwrap(), b"unchanged");
+  assert_eq!(scope.snapshot().disk_ops, 0);
+  release.send(()).unwrap();
+  blocker.join().unwrap();
+  runtime.shutdown(ShutdownMode::Drain).unwrap();
+
+  let mut runtime = self::runtime(1, 2);
+  let (blocker, started, release) = gated_job(&runtime);
+  started.recv_timeout(WATCHDOG).unwrap();
+  let handle = FsHandle::new(runtime.handle(), scope.clone());
+  let file = OwnedFile::from_std(open_options(true, true, false).open(&path).unwrap());
+  let job = handle.set_len(file, 0).unwrap();
+  assert_eq!(scope.snapshot().disk_ops, 1);
+  job.cancel();
+  release.send(()).unwrap();
+  assert!(matches!(job.join(), Err(JoinError::Cancelled)));
+  assert_eq!(fs::read(&path).unwrap(), b"unchanged");
+  assert_eq!(scope.snapshot().disk_ops, 0);
+  blocker.join().unwrap();
+  runtime.shutdown(ShutdownMode::Drain).unwrap();
+}
+
+#[test]
+fn failed_truncation_returns_the_original_read_only_descriptor() {
+  let scratch = Scratch::new();
+  let path = scratch.child("read-only-mutation");
+  fs::write(&path, b"retain").unwrap();
+  let standard = File::open(&path).unwrap();
+  let descriptor = standard.as_raw_fd();
+  let mut runtime = runtime(1, 2);
+  let scope = scope(0, 1);
+  let handle = FsHandle::new(runtime.handle(), scope.clone());
+  let (file, error) = handle
+    .set_len(OwnedFile::from_std(standard), 0)
+    .unwrap()
+    .join()
+    .unwrap();
+  assert!(error.is_err());
+  let mut returned = file.into_std();
+  assert_eq!(returned.as_raw_fd(), descriptor);
+  let mut contents = String::new();
+  returned.read_to_string(&mut contents).unwrap();
+  assert_eq!(contents, "retain");
+  assert_eq!(scope.snapshot().disk_ops, 0);
+  runtime.shutdown(ShutdownMode::Drain).unwrap();
+}
+
+#[test]
+fn path_ports_preserve_relative_links_dangling_links_and_nonempty_directories() {
+  let scratch = Scratch::new();
+  let directory = scratch.child("directory");
+  fs::create_dir(&directory).unwrap();
+  let original = directory.join("original");
+  let hard = directory.join("hard");
+  let symbolic = directory.join("symbolic");
+  fs::write(&original, b"linked").unwrap();
+  let mut runtime = runtime(1, 2);
+  let scope = scope(0, 1);
+  let handle = FsHandle::new(runtime.handle(), scope.clone());
+  handle
+    .hard_link(original.clone(), hard.clone())
+    .unwrap()
+    .join()
+    .unwrap()
+    .unwrap();
+  handle
+    .symlink(PathBuf::from("original"), symbolic.clone())
+    .unwrap()
+    .join()
+    .unwrap()
+    .unwrap();
+  assert_eq!(
+    handle
+      .canonicalize(symbolic.clone())
+      .unwrap()
+      .join()
+      .unwrap()
+      .unwrap(),
+    fs::canonicalize(&original).unwrap()
+  );
+  handle
+    .set_permissions(hard.clone(), fs::Permissions::from_mode(0o640))
+    .unwrap()
+    .join()
+    .unwrap()
+    .unwrap();
+  assert_eq!(
+    fs::metadata(&original).unwrap().permissions().mode() & 0o777,
+    0o640
+  );
+  assert!(
+    handle
+      .remove_dir(directory.clone())
+      .unwrap()
+      .join()
+      .unwrap()
+      .is_err()
+  );
+  fs::remove_file(&original).unwrap();
+  assert!(
+    !handle
+      .try_exists(symbolic.clone())
+      .unwrap()
+      .join()
+      .unwrap()
+      .unwrap()
+  );
+  assert_eq!(fs::read(&hard).unwrap(), b"linked");
+  fs::remove_file(hard).unwrap();
+  fs::remove_file(symbolic).unwrap();
+  handle
+    .remove_dir(directory)
+    .unwrap()
+    .join()
+    .unwrap()
+    .unwrap();
+  assert_eq!(scope.snapshot().disk_ops, 0);
+  runtime.shutdown(ShutdownMode::Drain).unwrap();
+}
 
 struct Scratch(PathBuf);
 

@@ -24,7 +24,7 @@
 //! next cursor-based operation. On Unix, positional operations use
 //! `FileExt` and leave the sequential cursor unchanged.
 
-use std::fs::{self, File, Metadata, OpenOptions, ReadDir};
+use std::fs::{self, File, Metadata, OpenOptions, Permissions, ReadDir};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -108,11 +108,35 @@ pub struct OwnedFile {
   file: File,
 }
 
+impl OwnedFile {
+  /// Takes ownership without performing I/O or reserving a disk permit.
+  ///
+  /// Existing descriptor aliases remain the caller's responsibility: they
+  /// can share cursor, status flags and file mutations with this handle.
+  /// The blocking operations preserve the supplied descriptor's semantics;
+  /// the separate `AsyncFile` adapter requires an ordinary seekable file.
+  #[must_use]
+  pub const fn from_std(file: File) -> Self {
+    Self { file }
+  }
+
+  /// Recovers the supplied file without I/O. Ownership can be recovered only
+  /// after an admitted operation has returned it in its outcome. Direct
+  /// operations on this standard handle bypass the pool and resource ledger.
+  #[must_use]
+  pub fn into_std(self) -> File {
+    self.file
+  }
+}
+
 impl std::fmt::Debug for OwnedFile {
   fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
     f.debug_struct("OwnedFile").finish_non_exhaustive()
   }
 }
+
+/// The original file and the result of a one-call file mutation.
+pub type FileMutationOutcome = (OwnedFile, io::Result<()>);
 
 /// The returned file, managed buffer, progress count, and any I/O error.
 ///
@@ -427,6 +451,43 @@ impl FsHandle {
     })
   }
 
+  /// Reads metadata from the open descriptor, even after its path is removed.
+  pub fn file_metadata(
+    &self,
+    file: OwnedFile,
+  ) -> Result<Job<(OwnedFile, io::Result<Metadata>)>, FsSubmissionError<OwnedFile>> {
+    self.submit(file, |file, _token| {
+      let result = file.file.metadata();
+      (file, result)
+    })
+  }
+
+  /// Changes file length, returning the file even on I/O failure. This is
+  /// one blocking operation, with no rollback or interruption once started.
+  /// Its sequential cursor is unchanged, including when beyond the new EOF.
+  pub fn set_len(
+    &self,
+    file: OwnedFile,
+    length: u64,
+  ) -> Result<Job<FileMutationOutcome>, FsSubmissionError<(OwnedFile, u64)>> {
+    self.submit((file, length), |(file, length), _token| {
+      let result = file.file.set_len(length);
+      (file, result)
+    })
+  }
+
+  /// Changes open-file permissions, preserving descriptor ownership on error.
+  pub fn file_set_permissions(
+    &self,
+    file: OwnedFile,
+    permissions: Permissions,
+  ) -> Result<Job<FileMutationOutcome>, FsSubmissionError<(OwnedFile, Permissions)>> {
+    self.submit((file, permissions), |(file, permissions), _token| {
+      let result = file.file.set_permissions(permissions);
+      (file, result)
+    })
+  }
+
   /// Seeks the file and returns its new cursor position with the file.
   pub fn seek(
     &self,
@@ -533,6 +594,68 @@ impl FsHandle {
     path: PathBuf,
   ) -> Result<Job<io::Result<PathBuf>>, FsSubmissionError<PathBuf>> {
     self.submit(path, |path, _token| fs::read_link(path))
+  }
+
+  /// Resolves an absolute canonical path on the blocking pool. The result is
+  /// a snapshot, not a path-security or subsequent-operation guarantee.
+  pub fn canonicalize(
+    &self,
+    path: PathBuf,
+  ) -> Result<Job<io::Result<PathBuf>>, FsSubmissionError<PathBuf>> {
+    self.submit(path, |path, _token| fs::canonicalize(path))
+  }
+
+  /// Checks existence while preserving errors such as permission denial.
+  /// The result can change before a subsequent path operation.
+  pub fn try_exists(
+    &self,
+    path: PathBuf,
+  ) -> Result<Job<io::Result<bool>>, FsSubmissionError<PathBuf>> {
+    self.submit(path, |path, _token| path.try_exists())
+  }
+
+  /// Creates a hard link using platform filesystem semantics, without replay.
+  pub fn hard_link(
+    &self,
+    original: PathBuf,
+    link: PathBuf,
+  ) -> Result<Job<io::Result<()>>, FsSubmissionError<(PathBuf, PathBuf)>> {
+    self.submit((original, link), |(original, link), _token| {
+      fs::hard_link(original, link)
+    })
+  }
+
+  /// Creates a symbolic link. Relative targets are interpreted relative to
+  /// the link's directory by later filesystem lookups, not this operation.
+  #[cfg(unix)]
+  pub fn symlink(
+    &self,
+    target: PathBuf,
+    link: PathBuf,
+  ) -> Result<Job<io::Result<()>>, FsSubmissionError<(PathBuf, PathBuf)>> {
+    self.submit((target, link), |(target, link), _token| {
+      std::os::unix::fs::symlink(target, link)
+    })
+  }
+
+  /// Changes path permissions using standard-library symlink-following rules.
+  pub fn set_permissions(
+    &self,
+    path: PathBuf,
+    permissions: Permissions,
+  ) -> Result<Job<io::Result<()>>, FsSubmissionError<(PathBuf, Permissions)>> {
+    self.submit((path, permissions), |(path, permissions), _token| {
+      fs::set_permissions(path, permissions)
+    })
+  }
+
+  /// Removes one empty directory. Nonempty directories return an I/O error;
+  /// this does not perform recursive traversal.
+  pub fn remove_dir(
+    &self,
+    path: PathBuf,
+  ) -> Result<Job<io::Result<()>>, FsSubmissionError<PathBuf>> {
+    self.submit(path, |path, _token| fs::remove_dir(path))
   }
 
   fn submit<I, T>(
