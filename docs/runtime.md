@@ -89,6 +89,42 @@ table. Full queues, worker parking, actual wakers, ownership and scope pointer
 identity are outside those models; native lifecycle tests cover these paths.
 This foundation supplies no current-thread/local executor or I/O reactor yet.
 
+## Bounded timers
+
+Driver close drains sleeps that remain registered. Already-fired sleeps keep
+their published success, and their service-thread callbacks may continue after
+driver drop returns. External `shutdown` joins the service thread and waits for
+those callbacks; service-thread shutdown closes and returns `WouldDeadlock`.
+
+`runtime::time::TimerDriver` owns one timer service thread. Its clonable handle
+creates sleeps, timeouts and intervals under an explicit registration bound.
+The indexed minimum heap, registration table and free-slot list are reserved
+at construction. Sleeps allocate shared state separately; the registration
+bound is not a total heap or RSS budget. Equal deadlines fire in arming order.
+
+Reset updates the current generation in place. Dropping a sleep cancels its
+registration, and stale generations cannot complete a reset or reused slot.
+Capacity is released before completion publication. Waker registration and
+publication share a slot lock; cloning, waking and dropping wakers occur
+outside timer locks. Callback panics are contained under unwinding.
+
+Timeout polls the deadline first and gives it ties, dropping the losing future
+when it completes. Intervals support Burst, Delay and Skip; lateness greater
+than five milliseconds activates the selected policy. `reset` schedules one
+period from now, while `reset_immediately` schedules now. Reset failures retain
+the prior interval schedule. Real clocks can fire late due to scheduling.
+
+Driver shutdown closes admission and drains pending sleeps with `Closed`,
+using a single drain owner and fixed-size callback batches. Concurrent close
+callers wait for that drain. A service-thread caller avoids waiting on an
+external closer that might be joining it; joining the service from its own
+callback returns `WouldDeadlock`. Dropping the driver closes without joining.
+
+Two Loom models exercise the production slot publication/registration helpers
+and indexed-queue generation transitions. Service-thread scheduling, condition
+variable waits, ownership and close-drain callbacks are outside those models;
+native tests cover them. A controlled test clock remains to be implemented.
+
 ## First milestone contract
 
 Each submission declares a `Resources` vector. Admission reserves every

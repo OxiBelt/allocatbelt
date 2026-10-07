@@ -89,6 +89,7 @@ mod task;
 mod tests;
 #[cfg(all(test, not(loom)))]
 mod tests_guard;
+pub mod time;
 mod worker;
 
 pub use crate::runtime::blocking::{Config, Handle, Runtime, ShutdownMode};

@@ -44,7 +44,7 @@
 //!
 //! | Feature | Default | Status | Adds |
 //! |---|---|---|---|
-//! | `runtime` | no | experimental runtime foundation | bounded blocking/owned-future pools, managed storage and initialized-buffer I/O (`allocatbelt::runtime`) |
+//! | `runtime` | no | experimental runtime foundation | bounded blocking/owned-future pools, managed storage, initialized-buffer I/O and timers (`allocatbelt::runtime`) |
 //! | `maintenance` | yes | stable | the background maintenance thread (`start_maintenance_thread`, `purge_backend`, `PurgeBackend`) |
 //! | `scheduler` | yes | stable | runs that thread as `SCHED_BATCH`; implies `maintenance` |
 //! | `io-uring` | no | stable, off at run time until `set_io_uring(true)` | batched purges through a restricted io_uring, falling back to `madvise` (`set_io_uring`, `io_uring_error`, `RingError`); implies `maintenance` |
