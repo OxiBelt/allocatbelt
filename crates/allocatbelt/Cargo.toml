@@ -30,6 +30,7 @@ rustdoc-args = ["-C", "target-cpu=x86-64-v3"]
 # `pthread_atfork`, `sched_setscheduler` and `getauxval`.
 libc.workspace = true
 rustix.workspace = true
+signal-hook-registry = { workspace = true, optional = true }
 
 # Cargo features choose which optional parts are compiled in (a ceiling);
 # which of them a process uses is chosen at run time. All are additive and
@@ -37,7 +38,7 @@ rustix.workspace = true
 [features]
 default = ["maintenance", "scheduler"]
 # Safe runtime foundations and readiness; allocator-only defaults are unchanged.
-runtime = ["rustix/std", "rustix/event", "rustix/fs"]
+runtime = ["rustix/std", "rustix/event", "rustix/fs", "rustix/process", "dep:signal-hook-registry"]
 # The background maintenance thread (`start_maintenance_thread`). Without
 # it, allocating threads run every housekeeping pass inline.
 maintenance = []

@@ -2,7 +2,8 @@
 
 `allocatbelt` is one package with responsibility-focused modules. `core` (`crates/allocatbelt/src/core/`) carries `#![forbid(unsafe_code)]` as an inner attribute, so it contains **0** `unsafe` sites, and the `publish = false` package `allocatbelt-core-check` compiles the same source as a `#![no_std]`, `#![forbid(unsafe_code)]` crate of its own, which runs the core's tests, the checking model and loom. The optional `runtime` module also carries `#![forbid(unsafe_code)]`; its
 blocking and owned-future implementations are shared with the unpublished runtime façade
-and adds no unsafe boundary. Library `unsafe` is in `sys`, `arch`, `global` (with `rseq`) and the opt-in `region` API; benchmark-only `unsafe` is limited to the diagnostic allocator wrapper and SIMD candidates, listed below. Every `unsafe` block holds exactly one unsafe operation and carries a `// SAFETY:` comment (`clippy::undocumented_unsafe_blocks` and `multiple_unsafe_ops_per_block` are deny).
+and remains safe. Runtime signal installation adds the narrow `sys` boundary
+listed below. Library `unsafe` is in `sys`, `arch`, `global` (with `rseq`) and the opt-in `region` API; benchmark-only `unsafe` is limited to the diagnostic allocator wrapper and SIMD candidates, listed below. Every `unsafe` block holds exactly one unsafe operation and carries a `// SAFETY:` comment (`clippy::undocumented_unsafe_blocks` and `multiple_unsafe_ops_per_block` are deny).
 
 Regenerate: `grep -rn "unsafe" crates/allocatbelt/src bench/src/bin/bench-runtime-diagnostic.rs bench/simd/src | grep -E "unsafe (\{|fn|impl|extern)"`
 
@@ -25,6 +26,25 @@ Regenerate: `grep -rn "unsafe" crates/allocatbelt/src bench/src/bin/bench-runtim
 | `MetaArena::slot` | block | `slice::from_raw_parts` → `&[AtomicU64]` | Published only after commit (READY, Acquire). Never unmapped or purged. Zero-filled by the kernel, so every bit pattern is valid, and only atomic access follows. |
 | `platform::probe` | block ×5 | `write_volatile` / `read_volatile` of one byte, `Region::purge`, `Region::guard_markers`, `Region::decommit`, all on a 64 KiB scratch `Region` the probe reserves itself | The scratch range is private to the function: no reference to it exists and nothing else knows its address, so writing, purging, guarding and decommitting it cannot affect any other memory. The byte is written and read only while the range is committed read/write (a purge keeps it accessible). Runs once, before the arena is reserved ([docs/platform.md](platform.md)). |
 | `set_batch_scheduling` (feature `scheduler`) | block | `libc::syscall(SYS_sched_setscheduler, 0, SCHED_BATCH, &param)` | The kernel only reads `param`, a live `#[repr(C)]` local with the UAPI `struct sched_param` layout (one `int`, 0 as `SCHED_BATCH` requires), and changes only the calling thread's policy (pid 0 is the caller). A raw syscall because rustix has no binding and musl's `sched_setscheduler` wrapper always fails. Called once, by the maintenance thread. |
+
+### `sys/runtime_signal.rs` (optional `runtime`)
+
+Explicit signal subscription uses `signal-hook-registry` to preserve previous
+handler ABI and the interrupted errno. Installation allocates ordinary registry
+metadata outside allocator hot paths. The callback and its nonblocking descriptor
+remain valid for the process lifetime, including a reported installation error;
+at most one installation attempt is made per supported signal. A listener slot
+is reserved before installation. Dispatcher startup must succeed first.
+
+| Location | Kind | Operation | Why it is sound |
+|---|---|---|---|
+| `register` | block | `signal_hook_registry::register` | The validated signal excludes the registry's forbidden set and libc-reserved signals. The fixed callback captures only a process-lifetime atomic bitmap and borrowed descriptor, updates a lock-free bit and performs an async-signal-safe one-byte write, retrying interruptions. It never allocates, locks, panics or calls user code. The registry preserves errno and chains prior handlers. |
+
+Listener polling, delivery and callbacks stay in the safe runtime. Real-signal
+tests change dispositions only in subprocesses; actual listener-table Loom
+models cover cancellation, slot reuse and registration versus delivery/close.
+Handlers persist after subscriptions drop; unrelated concurrent application
+handler replacement has the registry's installation-race limitations.
 
 ### `sys/ring.rs` (io_uring purge ring, plan Phase 8, feature `io-uring`)
 

@@ -98,6 +98,7 @@ mod resources;
 pub mod rwlock;
 mod scheduler;
 pub mod semaphore;
+pub mod signal;
 mod state;
 mod sync;
 mod task;

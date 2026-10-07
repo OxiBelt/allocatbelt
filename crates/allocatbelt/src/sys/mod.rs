@@ -7,7 +7,9 @@
 //! caller might still use ([`Region::purge`], [`Region::decommit`]) are
 //! `unsafe fn` and document the contract the caller (the heap) must uphold.
 //!
-//! Nothing in this module allocates, panics on the hot path, or unwinds.
+//! Allocator syscall wrappers never allocate or unwind on the hot path.
+//! The optional runtime signal-registration boundary allocates registry metadata
+//! during explicit installation; its handler remains allocation-free.
 //!
 //! This module also holds the platform contract (`platform`): builds for
 //! anything but 64-bit little-endian Linux on x86_64 (x86-64-v3 or newer),
@@ -28,6 +30,8 @@ mod platform;
 mod ring;
 #[cfg(feature = "experimental-rseq")]
 mod rseq;
+#[cfg(feature = "runtime")]
+pub(crate) mod runtime_signal;
 
 pub use platform::{Capabilities, KernelVersion, probe};
 #[cfg(feature = "io-uring")]

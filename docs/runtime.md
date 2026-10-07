@@ -384,6 +384,35 @@ retain their charges through the final snapshot. Nine native tests, two
 compile-fail examples and three actual-source Loom models cover cleanup,
 recovery, competing publishers and thread boundaries.
 
+## Process-wide signals
+
+`runtime::signal::SignalDriver` shares one process-wide dispatcher and a fixed
+listener table. The first published bridge fixes the ceiling; later drivers
+must request the same value. A dispatcher startup failure is cached without
+installing handlers. Invalid kinds and full listener admission make no handler
+installation attempt. Listener capacity is reserved before a new kind's first
+registration. A reported registry error may already have changed disposition;
+that attempt is cached and its callback state remains permanently valid.
+
+Each listener coalesces delivery to one unseen event. `recv` consumes that
+event only when ready; dropping a pending receive removes its waker without
+consuming an unseen event. Dropping a listener releases its table slot, whose
+generation is checked and retired on exhaustion. Multiple drivers and runtimes
+share the same process-wide ceiling. `ctrl_c` creates an interrupt subscription.
+
+The permanent handler only updates a pending bitmap and writes one byte to a
+nonblocking descriptor. An ordinary dedicated thread dispatches into the table
+and invokes callbacks outside locks. Registration chains previous handlers and
+preserves errno. Dropping all subscriptions does not restore default signal
+behavior; the bridge, handlers and dispatcher remain for the process lifetime.
+No API here is intended to be called from an application signal handler.
+Unrelated concurrent handler replacement retains the registry's race limits.
+This is a coalescing event port, with no exact signal-count or payload queue.
+Metadata and the kernel socket buffer are outside managed-storage accounting.
+Eight native tests, four real-signal subprocess cases and four actual-table
+Loom models qualify the implemented contract; they do not model kernel delivery
+or arbitrary application handlers.
+
 ## Composing two futures
 
 `runtime::concurrency` supplies `join2`, `try_join2` and `select2` for borrowed,
