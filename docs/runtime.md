@@ -257,6 +257,30 @@ fn require_send<T: Send>() {}
 require_send::<LocalRuntime>();
 ```
 
+## Task-local values
+
+`runtime::task_local::TaskLocalKey` supports synchronous `sync_scope` closures
+and named asynchronous `scope` futures. `with` reads the active value and
+`try_with` returns `None` without a value or after TLS destruction. Nested
+scopes restore their enclosing value, including on panic. User closures and
+destructors run outside TLS map borrows.
+
+An async scope installs its value only during polling and inner-future cleanup.
+The inner future is destroyed immediately on readiness, or during cancellation,
+with its own value installed; then the enclosing context is restored. The
+wrapper retains its value until wrapper destruction. If TLS is unavailable
+during thread teardown, inner cleanup falls back to ordinary destruction
+without an installed value. Synchronous entry rejects unavailable TLS before
+running its closure.
+
+The scope future can move between threads when its value and inner future are
+`Send`; its value need not be `Sync`. Local `!Send` values remain supported.
+Checked key IDs do not wrap. A pinned inner-future box, temporary synchronous,
+per-poll or cleanup `Rc` allocations, and the TLS map are ordinary utility storage outside
+the managed-buffer ledger. Native tests cover context and destructor ordering,
+panic restoration, migration and real TLS teardown; compile-fail examples
+check `!Send` relationships.
+
 ## Bounded timers
 
 Driver close drains sleeps that remain registered. Already-fired sleeps keep

@@ -91,6 +91,7 @@ pub mod semaphore;
 mod state;
 mod sync;
 mod task;
+pub mod task_local;
 #[cfg(all(test, not(loom)))]
 mod tests;
 #[cfg(all(test, not(loom)))]
