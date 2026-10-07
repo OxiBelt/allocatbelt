@@ -169,6 +169,50 @@ models cover ring transitions and lost-wake registration, not TLS budgeting.
 The endpoints use scalar I/O and its vectored fallback; they do not expose a
 borrowed buffered ring view across lock release.
 
+## Blocking streams and standard I/O
+
+`runtime::blocking_io::reader` and `writer` adapt owned `Read + Send + 'static`
+and `Write + Send + 'static` streams to initialized-buffer asynchronous I/O.
+Streams may be `!Sync` or `!Unpin`: each adapter boxes its stream and owns a
+nonempty, uniquely owned caller-supplied `ManagedBuf`. Constructor rejection
+returns both original inputs. The adapter uses a supplied blocking `Handle`
+and explicit per-operation `Resources`; it creates no worker or private queue.
+There is at most one retained job per endpoint. Each job performs at most five
+underlying read, write or flush calls: the first attempt and four bounded
+Interrupted retries. Other I/O errors retain their kind.
+
+A reader uses its fixed staging buffer for read-ahead, retaining unread bytes
+when a borrowing read future is cancelled or a later destination changes size.
+A writer accepts bytes into its staging buffer only after job admission and
+returns their accepted count in that same poll. Later polls drain the previous
+job and unwritten suffix before accepting another input; they never attribute
+cancelled-call progress to a new input slice. Partial writes commit only the
+counts the underlying stream reports. Errors retain an unwritten suffix;
+external side effects that a generic `Write` does not report cannot be rolled
+back. Flush runs as a separate retained job after accepted writes drain.
+Shutdown flushes and permanently stops new writes on this adapter.
+
+Admission or resource-capacity rejection returns `WouldBlock`, restores the
+adapter's owned inputs, and accepts no write bytes. There is no asynchronous
+blocking-pool capacity notification; applications must explicitly retry or
+abandon the operation. Dropping a borrowing future retains its job and progress.
+Dropping an endpoint detaches the job: stream and charged staging storage remain
+owned until actual completion and result cleanup. Queued `CancelPending`
+cancellation drops the captured stream and storage and makes that endpoint
+terminal. Started blocking calls cannot be preempted, so a read can delay pool
+Drain indefinitely. Operation panics and recursive destructor-panic payloads
+follow the existing contained blocking-job cleanup path.
+
+`stdin_reader`, `stdout_writer` and `stderr_writer` use the standard library's
+process-global handles and locking/buffering. Those global buffers, boxes and
+fixed job metadata are ordinary allocations outside managed-memory accounting.
+Staging storage stays charged to its actual owners. Logical writer shutdown
+never closes a global descriptor. A pool with every worker blocked on stdin
+cannot service its queued jobs until a read returns. These endpoints participate
+in automatic per-poll cooperation; native tests cover ownership, cancellation,
+rejection, partial/error progress, bounded retries and zero-budget preservation.
+They do not establish a shutdown latency bound or performance benefit.
+
 ## General Unix pipes
 
 `runtime::unix_pipe::pipe` creates an anonymous Linux pipe with
@@ -875,7 +919,7 @@ Runtime-owned outer polls also use a shared 64-operation budget for ready
 `channel` send/receive/reservation/closed-wait, oneshot receive/close,
 semaphore acquisition, mutex acquisition and reader-writer-lock acquisition
 polls, plus `Notify`, watch change/closure, broadcast receive/closure and
-barrier waits, and managed-pipe and Unix-pipe read/write/flush/shutdown polls.
+barrier waits, and managed-pipe, Unix-pipe and blocking-stream I/O polls.
 A synchronous primitive-to-primitive chain charges once; a
 primitive poll that returns `Pending` restores its provisional charge. Once
 exhausted, the next supported primitive arranges a wake and returns `Pending`
@@ -1430,7 +1474,8 @@ baseline still requires these implementation and qualification steps:
 1. Extend automatic cooperative progress beyond the currently listed
    operations. Expand TCP socket-option and listen-builder coverage beyond the
    explicit single-address nonblocking connect and bound-socket operations.
-2. Add standard I/O adapters and FIFO path constructors. Anonymous Unix pipes, managed
+2. Add FIFO path constructors. Owned blocking streams, standard I/O adapters,
+   anonymous Unix pipes, managed
    in-memory simplex/duplex pipes and caller-buffered bidirectional copy are
    implemented with explicit partial-progress and half-close contracts. The initialized-buffer `Take`/`Chain`/`Empty`/`Sink`/`Repeat` family,
    bounded delimiter/line and whole-stream reads, and fixed managed buffered

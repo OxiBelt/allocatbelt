@@ -44,7 +44,7 @@
 //!
 //! | Feature | Default | Status | Adds |
 //! |---|---|---|---|
-//! | `runtime` | no | experimental runtime foundation | bounded blocking/owned-future pools, managed storage, initialized-buffer I/O, owned filesystem operations with bounded recursive path streaming, bounded anonymous Unix pipes, epoll readiness and timers (`allocatbelt::runtime`) |
+//! | `runtime` | no | experimental runtime foundation | bounded blocking/owned-future pools, managed storage, initialized-buffer I/O including managed-buffered blocking and standard streams, owned filesystem operations with bounded recursive path streaming, bounded anonymous Unix pipes, epoll readiness and timers (`allocatbelt::runtime`) |
 //! | `maintenance` | yes | stable | the background maintenance thread (`start_maintenance_thread`, `purge_backend`, `PurgeBackend`) |
 //! | `scheduler` | yes | stable | runs that thread as `SCHED_BATCH`; implies `maintenance` |
 //! | `runtime-io-uring` | no | experimental, implies `runtime` | independently started bounded owned-buffer file I/O (`runtime::uring`); setup denial returns before admission, ambiguous completion aborts |
