@@ -104,6 +104,7 @@ pub mod rwlock;
 mod scheduler;
 pub mod semaphore;
 pub mod signal;
+pub mod split_io;
 mod state;
 mod sync;
 mod task;

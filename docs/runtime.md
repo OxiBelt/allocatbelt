@@ -54,6 +54,22 @@ across budget yields and pending shutdown calls. Accepting subsequent writes
 starts a fresh flush/shutdown sequence. Dropping a writer does not flush it;
 bytes already accepted by the underlying endpoint remain committed.
 
+`runtime::split_io::split` pins one bidirectional endpoint and returns unique
+read and write halves. It supports borrowed, local and `!Unpin` endpoints.
+Poll methods on the endpoint are serialized; a busy direction records one
+bounded waiter and is woken after the active poll releases the endpoint.
+Endpoint methods, waker callbacks and destruction run outside the shared
+state mutex. `is_write_vectored` reports the capability queried at split time.
+
+`reunite` accepts only halves from the same split and returns `Pin<Box<T>>`
+without moving the endpoint. A mismatch returns both original halves.
+Dropping one half retains the endpoint; dropping the last releases it without
+implicit flush or shutdown. Endpoint-owned managed charges stay with the
+endpoint through reunite and end when its storage is actually released.
+The pinning box and fixed shared metadata are ordinary allocations. Six
+native tests cover pinning, ownership, callbacks and panic cleanup; one
+actual-source Loom model checks poll exclusion and busy-waiter notification.
+
 ## Managed buffers and operation permits
 
 `runtime::managed::ResourceScope` provides a separate shared ledger for managed
