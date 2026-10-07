@@ -107,11 +107,13 @@
 //!
 //! # Limitations
 //!
-//! This is not complete I/O parity with Tokio: there are no buffered readers
-//! or writers, vectored or uninitialized-buffer I/O, stream splitting,
+//! This is not complete I/O parity with Tokio: there is no vectored or
+//! uninitialized-buffer I/O, stream splitting,
 //! line or delimiter reads, or reads that grow a buffer. [`AsyncSeek`] is a
 //! single `poll_seek` that is polled again with the same position after
 //! `Pending`, instead of a separate start and completion.
+//! Managed buffered readers and writers live in
+//! [`buffered_io`](crate::runtime::buffered_io).
 
 #![forbid(unsafe_code)]
 #![cfg_attr(not(test), deny(clippy::expect_used, clippy::unwrap_used))]

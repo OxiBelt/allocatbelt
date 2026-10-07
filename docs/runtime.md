@@ -30,8 +30,21 @@ reported count when it exceeds the offered slice, retry interrupted calls,
 and yield with a self-wake after 64 endpoint calls in one poll. This requests
 rescheduling without guaranteeing another task's turn. Simple helpers do not
 allocate or implicitly reserve managed-storage charges. TCP and Unix stream
-endpoints implement these traits. Buffered adapters and vectored operations
-remain pending.
+endpoints implement these traits. Vectored operations remain pending.
+
+`runtime::buffered_io` supplies `BufferedReader`, `BufferedWriter` and
+`AsyncBufRead`. Constructors take a nonempty, uniquely owned `ManagedBuf` and
+return both original inputs on rejection. Readers and writers use this fixed
+initialized storage; they do not allocate a separate byte buffer. `into_parts`
+returns the endpoint, charged storage and exact unread or unwritten range for
+recovery. Consuming too much reader data is clamped to the available length.
+
+Buffered operations share a budget of 64 endpoint calls per poll, including
+flush and shutdown. Interrupted calls count toward that bound; other errors,
+including `WouldBlock`, propagate. Shutdown retains a completed flush phase
+across budget yields and pending shutdown calls. Accepting subsequent writes
+starts a fresh flush/shutdown sequence. Dropping a writer does not flush it;
+bytes already accepted by the underlying endpoint remain committed.
 
 ## Managed buffers and operation permits
 
@@ -452,7 +465,7 @@ The lifecycle foundation above is implemented. Remaining milestones include:
 
 1. Task utilities and integration of resource permits into active polling.
 2. Integrate the implemented timers, epoll readiness and owned filesystem APIs
-   into application ports; complete buffered I/O and socket adapters.
+   into application ports; complete remaining I/O utilities and socket adapters.
 3. Complete synchronization, processes, signals and concurrency helpers;
    verify compatibility requirements against real Tokio application workloads.
 4. Resource measurement and optional cgroup-aware feedback, with explicit

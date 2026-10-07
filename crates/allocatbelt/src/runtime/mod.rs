@@ -73,6 +73,7 @@
 mod admission;
 pub mod asynchronous;
 mod blocking;
+pub mod buffered_io;
 mod cache;
 mod error;
 pub mod fs;
