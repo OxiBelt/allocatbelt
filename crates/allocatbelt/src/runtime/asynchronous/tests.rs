@@ -1197,10 +1197,36 @@ fn native_runtime_owned_future_and_detached_output_drops_keep_scope_binding() {
     }
   }
   let (output_tx, output_rx) = std::sync::mpsc::channel();
+  let output_gate = Arc::new((Mutex::new(false), Condvar::new()));
+  let _release_output_gate = ReleaseGate(Arc::clone(&output_gate));
+  let output_started = Arc::new((Mutex::new(false), Condvar::new()));
+  let task_gate = Arc::clone(&output_gate);
+  let task_started = Arc::clone(&output_started);
   let detached = scope
-    .spawn(async move { OutputProbe(output_tx) })
+    .spawn(async move {
+      Gate {
+        gate: task_gate,
+        started: task_started,
+      }
+      .await;
+      OutputProbe(output_tx)
+    })
     .unwrap_or_else(|e| panic!("detached task spawn failed: {e}"));
+  {
+    let (lock, cv) = &*output_started;
+    let mut started = lock.lock().unwrap_or_else(|e| e.into_inner());
+    while !*started {
+      started = cv.wait(started).unwrap_or_else(|e| e.into_inner());
+    }
+  }
+  // Keep the future from producing its output until after the caller has
+  // detached the job, so this observes producer-side discarded-output cleanup.
   drop(detached);
+  {
+    let (lock, cv) = &*output_gate;
+    *lock.lock().unwrap_or_else(|e| e.into_inner()) = true;
+    cv.notify_all();
+  }
   assert_eq!(
     output_rx.recv_timeout(Duration::from_secs(3)).unwrap(),
     Some(41)

@@ -90,7 +90,10 @@ unpacked_test() {
     RUSTDOCFLAGS="${unpacked_flags}" cargo test --release --quiet --target-dir "${work}/target" "$@")
 }
 unpacked_test 2>&1 | grep -E '^test result' | sort | uniq -c
-unpacked_test --all-features >/dev/null 2>&1 || fail "the unpacked crate's all-feature tests fail"
+if ! unpacked_test --all-features >"${work}/all-feature-tests.log" 2>&1; then
+  cat "${work}/all-feature-tests.log" >&2
+  fail "the unpacked crate's all-feature tests fail"
+fi
 echo "ok: the unpacked crate's tests pass"
 
 # docs.rs builds the documentation with `[package.metadata.docs.rs]` and
