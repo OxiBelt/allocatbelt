@@ -1,5 +1,5 @@
 use std::future::Future;
-use std::io::{Read, Write};
+use std::io::{self, Read, Write};
 use std::net::{
   Ipv6Addr, SocketAddr, SocketAddrV6, TcpListener as StdTcpListener, TcpStream as StdTcpStream,
   UdpSocket as StdUdpSocket,
@@ -30,6 +30,390 @@ fn reactor(registrations: usize) -> Reactor {
     max_waiters: 16,
   })
   .unwrap()
+}
+
+#[cfg(unix)]
+#[test]
+fn ready_unix_read_loop_yields_to_already_queued_sibling() {
+  use std::os::unix::net::UnixStream as StdUnixStream;
+  use std::sync::atomic::{AtomicBool, Ordering};
+
+  use crate::runtime::asynchronous::{AsyncConfig, AsyncRuntime};
+
+  struct Release(std::sync::mpsc::Sender<()>);
+  impl Drop for Release {
+    fn drop(&mut self) {
+      let _ = self.0.send(());
+    }
+  }
+
+  const READS: usize = 2_048;
+  let reactor = reactor(2);
+  let (read_side, mut peer) = StdUnixStream::pair().unwrap();
+  peer.write_all(&vec![0_u8; READS]).unwrap();
+  let stream = super::unix::UnixStream::from_std(read_side, &reactor.handle()).unwrap();
+  drop(block_on(stream.fd.readable()).unwrap());
+
+  let runtime = AsyncRuntime::new(AsyncConfig {
+    workers: 1,
+    max_outstanding: 4,
+    max_scopes: 2,
+  })
+  .unwrap();
+  let scope = runtime.scope().unwrap();
+  let (started_tx, started_rx) = mpsc::channel();
+  let (reader_done_tx, reader_done_rx) = mpsc::channel();
+  let (sibling_done_tx, sibling_done_rx) = mpsc::channel();
+  let (release_tx, release_rx) = mpsc::channel();
+  let release_guard = Release(release_tx);
+  let sibling_ran = Arc::new(AtomicBool::new(false));
+  let bytes_read = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+  let read_count = Arc::clone(&bytes_read);
+  let reader = scope
+    .spawn(async move {
+      started_tx.send(()).unwrap();
+      release_rx.recv().unwrap();
+      let mut byte = [0_u8; 1];
+      for _ in 0..READS {
+        assert_eq!(stream.read(&mut byte).await.unwrap(), 1);
+        assert_eq!(byte, [0]);
+        read_count.fetch_add(1, Ordering::Relaxed);
+      }
+      reader_done_tx.send(()).unwrap();
+    })
+    .unwrap();
+  started_rx
+    .recv_timeout(IO_TIMEOUT)
+    .expect("hot reader should occupy its worker before sibling admission");
+
+  let sibling_flag = Arc::clone(&sibling_ran);
+  let observed_reads = Arc::clone(&bytes_read);
+  let sibling = scope
+    .spawn(async move {
+      assert!(observed_reads.load(Ordering::Relaxed) < READS);
+      sibling_flag.store(true, Ordering::Release);
+      sibling_done_tx.send(()).unwrap();
+    })
+    .unwrap();
+  drop(release_guard);
+
+  let completion_deadline = Instant::now() + IO_TIMEOUT;
+  for done in [&reader_done_rx, &sibling_done_rx] {
+    let remaining = completion_deadline.saturating_duration_since(Instant::now());
+    if done.recv_timeout(remaining).is_err() {
+      reader.abort_handle().abort();
+      sibling.abort_handle().abort();
+      runtime
+        .shutdown(crate::runtime::asynchronous::AsyncShutdown::CancelPending)
+        .unwrap();
+      panic!("ready I/O and its queued sibling did not complete before the watchdog");
+    }
+  }
+  while !reader.is_finished() || !sibling.is_finished() {
+    if Instant::now() >= completion_deadline {
+      reader.abort_handle().abort();
+      sibling.abort_handle().abort();
+      runtime
+        .shutdown(crate::runtime::asynchronous::AsyncShutdown::CancelPending)
+        .unwrap();
+      panic!("completed network task bodies did not publish before the watchdog");
+    }
+    thread::yield_now();
+  }
+
+  runtime
+    .block_on(async move {
+      reader.await.unwrap();
+      sibling.await.unwrap();
+      scope.close().await;
+    })
+    .unwrap();
+  runtime
+    .shutdown(crate::runtime::asynchronous::AsyncShutdown::Drain)
+    .unwrap();
+
+  assert_eq!(bytes_read.load(Ordering::Relaxed), READS);
+  assert!(sibling_ran.load(Ordering::Acquire));
+}
+
+#[cfg(unix)]
+#[test]
+fn ready_unix_read_attempt_preserves_input_at_zero_budget() {
+  use std::os::unix::net::UnixStream as StdUnixStream;
+
+  use crate::runtime::asynchronous::{AsyncConfig, AsyncRuntime, AsyncShutdown};
+
+  let reactor = reactor(2);
+  let (read_side, mut peer) = StdUnixStream::pair().unwrap();
+  peer.write_all(b"x").unwrap();
+  let mut stream = super::unix::UnixStream::from_std(read_side, &reactor.handle()).unwrap();
+  drop(block_on(stream.fd.readable()).unwrap());
+
+  let runtime = AsyncRuntime::new(AsyncConfig {
+    workers: 1,
+    max_outstanding: 2,
+    max_scopes: 1,
+  })
+  .unwrap();
+  let task = runtime
+    .handle()
+    .spawn(async move {
+      let mut first = [0_u8; 1];
+      std::future::poll_fn(|cx| {
+        for _ in 0..64 {
+          let mut empty = [];
+          assert!(matches!(
+            Pin::new(&mut stream).poll_read(cx, &mut empty),
+            Poll::Ready(Ok(0))
+          ));
+        }
+        match Pin::new(&mut stream).poll_read(cx, &mut first) {
+          Poll::Pending => {
+            assert!(stream.read_waiter_is_none());
+            Poll::Ready(())
+          }
+          Poll::Ready(result) => panic!("zero-budget read consumed ready input: {result:?}"),
+        }
+      })
+      .await;
+      assert_eq!(first, [0]);
+
+      let mut received = [0_u8; 1];
+      assert_eq!(stream.read(&mut received).await.unwrap(), 1);
+      assert_eq!(received, *b"x");
+    })
+    .unwrap();
+  runtime.block_on(task).unwrap().unwrap();
+  runtime.shutdown(AsyncShutdown::Drain).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn pending_readiness_refunds_budget_and_preserves_its_waiter_at_zero() {
+  use std::os::unix::net::UnixStream as StdUnixStream;
+
+  use crate::runtime::asynchronous::{AsyncConfig, AsyncRuntime, AsyncShutdown};
+
+  let reactor = reactor(2);
+  let (read_side, mut peer) = StdUnixStream::pair().unwrap();
+  let mut stream = super::unix::UnixStream::from_std(read_side, &reactor.handle()).unwrap();
+  let runtime = AsyncRuntime::new(AsyncConfig {
+    workers: 1,
+    max_outstanding: 2,
+    max_scopes: 1,
+  })
+  .unwrap();
+  let (waiting_tx, waiting_rx) = mpsc::channel();
+  let task = runtime
+    .handle()
+    .spawn(async move {
+      let mut waiter = None;
+      std::future::poll_fn(|cx| {
+        match super::poll_io_attempt(
+          cx,
+          &stream.fd,
+          &mut waiter,
+          super::IoDirection::Read,
+          |_| -> io::Result<()> { unreachable!("pending readiness must not poll the endpoint") },
+        ) {
+          Poll::Pending => {
+            assert!(waiter.is_some());
+            Poll::Ready(())
+          }
+          Poll::Ready(result) => panic!("empty stream unexpectedly had readiness: {result:?}"),
+        }
+      })
+      .await;
+
+      std::future::poll_fn(|cx| {
+        for _ in 0..64 {
+          let mut empty = [];
+          assert!(matches!(
+            Pin::new(&mut stream).poll_read(cx, &mut empty),
+            Poll::Ready(Ok(0))
+          ));
+        }
+        let mut empty = [];
+        assert!(Pin::new(&mut stream).poll_read(cx, &mut empty).is_pending());
+        assert!(waiter.is_some());
+        assert!(matches!(
+          super::poll_io_attempt(
+            cx,
+            &stream.fd,
+            &mut waiter,
+            super::IoDirection::Read,
+            |_| -> io::Result<()> {
+              unreachable!("zero-budget poll must preserve the retained waiter")
+            },
+          ),
+          Poll::Pending
+        ));
+        assert!(waiter.is_some());
+        Poll::Ready(())
+      })
+      .await;
+      drop(waiter);
+      waiting_tx.send(()).unwrap();
+
+      let mut received = [0_u8; 1];
+      assert_eq!(stream.read(&mut received).await.unwrap(), 1);
+      assert_eq!(received, *b"p");
+    })
+    .unwrap();
+  waiting_rx
+    .recv_timeout(IO_TIMEOUT)
+    .expect("readiness waiter should be retained before peer data arrives");
+  peer.write_all(b"p").unwrap();
+  runtime.block_on(task).unwrap().unwrap();
+  runtime.shutdown(AsyncShutdown::Drain).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn stale_would_block_refunds_budget_while_interrupted_consumes_it() {
+  use std::os::unix::net::UnixStream as StdUnixStream;
+
+  use crate::runtime::asynchronous::{AsyncConfig, AsyncRuntime, AsyncShutdown};
+
+  let reactor = reactor(4);
+  let (would_block_side, mut would_block_peer) = StdUnixStream::pair().unwrap();
+  let (interrupted_side, mut interrupted_peer) = StdUnixStream::pair().unwrap();
+  would_block_peer.write_all(b"w").unwrap();
+  interrupted_peer.write_all(b"i").unwrap();
+  let mut would_block_stream =
+    super::unix::UnixStream::from_std(would_block_side, &reactor.handle()).unwrap();
+  let mut interrupted_stream =
+    super::unix::UnixStream::from_std(interrupted_side, &reactor.handle()).unwrap();
+  drop(block_on(would_block_stream.fd.readable()).unwrap());
+  drop(block_on(interrupted_stream.fd.readable()).unwrap());
+
+  let runtime = AsyncRuntime::new(AsyncConfig {
+    workers: 1,
+    max_outstanding: 2,
+    max_scopes: 1,
+  })
+  .unwrap();
+  let task = runtime
+    .handle()
+    .spawn(async move {
+      let mut would_block_waiter = None;
+      std::future::poll_fn(|cx| {
+        match super::poll_io_attempt(
+          cx,
+          &would_block_stream.fd,
+          &mut would_block_waiter,
+          super::IoDirection::Read,
+          |_| -> io::Result<()> { Err(io::ErrorKind::WouldBlock.into()) },
+        ) {
+          Poll::Ready(super::IoAttempt::RetryRefunded) => Poll::Ready(()),
+          other => panic!("expected stale WouldBlock to refund and retry: {other:?}"),
+        }
+      })
+      .await;
+      std::future::poll_fn(|cx| {
+        for _ in 0..64 {
+          let mut empty = [];
+          assert!(matches!(
+            Pin::new(&mut would_block_stream).poll_read(cx, &mut empty),
+            Poll::Ready(Ok(0))
+          ));
+        }
+        let mut empty = [];
+        assert!(
+          Pin::new(&mut would_block_stream)
+            .poll_read(cx, &mut empty)
+            .is_pending()
+        );
+        Poll::Ready(())
+      })
+      .await;
+      let mut received = [0_u8; 1];
+      assert_eq!(would_block_stream.read(&mut received).await.unwrap(), 1);
+      assert_eq!(received, *b"w");
+
+      let mut interrupted_waiter = None;
+      std::future::poll_fn(|cx| {
+        match super::poll_io_attempt(
+          cx,
+          &interrupted_stream.fd,
+          &mut interrupted_waiter,
+          super::IoDirection::Read,
+          |_| -> io::Result<()> { Err(io::ErrorKind::Interrupted.into()) },
+        ) {
+          Poll::Ready(super::IoAttempt::RetryCharged) => Poll::Ready(()),
+          other => panic!("expected Interrupted to consume one unit: {other:?}"),
+        }
+      })
+      .await;
+      std::future::poll_fn(|cx| {
+        for _ in 0..62 {
+          let mut empty = [];
+          assert!(matches!(
+            Pin::new(&mut interrupted_stream).poll_read(cx, &mut empty),
+            Poll::Ready(Ok(0))
+          ));
+        }
+        let mut empty = [];
+        assert!(
+          Pin::new(&mut interrupted_stream)
+            .poll_read(cx, &mut empty)
+            .is_pending()
+        );
+        Poll::Ready(())
+      })
+      .await;
+      let mut received = [0_u8; 1];
+      assert_eq!(interrupted_stream.read(&mut received).await.unwrap(), 1);
+      assert_eq!(received, *b"i");
+    })
+    .unwrap();
+  runtime.block_on(task).unwrap().unwrap();
+  runtime.shutdown(AsyncShutdown::Drain).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn manual_interrupted_io_attempts_self_wake_at_the_local_sixty_four_limit() {
+  use std::os::unix::net::UnixStream as StdUnixStream;
+  use std::sync::atomic::{AtomicUsize, Ordering};
+
+  struct WakeCount(Arc<AtomicUsize>);
+  impl Wake for WakeCount {
+    fn wake(self: Arc<Self>) {
+      self.wake_by_ref();
+    }
+    fn wake_by_ref(self: &Arc<Self>) {
+      self.0.fetch_add(1, Ordering::Relaxed);
+    }
+  }
+
+  let reactor = reactor(2);
+  let (read_side, mut peer) = StdUnixStream::pair().unwrap();
+  peer.write_all(b"ready").unwrap();
+  let stream = super::unix::UnixStream::from_std(read_side, &reactor.handle()).unwrap();
+  drop(block_on(stream.fd.readable()).unwrap());
+
+  let wake_count = Arc::new(AtomicUsize::new(0));
+  let waker = Waker::from(Arc::new(WakeCount(Arc::clone(&wake_count))));
+  let mut context = Context::from_waker(&waker);
+  let mut waiter = None;
+  let mut calls = 0;
+  assert!(
+    super::poll_io_with_retry(
+      &mut context,
+      &stream.fd,
+      &mut waiter,
+      super::IoDirection::Read,
+      |_| -> io::Result<usize> {
+        calls += 1;
+        Err(io::ErrorKind::Interrupted.into())
+      },
+    )
+    .is_pending()
+  );
+  assert_eq!(calls, 64);
+  assert_eq!(wake_count.load(Ordering::Relaxed), 1);
 }
 
 const IO_TIMEOUT: Duration = Duration::from_secs(10);

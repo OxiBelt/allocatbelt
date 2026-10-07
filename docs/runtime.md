@@ -987,6 +987,13 @@ barrier waits, managed-pipe, Unix-pipe and blocking-stream I/O polls,
 result polls. Job polls gate before cloning a waker, examining the completion
 slot or consuming its output; an exhausted poll preserves an already-published
 result for a later poll. Synchronous job observers remain unchanged.
+Concrete TCP/Unix stream reads and writes, socket shutdown/flush, listener
+accepts, UDP/Unix datagram send/receive operations and UDP peeks also gate
+readiness and syscall attempts. An interrupted syscall spends its unit;
+stale `WouldBlock` refunds
+it and rearms readiness before waiting. Their independent per-poll retry caps
+also apply to manual polls. Connect polling retains a separate ceiling of 64
+physical endpoint calls, including its initial attempt and completion probes.
 A synchronous primitive-to-primitive
 chain charges once; a primitive poll that returns `Pending` restores its
 provisional charge. `Timeout` checks the budget before touching its timer or
@@ -1000,9 +1007,10 @@ borrowed `block_on` root.
 Manual polls and futures driven by external executors bypass automatic
 accounting. Other arbitrary futures are not automatically cooperative; long-running
 work outside the listed primitives still needs explicit checkpoints or its own
-bounded polling. Other direct I/O endpoint
-polls, including `AsyncBufRead`, are outside this automatic accounting; the
-looping I/O helpers and buffered endpoints enforce their own 64-call-per-poll
+bounded polling. Raw readiness waits and other direct I/O endpoint
+polls, including direct child-pipe and `AsyncBufRead` operations, are outside
+this automatic accounting; the looping I/O helpers and buffered endpoints
+enforce their own 64-call-per-poll
 limits.
 
 `AsyncJob` is awaitable; dropping it detaches, while `abort` requests cleanup

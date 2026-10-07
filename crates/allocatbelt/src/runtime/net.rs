@@ -14,8 +14,13 @@
 //! it.
 //!
 //! The async methods preserve partial byte counts and retry `Interrupted`
-//! and stale-readiness `WouldBlock`. They make at most 64 endpoint calls per
-//! poll before yielding. Readiness waits do not count as endpoint calls.
+//! and stale-readiness `WouldBlock`. Each ready endpoint operation consumes
+//! one unit from the runtime-owned task poll's shared cooperative budget;
+//! pending readiness and stale `WouldBlock` refund their reservation, while
+//! `Interrupted` consumes a unit. Each I/O poll also caps its own
+//! stale/interrupted retry loop at 64 attempts and self-wakes before returning
+//! `Pending`. Readiness-only waits do not consume units, and manual polls
+//! outside a runtime-owned task use the cooperative helper's no-op behavior.
 //! Dropping a named async-method future releases its readiness waiter; bytes
 //! already transferred remain transferred. `TcpStream` and Unix `UnixStream`
 //! also implement [`AsyncRead`] and [`AsyncWrite`]. Their pending waiter is
@@ -604,25 +609,9 @@ impl TcpStream {
   /// EOF (`Ok(0)`) and partial-read behavior.
   pub async fn read(&self, buf: &mut [u8]) -> io::Result<usize> {
     if buf.is_empty() {
-      return Ok(0);
+      return ready_operation(|| Ok(0)).await;
     }
-    let mut attempts = 0;
-    loop {
-      if attempts == IO_BUDGET {
-        yield_once().await;
-        attempts = 0;
-      }
-      let guard = self.fd.readable().await?;
-      attempts += 1;
-      match guard.try_io(|stream| (&*stream).read(buf)) {
-        Err(error)
-          if matches!(
-            error.kind(),
-            io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock
-          ) => {}
-        result => return result,
-      }
-    }
+    ready_io(&self.fd, IoDirection::Read, |stream| (&*stream).read(buf)).await
   }
 
   /// Reads once into initialized buffers after readable readiness.
@@ -633,25 +622,9 @@ impl TcpStream {
   /// Writes once after writable readiness, preserving partial-write counts.
   pub async fn write(&self, buf: &[u8]) -> io::Result<usize> {
     if buf.is_empty() {
-      return Ok(0);
+      return ready_operation(|| Ok(0)).await;
     }
-    let mut attempts = 0;
-    loop {
-      if attempts == IO_BUDGET {
-        yield_once().await;
-        attempts = 0;
-      }
-      let guard = self.fd.writable().await?;
-      attempts += 1;
-      match guard.try_io(|stream| (&*stream).write(buf)) {
-        Err(error)
-          if matches!(
-            error.kind(),
-            io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock
-          ) => {}
-        result => return result,
-      }
-    }
+    ready_io(&self.fd, IoDirection::Write, |stream| (&*stream).write(buf)).await
   }
 
   /// Writes once from initialized buffers after writable readiness.
@@ -661,12 +634,12 @@ impl TcpStream {
 
   /// TCP flush is a no-op because writes go directly to the socket.
   pub async fn flush(&self) -> io::Result<()> {
-    Ok(())
+    ready_operation(|| Ok(())).await
   }
 
   /// Shuts down the local write half. The read half remains usable.
   pub async fn shutdown(&self) -> io::Result<()> {
-    self.get_ref().shutdown(std::net::Shutdown::Write)
+    ready_operation(|| self.get_ref().shutdown(std::net::Shutdown::Write)).await
   }
 
   /// Cancels readiness waits retained by [`AsyncRead`] or [`AsyncWrite`]
@@ -680,223 +653,112 @@ impl TcpStream {
 
 impl AsyncRead for TcpStream {
   fn poll_read(
-    mut self: Pin<&mut Self>,
+    self: Pin<&mut Self>,
     cx: &mut Context<'_>,
     buf: &mut [u8],
   ) -> Poll<io::Result<usize>> {
-    let this = self.as_mut().get_mut();
+    let this = self.get_mut();
     if buf.is_empty() {
-      this.read_waiter = None;
-      return Poll::Ready(Ok(0));
+      return super::asynchronous::poll_cooperative(cx, |_| {
+        drop(this.read_waiter.take());
+        Poll::Ready(Ok(0))
+      });
     }
-    let mut attempts = 0;
-    loop {
-      if attempts == IO_BUDGET {
-        cx.waker().wake_by_ref();
-        return Poll::Pending;
-      }
-      if this.read_waiter.is_none() {
-        this.read_waiter = Some(this.fd.readable_owned());
-      }
-      let readiness = match this.read_waiter.as_mut() {
-        Some(readiness) => Pin::new(readiness).poll(cx),
-        None => unreachable!("read waiter was just created"),
-      };
-      match readiness {
-        Poll::Pending => return Poll::Pending,
-        Poll::Ready(Err(error)) => {
-          this.read_waiter = None;
-          return Poll::Ready(Err(error));
-        }
-        Poll::Ready(Ok(guard)) => {
-          this.read_waiter = None;
-          attempts += 1;
-          match guard.try_io(|stream| (&*stream).read(buf)) {
-            Err(error)
-              if matches!(
-                error.kind(),
-                io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock
-              ) => {}
-            result => return Poll::Ready(result),
-          }
-        }
-      }
-    }
+    poll_io_with_retry(
+      cx,
+      &this.fd,
+      &mut this.read_waiter,
+      IoDirection::Read,
+      |stream| (&*stream).read(buf),
+    )
   }
 
   fn poll_read_vectored(
-    mut self: Pin<&mut Self>,
+    self: Pin<&mut Self>,
     cx: &mut Context<'_>,
     bufs: &mut [IoSliceMut<'_>],
   ) -> Poll<io::Result<usize>> {
-    let this = self.as_mut().get_mut();
-    let offered = match read_vectored_len(bufs) {
-      Ok(len) => len,
-      Err(error) => {
-        this.read_waiter = None;
-        return Poll::Ready(Err(error));
-      }
-    };
-    if offered == 0 {
-      this.read_waiter = None;
-      return Poll::Ready(Ok(0));
-    }
-    let mut attempts = 0;
-    loop {
-      if attempts == IO_BUDGET {
-        cx.waker().wake_by_ref();
-        return Poll::Pending;
-      }
-      if this.read_waiter.is_none() {
-        this.read_waiter = Some(this.fd.readable_owned());
-      }
-      let readiness = match this.read_waiter.as_mut() {
-        Some(readiness) => Pin::new(readiness).poll(cx),
-        None => unreachable!("read waiter was just created"),
-      };
-      match readiness {
-        Poll::Pending => return Poll::Pending,
-        Poll::Ready(Err(error)) => {
-          this.read_waiter = None;
-          return Poll::Ready(Err(error));
-        }
-        Poll::Ready(Ok(guard)) => {
-          this.read_waiter = None;
-          attempts += 1;
-          match guard.try_io(|stream| {
-            let mut stream = stream;
-            stream.read_vectored(bufs)
-          }) {
-            Err(error)
-              if matches!(
-                error.kind(),
-                io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock
-              ) => {}
-            Ok(count) if count > offered => {
-              return Poll::Ready(Err(io::ErrorKind::InvalidData.into()));
-            }
-            result => return Poll::Ready(result),
+    let this = self.get_mut();
+    poll_vectored_io_with_retry(
+      cx,
+      &this.fd,
+      &mut this.read_waiter,
+      IoDirection::Read,
+      |stream| match stream {
+        None => read_vectored_len(bufs).map(|len| {
+          if len == 0 {
+            VectoredCall::Empty
+          } else {
+            VectoredCall::Offered(len)
           }
+        }),
+        Some(stream) => {
+          let mut stream = stream;
+          stream.read_vectored(bufs).map(VectoredCall::Count)
         }
-      }
-    }
+      },
+    )
   }
 }
 
 impl AsyncWrite for TcpStream {
-  fn poll_write(
-    mut self: Pin<&mut Self>,
-    cx: &mut Context<'_>,
-    buf: &[u8],
-  ) -> Poll<io::Result<usize>> {
-    let this = self.as_mut().get_mut();
+  fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+    let this = self.get_mut();
     if buf.is_empty() {
-      this.write_waiter = None;
-      return Poll::Ready(Ok(0));
+      return super::asynchronous::poll_cooperative(cx, |_| {
+        drop(this.write_waiter.take());
+        Poll::Ready(Ok(0))
+      });
     }
-    let mut attempts = 0;
-    loop {
-      if attempts == IO_BUDGET {
-        cx.waker().wake_by_ref();
-        return Poll::Pending;
-      }
-      if this.write_waiter.is_none() {
-        this.write_waiter = Some(this.fd.writable_owned());
-      }
-      let readiness = match this.write_waiter.as_mut() {
-        Some(readiness) => Pin::new(readiness).poll(cx),
-        None => unreachable!("write waiter was just created"),
-      };
-      match readiness {
-        Poll::Pending => return Poll::Pending,
-        Poll::Ready(Err(error)) => {
-          this.write_waiter = None;
-          return Poll::Ready(Err(error));
-        }
-        Poll::Ready(Ok(guard)) => {
-          this.write_waiter = None;
-          attempts += 1;
-          match guard.try_io(|stream| (&*stream).write(buf)) {
-            Err(error)
-              if matches!(
-                error.kind(),
-                io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock
-              ) => {}
-            result => return Poll::Ready(result),
-          }
-        }
-      }
-    }
+    poll_io_with_retry(
+      cx,
+      &this.fd,
+      &mut this.write_waiter,
+      IoDirection::Write,
+      |stream| (&*stream).write(buf),
+    )
   }
 
   fn poll_write_vectored(
-    mut self: Pin<&mut Self>,
+    self: Pin<&mut Self>,
     cx: &mut Context<'_>,
     bufs: &[IoSlice<'_>],
   ) -> Poll<io::Result<usize>> {
-    let this = self.as_mut().get_mut();
-    let offered = match write_vectored_len(bufs) {
-      Ok(len) => len,
-      Err(error) => {
-        this.write_waiter = None;
-        return Poll::Ready(Err(error));
-      }
-    };
-    if offered == 0 {
-      this.write_waiter = None;
-      return Poll::Ready(Ok(0));
-    }
-    let mut attempts = 0;
-    loop {
-      if attempts == IO_BUDGET {
-        cx.waker().wake_by_ref();
-        return Poll::Pending;
-      }
-      if this.write_waiter.is_none() {
-        this.write_waiter = Some(this.fd.writable_owned());
-      }
-      let readiness = match this.write_waiter.as_mut() {
-        Some(readiness) => Pin::new(readiness).poll(cx),
-        None => unreachable!("write waiter was just created"),
-      };
-      match readiness {
-        Poll::Pending => return Poll::Pending,
-        Poll::Ready(Err(error)) => {
-          this.write_waiter = None;
-          return Poll::Ready(Err(error));
-        }
-        Poll::Ready(Ok(guard)) => {
-          this.write_waiter = None;
-          attempts += 1;
-          match guard.try_io(|stream| {
-            let mut stream = stream;
-            stream.write_vectored(bufs)
-          }) {
-            Err(error)
-              if matches!(
-                error.kind(),
-                io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock
-              ) => {}
-            Ok(count) if count > offered => {
-              return Poll::Ready(Err(io::ErrorKind::InvalidData.into()));
-            }
-            result => return Poll::Ready(result),
+    let this = self.get_mut();
+    poll_vectored_io_with_retry(
+      cx,
+      &this.fd,
+      &mut this.write_waiter,
+      IoDirection::Write,
+      |stream| match stream {
+        None => write_vectored_len(bufs).map(|len| {
+          if len == 0 {
+            VectoredCall::Empty
+          } else {
+            VectoredCall::Offered(len)
           }
+        }),
+        Some(stream) => {
+          let mut stream = stream;
+          stream.write_vectored(bufs).map(VectoredCall::Count)
         }
-      }
-    }
+      },
+    )
   }
 
   fn is_write_vectored(&self) -> bool {
     true
   }
 
-  fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-    Poll::Ready(Ok(()))
+  fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+    super::asynchronous::poll_cooperative(cx, |_| Poll::Ready(Ok(())))
   }
 
   fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-    Poll::Ready(self.get_mut().get_ref().shutdown(std::net::Shutdown::Write))
+    let this = self.get_mut();
+    super::asynchronous::poll_cooperative(_cx, |_| {
+      Poll::Ready(this.get_ref().shutdown(std::net::Shutdown::Write))
+    })
   }
 }
 
@@ -937,27 +799,11 @@ impl TcpListener {
   /// [`AcceptError::Registration`] returns that accepted socket to the
   /// caller; the connection has already been consumed from the listen queue.
   pub async fn accept(&self) -> Result<(TcpStream, SocketAddr), AcceptError> {
-    let mut attempts = 0;
-    loop {
-      if attempts == IO_BUDGET {
-        yield_once().await;
-        attempts = 0;
-      }
-      let guard = self.fd.readable().await.map_err(AcceptError::Io)?;
-      attempts += 1;
-      match guard.try_io(|listener| listener.accept()) {
-        Err(error)
-          if matches!(
-            error.kind(),
-            io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock
-          ) => {}
-        Err(error) => return Err(AcceptError::Io(error)),
-        Ok((stream, address)) => match TcpStream::from_std(stream, &self.reactor) {
-          Ok(stream) => return Ok((stream, address)),
-          Err(error) => return Err(AcceptError::Registration(error)),
-        },
-      }
-    }
+    let (stream, address) = ready_io(&self.fd, IoDirection::Read, |listener| listener.accept())
+      .await
+      .map_err(AcceptError::Io)?;
+    let stream = TcpStream::from_std(stream, &self.reactor).map_err(AcceptError::Registration)?;
+    Ok((stream, address))
   }
 }
 
@@ -1409,9 +1255,13 @@ impl NetHandle {
       }
     };
     let mut attempt = ConnectAttempt::new(stream, permit);
-    let pending = match initiate_tcp_connect(attempt.stream_ref(), &address, |stream, address| {
-      rnet::connect(stream, address)
-    }) {
+    let pending = match ready_operation(|| {
+      initiate_tcp_connect(attempt.stream_ref(), &address, |stream, address| {
+        rnet::connect(stream, address)
+      })
+    })
+    .await
+    {
       Ok(pending) => pending,
       Err(error) => {
         return Err(TcpConnectError::Operation(NetworkError::Io(error)));
@@ -1636,39 +1486,69 @@ async fn wait_for_tcp_connect(
       yield_once().await;
       endpoint_calls = 0;
     }
-    let guard = poll_fn(|cx| {
-      if attempt.waiter.is_none() {
-        attempt.waiter = Some(attempt.stream_fd().writable_owned());
-      }
-      let waiter = match attempt.waiter.as_mut() {
-        Some(waiter) => waiter,
-        None => unreachable!("connect readiness waiter was just created"),
-      };
-      match Pin::new(waiter).poll(cx) {
-        Poll::Pending => Poll::Pending,
-        Poll::Ready(Err(error)) => {
-          drop(attempt.waiter.take());
-          Poll::Ready(Err(error))
+    let mut stale_would_block = false;
+    let connected = poll_fn(|cx| {
+      let result = super::asynchronous::poll_cooperative(cx, |cx| {
+        if attempt.waiter.is_none() {
+          attempt.waiter = Some(attempt.stream_fd().writable_owned());
         }
-        Poll::Ready(Ok(guard)) => {
-          drop(attempt.waiter.take());
-          Poll::Ready(Ok(guard))
+        let waiter = match attempt.waiter.as_mut() {
+          Some(waiter) => waiter,
+          None => unreachable!("connect readiness waiter was just created"),
+        };
+        match Pin::new(waiter).poll(cx) {
+          Poll::Pending => Poll::Pending,
+          Poll::Ready(Err(error)) => {
+            drop(attempt.waiter.take());
+            Poll::Ready(Err(error))
+          }
+          Poll::Ready(Ok(guard)) => {
+            drop(attempt.waiter.take());
+            let mut calls = 0;
+            let probe = guard.try_io(|stream| {
+              calls += 1;
+              let socket_error = rnet::sockopt::socket_error(stream)?;
+              classify_connect_probe(socket_error, || {
+                calls += 1;
+                stream.peer_addr()
+              })
+            });
+            endpoint_calls += calls;
+            match probe {
+              Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                stale_would_block = true;
+                Poll::Pending
+              }
+              probe => Poll::Ready(finish_connect_probe(probe)),
+            }
+          }
         }
+      });
+      match result {
+        Poll::Pending if stale_would_block => Poll::Ready(Ok(false)),
+        result => result,
       }
     })
     .await?;
-    let connected = finish_connect_probe(guard.try_io(|stream| {
-      let socket_error = rnet::sockopt::socket_error(stream)?;
-      classify_connect_probe(socket_error, || stream.peer_addr())
-    }));
-    match connected {
-      Ok(true) => return Ok(()),
-      Ok(false) => {
-        endpoint_calls += 2;
-      }
-      Err(error) => return Err(error),
+    if connected {
+      return Ok(());
     }
   }
+}
+
+/// Self-wakes once so manual and foreign polls also cap connect probes.
+async fn yield_once() {
+  let mut yielded = false;
+  poll_fn(|cx| {
+    if yielded {
+      Poll::Ready(())
+    } else {
+      yielded = true;
+      cx.waker().wake_by_ref();
+      Poll::Pending
+    }
+  })
+  .await
 }
 
 enum ConnectWorkerError {
@@ -1815,23 +1695,7 @@ impl UdpSocket {
   /// `connect`. Empty buffers still send a zero-length datagram. Peer
   /// selection is explicit; this method performs no DNS or connection retry.
   pub async fn send(&self, buf: &[u8]) -> io::Result<usize> {
-    let mut attempts = 0;
-    loop {
-      if attempts == IO_BUDGET {
-        yield_once().await;
-        attempts = 0;
-      }
-      let guard = self.fd.writable().await?;
-      attempts += 1;
-      match guard.try_io(|socket| socket.send(buf)) {
-        Err(error)
-          if matches!(
-            error.kind(),
-            io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock
-          ) => {}
-        result => return result,
-      }
-    }
+    ready_io(&self.fd, IoDirection::Write, |socket| socket.send(buf)).await
   }
 
   /// Receives one datagram, using the kernel's connected-peer filtering when
@@ -1861,67 +1725,22 @@ impl UdpSocket {
     &self,
     mut operation: impl FnMut(&StdUdpSocket) -> io::Result<T>,
   ) -> io::Result<T> {
-    let mut attempts = 0;
-    loop {
-      if attempts == IO_BUDGET {
-        yield_once().await;
-        attempts = 0;
-      }
-      let guard = self.fd.readable().await?;
-      attempts += 1;
-      match guard.try_io(&mut operation) {
-        Err(error)
-          if matches!(
-            error.kind(),
-            io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock
-          ) => {}
-        result => return result,
-      }
-    }
+    ready_io(&self.fd, IoDirection::Read, |socket| operation(socket)).await
   }
 
   /// Sends one complete datagram in one syscall. A short successful count is
   /// returned as reported by the operating system.
   pub async fn send_to(&self, buf: &[u8], address: SocketAddr) -> io::Result<usize> {
-    let mut attempts = 0;
-    loop {
-      if attempts == IO_BUDGET {
-        yield_once().await;
-        attempts = 0;
-      }
-      let guard = self.fd.writable().await?;
-      attempts += 1;
-      match guard.try_io(|socket| socket.send_to(buf, address)) {
-        Err(error)
-          if matches!(
-            error.kind(),
-            io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock
-          ) => {}
-        result => return result,
-      }
-    }
+    ready_io(&self.fd, IoDirection::Write, |socket| {
+      socket.send_to(buf, address)
+    })
+    .await
   }
 
   /// Receives one datagram into the initialized buffer and returns its source.
   /// A datagram larger than `buf` is truncated by the operating system.
   pub async fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
-    let mut attempts = 0;
-    loop {
-      if attempts == IO_BUDGET {
-        yield_once().await;
-        attempts = 0;
-      }
-      let guard = self.fd.readable().await?;
-      attempts += 1;
-      match guard.try_io(|socket| socket.recv_from(buf)) {
-        Err(error)
-          if matches!(
-            error.kind(),
-            io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock
-          ) => {}
-        result => return result,
-      }
-    }
+    ready_io(&self.fd, IoDirection::Read, |socket| socket.recv_from(buf)).await
   }
 }
 
@@ -1983,11 +1802,11 @@ mod unix {
     }
     /// Flushes the direct socket writer.
     pub async fn flush(&self) -> io::Result<()> {
-      Ok(())
+      super::ready_operation(|| Ok(())).await
     }
     /// Shuts down the local write half.
     pub async fn shutdown(&self) -> io::Result<()> {
-      self.get_ref().shutdown(std::net::Shutdown::Write)
+      super::ready_operation(|| self.get_ref().shutdown(std::net::Shutdown::Write)).await
     }
 
     /// Cancels readiness waits retained by [`AsyncRead`] or [`AsyncWrite`]
@@ -1997,227 +1816,125 @@ mod unix {
       self.read_waiter = None;
       self.write_waiter = None;
     }
+
+    #[cfg(test)]
+    pub(super) fn read_waiter_is_none(&self) -> bool {
+      self.read_waiter.is_none()
+    }
   }
 
   impl AsyncRead for UnixStream {
     fn poll_read(
-      mut self: Pin<&mut Self>,
+      self: Pin<&mut Self>,
       cx: &mut Context<'_>,
       buf: &mut [u8],
     ) -> Poll<io::Result<usize>> {
-      let this = self.as_mut().get_mut();
+      let this = self.get_mut();
       if buf.is_empty() {
-        this.read_waiter = None;
-        return Poll::Ready(Ok(0));
+        return super::super::asynchronous::poll_cooperative(cx, |_| {
+          drop(this.read_waiter.take());
+          Poll::Ready(Ok(0))
+        });
       }
-      let mut attempts = 0;
-      loop {
-        if attempts == IO_BUDGET {
-          cx.waker().wake_by_ref();
-          return Poll::Pending;
-        }
-        if this.read_waiter.is_none() {
-          this.read_waiter = Some(this.fd.readable_owned());
-        }
-        let readiness = match this.read_waiter.as_mut() {
-          Some(readiness) => Pin::new(readiness).poll(cx),
-          None => unreachable!("read waiter was just created"),
-        };
-        match readiness {
-          Poll::Pending => return Poll::Pending,
-          Poll::Ready(Err(error)) => {
-            this.read_waiter = None;
-            return Poll::Ready(Err(error));
-          }
-          Poll::Ready(Ok(guard)) => {
-            this.read_waiter = None;
-            attempts += 1;
-            match guard.try_io(|stream| (&*stream).read(buf)) {
-              Err(error)
-                if matches!(
-                  error.kind(),
-                  io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock
-                ) => {}
-              result => return Poll::Ready(result),
-            }
-          }
-        }
-      }
+      super::poll_io_with_retry(
+        cx,
+        &this.fd,
+        &mut this.read_waiter,
+        super::IoDirection::Read,
+        |stream| (&*stream).read(buf),
+      )
     }
 
     fn poll_read_vectored(
-      mut self: Pin<&mut Self>,
+      self: Pin<&mut Self>,
       cx: &mut Context<'_>,
       bufs: &mut [IoSliceMut<'_>],
     ) -> Poll<io::Result<usize>> {
-      let this = self.as_mut().get_mut();
-      let offered = match read_vectored_len(bufs) {
-        Ok(len) => len,
-        Err(error) => {
-          this.read_waiter = None;
-          return Poll::Ready(Err(error));
-        }
-      };
-      if offered == 0 {
-        this.read_waiter = None;
-        return Poll::Ready(Ok(0));
-      }
-      let mut attempts = 0;
-      loop {
-        if attempts == IO_BUDGET {
-          cx.waker().wake_by_ref();
-          return Poll::Pending;
-        }
-        if this.read_waiter.is_none() {
-          this.read_waiter = Some(this.fd.readable_owned());
-        }
-        let readiness = match this.read_waiter.as_mut() {
-          Some(readiness) => Pin::new(readiness).poll(cx),
-          None => unreachable!("read waiter was just created"),
-        };
-        match readiness {
-          Poll::Pending => return Poll::Pending,
-          Poll::Ready(Err(error)) => {
-            this.read_waiter = None;
-            return Poll::Ready(Err(error));
-          }
-          Poll::Ready(Ok(guard)) => {
-            this.read_waiter = None;
-            attempts += 1;
-            match guard.try_io(|stream| {
-              let mut stream = stream;
-              stream.read_vectored(bufs)
-            }) {
-              Err(error)
-                if matches!(
-                  error.kind(),
-                  io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock
-                ) => {}
-              Ok(count) if count > offered => {
-                return Poll::Ready(Err(io::ErrorKind::InvalidData.into()));
-              }
-              result => return Poll::Ready(result),
+      let this = self.get_mut();
+      super::poll_vectored_io_with_retry(
+        cx,
+        &this.fd,
+        &mut this.read_waiter,
+        super::IoDirection::Read,
+        |stream| match stream {
+          None => read_vectored_len(bufs).map(|len| {
+            if len == 0 {
+              super::VectoredCall::Empty
+            } else {
+              super::VectoredCall::Offered(len)
             }
+          }),
+          Some(stream) => {
+            let mut stream = stream;
+            stream.read_vectored(bufs).map(super::VectoredCall::Count)
           }
-        }
-      }
+        },
+      )
     }
   }
 
   impl AsyncWrite for UnixStream {
     fn poll_write(
-      mut self: Pin<&mut Self>,
+      self: Pin<&mut Self>,
       cx: &mut Context<'_>,
       buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-      let this = self.as_mut().get_mut();
+      let this = self.get_mut();
       if buf.is_empty() {
-        this.write_waiter = None;
-        return Poll::Ready(Ok(0));
+        return super::super::asynchronous::poll_cooperative(cx, |_| {
+          drop(this.write_waiter.take());
+          Poll::Ready(Ok(0))
+        });
       }
-      let mut attempts = 0;
-      loop {
-        if attempts == IO_BUDGET {
-          cx.waker().wake_by_ref();
-          return Poll::Pending;
-        }
-        if this.write_waiter.is_none() {
-          this.write_waiter = Some(this.fd.writable_owned());
-        }
-        let readiness = match this.write_waiter.as_mut() {
-          Some(readiness) => Pin::new(readiness).poll(cx),
-          None => unreachable!("write waiter was just created"),
-        };
-        match readiness {
-          Poll::Pending => return Poll::Pending,
-          Poll::Ready(Err(error)) => {
-            this.write_waiter = None;
-            return Poll::Ready(Err(error));
-          }
-          Poll::Ready(Ok(guard)) => {
-            this.write_waiter = None;
-            attempts += 1;
-            match guard.try_io(|stream| (&*stream).write(buf)) {
-              Err(error)
-                if matches!(
-                  error.kind(),
-                  io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock
-                ) => {}
-              result => return Poll::Ready(result),
-            }
-          }
-        }
-      }
+      super::poll_io_with_retry(
+        cx,
+        &this.fd,
+        &mut this.write_waiter,
+        super::IoDirection::Write,
+        |stream| (&*stream).write(buf),
+      )
     }
 
     fn poll_write_vectored(
-      mut self: Pin<&mut Self>,
+      self: Pin<&mut Self>,
       cx: &mut Context<'_>,
       bufs: &[IoSlice<'_>],
     ) -> Poll<io::Result<usize>> {
-      let this = self.as_mut().get_mut();
-      let offered = match write_vectored_len(bufs) {
-        Ok(len) => len,
-        Err(error) => {
-          this.write_waiter = None;
-          return Poll::Ready(Err(error));
-        }
-      };
-      if offered == 0 {
-        this.write_waiter = None;
-        return Poll::Ready(Ok(0));
-      }
-      let mut attempts = 0;
-      loop {
-        if attempts == IO_BUDGET {
-          cx.waker().wake_by_ref();
-          return Poll::Pending;
-        }
-        if this.write_waiter.is_none() {
-          this.write_waiter = Some(this.fd.writable_owned());
-        }
-        let readiness = match this.write_waiter.as_mut() {
-          Some(readiness) => Pin::new(readiness).poll(cx),
-          None => unreachable!("write waiter was just created"),
-        };
-        match readiness {
-          Poll::Pending => return Poll::Pending,
-          Poll::Ready(Err(error)) => {
-            this.write_waiter = None;
-            return Poll::Ready(Err(error));
-          }
-          Poll::Ready(Ok(guard)) => {
-            this.write_waiter = None;
-            attempts += 1;
-            match guard.try_io(|stream| {
-              let mut stream = stream;
-              stream.write_vectored(bufs)
-            }) {
-              Err(error)
-                if matches!(
-                  error.kind(),
-                  io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock
-                ) => {}
-              Ok(count) if count > offered => {
-                return Poll::Ready(Err(io::ErrorKind::InvalidData.into()));
-              }
-              result => return Poll::Ready(result),
+      let this = self.get_mut();
+      super::poll_vectored_io_with_retry(
+        cx,
+        &this.fd,
+        &mut this.write_waiter,
+        super::IoDirection::Write,
+        |stream| match stream {
+          None => write_vectored_len(bufs).map(|len| {
+            if len == 0 {
+              super::VectoredCall::Empty
+            } else {
+              super::VectoredCall::Offered(len)
             }
+          }),
+          Some(stream) => {
+            let mut stream = stream;
+            stream.write_vectored(bufs).map(super::VectoredCall::Count)
           }
-        }
-      }
+        },
+      )
     }
 
     fn is_write_vectored(&self) -> bool {
       true
     }
 
-    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-      Poll::Ready(Ok(()))
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+      super::super::asynchronous::poll_cooperative(cx, |_| Poll::Ready(Ok(())))
     }
 
-    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-      Poll::Ready(self.get_mut().get_ref().shutdown(std::net::Shutdown::Write))
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+      let this = self.get_mut();
+      super::super::asynchronous::poll_cooperative(cx, |_| {
+        Poll::Ready(this.get_ref().shutdown(std::net::Shutdown::Write))
+      })
     }
   }
   impl fmt::Debug for UnixStream {
@@ -2249,27 +1966,14 @@ mod unix {
     pub async fn accept(
       &self,
     ) -> Result<(UnixStream, std::os::unix::net::SocketAddr), UnixAcceptError> {
-      let mut attempts = 0;
-      loop {
-        if attempts == IO_BUDGET {
-          yield_once().await;
-          attempts = 0;
-        }
-        let guard = self.fd.readable().await.map_err(UnixAcceptError::Io)?;
-        attempts += 1;
-        match guard.try_io(|listener| listener.accept()) {
-          Err(error)
-            if matches!(
-              error.kind(),
-              io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock
-            ) => {}
-          Err(error) => return Err(UnixAcceptError::Io(error)),
-          Ok((stream, address)) => match UnixStream::from_std(stream, &self.reactor) {
-            Ok(stream) => return Ok((stream, address)),
-            Err(error) => return Err(UnixAcceptError::Registration(error)),
-          },
-        }
-      }
+      let (stream, address) = super::ready_io(&self.fd, super::IoDirection::Read, |listener| {
+        listener.accept()
+      })
+      .await
+      .map_err(UnixAcceptError::Io)?;
+      let stream =
+        UnixStream::from_std(stream, &self.reactor).map_err(UnixAcceptError::Registration)?;
+      Ok((stream, address))
     }
   }
   impl fmt::Debug for UnixListener {
@@ -2318,23 +2022,10 @@ mod unix {
     }
     /// Sends one datagram to a filesystem Unix socket path.
     pub async fn send_to(&self, buf: &[u8], path: &std::path::Path) -> io::Result<usize> {
-      let mut attempts = 0;
-      loop {
-        if attempts == IO_BUDGET {
-          yield_once().await;
-          attempts = 0;
-        }
-        let guard = self.fd.writable().await?;
-        attempts += 1;
-        match guard.try_io(|socket| socket.send_to(buf, path)) {
-          Err(error)
-            if matches!(
-              error.kind(),
-              io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock
-            ) => {}
-          result => return result,
-        }
-      }
+      super::ready_io(&self.fd, super::IoDirection::Write, |socket| {
+        socket.send_to(buf, path)
+      })
+      .await
     }
     /// Receives one datagram in one syscall.
     pub async fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
@@ -2345,23 +2036,10 @@ mod unix {
       &self,
       buf: &mut [u8],
     ) -> io::Result<(usize, std::os::unix::net::SocketAddr)> {
-      let mut attempts = 0;
-      loop {
-        if attempts == IO_BUDGET {
-          yield_once().await;
-          attempts = 0;
-        }
-        let guard = self.fd.readable().await?;
-        attempts += 1;
-        match guard.try_io(|socket| socket.recv_from(buf)) {
-          Err(error)
-            if matches!(
-              error.kind(),
-              io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock
-            ) => {}
-          result => return result,
-        }
-      }
+      super::ready_io(&self.fd, super::IoDirection::Read, |socket| {
+        socket.recv_from(buf)
+      })
+      .await
     }
   }
   impl fmt::Debug for UnixDatagram {
@@ -2372,85 +2050,24 @@ mod unix {
 
   async fn stream_read(fd: &AsyncFd<StdUnixStream>, buf: &mut [u8]) -> io::Result<usize> {
     if buf.is_empty() {
-      return Ok(0);
+      return super::ready_operation(|| Ok(0)).await;
     }
-    let mut attempts = 0;
-    loop {
-      if attempts == IO_BUDGET {
-        yield_once().await;
-        attempts = 0;
-      }
-      let g = fd.readable().await?;
-      attempts += 1;
-      match g.try_io(|s| (&*s).read(buf)) {
-        Err(e)
-          if matches!(
-            e.kind(),
-            io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock
-          ) => {}
-        r => return r,
-      }
-    }
+    super::ready_io(fd, super::IoDirection::Read, |stream| (&*stream).read(buf)).await
   }
   async fn stream_write(fd: &AsyncFd<StdUnixStream>, buf: &[u8]) -> io::Result<usize> {
     if buf.is_empty() {
-      return Ok(0);
+      return super::ready_operation(|| Ok(0)).await;
     }
-    let mut attempts = 0;
-    loop {
-      if attempts == IO_BUDGET {
-        yield_once().await;
-        attempts = 0;
-      }
-      let g = fd.writable().await?;
-      attempts += 1;
-      match g.try_io(|s| (&*s).write(buf)) {
-        Err(e)
-          if matches!(
-            e.kind(),
-            io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock
-          ) => {}
-        r => return r,
-      }
-    }
+    super::ready_io(fd, super::IoDirection::Write, |stream| {
+      (&*stream).write(buf)
+    })
+    .await
   }
   async fn datagram_send(fd: &AsyncFd<StdUnixDatagram>, buf: &[u8]) -> io::Result<usize> {
-    let mut attempts = 0;
-    loop {
-      if attempts == IO_BUDGET {
-        yield_once().await;
-        attempts = 0;
-      }
-      let g = fd.writable().await?;
-      attempts += 1;
-      match g.try_io(|s| s.send(buf)) {
-        Err(e)
-          if matches!(
-            e.kind(),
-            io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock
-          ) => {}
-        r => return r,
-      }
-    }
+    super::ready_io(fd, super::IoDirection::Write, |socket| socket.send(buf)).await
   }
   async fn datagram_recv(fd: &AsyncFd<StdUnixDatagram>, buf: &mut [u8]) -> io::Result<usize> {
-    let mut attempts = 0;
-    loop {
-      if attempts == IO_BUDGET {
-        yield_once().await;
-        attempts = 0;
-      }
-      let g = fd.readable().await?;
-      attempts += 1;
-      match g.try_io(|s| s.recv(buf)) {
-        Err(e)
-          if matches!(
-            e.kind(),
-            io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock
-          ) => {}
-        r => return r,
-      }
-    }
+    super::ready_io(fd, super::IoDirection::Read, |socket| socket.recv(buf)).await
   }
 
   pub use self::UnixAcceptError as PublicUnixAcceptError;
@@ -2465,17 +2082,194 @@ pub use unix::{
   PublicUnixListener as UnixListener, PublicUnixStream as UnixStream,
 };
 
-/// Yields after a bounded run of interrupted syscalls.
-async fn yield_once() {
-  let mut yielded = false;
-  std::future::poll_fn(|cx| {
-    if yielded {
-      Poll::Ready(())
-    } else {
-      yielded = true;
-      cx.waker().wake_by_ref();
-      Poll::Pending
+#[derive(Clone, Copy)]
+enum IoDirection {
+  Read,
+  Write,
+}
+
+#[derive(Debug)]
+enum IoAttempt<T> {
+  RetryCharged,
+  RetryRefunded,
+  Complete(io::Result<T>),
+}
+
+enum VectoredCall {
+  Empty,
+  Offered(usize),
+  Count(usize),
+}
+
+/// Polls one readiness-plus-syscall attempt behind the shared cooperative
+/// gate. `Interrupted` commits the unit. Stale `WouldBlock` returns Pending
+/// inside the gate to refund the unit, then is translated to a retry so the
+/// loop re-registers readiness before it can return Pending to its caller.
+/// The owned waiter remains in `waiter` across readiness Pending and is
+/// removed before a terminal result.
+fn poll_io_attempt<T, R>(
+  cx: &mut Context<'_>,
+  fd: &AsyncFd<T>,
+  waiter: &mut Option<OwnedReadiness<T>>,
+  direction: IoDirection,
+  operation: impl FnOnce(&T) -> io::Result<R>,
+) -> Poll<IoAttempt<R>> {
+  let mut stale_would_block = false;
+  let result = super::asynchronous::poll_cooperative(cx, |cx| {
+    if waiter.is_none() {
+      *waiter = Some(match direction {
+        IoDirection::Read => fd.readable_owned(),
+        IoDirection::Write => fd.writable_owned(),
+      });
     }
+    let readiness = match waiter.as_mut() {
+      Some(readiness) => Pin::new(readiness).poll(cx),
+      None => unreachable!("readiness waiter was just created"),
+    };
+    match readiness {
+      Poll::Pending => Poll::Pending,
+      Poll::Ready(Err(error)) => {
+        drop(waiter.take());
+        Poll::Ready(IoAttempt::Complete(Err(error)))
+      }
+      Poll::Ready(Ok(guard)) => {
+        drop(waiter.take());
+        match guard.try_io(operation) {
+          Err(error) if error.kind() == io::ErrorKind::Interrupted => {
+            Poll::Ready(IoAttempt::RetryCharged)
+          }
+          Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+            stale_would_block = true;
+            Poll::Pending
+          }
+          result => Poll::Ready(IoAttempt::Complete(result)),
+        }
+      }
+    }
+  });
+  match result {
+    Poll::Pending if stale_would_block => Poll::Ready(IoAttempt::RetryRefunded),
+    result => result,
+  }
+}
+
+/// Polls at most `IO_BUDGET` endpoint attempts in one poll. On that local cap,
+/// readiness has already been cleared by the last stale syscall, so self-wake
+/// before returning Pending; every next syscall must pass the shared gate.
+fn poll_io_with_retry<T, R>(
+  cx: &mut Context<'_>,
+  fd: &AsyncFd<T>,
+  waiter: &mut Option<OwnedReadiness<T>>,
+  direction: IoDirection,
+  mut operation: impl FnMut(&T) -> io::Result<R>,
+) -> Poll<io::Result<R>> {
+  let mut attempts = 0;
+  loop {
+    if attempts == IO_BUDGET {
+      cx.waker().wake_by_ref();
+      return Poll::Pending;
+    }
+    match poll_io_attempt(cx, fd, waiter, direction, |value| operation(value)) {
+      Poll::Pending => return Poll::Pending,
+      Poll::Ready(IoAttempt::RetryCharged | IoAttempt::RetryRefunded) => attempts += 1,
+      Poll::Ready(IoAttempt::Complete(result)) => return Poll::Ready(result),
+    }
+  }
+}
+
+fn poll_vectored_io_with_retry<T>(
+  cx: &mut Context<'_>,
+  fd: &AsyncFd<T>,
+  waiter: &mut Option<OwnedReadiness<T>>,
+  direction: IoDirection,
+  mut operation: impl FnMut(Option<&T>) -> io::Result<VectoredCall>,
+) -> Poll<io::Result<usize>> {
+  let mut attempts = 0;
+  loop {
+    if attempts == IO_BUDGET {
+      cx.waker().wake_by_ref();
+      return Poll::Pending;
+    }
+    let mut stale_would_block = false;
+    let attempt = super::asynchronous::poll_cooperative(cx, |cx| {
+      let offered = match operation(None) {
+        Ok(VectoredCall::Offered(offered)) => offered,
+        Ok(VectoredCall::Empty) => {
+          drop(waiter.take());
+          return Poll::Ready(Some(Ok(0)));
+        }
+        Ok(VectoredCall::Count(_)) => {
+          drop(waiter.take());
+          return Poll::Ready(Some(Err(io::ErrorKind::InvalidData.into())));
+        }
+        Err(error) => {
+          drop(waiter.take());
+          return Poll::Ready(Some(Err(error)));
+        }
+      };
+      if waiter.is_none() {
+        *waiter = Some(match direction {
+          IoDirection::Read => fd.readable_owned(),
+          IoDirection::Write => fd.writable_owned(),
+        });
+      }
+      let readiness = match waiter.as_mut() {
+        Some(readiness) => Pin::new(readiness).poll(cx),
+        None => unreachable!("readiness waiter was just created"),
+      };
+      match readiness {
+        Poll::Pending => Poll::Pending,
+        Poll::Ready(Err(error)) => {
+          drop(waiter.take());
+          Poll::Ready(Some(Err(error)))
+        }
+        Poll::Ready(Ok(guard)) => {
+          drop(waiter.take());
+          match guard.try_io(|value| operation(Some(value))) {
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => Poll::Ready(None),
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+              stale_would_block = true;
+              Poll::Pending
+            }
+            Ok(VectoredCall::Count(count)) => {
+              Poll::Ready(Some(checked_vectored_count(count, offered)))
+            }
+            Ok(VectoredCall::Empty | VectoredCall::Offered(_)) => {
+              Poll::Ready(Some(Err(io::ErrorKind::InvalidData.into())))
+            }
+            Err(error) => Poll::Ready(Some(Err(error))),
+          }
+        }
+      }
+    });
+    match attempt {
+      Poll::Pending if stale_would_block => attempts += 1,
+      Poll::Pending => return Poll::Pending,
+      Poll::Ready(None) => attempts += 1,
+      Poll::Ready(Some(result)) => return Poll::Ready(result),
+    }
+  }
+}
+
+async fn ready_io<T, R>(
+  fd: &AsyncFd<T>,
+  direction: IoDirection,
+  mut operation: impl FnMut(&T) -> io::Result<R>,
+) -> io::Result<R> {
+  let mut waiter = None;
+  poll_fn(|cx| poll_io_with_retry(cx, fd, &mut waiter, direction, &mut operation)).await
+}
+
+async fn ready_operation<R>(operation: impl FnOnce() -> R) -> R {
+  let mut operation = Some(operation);
+  poll_fn(|cx| {
+    super::asynchronous::poll_cooperative(cx, |_| {
+      let operation = match operation.take() {
+        Some(operation) => operation,
+        None => unreachable!("cooperative operation completes in one poll"),
+      };
+      Poll::Ready(operation())
+    })
   })
   .await
 }
@@ -2508,62 +2302,58 @@ async fn stream_read_vectored<T>(fd: &AsyncFd<T>, bufs: &mut [IoSliceMut<'_>]) -
 where
   for<'a> &'a T: Read,
 {
-  let offered = read_vectored_len(bufs)?;
-  if offered == 0 {
-    return Ok(0);
-  }
-  let mut attempts = 0;
-  loop {
-    if attempts == IO_BUDGET {
-      yield_once().await;
-      attempts = 0;
-    }
-    let guard = fd.readable().await?;
-    attempts += 1;
-    match guard.try_io(|stream| {
-      let mut stream = stream;
-      stream.read_vectored(bufs)
-    }) {
-      Err(error)
-        if matches!(
-          error.kind(),
-          io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock
-        ) => {}
-      Ok(count) => return checked_vectored_count(count, offered),
-      Err(error) => return Err(error),
-    }
-  }
+  let mut waiter = None;
+  poll_fn(|cx| {
+    poll_vectored_io_with_retry(
+      cx,
+      fd,
+      &mut waiter,
+      IoDirection::Read,
+      |stream| match stream {
+        None => read_vectored_len(bufs).map(|len| {
+          if len == 0 {
+            VectoredCall::Empty
+          } else {
+            VectoredCall::Offered(len)
+          }
+        }),
+        Some(stream) => {
+          let mut stream = stream;
+          stream.read_vectored(bufs).map(VectoredCall::Count)
+        }
+      },
+    )
+  })
+  .await
 }
 
 async fn stream_write_vectored<T>(fd: &AsyncFd<T>, bufs: &[IoSlice<'_>]) -> io::Result<usize>
 where
   for<'a> &'a T: Write,
 {
-  let offered = write_vectored_len(bufs)?;
-  if offered == 0 {
-    return Ok(0);
-  }
-  let mut attempts = 0;
-  loop {
-    if attempts == IO_BUDGET {
-      yield_once().await;
-      attempts = 0;
-    }
-    let guard = fd.writable().await?;
-    attempts += 1;
-    match guard.try_io(|stream| {
-      let mut stream = stream;
-      stream.write_vectored(bufs)
-    }) {
-      Err(error)
-        if matches!(
-          error.kind(),
-          io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock
-        ) => {}
-      Ok(count) => return checked_vectored_count(count, offered),
-      Err(error) => return Err(error),
-    }
-  }
+  let mut waiter = None;
+  poll_fn(|cx| {
+    poll_vectored_io_with_retry(
+      cx,
+      fd,
+      &mut waiter,
+      IoDirection::Write,
+      |stream| match stream {
+        None => write_vectored_len(bufs).map(|len| {
+          if len == 0 {
+            VectoredCall::Empty
+          } else {
+            VectoredCall::Offered(len)
+          }
+        }),
+        Some(stream) => {
+          let mut stream = stream;
+          stream.write_vectored(bufs).map(VectoredCall::Count)
+        }
+      },
+    )
+  })
+  .await
 }
 
 #[cfg(all(test, not(loom)))]
