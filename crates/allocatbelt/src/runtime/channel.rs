@@ -8,11 +8,14 @@
 //! order, so the channel does not promise FIFO message order across senders.
 //!
 //! The channel owns messages after enqueue. Closing the receiver rejects new
-//! sends, wakes queued senders, and leaves already queued messages available
-//! to drain. Dropping the receiver closes admission and drops queued messages
-//! after releasing the queue lock. Dropping an unsubmitted [`SendFuture`]
-//! cancels its wait and drops its offered value outside the queue lock;
-//! [`SendFuture::into_inner`] can recover that value before it is submitted.
+//! sends and wakes queued senders, while already-issued [`Permit`]s remain
+//! valid and can publish a message as the receiver drains. EOF waits for those
+//! permits to be sent or dropped. [`Sender::closed`] uses a separate bounded
+//! waiter table. Dropping the receiver revokes unused permits and drops queued
+//! messages after releasing the queue lock. Dropping an
+//! unsubmitted [`SendFuture`] cancels its wait and drops its offered value
+//! outside the queue lock; [`SendFuture::into_inner`] can recover that value
+//! before it is submitted.
 //!
 //! Managed buffers keep their own accounting while held by the send future,
 //! queued message, or receiver. Queue metadata is not part of that ledger.
@@ -44,6 +47,13 @@
 //! fn require_send<T: Send>() {}
 //! require_send::<RecvFuture<'static, Rc<()>>>();
 //! ```
+//!
+//! ```compile_fail
+//! use allocatbelt::runtime::channel::OwnedReserveFuture;
+//! use std::rc::Rc;
+//! fn require_send<T: Send>() {}
+//! require_send::<OwnedReserveFuture<Rc<()>>>();
+//! ```
 
 #![forbid(unsafe_code)]
 #![cfg_attr(not(test), deny(clippy::expect_used, clippy::unwrap_used))]
@@ -60,7 +70,9 @@ use std::sync::PoisonError;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::task::{Context, Poll, Waker};
 
-use super::semaphore::{AcquireError, AcquireMany, Permit, Semaphore, SemaphoreBuildError};
+use super::semaphore::{
+  AcquireError, AcquireMany, Permit as SemaphorePermit, Semaphore, SemaphoreBuildError,
+};
 use super::task::drop_contained;
 
 /// Constructs a bounded channel with a fixed message capacity and waiter
@@ -78,11 +90,22 @@ pub fn channel<T>(
   if bytes > isize::MAX as usize {
     return Err(BuildError::CapacityOverflow);
   }
+  let waiter_bytes = max_waiters
+    .checked_mul(std::mem::size_of::<ClosedWaiterSlot>())
+    .ok_or(BuildError::CapacityOverflow)?;
+  if waiter_bytes > isize::MAX as usize {
+    return Err(BuildError::CapacityOverflow);
+  }
 
   let mut queue = VecDeque::new();
   queue
     .try_reserve_exact(capacity)
     .map_err(|_| BuildError::AllocationFailed)?;
+  let mut closed_waiters = Vec::new();
+  closed_waiters
+    .try_reserve_exact(max_waiters)
+    .map_err(|_| BuildError::AllocationFailed)?;
+  closed_waiters.resize_with(max_waiters, ClosedWaiterSlot::new);
   let permits = Semaphore::new(capacity, max_waiters).map_err(|error| match error {
     SemaphoreBuildError::CapacityOverflow => BuildError::CapacityOverflow,
     SemaphoreBuildError::AllocationFailed => BuildError::AllocationFailed,
@@ -91,8 +114,11 @@ pub fn channel<T>(
     state: Mutex::new(QueueState {
       queue,
       closed: false,
+      receiver_dropped: false,
       senders_gone: false,
+      public_reservations: 0,
       receiver_waker: None,
+      closed_waiters,
     }),
     permits,
   });
@@ -139,6 +165,49 @@ pub enum SendErrorKind {
   /// The receiver has closed or been dropped.
   Closed,
 }
+
+/// Why a reservation could not be returned.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReserveError {
+  /// The receiver closed before the reservation was published.
+  Closed,
+  /// The bounded semaphore waiter table is full.
+  WaitersFull,
+  /// The reservation future has already completed.
+  Completed,
+}
+
+impl fmt::Display for ReserveError {
+  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    f.write_str(match self {
+      Self::Closed => "channel is closed",
+      Self::WaitersFull => "channel waiter table is full",
+      Self::Completed => "reservation future has completed",
+    })
+  }
+}
+
+impl std::error::Error for ReserveError {}
+
+/// Why a [`Sender::closed`] waiter could not be registered.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ClosedWaitError {
+  /// The bounded closed-waiter table has no free entry.
+  WaitersFull,
+  /// Every waiter entry has exhausted its generation counter.
+  GenerationExhausted,
+}
+
+impl fmt::Display for ClosedWaitError {
+  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    f.write_str(match self {
+      Self::WaitersFull => "closed waiter table is full",
+      Self::GenerationExhausted => "closed waiter generations are exhausted",
+    })
+  }
+}
+
+impl std::error::Error for ClosedWaitError {}
 
 impl fmt::Display for SendErrorKind {
   fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -190,7 +259,8 @@ impl<T: fmt::Debug> std::error::Error for SendError<T> {}
 pub enum TryRecvError {
   /// No message is queued yet.
   Empty,
-  /// The channel is closed and all queued messages have been consumed.
+  /// The channel is closed, queued messages are consumed, and reservations
+  /// have been sent or dropped.
   Closed,
 }
 
@@ -236,9 +306,63 @@ pub struct RecvFuture<'a, T> {
   completed: bool,
 }
 
+/// A future that waits for one bounded channel slot.
+#[must_use = "futures do nothing unless polled"]
+pub struct ReserveFuture<'a, T> {
+  sender: &'a Sender<T>,
+  acquire: Option<AcquireMany>,
+  completed: bool,
+}
+
+/// An owned reservation future retaining a clone of its sender.
+#[must_use = "futures do nothing unless polled"]
+pub struct OwnedReserveFuture<T> {
+  sender: Option<Sender<T>>,
+  acquire: Option<AcquireMany>,
+  completed: bool,
+}
+
+/// A borrowed channel slot. Dropping it returns capacity to the channel.
+pub struct Permit<'a, T> {
+  slot: Option<SlotPermit<T>>,
+  _sender: &'a Sender<T>,
+}
+
+/// An owned channel slot. Dropping it returns capacity to the channel.
+pub struct OwnedPermit<T> {
+  slot: Option<SlotPermit<T>>,
+  _sender: Option<Sender<T>>,
+}
+
+/// A future that completes after the receiver closes or is dropped.
+#[must_use = "futures do nothing unless polled"]
+pub struct ClosedFuture<'a, T> {
+  sender: &'a Sender<T>,
+  key: Option<WaiterKey>,
+  completed: Option<Result<(), ClosedWaitError>>,
+}
+
 struct Envelope<T> {
   value: T,
-  _permit: Permit,
+  _permit: SemaphorePermit,
+}
+
+struct SlotPermit<T> {
+  shared: Arc<Shared<T>>,
+  semaphore: Option<SemaphorePermit>,
+  active: bool,
+}
+
+struct ClosedWaiterSlot {
+  generation: u64,
+  exhausted: bool,
+  waker: Option<Waker>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct WaiterKey {
+  index: usize,
+  generation: u64,
 }
 
 struct SendSide<T> {
@@ -253,8 +377,11 @@ struct Shared<T> {
 struct QueueState<T> {
   queue: VecDeque<Envelope<T>>,
   closed: bool,
+  receiver_dropped: bool,
   senders_gone: bool,
+  public_reservations: usize,
   receiver_waker: Option<Waker>,
+  closed_waiters: Vec<ClosedWaiterSlot>,
 }
 
 impl<T> Sender<T> {
@@ -281,6 +408,42 @@ impl<T> Sender<T> {
       acquire: Some(self.side.shared.permits.acquire_many(1)),
     }
   }
+
+  /// Waits for one queue slot without constructing or moving a message.
+  /// The returned permit can still publish after an orderly receiver close.
+  pub fn reserve(&self) -> ReserveFuture<'_, T> {
+    ReserveFuture {
+      sender: self,
+      acquire: Some(self.side.shared.permits.acquire_many(1)),
+      completed: false,
+    }
+  }
+
+  /// Waits for one queue slot while retaining a clone of this sender.
+  ///
+  /// The original sender remains usable if this future is cancelled or
+  /// rejected. Unlike Tokio's consuming `reserve_owned`, this method borrows
+  /// the sender to create the owned handle.
+  pub fn reserve_owned(&self) -> OwnedReserveFuture<T> {
+    OwnedReserveFuture {
+      sender: Some(self.clone()),
+      acquire: Some(self.side.shared.permits.acquire_many(1)),
+      completed: false,
+    }
+  }
+
+  /// Waits until the receiver closes or is dropped.
+  ///
+  /// Registration uses the channel's bounded waiter table and may return
+  /// [`ClosedWaitError::WaitersFull`]. Dropping a pending future unregisters
+  /// only its own generation-tagged waiter.
+  pub fn closed(&self) -> ClosedFuture<'_, T> {
+    ClosedFuture {
+      sender: self,
+      key: None,
+      completed: None,
+    }
+  }
 }
 
 impl<T> Clone for Sender<T> {
@@ -288,6 +451,325 @@ impl<T> Clone for Sender<T> {
     Self {
       side: Arc::clone(&self.side),
     }
+  }
+}
+
+impl ClosedWaiterSlot {
+  fn new() -> Self {
+    Self {
+      generation: 0,
+      exhausted: false,
+      waker: None,
+    }
+  }
+}
+
+impl<'a, T> Future for ReserveFuture<'a, T> {
+  type Output = Result<Permit<'a, T>, ReserveError>;
+
+  fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+    super::asynchronous::poll_cooperative(cx, |cx| {
+      let this = self.get_mut();
+      if this.completed {
+        return Poll::Ready(Err(ReserveError::Completed));
+      }
+      match poll_reservation(&this.sender.side.shared, &mut this.acquire, cx) {
+        Poll::Pending => Poll::Pending,
+        Poll::Ready(Err(error)) => {
+          this.completed = true;
+          Poll::Ready(Err(error))
+        }
+        Poll::Ready(Ok(slot)) => {
+          this.completed = true;
+          Poll::Ready(Ok(Permit {
+            slot: Some(slot),
+            _sender: this.sender,
+          }))
+        }
+      }
+    })
+  }
+}
+
+impl<T> Future for OwnedReserveFuture<T> {
+  type Output = Result<OwnedPermit<T>, ReserveError>;
+
+  fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+    super::asynchronous::poll_cooperative(cx, |cx| {
+      let this = self.get_mut();
+      if this.completed {
+        return Poll::Ready(Err(ReserveError::Completed));
+      }
+      let Some(sender) = this.sender.as_ref() else {
+        this.completed = true;
+        return Poll::Ready(Err(ReserveError::Completed));
+      };
+      match poll_reservation(&sender.side.shared, &mut this.acquire, cx) {
+        Poll::Pending => Poll::Pending,
+        Poll::Ready(Err(error)) => {
+          this.completed = true;
+          this.acquire.take();
+          drop(this.sender.take());
+          Poll::Ready(Err(error))
+        }
+        Poll::Ready(Ok(slot)) => {
+          this.completed = true;
+          this.acquire.take();
+          Poll::Ready(Ok(OwnedPermit {
+            slot: Some(slot),
+            _sender: this.sender.take(),
+          }))
+        }
+      }
+    })
+  }
+}
+
+fn poll_reservation<T>(
+  shared: &Arc<Shared<T>>,
+  acquire_slot: &mut Option<AcquireMany>,
+  cx: &mut Context<'_>,
+) -> Poll<Result<SlotPermit<T>, ReserveError>> {
+  let Some(acquire) = acquire_slot.as_mut() else {
+    return Poll::Ready(Err(ReserveError::Completed));
+  };
+  match Pin::new(acquire).poll(cx) {
+    Poll::Pending => Poll::Pending,
+    Poll::Ready(Err(AcquireError::Closed)) => {
+      *acquire_slot = None;
+      Poll::Ready(Err(ReserveError::Closed))
+    }
+    Poll::Ready(Err(AcquireError::Full)) => {
+      *acquire_slot = None;
+      Poll::Ready(Err(ReserveError::WaitersFull))
+    }
+    Poll::Ready(Err(AcquireError::Completed)) => {
+      *acquire_slot = None;
+      Poll::Ready(Err(ReserveError::Completed))
+    }
+    Poll::Ready(Ok(semaphore)) => {
+      *acquire_slot = None;
+      let accepted = {
+        let mut state = lock(&shared.state);
+        if state.closed || state.receiver_dropped {
+          false
+        } else if let Some(count) = state.public_reservations.checked_add(1) {
+          state.public_reservations = count;
+          true
+        } else {
+          false
+        }
+      };
+      if accepted {
+        Poll::Ready(Ok(SlotPermit {
+          shared: Arc::clone(shared),
+          semaphore: Some(semaphore),
+          active: true,
+        }))
+      } else {
+        drop(semaphore);
+        Poll::Ready(Err(ReserveError::Closed))
+      }
+    }
+  }
+}
+
+impl<T> Future for ClosedFuture<'_, T> {
+  type Output = Result<(), ClosedWaitError>;
+
+  fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+    super::asynchronous::poll_cooperative(cx, |cx| {
+      let this = self.get_mut();
+      if let Some(result) = this.completed {
+        return Poll::Ready(result);
+      }
+      let mut replacement = Some(cx.waker().clone());
+      let (result, old_waker) = {
+        let mut state = lock(&this.sender.side.shared.state);
+        if state.closed || state.receiver_dropped {
+          (
+            Some(Ok(())),
+            this
+              .key
+              .take()
+              .and_then(|key| take_closed_waiter(&mut state, key)),
+          )
+        } else if let Some(key) = this.key {
+          match state.closed_waiters.get_mut(key.index) {
+            Some(slot) if slot.generation == key.generation => {
+              let replacement = match replacement.take() {
+                Some(waker) => waker,
+                None => unreachable!("replacement is retained until stored"),
+              };
+              (None, slot.waker.replace(replacement))
+            }
+            _ => (None, None),
+          }
+        } else {
+          let mut registered = false;
+          while let Some(index) = state
+            .closed_waiters
+            .iter()
+            .position(|slot| !slot.exhausted && slot.waker.is_none())
+          {
+            if let Some(generation) = state.closed_waiters[index].generation.checked_add(1) {
+              let slot = &mut state.closed_waiters[index];
+              slot.generation = generation;
+              slot.waker = replacement.take();
+              this.key = Some(WaiterKey { index, generation });
+              registered = true;
+              break;
+            }
+            state.closed_waiters[index].exhausted = true;
+          }
+          if registered {
+            (None, None)
+          } else if !state.closed_waiters.is_empty()
+            && state.closed_waiters.iter().all(|slot| slot.exhausted)
+          {
+            (Some(Err(ClosedWaitError::GenerationExhausted)), None)
+          } else {
+            (Some(Err(ClosedWaitError::WaitersFull)), None)
+          }
+        }
+      };
+      drop_waker(replacement);
+      drop_waker(old_waker);
+      if let Some(result) = result {
+        this.completed = Some(result);
+        Poll::Ready(result)
+      } else {
+        Poll::Pending
+      }
+    })
+  }
+}
+
+impl<T> Drop for ClosedFuture<'_, T> {
+  fn drop(&mut self) {
+    let Some(key) = self.key.take() else {
+      return;
+    };
+    let waker = {
+      let mut state = lock(&self.sender.side.shared.state);
+      if state.closed || state.receiver_dropped {
+        None
+      } else {
+        take_closed_waiter(&mut state, key)
+      }
+    };
+    drop_waker(waker);
+  }
+}
+
+fn take_closed_waiter<T>(state: &mut QueueState<T>, key: WaiterKey) -> Option<Waker> {
+  let slot = state.closed_waiters.get_mut(key.index)?;
+  if slot.generation == key.generation {
+    slot.waker.take()
+  } else {
+    None
+  }
+}
+
+impl<'a, T> Permit<'a, T> {
+  /// Publishes `value` using this reserved slot.
+  ///
+  /// An orderly receiver close preserves the reservation. If the receiver was
+  /// dropped, the original value is returned in [`SendError`].
+  pub fn send(mut self, value: T) -> Result<(), SendError<T>> {
+    let Some(slot) = self.slot.take() else {
+      return Err(SendError {
+        kind: SendErrorKind::Closed,
+        value,
+      });
+    };
+    slot.send(value)
+  }
+}
+
+impl<T> OwnedPermit<T> {
+  /// Publishes `value` using this reserved slot.
+  ///
+  /// An orderly receiver close preserves the reservation. If the receiver was
+  /// dropped, the original value is returned in [`SendError`].
+  pub fn send(mut self, value: T) -> Result<(), SendError<T>> {
+    let Some(slot) = self.slot.take() else {
+      return Err(SendError {
+        kind: SendErrorKind::Closed,
+        value,
+      });
+    };
+    slot.send(value)
+  }
+}
+
+impl<T> SlotPermit<T> {
+  fn send(mut self, value: T) -> Result<(), SendError<T>> {
+    let mut value = Some(value);
+    let outcome = {
+      let mut state = lock(&self.shared.state);
+      debug_assert!(self.active && state.public_reservations > 0);
+      state.public_reservations -= 1;
+      self.active = false;
+      if state.receiver_dropped {
+        Err(state.receiver_waker.take())
+      } else {
+        let semaphore = self.semaphore.take();
+        let queued = match (value.take(), semaphore) {
+          (Some(value), Some(permit)) => {
+            state.queue.push_back(Envelope {
+              value,
+              _permit: permit,
+            });
+            true
+          }
+          _ => false,
+        };
+        debug_assert!(queued);
+        Ok(state.receiver_waker.take())
+      }
+    };
+    match outcome {
+      Ok(waker) => {
+        wake_contained(waker);
+        Ok(())
+      }
+      Err(waker) => {
+        drop(self.semaphore.take());
+        wake_contained(waker);
+        match value.take() {
+          Some(value) => Err(SendError {
+            kind: SendErrorKind::Closed,
+            value,
+          }),
+          None => unreachable!("value is retained after receiver drop"),
+        }
+      }
+    }
+  }
+}
+
+impl<T> Drop for SlotPermit<T> {
+  fn drop(&mut self) {
+    let receiver_waker = {
+      let mut state = lock(&self.shared.state);
+      if !self.active {
+        return;
+      }
+      debug_assert!(state.public_reservations > 0);
+      state.public_reservations -= 1;
+      self.active = false;
+      if (state.closed || state.senders_gone)
+        && state.queue.is_empty()
+        && state.public_reservations == 0
+      {
+        state.receiver_waker.take()
+      } else {
+        None
+      }
+    };
+    drop(self.semaphore.take());
+    wake_contained(receiver_waker);
   }
 }
 
@@ -304,14 +786,31 @@ impl<T> Receiver<T> {
 
   /// Removes a queued message without waiting.
   pub fn try_recv(&mut self) -> Result<T, TryRecvError> {
-    match dequeue(&self.shared) {
-      Some(value) => Ok(value),
-      None => {
-        let state = lock(&self.shared.state);
-        if state.closed || state.senders_gone {
-          Err(TryRecvError::Closed)
+    let (envelope, result, old_waker) = {
+      let mut state = lock(&self.shared.state);
+      if let Some(envelope) = state.queue.pop_front() {
+        (Some(envelope), None, state.receiver_waker.take())
+      } else {
+        let result = if (state.closed || state.senders_gone) && state.public_reservations == 0 {
+          TryRecvError::Closed
         } else {
-          Err(TryRecvError::Empty)
+          TryRecvError::Empty
+        };
+        (None, Some(result), None)
+      }
+    };
+    match envelope {
+      Some(envelope) => {
+        let Envelope { value, _permit } = envelope;
+        drop(_permit);
+        drop_waker(old_waker);
+        Ok(value)
+      }
+      None => {
+        drop_waker(old_waker);
+        match result {
+          Some(result) => Err(result),
+          None => unreachable!("empty receive result is retained"),
         }
       }
     }
@@ -320,28 +819,35 @@ impl<T> Receiver<T> {
   /// Closes admission, rejects pending and future sends, and leaves queued
   /// messages available to receive.
   pub fn close(&mut self) {
-    let receiver_waker = {
+    let (receiver_waker, closed_waiters) = {
       let mut state = lock(&self.shared.state);
       state.closed = true;
-      state.receiver_waker.take()
+      (
+        state.receiver_waker.take(),
+        std::mem::take(&mut state.closed_waiters),
+      )
     };
     self.shared.permits.close();
     wake_contained(receiver_waker);
+    wake_waiters(closed_waiters);
   }
 }
 
 impl<T> Drop for Receiver<T> {
   fn drop(&mut self) {
-    let (queued, receiver_waker) = {
+    let (queued, receiver_waker, closed_waiters) = {
       let mut state = lock(&self.shared.state);
       state.closed = true;
+      state.receiver_dropped = true;
       (
         std::mem::take(&mut state.queue),
         state.receiver_waker.take(),
+        std::mem::take(&mut state.closed_waiters),
       )
     };
     self.shared.permits.close();
     wake_contained(receiver_waker);
+    wake_waiters(closed_waiters);
     for envelope in queued {
       drop_contained(envelope);
     }
@@ -464,7 +970,7 @@ impl<T> Future for RecvFuture<'_, T> {
         let mut state = lock(&this.receiver.shared.state);
         if let Some(envelope) = state.queue.pop_front() {
           (Some(envelope), false, state.receiver_waker.take())
-        } else if state.closed || state.senders_gone {
+        } else if (state.closed || state.senders_gone) && state.public_reservations == 0 {
           (None, true, state.receiver_waker.take())
         } else {
           let replacement = match new_waker.take() {
@@ -500,7 +1006,11 @@ impl<T> Future for RecvFuture<'_, T> {
   }
 }
 
-fn enqueue<T>(shared: &Arc<Shared<T>>, value: T, permit: Permit) -> Result<(), SendError<T>> {
+fn enqueue<T>(
+  shared: &Arc<Shared<T>>,
+  value: T,
+  permit: SemaphorePermit,
+) -> Result<(), SendError<T>> {
   let result = {
     let mut state = lock(&shared.state);
     if state.closed {
@@ -529,23 +1039,9 @@ fn enqueue<T>(shared: &Arc<Shared<T>>, value: T, permit: Permit) -> Result<(), S
   }
 }
 
-fn dequeue<T>(shared: &Arc<Shared<T>>) -> Option<T> {
-  let (envelope, old_waker) = {
-    let mut state = lock(&shared.state);
-    (state.queue.pop_front(), state.receiver_waker.take())
-  };
-  let Some(envelope) = envelope else {
-    drop_waker(old_waker);
-    return None;
-  };
-  let Envelope { value, _permit } = envelope;
-  drop(_permit);
-  drop_waker(old_waker);
-  Some(value)
-}
-
 fn is_closed<T>(shared: &Arc<Shared<T>>) -> bool {
-  lock(&shared.state).closed
+  let state = lock(&shared.state);
+  state.closed || state.receiver_dropped
 }
 
 impl<T> Drop for SendSide<T> {
@@ -571,6 +1067,12 @@ fn wake_contained(waker: Option<Waker>) {
   }
 }
 
+fn wake_waiters(waiters: Vec<ClosedWaiterSlot>) {
+  for slot in waiters {
+    wake_contained(slot.waker);
+  }
+}
+
 fn drop_waker(waker: Option<Waker>) {
   if let Some(waker) = waker {
     drop_contained(waker);
@@ -586,9 +1088,88 @@ mod tests {
   use std::sync::atomic::{AtomicUsize, Ordering};
   use std::task::{Wake, Waker};
   use std::thread;
+  use std::time::{Duration, Instant};
 
   fn context() -> Context<'static> {
     Context::from_waker(Waker::noop())
+  }
+
+  fn ready<T, E>(poll: Poll<Result<T, E>>) -> Result<T, E> {
+    match poll {
+      Poll::Ready(result) => result,
+      Poll::Pending => panic!("operation unexpectedly pending"),
+    }
+  }
+
+  fn assert_cooperative_hot_loop_yields(
+    future: impl Future<Output = ()> + Send + 'static,
+    progress: Arc<AtomicUsize>,
+  ) {
+    use crate::runtime::asynchronous::{AsyncConfig, AsyncJoinError, AsyncRuntime, AsyncShutdown};
+
+    let runtime = AsyncRuntime::new(AsyncConfig {
+      workers: 1,
+      max_outstanding: 4,
+      max_scopes: 2,
+    })
+    .unwrap_or_else(|error| panic!("runtime construction failed: {error}"));
+    let hot = runtime
+      .handle()
+      .spawn(future)
+      .unwrap_or_else(|error| panic!("hot task spawn failed: {error}"));
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while progress.load(Ordering::SeqCst) == 0 {
+      assert!(Instant::now() < deadline, "hot loop did not start");
+      thread::yield_now();
+    }
+
+    let seen = Arc::new(AtomicUsize::new(0));
+    let sibling_seen = Arc::clone(&seen);
+    let sibling_progress = Arc::clone(&progress);
+    let sibling = runtime
+      .handle()
+      .spawn(async move {
+        sibling_seen.store(sibling_progress.load(Ordering::SeqCst), Ordering::SeqCst);
+      })
+      .unwrap_or_else(|error| panic!("sibling task spawn failed: {error}"));
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while !sibling.is_finished() {
+      assert!(Instant::now() < deadline, "ready-loop sibling did not run");
+      thread::yield_now();
+    }
+    assert!(seen.load(Ordering::SeqCst) > 0);
+    assert!(!hot.is_finished(), "hot loop stopped before cancellation");
+
+    hot.abort_handle().abort();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while !hot.is_finished() {
+      assert!(Instant::now() < deadline, "hot loop abort did not finish");
+      thread::yield_now();
+    }
+    let hot_result = runtime
+      .block_on(hot)
+      .unwrap_or_else(|error| panic!("block_on failed: {error}"));
+    assert!(matches!(hot_result, Err(AsyncJoinError::Cancelled)));
+    let sibling_result = runtime
+      .block_on(sibling)
+      .unwrap_or_else(|error| panic!("block_on failed: {error}"));
+    assert!(matches!(sibling_result, Ok(())));
+    runtime
+      .shutdown(AsyncShutdown::Drain)
+      .unwrap_or_else(|error| panic!("runtime shutdown failed: {error}"));
+  }
+
+  #[derive(Default)]
+  struct CountWake(AtomicUsize);
+
+  impl Wake for CountWake {
+    fn wake(self: Arc<Self>) {
+      self.0.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+      self.0.fetch_add(1, Ordering::SeqCst);
+    }
   }
 
   #[test]
@@ -617,6 +1198,306 @@ mod tests {
     let error = tx.try_send(30).unwrap_err();
     assert_eq!(error.kind(), SendErrorKind::Closed);
     assert_eq!(error.into_inner(), 30);
+  }
+
+  #[test]
+  fn construction_rejects_unrepresentable_closed_waiter_storage() {
+    assert!(matches!(
+      channel::<u8>(1, usize::MAX),
+      Err(BuildError::CapacityOverflow)
+    ));
+  }
+
+  #[test]
+  fn borrowed_and_owned_reservations_hold_and_return_capacity() {
+    let (tx, mut rx) = channel(1, 2).unwrap();
+    let permit = pin!(tx.reserve());
+    let permit = ready(permit.poll(&mut context())).unwrap();
+    assert_eq!(tx.try_send(1).unwrap_err().kind(), SendErrorKind::Full);
+    permit.send(2).unwrap();
+    assert_eq!(rx.try_recv(), Ok(2));
+
+    let owned = pin!(tx.reserve_owned());
+    let owned = ready(owned.poll(&mut context())).unwrap();
+    drop(tx);
+    owned.send(3).unwrap();
+    assert_eq!(rx.try_recv(), Ok(3));
+    assert_eq!(rx.try_recv(), Err(TryRecvError::Closed));
+  }
+
+  #[test]
+  fn unused_reservations_release_capacity_and_close_waits_for_them() {
+    let (tx, mut rx) = channel::<u8>(1, 1).unwrap();
+    let permit = ready(pin!(tx.reserve()).poll(&mut context())).unwrap();
+    rx.close();
+    assert_eq!(rx.try_recv(), Err(TryRecvError::Empty));
+
+    let wake = Arc::new(CountWake::default());
+    let waker = Waker::from(Arc::clone(&wake));
+    let mut cx = Context::from_waker(&waker);
+    let mut recv = pin!(rx.recv());
+    assert!(recv.as_mut().poll(&mut cx).is_pending());
+    drop(permit);
+    assert_eq!(wake.0.load(Ordering::SeqCst), 1);
+    assert_eq!(recv.as_mut().poll(&mut cx), Poll::Ready(None));
+  }
+
+  #[test]
+  fn a_public_reservation_survives_close_but_receiver_drop_recovers_value() {
+    let (tx, mut rx) = channel::<u8>(1, 1).unwrap();
+    let permit = ready(pin!(tx.reserve()).poll(&mut context())).unwrap();
+    rx.close();
+    permit.send(7).unwrap();
+    assert_eq!(rx.try_recv(), Ok(7));
+    assert_eq!(rx.try_recv(), Err(TryRecvError::Closed));
+
+    let (tx, rx) = channel(1, 1).unwrap();
+    let permit = ready(pin!(tx.reserve()).poll(&mut context())).unwrap();
+    drop(rx);
+    let error = permit.send(19).unwrap_err();
+    assert_eq!(error.kind(), SendErrorKind::Closed);
+    assert_eq!(error.into_inner(), 19);
+    assert!(tx.try_send(20).is_err());
+  }
+
+  #[test]
+  fn owned_reserve_waiter_cancellation_preserves_original_sender() {
+    let (tx, mut rx) = channel(1, 1).unwrap();
+    tx.try_send(0).unwrap();
+    {
+      let mut reserve = pin!(tx.reserve_owned());
+      assert!(reserve.as_mut().poll(&mut context()).is_pending());
+    }
+    assert_eq!(tx.try_send(1).unwrap_err().kind(), SendErrorKind::Full);
+    assert_eq!(rx.try_recv(), Ok(0));
+    tx.try_send(2).unwrap();
+    assert_eq!(rx.try_recv(), Ok(2));
+  }
+
+  #[test]
+  fn close_revokes_a_queued_internal_grant_before_public_reservation() {
+    let (tx, mut rx) = channel::<u8>(1, 1).unwrap();
+    tx.try_send(0).unwrap();
+    let mut reserve = Box::pin(tx.reserve_owned());
+    assert!(reserve.as_mut().poll(&mut context()).is_pending());
+
+    // Dequeue grants the semaphore internally, but the reserve future has
+    // not polled again to publish a public permit.
+    assert_eq!(rx.try_recv(), Ok(0));
+    rx.close();
+    assert!(matches!(
+      reserve.as_mut().poll(&mut context()),
+      Poll::Ready(Err(ReserveError::Closed))
+    ));
+    assert_eq!(rx.try_recv(), Err(TryRecvError::Closed));
+    assert_eq!(tx.try_send(1).unwrap_err().kind(), SendErrorKind::Closed);
+  }
+
+  #[test]
+  fn reserve_ready_loop_yields_and_can_be_aborted() {
+    let (sender, _receiver) = channel::<u8>(1, 1).unwrap();
+    let progress = Arc::new(AtomicUsize::new(0));
+    let loop_progress = Arc::clone(&progress);
+    let future = async move {
+      loop {
+        let permit = sender
+          .reserve()
+          .await
+          .unwrap_or_else(|error| panic!("reservation failed: {error}"));
+        drop(permit);
+        loop_progress.fetch_add(1, Ordering::SeqCst);
+      }
+    };
+    assert_cooperative_hot_loop_yields(future, progress);
+  }
+
+  #[test]
+  fn closed_ready_loop_yields_and_can_be_aborted() {
+    let (sender, mut receiver) = channel::<u8>(1, 1).unwrap();
+    receiver.close();
+    let progress = Arc::new(AtomicUsize::new(0));
+    let loop_progress = Arc::clone(&progress);
+    let future = async move {
+      loop {
+        sender
+          .closed()
+          .await
+          .unwrap_or_else(|error| panic!("closed wait failed: {error}"));
+        loop_progress.fetch_add(1, Ordering::SeqCst);
+      }
+    };
+    assert_cooperative_hot_loop_yields(future, progress);
+  }
+
+  #[test]
+  fn pending_owned_reservation_keeps_sender_alive_until_cancelled() {
+    let (tx, mut rx) = channel::<u8>(1, 1).unwrap();
+    tx.try_send(0).unwrap();
+    let mut reserve = Box::pin(tx.reserve_owned());
+    assert!(reserve.as_mut().poll(&mut context()).is_pending());
+    drop(tx);
+    assert_eq!(rx.try_recv(), Ok(0));
+    assert_eq!(rx.try_recv(), Err(TryRecvError::Empty));
+    drop(reserve);
+    assert_eq!(rx.try_recv(), Err(TryRecvError::Closed));
+  }
+
+  #[test]
+  fn closed_waiters_are_bounded_cancel_safe_and_sticky() {
+    let (tx, mut rx) = channel::<u8>(1, 1).unwrap();
+    let mut first = Box::pin(tx.closed());
+    assert!(first.as_mut().poll(&mut context()).is_pending());
+    let mut second = pin!(tx.closed());
+    assert_eq!(
+      second.as_mut().poll(&mut context()),
+      Poll::Ready(Err(ClosedWaitError::WaitersFull))
+    );
+    drop(first);
+
+    let mut replacement = pin!(tx.closed());
+    assert!(replacement.as_mut().poll(&mut context()).is_pending());
+    rx.close();
+    assert_eq!(
+      replacement.as_mut().poll(&mut context()),
+      Poll::Ready(Ok(()))
+    );
+    assert_eq!(
+      replacement.as_mut().poll(&mut context()),
+      Poll::Ready(Ok(()))
+    );
+
+    let (tx, mut rx) = channel::<u8>(1, 0).unwrap();
+    let mut no_slot = pin!(tx.closed());
+    assert_eq!(
+      no_slot.as_mut().poll(&mut context()),
+      Poll::Ready(Err(ClosedWaitError::WaitersFull))
+    );
+    rx.close();
+    let mut after_close = pin!(tx.closed());
+    assert_eq!(
+      after_close.as_mut().poll(&mut context()),
+      Poll::Ready(Ok(()))
+    );
+  }
+
+  #[test]
+  fn closed_waiter_callbacks_run_after_releasing_the_queue_lock() {
+    struct Reenter {
+      sender: Sender<u8>,
+      calls: Arc<AtomicUsize>,
+    }
+
+    impl Wake for Reenter {
+      fn wake(self: Arc<Self>) {
+        self.wake_by_ref();
+      }
+
+      fn wake_by_ref(self: &Arc<Self>) {
+        if self.sender.side.shared.state.try_lock().is_ok() {
+          self.calls.fetch_add(1, Ordering::SeqCst);
+        }
+      }
+    }
+
+    let (tx, mut rx) = channel::<u8>(1, 1).unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let waker = Waker::from(Arc::new(Reenter {
+      sender: tx.clone(),
+      calls: Arc::clone(&calls),
+    }));
+    let mut cx = Context::from_waker(&waker);
+    let mut closed = pin!(tx.closed());
+    assert!(closed.as_mut().poll(&mut cx).is_pending());
+    rx.close();
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+  }
+
+  #[test]
+  fn closed_waiter_generation_exhaustion_is_not_reported_as_full() {
+    let (tx, _rx) = channel::<u8>(1, 1).unwrap();
+    {
+      let mut state = lock(&tx.side.shared.state);
+      state.closed_waiters[0].generation = u64::MAX;
+    }
+    let mut closed = pin!(tx.closed());
+    assert_eq!(
+      closed.as_mut().poll(&mut context()),
+      Poll::Ready(Err(ClosedWaitError::GenerationExhausted))
+    );
+  }
+
+  #[test]
+  fn retired_closed_waiter_slots_are_skipped_or_report_full() {
+    let (tx, _rx) = channel::<u8>(1, 2).unwrap();
+    {
+      let mut state = lock(&tx.side.shared.state);
+      state.closed_waiters[0].generation = u64::MAX;
+    }
+    let mut future = pin!(tx.closed());
+    assert!(future.as_mut().poll(&mut context()).is_pending());
+    assert_eq!(future.as_ref().get_ref().key.unwrap().index, 1);
+
+    let (tx, _rx) = channel::<u8>(1, 2).unwrap();
+    {
+      let mut state = lock(&tx.side.shared.state);
+      state.closed_waiters[0].generation = u64::MAX;
+      state.closed_waiters[1].generation = 1;
+      state.closed_waiters[1].waker = Some(Waker::noop().clone());
+    }
+    let mut future = pin!(tx.closed());
+    assert_eq!(
+      future.as_mut().poll(&mut context()),
+      Poll::Ready(Err(ClosedWaitError::WaitersFull))
+    );
+  }
+
+  #[test]
+  fn cancelling_an_old_closed_waiter_cannot_remove_a_reused_slot() {
+    let (tx, _rx) = channel::<u8>(1, 1).unwrap();
+    let old_key = {
+      let mut old = Box::pin(tx.closed());
+      assert!(old.as_mut().poll(&mut context()).is_pending());
+      old.as_ref().get_ref().key.unwrap()
+    };
+    let mut current = Box::pin(tx.closed());
+    assert!(current.as_mut().poll(&mut context()).is_pending());
+    let current_key = current.as_ref().get_ref().key.unwrap();
+    assert_ne!(old_key, current_key);
+    {
+      let mut state = lock(&tx.side.shared.state);
+      assert!(take_closed_waiter(&mut state, old_key).is_none());
+      assert!(state.closed_waiters[current_key.index].waker.is_some());
+    }
+  }
+
+  #[test]
+  fn reserved_send_error_value_drops_outside_the_queue_lock() {
+    struct ReentrantDrop {
+      sender: Sender<ReentrantDrop>,
+      drops: Arc<AtomicUsize>,
+    }
+
+    impl Drop for ReentrantDrop {
+      fn drop(&mut self) {
+        if self.sender.side.shared.state.try_lock().is_ok() {
+          self.drops.fetch_add(1, Ordering::SeqCst);
+        }
+      }
+    }
+
+    let drops = Arc::new(AtomicUsize::new(0));
+    let (tx, rx) = channel::<ReentrantDrop>(1, 1).unwrap();
+    let permit = ready(pin!(tx.reserve_owned()).poll(&mut context())).unwrap();
+    drop(rx);
+    let error = match permit.send(ReentrantDrop {
+      sender: tx.clone(),
+      drops: Arc::clone(&drops),
+    }) {
+      Ok(()) => panic!("dropped receiver accepted a reserved send"),
+      Err(error) => error,
+    };
+    drop(error);
+    assert_eq!(drops.load(Ordering::SeqCst), 1);
   }
 
   #[test]
@@ -910,6 +1791,28 @@ mod tests {
 mod loom_tests {
   use super::channel;
   use loom::thread;
+  use std::future::Future;
+  use std::pin::pin;
+  use std::sync::Arc as StdArc;
+  use std::sync::atomic::{AtomicUsize, Ordering};
+  use std::task::{Context, Poll, Wake, Waker};
+
+  fn context() -> Context<'static> {
+    Context::from_waker(Waker::noop())
+  }
+
+  #[derive(Default)]
+  struct CountWake(AtomicUsize);
+
+  impl Wake for CountWake {
+    fn wake(self: StdArc<Self>) {
+      self.0.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn wake_by_ref(self: &StdArc<Self>) {
+      self.0.fetch_add(1, Ordering::SeqCst);
+    }
+  }
 
   // Covers the close/enqueue linearization using the real channel state and
   // semaphore. It does not model async waiter scheduling or custom RawWakers.
@@ -932,6 +1835,138 @@ mod loom_tests {
         assert_eq!(receiver.try_recv(), Err(super::TryRecvError::Closed));
       }
       assert_eq!(receiver.try_recv(), Err(super::TryRecvError::Closed));
+    });
+  }
+
+  #[test]
+  fn close_races_reservation_publication_without_losing_a_permit_message() {
+    loom::model(|| {
+      let (sender, receiver) = channel(1, 0).unwrap();
+      let reserve = thread::spawn(move || {
+        let mut future = Box::pin(sender.reserve_owned());
+        match future.as_mut().poll(&mut context()) {
+          Poll::Ready(Ok(permit)) => permit.send(42).is_ok(),
+          Poll::Ready(Err(super::ReserveError::Closed)) => false,
+          Poll::Ready(Err(_)) => panic!("single-slot reservation was unexpectedly rejected"),
+          Poll::Pending => panic!("single-slot reservation unexpectedly pending"),
+        }
+      });
+      let close = thread::spawn(move || {
+        let mut receiver = receiver;
+        receiver.close();
+        receiver
+      });
+
+      let accepted = reserve.join().unwrap();
+      let mut receiver = close.join().unwrap();
+      if accepted {
+        assert_eq!(receiver.try_recv(), Ok(42));
+      } else {
+        assert_eq!(receiver.try_recv(), Err(super::TryRecvError::Closed));
+      }
+      assert_eq!(receiver.try_recv(), Err(super::TryRecvError::Closed));
+    });
+  }
+
+  #[test]
+  fn reserved_send_races_receiver_destruction_and_recovers_if_it_loses() {
+    loom::model(|| {
+      let (sender, receiver) = channel(1, 0).unwrap();
+      let permit = match pin!(sender.reserve_owned()).poll(&mut context()) {
+        Poll::Ready(Ok(permit)) => permit,
+        _ => panic!("single-slot reservation must complete"),
+      };
+      let send = thread::spawn(move || match permit.send(17) {
+        Ok(()) => true,
+        Err(error) => {
+          assert_eq!(error.into_inner(), 17);
+          false
+        }
+      });
+      let drop_receiver = thread::spawn(move || drop(receiver));
+      let _sent_before_drop = send.join().unwrap();
+      drop_receiver.join().unwrap();
+    });
+  }
+
+  #[test]
+  fn final_unused_permit_drop_allows_closed_receiver_to_reach_eof() {
+    loom::model(|| {
+      let (sender, mut receiver) = channel::<u8>(1, 0).unwrap();
+      let permit = match pin!(sender.reserve_owned()).poll(&mut context()) {
+        Poll::Ready(Ok(permit)) => permit,
+        _ => panic!("single-slot reservation must complete"),
+      };
+      receiver.close();
+      let wake = StdArc::new(CountWake::default());
+      let waker = Waker::from(StdArc::clone(&wake));
+      let mut cx = Context::from_waker(&waker);
+      let mut recv = pin!(receiver.recv());
+      assert!(recv.as_mut().poll(&mut cx).is_pending());
+      let drop_permit = thread::spawn(move || drop(permit));
+      drop_permit.join().unwrap();
+      assert_eq!(wake.0.load(Ordering::SeqCst), 1);
+      assert_eq!(recv.as_mut().poll(&mut cx), Poll::Ready(None));
+    });
+  }
+
+  #[test]
+  fn closed_waiter_registration_races_close_and_remains_sticky() {
+    loom::model(|| {
+      let (sender, receiver) = channel::<u8>(1, 1).unwrap();
+      let close = thread::spawn(move || {
+        let mut receiver = receiver;
+        receiver.close();
+      });
+      let registration = thread::spawn(move || {
+        let wake = StdArc::new(CountWake::default());
+        let waker = Waker::from(StdArc::clone(&wake));
+        let mut cx = Context::from_waker(&waker);
+        let mut future = pin!(sender.closed());
+        let first = future.as_mut().poll(&mut cx);
+        close.join().unwrap();
+        let result = match first {
+          Poll::Ready(result) => result,
+          Poll::Pending => match future.as_mut().poll(&mut context()) {
+            Poll::Ready(result) => result,
+            Poll::Pending => panic!("closed waiter missed the close notification"),
+          },
+        };
+        assert_eq!(result, Ok(()));
+        if first.is_pending() {
+          assert_eq!(wake.0.load(Ordering::SeqCst), 1);
+        }
+        assert_eq!(future.as_mut().poll(&mut cx), Poll::Ready(Ok(())));
+      });
+      registration.join().unwrap();
+    });
+  }
+
+  #[test]
+  fn try_recv_never_reports_closed_while_a_reserved_message_is_queued() {
+    loom::model(|| {
+      let (sender, mut receiver) = channel::<u8>(1, 0).unwrap();
+      let permit = match pin!(sender.reserve_owned()).poll(&mut context()) {
+        Poll::Ready(Ok(permit)) => permit,
+        _ => panic!("single-slot reservation must complete"),
+      };
+      receiver.close();
+      let send = thread::spawn(move || permit.send(9).is_ok());
+      let receive = thread::spawn(move || {
+        let result = receiver.try_recv();
+        (receiver, result)
+      });
+      let sent = send.join().unwrap();
+      let (mut receiver, result) = receive.join().unwrap();
+      assert!(sent);
+      match result {
+        Ok(9) => assert_eq!(receiver.try_recv(), Err(super::TryRecvError::Closed)),
+        Err(super::TryRecvError::Empty) => assert_eq!(receiver.try_recv(), Ok(9)),
+        Err(super::TryRecvError::Closed) => {
+          panic!("try_recv reported EOF before the reserved message was visible")
+        }
+        _ => panic!("try_recv returned an unexpected result"),
+      }
     });
   }
 }

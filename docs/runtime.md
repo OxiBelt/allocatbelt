@@ -260,14 +260,27 @@ granted sends may enqueue in a different scheduling order. `try_send` rejects
 immediately, and named `send` futures wait within the waiter bound. Rejections
 return the original value. An unsubmitted send retains its value across polls;
 `into_inner` recovers it, while cancellation drops it outside queue locks.
+`reserve` waits for capacity before the caller constructs a message and returns
+a borrowed permit; `reserve_owned` retains a sender clone and returns an owned
+permit. Both permit forms return capacity when dropped. The owned form borrows
+the original sender to create its clone, so a failed or cancelled reservation
+does not consume the caller's handle. A permit's `send` returns the original
+value if the receiver was dropped.
 
-Receiver close rejects further sends and allows queued messages to drain.
-Receiver destruction closes admission and drops messages individually outside
-locks, containing destructor panics. Receive futures remove their stored waker
-on cancellation. EOF follows the last sender and unfinished owned send future;
-a completed retained send future does not delay EOF. Managed-buffer charges
-survive pending sends, queued messages and returned results until final release.
-Queue metadata and arbitrary message allocations are outside that ledger.
+Receiver close rejects new sends and reservations, wakes `Sender::closed`
+waiters, and allows queued messages to drain. A permit issued before that
+close remains valid; EOF waits until each such permit is used or dropped. This
+keeps `queue length + issued permits` within capacity. Receiver destruction
+closes admission, revokes unused permits, and drops messages individually
+outside locks, containing destructor panics. Receive futures remove their
+stored waker on cancellation. `Sender::closed` uses its own bounded waiter
+table, with the same configured waiter limit; registration can fail with
+`ClosedWaitError::WaitersFull`, and cancellation removes only that waiter's
+generation. EOF follows the last sender, unfinished owned send future, and
+outstanding issued permits; a completed retained send future does not delay
+EOF. Managed-buffer charges survive pending sends, queued messages and returned
+results until final release. Queue metadata and arbitrary message allocations
+are outside that ledger.
 
 `runtime::oneshot::channel` transfers one value through a consuming synchronous
 sender and an awaitable receiver. Send rejection returns the value unchanged.
@@ -276,11 +289,13 @@ outside the state lock. Dropping an unused sender wakes the receiver with
 closure. `Sender::closed` uses a mutable borrow to bound closure notification to
 one waiter, and dropping that future removes its waker.
 
-Native tests cover message uniqueness, FIFO admission, cancellation, close/drain,
-EOF, reentrant and panicking callbacks, retained charges and Send/Sync bounds.
-Actual-source Loom models cover queue close versus enqueue, single-message send
-versus receiver registration, and send versus receiver destruction. They do not
-model every channel/executor combination or arbitrary user callback behavior.
+Native tests cover message uniqueness, FIFO admission, cancellation, borrowed
+and owned reservations, close/drain, EOF, bounded closure waiters, reentrant
+and panicking callbacks, retained charges and Send/Sync bounds. Actual-source
+Loom models cover queue close versus enqueue, reservation publication, permit
+resolution versus receiver drop, EOF wakeup and closure-wait registration. They
+do not model every channel/executor combination or arbitrary user callback
+behavior.
 
 `runtime::watch::channel` retains the latest value in an owned `Arc` and fixes
 the receiver bound at construction. Construction failures preserve the initial
@@ -688,8 +703,9 @@ primitive/checkpoint budget is exhausted. It cannot preempt code that does not
 await it, and it does not impose a fairness or latency bound.
 
 Runtime-owned outer polls also use a shared 64-operation budget for ready
-`channel` send/receive, oneshot receive/close, semaphore acquisition, mutex
-acquisition and reader-writer-lock acquisition polls. A synchronous
+`channel` send/receive/reservation/closed-wait, oneshot receive/close,
+semaphore acquisition, mutex acquisition and reader-writer-lock acquisition
+polls. A synchronous
 primitive-to-primitive chain charges once; a primitive poll that returns
 Pending restores its provisional charge. Once exhausted, the next supported
 primitive arranges a wake and returns Pending before it dequeues a message,
@@ -1244,8 +1260,7 @@ baseline still requires these implementation and qualification steps:
 2. Add standard I/O adapters and general pipe construction, bounded delimiter,
    line and whole-stream reads, stream composition, managed in-memory pipes
    and bidirectional copy with explicit partial-progress and half-close rules.
-3. Add file-copy operations and bounded recursive traversal. Add channel capacity
-   reservation before message construction and sender closure notification.
+3. Add file-copy operations and bounded recursive traversal.
 4. Exercise realistic application ports covering cancellation, bounded
    rejection recovery, resource/dependency quotas, retained managed storage,
    partial I/O and explicit driver/process shutdown. The existing CPU, memory,
