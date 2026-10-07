@@ -877,6 +877,34 @@ Workers prefer allocator shards at startup and return allocator caches before
 parking and at exit. The crate does not install a global allocator. With system
 allocation or mimalloc these hooks do not alter those allocators.
 
+## Per-scope active polling
+
+`AsyncRuntime::scope_with_config(AsyncScopeConfig { max_active_polls })`
+adds a nonzero simultaneous-poll limit to an owned Send scope. Existing scope
+construction uses the worker count. A configured limit above that count is
+accepted; the fixed worker pool remains the overall concurrency ceiling.
+`OwnedTaskScope::snapshot` reports unfinished tasks, reserved poll slots and
+the configured limit. Poll slots are sampled under the scheduler lock;
+unfinished-task counts may change concurrently. A slot is reserved before
+dispatch and held through the future's poll return, so it can include work
+about to enter `Future::poll`.
+
+A saturated scope parks its ordinary ready queue without spinning. Other
+dispatchable scopes continue equal round-robin scheduling, one poll per turn.
+Ordinary ready work retains FIFO order when capacity reopens. Cancellation
+cleanup can pass ordinary work in a saturated scope and consumes no poll slot.
+The slot is released before future destruction or completion publication,
+including panic cleanup. Outstanding-task admission remains charged through
+future cleanup and is released before join publication; it is a separate
+limit. Scope unfinished-task bookkeeping completes after publication.
+
+This bounds simultaneous polling, not CPU time. A future can block a worker
+inside a poll, and destructors can block during quota-free cleanup. There is
+no preemption or implicit managed-storage reservation. Current-thread local
+execution already polls one future at a time. Native tests exercise saturation,
+cross-scope progress, FIFO resumption, cancellation, shutdown, slot reuse and
+cleanup; a same-source Loom model checks poll-slot acquire/release transitions.
+
 ## Explicit cgroup controls
 
 `runtime::cgroup::CgroupV2` accepts an owned directory descriptor for a

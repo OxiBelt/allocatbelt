@@ -16,6 +16,48 @@ pub(super) enum PollFinish {
   Idle,
 }
 
+/// A scope's active-poll quota. Scheduler state owns this value under its
+/// mutex; keeping acquire/release in this helper lets Loom exercise the exact
+/// production counter transition without modeling unrelated queue details.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct PollQuota {
+  maximum: usize,
+  active: usize,
+}
+
+impl PollQuota {
+  pub(super) const fn new(maximum: usize) -> Self {
+    Self { maximum, active: 0 }
+  }
+
+  pub(super) fn try_acquire(&mut self) -> bool {
+    if self.active >= self.maximum {
+      return false;
+    }
+    self.active += 1;
+    true
+  }
+
+  /// Releases a previously acquired poll slot and reports whether capacity
+  /// became available to a blocked scope.
+  pub(super) fn release(&mut self) -> bool {
+    debug_assert!(self.active > 0);
+    if self.active == 0 {
+      return false;
+    }
+    self.active -= 1;
+    self.active < self.maximum
+  }
+
+  pub(super) const fn active(&self) -> usize {
+    self.active
+  }
+
+  pub(super) const fn maximum(&self) -> usize {
+    self.maximum
+  }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(super) struct PollProtocol {
   generation: u64,
@@ -62,6 +104,10 @@ impl PollProtocol {
 
   pub(super) fn matches(&self, generation: u64) -> bool {
     self.admitted && self.generation == generation
+  }
+
+  pub(super) fn aborting_queued(&self) -> bool {
+    self.admitted && self.queued && self.abort && !self.running
   }
 
   #[cfg(all(test, loom))]
@@ -214,7 +260,7 @@ mod loom_tests {
   use loom::sync::{Arc, Mutex};
   use loom::thread;
 
-  use super::{PollFinish, PollProtocol, ScopeProtocol};
+  use super::{PollFinish, PollProtocol, PollQuota, ScopeProtocol};
 
   fn lock<T>(mutex: &Mutex<T>) -> loom::sync::MutexGuard<'_, T> {
     mutex
@@ -280,6 +326,73 @@ mod loom_tests {
       assert!(!state.queued);
       assert!(!state.running);
       assert_eq!(state.finish_poll(false, false), PollFinish::Stale);
+    });
+  }
+
+  #[test]
+  fn loom_poll_quota_serializes_acquire_and_release_at_capacity_one() {
+    bounded_model(|| {
+      let state = Arc::new(Mutex::new((PollQuota::new(1), 0usize, 0usize)));
+      let first = {
+        let state = Arc::clone(&state);
+        thread::spawn(move || {
+          loop {
+            let acquired = {
+              let mut state = lock(&state);
+              if state.0.try_acquire() {
+                state.1 += 1;
+                state.2 += 1;
+                assert_eq!(state.0.active(), 1);
+                assert_eq!(state.1, 1);
+                true
+              } else {
+                false
+              }
+            };
+            if acquired {
+              break;
+            }
+            thread::yield_now();
+          }
+          thread::yield_now();
+          let mut state = lock(&state);
+          assert!(state.0.release());
+          state.1 -= 1;
+        })
+      };
+      let second = {
+        let state = Arc::clone(&state);
+        thread::spawn(move || {
+          loop {
+            let acquired = {
+              let mut state = lock(&state);
+              if state.0.try_acquire() {
+                state.1 += 1;
+                state.2 += 1;
+                assert_eq!(state.0.active(), 1);
+                assert_eq!(state.1, 1);
+                true
+              } else {
+                false
+              }
+            };
+            if acquired {
+              break;
+            }
+            thread::yield_now();
+          }
+          thread::yield_now();
+          let mut state = lock(&state);
+          assert!(state.0.release());
+          state.1 -= 1;
+        })
+      };
+      first.join().unwrap();
+      second.join().unwrap();
+      let state = lock(&state);
+      assert_eq!(state.0.active(), 0);
+      assert_eq!(state.1, 0);
+      assert_eq!(state.2, 2);
     });
   }
 

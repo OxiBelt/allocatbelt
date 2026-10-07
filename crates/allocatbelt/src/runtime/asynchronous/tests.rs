@@ -5,7 +5,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::task::{Context, Poll, Wake, Waker};
 use std::time::{Duration, Instant};
 
-use super::{AsyncConfig, AsyncJoinError, AsyncRuntime, AsyncShutdown};
+use super::{AsyncConfig, AsyncJoinError, AsyncRuntime, AsyncScopeConfig, AsyncShutdown};
 
 fn runtime(workers: usize, max_outstanding: usize, max_scopes: usize) -> AsyncRuntime {
   AsyncRuntime::new(AsyncConfig {
@@ -14,6 +14,24 @@ fn runtime(workers: usize, max_outstanding: usize, max_scopes: usize) -> AsyncRu
     max_scopes,
   })
   .unwrap_or_else(|error| panic!("runtime construction failed: {error}"))
+}
+
+fn wait_until(predicate: impl Fn() -> bool, message: &str) {
+  let deadline = Instant::now() + Duration::from_secs(3);
+  while !predicate() {
+    assert!(Instant::now() < deadline, "timed out waiting for {message}");
+    std::thread::yield_now();
+  }
+}
+
+struct ReleaseGate(Arc<(Mutex<bool>, Condvar)>);
+
+impl Drop for ReleaseGate {
+  fn drop(&mut self) {
+    let (lock, cv) = &*self.0;
+    *lock.lock().unwrap_or_else(|e| e.into_inner()) = true;
+    cv.notify_all();
+  }
 }
 
 struct ThreadWake(std::thread::Thread);
@@ -672,6 +690,326 @@ fn ready_queue_rotates_fairly_between_scopes() {
   }
   let order = order.lock().unwrap_or_else(|e| e.into_inner()).clone();
   assert_eq!(order, ['A', 'B', 'A', 'B', 'A', 'B']);
+  runtime
+    .shutdown(AsyncShutdown::Drain)
+    .unwrap_or_else(|e| panic!("shutdown failed: {e}"));
+}
+
+#[test]
+fn saturated_scope_preserves_fifo_and_cancellation_leapfrogs_queued_work() {
+  let runtime = runtime(2, 8, 4);
+  let limited = runtime
+    .scope_with_config(AsyncScopeConfig {
+      max_active_polls: 1,
+    })
+    .unwrap_or_else(|e| panic!("limited scope failed: {e}"));
+  let other = runtime
+    .scope()
+    .unwrap_or_else(|e| panic!("other scope failed: {e}"));
+  let gate = Arc::new((Mutex::new(false), Condvar::new()));
+  let _release_gate = ReleaseGate(Arc::clone(&gate));
+  let started = Arc::new((Mutex::new(false), Condvar::new()));
+  let blocker = limited
+    .spawn(Gate {
+      gate: Arc::clone(&gate),
+      started: Arc::clone(&started),
+    })
+    .unwrap_or_else(|e| panic!("blocker spawn failed: {e}"));
+  {
+    let (lock, cv) = &*started;
+    let mut value = lock.lock().unwrap_or_else(|e| e.into_inner());
+    while !*value {
+      value = cv.wait(value).unwrap_or_else(|e| e.into_inner());
+    }
+  }
+  assert_eq!(limited.snapshot().active_polls, 1);
+  assert_eq!(limited.snapshot().max_active_polls, 1);
+
+  let order = Arc::new(Mutex::new(Vec::new()));
+  let head_order = Arc::clone(&order);
+  let head = limited
+    .spawn(async move {
+      head_order.lock().unwrap_or_else(|e| e.into_inner()).push(1);
+    })
+    .unwrap_or_else(|e| panic!("head spawn failed: {e}"));
+  let tail_order = Arc::clone(&order);
+  let tail = limited
+    .spawn(async move {
+      tail_order.lock().unwrap_or_else(|e| e.into_inner()).push(2);
+    })
+    .unwrap_or_else(|e| panic!("tail spawn failed: {e}"));
+
+  struct DropMark(Arc<AtomicBool>);
+  impl Future for DropMark {
+    type Output = ();
+    fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<()> {
+      Poll::Pending
+    }
+  }
+  impl Drop for DropMark {
+    fn drop(&mut self) {
+      self.0.store(true, Ordering::SeqCst);
+    }
+  }
+  let dropped = Arc::new(AtomicBool::new(false));
+  let cancelled = limited
+    .spawn(DropMark(Arc::clone(&dropped)))
+    .unwrap_or_else(|e| panic!("cancelled spawn failed: {e}"));
+
+  let other_ran = Arc::new(AtomicBool::new(false));
+  let other_flag = Arc::clone(&other_ran);
+  let independent = other
+    .spawn(async move {
+      other_flag.store(true, Ordering::SeqCst);
+    })
+    .unwrap_or_else(|e| panic!("other spawn failed: {e}"));
+  wait_until(|| other_ran.load(Ordering::SeqCst), "other scope dispatch");
+  assert!(order.lock().unwrap_or_else(|e| e.into_inner()).is_empty());
+
+  cancelled.abort_handle().abort();
+  wait_until(
+    || dropped.load(Ordering::SeqCst),
+    "queued cancellation cleanup",
+  );
+  assert!(matches!(
+    block_on(cancelled),
+    Err(AsyncJoinError::Cancelled)
+  ));
+  assert!(order.lock().unwrap_or_else(|e| e.into_inner()).is_empty());
+
+  let (lock, cv) = &*gate;
+  *lock.lock().unwrap_or_else(|e| e.into_inner()) = true;
+  cv.notify_all();
+  assert!(matches!(block_on(blocker), Ok(())));
+  assert!(matches!(block_on(head), Ok(())));
+  assert!(matches!(block_on(tail), Ok(())));
+  assert!(matches!(block_on(independent), Ok(())));
+  assert_eq!(*order.lock().unwrap_or_else(|e| e.into_inner()), [1, 2]);
+  assert_eq!(limited.snapshot().active_polls, 0);
+  runtime
+    .shutdown(AsyncShutdown::Drain)
+    .unwrap_or_else(|e| panic!("shutdown failed: {e}"));
+}
+
+#[test]
+fn idle_pending_abort_gets_a_queue_token_and_invalid_poll_limits_reject() {
+  assert!(matches!(
+    runtime(1, 2, 2).scope_with_config(AsyncScopeConfig {
+      max_active_polls: 0
+    }),
+    Err(super::AsyncError::InvalidConfig)
+  ));
+  let runtime = runtime(1, 2, 2);
+  let scope = runtime
+    .scope_with_config(AsyncScopeConfig {
+      max_active_polls: 1,
+    })
+    .unwrap_or_else(|e| panic!("scope failed: {e}"));
+  let polls = Arc::new(AtomicUsize::new(0));
+  let observed = Arc::clone(&polls);
+  let job = scope
+    .spawn(std::future::poll_fn(move |_cx| {
+      observed.fetch_add(1, Ordering::SeqCst);
+      Poll::<()>::Pending
+    }))
+    .unwrap_or_else(|e| panic!("spawn failed: {e}"));
+  wait_until(|| polls.load(Ordering::SeqCst) == 1, "first pending poll");
+  let sentinel_ran = Arc::new(AtomicBool::new(false));
+  let sentinel_flag = Arc::clone(&sentinel_ran);
+  let sentinel = scope
+    .spawn(async move {
+      sentinel_flag.store(true, Ordering::SeqCst);
+    })
+    .unwrap_or_else(|e| panic!("sentinel spawn failed: {e}"));
+  assert!(matches!(block_on(sentinel), Ok(())));
+  assert!(sentinel_ran.load(Ordering::SeqCst));
+  job.abort_handle().abort();
+  assert!(matches!(block_on(job), Err(AsyncJoinError::Cancelled)));
+  runtime
+    .shutdown(AsyncShutdown::Drain)
+    .unwrap_or_else(|e| panic!("shutdown failed: {e}"));
+}
+
+#[test]
+fn closing_a_quota_blocked_scope_reactivates_queued_cancellation() {
+  let runtime = runtime(2, 4, 2);
+  let scope = runtime
+    .scope_with_config(AsyncScopeConfig {
+      max_active_polls: 1,
+    })
+    .unwrap_or_else(|e| panic!("scope failed: {e}"));
+  let gate = Arc::new((Mutex::new(false), Condvar::new()));
+  let _release_gate = ReleaseGate(Arc::clone(&gate));
+  let started = Arc::new((Mutex::new(false), Condvar::new()));
+  let blocker = scope
+    .spawn(Gate {
+      gate: Arc::clone(&gate),
+      started: Arc::clone(&started),
+    })
+    .unwrap_or_else(|e| panic!("blocker spawn failed: {e}"));
+  {
+    let (lock, cv) = &*started;
+    let mut value = lock.lock().unwrap_or_else(|e| e.into_inner());
+    while !*value {
+      value = cv.wait(value).unwrap_or_else(|e| e.into_inner());
+    }
+  }
+  let dropped = Arc::new(AtomicBool::new(false));
+  struct DropMark(Arc<AtomicBool>);
+  impl Future for DropMark {
+    type Output = ();
+    fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<()> {
+      Poll::Pending
+    }
+  }
+  impl Drop for DropMark {
+    fn drop(&mut self) {
+      self.0.store(true, Ordering::SeqCst);
+    }
+  }
+  let queued = scope
+    .spawn(DropMark(Arc::clone(&dropped)))
+    .unwrap_or_else(|e| panic!("queued spawn failed: {e}"));
+  let close = scope.close();
+  wait_until(
+    || dropped.load(Ordering::SeqCst),
+    "scope-close cancellation bypass",
+  );
+  assert!(matches!(block_on(queued), Err(AsyncJoinError::Cancelled)));
+  let (lock, cv) = &*gate;
+  *lock.lock().unwrap_or_else(|e| e.into_inner()) = true;
+  cv.notify_all();
+  assert!(matches!(block_on(blocker), Ok(())));
+  assert_eq!(block_on(close), ());
+  runtime
+    .shutdown(AsyncShutdown::Drain)
+    .unwrap_or_else(|e| panic!("shutdown failed: {e}"));
+}
+
+#[test]
+fn cancel_pending_shutdown_reactivates_quota_blocked_work() {
+  let runtime = runtime(2, 4, 3);
+  let scope = runtime
+    .scope_with_config(AsyncScopeConfig {
+      max_active_polls: 1,
+    })
+    .unwrap_or_else(|e| panic!("scope failed: {e}"));
+  let gate = Arc::new((Mutex::new(false), Condvar::new()));
+  let _release_gate = ReleaseGate(Arc::clone(&gate));
+  let started = Arc::new((Mutex::new(false), Condvar::new()));
+  let blocker = scope
+    .spawn(Gate {
+      gate: Arc::clone(&gate),
+      started: Arc::clone(&started),
+    })
+    .unwrap_or_else(|e| panic!("blocker spawn failed: {e}"));
+  {
+    let (lock, cv) = &*started;
+    let mut value = lock.lock().unwrap_or_else(|e| e.into_inner());
+    while !*value {
+      value = cv.wait(value).unwrap_or_else(|e| e.into_inner());
+    }
+  }
+  let dropped = Arc::new(AtomicBool::new(false));
+  struct DropMark(Arc<AtomicBool>);
+  impl Future for DropMark {
+    type Output = ();
+    fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<()> {
+      Poll::Pending
+    }
+  }
+  impl Drop for DropMark {
+    fn drop(&mut self) {
+      self.0.store(true, Ordering::SeqCst);
+    }
+  }
+  let queued = scope
+    .spawn(DropMark(Arc::clone(&dropped)))
+    .unwrap_or_else(|e| panic!("queued spawn failed: {e}"));
+  let release_gate = Arc::clone(&gate);
+  let dropped_signal = Arc::clone(&dropped);
+  let releaser = std::thread::spawn(move || {
+    let _release_on_unwind = ReleaseGate(Arc::clone(&release_gate));
+    wait_until(
+      || dropped_signal.load(Ordering::SeqCst),
+      "shutdown cancellation dispatch",
+    );
+    let (lock, cv) = &*release_gate;
+    *lock.lock().unwrap_or_else(|e| e.into_inner()) = true;
+    cv.notify_all();
+  });
+  runtime
+    .shutdown(AsyncShutdown::CancelPending)
+    .unwrap_or_else(|e| panic!("shutdown failed: {e}"));
+  releaser
+    .join()
+    .unwrap_or_else(|_| panic!("gate releaser panicked"));
+  assert!(matches!(block_on(queued), Err(AsyncJoinError::Cancelled)));
+  assert!(matches!(block_on(blocker), Ok(())));
+}
+
+#[test]
+fn poll_quota_releases_before_a_panicking_future_destructor() {
+  let runtime = runtime(2, 4, 2);
+  let scope = runtime
+    .scope_with_config(AsyncScopeConfig {
+      max_active_polls: 1,
+    })
+    .unwrap_or_else(|e| panic!("scope failed: {e}"));
+  let drop_gate = Arc::new((Mutex::new(false), Condvar::new()));
+  let _release_drop_gate = ReleaseGate(Arc::clone(&drop_gate));
+  let drop_started = Arc::new(AtomicBool::new(false));
+  struct PanicOnPoll {
+    gate: Arc<(Mutex<bool>, Condvar)>,
+    started: Arc<AtomicBool>,
+  }
+  impl Future for PanicOnPoll {
+    type Output = ();
+    fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<()> {
+      panic!("expected poll panic");
+    }
+  }
+  impl Drop for PanicOnPoll {
+    fn drop(&mut self) {
+      self.started.store(true, Ordering::SeqCst);
+      let (lock, cv) = &*self.gate;
+      let mut released = lock.lock().unwrap_or_else(|e| e.into_inner());
+      while !*released {
+        released = cv.wait(released).unwrap_or_else(|e| e.into_inner());
+      }
+    }
+  }
+  let panicked = scope
+    .spawn(PanicOnPoll {
+      gate: Arc::clone(&drop_gate),
+      started: Arc::clone(&drop_started),
+    })
+    .unwrap_or_else(|e| panic!("spawn failed: {e}"));
+  wait_until(
+    || drop_started.load(Ordering::SeqCst),
+    "panicking future destructor",
+  );
+
+  let successor_ran = Arc::new(AtomicBool::new(false));
+  let flag = Arc::clone(&successor_ran);
+  let successor = scope
+    .spawn(async move {
+      flag.store(true, Ordering::SeqCst);
+    })
+    .unwrap_or_else(|e| panic!("successor spawn failed: {e}"));
+  wait_until(
+    || successor_ran.load(Ordering::SeqCst),
+    "successor poll during cleanup",
+  );
+
+  let (lock, cv) = &*drop_gate;
+  *lock.lock().unwrap_or_else(|e| e.into_inner()) = true;
+  cv.notify_all();
+  assert!(matches!(
+    block_on(panicked),
+    Err(AsyncJoinError::Panicked(_))
+  ));
+  assert!(matches!(block_on(successor), Ok(())));
   runtime
     .shutdown(AsyncShutdown::Drain)
     .unwrap_or_else(|e| panic!("shutdown failed: {e}"));

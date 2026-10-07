@@ -9,7 +9,7 @@ use std::task::Context;
 use super::entry::TaskContextGuard;
 use super::identity::TaskId;
 use super::join::{AsyncJob, AsyncJoinError, JoinState};
-use super::scheduler::{Shared, TaskRef};
+use super::scheduler::{PollPermit, Shared, TaskRef};
 
 pub(super) enum PollResult {
   Pending,
@@ -19,7 +19,7 @@ pub(super) enum PollResult {
 pub(super) trait ErasedTask: Send + Sync {
   /// Polls once without a scheduler lock. The future mutex prevents a
   /// cancellation cleanup from taking the future concurrently with poll.
-  fn poll(&self, cx: &mut Context<'_>) -> PollResult;
+  fn poll(&self, cx: &mut Context<'_>, permit: PollPermit) -> PollResult;
 
   /// Drops a cancelled future and stages its terminal outcome, with no
   /// scheduler lock held.
@@ -58,7 +58,7 @@ where
   F: Future + Send + 'static,
   F::Output: Send + 'static,
 {
-  fn poll(&self, cx: &mut Context<'_>) -> PollResult {
+  fn poll(&self, cx: &mut Context<'_>, permit: PollPermit) -> PollResult {
     let _task_context = TaskContextGuard::enter(Some(self.id));
     let Some(mut future) = self.lock_future().take() else {
       return PollResult::Ready;
@@ -66,6 +66,9 @@ where
     // Take ownership before calling user code. The task-state mutex is never
     // held while polling or dropping the future.
     let result = panic::catch_unwind(AssertUnwindSafe(|| future.as_mut().poll(cx)));
+    // Polling is the only quota-protected region. Release before user
+    // destructors, output staging, or cancellation cleanup can execute.
+    drop(permit);
     match result {
       Ok(std::task::Poll::Pending) => {
         *self.lock_future() = Some(future);

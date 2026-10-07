@@ -11,7 +11,7 @@ use std::task::{Context, Wake, Waker};
 
 use super::identity;
 use super::join::AsyncJob;
-use super::protocol::{PollFinish, PollProtocol, ScopeProtocol};
+use super::protocol::{PollFinish, PollProtocol, PollQuota, ScopeProtocol};
 use super::task::{ErasedTask, PollResult, Task};
 use super::{AsyncConfig, AsyncError, AsyncSpawnError};
 use crate::runtime::cache;
@@ -38,6 +38,8 @@ struct ScopeSlot {
   generation: u64,
   scope: Option<Arc<ScopeCell>>,
   ready: bool,
+  quota_blocked: bool,
+  quota: PollQuota,
 }
 
 struct TaskSlot {
@@ -65,15 +67,21 @@ pub(super) struct Shared {
 struct ScopeCell {
   reference: Option<ScopeRef>,
   shared: Option<Weak<Shared>>,
+  max_active_polls: usize,
   protocol: ScopeProtocol,
   completion: Mutex<Option<Waker>>,
 }
 
 impl ScopeCell {
-  fn new(reference: Option<ScopeRef>, shared: Option<Weak<Shared>>) -> Self {
+  fn new(
+    reference: Option<ScopeRef>,
+    shared: Option<Weak<Shared>>,
+    max_active_polls: usize,
+  ) -> Self {
     Self {
       reference,
       shared,
+      max_active_polls,
       protocol: ScopeProtocol::new(reference.is_none()),
       completion: Mutex::new(None),
     }
@@ -126,6 +134,8 @@ impl Shared {
       generation: 0,
       scope: None,
       ready: false,
+      quota_blocked: false,
+      quota: PollQuota::new(1),
     });
     let mut round_robin = VecDeque::new();
     round_robin
@@ -137,11 +147,13 @@ impl Shared {
     else {
       return Err(AsyncError::InvalidConfig);
     };
-    let root_scope = Arc::new(ScopeCell::new(None, None));
+    let root_scope = Arc::new(ScopeCell::new(None, None, config.workers));
     scopes[0] = ScopeSlot {
       generation: 1,
       scope: Some(root_scope),
       ready: false,
+      quota_blocked: false,
+      quota: PollQuota::new(config.workers),
     };
     let root = ScopeRef {
       index: 0,
@@ -185,13 +197,20 @@ impl Shared {
         return;
       }
       slot.ready = false;
+      slot.quota_blocked = false;
       cell.protocol.mark_reclaimed();
       slot.scope.take()
     };
     drop(retired);
   }
 
-  pub(super) fn new_scope(self: &Arc<Self>) -> Result<OwnedTaskScope, AsyncError> {
+  pub(super) fn new_scope(
+    self: &Arc<Self>,
+    max_active_polls: usize,
+  ) -> Result<OwnedTaskScope, AsyncError> {
+    if max_active_polls == 0 {
+      return Err(AsyncError::InvalidConfig);
+    }
     let mut state = self.lock();
     if state.closed {
       return Err(AsyncError::Closed);
@@ -203,15 +222,62 @@ impl Shared {
       return Err(AsyncError::TooManyScopes);
     };
     let scope_ref = ScopeRef { index, generation };
-    let cell = Arc::new(ScopeCell::new(Some(scope_ref), Some(Arc::downgrade(self))));
+    let cell = Arc::new(ScopeCell::new(
+      Some(scope_ref),
+      Some(Arc::downgrade(self)),
+      max_active_polls,
+    ));
     state.scopes[index].generation = generation;
     state.scopes[index].scope = Some(Arc::clone(&cell));
+    state.scopes[index].ready = false;
+    state.scopes[index].quota_blocked = false;
+    state.scopes[index].quota = PollQuota::new(max_active_polls);
     Ok(OwnedTaskScope {
       shared: Arc::clone(self),
       scope: scope_ref,
       cell,
       closed: false,
     })
+  }
+
+  pub(super) fn default_scope_poll_limit(&self) -> usize {
+    self.lock().scopes[0].quota.maximum()
+  }
+
+  fn scope_snapshot(&self, scope_ref: ScopeRef) -> Option<super::AsyncScopeSnapshot> {
+    let state = self.lock();
+    let slot = state.scopes.get(scope_ref.index)?;
+    if slot.generation != scope_ref.generation || slot.scope.is_none() {
+      return None;
+    }
+    let cell = slot.scope.as_ref()?;
+    Some(super::AsyncScopeSnapshot {
+      active_tasks: cell.protocol.active(),
+      active_polls: slot.quota.active(),
+      max_active_polls: slot.quota.maximum(),
+    })
+  }
+
+  fn release_poll(&self, scope_ref: ScopeRef) {
+    let notify = {
+      let mut state = self.lock();
+      let Some(slot) = state.scopes.get_mut(scope_ref.index) else {
+        return;
+      };
+      if slot.generation != scope_ref.generation || slot.scope.is_none() {
+        return;
+      }
+      let capacity_available = slot.quota.release();
+      if capacity_available && slot.quota_blocked {
+        refresh_scope_schedule(&mut state, scope_ref);
+        true
+      } else {
+        false
+      }
+    };
+    if notify {
+      self.work.notify_all();
+    }
   }
 
   pub(super) fn spawn<F>(
@@ -270,12 +336,16 @@ impl Shared {
     state.cancel_all |= cancel;
     if cancel {
       for index in 0..state.tasks.len() {
-        if state.tasks[index].task.is_some() && state.tasks[index].protocol.abort() {
+        if state.tasks[index].task.is_some() {
+          let inserted = state.tasks[index].protocol.abort();
           let task_ref = TaskRef {
             index,
             generation: state.tasks[index].protocol.generation(),
           };
-          push_ready(&mut state, task_ref);
+          if inserted {
+            push_ready(&mut state, task_ref);
+          }
+          refresh_task_scope(&mut state, task_ref);
         }
       }
       for scope in &mut state.scopes {
@@ -294,15 +364,16 @@ impl Shared {
       cell.protocol.close();
     }
     for index in 0..state.tasks.len() {
-      if state.tasks[index].task.is_some()
-        && state.tasks[index].scope == Some(scope)
-        && state.tasks[index].protocol.abort()
-      {
+      if state.tasks[index].task.is_some() && state.tasks[index].scope == Some(scope) {
+        let inserted = state.tasks[index].protocol.abort();
         let task = TaskRef {
           index,
           generation: state.tasks[index].protocol.generation(),
         };
-        push_ready(&mut state, task);
+        if inserted {
+          push_ready(&mut state, task);
+        }
+        refresh_task_scope(&mut state, task);
       }
     }
     let retired = if scope.index != 0
@@ -314,6 +385,7 @@ impl Shared {
         .is_some_and(|cell| cell.protocol.can_reclaim())
     {
       slot.ready = false;
+      slot.quota_blocked = false;
       if let Some(cell) = &slot.scope {
         cell.protocol.mark_reclaimed();
       }
@@ -352,9 +424,11 @@ impl Shared {
     if !slot.protocol.matches(task_ref.generation) || slot.task.is_none() {
       return;
     }
-    if slot.protocol.abort() {
+    let inserted = slot.protocol.abort();
+    if inserted {
       push_ready(&mut state, task_ref);
     }
+    refresh_task_scope(&mut state, task_ref);
     drop(state);
     self.work.notify_all();
   }
@@ -386,6 +460,21 @@ impl OwnedTaskScope {
     F::Output: Send + 'static,
   {
     self.shared.spawn(self.scope, future)
+  }
+
+  /// Returns task and active-poll counts for this scope. The task count may
+  /// change concurrently; the active-poll count and configured maximum are
+  /// sampled together under the scheduler lock.
+  #[must_use]
+  pub fn snapshot(&self) -> super::AsyncScopeSnapshot {
+    self
+      .shared
+      .scope_snapshot(self.scope)
+      .unwrap_or(super::AsyncScopeSnapshot {
+        active_tasks: self.cell.protocol.active(),
+        active_polls: 0,
+        max_active_polls: self.cell.max_active_polls,
+      })
   }
 
   /// Requests cancellation and returns a future that resolves after every
@@ -498,20 +587,81 @@ fn push_ready(state: &mut State, task_ref: TaskRef) {
     return;
   };
   state.ready.push_back(task_ref);
-  if let Some(scope) = state.scopes.get_mut(scope_ref.index)
-    && scope.generation == scope_ref.generation
-    && !scope.ready
+  refresh_scope_schedule(state, scope_ref);
+}
+
+fn refresh_task_scope(state: &mut State, task_ref: TaskRef) {
+  if let Some(scope_ref) = state
+    .tasks
+    .get(task_ref.index)
+    .filter(|task| task.protocol.matches(task_ref.generation))
+    .and_then(|task| task.scope)
   {
-    scope.ready = true;
-    state.round_robin.push_back(scope_ref);
+    refresh_scope_schedule(state, scope_ref);
+  }
+}
+
+/// Ensures a scope has one RR token exactly when it has dispatchable work.
+/// All callers hold the scheduler mutex, serializing this transition with
+/// poll-quota release so a scope cannot lose the release-before-block race.
+fn refresh_scope_schedule(state: &mut State, scope_ref: ScopeRef) {
+  let Some(scope) = state.scopes.get(scope_ref.index) else {
+    return;
+  };
+  if scope.generation != scope_ref.generation || scope.scope.is_none() {
+    return;
+  }
+  let has_queued = state.ready.iter().any(|task_ref| {
+    state.tasks.get(task_ref.index).is_some_and(|task| {
+      task.protocol.matches(task_ref.generation) && task.scope == Some(scope_ref)
+    })
+  });
+  if !has_queued {
+    let scope = &mut state.scopes[scope_ref.index];
+    scope.quota_blocked = false;
+    return;
+  }
+  let has_abort = state.ready.iter().any(|task_ref| {
+    state.tasks.get(task_ref.index).is_some_and(|task| {
+      task.protocol.matches(task_ref.generation)
+        && task.scope == Some(scope_ref)
+        && task.protocol.aborting_queued()
+    })
+  });
+  let scope = &mut state.scopes[scope_ref.index];
+  if scope.quota.active() < scope.quota.maximum() || has_abort {
+    scope.quota_blocked = false;
+    if !scope.ready {
+      scope.ready = true;
+      state.round_robin.push_back(scope_ref);
+    }
+  } else {
+    scope.quota_blocked = true;
+    scope.ready = false;
   }
 }
 
 enum Work {
-  Poll(TaskRef, Arc<dyn ErasedTask>),
+  Poll(TaskRef, Arc<dyn ErasedTask>, PollPermit),
   Cancel(TaskRef, Arc<dyn ErasedTask>),
   Park,
   Exit,
+}
+
+/// Releases one scope's active-poll reservation on every exit path. The task
+/// drops this immediately after the user's `Future::poll` returns, before any
+/// future/output cleanup can run.
+pub(super) struct PollPermit {
+  shared: Weak<Shared>,
+  scope: ScopeRef,
+}
+
+impl Drop for PollPermit {
+  fn drop(&mut self) {
+    if let Some(shared) = self.shared.upgrade() {
+      shared.release_poll(self.scope);
+    }
+  }
 }
 
 fn take_next(shared: &Arc<Shared>, worker_index: usize) -> Work {
@@ -523,37 +673,69 @@ fn take_next(shared: &Arc<Shared>, worker_index: usize) -> Work {
       {
         scope.ready = false;
       }
-      let position = state.ready.iter().position(|task_ref| {
+      let matches_scope = |task_ref: &&TaskRef| {
         state.tasks.get(task_ref.index).is_some_and(|task| {
           task.protocol.matches(task_ref.generation) && task.scope == Some(scope_ref)
         })
+      };
+      let abort_position = state.ready.iter().position(|task_ref| {
+        matches_scope(&task_ref) && state.tasks[task_ref.index].protocol.aborting_queued()
       });
+      let normal_position = state.ready.iter().position(|task_ref| {
+        matches_scope(&task_ref) && !state.tasks[task_ref.index].protocol.aborting_queued()
+      });
+      let quota_available = state.scopes.get(scope_ref.index).is_some_and(|scope| {
+        scope.generation == scope_ref.generation
+          && scope.scope.is_some()
+          && scope.quota.active() < scope.quota.maximum()
+      });
+      let position =
+        abort_position.or_else(|| quota_available.then_some(normal_position).flatten());
       if let Some(position) = position {
+        let selected_abort = abort_position.is_some();
+        let acquired = if selected_abort {
+          false
+        } else {
+          state.scopes[scope_ref.index].quota.try_acquire()
+        };
+        if !selected_abort && !acquired {
+          refresh_scope_schedule(&mut state, scope_ref);
+          continue;
+        }
         let Some(task_ref) = state.ready.remove(position) else {
+          if acquired {
+            state.scopes[scope_ref.index].quota.release();
+          }
           continue;
         };
-        let remaining = state.ready.iter().any(|queued| {
-          state.tasks.get(queued.index).is_some_and(|task| {
-            task.protocol.matches(queued.generation) && task.scope == Some(scope_ref)
-          })
-        });
-        if remaining
-          && let Some(scope) = state.scopes.get_mut(scope_ref.index)
-          && scope.generation == scope_ref.generation
-        {
-          scope.ready = true;
-          state.round_robin.push_back(scope_ref);
-        }
-        if let Some(slot) = state.tasks.get_mut(task_ref.index)
-          && let Some(task) = slot.task.as_ref().map(Arc::clone)
-          && let Some(aborting) = slot.protocol.begin_poll()
-        {
-          return if aborting {
-            Work::Cancel(task_ref, task)
+        let task = state.tasks[task_ref.index].task.as_ref().map(Arc::clone);
+        let began = state.tasks[task_ref.index].protocol.begin_poll();
+        if let (Some(task), Some(aborting)) = (task, began) {
+          let permit = if aborting {
+            if acquired {
+              state.scopes[scope_ref.index].quota.release();
+            }
+            None
           } else {
-            Work::Poll(task_ref, task)
+            debug_assert!(acquired);
+            Some(PollPermit {
+              shared: Arc::downgrade(shared),
+              scope: scope_ref,
+            })
+          };
+          refresh_scope_schedule(&mut state, scope_ref);
+          return if aborting || selected_abort {
+            Work::Cancel(task_ref, task)
+          } else if let Some(permit) = permit {
+            Work::Poll(task_ref, task, permit)
+          } else {
+            continue;
           };
         }
+        if acquired {
+          state.scopes[scope_ref.index].quota.release();
+        }
+        refresh_scope_schedule(&mut state, scope_ref);
       }
       continue;
     }
@@ -564,7 +746,7 @@ fn take_next(shared: &Arc<Shared>, worker_index: usize) -> Work {
     drop(state);
     cache::flush();
     state = shared.lock();
-    if state.ready.is_empty()
+    if state.round_robin.is_empty()
       && !(state.closed && !state.tasks.iter().any(|slot| slot.task.is_some()))
     {
       state = shared
@@ -585,7 +767,7 @@ fn take_next(shared: &Arc<Shared>, worker_index: usize) -> Work {
         }
       }
     }
-    if state.ready.is_empty() && !state.closed {
+    if state.round_robin.is_empty() && !state.closed {
       return Work::Park;
     }
   }
@@ -605,11 +787,11 @@ pub(super) fn worker(shared: Arc<Shared>, index: usize) {
   let _runtime_context = super::entry::EnterGuard::enter(&worker_handle);
   loop {
     match take_next(&shared, index) {
-      Work::Poll(task_ref, task) => {
+      Work::Poll(task_ref, task, permit) => {
         super::entry::reset_budget();
         let waker = task_waker(&shared, task_ref);
         let mut context = Context::from_waker(&waker);
-        let result = task.poll(&mut context);
+        let result = task.poll(&mut context, permit);
         finish_poll(&shared, task_ref, result);
       }
       Work::Cancel(task_ref, task) => {
@@ -716,7 +898,7 @@ mod tests {
     })
     .unwrap_or_else(|error| panic!("shared construction failed: {error}"));
     let scope = shared
-      .new_scope()
+      .new_scope(2)
       .unwrap_or_else(|error| panic!("scope construction failed: {error}"));
     let old_reference = scope.scope;
     let cell = Arc::clone(&scope.cell);
@@ -741,9 +923,11 @@ mod tests {
     ));
 
     let replacement = shared
-      .new_scope()
+      .new_scope(1)
       .unwrap_or_else(|error| panic!("reclaimed scope slot unavailable: {error}"));
     assert_eq!(replacement.scope.index, old_reference.index);
     assert!(replacement.scope.generation > old_reference.generation);
+    assert_eq!(replacement.snapshot().active_polls, 0);
+    assert_eq!(replacement.snapshot().max_active_polls, 1);
   }
 }

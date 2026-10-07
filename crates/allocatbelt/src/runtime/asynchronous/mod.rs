@@ -51,6 +51,29 @@ pub struct AsyncConfig {
   pub max_scopes: usize,
 }
 
+/// Polling limits for one owned scope.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AsyncScopeConfig {
+  /// Maximum number of this scope's futures that may be inside `Future::poll`
+  /// simultaneously. Must be nonzero; the runtime worker count remains the
+  /// overall concurrency ceiling.
+  pub max_active_polls: usize,
+}
+
+/// A scope's point-in-time task and active-poll counts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AsyncScopeSnapshot {
+  /// Admitted unfinished tasks, including cleanup after polling.
+  /// This count can change concurrently with a snapshot.
+  pub active_tasks: usize,
+  /// Poll slots reserved before dispatch and held through `Future::poll`
+  /// return, sampled under the scheduler lock with `max_active_polls`.
+  /// A reserved task may be about to enter its poll call.
+  pub active_polls: usize,
+  /// The configured active-poll limit for this scope.
+  pub max_active_polls: usize,
+}
+
 /// Construction, admission, block-on entry, or shutdown failure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
@@ -200,7 +223,15 @@ impl AsyncRuntime {
 
   /// Creates an independently cancellable owned scope.
   pub fn scope(&self) -> Result<OwnedTaskScope, AsyncError> {
-    self.shared.new_scope()
+    self
+      .shared
+      .new_scope(self.shared.default_scope_poll_limit())
+  }
+
+  /// Creates an independently cancellable owned scope with a per-scope
+  /// simultaneous polling limit.
+  pub fn scope_with_config(&self, config: AsyncScopeConfig) -> Result<OwnedTaskScope, AsyncError> {
+    self.shared.new_scope(config.max_active_polls)
   }
 
   /// Closes admission and joins every worker.
