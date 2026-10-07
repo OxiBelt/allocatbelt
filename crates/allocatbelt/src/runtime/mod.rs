@@ -79,6 +79,7 @@ pub mod buffered_io;
 mod cache;
 pub mod channel;
 pub mod concurrency;
+pub mod concurrency_many;
 mod error;
 pub mod fs;
 #[cfg(not(loom))]

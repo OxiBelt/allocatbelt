@@ -538,7 +538,7 @@ Three Loom models compile the production completion ledger and cover waiter
 registration, publication, cancellation and retained completion identity.
 They do not model OS spawn/wait/kill, pidfd identity or the reaper slot table.
 
-## Composing two futures
+## Composing futures
 
 `runtime::concurrency` supplies `join2`, `try_join2` and `select2` for borrowed,
 local or owned futures. Each input has one ordinary pinned-box allocation;
@@ -550,9 +550,25 @@ remain pending. This is a two-input port; it does not provide arbitrary-arity
 macros or disabled select branches. Both inputs are constructed by the caller
 and owned immediately.
 
+`runtime::concurrency_many` adds homogeneous `join_all`, `try_join_all` and
+`select_many` with an explicit branch ceiling up to 1,024. Rejection returns
+the original input vector before consuming any element. Empty joins complete
+immediately; an empty or wholly disabled selection is rejected. Disabled
+futures are owned but never polled, and are destroyed before result
+publication. Selection returns the original branch index and uses biased
+order or deterministic round-robin starting priority after pending polls.
+
+These helpers reserve ordinary bookkeeping and result-vector storage before
+consuming inputs, then pin each active future in an ordinary box. Bookkeeping
+reservation failure is recoverable; box allocation follows ordinary Rust
+allocation-failure behavior. Managed storage is not implicitly charged.
+Twenty native tests cover ownership, ordering, pinning, rejection and panic
+cleanup. Heterogeneous macros and randomized selection remain subsequent
+ports.
+
 A completed input is destroyed before its output is retained. Failure or
 selection destroys unfinished inputs and unused partial outputs before
-returning the selected result. Cancellation drops both inputs; earlier side
+returning the selected result. Cancellation drops the owned inputs; earlier side
 effects remain committed. Poll panics resume after cleanup, with secondary
 cleanup panics contained. When normal cleanup first panics, that primary panic
 resumes after all other values are disposed. Cleanup during an existing unwind
