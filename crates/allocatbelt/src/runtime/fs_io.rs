@@ -1,7 +1,7 @@
 //! Asynchronous traits over the bounded blocking filesystem API.
 //!
-//! [`AsyncFile`] owns one [`OwnedFile`](crate::runtime::fs::OwnedFile) and two
-//! caller-sized [`ManagedBuf`](crate::runtime::managed::ManagedBuf) staging
+//! [`AsyncFile`] owns one [`OwnedFile`] and two
+//! caller-sized [`ManagedBuf`] staging
 //! buffers. Reads use bounded read-ahead; writes are accepted into the write
 //! buffer and submitted to the blocking pool by flush, buffer pressure, seek,
 //! read-after-write or shutdown. The buffers remain charged to their resource
