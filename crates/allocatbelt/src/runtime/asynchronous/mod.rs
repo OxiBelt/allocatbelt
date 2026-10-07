@@ -14,6 +14,7 @@ mod local;
 mod protocol;
 mod scheduler;
 mod task;
+mod task_set;
 
 #[cfg(all(test, not(loom)))]
 mod tests;
@@ -33,6 +34,7 @@ pub use local::{
   LocalSendHandle, LocalSpawnError, LocalTaskScope,
 };
 pub use scheduler::{OwnedTaskScope, ScopeClose};
+pub use task_set::{JoinNext, SetTaskId, TaskSet, TaskSetError};
 
 /// Fixed limits for an [`AsyncRuntime`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -1,12 +1,19 @@
 //! Awaitable single-consumer task outcomes.
 
+#[cfg(loom)]
+use loom::sync::atomic::{AtomicBool, Ordering};
+#[cfg(loom)]
+use loom::sync::{Mutex, MutexGuard};
 use std::any::Any;
 use std::fmt;
 use std::future::Future;
 use std::panic::{self, AssertUnwindSafe};
 use std::pin::Pin;
+#[cfg(not(loom))]
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, PoisonError};
+#[cfg(not(loom))]
+use std::sync::{Mutex, MutexGuard};
 use std::task::{Context, Poll, Waker};
 
 /// Why an async task did not produce its output.
@@ -37,8 +44,13 @@ impl fmt::Display for AsyncJoinError {
 
 impl std::error::Error for AsyncJoinError {}
 
+struct PendingWakers {
+  join: Option<Waker>,
+  finished: Option<Waker>,
+}
+
 enum Slot<T> {
-  Pending(Option<Waker>),
+  Pending(PendingWakers),
   Ready(Option<Result<T, AsyncJoinError>>),
   Taken,
 }
@@ -51,7 +63,10 @@ pub(super) struct JoinState<T> {
 impl<T> JoinState<T> {
   pub(super) fn new() -> Arc<Self> {
     Arc::new(Self {
-      slot: Mutex::new(Slot::Pending(None)),
+      slot: Mutex::new(Slot::Pending(PendingWakers {
+        join: None,
+        finished: None,
+      })),
       finished: Arc::new(AtomicBool::new(false)),
     })
   }
@@ -68,11 +83,16 @@ impl<T> JoinState<T> {
   ) -> Option<Result<T, AsyncJoinError>> {
     let mut slot = self.lock();
     match std::mem::replace(&mut *slot, Slot::Taken) {
-      Slot::Pending(waker) => {
+      Slot::Pending(wakers) => {
         *slot = Slot::Ready(Some(result));
         self.finished.store(true, Ordering::Release);
         drop(slot);
-        if let Some(waker) = waker
+        if let Some(waker) = wakers.finished
+          && let Err(payload) = panic::catch_unwind(AssertUnwindSafe(|| waker.wake()))
+        {
+          drop_contained(payload);
+        }
+        if let Some(waker) = wakers.join
           && let Err(payload) = panic::catch_unwind(AssertUnwindSafe(|| waker.wake()))
         {
           drop_contained(payload);
@@ -140,6 +160,56 @@ impl<T> AsyncJob<T> {
   pub fn is_finished(&self) -> bool {
     self.state.finished.load(Ordering::Acquire)
   }
+
+  /// Polls for terminal completion without taking the task's result.
+  ///
+  /// This is intended for completion-order collections that need a separate
+  /// notification before they consume this join handle.
+  pub fn poll_finished(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+    let this = self.get_mut();
+    if this.state.finished.load(Ordering::Acquire) {
+      return Poll::Ready(());
+    }
+
+    let replacement = cx.waker().clone();
+    let old = {
+      let mut slot = this.state.lock();
+      let Slot::Pending(wakers) = &mut *slot else {
+        drop(slot);
+        drop(replacement);
+        return Poll::Ready(());
+      };
+      if this.state.finished.load(Ordering::Acquire) {
+        drop(slot);
+        drop(replacement);
+        return Poll::Ready(());
+      }
+      wakers.finished.replace(replacement)
+    };
+    drop(old);
+    Poll::Pending
+  }
+
+  /// Takes an outcome already announced by `poll_finished`, without cloning a
+  /// caller waker while consuming a completion notification.
+  pub(super) fn take_finished(&mut self) -> Option<Result<T, AsyncJoinError>> {
+    if !self.state.finished.load(Ordering::Acquire) {
+      return None;
+    }
+    let outcome = {
+      let mut slot = self.state.lock();
+      match std::mem::replace(&mut *slot, Slot::Taken) {
+        Slot::Ready(outcome) => outcome.unwrap_or(Err(AsyncJoinError::Cancelled)),
+        Slot::Taken => Err(AsyncJoinError::Cancelled),
+        Slot::Pending(wakers) => {
+          *slot = Slot::Pending(wakers);
+          return None;
+        }
+      }
+    };
+    self.finished = true;
+    Some(outcome)
+  }
 }
 
 /// A clonable, thread-safe cancellation handle, including for local tasks
@@ -180,8 +250,8 @@ impl<T> Future for AsyncJob<T> {
     let replacement = cx.waker().clone();
     let mut slot = self.state.lock();
     match &mut *slot {
-      Slot::Pending(waker) => {
-        let old = waker.replace(replacement);
+      Slot::Pending(wakers) => {
+        let old = wakers.join.replace(replacement);
         drop(slot);
         drop(old);
         Poll::Pending
@@ -229,7 +299,7 @@ mod tests {
   use std::pin::Pin;
   use std::rc::Rc;
   use std::sync::Arc;
-  use std::sync::atomic::{AtomicUsize, Ordering};
+  use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
   use std::task::{Context, Poll, Wake, Waker};
 
   #[test]
@@ -297,5 +367,127 @@ mod tests {
       Poll::Ready(Ok(7))
     ));
     assert!(job.is_finished());
+  }
+
+  #[test]
+  fn finished_observer_does_not_consume_outcome_and_both_observers_are_woken() {
+    let state = JoinState::<usize>::new();
+    let mut job = AsyncJob::new(Arc::clone(&state), Arc::new(|| {}));
+    let wakes = Arc::new(AtomicUsize::new(0));
+    let waker = Waker::from(Arc::new(CountWake(Arc::clone(&wakes))));
+    let mut context = Context::from_waker(&waker);
+
+    assert!(Pin::new(&mut job).poll_finished(&mut context).is_pending());
+    assert!(Pin::new(&mut job).poll(&mut context).is_pending());
+    assert!(state.publish(Ok(17)).is_none());
+    assert_eq!(wakes.load(Ordering::SeqCst), 2);
+    assert!(Pin::new(&mut job).poll_finished(&mut context).is_ready());
+    assert!(matches!(
+      Pin::new(&mut job).poll(&mut context),
+      Poll::Ready(Ok(17))
+    ));
+  }
+
+  struct CountWake(Arc<AtomicUsize>);
+
+  impl Wake for CountWake {
+    fn wake(self: Arc<Self>) {
+      self.0.fetch_add(1, Ordering::SeqCst);
+    }
+  }
+
+  #[test]
+  fn detaching_drops_join_and_finished_wakers_after_releasing_state_lock() {
+    struct LockProbe {
+      state: std::sync::Weak<JoinState<usize>>,
+      unlocked_on_drop: Arc<AtomicBool>,
+      wakes: Arc<AtomicUsize>,
+    }
+
+    impl Wake for LockProbe {
+      fn wake(self: Arc<Self>) {
+        self.wakes.fetch_add(1, Ordering::SeqCst);
+      }
+    }
+
+    impl Drop for LockProbe {
+      fn drop(&mut self) {
+        let unlocked = self
+          .state
+          .upgrade()
+          .is_some_and(|state| state.slot.try_lock().is_ok());
+        self.unlocked_on_drop.store(unlocked, Ordering::SeqCst);
+      }
+    }
+
+    let state = JoinState::<usize>::new();
+    let mut job = AsyncJob::new(Arc::clone(&state), Arc::new(|| {}));
+    let unlocked_on_drop = Arc::new(AtomicBool::new(false));
+    let wakes = Arc::new(AtomicUsize::new(0));
+    let waker = Waker::from(Arc::new(LockProbe {
+      state: Arc::downgrade(&state),
+      unlocked_on_drop: Arc::clone(&unlocked_on_drop),
+      wakes,
+    }));
+    let mut context = Context::from_waker(&waker);
+    assert!(Pin::new(&mut job).poll_finished(&mut context).is_pending());
+    assert!(Pin::new(&mut job).poll(&mut context).is_pending());
+    drop(waker);
+    drop(job);
+    assert!(unlocked_on_drop.load(Ordering::SeqCst));
+  }
+}
+
+#[cfg(all(test, loom))]
+mod model {
+  // This models JoinState's observer registration/publication lock and flag.
+  // It does not model scheduler cleanup, executor ordering, or user waker code.
+  use super::{AsyncJob, JoinState};
+  use loom::sync::Arc;
+  use loom::sync::atomic::{AtomicBool, Ordering};
+  use loom::thread;
+  use std::pin::Pin;
+  use std::sync::Arc as StdArc;
+  use std::task::{Context, Wake, Waker};
+
+  struct WakeFlag(Arc<AtomicBool>);
+
+  impl Wake for WakeFlag {
+    fn wake(self: StdArc<Self>) {
+      self.0.store(true, Ordering::Release);
+    }
+  }
+
+  #[test]
+  fn publication_racing_finished_observer_registration_is_not_lost() {
+    loom::model(|| {
+      let state = JoinState::<usize>::new();
+      let job = AsyncJob::new(StdArc::clone(&state), StdArc::new(|| {}));
+      let observed_wake = Arc::new(AtomicBool::new(false));
+      let published = Arc::new(AtomicBool::new(false));
+
+      let observer_wake = Arc::clone(&observed_wake);
+      let observer_published = Arc::clone(&published);
+      let observer = thread::spawn(move || {
+        let mut job = job;
+        let waker = Waker::from(StdArc::new(WakeFlag(observer_wake.clone())));
+        let mut context = Context::from_waker(&waker);
+        let ready = Pin::new(&mut job).poll_finished(&mut context).is_ready();
+        while !observer_published.load(Ordering::Acquire) {
+          thread::yield_now();
+        }
+        ready
+      });
+
+      let publisher_published = Arc::clone(&published);
+      let publisher = thread::spawn(move || {
+        assert!(state.publish(Ok(1)).is_none());
+        publisher_published.store(true, Ordering::Release);
+      });
+
+      let ready = observer.join().unwrap();
+      publisher.join().unwrap();
+      assert!(ready || observed_wake.load(Ordering::Acquire));
+    });
   }
 }

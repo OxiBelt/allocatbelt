@@ -205,8 +205,9 @@ metadata rather than the future or result. `is_finished` becomes true when the
 terminal outcome is published after future destruction and admission release.
 Detaching a join alone leaves it false. It does not wait for completion callbacks,
 discarded-output destruction or the later scope-close publication/reclamation.
-The completion flag has native publication and cross-thread cancellation tests;
-it is outside the existing Loom transition models.
+The completion flag has native publication and cross-thread cancellation tests.
+A Loom model races completion-observer registration against join publication;
+it does not model the executor's entire cleanup and scope-close sequence.
 
 The blocking pool's `Job` is also a future, so an asynchronous caller can await
 blocking work without blocking an executor worker. Its existing consuming
@@ -218,6 +219,35 @@ table. Full queues, worker parking, actual wakers, ownership and scope pointer
 identity are outside those models; native lifecycle tests cover these paths.
 The separately constructed epoll reactor and timer driver can wake executor
 tasks; their registration limits are configured independently.
+
+## Completion sets
+
+`runtime::asynchronous::TaskSet` owns at most its configured number of async
+joins, including completed but unconsumed results. Its table and notification
+queue are reserved at construction. `try_insert` returns the original join
+when full; `try_spawn` checks set capacity before executor admission and
+returns the original future on either rejection. Slot generations and set
+identities do not wrap; exhausted slots retire.
+
+`join_next` yields a set-scoped ID and outcome in completion-notification queue
+order. Simultaneous completions have no wall-clock ordering guarantee. Results
+remain in their original join state until consumed, including any managed
+buffer charges. A separate `poll_finished` observer supports notification
+without consuming an `AsyncJob` result. Dropping a pending `join_next` removes
+its parent waker and retains the jobs.
+
+`abort_all` requests every cancellation, containing callback panics separately.
+Set destruction requests all aborts before individually dropping the joins and
+their retained results outside queue locks. Cancellation cleanup is asynchronous;
+destruction does not wait for task cleanup or scope closure. Helper metadata
+and caller results are outside the managed-buffer budget unless their storage
+is explicitly managed.
+
+Native tests cover publication/registration races, rejection, ordering, stale
+generations, retained charges and panicking callbacks/destructors. Two Loom
+models exercise the actual queue's notification coalescing and release race.
+A separate join-state model covers completion-observer registration against
+publication; these models do not cover the entire completion-set lifecycle.
 
 ## Current-thread local tasks
 
