@@ -1,0 +1,82 @@
+# Resource runtime implementation and qualification
+
+Implementation target: one published `allocatbelt` package, allocator-only
+defaults preserved, optional runtime modules, and no Tokio dependency anywhere
+in the published normal/build dependency graph. Development comparators may
+depend on Tokio. Work takes place on `feat/resource-runtime-foundation`.
+
+The compatibility baseline is Tokio 1.53.1's stable Linux capabilities. This
+requires explicit application ports rather than claiming binary or exact API
+compatibility. Declarative macros and functions replace procedural entry
+macros. Bounded submission and channel capacities require applications to
+handle rejection and retain ownership. Owned task scopes accept `'static`
+futures; scoped borrowing is outside this contract.
+
+## Dependency order and acceptance
+
+| Stage | Deliverable | Acceptance |
+|---|---|---|
+| Package | Move the existing blocking pool into the allocator package | Packaged consumer works; production graph excludes Tokio; allocator defaults unchanged |
+| Miri repair | Preserve native stress sizes; use topology-equivalent bounded Miri fixtures and a bounded multiword test | Both formerly cancelled cases exit successfully within 30 minutes each; complete isolated core campaign records process exits and intentional benchmark skip |
+| Measurement | Separate allocation churn, executor scheduling and application lanes | Independent open-loop arrivals, post-publication completion, checksums, overload counts, timer overhead, fresh balanced processes, immutable source/binary manifests |
+| Managed resources | Account managed storage and operation lifetimes | Charges survive returned results and final clones; replacement growth counts old plus new storage; rollback is atomic |
+| Async lifecycle | Owned Send tasks, asynchronous joins, cancellation and fair owned scopes | No concurrent poll; stale wakes are harmless; cleanup and admission release precede result publication; callbacks run outside scheduler locks |
+| Runtime entry | Multithread/current-thread entry, handles and local execution | Context restoration, external submissions, owner-thread `!Send` tasks, explicit nested-entry rules |
+| Task utilities | Yield/budgets, IDs, task-local state, abort controls, completion-order task sets and awaitable blocking jobs | Cancellation, panic containment, detach and shutdown semantics are tested |
+| Time | Bounded sleeps/reset, timeout, all interval missed-tick policies and test clock | Deadline ordering, reset generations, cancellation release, lost wakes and shutdown are covered |
+| Readiness | Epoll reactor, bounded fd registrations and readiness guards | Fd reuse, simultaneous directions, `WouldBlock`, cancellation and sandbox denial |
+| I/O and network | Runtime-neutral traits/utilities; TCP, UDP, Unix sockets and bounded DNS | Partial progress, EOF/half-close, datagram boundaries, options and backpressure |
+| Filesystem | Bounded blocking file/directory operations | Offsets and flush ordering; detached cancellation retains owned buffers/permits until actual completion |
+| Synchronization | Channels, locks/guards, semaphores, notifications, barriers and initialization cells | Lost-wake models, FIFO fairness, cancellation removal, lag/closure and retained-message accounting |
+| Processes/signals | Child lifecycle, pipes and process-global signal integration | Reaping, deliberate kill-on-drop policy, cancellation, bounded output and multiple runtimes |
+| Entry/concurrency helpers | Function/declarative equivalents for entry, pinning, task-local, join/error-join and selection | Borrowing, disabled branches, selection policy and loser cleanup |
+| Optional controls | Delegated cgroup v2, bounded adaptive policy and separately named runtime io_uring | Permission/readback checks, fixed ceilings, sustained-breach/cooldown/recovery; denied ring setup and no replay after submission |
+| Application ports | CPU, memory, TCP/HTTP and disk workloads | Same allocator/policies for executor comparisons; Tokio-free normal/build graph of each port |
+| Qualification | Native allocator/executor/application matrix | Per-host statistical gates and correctness checks below; no unsupported superiority claim |
+
+`block_in_place` needs bounded worker handoff while retaining execution on the
+calling thread; a blocking-pool offload alone does not preserve borrowed or
+`!Send` closures. Unbounded Tokio APIs require an explicit bounded migration
+policy. Tokio's unstable io_uring, tracing, taskdump and scheduler-latency APIs
+are outside the stable baseline; owned-buffer runtime io_uring is an additional
+goal, independent of allocator purge io_uring.
+
+## Performance gates
+
+Preregister workloads, equal geometric-mean weights, arrival rates, worker
+counts, resource ceilings, reclamation policies and exclusions before the
+confirmation campaign. Use six exploratory paired runs to develop candidates,
+then an independent fixed campaign of 36 pairs with simultaneous paired
+confidence intervals. Preserve failed and slower variants. Analyze each host
+separately; never pool hosts to pass a gate.
+
+Allocator qualification requires at least 5% higher suite throughput and 5%
+lower suite p99 against both secure and standard mimalloc. Executor
+qualification requires the same gains over Tokio with the same allocator and
+matched policies. Individual workload guards allow at most 2% throughput or
+CPU regression and 5% tail-latency or retained-memory regression. Report
+rejections and late arrivals separately; failed admission is not completed
+work. Allocation-churn latency includes payload access and freeing, and is
+distinct from raw allocation/free latency and application response latency.
+
+Run the primary native campaign on the designated bare-metal host and confirm
+on both designated guest hosts using their native instructions. Docker and
+QEMU establish correctness, not performance. Keep raw measurements, profiles,
+security findings and Miri logs in the private resources checkout. Public
+reports contain sanitized conclusions and reproducible configuration.
+
+## Correctness and review gates
+
+Preserve the safe `no_std` allocator core and every design constraint. New
+runtime modules forbid unsafe code. Model actual concurrent transitions where
+feasible, and state the limits of any model explicitly. Run targeted lifecycle
+and ownership tests, Miri, relevant Loom models, standard formatting/Clippy/
+release tests, feature/package gates, audit/deny and affected platform scripts.
+Use independent specification/correctness reviews before signed commits. Every
+commit includes the required assistance trailer. A passing milestone does not
+establish full capability parity or performance qualification.
+
+The [runtime contract](../runtime.md) documents accepted implementation. The
+[foundation report](runtime-foundation.md) contains earlier measurements, whose
+limitations remain in force. This roadmap records acceptance requirements,
+not completed qualification results.

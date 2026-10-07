@@ -45,6 +45,51 @@ cargo install rustfilt inferno
 
 ## The benchmarks' own columns
 
+### Allocation churn and open-loop completion latency
+
+[`scripts/bench-latency.sh`](../../scripts/bench-latency.sh) collects separate
+latency and throughput experiments. The allocator lane measures allocation,
+payload access and freeing for local, aligned and mixed-size traces. It does
+not measure raw allocator calls. The blocking lane uses independent scheduled
+arrivals and records latency from the intended arrival until an observer
+polls the public join future to `Ready`, after result publication. Producer
+lateness remains in the sample and is also reported separately. Throughput
+runs omit per-completion timestamps and percentiles.
+
+```sh
+scripts/bench-latency.sh --lane allocator --workload mixed --mode latency \
+  --allocs mimalloc,standard,allocatbelt --reps 6 --ops 20000 --out PRIVATE_DIR
+scripts/bench-latency.sh --lane blocking --mode latency \
+  --allocs mimalloc,standard,allocatbelt --reps 6 --jobs 5000 \
+  --workers 4 --arrival-rate 10000 --bytes 256 --out PRIVATE_DIR
+```
+
+Use a distinct private output directory for every configuration and mode.
+Six pairs are exploratory; confirmation requires the independent campaign
+and gates in the [implementation plan](resource-runtime-plan.md). This
+blocking lane does not qualify async scheduling or application response time.
+
+Secure and standard mimalloc are built in separate Cargo dependency graphs
+to prevent feature unification from enabling hardening in the standard
+baseline. [`check-benchmark-baselines.sh`](../../scripts/check-benchmark-baselines.sh)
+checks active features and matching locked dependency versions. The collector
+checks exact counts, checksums, output shape and zero loss; failed attempts
+retain their raw output and result rows. It records effective arguments,
+source fingerprints before and after building, executable hashes, flags,
+toolchain, affinity and environment. Sources must stay fixed while building.
+
+Each variant runs in a fresh process in Williams order. Use whole balancing
+cycles: the default three allocator variants need six repetitions; the default
+six blocking variants also need six. Adding the diagnostic system allocator
+creates eight blocking variants, requiring eight repetitions per cycle.
+Incomplete cycles are explicitly marked and cannot qualify results.
+`--bin-dir` likewise marks unverified prebuilt artifacts nonqualifying.
+Nearest-rank percentiles include measured timer overhead without subtraction;
+short allocator samples require interpreting the reported overhead. Worker
+warm-up and preallocated observer setup precede the common arrival clock.
+Observer notifications coalesce in a bounded queue; capacity failure is
+reported rather than silently dropping completion observations.
+
 ### Resource-aware blocking runtime
 
 The runtime matrix uses one binary per allocator and chooses the executor

@@ -355,3 +355,5 @@ fn count(n: usize) -> String {
     n.to_string()
   }
 }
+
+pub mod latency;

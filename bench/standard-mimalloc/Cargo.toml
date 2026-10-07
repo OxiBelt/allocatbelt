@@ -1,0 +1,20 @@
+[package]
+name = "allocatbelt-standard-mimalloc-bench"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99.0"
+license = "Apache-2.0"
+publish = false
+
+# An independent dependency graph is necessary: Cargo otherwise unifies the
+# workspace's secure mimalloc feature into the standard baseline.
+[workspace]
+
+[dependencies]
+allocatbelt = { path = "../../crates/allocatbelt", features = ["io-uring", "runtime"] }
+mimalloc = { version = "=0.1.52", default-features = false }
+tokio = { version = "=1.53.1", default-features = false, features = ["rt", "rt-multi-thread"] }
+
+[[bin]]
+name = "bench-latency-standard"
+path = "src/main.rs"
