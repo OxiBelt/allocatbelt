@@ -88,6 +88,7 @@ pub mod mutex;
 #[cfg(not(loom))]
 pub mod net;
 pub mod notify;
+pub mod once_cell;
 pub mod oneshot;
 #[cfg(not(loom))]
 pub mod reactor;

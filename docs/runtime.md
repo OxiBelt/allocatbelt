@@ -291,6 +291,31 @@ barriers, cancellation, close, downgrade, owned lifetimes and trait boundaries;
 an actual-source Loom model checks reader/writer exclusivity. Metadata is
 outside the managed-buffer ledger.
 
+## Bounded asynchronous initialization
+
+`runtime::once_cell::AsyncOnceCell` publishes one successful value and returns
+owned `Arc` snapshots. It uses a private one-permit FIFO semaphore with an
+explicit waiter bound. Factories run lazily only after an empty-cell recheck
+under issued admission. Admission failure returns the original uncalled
+factory; application initialization errors are distinct. Immediate `set`
+returns the unchanged value when already initialized or busy.
+
+Errors, cancellation and panics leave an empty cell retryable. Cleanup drops
+initializer futures and remaining factory captures before releasing admission.
+A completed initializer's destructor must finish before publication; if it
+panics, its proposed value is discarded and later initialization can retry.
+Primary panics resume after cleanup, while secondary panic payload destruction
+is contained. Completed futures release admission immediately. Recursive
+initialization can wait for itself and deadlock.
+
+This explicit port returns owned snapshots instead of Tokio references and
+provides no cell clone, reset, mutable-reference or constant-construction API.
+Threaded cells and snapshots require `T: Send + Sync`; local values can borrow
+data and need no `'static` bound. Metadata is ordinary storage; managed values
+retain their charges through the final snapshot. Nine native tests, two
+compile-fail examples and three actual-source Loom models cover cleanup,
+recovery, competing publishers and thread boundaries.
+
 ## Owned asynchronous tasks
 
 `runtime::asynchronous::AsyncRuntime` runs owned `Send + 'static` futures on a
