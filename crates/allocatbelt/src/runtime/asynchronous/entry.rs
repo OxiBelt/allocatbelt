@@ -24,6 +24,7 @@ thread_local! {
   static EXECUTOR_WORKER: Cell<bool> = const { Cell::new(false) };
   static COOPERATIVE_BUDGET: Cell<u16> = const { Cell::new(DEFAULT_BUDGET) };
   static CURRENT_TASK_ID: Cell<Option<TaskId>> = const { Cell::new(None) };
+  static LOCAL_EXECUTION: Cell<bool> = const { Cell::new(false) };
   static CURRENT_RESOURCE_SCOPE: RefCell<Option<ResourceScope>> = const { RefCell::new(None) };
 }
 
@@ -170,8 +171,8 @@ impl Drop for TaskContextGuard {
 }
 
 /// Returns the explicitly bound managed-resource ledger during a task poll,
-/// runtime-owned future cleanup/publication, or a resource-bound handle's
-/// borrowed root poll. Returns `None` for unbound tasks and runtime roots.
+/// runtime-owned cleanup/publication, or a resource-bound handle's borrowed
+/// root poll. Unbound contexts return `None`.
 #[must_use]
 pub fn try_current_resource_scope() -> Option<ResourceScope> {
   CURRENT_RESOURCE_SCOPE
@@ -179,8 +180,8 @@ pub fn try_current_resource_scope() -> Option<ResourceScope> {
     .unwrap_or(None)
 }
 
-/// Returns the explicitly bound managed-resource ledger for the current
-/// task or bound-handle root poll.
+/// Returns the explicitly bound managed-resource ledger for the current task
+/// or bound-handle root poll.
 ///
 /// # Panics
 ///
@@ -191,6 +192,80 @@ pub fn try_current_resource_scope() -> Option<ResourceScope> {
 pub fn current_resource_scope() -> ResourceScope {
   try_current_resource_scope()
     .unwrap_or_else(|| panic!("no managed resource scope is bound to this async context"))
+}
+
+/// Marks actual `LocalRuntime` polling or cleanup on this thread. Entering a
+/// `LocalHandle` context alone does not set it. Nested use preserves the
+/// outer marker.
+pub(super) struct LocalExecutionGuard {
+  previous: bool,
+  _not_send: PhantomData<Rc<()>>,
+}
+
+impl LocalExecutionGuard {
+  pub(super) fn enter() -> Self {
+    let previous = LOCAL_EXECUTION.with(|local| local.replace(true));
+    Self {
+      previous,
+      _not_send: PhantomData,
+    }
+  }
+}
+
+impl Drop for LocalExecutionGuard {
+  fn drop(&mut self) {
+    let _ = LOCAL_EXECUTION.try_with(|local| local.set(self.previous));
+  }
+}
+
+pub(super) fn local_execution_active() -> bool {
+  LOCAL_EXECUTION.try_with(Cell::get).unwrap_or(false)
+}
+
+/// Saves the borrowed-root marker and cooperative budget, and optionally the
+/// executor-worker marker, around a blocking closure so that the closure may
+/// run one nested `block_on` on its thread. Task identity and entered
+/// contexts are left unchanged. Dropping the guard, on return or unwind,
+/// restores every saved value.
+pub(super) struct ClosureContextGuard {
+  executor_worker: Option<bool>,
+  block_on_active: bool,
+  budget: u16,
+  _not_send: PhantomData<Rc<()>>,
+}
+
+impl ClosureContextGuard {
+  pub(super) fn suspend(suspend_worker: bool) -> Self {
+    let executor_worker = if suspend_worker {
+      EXECUTOR_WORKER
+        .try_with(|worker| worker.replace(false))
+        .ok()
+    } else {
+      None
+    };
+    let block_on_active = BLOCK_ON_ACTIVE
+      .try_with(|active| active.replace(false))
+      .unwrap_or(false);
+    let budget = COOPERATIVE_BUDGET
+      .try_with(Cell::get)
+      .unwrap_or(DEFAULT_BUDGET);
+    Self {
+      executor_worker,
+      block_on_active,
+      budget,
+      _not_send: PhantomData,
+    }
+  }
+}
+
+impl Drop for ClosureContextGuard {
+  fn drop(&mut self) {
+    if let Some(previous) = self.executor_worker {
+      let _ = EXECUTOR_WORKER.try_with(|worker| worker.set(previous));
+    }
+    let _ = BLOCK_ON_ACTIVE.try_with(|active| active.set(self.block_on_active));
+    let _ = COOPERATIVE_BUDGET.try_with(|budget| budget.set(self.budget));
+  }
 }
 
 /// Returns the identity of the task currently being polled or cleaned up.
@@ -384,6 +459,16 @@ pub fn consume_budget() -> ConsumeBudget {
 
 pub(super) fn reset_budget() {
   COOPERATIVE_BUDGET.with(|budget| budget.set(DEFAULT_BUDGET));
+}
+
+#[cfg(all(test, not(loom)))]
+pub(super) fn budget_remaining() -> u16 {
+  COOPERATIVE_BUDGET.with(Cell::get)
+}
+
+#[cfg(all(test, not(loom)))]
+pub(super) fn block_on_active() -> bool {
+  BLOCK_ON_ACTIVE.with(Cell::get)
 }
 
 #[cfg(test)]

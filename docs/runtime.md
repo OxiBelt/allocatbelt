@@ -1085,6 +1085,39 @@ even when functional validation passes. Capacity tests and small process
 smokes verify accounting and cleanup, including cleanup before window refill;
 they are not native performance qualification.
 
+## Bounded original-thread blocking handoff
+
+`AsyncRuntime::new_with_handoffs(AsyncConfig, HandoffConfig)` prestarts a fixed
+number of helpers. Ordinary `new` keeps its original worker count and disables
+handoff. `try_block_in_place` runs its closure on the calling thread, accepting
+borrowed or `!Send` closures and results. Disabled/full/local-executor rejection
+returns the uncalled closure. Outside owned dispatcher execution it runs inline;
+entering a local handle alone does not constitute local execution.
+
+With `W` workers and `B` helpers, at most `W` dispatcher turns and `B` handed-off
+closures are active. Reserving a loan precedes releasing the dispatcher permit.
+The original task retains admission, its running state and its scope poll quota
+throughout the closure. A still-pending same-scope dependency cannot make
+progress if the scope quota is exhausted; use a separate scope or an explicit
+higher quota. The default root quota remains `W`. The dispatcher bound covers
+owned dispatch, not CPU time, nested borrowed roots or external threads.
+
+Return or panic reacquires a dispatcher permit ahead of new work, retaining the
+loan until restoration; this also works after admission closes. Helpers can
+hand off under the same fixed bound, while nested handoff on the original
+already-loaned thread runs inline. Task identity, explicit resource binding,
+task-local values and runtime-worker shutdown identity remain intact. The
+closure may call a nested handle `block_on`; its borrowed root has no task ID,
+and budget/context markers restore on return or unwind.
+
+Abort and cancelling shutdown cannot preempt the closure. Explicit shutdown
+joins every worker/helper and may wait indefinitely; worker-origin shutdown
+returns `WouldDeadlock`, including from a handed-off closure. Runtime drop
+closes admission and detaches. Thread caches flush before handoff/parking.
+Native lifecycle tests and bounded same-source coordinator Loom models qualify
+these semantics. The models cover permit/loan accounting, not the full
+scheduler, condition variables, TLS or a performance benefit.
+
 ## Path toward replacing Tokio
 
 The lifecycle foundation above is implemented. Remaining milestones include:

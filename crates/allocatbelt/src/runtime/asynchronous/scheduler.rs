@@ -9,6 +9,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, Weak};
 use std::task::{Context, Wake, Waker};
 
+use super::handoff;
+use super::handoff_protocol::{DispatchTurn, HandoffLoan, HelperLease, TurnCoordinator};
 use super::identity;
 use super::join::AsyncJob;
 use super::protocol::{PollFinish, PollProtocol, PollQuota, ScopeProtocol};
@@ -57,12 +59,17 @@ struct State {
   scopes: Vec<ScopeSlot>,
   round_robin: VecDeque<ScopeRef>,
   idle: usize,
+  turns: TurnCoordinator,
 }
 
 pub(super) struct Shared {
   id: u64,
+  max_handoffs: usize,
   state: Mutex<State>,
   work: Condvar,
+  /// Inactive helpers and restoring threads wait here; `work` waiters are
+  /// dispatchers.
+  handoff: Condvar,
 }
 
 struct ScopeCell {
@@ -116,7 +123,10 @@ impl ScopeCell {
 }
 
 impl Shared {
-  pub(super) fn new(config: AsyncConfig) -> Result<(Arc<Self>, ScopeRef), AsyncError> {
+  pub(super) fn new(
+    config: AsyncConfig,
+    max_handoffs: usize,
+  ) -> Result<(Arc<Self>, ScopeRef), AsyncError> {
     let mut tasks = Vec::new();
     tasks
       .try_reserve_exact(config.max_outstanding)
@@ -166,6 +176,7 @@ impl Shared {
     Ok((
       Arc::new(Self {
         id,
+        max_handoffs,
         state: Mutex::new(State {
           closed: false,
           cancel_all: false,
@@ -174,8 +185,10 @@ impl Shared {
           scopes,
           round_robin,
           idle: 0,
+          turns: TurnCoordinator::new(config.workers, max_handoffs),
         }),
         work: Condvar::new(),
+        handoff: Condvar::new(),
       }),
       root,
     ))
@@ -368,6 +381,7 @@ impl Shared {
     }
     drop(state);
     self.work.notify_all();
+    self.handoff.notify_all();
   }
 
   fn request_scope_close(&self, scope: ScopeRef) {
@@ -444,6 +458,82 @@ impl Shared {
     drop(state);
     self.work.notify_all();
   }
+
+  pub(super) fn handoffs_enabled(&self) -> bool {
+    self.max_handoffs != 0
+  }
+
+  /// Converts the caller's turn into a handoff loan, or returns the turn
+  /// unchanged when every slot is loaned.
+  pub(super) fn hand_off(&self, turn: DispatchTurn) -> Result<HandoffLoan, DispatchTurn> {
+    let loan = self.lock().turns.try_hand_off(turn)?;
+    // The released permit may serve a helper, a dispatcher or a restorer.
+    self.handoff.notify_all();
+    self.work.notify_all();
+    Ok(loan)
+  }
+
+  /// Waits, with priority over new turns, until the loan's thread holds a
+  /// dispatcher permit again. Admission closure does not prevent this.
+  pub(super) fn restore(&self, loan: HandoffLoan) -> DispatchTurn {
+    let mut state = self.lock();
+    let mut ticket = state.turns.begin_restore(loan);
+    let mut flushed = false;
+    loop {
+      match state.turns.try_restore(ticket) {
+        Ok(turn) => {
+          drop(state);
+          // Helpers beyond the remaining loans retire between turns.
+          self.work.notify_all();
+          return turn;
+        }
+        Err(waiting) => ticket = waiting,
+      }
+      if flushed {
+        state = self
+          .handoff
+          .wait(state)
+          .unwrap_or_else(PoisonError::into_inner);
+      } else {
+        drop(state);
+        cache::flush();
+        flushed = true;
+        state = self.lock();
+      }
+    }
+  }
+
+  /// Checks the coordinator bounds and returns its turn, loan, restoration
+  /// and helper counts.
+  #[cfg(all(test, not(loom)))]
+  pub(super) fn turn_counts(&self) -> (usize, usize, usize, usize) {
+    let state = self.lock();
+    state.turns.check();
+    state.turns.counts()
+  }
+
+  /// Releases the permit of a thread that unwound out of a turn.
+  pub(super) fn abandon_turn(&self, turn: DispatchTurn) {
+    let mut state = self.lock();
+    end_turn(self, &mut state, turn);
+  }
+}
+
+/// Releases one dispatcher permit and wakes whoever it unblocks: a restorer,
+/// or, for the final release after close, every thread waiting to exit.
+fn end_turn(shared: &Shared, state: &mut State, turn: DispatchTurn) {
+  let end = state.turns.end_turn(turn);
+  if end.wake_restorer {
+    shared.handoff.notify_all();
+  }
+  if shared.handoffs_enabled() && end.quiescent && state.closed {
+    shared.work.notify_all();
+    shared.handoff.notify_all();
+  }
+}
+
+fn admission_empty(state: &State) -> bool {
+  state.closed && !state.tasks.iter().any(|slot| slot.task.is_some())
 }
 
 /// An owned scope admits only owned `Send + 'static` futures. Dropping it
@@ -655,10 +745,26 @@ fn refresh_scope_schedule(state: &mut State, scope_ref: ScopeRef) {
 }
 
 enum Work {
+  Poll(TaskRef, Arc<dyn ErasedTask>, PollPermit, DispatchTurn),
+  Cancel(TaskRef, Arc<dyn ErasedTask>, DispatchTurn),
+  Park,
+  /// An activated helper is no longer needed and returns to waiting.
+  Retire,
+  Exit,
+}
+
+enum Selected {
   Poll(TaskRef, Arc<dyn ErasedTask>, PollPermit),
   Cancel(TaskRef, Arc<dyn ErasedTask>),
-  Park,
-  Exit,
+}
+
+impl Selected {
+  fn into_work(self, turn: DispatchTurn) -> Work {
+    match self {
+      Self::Poll(task_ref, task, permit) => Work::Poll(task_ref, task, permit, turn),
+      Self::Cancel(task_ref, task) => Work::Cancel(task_ref, task, turn),
+    }
+  }
 }
 
 /// Releases one scope's active-poll reservation on every exit path. The task
@@ -677,98 +783,132 @@ impl Drop for PollPermit {
   }
 }
 
-fn take_next(shared: &Arc<Shared>, worker_index: usize) -> Work {
-  let mut state = shared.lock();
-  loop {
-    if let Some(scope_ref) = state.round_robin.pop_front() {
-      if let Some(scope) = state.scopes.get_mut(scope_ref.index)
-        && scope.generation == scope_ref.generation
-      {
-        scope.ready = false;
-      }
-      let matches_scope = |task_ref: &&TaskRef| {
-        state.tasks.get(task_ref.index).is_some_and(|task| {
-          task.protocol.matches(task_ref.generation) && task.scope == Some(scope_ref)
-        })
+/// Selects the next poll or cancellation cleanup from the scope round-robin
+/// queue, or returns `None` once that queue is empty.
+fn dequeue(shared: &Arc<Shared>, state: &mut State) -> Option<Selected> {
+  while let Some(scope_ref) = state.round_robin.pop_front() {
+    if let Some(scope) = state.scopes.get_mut(scope_ref.index)
+      && scope.generation == scope_ref.generation
+    {
+      scope.ready = false;
+    }
+    let matches_scope = |task_ref: &&TaskRef| {
+      state.tasks.get(task_ref.index).is_some_and(|task| {
+        task.protocol.matches(task_ref.generation) && task.scope == Some(scope_ref)
+      })
+    };
+    let abort_position = state.ready.iter().position(|task_ref| {
+      matches_scope(&task_ref) && state.tasks[task_ref.index].protocol.aborting_queued()
+    });
+    let normal_position = state.ready.iter().position(|task_ref| {
+      matches_scope(&task_ref) && !state.tasks[task_ref.index].protocol.aborting_queued()
+    });
+    let quota_available = state.scopes.get(scope_ref.index).is_some_and(|scope| {
+      scope.generation == scope_ref.generation
+        && scope.scope.is_some()
+        && scope.quota.active() < scope.quota.maximum()
+    });
+    let position = abort_position.or_else(|| quota_available.then_some(normal_position).flatten());
+    if let Some(position) = position {
+      let selected_abort = abort_position.is_some();
+      let acquired = if selected_abort {
+        false
+      } else {
+        state.scopes[scope_ref.index].quota.try_acquire()
       };
-      let abort_position = state.ready.iter().position(|task_ref| {
-        matches_scope(&task_ref) && state.tasks[task_ref.index].protocol.aborting_queued()
-      });
-      let normal_position = state.ready.iter().position(|task_ref| {
-        matches_scope(&task_ref) && !state.tasks[task_ref.index].protocol.aborting_queued()
-      });
-      let quota_available = state.scopes.get(scope_ref.index).is_some_and(|scope| {
-        scope.generation == scope_ref.generation
-          && scope.scope.is_some()
-          && scope.quota.active() < scope.quota.maximum()
-      });
-      let position =
-        abort_position.or_else(|| quota_available.then_some(normal_position).flatten());
-      if let Some(position) = position {
-        let selected_abort = abort_position.is_some();
-        let acquired = if selected_abort {
-          false
-        } else {
-          state.scopes[scope_ref.index].quota.try_acquire()
-        };
-        if !selected_abort && !acquired {
-          refresh_scope_schedule(&mut state, scope_ref);
-          continue;
-        }
-        let Some(task_ref) = state.ready.remove(position) else {
-          if acquired {
-            state.scopes[scope_ref.index].quota.release();
-          }
-          continue;
-        };
-        let task = state.tasks[task_ref.index].task.as_ref().map(Arc::clone);
-        let began = state.tasks[task_ref.index].protocol.begin_poll();
-        if let (Some(task), Some(aborting)) = (task, began) {
-          let permit = if aborting {
-            if acquired {
-              state.scopes[scope_ref.index].quota.release();
-            }
-            None
-          } else {
-            debug_assert!(acquired);
-            Some(PollPermit {
-              shared: Arc::downgrade(shared),
-              scope: scope_ref,
-            })
-          };
-          refresh_scope_schedule(&mut state, scope_ref);
-          return if aborting || selected_abort {
-            Work::Cancel(task_ref, task)
-          } else if let Some(permit) = permit {
-            Work::Poll(task_ref, task, permit)
-          } else {
-            continue;
-          };
-        }
+      if !selected_abort && !acquired {
+        refresh_scope_schedule(state, scope_ref);
+        continue;
+      }
+      let Some(task_ref) = state.ready.remove(position) else {
         if acquired {
           state.scopes[scope_ref.index].quota.release();
         }
-        refresh_scope_schedule(&mut state, scope_ref);
+        continue;
+      };
+      let task = state.tasks[task_ref.index].task.as_ref().map(Arc::clone);
+      let began = state.tasks[task_ref.index].protocol.begin_poll();
+      if let (Some(task), Some(aborting)) = (task, began) {
+        let permit = if aborting {
+          if acquired {
+            state.scopes[scope_ref.index].quota.release();
+          }
+          None
+        } else {
+          debug_assert!(acquired);
+          Some(PollPermit {
+            shared: Arc::downgrade(shared),
+            scope: scope_ref,
+          })
+        };
+        refresh_scope_schedule(state, scope_ref);
+        if aborting || selected_abort {
+          return Some(Selected::Cancel(task_ref, task));
+        } else if let Some(permit) = permit {
+          return Some(Selected::Poll(task_ref, task, permit));
+        }
+        continue;
       }
-      continue;
+      if acquired {
+        state.scopes[scope_ref.index].quota.release();
+      }
+      refresh_scope_schedule(state, scope_ref);
     }
-    if state.closed && !state.tasks.iter().any(|slot| slot.task.is_some()) {
+  }
+  None
+}
+
+/// Ends the caller's finished turn, then returns its next turn, a park or
+/// retirement between turns, or exit. A new turn needs one of the `workers`
+/// dispatcher permits and yields to waiting restorations.
+fn take_next(
+  shared: &Arc<Shared>,
+  shard: usize,
+  lease: &mut Option<HelperLease>,
+  finished: Option<DispatchTurn>,
+) -> Work {
+  let mut state = shared.lock();
+  if let Some(turn) = finished {
+    end_turn(shared, &mut state, turn);
+  }
+  loop {
+    if let Some(held) = lease.take() {
+      match state.turns.retire_helper(held) {
+        Ok(()) => {
+          if !state.round_robin.is_empty() {
+            // A wake meant for a dispatcher may have reached this helper.
+            shared.work.notify_all();
+          }
+          return Work::Retire;
+        }
+        Err(held) => *lease = Some(held),
+      }
+    }
+    if !state.round_robin.is_empty()
+      && let Some(turn) = state.turns.try_begin_turn()
+    {
+      if let Some(selected) = dequeue(shared, &mut state) {
+        return selected.into_work(turn);
+      }
+      end_turn(shared, &mut state, turn);
+    }
+    if state.turns.may_exit(admission_empty(&state)) {
       return Work::Exit;
     }
     state.idle += 1;
     drop(state);
     cache::flush();
     state = shared.lock();
-    if state.round_robin.is_empty()
-      && !(state.closed && !state.tasks.iter().any(|slot| slot.task.is_some()))
-    {
+    let excess = lease.is_some() && state.turns.helper_is_excess();
+    let dispatchable = !state.round_robin.is_empty() && state.turns.can_begin_turn();
+    if !excess && !dispatchable && !state.turns.may_exit(admission_empty(&state)) {
       state = shared
         .work
         .wait(state)
         .unwrap_or_else(PoisonError::into_inner);
     }
     state.idle = state.idle.saturating_sub(1);
-    cache::set_shard(worker_index);
+    cache::set_shard(shard);
     if state.closed && state.cancel_all {
       for index in 0..state.tasks.len() {
         if state.tasks[index].task.is_some() && state.tasks[index].protocol.abort() {
@@ -786,12 +926,51 @@ fn take_next(shared: &Arc<Shared>, worker_index: usize) -> Work {
   }
 }
 
-pub(super) fn worker(shared: Arc<Shared>, index: usize) {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Stop {
+  Retire,
+  Exit,
+}
+
+/// Runs owned turns on an executor thread. Each turn's task, waker and
+/// published values are dropped before the turn's permit is released.
+fn run_turns(shared: &Arc<Shared>, shard: usize, lease: &mut Option<HelperLease>) -> Stop {
+  let mut finished = None;
+  loop {
+    match take_next(shared, shard, lease, finished.take()) {
+      Work::Poll(task_ref, task, permit, turn) => {
+        handoff::enter_turn(turn);
+        super::entry::reset_budget();
+        let waker = task_waker(shared, task_ref);
+        let mut context = Context::from_waker(&waker);
+        let result = task.poll(&mut context, permit);
+        finish_poll(shared, task_ref, result);
+        drop(task);
+        drop(waker);
+        finished = handoff::leave_turn();
+      }
+      Work::Cancel(task_ref, task, turn) => {
+        handoff::enter_turn(turn);
+        task.cancel();
+        finish_cancel(shared, task_ref, task);
+        finished = handoff::leave_turn();
+      }
+      Work::Park => {}
+      Work::Retire => return Stop::Retire,
+      Work::Exit => return Stop::Exit,
+    }
+  }
+}
+
+/// Marks this thread as one of the runtime's executor threads. The worker
+/// identity makes `shutdown` from any of its code, handed-off closures
+/// included, return `WouldDeadlock`.
+fn executor_thread<R>(shared: &Arc<Shared>, shard: usize, run: impl FnOnce() -> R) -> R {
   WORKER_RUNTIME.set(shared.id);
-  cache::set_shard(index);
+  cache::set_shard(shard);
   let _worker_context = super::entry::WorkerContextGuard::enter();
   let worker_handle = super::AsyncHandle {
-    shared: Arc::clone(&shared),
+    shared: Arc::clone(shared),
     scope: ScopeRef {
       index: 0,
       generation: 1,
@@ -799,24 +978,55 @@ pub(super) fn worker(shared: Arc<Shared>, index: usize) {
     resources: None,
   };
   let _runtime_context = super::entry::EnterGuard::enter(&worker_handle);
+  let _dispatcher = handoff::DispatcherGuard::install(shared);
+  run()
+}
+
+pub(super) fn worker(shared: Arc<Shared>, index: usize) {
+  executor_thread(&shared, index, || {
+    let _ = run_turns(&shared, index, &mut None);
+  });
+  cache::flush();
+}
+
+/// A prestarted handoff helper with its own shard hint. It parks until a
+/// handoff loan leaves fewer dispatching threads than workers, dispatches
+/// turns while it is needed, and retires only between turns.
+pub(super) fn helper(shared: Arc<Shared>, shard: usize) {
+  executor_thread(&shared, shard, || {
+    while let Some(lease) = wait_for_activation(&shared, shard) {
+      let mut lease = Some(lease);
+      let stop = run_turns(&shared, shard, &mut lease);
+      debug_assert!(lease.is_none());
+      if stop == Stop::Exit {
+        break;
+      }
+    }
+  });
+  cache::flush();
+}
+
+fn wait_for_activation(shared: &Arc<Shared>, shard: usize) -> Option<HelperLease> {
+  let mut state = shared.lock();
   loop {
-    match take_next(&shared, index) {
-      Work::Poll(task_ref, task, permit) => {
-        super::entry::reset_budget();
-        let waker = task_waker(&shared, task_ref);
-        let mut context = Context::from_waker(&waker);
-        let result = task.poll(&mut context, permit);
-        finish_poll(&shared, task_ref, result);
-      }
-      Work::Cancel(task_ref, task) => {
-        task.cancel();
-        finish_cancel(&shared, task_ref, task);
-      }
-      Work::Park => continue,
-      Work::Exit => break,
+    if let Some(lease) = state.turns.try_activate_helper() {
+      drop(state);
+      cache::set_shard(shard);
+      return Some(lease);
+    }
+    if state.turns.may_exit(admission_empty(&state)) {
+      return None;
+    }
+    drop(state);
+    cache::flush();
+    state = shared.lock();
+    if !state.turns.can_activate_helper() && !state.turns.may_exit(admission_empty(&state)) {
+      state = shared
+        .handoff
+        .wait(state)
+        .unwrap_or_else(PoisonError::into_inner);
     }
   }
-  cache::flush();
 }
 
 fn finish_cancel(shared: &Arc<Shared>, task_ref: TaskRef, task: Arc<dyn ErasedTask>) {
@@ -905,11 +1115,14 @@ mod tests {
 
   #[test]
   fn scope_close_stays_pending_until_zero_count_slot_reclamation() {
-    let (shared, _) = Shared::new(AsyncConfig {
-      workers: 1,
-      max_outstanding: 1,
-      max_scopes: 2,
-    })
+    let (shared, _) = Shared::new(
+      AsyncConfig {
+        workers: 1,
+        max_outstanding: 1,
+        max_scopes: 2,
+      },
+      0,
+    )
     .unwrap_or_else(|error| panic!("shared construction failed: {error}"));
     let scope = shared
       .new_scope(2, None)

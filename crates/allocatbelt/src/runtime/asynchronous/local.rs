@@ -19,7 +19,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use std::task::{Context, Poll, Wake, Waker};
 use std::thread::{self, Thread, ThreadId};
 
-use super::entry::{BlockOnGuard, TaskContextGuard};
+use super::entry::{BlockOnGuard, LocalExecutionGuard, TaskContextGuard};
 use super::identity::{self, TaskId};
 use super::join::{AsyncJob, AsyncJoinError, JoinState};
 use super::protocol::{PollFinish, PollProtocol};
@@ -869,7 +869,7 @@ where
       abort_target: _,
       admission,
     } = *self;
-    let _task_context = TaskContextGuard::enter_with_resource(Some(id), None);
+    let _task_context = TaskContextGuard::enter(Some(id));
     let outcome = match panic::catch_unwind(AssertUnwindSafe(|| drop(future))) {
       Ok(()) => Err(AsyncJoinError::Cancelled),
       Err(payload) => Err(AsyncJoinError::Panicked(payload)),
@@ -1020,6 +1020,7 @@ impl LocalRuntime {
       return Err(LocalError::Closed);
     }
     let _block_on = BlockOnGuard::enter().map_err(|_| LocalError::BlockOnRejected)?;
+    let _local_execution = LocalExecutionGuard::enter();
     let _task_context = TaskContextGuard::enter(None);
     let _context = LocalEnterGuard::enter(&self.handle());
     let root_waker = Waker::from(Arc::clone(&self.core.notifier));
@@ -1142,6 +1143,7 @@ impl LocalRuntime {
       return;
     }
     self.closed = true;
+    let _local_execution = LocalExecutionGuard::enter();
     self.core.gate.close();
     self.core.control.close_all();
     while let Ok(request) = self.receiver.try_recv() {
@@ -1253,8 +1255,8 @@ impl LocalHandle {
       join: Arc::clone(&join),
       id,
       admission: Some(permit),
-      scope: Rc::clone(&scope),
       resources: scope.resources.clone(),
+      scope: Rc::clone(&scope),
     };
     self
       .core

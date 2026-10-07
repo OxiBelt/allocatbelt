@@ -4,11 +4,16 @@
 //! on its caller thread. Spawned work remains owned and `Send + 'static`.
 //! [`yield_now`] schedules one self-wake; [`consume_budget`] is an opt-in
 //! checkpoint and cannot preempt code that does not await it.
+//! [`try_block_in_place`] runs a blocking closure on its caller's thread; a
+//! runtime built with [`AsyncRuntime::new_with_handoffs`] keeps dispatching
+//! on a bounded set of prestarted helpers meanwhile.
 
 #![forbid(unsafe_code)]
 #![cfg_attr(not(test), deny(clippy::expect_used, clippy::unwrap_used))]
 
 mod entry;
+mod handoff;
+mod handoff_protocol;
 mod identity;
 mod join;
 mod local;
@@ -17,6 +22,8 @@ mod scheduler;
 mod task;
 mod task_set;
 
+#[cfg(all(test, not(loom)))]
+mod handoff_tests;
 #[cfg(all(test, not(loom)))]
 mod tests;
 
@@ -31,6 +38,7 @@ pub use entry::{
   ConsumeBudget, EnterGuard, YieldNow, consume_budget, current, current_resource_scope, task_id,
   try_current, try_current_resource_scope, try_task_id, yield_now,
 };
+pub use handoff::{BlockInPlaceError, BlockInPlaceErrorKind, HandoffConfig, try_block_in_place};
 pub use identity::TaskId;
 pub use join::{AbortHandle, AsyncJob, AsyncJoinError};
 pub use local::{
@@ -173,21 +181,64 @@ pub struct AsyncRuntime {
 
 impl AsyncRuntime {
   /// Reserves all bounded scheduler tables before starting worker threads.
+  /// The runtime has exactly `config.workers` threads and no handoff slots:
+  /// [`try_block_in_place`] on one of its turns returns
+  /// [`BlockInPlaceErrorKind::Disabled`].
   pub fn new(config: AsyncConfig) -> Result<Self, AsyncError> {
+    Self::start(config, 0)
+  }
+
+  /// Like [`AsyncRuntime::new`], and also prestarts
+  /// `handoffs.max_handoffs` helper threads so that up to that many owned
+  /// turns at once can run a [`try_block_in_place`] closure on their own
+  /// thread while a helper keeps dispatching. At most `config.workers`
+  /// threads dispatch owned turns at any time; scope and root poll limits are
+  /// unchanged. If any thread fails to start, every started thread is joined
+  /// before the error is returned.
+  ///
+  /// # Errors
+  ///
+  /// [`AsyncError::InvalidConfig`] for a zero bound or when
+  /// `workers + max_handoffs` overflows, and [`AsyncError::OutOfMemory`] when
+  /// bounded storage cannot be reserved or a thread cannot start.
+  pub fn new_with_handoffs(
+    config: AsyncConfig,
+    handoffs: HandoffConfig,
+  ) -> Result<Self, AsyncError> {
+    if handoffs.max_handoffs == 0 {
+      return Err(AsyncError::InvalidConfig);
+    }
+    Self::start(config, handoffs.max_handoffs)
+  }
+
+  fn start(config: AsyncConfig, max_handoffs: usize) -> Result<Self, AsyncError> {
     if config.workers == 0 || config.max_outstanding == 0 || config.max_scopes == 0 {
       return Err(AsyncError::InvalidConfig);
     }
-    let (shared, root) = Shared::new(config)?;
+    let Some(threads) = config.workers.checked_add(max_handoffs) else {
+      return Err(AsyncError::InvalidConfig);
+    };
+    let (shared, root) = Shared::new(config, max_handoffs)?;
     let mut workers = Vec::new();
     workers
-      .try_reserve_exact(config.workers)
+      .try_reserve_exact(threads)
       .map_err(|_| AsyncError::OutOfMemory)?;
-    for index in 0..config.workers {
-      let worker_shared = Arc::clone(&shared);
-      match thread::Builder::new()
-        .name(format!("allocatbelt-async-{index}"))
-        .spawn(move || scheduler::worker(worker_shared, index))
-      {
+    for index in 0..threads {
+      let thread_shared = Arc::clone(&shared);
+      let started = if index < config.workers {
+        thread::Builder::new()
+          .name(format!("allocatbelt-async-{index}"))
+          .spawn(move || scheduler::worker(thread_shared, index))
+      } else {
+        // Helpers continue the workers' shard hints, one per thread.
+        thread::Builder::new()
+          .name(format!(
+            "allocatbelt-async-handoff-{}",
+            index - config.workers
+          ))
+          .spawn(move || scheduler::helper(thread_shared, index))
+      };
+      match started {
         Ok(worker) => workers.push(worker),
         Err(_) => {
           shared.close(true);
@@ -225,7 +276,8 @@ impl AsyncRuntime {
     self.handle().block_on(future)
   }
 
-  /// Creates an independently cancellable owned scope.
+  /// Creates an independently cancellable owned scope without a resource
+  /// binding.
   pub fn scope(&self) -> Result<OwnedTaskScope, AsyncError> {
     self
       .shared
@@ -233,7 +285,7 @@ impl AsyncRuntime {
   }
 
   /// Creates an independently cancellable owned scope with a per-scope
-  /// simultaneous polling limit.
+  /// simultaneous polling limit and no resource binding.
   pub fn scope_with_config(&self, config: AsyncScopeConfig) -> Result<OwnedTaskScope, AsyncError> {
     self.shared.new_scope(config.max_active_polls, None)
   }
@@ -262,7 +314,12 @@ impl AsyncRuntime {
       .new_scope(config.max_active_polls, Some(resources.clone()))
   }
 
-  /// Closes admission and joins every worker.
+  /// Closes admission and joins every worker and handoff helper. Admitted
+  /// tasks, including tasks inside a [`try_block_in_place`] closure, keep
+  /// their turns: a handed-off closure is never interrupted, so this waits
+  /// for blocked closures without a time limit. Called from one of this
+  /// runtime's threads, handed-off closures included, it closes admission
+  /// with cancellation and returns [`AsyncError::WouldDeadlock`] instead.
   pub fn shutdown(mut self, mode: AsyncShutdown) -> Result<(), AsyncError> {
     if scheduler::is_worker(&self.shared) {
       self.shared.close(true);
