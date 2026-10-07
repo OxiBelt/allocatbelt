@@ -90,6 +90,7 @@ pub mod oneshot;
 #[cfg(not(loom))]
 pub mod reactor;
 mod resources;
+pub mod rwlock;
 mod scheduler;
 pub mod semaphore;
 mod state;

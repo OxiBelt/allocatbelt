@@ -504,6 +504,7 @@ jobs:
           cargo test --release --locked -p allocatbelt-runtime --lib runtime::time::loom_tests
           cargo test --release --locked -p allocatbelt-runtime --lib runtime::semaphore::loom_tests
           cargo test --release --locked -p allocatbelt-runtime --lib runtime::mutex::loom_tests
+          cargo test --release --locked -p allocatbelt-runtime --lib runtime::rwlock::loom_tests
           cargo test --release --locked -p allocatbelt-runtime --lib runtime::channel::loom_tests
           cargo test --release --locked -p allocatbelt-runtime --lib runtime::oneshot::model
 

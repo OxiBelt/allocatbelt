@@ -225,6 +225,29 @@ Native tests cover FIFO order, queued/granted cancellation, close, reentrant
 unlock wakes, panic cleanup and ownership. A Loom model uses the actual mutex
 and semaphore implementation to check serialized updates.
 
+## Bounded asynchronous read/write lock
+
+`runtime::rwlock::AsyncRwLock` fixes a nonzero reader ceiling and FIFO waiter
+bound at construction. Readers reserve one private permit; writers reserve
+the whole ceiling, forming a barrier to later readers. Queued and granted
+acquisitions can be cancelled. Close rejects unclaimed acquisitions while
+issued guards remain valid. Reported construction errors return the original
+value; shared headers follow ordinary Rust allocation-failure handling.
+
+Borrowed and owned guards provide shared reads or exclusive mutation. Reader
+guards drop their value references before releasing permits; writers restore
+the value before releasing theirs. The writer uses the existing unique `Arc`
+and allocates no replacement header per acquisition. Downgrade retains one
+reader permit and restores shared access before returning the others, without
+an intervening writer. Owned guards and futures may outlive the handle.
+
+This Arc-based implementation requires `T: Send + Sync` for its lock, guards
+and futures to move between threads. It provides no upgrade operation or
+stable-address promise. Native tests and compile-fail examples cover FIFO
+barriers, cancellation, close, downgrade, owned lifetimes and trait boundaries;
+an actual-source Loom model checks reader/writer exclusivity. Metadata is
+outside the managed-buffer ledger.
+
 ## Owned asynchronous tasks
 
 `runtime::asynchronous::AsyncRuntime` runs owned `Send + 'static` futures on a
