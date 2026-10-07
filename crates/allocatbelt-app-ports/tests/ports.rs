@@ -174,6 +174,58 @@ fn loopback_http_uses_reactor_tcp_and_releases_all_charges() {
 }
 
 #[test]
+fn id_aware_loopback_uses_the_shared_client_and_server_transaction_kernels() {
+  let mut blocking = BlockingRuntime::new(BlockingConfig {
+    workers: 1,
+    max_outstanding: 4,
+    capacity: Resources::ZERO,
+  })
+  .expect("blocking runtime should start");
+  let reactor = Reactor::new(ReactorConfig {
+    max_registrations: 3,
+    max_waiters: 6,
+  })
+  .expect("reactor should start");
+  let runtime = async_runtime(4);
+  let ledger = resources(3 * MAX_REQUEST_BYTES + 256, 0, 2);
+  let scope = runtime
+    .scope_with_resources(&ledger)
+    .expect("scope should open");
+  let request_id = u64::MAX - 17;
+  let body_bytes = 1021;
+  let seed = 0x2a73;
+  let (server_id, digest) = runtime
+    .block_on(http::loopback_transaction_with_id(
+      &scope,
+      blocking.handle(),
+      reactor.handle(),
+      ledger.clone(),
+      HttpConfig { body_bytes, seed },
+      request_id,
+    ))
+    .expect("root should complete")
+    .expect("ID-aware exchange should complete");
+  let expected = memory::checksum(
+    &(0..body_bytes)
+      .map(|index| memory::pattern_byte(seed, index))
+      .collect::<Vec<_>>(),
+  );
+  assert_eq!(server_id, request_id);
+  assert_eq!(digest, expected);
+  runtime.block_on(scope.close()).expect("scope should close");
+  runtime
+    .shutdown(AsyncShutdown::Drain)
+    .expect("async runtime should stop");
+  blocking
+    .shutdown(ShutdownMode::Drain)
+    .expect("blocking runtime should stop");
+  reactor.shutdown().expect("reactor should stop");
+  let snapshot = ledger.snapshot();
+  assert_eq!(snapshot.managed_memory, 0);
+  assert_eq!(snapshot.network_ops, 0);
+}
+
+#[test]
 fn disk_transaction_uses_owned_offsets_syncs_reads_back_and_removes_temp_tree() {
   let mut blocking = BlockingRuntime::new(BlockingConfig {
     workers: 1,

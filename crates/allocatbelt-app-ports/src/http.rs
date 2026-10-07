@@ -6,7 +6,7 @@ use std::ops::{Deref, DerefMut};
 
 use allocatbelt::runtime::Handle as BlockingHandle;
 use allocatbelt::runtime::asynchronous::{AbortHandle, AsyncJob, AsyncJoinError, OwnedTaskScope};
-use allocatbelt::runtime::io::AsyncWriteExt;
+use allocatbelt::runtime::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use allocatbelt::runtime::managed::{OperationPermit, OperationRequest, ResourceScope};
 use allocatbelt::runtime::net::{NetHandle, TcpListener, TcpStream};
 use allocatbelt::runtime::reactor::ReactorHandle;
@@ -24,6 +24,7 @@ const RESPONSE_HEADER: &[u8] =
   b"HTTP/1.1 200 OK\r\nContent-Length: 16\r\nConnection: close\r\n\r\n";
 const REQUEST_PREFIX: &[u8] = b"POST /checksum HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: ";
 const REQUEST_SUFFIX: &[u8] = b"\r\nConnection: close\r\n\r\n";
+const REQUEST_ID_PREFIX: &[u8] = b"\r\nX-Request-ID: ";
 const MAX_RESPONSE_BYTES: usize = 128;
 const REQUEST_READ_CHUNK: usize = 127;
 const RESPONSE_READ_CHUNK: usize = 7;
@@ -118,6 +119,22 @@ impl Default for HttpConfig {
 /// arrived. Extra bytes, oversized headers/bodies and malformed framing are
 /// rejected, so one transaction owns exactly one request.
 pub fn parse_request(bytes: &[u8]) -> io::Result<Option<&[u8]>> {
+  Ok(parse_request_with_id(bytes)?.map(|request| request.body))
+}
+
+/// A complete request frame parsed by [`parse_request_with_id`]. Requests
+/// without the optional ID use zero for compatibility with the functional
+/// single-transaction port.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ParsedRequest<'a> {
+  /// Stable caller-supplied transaction identifier, or zero when absent.
+  pub request_id: u64,
+  /// Request body bytes borrowed from the supplied frame.
+  pub body: &'a [u8],
+}
+
+/// Parses a bounded request and its optional `X-Request-ID` header.
+pub fn parse_request_with_id(bytes: &[u8]) -> io::Result<Option<ParsedRequest<'_>>> {
   if bytes.len() > MAX_REQUEST_BYTES {
     return Err(io::Error::new(
       io::ErrorKind::InvalidData,
@@ -158,6 +175,7 @@ pub fn parse_request(bytes: &[u8]) -> io::Result<Option<&[u8]>> {
     ));
   }
   let mut content_length = None;
+  let mut request_id = None;
   for line in lines {
     let (name, value) = line
       .split_once(':')
@@ -198,6 +216,26 @@ pub fn parse_request(bytes: &[u8]) -> io::Result<Option<&[u8]>> {
         )
       })?);
     }
+    if name.eq_ignore_ascii_case("x-request-id") {
+      if request_id.is_some() {
+        return Err(io::Error::new(
+          io::ErrorKind::InvalidData,
+          "duplicate X-Request-ID",
+        ));
+      }
+      let value = value.trim_matches(|character| character == ' ' || character == '\t');
+      if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(io::Error::new(
+          io::ErrorKind::InvalidData,
+          "invalid X-Request-ID",
+        ));
+      }
+      request_id = Some(
+        value
+          .parse::<u64>()
+          .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "X-Request-ID overflows u64"))?,
+      );
+    }
     if name.eq_ignore_ascii_case("transfer-encoding") {
       return Err(io::Error::new(
         io::ErrorKind::InvalidData,
@@ -225,7 +263,10 @@ pub fn parse_request(bytes: &[u8]) -> io::Result<Option<&[u8]>> {
       "extra bytes after HTTP request",
     ));
   }
-  Ok(Some(&bytes[header_len..frame_len]))
+  Ok(Some(ParsedRequest {
+    request_id: request_id.unwrap_or(0),
+    body: &bytes[header_len..frame_len],
+  }))
 }
 
 fn is_header_token(byte: u8) -> bool {
@@ -258,6 +299,26 @@ fn find_header_end(bytes: &[u8]) -> Option<usize> {
 /// Returns the exact frame length or `InvalidInput` when the destination is
 /// too small or the requested body exceeds the port limit.
 pub fn encode_request(out: &mut [u8], body_bytes: usize, seed: u64) -> io::Result<usize> {
+  encode_request_inner(out, None, body_bytes, seed)
+}
+
+/// Encodes a bounded request with a stable ID for client/server result
+/// pairing in the development application benchmark.
+pub fn encode_request_with_id(
+  out: &mut [u8],
+  request_id: u64,
+  body_bytes: usize,
+  seed: u64,
+) -> io::Result<usize> {
+  encode_request_inner(out, Some(request_id), body_bytes, seed)
+}
+
+fn encode_request_inner(
+  out: &mut [u8],
+  request_id: Option<u64>,
+  body_bytes: usize,
+  seed: u64,
+) -> io::Result<usize> {
   if body_bytes > MAX_BODY_BYTES {
     return Err(io::Error::new(
       io::ErrorKind::InvalidInput,
@@ -275,7 +336,27 @@ pub fn encode_request(out: &mut [u8], body_bytes: usize, seed: u64) -> io::Resul
       break;
     }
   }
-  let header_len = REQUEST_PREFIX.len() + digits + REQUEST_SUFFIX.len();
+  let mut id_decimal = [0u8; 20];
+  let id_digits = if let Some(mut id) = request_id {
+    let mut digits = 0;
+    loop {
+      id_decimal[digits] = b'0' + (id % 10) as u8;
+      digits += 1;
+      id /= 10;
+      if id == 0 {
+        break;
+      }
+    }
+    digits
+  } else {
+    0
+  };
+  let id_header_len = if request_id.is_some() {
+    REQUEST_ID_PREFIX.len() + id_digits
+  } else {
+    0
+  };
+  let header_len = REQUEST_PREFIX.len() + digits + id_header_len + REQUEST_SUFFIX.len();
   let frame_len = header_len + body_bytes;
   if frame_len > out.len() || header_len > MAX_HEADER_BYTES {
     return Err(io::Error::new(
@@ -288,6 +369,13 @@ pub fn encode_request(out: &mut [u8], body_bytes: usize, seed: u64) -> io::Resul
   for digit in decimal[..digits].iter().rev() {
     out[cursor] = *digit;
     cursor += 1;
+  }
+  if request_id.is_some() {
+    append(out, &mut cursor, REQUEST_ID_PREFIX);
+    for digit in id_decimal[..id_digits].iter().rev() {
+      out[cursor] = *digit;
+      cursor += 1;
+    }
   }
   append(out, &mut cursor, REQUEST_SUFFIX);
   for index in 0..body_bytes {
@@ -356,16 +444,44 @@ pub fn parse_response(bytes: &[u8]) -> io::Result<Option<u64>> {
 /// Accepts and services one connection. This reusable handler contains no
 /// listener/runtime setup, so a paced server can invoke it repeatedly.
 pub async fn serve_connection(stream: TcpStream, resources: ResourceScope) -> PortResult<u64> {
+  serve_connection_with_id(stream, resources)
+    .await
+    .map(|(_, checksum)| checksum)
+}
+
+/// Serves one request and returns its parsed request ID with the body
+/// checksum. This is the reusable server-handler result used by the
+/// development comparison adapter.
+pub async fn serve_connection_with_id(
+  stream: TcpStream,
+  resources: ResourceScope,
+) -> PortResult<(u64, u64)> {
   let network = resources.try_acquire(OperationRequest {
     disk: 0,
     network: 1,
   })?;
   let mut endpoint = NetworkEndpoint::new(stream, network);
+  serve_connection_io(&mut endpoint.stream, &resources).await
+}
+
+/// Runs the shared bounded server-side HTTP transaction over any endpoint
+/// implementing allocatbelt's safe initialized-buffer I/O traits. Executor
+/// adapters own connection creation and endpoint permits; this kernel owns
+/// request parsing, checksum, response framing, and managed scratch buffers.
+/// If an adapter cancels this future, it must drop it first and then perform
+/// the endpoint's documented waiter-cancellation/cleanup operation.
+pub async fn serve_connection_io<T>(
+  endpoint: &mut T,
+  resources: &ResourceScope,
+) -> PortResult<(u64, u64)>
+where
+  T: AsyncRead + AsyncWrite + Unpin,
+{
   // Keep reads deliberately small so the normal transaction exercises
   // incremental parsing even when the kernel coalesces client writes.
   let mut request = resources.try_alloc_zeroed(MAX_REQUEST_BYTES)?;
   let mut used = 0usize;
-  let body_checksum = loop {
+  let (request_id, body_checksum) = loop {
     let Some(storage) = request.get_mut() else {
       return Err(message("HTTP request buffer is unexpectedly shared").into());
     };
@@ -378,8 +494,8 @@ pub async fn serve_connection(stream: TcpStream, resources: ResourceScope) -> Po
       return Err(message("connection closed before a complete HTTP request").into());
     }
     used += count;
-    if let Some(body) = parse_request(&request.as_slice()[..used])? {
-      break checksum(body);
+    if let Some(parsed) = parse_request_with_id(&request.as_slice()[..used])? {
+      break (parsed.request_id, checksum(parsed.body));
     }
     if used == MAX_REQUEST_BYTES {
       return Err(message("HTTP request filled its buffer without completing").into());
@@ -402,94 +518,61 @@ pub async fn serve_connection(stream: TcpStream, resources: ResourceScope) -> Po
     .map_err(|error| message(format!("HTTP server shutdown: {error}")))?;
   drop(response);
   drop(request);
-  Ok(body_checksum)
+  Ok((request_id, body_checksum))
 }
 
-/// Runs one real loopback HTTP transaction through allocatbelt readiness I/O.
-/// Socket listeners, handles and the reactor remain caller-owned; only this
-/// request/connection is created here.
-pub async fn loopback_transaction(
-  scope: &OwnedTaskScope,
-  blocking: BlockingHandle,
-  reactor: ReactorHandle,
-  resources: ResourceScope,
+/// Runs the shared client-side transaction over an executor adapter's
+/// connected endpoint, including partial-write handling and bounded response
+/// parsing. Endpoint permits remain the caller's responsibility.
+/// If an adapter cancels this future, it must drop it first and then perform
+/// the endpoint's documented waiter-cancellation/cleanup operation.
+pub async fn transact_client_io<T>(
+  endpoint: &mut T,
+  resources: &ResourceScope,
+  request_id: u64,
   config: HttpConfig,
-) -> PortResult<u64> {
+) -> PortResult<u64>
+where
+  T: AsyncRead + AsyncWrite + Unpin,
+{
+  transact_client_io_inner(endpoint, resources, Some(request_id), config).await
+}
+
+async fn transact_client_io_inner<T>(
+  endpoint: &mut T,
+  resources: &ResourceScope,
+  request_id: Option<u64>,
+  config: HttpConfig,
+) -> PortResult<u64>
+where
+  T: AsyncRead + AsyncWrite + Unpin,
+{
   if config.body_bytes > MAX_BODY_BYTES {
     return Err(message("HTTP config exceeds its body bound").into());
   }
-  let listener = StdTcpListener::bind(("127.0.0.1", 0))?;
-  let address = listener.local_addr()?;
-  let listener = TcpListener::from_std(listener, &reactor)?;
-  let server_resources = resources.clone();
-  let server = scope
-    .spawn(async move {
-      let (stream, _) = listener.accept().await.map_err(join_message)?;
-      serve_connection(stream, server_resources).await
-    })
-    .map_err(|error| join_message(error.kind))?;
-  let mut server = AbortOnDrop::new(server);
-  let client_result = transact_client(blocking, reactor, resources.clone(), address, config).await;
-  match client_result {
-    Ok(client_checksum) => {
-      let server_checksum = server
-        .join()
-        .await
-        .map_err(|error: AsyncJoinError| join_message(error))??;
-      if client_checksum != server_checksum {
-        return Err(message("client/server HTTP checksums differ").into());
-      }
-      Ok(client_checksum)
-    }
-    Err(error) => {
-      server.abort();
-      match server.join().await {
-        Ok(Err(server_error)) => {
-          Err(message(format!("{}; HTTP server failed: {server_error}", error)).into())
-        }
-        Err(server_error) => Err(
-          message(format!(
-            "{}; HTTP server task failed: {server_error}",
-            error
-          ))
-          .into(),
-        ),
-        Ok(Ok(_)) => Err(error),
-      }
-    }
-  }
-}
-
-async fn transact_client(
-  blocking: BlockingHandle,
-  reactor: ReactorHandle,
-  resources: ResourceScope,
-  address: SocketAddr,
-  config: HttpConfig,
-) -> PortResult<u64> {
-  let net = NetHandle::new(blocking, resources.clone(), reactor, 1)?;
-  // NetHandle uses a bounded blocking-pool connect, then registers the stream
-  // with the same reactor used by the accepting side.
-  let stream = net
-    .connect(address)
-    .await
-    .map_err(|error| message(error.to_string()))?;
-  let network: OperationPermit = resources.try_acquire(OperationRequest {
-    disk: 0,
-    network: 1,
-  })?;
-  let mut endpoint = NetworkEndpoint::new(stream, network);
-  let request_capacity = REQUEST_PREFIX.len() + 20 + REQUEST_SUFFIX.len() + config.body_bytes;
+  let request_capacity = if request_id.is_some() {
+    MAX_REQUEST_BYTES
+  } else {
+    REQUEST_PREFIX.len() + 20 + REQUEST_SUFFIX.len() + config.body_bytes
+  };
   let mut request = resources.try_alloc_zeroed(request_capacity)?;
-  let request_len = encode_request(
-    request
-      .get_mut()
-      .ok_or_else(|| message("HTTP request buffer is shared"))?,
-    config.body_bytes,
-    config.seed,
-  )?;
-  // Two writes exercise request framing across calls; the server's parser is
-  // also tested with bytewise feeds so syscall coalescing cannot hide splits.
+  let request_len = match request_id {
+    Some(request_id) => encode_request_with_id(
+      request
+        .get_mut()
+        .ok_or_else(|| message("HTTP request buffer is shared"))?,
+      request_id,
+      config.body_bytes,
+      config.seed,
+    )?,
+    None => encode_request(
+      request
+        .get_mut()
+        .ok_or_else(|| message("HTTP request buffer is shared"))?,
+      config.body_bytes,
+      config.seed,
+    )?,
+  };
   let split = (REQUEST_PREFIX.len() + 24).min(request_len);
   endpoint
     .write_all(&request.as_slice()[..split])
@@ -515,8 +598,6 @@ async fn transact_client(
     }
     used += count;
     if let Some(result) = parse_response(&response.as_slice()[..used])? {
-      drop(response);
-      drop(request);
       return Ok(result);
     }
     if used == MAX_RESPONSE_BYTES {
@@ -525,11 +606,134 @@ async fn transact_client(
   }
 }
 
+/// Runs one real loopback HTTP transaction through allocatbelt readiness I/O.
+/// Socket listeners, handles and the reactor remain caller-owned; only this
+/// request/connection is created here.
+pub async fn loopback_transaction(
+  scope: &OwnedTaskScope,
+  blocking: BlockingHandle,
+  reactor: ReactorHandle,
+  resources: ResourceScope,
+  config: HttpConfig,
+) -> PortResult<u64> {
+  loopback_transaction_inner(scope, blocking, reactor, resources, config, None)
+    .await
+    .map(|(_, checksum)| checksum)
+}
+
+/// Runs an ID-aware native loopback exchange through the same transport-
+/// independent client/server kernels used by executor comparison adapters.
+pub async fn loopback_transaction_with_id(
+  scope: &OwnedTaskScope,
+  blocking: BlockingHandle,
+  reactor: ReactorHandle,
+  resources: ResourceScope,
+  config: HttpConfig,
+  request_id: u64,
+) -> PortResult<(u64, u64)> {
+  loopback_transaction_inner(
+    scope,
+    blocking,
+    reactor,
+    resources,
+    config,
+    Some(request_id),
+  )
+  .await
+}
+
+async fn loopback_transaction_inner(
+  scope: &OwnedTaskScope,
+  blocking: BlockingHandle,
+  reactor: ReactorHandle,
+  resources: ResourceScope,
+  config: HttpConfig,
+  request_id: Option<u64>,
+) -> PortResult<(u64, u64)> {
+  if config.body_bytes > MAX_BODY_BYTES {
+    return Err(message("HTTP config exceeds its body bound").into());
+  }
+  let listener = StdTcpListener::bind(("127.0.0.1", 0))?;
+  let address = listener.local_addr()?;
+  let listener = TcpListener::from_std(listener, &reactor)?;
+  let server_resources = resources.clone();
+  let server = scope
+    .spawn(async move {
+      let (stream, _) = listener.accept().await.map_err(join_message)?;
+      serve_connection_with_id(stream, server_resources).await
+    })
+    .map_err(|error| join_message(error.kind))?;
+  let mut server = AbortOnDrop::new(server);
+  let client_result = transact_client(
+    blocking,
+    reactor,
+    resources.clone(),
+    address,
+    request_id,
+    config,
+  )
+  .await;
+  match client_result {
+    Ok(client_checksum) => {
+      let (server_id, server_checksum) = server
+        .join()
+        .await
+        .map_err(|error: AsyncJoinError| join_message(error))??;
+      if request_id.is_some_and(|expected| expected != server_id) {
+        return Err(message("HTTP server returned a mismatched request ID").into());
+      }
+      if client_checksum != server_checksum {
+        return Err(message("client/server HTTP checksums differ").into());
+      }
+      Ok((server_id, client_checksum))
+    }
+    Err(error) => {
+      server.abort();
+      match server.join().await {
+        Ok(Err(server_error)) => {
+          Err(message(format!("{}; HTTP server failed: {server_error}", error)).into())
+        }
+        Err(server_error) => Err(
+          message(format!(
+            "{}; HTTP server task failed: {server_error}",
+            error
+          ))
+          .into(),
+        ),
+        Ok(Ok(_)) => Err(error),
+      }
+    }
+  }
+}
+
+async fn transact_client(
+  blocking: BlockingHandle,
+  reactor: ReactorHandle,
+  resources: ResourceScope,
+  address: SocketAddr,
+  request_id: Option<u64>,
+  config: HttpConfig,
+) -> PortResult<u64> {
+  let net = NetHandle::new(blocking, resources.clone(), reactor, 1)?;
+  // NetHandle uses a bounded blocking-pool connect, then registers the stream
+  // with the same reactor used by the accepting side.
+  let stream = net
+    .connect(address)
+    .await
+    .map_err(|error| message(error.to_string()))?;
+  let network: OperationPermit = resources.try_acquire(OperationRequest {
+    disk: 0,
+    network: 1,
+  })?;
+  let mut endpoint = NetworkEndpoint::new(stream, network);
+  transact_client_io_inner(&mut endpoint.stream, &resources, request_id, config).await
+}
+
 #[cfg(test)]
 mod tests {
   use super::{
     MAX_BODY_BYTES, MAX_HEADER_BYTES, MAX_REQUEST_BYTES, RESPONSE_READ_CHUNK, encode_request,
-    encode_response, parse_request, parse_response,
+    encode_request_with_id, encode_response, parse_request, parse_request_with_id, parse_response,
   };
   use crate::memory::{checksum, pattern_byte};
 
@@ -553,6 +757,35 @@ mod tests {
       checksum(parse_request(full_frame).unwrap().unwrap()),
       expected
     );
+  }
+
+  #[test]
+  fn request_id_round_trips_with_partial_frames_and_full_u64_range() {
+    let body_len = 37;
+    let request_id = u64::MAX;
+    let mut frame = vec![0; MAX_REQUEST_BYTES];
+    let frame_len = encode_request_with_id(&mut frame, request_id, body_len, 9).unwrap();
+    for split in 0..frame_len {
+      assert!(parse_request_with_id(&frame[..split]).unwrap().is_none());
+    }
+    let parsed = parse_request_with_id(&frame[..frame_len]).unwrap().unwrap();
+    assert_eq!(parsed.request_id, request_id);
+    assert_eq!(parsed.body.len(), body_len);
+    assert_eq!(
+      parse_request(&frame[..frame_len]).unwrap(),
+      Some(parsed.body)
+    );
+  }
+
+  #[test]
+  fn request_id_parser_rejects_duplicate_and_nondecimal_values() {
+    for request in [
+      b"POST /checksum HTTP/1.1\r\nContent-Length: 0\r\nX-Request-ID: 1\r\nX-Request-ID: 2\r\n\r\n"
+        .as_slice(),
+      b"POST /checksum HTTP/1.1\r\nContent-Length: 0\r\nX-Request-ID: 1x\r\n\r\n".as_slice(),
+    ] {
+      assert!(parse_request_with_id(request).is_err());
+    }
   }
 
   #[test]

@@ -35,9 +35,10 @@ impl Default for MemoryConfig {
 /// Charges observed after successful replacement and its payload checksum.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MemoryReport {
-  /// The old plus replacement reservation was refused under the exact cap.
+  /// Whether the idle-scope functional wrapper ran the old-plus-replacement
+  /// refusal probe. Shared `run_operation` kernels leave this false.
   pub peak_replacement_was_enforced: bool,
-  /// Managed bytes charged after the old buffer was replaced.
+  /// Managed bytes charged to this output after the old buffer was replaced.
   pub charged_after_growth: usize,
   /// Checksum over the initialized grown payload.
   pub checksum: u64,
@@ -84,14 +85,17 @@ fn fill(buf: &mut ManagedBuf, seed: u64) -> PortResult<()> {
   Ok(())
 }
 
-fn managed_work(resources: &ResourceScope, config: MemoryConfig) -> PortResult<MemoryOutput> {
+fn validate_config(config: MemoryConfig) -> PortResult<()> {
   if config.initial_bytes == 0
     || config.grown_bytes <= config.initial_bytes
     || config.grown_bytes > MAX_BUFFER_BYTES
   {
     return Err(message("memory config exceeds its functional bounds").into());
   }
+  Ok(())
+}
 
+fn verify_growth_rejection(config: MemoryConfig) -> PortResult<()> {
   // This smaller scope proves that a move to a replacement needs the old and
   // new storage together. The requested target alone fits, but old+target
   // cannot fit. `try_resize` must preserve the old bytes and charge on reject.
@@ -128,6 +132,14 @@ fn managed_work(resources: &ResourceScope, config: MemoryConfig) -> PortResult<M
   if peak_scope.snapshot().managed_memory != 0 {
     return Err(message("peak-probe buffer charge was not released").into());
   }
+  Ok(())
+}
+
+/// Performs one shared managed-memory workload operation and returns its
+/// retained output. The caller owns the output lifetime and may keep it in a
+/// bounded result window. This kernel does not require the scope to be idle.
+pub fn run_operation(resources: &ResourceScope, config: MemoryConfig) -> PortResult<MemoryOutput> {
+  validate_config(config)?;
 
   let mut buffer = resources.try_alloc_zeroed(config.initial_bytes)?;
   fill(&mut buffer, config.seed)?;
@@ -147,12 +159,11 @@ fn managed_work(resources: &ResourceScope, config: MemoryConfig) -> PortResult<M
   } else {
     return Err(message("grown buffer unexpectedly has shared owners").into());
   }
-  let charged_after_growth = resources.snapshot().managed_memory;
-  if charged_after_growth != buffer.charged_bytes() {
-    return Err(message("ledger does not match retained grown storage").into());
-  }
+  // This is the output's charge, not a global snapshot: benchmark operations
+  // may share the scope with other live outputs or in-flight allocations.
+  let charged_after_growth = buffer.charged_bytes();
   let report = MemoryReport {
-    peak_replacement_was_enforced: true,
+    peak_replacement_was_enforced: false,
     charged_after_growth,
     checksum: checksum(buffer.as_slice()),
   };
@@ -167,7 +178,16 @@ pub async fn run(
   config: MemoryConfig,
 ) -> PortResult<MemoryOutput> {
   let job = scope
-    .spawn(async move { managed_work(&resources, config) })
+    .spawn(async move {
+      validate_config(config)?;
+      verify_growth_rejection(config)?;
+      let mut output = run_operation(&resources, config)?;
+      if resources.snapshot().managed_memory != output.report.charged_after_growth {
+        return Err(message("memory run requires an otherwise-idle resource scope").into());
+      }
+      output.report.peak_replacement_was_enforced = true;
+      Ok(output)
+    })
     .map_err(|error| join_message(error.kind))?;
   job
     .await

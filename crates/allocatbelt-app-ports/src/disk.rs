@@ -79,9 +79,39 @@ pub fn payload_byte(seed: u64, index: usize) -> u8 {
 /// The directory and `create_new` file are created synchronously before any
 /// cancellable work. Later pool opens never create a path, so cleanup may
 /// remove the tree even if an admitted open job is still queued.
+#[derive(Debug)]
 struct TempDir {
   path: PathBuf,
   owned: bool,
+}
+
+/// Private create-new file workspace shared by filesystem executor adapters.
+/// Creation and cleanup are synchronous and ordinary filesystem operations;
+/// callers must include both phases identically when comparing drivers.
+#[derive(Debug)]
+pub struct DiskWorkspace {
+  temp: TempDir,
+  file_path: PathBuf,
+}
+
+impl DiskWorkspace {
+  /// Creates a unique mode-0700 directory and an empty `create_new` payload
+  /// file before any cancellable I/O is submitted.
+  pub fn create() -> io::Result<Self> {
+    let temp = TempDir::create()?;
+    let file_path = temp.create_file()?;
+    Ok(Self { temp, file_path })
+  }
+
+  /// Path to the already-created empty payload file.
+  pub fn file_path(&self) -> &std::path::Path {
+    &self.file_path
+  }
+
+  /// Removes the owned directory tree. Drop retries cleanup if this fails.
+  pub fn cleanup(&mut self) -> io::Result<()> {
+    self.temp.cleanup()
+  }
 }
 
 impl TempDir {
@@ -141,6 +171,46 @@ fn existing_file_options() -> OpenOptions {
   options
 }
 
+/// Opens the already-created payload path without `create` or `truncate`.
+pub fn existing_payload_options() -> OpenOptions {
+  existing_file_options()
+}
+
+/// Validates the disk config and creates the deterministic managed payload.
+pub fn make_payload(resources: &ResourceScope, config: DiskConfig) -> PortResult<ManagedBuf> {
+  validate_config(config)?;
+  let mut payload = resources.try_alloc_zeroed(config.bytes)?;
+  let Some(bytes) = payload.get_mut() else {
+    return Err(message("new disk payload buffer is shared").into());
+  };
+  for (index, byte) in bytes.iter_mut().enumerate() {
+    *byte = payload_byte(config.seed, index);
+  }
+  Ok(payload)
+}
+
+/// Computes the reference checksum for one validated disk payload without
+/// allocating its buffer.
+pub fn expected_checksum(config: DiskConfig) -> PortResult<u64> {
+  validate_config(config)?;
+  Ok(
+    (0..config.bytes).fold(0xcbf2_9ce4_8422_2325, |hash, index| {
+      (hash ^ u64::from(payload_byte(config.seed, index))).wrapping_mul(0x0000_0100_0000_01b3)
+    }),
+  )
+}
+
+fn validate_config(config: DiskConfig) -> PortResult<()> {
+  if config.bytes == 0
+    || config.bytes > MAX_DISK_BYTES
+    || config.offset > MAX_DISK_OFFSET
+    || config.offset.checked_add(config.bytes as u64).is_none()
+  {
+    return Err(message("disk config exceeds its functional bounds").into());
+  }
+  Ok(())
+}
+
 /// Submits an open for a caller-prepared path without losing retry inputs.
 ///
 /// A returned error is a pre-admission rejection; callers can inspect its
@@ -189,27 +259,14 @@ async fn transaction(
   resources: &ResourceScope,
   config: DiskConfig,
 ) -> PortResult<DiskReport> {
-  if config.bytes == 0
-    || config.bytes > MAX_DISK_BYTES
-    || config.offset > MAX_DISK_OFFSET
-    || config.offset.checked_add(config.bytes as u64).is_none()
-  {
-    return Err(message("disk config exceeds its functional bounds").into());
-  }
+  validate_config(config)?;
 
-  let mut temp = TempDir::create()?;
+  let mut workspace = DiskWorkspace::create()?;
   // Establish the unique file before yielding to cancellable asynchronous
   // work. The pool open below cannot create a file after `temp` is dropped.
-  let path = temp.create_file()?;
-  let file = open_prepared_file(fs_handle, path).await?;
+  let file = open_prepared_file(fs_handle, workspace.file_path.clone()).await?;
 
-  let mut payload = resources.try_alloc_zeroed(config.bytes)?;
-  let Some(bytes) = payload.get_mut() else {
-    return Err(message("new disk payload buffer is shared").into());
-  };
-  for (index, byte) in bytes.iter_mut().enumerate() {
-    *byte = payload_byte(config.seed, index);
-  }
+  let payload = make_payload(resources, config)?;
   let expected_checksum = checksum(payload.as_slice());
 
   let FileIoOutcome {
@@ -267,20 +324,25 @@ async fn transaction(
   drop(file);
 
   let resources_after_cleanup = resources.snapshot();
-  if resources_after_cleanup.managed_memory != 0
-    || resources_after_cleanup.disk_ops != 0
-    || resources_after_cleanup.network_ops != 0
-  {
-    return Err(message("disk transaction retained a managed resource charge").into());
-  }
-  temp.cleanup()?;
+  workspace.cleanup()?;
   Ok(DiskReport {
     offset: config.offset,
     bytes: config.bytes,
     checksum: actual_checksum,
     resources_after_cleanup,
-    temp_directory_removed: !temp.path.exists(),
+    temp_directory_removed: !workspace.temp.path.exists(),
   })
+}
+
+/// Runs one filesystem transaction on a caller-owned bounded task. The scope
+/// may be shared with concurrent operations; use a benchmark-wide snapshot
+/// after all work and output buffers have been drained.
+pub async fn run_operation(
+  fs_handle: &FsHandle,
+  resources: &ResourceScope,
+  config: DiskConfig,
+) -> PortResult<DiskReport> {
+  transaction(fs_handle, resources, config).await
 }
 
 /// Runs the owned filesystem transaction in a bounded async task scope.
@@ -291,7 +353,14 @@ pub async fn run(
   config: DiskConfig,
 ) -> PortResult<DiskReport> {
   let job = scope
-    .spawn(async move { transaction(&fs_handle, &resources, config).await })
+    .spawn(async move {
+      let report = run_operation(&fs_handle, &resources, config).await?;
+      let snapshot = resources.snapshot();
+      if snapshot.managed_memory != 0 || snapshot.disk_ops != 0 || snapshot.network_ops != 0 {
+        return Err(message("disk run requires an otherwise-idle resource scope").into());
+      }
+      Ok(report)
+    })
     .map_err(|error| join_message(error.kind))?;
   job
     .await

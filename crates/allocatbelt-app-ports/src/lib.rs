@@ -6,11 +6,13 @@
 //! development-only executor comparison can reuse the same deterministic
 //! work without adding Tokio to this package.
 //!
-//! Resource-backed ports take explicit ledger handles. Their reported final
-//! snapshots and exact capacity checks assume a dedicated, otherwise-idle
-//! `ResourceScope`; unrelated live buffers or operation permits contribute to
-//! the same ledger and can change those observations. Runtime, reactor and
-//! filesystem handles remain caller-owned and must be shut down explicitly.
+//! Resource-backed functional `run` ports take explicit ledger handles and
+//! retain their dedicated, otherwise-idle scope checks. The additive
+//! `run_operation` kernels used by the development benchmark support shared
+//! scopes and report per-operation outputs; benchmark-wide charge assertions
+//! belong after all operations and retained outputs have drained. Runtime,
+//! reactor and filesystem handles remain caller-owned and must be shut down
+//! explicitly.
 //! The qualification tests exercise recovered bounded-admission inputs,
 //! returned managed-buffer clone lifetime, canceled HTTP server cleanup,
 //! detached multi-chunk filesystem work, and explicit process reaping. These
