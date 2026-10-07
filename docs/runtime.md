@@ -1211,17 +1211,34 @@ pressure or a native application benefit.
 
 ## Path toward replacing Tokio
 
-The lifecycle foundation above is implemented. Remaining milestones include:
+Task utilities, resource-bound polling, the synchronization families,
+processes, signals, concurrency helpers and explicit cgroup feedback are
+implemented with the contracts above. The stable Linux Tokio 1.53.1 capability
+baseline still requires these implementation and qualification steps:
 
-1. Task utilities and integration of resource permits into active polling.
-2. Integrate the implemented timers, epoll readiness and owned filesystem APIs
-   into application ports; complete remaining I/O utilities and socket adapters.
-3. Complete synchronization, processes, signals and concurrency helpers;
-   verify compatibility requirements against real Tokio application workloads.
-4. Resource measurement and optional cgroup-aware feedback, with explicit
-   admission versus enforcement semantics and oscillation/overload tests.
-5. Profile-driven scheduler and ISA variants, promoted only after correctness,
-   tail-latency, throughput and memory gates on native supported platforms.
+1. Extend automatic cooperative progress beyond the listed channel and lock
+   operations. Add cancellation-friendly nonblocking connect and supplied/bound
+   socket ports, connected UDP operations and datagram peeking.
+2. Add standard I/O adapters and general pipe construction, bounded delimiter,
+   line and whole-stream reads, stream composition, managed in-memory pipes
+   and bidirectional copy with explicit partial-progress and half-close rules.
+3. Add supplied-file conversion/recovery, open-file metadata and mutations,
+   missing path operations and bounded recursive traversal. Add channel capacity
+   reservation before message construction and sender closure notification.
+4. Exercise realistic application ports covering cancellation, bounded
+   rejection recovery, resource/dependency quotas, retained managed storage,
+   partial I/O and explicit driver/process shutdown. The existing CPU, memory,
+   limited TCP/HTTP and disk examples establish functional ports only.
+5. Finish complete isolated core Miri and supported platform, feature, package
+   and security-tool qualification, preserving failures and model-coverage
+   limits. Complete per-host retained-memory, allocator, executor and application
+   gates against both mimalloc baselines and matched-allocator Tokio, separating
+   saturated capacity from open-loop tail-latency workloads.
+6. Qualify adaptive controls under real resource pressure, overload and
+   readback failures. Synthetic policy samples and control-write integration
+   establish correctness, not pressure response or application performance.
+   Promote scheduler, allocator and ISA candidates only after their required
+   correctness and native throughput, tail-latency and memory gates pass.
 
 No default algorithm or ISA dispatch is promoted by this milestone. The
 [platform contract](platform.md), including the allocator's x86-64-v3 floor,
