@@ -458,7 +458,7 @@ the driver's guarded ownership checks. Pipe accessors transfer standard
 handles. `runtime::process::pipe` converts them into `AsyncChildStdin`,
 `AsyncChildStdout` and `AsyncChildStderr` through a supplied bounded reactor.
 Callers must drain piped stdout and stderr concurrently to avoid blocking the
-child. Bounded output collection is a subsequent port.
+child. `runtime::process::output` supplies an owned bounded collector.
 
 Pipe endpoints use initialized scalar and vectored I/O without allocating
 userspace byte buffers. Each poll limits interrupted/readiness retries to
@@ -470,6 +470,26 @@ not stop or reap the child. Registration rejection returns the original
 standard handle and reports both the primary error and any failure to restore
 its original status flags. Five native tests cover simultaneous large output
 drains, vector progress/EOF, stdin shutdown, waiter reuse and input recovery.
+
+The output collector takes the child, both registered output endpoints and
+two uniquely owned `ManagedBuf`s. Rejected construction returns every input
+before closing stdin or reading a pipe. Accepted construction closes stdin
+still owned by the child, then alternates bounded reads from stdout/stderr
+and keeps its completion waiter until publication or cancellation. Returned
+buffers retain their managed charges; no growable output allocation is used.
+
+An exact-capacity output succeeds when a one-byte probe observes EOF. On
+overflow, `ReturnPartial` returns the child, endpoints, retained prefixes and
+the consumed probe byte so the caller can resume without losing data.
+`KillAndWait` requests termination and drains excess output through fixed
+stack storage before reporting reaped status and truncation. It preserves
+the first overflow probe across both streams. Errors return recoverable
+owned inputs and progress. Dropping a pending collector removes its waiters
+and follows the child's configured detach/kill-on-drop policy; the process
+slot remains owned by the reaper until actual reaping. A descendant that
+retains pipe writers or a blocked kernel operation can delay collection
+indefinitely. Nine native tests and independent wake-driven cases cover
+simultaneous drains, exact/zero capacities, recovery, cleanup and charges.
 
 The driver requires exclusive child wait ownership. Foreign `waitpid`, a
 chained `SIGCHLD` handler that reaps children, and `SIG_IGN` or `SA_NOCLDWAIT`
