@@ -18,6 +18,9 @@ use crate::Allocatbelt;
 pub struct CompiledCapabilities {
   /// Feature `runtime`: the safe bounded blocking worker runtime.
   pub runtime: bool,
+  /// Feature `runtime-io-uring`: bounded owned-buffer positional file I/O.
+  /// A separate driver must start successfully before it accepts operations.
+  pub runtime_io_uring: bool,
   /// Feature `maintenance`: the background maintenance thread
   /// ([`Allocatbelt::start_maintenance_thread`]). Without it, allocating
   /// threads run every housekeeping pass inline.
@@ -48,6 +51,7 @@ impl CompiledCapabilities {
   /// The capabilities of this build.
   pub const CURRENT: Self = Self {
     runtime: cfg!(feature = "runtime"),
+    runtime_io_uring: cfg!(feature = "runtime-io-uring"),
     maintenance: cfg!(feature = "maintenance"),
     scheduler: cfg!(feature = "scheduler"),
     io_uring: cfg!(feature = "io-uring"),

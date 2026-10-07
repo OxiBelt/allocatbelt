@@ -1118,6 +1118,45 @@ Native lifecycle tests and bounded same-source coordinator Loom models qualify
 these semantics. The models cover permit/loan accounting, not the full
 scheduler, condition variables, TLS or a performance benefit.
 
+## Owned-buffer runtime io_uring
+
+The separate `runtime-io-uring` feature implies `runtime` and exposes
+`runtime::uring`. `UringRuntime::start(UringConfig, ResourceScope)` starts a
+dedicated issuer and completes its setup/probe/restriction handshake before
+returning a handle. Capacity must be in `1..=1024`. Setup denial returns a typed
+stage/error before admission; no automatic fallback or allocator purge-policy
+change occurs. `CompiledCapabilities::runtime_io_uring` reports compiled code,
+while successful startup establishes that this driver was permitted.
+
+`try_read_at` and `try_write_at` take an owned regular-file descriptor, unique
+`ManagedBuf` and checked offset, returning the original inputs on admission
+rejection. Direct/path-only descriptors, incompatible access, observed append
+writes, shared buffers and overflowing extents are refused. The caller must
+keep shared file-status flags stable through all descriptor aliases while the
+service owns the descriptor. Each request is one positional operation, and a
+short completion returns its byte count and original owners without replay.
+Zero-length accepted operations finish locally.
+
+Fixed admission slots count queued, claimed, published, completing and
+completed-unclaimed requests. Dropping a queued future cancels before claim;
+after claim, dropping detaches observation and retains inputs until the original
+CQE. Disk operation permits are released after actual I/O cleanup and before
+completion publication; managed memory remains charged through the final
+buffer owner, including returned results. Slot generations retire on exhaustion.
+Waker callbacks and payload destruction run outside the ledger lock.
+
+Explicit `shutdown` closes admission, drains accepted work and joins the issuer;
+it can wait indefinitely for kernel I/O and rejects issuer-thread self-joining.
+Dropping the service closes admission and detaches while the issuer drains.
+Closing a ring descriptor is not a synchronous buffer-release barrier. If
+published ownership becomes uncertain, the initial backend aborts the process
+before kernel-visible owners can drop. It does not cancel, recreate, quarantine
+or replay uncertain operations. Fake-driver and slot-protocol Loom tests cover
+bounded lifecycle transitions, not kernel execution. Real-kernel tests with
+`ALLOCATBELT_REQUIRE_IO_URING=1` fail on denied setup, distinguishing permission
+failure from a successful kernel transfer/fail-stop qualification. No native
+performance benefit has been established for this optional service.
+
 ## Path toward replacing Tokio
 
 The lifecycle foundation above is implemented. Remaining milestones include:

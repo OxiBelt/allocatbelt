@@ -9,7 +9,9 @@
 //!
 //! Allocator syscall wrappers never allocate or unwind on the hot path.
 //! The optional runtime signal-registration boundary allocates registry metadata
-//! during explicit installation; its handler remains allocation-free.
+//! during explicit installation; its handler remains allocation-free. The
+//! separately enabled runtime file ring allocates bounded metadata at startup,
+//! outside allocator syscall paths.
 //!
 //! This module also holds the platform contract (`platform`): builds for
 //! anything but 64-bit little-endian Linux on x86_64 (x86-64-v3 or newer),
@@ -30,6 +32,8 @@ mod platform;
 mod ring;
 #[cfg(feature = "experimental-rseq")]
 mod rseq;
+#[cfg(feature = "runtime-io-uring")]
+pub(crate) mod runtime_ring;
 #[cfg(feature = "runtime")]
 pub(crate) mod runtime_signal;
 

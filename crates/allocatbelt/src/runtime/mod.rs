@@ -120,6 +120,10 @@ mod tests;
 #[cfg(all(test, not(loom)))]
 mod tests_guard;
 pub mod time;
+#[cfg(all(feature = "runtime-io-uring", not(loom)))]
+pub mod uring;
+#[cfg(any(all(feature = "runtime-io-uring", not(loom)), all(test, loom)))]
+mod uring_protocol;
 pub mod watch;
 mod worker;
 

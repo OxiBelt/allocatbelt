@@ -27,6 +27,9 @@ combos=(
   "--no-default-features --features runtime"
   "--features runtime"
   "--features runtime,io-uring"
+  "--no-default-features --features runtime-io-uring"
+  "--features runtime-io-uring"
+  "--features runtime-io-uring,io-uring"
   "--all-features"
 )
 

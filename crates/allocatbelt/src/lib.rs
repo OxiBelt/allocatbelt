@@ -47,6 +47,7 @@
 //! | `runtime` | no | experimental runtime foundation | bounded blocking/owned-future pools, managed storage, initialized-buffer I/O, owned filesystem operations, epoll readiness and timers (`allocatbelt::runtime`) |
 //! | `maintenance` | yes | stable | the background maintenance thread (`start_maintenance_thread`, `purge_backend`, `PurgeBackend`) |
 //! | `scheduler` | yes | stable | runs that thread as `SCHED_BATCH`; implies `maintenance` |
+//! | `runtime-io-uring` | no | experimental, implies `runtime` | independently started bounded owned-buffer file I/O (`runtime::uring`); setup denial returns before admission, ambiguous completion aborts |
 //! | `io-uring` | no | stable, off at run time until `set_io_uring(true)` | batched purges through a restricted io_uring, falling back to `madvise` (`set_io_uring`, `io_uring_error`, `RingError`); implies `maintenance` |
 //! | `experimental-rseq` | no | experimental, off at run time until `set_rseq_policy` | shard selection by the rseq `mm_cid`, glibc 2.35+ (`RseqPolicy`, `RseqStatus`) |
 //! | `experimental-aarch64-sve` | no | experimental, off at run time until `Policy::experimental_isa` selects it | on aarch64, the decay pass's age scan compiled for SVE ([`KernelSet::Sve`]) |

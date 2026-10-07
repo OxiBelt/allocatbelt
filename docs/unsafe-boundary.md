@@ -46,6 +46,40 @@ models cover cancellation, slot reuse and registration versus delivery/close.
 Handlers persist after subscriptions drop; unrelated concurrent application
 handler replacement has the registry's installation-race limitations.
 
+### `sys/runtime_ring.rs` (feature `runtime-io-uring`)
+
+A separately created, bounded ring serves owned regular-file reads/writes.
+The safe runtime never exposes its private kernel pointers. Startup reserves
+owner metadata and maps the ring; these allocations are outside allocator
+syscall paths. The original creating issuer is the only thread permitted to
+use the ring. It requires `SINGLE_MMAP`, `EXT_ARG`, `NODROP` and
+`SUBMIT_STABLE`, probes both operations, caps both io-wq classes, installs
+flagless read/write restrictions, then enables the disabled single-issuer ring.
+No SQ polling or shared work queue is requested.
+
+| Location | Kind | Operation | Why it is sound |
+|---|---|---|---|
+| `RuntimeRing::new` | block | `io_uring_setup` | Exclusive live params, no SQ polling/attached queue; checked flags, bounded power-of-two depths, offsets, masks, mapping lengths and alignment before use. |
+| `Mapping::new` / `Drop` | block each | `mmap` / `munmap` | Fresh shared mappings of this ring's own memory; destruction occurs only before publication or after the owner table is drained. |
+| `RuntimeRing::word` | block | Raw reference to `AtomicU32` | Validated aligned offsets within the live mapping; all accesses to shared header words are atomic and no reference escapes the ring. |
+| `RuntimeRing::write_sqe` | block | Write one SQE | Slot below validated capacity, not reused before acquire-observed kernel SQ head; required `SUBMIT_STABLE` permits reuse after consumption. Original FD/buffer owners are stored before release-publishing SQ tail. |
+| `RuntimeRing::read_cqe` | block | Read one CQE | Acquire-observed CQ tail makes the kernel entry visible; checked outstanding count/mask keeps it in bounds; CQ head advances with release only after reading. |
+| `RuntimeRing::register` | block | `io_uring_register` | Private call sites provide correctly sized, live probe/worker/restriction arrays or a null enable argument. Restrictions prohibit other operations and SQE flags. |
+| `RuntimeRing::enter` / `enter_wait` | block each | `io_uring_enter` / `io_uring_enter_arg` | SQEs refer to retained unique buffers and descriptors. Timed waits use live correctly laid out argument/timespec locals until syscall return. Retries submit only the existing unconsumed range. |
+| Backend test `sqe_at` | block | Read a private injected SQE | Bounds/mapping validated; test ring has one issuer, and injection does not rewrite published requests. |
+
+Buffers have no Rust slices, clones, debug-byte access or final owner release
+while kernel-visible. A checked original terminal CQE restores ownership;
+queued cancellation has never exposed inputs, while claimed/published
+cancellation detaches observation until actual completion. Unknown/duplicate
+completions, malformed results, lost CQ ownership, fatal ambiguous enter,
+in-flight unwind or in-flight backend destruction abort before owner release.
+Closing the descriptor is not used as an ownership barrier: Linux v7.0's
+[ring release implementation](https://github.com/torvalds/linux/blob/v7.0/io_uring/io_uring.c)
+queues asynchronous exit work. Original operations are never replayed or
+silently replaced by blocking I/O. This initial fail-stop policy is explicit
+in the public runtime contract.
+
 ### `sys/ring.rs` (io_uring purge ring, plan Phase 8, feature `io-uring`)
 
 Compiled only with the Cargo feature `io-uring` (not default). A restricted ring for batched `MADV_DONTNEED` (`PurgeRing`, used by the maintenance thread only after `Allocatbelt::set_io_uring(true)`). The syscalls go through rustix's `io_uring_*` functions, which are `unsafe` because the kernel works on raw pointers; no safe crate covers a ring that the allocator can use without allocating. A safe alternative would be `madvise` per run, which stays the default.
