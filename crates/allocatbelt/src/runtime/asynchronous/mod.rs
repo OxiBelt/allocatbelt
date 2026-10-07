@@ -2,8 +2,13 @@
 //! it does not provide I/O, borrowed spawned tasks, or Tokio compatibility.
 //! [`AsyncRuntime::block_on`] may poll one borrowed or non-`Send` root future
 //! on its caller thread. Spawned work remains owned and `Send + 'static`.
-//! [`yield_now`] schedules one self-wake; [`consume_budget`] is an opt-in
-//! checkpoint and cannot preempt code that does not await it.
+//! Runtime-owned outer polls enable a shared 64-operation cooperative budget
+//! for ready channel, oneshot, semaphore, mutex, and reader-writer-lock
+//! futures. The budget is scoped to those polls; manually polled primitives
+//! and futures polled by another executor bypass automatic accounting.
+//! [`yield_now`] schedules one self-wake; [`consume_budget`] remains an
+//! explicit checkpoint for other long-running future work. No checkpoint
+//! preempts synchronous code or arbitrary futures that never yield.
 //! [`try_block_in_place`] runs a blocking closure on its caller's thread; a
 //! runtime built with [`AsyncRuntime::new_with_handoffs`] keeps dispatching
 //! on a bounded set of prestarted helpers meanwhile.
@@ -34,6 +39,7 @@ use std::thread::{self, JoinHandle};
 use crate::runtime::managed::ResourceScope;
 use scheduler::{ScopeRef, Shared};
 
+pub(super) use entry::poll_cooperative;
 pub use entry::{
   ConsumeBudget, EnterGuard, YieldNow, consume_budget, current, current_resource_scope, task_id,
   try_current, try_current_resource_scope, try_task_id, yield_now,

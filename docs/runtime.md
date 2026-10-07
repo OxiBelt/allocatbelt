@@ -661,8 +661,23 @@ guard is dropped. Worker polls also enter the runtime's implicit root handle.
 
 `yield_now` schedules one self-wake and completes on the next poll; it does not
 guarantee another task runs first. `consume_budget` is an opt-in checkpoint
-that yields after 64 completed checkpoints within one poll. It cannot preempt
-code that does not await it, and it does not impose a fairness or latency bound.
+that consumes from the shared per-poll budget and yields when the combined
+primitive/checkpoint budget is exhausted. It cannot preempt code that does not
+await it, and it does not impose a fairness or latency bound.
+
+Runtime-owned outer polls also use a shared 64-operation budget for ready
+`channel` send/receive, oneshot receive/close, semaphore acquisition, mutex
+acquisition and reader-writer-lock acquisition polls. A synchronous
+primitive-to-primitive chain charges once; a primitive poll that returns
+Pending restores its provisional charge. Once exhausted, the next supported
+primitive arranges a wake and returns Pending before it dequeues a message,
+accepts a send, or transfers a permit/lock guard. This applies only while the
+runtime is polling an owned Send/local task or a borrowed `block_on` root.
+Manual polls and futures driven by external executors bypass automatic
+accounting. Notifications, watch/broadcast, barriers, timers, and other
+arbitrary futures are not yet automatically cooperative; long-running work
+outside the listed primitives still needs explicit checkpoints or its own
+bounded polling.
 
 `AsyncJob` is awaitable; dropping it detaches, while `abort` requests cleanup
 after any in-flight poll returns. Owned scopes cancel their children on drop;

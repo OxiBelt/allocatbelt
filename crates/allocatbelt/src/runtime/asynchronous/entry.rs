@@ -1,5 +1,6 @@
 //! Safe caller-thread polling, entered-runtime context, and cooperative
-//! utilities. The budget is opt-in: futures must await `consume_budget()` at
+//! utilities. Selected ready runtime primitives share a per-outer-poll budget;
+//! futures doing other long-running work can await `consume_budget()` at
 //! points where they can safely yield.
 
 use std::cell::{Cell, RefCell};
@@ -23,6 +24,8 @@ thread_local! {
   static BLOCK_ON_ACTIVE: Cell<bool> = const { Cell::new(false) };
   static EXECUTOR_WORKER: Cell<bool> = const { Cell::new(false) };
   static COOPERATIVE_BUDGET: Cell<u16> = const { Cell::new(DEFAULT_BUDGET) };
+  static COOPERATIVE_POLL_ACTIVE: Cell<bool> = const { Cell::new(false) };
+  static COOPERATIVE_POLL_DEPTH: Cell<u16> = const { Cell::new(0) };
   static CURRENT_TASK_ID: Cell<Option<TaskId>> = const { Cell::new(None) };
   static LOCAL_EXECUTION: Cell<bool> = const { Cell::new(false) };
   static CURRENT_RESOURCE_SCOPE: RefCell<Option<ResourceScope>> = const { RefCell::new(None) };
@@ -231,6 +234,8 @@ pub(super) struct ClosureContextGuard {
   executor_worker: Option<bool>,
   block_on_active: bool,
   budget: u16,
+  cooperative_poll_active: bool,
+  cooperative_poll_depth: u16,
   _not_send: PhantomData<Rc<()>>,
 }
 
@@ -249,10 +254,18 @@ impl ClosureContextGuard {
     let budget = COOPERATIVE_BUDGET
       .try_with(Cell::get)
       .unwrap_or(DEFAULT_BUDGET);
+    let cooperative_poll_active = COOPERATIVE_POLL_ACTIVE
+      .try_with(|active| active.replace(false))
+      .unwrap_or(false);
+    let cooperative_poll_depth = COOPERATIVE_POLL_DEPTH
+      .try_with(|depth| depth.replace(0))
+      .unwrap_or(0);
     Self {
       executor_worker,
       block_on_active,
       budget,
+      cooperative_poll_active,
+      cooperative_poll_depth,
       _not_send: PhantomData,
     }
   }
@@ -265,7 +278,142 @@ impl Drop for ClosureContextGuard {
     }
     let _ = BLOCK_ON_ACTIVE.try_with(|active| active.set(self.block_on_active));
     let _ = COOPERATIVE_BUDGET.try_with(|budget| budget.set(self.budget));
+    let _ = COOPERATIVE_POLL_ACTIVE.try_with(|active| active.set(self.cooperative_poll_active));
+    let _ = COOPERATIVE_POLL_DEPTH.try_with(|depth| depth.set(self.cooperative_poll_depth));
   }
+}
+
+/// Activates a fresh cooperative budget for exactly one runtime-owned outer
+/// future poll. Primitive futures polled by foreign executors or manually do
+/// not see an active budget. This guard is thread-affine and must not cross an
+/// await or be stored after the poll returns.
+pub(super) struct CooperativePollGuard {
+  previous_active: bool,
+  previous_budget: u16,
+  previous_depth: u16,
+  _not_send: PhantomData<Rc<()>>,
+}
+
+impl CooperativePollGuard {
+  pub(super) fn enter() -> Self {
+    let previous_active = COOPERATIVE_POLL_ACTIVE.with(|active| active.replace(true));
+    let previous_budget = COOPERATIVE_BUDGET.with(|budget| budget.replace(DEFAULT_BUDGET));
+    let previous_depth = COOPERATIVE_POLL_DEPTH.with(|depth| depth.replace(0));
+    Self {
+      previous_active,
+      previous_budget,
+      previous_depth,
+      _not_send: PhantomData,
+    }
+  }
+}
+
+impl Drop for CooperativePollGuard {
+  fn drop(&mut self) {
+    let _ = COOPERATIVE_POLL_DEPTH.try_with(|depth| depth.set(self.previous_depth));
+    let _ = COOPERATIVE_BUDGET.try_with(|budget| budget.set(self.previous_budget));
+    let _ = COOPERATIVE_POLL_ACTIVE.try_with(|active| active.set(self.previous_active));
+  }
+}
+
+/// A provisional unit of cooperative work. Pending or unwinding polls restore
+/// the budget captured by this frame; Ready polls commit the charge. Nested
+/// primitive polls only maintain depth, so a channel send that acquires a
+/// semaphore permit consumes one unit rather than one unit per layer.
+pub(in crate::runtime) struct CooperativePollPermit {
+  tracked: bool,
+  charged: bool,
+  committed: bool,
+  previous_budget: u16,
+  previous_depth: u16,
+  _not_send: PhantomData<Rc<()>>,
+}
+
+impl CooperativePollPermit {
+  fn untracked() -> Self {
+    Self {
+      tracked: false,
+      charged: false,
+      committed: true,
+      previous_budget: 0,
+      previous_depth: 0,
+      _not_send: PhantomData,
+    }
+  }
+
+  pub(in crate::runtime) fn made_progress(&mut self) {
+    self.committed = true;
+  }
+}
+
+impl Drop for CooperativePollPermit {
+  fn drop(&mut self) {
+    if !self.tracked {
+      return;
+    }
+    if self.charged && !self.committed {
+      let _ = COOPERATIVE_BUDGET.try_with(|budget| budget.set(self.previous_budget));
+    }
+    let _ = COOPERATIVE_POLL_DEPTH.try_with(|depth| depth.set(self.previous_depth));
+  }
+}
+
+/// Attempts to reserve one unit before a primitive changes observable state.
+/// When no allocatbelt-owned outer poll is active, accounting is bypassed.
+fn reserve_cooperative(context: &Context<'_>) -> Poll<CooperativePollPermit> {
+  if !COOPERATIVE_POLL_ACTIVE.try_with(Cell::get).unwrap_or(false) {
+    return Poll::Ready(CooperativePollPermit::untracked());
+  }
+
+  let depth = COOPERATIVE_POLL_DEPTH.with(Cell::get);
+  if depth != 0 {
+    COOPERATIVE_POLL_DEPTH.with(|current| current.set(depth.saturating_add(1)));
+    return Poll::Ready(CooperativePollPermit {
+      tracked: true,
+      charged: false,
+      committed: true,
+      previous_budget: 0,
+      previous_depth: depth,
+      _not_send: PhantomData,
+    });
+  }
+
+  let previous_budget = COOPERATIVE_BUDGET.with(Cell::get);
+  if previous_budget == 0 {
+    // The caller must propagate Pending. Do not reset here: an enclosing
+    // select or retry loop must not obtain fresh work in this same outer poll.
+    context.waker().wake_by_ref();
+    return Poll::Pending;
+  }
+
+  COOPERATIVE_BUDGET.with(|budget| budget.set(previous_budget - 1));
+  COOPERATIVE_POLL_DEPTH.with(|current| current.set(1));
+  Poll::Ready(CooperativePollPermit {
+    tracked: true,
+    charged: true,
+    committed: false,
+    previous_budget,
+    previous_depth: depth,
+    _not_send: PhantomData,
+  })
+}
+
+/// Charges one outermost primitive poll only when it returns Ready. The
+/// operation closure is not called when an active poll has exhausted its
+/// budget, allowing callers to put this gate before queue or permit mutation.
+pub(in crate::runtime) fn poll_cooperative<T>(
+  context: &mut Context<'_>,
+  poll: impl FnOnce(&mut Context<'_>) -> Poll<T>,
+) -> Poll<T> {
+  let mut permit = match reserve_cooperative(context) {
+    Poll::Ready(permit) => permit,
+    Poll::Pending => return Poll::Pending,
+  };
+  let result = poll(context);
+  if result.is_ready() {
+    permit.made_progress();
+  }
+  result
 }
 
 /// Returns the identity of the task currently being polled or cleaned up.
@@ -351,7 +499,11 @@ fn block_on_caller_thread<F: Future>(future: F) -> F::Output {
   let mut future = Box::pin(future);
   loop {
     reset_budget();
-    if let Poll::Ready(output) = future.as_mut().poll(&mut context) {
+    let poll = {
+      let _cooperative_poll = CooperativePollGuard::enter();
+      future.as_mut().poll(&mut context)
+    };
+    if let Poll::Ready(output) = poll {
       return output;
     }
     parker.park();
@@ -421,9 +573,12 @@ pub fn yield_now() -> YieldNow {
   YieldNow::default()
 }
 
-/// A cooperative checkpoint. It completes for the first 64 calls during one
-/// task poll; the next call arranges one wake and yields. Callers must place
-/// checkpoints in long-running work. No preemption occurs between checkpoints.
+/// A cooperative checkpoint. During a runtime-owned outer poll it consumes
+/// one unit from the same 64-operation budget used by supported ready runtime
+/// primitives; the first operation after exhaustion arranges a wake and
+/// yields. Outside such a poll it retains standalone checkpoint behavior.
+/// Callers must place checkpoints in other long-running work. No preemption
+/// occurs between checkpoints.
 #[derive(Debug, Default)]
 pub struct ConsumeBudget;
 
@@ -431,6 +586,16 @@ impl Future for ConsumeBudget {
   type Output = ();
 
   fn poll(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
+    if COOPERATIVE_POLL_ACTIVE.try_with(Cell::get).unwrap_or(false) {
+      return match reserve_cooperative(context) {
+        Poll::Pending => Poll::Pending,
+        Poll::Ready(mut permit) => {
+          permit.made_progress();
+          Poll::Ready(())
+        }
+      };
+    }
+
     let exhausted = COOPERATIVE_BUDGET.with(|budget| {
       let remaining = budget.get();
       if remaining == 0 {
@@ -467,11 +632,16 @@ pub(super) fn budget_remaining() -> u16 {
 }
 
 #[cfg(all(test, not(loom)))]
+pub(super) fn cooperative_poll_active() -> bool {
+  COOPERATIVE_POLL_ACTIVE.with(Cell::get)
+}
+
+#[cfg(all(test, not(loom)))]
 pub(super) fn block_on_active() -> bool {
   BLOCK_ON_ACTIVE.with(Cell::get)
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(loom)))]
 mod tests {
   use super::*;
 
@@ -593,5 +763,124 @@ mod tests {
     assert!(Pin::new(&mut future).poll(&mut context).is_pending());
     assert!(Pin::new(&mut future).poll(&mut context).is_ready());
     reset_budget();
+  }
+
+  #[test]
+  fn automatic_budget_refunds_pending_and_charges_ready_errors_once() {
+    reset_budget();
+    let _outer = CooperativePollGuard::enter();
+    let mut context = Context::from_waker(Waker::noop());
+
+    assert!(poll_cooperative::<Result<(), ()>>(&mut context, |_| Poll::Pending).is_pending());
+    assert_eq!(budget_remaining(), DEFAULT_BUDGET);
+
+    assert_eq!(
+      poll_cooperative(&mut context, |_| Poll::Ready(Err::<(), ()>(()))),
+      Poll::Ready(Err(()))
+    );
+    assert_eq!(budget_remaining(), DEFAULT_BUDGET - 1);
+  }
+
+  #[test]
+  fn exhausted_budget_wakes_before_the_primitive_body_and_does_not_replenish() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::task::Wake;
+
+    struct WakeCounter(AtomicUsize);
+    impl Wake for WakeCounter {
+      fn wake(self: Arc<Self>) {
+        self.wake_by_ref();
+      }
+      fn wake_by_ref(self: &Arc<Self>) {
+        self.0.fetch_add(1, Ordering::SeqCst);
+      }
+    }
+
+    reset_budget();
+    let _outer = CooperativePollGuard::enter();
+    COOPERATIVE_BUDGET.set(0);
+    let wake = Arc::new(WakeCounter(AtomicUsize::new(0)));
+    let waker = Waker::from(Arc::clone(&wake));
+    let mut context = Context::from_waker(&waker);
+    let mutations = Cell::new(0);
+
+    assert!(
+      poll_cooperative(&mut context, |_| {
+        mutations.set(mutations.get() + 1);
+        Poll::Ready(())
+      })
+      .is_pending()
+    );
+    assert_eq!(mutations.get(), 0);
+    assert_eq!(wake.0.load(Ordering::SeqCst), 1);
+    assert_eq!(budget_remaining(), 0);
+  }
+
+  #[test]
+  fn unwinding_primitive_poll_refunds_its_provisional_unit() {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    reset_budget();
+    let _outer = CooperativePollGuard::enter();
+    let mut context = Context::from_waker(Waker::noop());
+    let result = catch_unwind(AssertUnwindSafe(|| {
+      let _ = poll_cooperative::<()>(&mut context, |_| panic!("injected primitive poll panic"));
+    }));
+    assert!(result.is_err());
+    assert_eq!(budget_remaining(), DEFAULT_BUDGET);
+    assert_eq!(COOPERATIVE_POLL_DEPTH.get(), 0);
+  }
+
+  #[test]
+  fn automatic_budget_suppresses_nested_primitive_charges() {
+    reset_budget();
+    let _outer = CooperativePollGuard::enter();
+    let mut context = Context::from_waker(Waker::noop());
+
+    let result = poll_cooperative(&mut context, |context| {
+      let nested = poll_cooperative(context, |_| Poll::Ready(7));
+      assert_eq!(nested, Poll::Ready(7));
+      Poll::Ready(())
+    });
+    assert_eq!(result, Poll::Ready(()));
+    assert_eq!(budget_remaining(), DEFAULT_BUDGET - 1);
+  }
+
+  #[test]
+  fn automatic_budget_bypass_does_not_stick_for_manual_polls() {
+    reset_budget();
+    let mut context = Context::from_waker(Waker::noop());
+    for _ in 0..(DEFAULT_BUDGET as usize * 2) {
+      assert_eq!(
+        poll_cooperative(&mut context, |_| Poll::Ready(())),
+        Poll::Ready(())
+      );
+    }
+    assert_eq!(budget_remaining(), DEFAULT_BUDGET);
+  }
+
+  #[test]
+  fn nested_poll_and_suspended_closure_restore_exact_tls_frame_on_unwind() {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    reset_budget();
+    let _outer = CooperativePollGuard::enter();
+    COOPERATIVE_BUDGET.set(37);
+    assert!(cooperative_poll_active());
+
+    let result = catch_unwind(AssertUnwindSafe(|| {
+      let _suspended = ClosureContextGuard::suspend(false);
+      assert!(!cooperative_poll_active());
+      assert_eq!(COOPERATIVE_POLL_DEPTH.get(), 0);
+      let _nested_root = CooperativePollGuard::enter();
+      assert!(cooperative_poll_active());
+      COOPERATIVE_BUDGET.set(11);
+      panic!("injected nested-root unwind");
+    }));
+
+    assert!(result.is_err());
+    assert!(cooperative_poll_active());
+    assert_eq!(budget_remaining(), 37);
+    assert_eq!(COOPERATIVE_POLL_DEPTH.get(), 0);
   }
 }

@@ -369,69 +369,71 @@ impl<T> Future for SendFuture<T> {
   type Output = Result<(), SendError<T>>;
 
   fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-    let this = self.get_mut();
-    if this.value.is_none() {
-      return Poll::Pending;
-    }
+    super::asynchronous::poll_cooperative(cx, |cx| {
+      let this = self.get_mut();
+      if this.value.is_none() {
+        return Poll::Pending;
+      }
 
-    let Some(side) = this.side.as_ref() else {
-      return Poll::Pending;
-    };
-    if is_closed(&side.shared) {
-      this.acquire.take();
-      let Some(value) = this.value.take() else {
+      let Some(side) = this.side.as_ref() else {
         return Poll::Pending;
       };
-      this.side.take();
-      return Poll::Ready(Err(SendError {
-        kind: SendErrorKind::Closed,
-        value,
-      }));
-    }
-
-    let Some(acquire) = this.acquire.as_mut() else {
-      return Poll::Pending;
-    };
-    match Pin::new(acquire).poll(cx) {
-      Poll::Pending => Poll::Pending,
-      Poll::Ready(Err(AcquireError::Closed)) => {
+      if is_closed(&side.shared) {
         this.acquire.take();
         let Some(value) = this.value.take() else {
           return Poll::Pending;
         };
         this.side.take();
-        Poll::Ready(Err(SendError {
+        return Poll::Ready(Err(SendError {
           kind: SendErrorKind::Closed,
           value,
-        }))
+        }));
       }
-      Poll::Ready(Err(AcquireError::Full | AcquireError::Completed)) => {
-        this.acquire.take();
-        let Some(value) = this.value.take() else {
-          return Poll::Pending;
-        };
-        this.side.take();
-        Poll::Ready(Err(SendError {
-          kind: SendErrorKind::Full,
-          value,
-        }))
-      }
-      Poll::Ready(Ok(permit)) => {
-        this.acquire.take();
-        let Some(value) = this.value.take() else {
-          drop(permit);
+
+      let Some(acquire) = this.acquire.as_mut() else {
+        return Poll::Pending;
+      };
+      match Pin::new(acquire).poll(cx) {
+        Poll::Pending => Poll::Pending,
+        Poll::Ready(Err(AcquireError::Closed)) => {
+          this.acquire.take();
+          let Some(value) = this.value.take() else {
+            return Poll::Pending;
+          };
           this.side.take();
-          return Poll::Pending;
-        };
-        let Some(side) = this.side.as_ref() else {
-          drop(permit);
-          return Poll::Pending;
-        };
-        let result = enqueue(&side.shared, value, permit);
-        this.side.take();
-        result.map_or_else(|error| Poll::Ready(Err(error)), |_| Poll::Ready(Ok(())))
+          Poll::Ready(Err(SendError {
+            kind: SendErrorKind::Closed,
+            value,
+          }))
+        }
+        Poll::Ready(Err(AcquireError::Full | AcquireError::Completed)) => {
+          this.acquire.take();
+          let Some(value) = this.value.take() else {
+            return Poll::Pending;
+          };
+          this.side.take();
+          Poll::Ready(Err(SendError {
+            kind: SendErrorKind::Full,
+            value,
+          }))
+        }
+        Poll::Ready(Ok(permit)) => {
+          this.acquire.take();
+          let Some(value) = this.value.take() else {
+            drop(permit);
+            this.side.take();
+            return Poll::Pending;
+          };
+          let Some(side) = this.side.as_ref() else {
+            drop(permit);
+            return Poll::Pending;
+          };
+          let result = enqueue(&side.shared, value, permit);
+          this.side.take();
+          result.map_or_else(|error| Poll::Ready(Err(error)), |_| Poll::Ready(Ok(())))
+        }
       }
-    }
+    })
   }
 }
 
@@ -451,48 +453,50 @@ impl<T> Future for RecvFuture<'_, T> {
   type Output = Option<T>;
 
   fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-    let this = self.get_mut();
-    if this.completed {
-      return Poll::Ready(None);
-    }
-
-    let mut new_waker = Some(cx.waker().clone());
-    let (message, ended, old_waker) = {
-      let mut state = lock(&this.receiver.shared.state);
-      if let Some(envelope) = state.queue.pop_front() {
-        (Some(envelope), false, state.receiver_waker.take())
-      } else if state.closed || state.senders_gone {
-        (None, true, state.receiver_waker.take())
-      } else {
-        let replacement = match new_waker.take() {
-          Some(waker) => waker,
-          None => unreachable!("receiver waker is cloned before locking"),
-        };
-        (None, false, state.receiver_waker.replace(replacement))
+    super::asynchronous::poll_cooperative(cx, |cx| {
+      let this = self.get_mut();
+      if this.completed {
+        return Poll::Ready(None);
       }
-    };
 
-    if let Some(envelope) = message {
-      this.registered = false;
-      this.completed = true;
-      // Return the slot before the caller can run a reentrant wake callback.
-      let Envelope { value, _permit } = envelope;
-      drop(_permit);
-      drop_waker(old_waker);
-      drop_waker(new_waker);
-      Poll::Ready(Some(value))
-    } else if ended {
-      this.registered = false;
-      this.completed = true;
-      drop_waker(old_waker);
-      drop_waker(new_waker);
-      Poll::Ready(None)
-    } else {
-      this.registered = true;
-      drop_waker(old_waker);
-      drop_waker(new_waker);
-      Poll::Pending
-    }
+      let mut new_waker = Some(cx.waker().clone());
+      let (message, ended, old_waker) = {
+        let mut state = lock(&this.receiver.shared.state);
+        if let Some(envelope) = state.queue.pop_front() {
+          (Some(envelope), false, state.receiver_waker.take())
+        } else if state.closed || state.senders_gone {
+          (None, true, state.receiver_waker.take())
+        } else {
+          let replacement = match new_waker.take() {
+            Some(waker) => waker,
+            None => unreachable!("receiver waker is cloned before locking"),
+          };
+          (None, false, state.receiver_waker.replace(replacement))
+        }
+      };
+
+      if let Some(envelope) = message {
+        this.registered = false;
+        this.completed = true;
+        // Return the slot before the caller can run a reentrant wake callback.
+        let Envelope { value, _permit } = envelope;
+        drop(_permit);
+        drop_waker(old_waker);
+        drop_waker(new_waker);
+        Poll::Ready(Some(value))
+      } else if ended {
+        this.registered = false;
+        this.completed = true;
+        drop_waker(old_waker);
+        drop_waker(new_waker);
+        Poll::Ready(None)
+      } else {
+        this.registered = true;
+        drop_waker(old_waker);
+        drop_waker(new_waker);
+        Poll::Pending
+      }
+    })
   }
 }
 

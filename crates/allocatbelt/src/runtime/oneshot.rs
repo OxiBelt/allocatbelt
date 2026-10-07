@@ -228,35 +228,37 @@ impl<T> Future for Receiver<T> {
   type Output = Result<T, RecvError>;
 
   fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-    let this = self.get_mut();
-    if this.completed {
-      return Poll::Ready(Err(RecvError));
-    }
-    let mut replacement = Some(cx.waker().clone());
-    let (result, old) = {
-      let mut state = this
-        .shared
-        .state
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner);
-      if let Some(value) = state.value.take() {
-        (Poll::Ready(Ok(value)), state.receiver_waker.take())
-      } else if state.receiver_closed || !state.sender_alive {
-        (Poll::Ready(Err(RecvError)), state.receiver_waker.take())
-      } else {
-        let waker = match replacement.take() {
-          Some(waker) => waker,
-          None => unreachable!("replacement is prepared before locking"),
-        };
-        (Poll::Pending, state.receiver_waker.replace(waker))
+    super::asynchronous::poll_cooperative(cx, |cx| {
+      let this = self.get_mut();
+      if this.completed {
+        return Poll::Ready(Err(RecvError));
       }
-    };
-    if result.is_ready() {
-      this.completed = true;
-    }
-    drop_contained(old);
-    drop_contained(replacement);
-    result
+      let mut replacement = Some(cx.waker().clone());
+      let (result, old) = {
+        let mut state = this
+          .shared
+          .state
+          .lock()
+          .unwrap_or_else(PoisonError::into_inner);
+        if let Some(value) = state.value.take() {
+          (Poll::Ready(Ok(value)), state.receiver_waker.take())
+        } else if state.receiver_closed || !state.sender_alive {
+          (Poll::Ready(Err(RecvError)), state.receiver_waker.take())
+        } else {
+          let waker = match replacement.take() {
+            Some(waker) => waker,
+            None => unreachable!("replacement is prepared before locking"),
+          };
+          (Poll::Pending, state.receiver_waker.replace(waker))
+        }
+      };
+      if result.is_ready() {
+        this.completed = true;
+      }
+      drop_contained(old);
+      drop_contained(replacement);
+      result
+    })
   }
 }
 
@@ -285,35 +287,37 @@ impl<T> Future for Closed<'_, T> {
   type Output = ();
 
   fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
-    let this = self.get_mut();
-    if this.completed {
-      return Poll::Ready(());
-    }
-    let Some(shared) = &this.sender.shared else {
-      this.completed = true;
-      return Poll::Ready(());
-    };
-    let mut replacement = Some(cx.waker().clone());
-    let (closed, old) = {
-      let mut state = shared.state.lock().unwrap_or_else(PoisonError::into_inner);
-      if state.receiver_closed {
-        (true, state.sender_waker.take())
-      } else {
-        let waker = match replacement.take() {
-          Some(waker) => waker,
-          None => unreachable!("replacement is prepared before locking"),
-        };
-        (false, state.sender_waker.replace(waker))
+    super::asynchronous::poll_cooperative(cx, |cx| {
+      let this = self.get_mut();
+      if this.completed {
+        return Poll::Ready(());
       }
-    };
-    drop_contained(old);
-    drop_contained(replacement);
-    if closed {
-      this.completed = true;
-      Poll::Ready(())
-    } else {
-      Poll::Pending
-    }
+      let Some(shared) = &this.sender.shared else {
+        this.completed = true;
+        return Poll::Ready(());
+      };
+      let mut replacement = Some(cx.waker().clone());
+      let (closed, old) = {
+        let mut state = shared.state.lock().unwrap_or_else(PoisonError::into_inner);
+        if state.receiver_closed {
+          (true, state.sender_waker.take())
+        } else {
+          let waker = match replacement.take() {
+            Some(waker) => waker,
+            None => unreachable!("replacement is prepared before locking"),
+          };
+          (false, state.sender_waker.replace(waker))
+        }
+      };
+      drop_contained(old);
+      drop_contained(replacement);
+      if closed {
+        this.completed = true;
+        Poll::Ready(())
+      } else {
+        Poll::Pending
+      }
+    })
   }
 }
 

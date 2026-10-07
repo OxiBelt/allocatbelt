@@ -756,7 +756,11 @@ impl<F: Future + 'static> LocalTask for Task<F> {
     let Some(mut future) = self.future.take() else {
       return Poll::Ready(());
     };
-    match panic::catch_unwind(AssertUnwindSafe(|| future.as_mut().poll(context))) {
+    let result = {
+      let _cooperative_poll = super::entry::CooperativePollGuard::enter();
+      panic::catch_unwind(AssertUnwindSafe(|| future.as_mut().poll(context)))
+    };
+    match result {
       Ok(Poll::Pending) => {
         self.future = Some(future);
         Poll::Pending
@@ -1028,7 +1032,11 @@ impl LocalRuntime {
     let mut future = Box::pin(future);
     loop {
       super::entry::reset_budget();
-      if let Poll::Ready(output) = future.as_mut().poll(&mut context) {
+      let poll = {
+        let _cooperative_poll = super::entry::CooperativePollGuard::enter();
+        future.as_mut().poll(&mut context)
+      };
+      if let Poll::Ready(output) = poll {
         return Ok(output);
       }
       self.import_external();

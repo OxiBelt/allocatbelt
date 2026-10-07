@@ -14,7 +14,7 @@ use std::task::{Context, Poll, Wake, Waker};
 use std::thread::{self, ThreadId};
 use std::time::{Duration, Instant};
 
-use super::entry::{block_on_active, budget_remaining};
+use super::entry::{block_on_active, budget_remaining, cooperative_poll_active};
 use super::{
   AsyncConfig, AsyncError, AsyncHandle, AsyncJob, AsyncJoinError, AsyncRuntime, AsyncScopeConfig,
   AsyncShutdown, BlockInPlaceErrorKind, HandoffConfig, LocalConfig, LocalRuntime, OwnedTaskScope,
@@ -581,22 +581,32 @@ fn a_closure_panic_reacquires_the_turn_before_unwinding_further() {
   let nested = handle.clone();
   let job = spawned(&handle, async move {
     let task = try_task_id();
-    let caught = panic::catch_unwind(AssertUnwindSafe(|| try_block_in_place(injected_panic)));
+    let caught = panic::catch_unwind(AssertUnwindSafe(|| {
+      try_block_in_place(|| {
+        assert!(!cooperative_poll_active());
+        injected_panic()
+      })
+    }));
+    let cooperative_restored = cooperative_poll_active();
     let (turns, loans, restoring, _) = shared.turn_counts();
-    let again = try_block_in_place(|| 3).ok();
+    let again = try_block_in_place(|| (!cooperative_poll_active(), 3)).ok();
     let worker_rejected = matches!(
       nested.block_on(async {}),
       Err(AsyncError::BlockOnFromWorker)
     );
     (
       caught.is_err(),
+      cooperative_restored,
       try_task_id() == task,
       (turns, loans, restoring),
       again,
       worker_rejected,
     )
   });
-  assert_eq!(joined(job), (true, true, (1, 0, 0), Some(3), true));
+  assert_eq!(
+    joined(job),
+    (true, true, true, (1, 0, 0), Some((true, 3)), true)
+  );
 
   let propagated = spawned(&handle, async { try_block_in_place(injected_panic).ok() });
   assert!(matches!(
@@ -883,16 +893,18 @@ fn borrowed_root_inline_closure_may_block_on_and_restores_identity_and_budget() 
       let caller = thread::current().id();
       let inline = try_block_in_place(|| {
         let marker_cleared = !block_on_active();
+        let cooperative_suspended = !cooperative_poll_active();
         let root = nested.block_on(async {
           consume_budget().await;
           (
             try_task_id(),
             thread::current().id(),
             AsyncHandle::try_current().is_some(),
+            cooperative_poll_active(),
           )
         });
         let spawned_value = nested.block_on(spawned(&nested, async { 6 }));
-        (marker_cleared, root, spawned_value)
+        (marker_cleared, cooperative_suspended, root, spawned_value)
       })
       .unwrap_or_else(|error| panic!("borrowed-root closure rejected: {error}"));
       let unwound = panic::catch_unwind(AssertUnwindSafe(|| {
@@ -902,20 +914,33 @@ fn borrowed_root_inline_closure_may_block_on_and_restores_identity_and_budget() 
       (
         before,
         budget_remaining(),
+        cooperative_poll_active(),
         block_on_active(),
         try_task_id(),
         caller,
         inline,
         unwound,
+        cooperative_poll_active(),
       )
     })
     .unwrap_or_else(|error| panic!("block_on failed: {error}"));
-  let (before, after, active, task, caller, (cleared, root, spawned_value), unwound) = outcome;
+  let (
+    before,
+    after,
+    cooperative_after_inline,
+    active,
+    task,
+    caller,
+    (cleared, cooperative_suspended, root, spawned_value),
+    unwound,
+    cooperative_after_unwind,
+  ) = outcome;
   assert_eq!(before, 54);
   assert_eq!(after, before);
-  assert!(active && cleared && unwound);
+  assert!(active && cleared && cooperative_suspended && cooperative_after_inline && unwound);
+  assert!(cooperative_after_unwind);
   assert_eq!(task, None);
-  assert_eq!(root, Ok((None, caller, true)));
+  assert_eq!(root, Ok((None, caller, true, true)));
   assert!(matches!(spawned_value, Ok(Ok(6))));
   assert!(!block_on_active());
   drained(runtime);
@@ -933,11 +958,17 @@ fn a_handed_off_worker_closure_runs_one_nested_root_and_restores_the_worker() {
     let task = try_task_id();
     let budget = budget_remaining();
     let worker_thread = thread::current().id();
-    let (root_task, helper_thread) = try_block_in_place(|| {
-      let root_task = nested.block_on(async { try_task_id() });
+    let (was_suspended, root_task, root_active, helper_thread) = try_block_in_place(|| {
+      let was_suspended = !cooperative_poll_active();
+      let root = nested.block_on(async { (try_task_id(), cooperative_poll_active()) });
       // The nested root awaits a task that a helper polls meanwhile.
       let helper_thread = nested.block_on(spawned(&nested, async { thread::current().id() }));
-      (root_task, helper_thread)
+      (
+        was_suspended,
+        root,
+        cooperative_poll_active(),
+        helper_thread,
+      )
     })
     .unwrap_or_else(|error| panic!("handoff rejected: {error}"));
     let rejected_again = matches!(
@@ -945,17 +976,32 @@ fn a_handed_off_worker_closure_runs_one_nested_root_and_restores_the_worker() {
       Err(AsyncError::BlockOnFromWorker)
     );
     (
+      was_suspended,
       root_task,
+      root_active,
       helper_thread
         .ok()
         .and_then(Result::ok)
         .map(|id| id != worker_thread),
       try_task_id() == task && task.is_some(),
       budget_remaining() == budget && budget == 59,
+      cooperative_poll_active(),
       rejected_again,
     )
   });
-  assert_eq!(joined(job), (Ok(None), Some(true), true, true, true));
+  assert_eq!(
+    joined(job),
+    (
+      true,
+      Ok((None, true)),
+      false,
+      Some(true),
+      true,
+      true,
+      true,
+      true
+    )
+  );
   drained(runtime);
 }
 

@@ -68,7 +68,10 @@ where
     };
     // Take ownership before calling user code. The task-state mutex is never
     // held while polling or dropping the future.
-    let result = panic::catch_unwind(AssertUnwindSafe(|| future.as_mut().poll(cx)));
+    let result = {
+      let _cooperative_poll = super::entry::CooperativePollGuard::enter();
+      panic::catch_unwind(AssertUnwindSafe(|| future.as_mut().poll(cx)))
+    };
     // Polling is the only quota-protected region. Release before user
     // destructors, output staging, or cancellation cleanup can execute.
     drop(permit);

@@ -351,54 +351,56 @@ impl Future for AcquireMany {
   type Output = Result<Permit, AcquireError>;
 
   fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-    let this = self.get_mut();
-    if this.completed {
-      return Poll::Ready(Err(AcquireError::Completed));
-    }
+    super::asynchronous::poll_cooperative(cx, |cx| {
+      let this = self.get_mut();
+      if this.completed {
+        return Poll::Ready(Err(AcquireError::Completed));
+      }
 
-    // A waker clone may invoke its RawWaker implementation. Clone it before
-    // taking the semaphore lock; any unused clone is dropped after unlocking.
-    let mut new_waker = Some(cx.waker().clone());
-    let action = if let Some(key) = this.waiter {
-      poll_waiter(&this.shared, key, &mut new_waker)
-    } else {
-      poll_first(&this.shared, this.count, &mut new_waker)
-    };
+      // A waker clone may invoke its RawWaker implementation. Clone it before
+      // taking the semaphore lock; any unused clone is dropped after unlocking.
+      let mut new_waker = Some(cx.waker().clone());
+      let action = if let Some(key) = this.waiter {
+        poll_waiter(&this.shared, key, &mut new_waker)
+      } else {
+        poll_first(&this.shared, this.count, &mut new_waker)
+      };
 
-    match action {
-      PollAction::Pending(key, old_waker) => {
-        if let Some(key) = key {
-          this.waiter = Some(key);
+      match action {
+        PollAction::Pending(key, old_waker) => {
+          if let Some(key) = key {
+            this.waiter = Some(key);
+          }
+          drop_waker(old_waker);
+          drop_waker(new_waker.take());
+          Poll::Pending
         }
-        drop_waker(old_waker);
-        drop_waker(new_waker.take());
-        Poll::Pending
+        PollAction::Permit(count, old_waker) => {
+          this.waiter = None;
+          this.completed = true;
+          drop_waker(old_waker);
+          drop_waker(new_waker.take());
+          Poll::Ready(Ok(Permit {
+            shared: Arc::clone(&this.shared),
+            count,
+            active: true,
+          }))
+        }
+        PollAction::Closed(old_waker) => {
+          this.waiter = None;
+          this.completed = true;
+          drop_waker(old_waker);
+          drop_waker(new_waker.take());
+          Poll::Ready(Err(AcquireError::Closed))
+        }
+        PollAction::Full => {
+          this.waiter = None;
+          this.completed = true;
+          drop_waker(new_waker.take());
+          Poll::Ready(Err(AcquireError::Full))
+        }
       }
-      PollAction::Permit(count, old_waker) => {
-        this.waiter = None;
-        this.completed = true;
-        drop_waker(old_waker);
-        drop_waker(new_waker.take());
-        Poll::Ready(Ok(Permit {
-          shared: Arc::clone(&this.shared),
-          count,
-          active: true,
-        }))
-      }
-      PollAction::Closed(old_waker) => {
-        this.waiter = None;
-        this.completed = true;
-        drop_waker(old_waker);
-        drop_waker(new_waker.take());
-        Poll::Ready(Err(AcquireError::Closed))
-      }
-      PollAction::Full => {
-        this.waiter = None;
-        this.completed = true;
-        drop_waker(new_waker.take());
-        Poll::Ready(Err(AcquireError::Full))
-      }
-    }
+    })
   }
 }
 

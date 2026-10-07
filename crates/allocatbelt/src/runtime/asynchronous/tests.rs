@@ -96,6 +96,184 @@ fn wakes_during_poll_are_coalesced_without_losing_progress() {
     .unwrap_or_else(|e| panic!("shutdown failed: {e}"));
 }
 
+async fn perpetually_ready_channel_task(
+  sender: crate::runtime::channel::Sender<usize>,
+  mut receiver: crate::runtime::channel::Receiver<usize>,
+  progress: Arc<AtomicUsize>,
+) {
+  let mut value = 0usize;
+  loop {
+    sender
+      .send(value)
+      .await
+      .unwrap_or_else(|_| panic!("self-send failed"));
+    assert_eq!(receiver.recv().await, Some(value));
+    value += 1;
+    progress.store(value, Ordering::SeqCst);
+  }
+}
+
+#[test]
+fn automatic_channel_budget_runs_sibling_and_cancel_pending_shutdown_completes() {
+  use crate::runtime::channel;
+
+  let runtime = runtime(1, 4, 2);
+  let (sender, receiver) = channel::channel(1, 4).unwrap();
+  let progress = Arc::new(AtomicUsize::new(0));
+  let hot = runtime
+    .handle()
+    .spawn(perpetually_ready_channel_task(
+      sender,
+      receiver,
+      Arc::clone(&progress),
+    ))
+    .unwrap_or_else(|error| panic!("hot task spawn failed: {error}"));
+  wait_until(
+    || progress.load(Ordering::SeqCst) != 0,
+    "channel hot loop start",
+  );
+
+  let seen = Arc::new(AtomicUsize::new(usize::MAX));
+  let sibling_seen = Arc::clone(&seen);
+  let sibling_progress = Arc::clone(&progress);
+  let sibling = runtime
+    .handle()
+    .spawn(async move {
+      sibling_seen.store(sibling_progress.load(Ordering::SeqCst), Ordering::SeqCst);
+    })
+    .unwrap_or_else(|error| panic!("sibling spawn failed: {error}"));
+  wait_until(|| sibling.is_finished(), "sibling task completion");
+  assert!(matches!(block_on(sibling), Ok(())));
+  let observed = seen.load(Ordering::SeqCst);
+  assert!(observed > 0, "sibling ran before the hot loop started");
+  assert!(!hot.is_finished(), "hot loop stopped before cancellation");
+
+  let (shutdown_tx, shutdown_rx) = std::sync::mpsc::sync_channel(1);
+  let shutdown_thread = std::thread::spawn(move || {
+    let _ = shutdown_tx.send(runtime.shutdown(AsyncShutdown::CancelPending));
+  });
+  shutdown_rx
+    .recv_timeout(Duration::from_secs(3))
+    .unwrap_or_else(|_| panic!("CancelPending shutdown timed out"))
+    .unwrap_or_else(|error| panic!("shutdown failed: {error}"));
+  shutdown_thread
+    .join()
+    .unwrap_or_else(|_| panic!("shutdown thread panicked"));
+  wait_until(|| hot.is_finished(), "hot task cancellation publication");
+  assert!(matches!(block_on(hot), Err(AsyncJoinError::Cancelled)));
+}
+
+#[test]
+fn automatic_channel_budget_allows_abort_of_perpetually_ready_loop() {
+  use crate::runtime::channel;
+
+  let runtime = runtime(1, 4, 2);
+  let (sender, receiver) = channel::channel(1, 4).unwrap();
+  let progress = Arc::new(AtomicUsize::new(0));
+  let hot = runtime
+    .handle()
+    .spawn(perpetually_ready_channel_task(
+      sender,
+      receiver,
+      Arc::clone(&progress),
+    ))
+    .unwrap_or_else(|error| panic!("hot task spawn failed: {error}"));
+  wait_until(
+    || progress.load(Ordering::SeqCst) != 0,
+    "channel hot loop start",
+  );
+
+  hot.abort_handle().abort();
+  wait_until(|| hot.is_finished(), "hot task abort publication");
+  assert!(matches!(block_on(hot), Err(AsyncJoinError::Cancelled)));
+  runtime
+    .shutdown(AsyncShutdown::Drain)
+    .unwrap_or_else(|error| panic!("shutdown failed: {error}"));
+}
+
+#[test]
+fn ready_channel_and_mutex_chains_each_charge_one_shared_unit() {
+  use crate::runtime::channel;
+  use crate::runtime::mutex::AsyncMutex;
+
+  let runtime = runtime(1, 2, 1);
+  let (sender, _receiver) = channel::channel(1, 2).unwrap();
+  let mutex = AsyncMutex::new(7usize, 2).unwrap();
+  let remaining = runtime
+    .block_on(std::future::poll_fn(|cx| {
+      let mut send = std::pin::pin!(sender.send(3));
+      assert!(send.as_mut().poll(cx).is_ready());
+      let after_send = super::entry::budget_remaining();
+
+      let mut lock = std::pin::pin!(mutex.lock());
+      let Poll::Ready(Ok(guard)) = lock.as_mut().poll(cx) else {
+        panic!("uncontended mutex did not acquire");
+      };
+      assert_eq!(*guard, 7);
+      drop(guard);
+      let after_lock = super::entry::budget_remaining();
+      Poll::Ready((after_send, after_lock))
+    }))
+    .unwrap();
+
+  assert_eq!(remaining, (63, 62));
+  runtime
+    .shutdown(AsyncShutdown::Drain)
+    .unwrap_or_else(|error| panic!("shutdown failed: {error}"));
+}
+
+#[test]
+fn semaphore_pending_refunds_and_terminal_ready_error_charges() {
+  use crate::runtime::semaphore::Semaphore;
+
+  let runtime = runtime(1, 1, 1);
+  let semaphore = Semaphore::new(0, 2).unwrap();
+  let closed = Semaphore::new(0, 1).unwrap();
+  closed.close();
+  let remaining = runtime
+    .block_on(std::future::poll_fn(|cx| {
+      let mut acquire = std::pin::pin!(semaphore.acquire_many(1));
+      assert!(acquire.as_mut().poll(cx).is_pending());
+      let after_pending = super::entry::budget_remaining();
+      semaphore.add_permits(1).unwrap();
+      let Poll::Ready(permit) = acquire.as_mut().poll(cx) else {
+        panic!("released semaphore did not acquire");
+      };
+      let after_acquire = super::entry::budget_remaining();
+      drop(permit);
+
+      let mut terminal = std::pin::pin!(closed.acquire_many(1));
+      assert!(terminal.as_mut().poll(cx).is_ready());
+      Poll::Ready((
+        after_pending,
+        after_acquire,
+        super::entry::budget_remaining(),
+      ))
+    }))
+    .unwrap();
+
+  assert_eq!(remaining, (64, 63, 62));
+  runtime
+    .shutdown(AsyncShutdown::Drain)
+    .unwrap_or_else(|error| panic!("shutdown failed: {error}"));
+}
+
+#[test]
+fn manually_polled_channel_primitives_bypass_automatic_budget() {
+  use crate::runtime::channel;
+
+  let (sender, mut receiver) = channel::channel(1, 2).unwrap();
+  let mut context = Context::from_waker(Waker::noop());
+  assert!(!super::entry::cooperative_poll_active());
+  for value in 0..130 {
+    let mut send = std::pin::pin!(sender.send(value));
+    assert!(send.as_mut().poll(&mut context).is_ready());
+    let mut recv = std::pin::pin!(receiver.recv());
+    assert_eq!(recv.as_mut().poll(&mut context), Poll::Ready(Some(value)));
+  }
+  assert_eq!(super::entry::budget_remaining(), 64);
+}
+
 struct NoConcurrentPoll {
   active: Arc<AtomicBool>,
   polls: Arc<AtomicUsize>,

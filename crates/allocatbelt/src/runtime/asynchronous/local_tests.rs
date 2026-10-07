@@ -118,6 +118,99 @@ fn local_root_and_task_polls_start_with_fresh_cooperative_budgets() {
 }
 
 #[test]
+fn local_borrowed_root_and_non_send_task_charge_automatic_primitive_polls() {
+  let mut runtime = runtime(1, 2);
+  let (sender, _receiver) = crate::runtime::channel::channel(1, 2).unwrap();
+  let local_value = Rc::new(Cell::new(5));
+  let root_value = Rc::clone(&local_value);
+  let root_remaining = runtime
+    .block_on(std::future::poll_fn(|cx| {
+      let mut send = std::pin::pin!(sender.send(Rc::clone(&root_value)));
+      assert!(send.as_mut().poll(cx).is_ready());
+      Poll::Ready(super::super::entry::budget_remaining())
+    }))
+    .unwrap();
+  assert_eq!(root_remaining, 63);
+
+  let (task_sender, _task_receiver) = crate::runtime::channel::channel(1, 2).unwrap();
+  let task_value = Rc::clone(&local_value);
+  let child = runtime
+    .handle()
+    .spawn_local(std::future::poll_fn(move |cx| {
+      let mut send = std::pin::pin!(task_sender.send(Rc::clone(&task_value)));
+      assert!(send.as_mut().poll(cx).is_ready());
+      Poll::Ready((super::super::entry::budget_remaining(), task_value.get()))
+    }))
+    .unwrap();
+  assert_eq!(
+    runtime.block_on(child).unwrap().unwrap(),
+    (63, 5),
+    "the local task gets one fresh budget and keeps non-Send captures"
+  );
+}
+
+#[test]
+fn local_ready_and_panicking_future_cleanup_runs_after_poll_budget_is_disabled() {
+  struct CleanupProbe {
+    active_during_drop: Rc<Cell<Option<bool>>>,
+    panic_during_poll: bool,
+  }
+
+  impl Future for CleanupProbe {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+      for _ in 0..64 {
+        assert!(
+          Pin::new(&mut super::super::consume_budget())
+            .poll(cx)
+            .is_ready()
+        );
+      }
+      assert_eq!(super::super::entry::budget_remaining(), 0);
+      if self.panic_during_poll {
+        panic!("injected local task poll panic");
+      }
+      Poll::Ready(())
+    }
+  }
+
+  impl Drop for CleanupProbe {
+    fn drop(&mut self) {
+      self
+        .active_during_drop
+        .set(Some(super::super::entry::cooperative_poll_active()));
+    }
+  }
+
+  let mut runtime = runtime(2, 2);
+  let ready_state = Rc::new(Cell::new(None));
+  let ready_job = runtime
+    .handle()
+    .spawn_local(CleanupProbe {
+      active_during_drop: Rc::clone(&ready_state),
+      panic_during_poll: false,
+    })
+    .unwrap();
+  assert!(runtime.block_on(ready_job).unwrap().is_ok());
+  assert_eq!(ready_state.get(), Some(false));
+
+  let panic_state = Rc::new(Cell::new(None));
+  let panic_job = runtime
+    .handle()
+    .spawn_local(CleanupProbe {
+      active_during_drop: Rc::clone(&panic_state),
+      panic_during_poll: true,
+    })
+    .unwrap();
+  assert!(matches!(
+    runtime.block_on(panic_job).unwrap(),
+    Err(AsyncJoinError::Panicked(_))
+  ));
+  assert_eq!(panic_state.get(), Some(false));
+}
+
+#[test]
 fn local_future_and_output_may_be_non_send() {
   let mut runtime = runtime(2, 2);
   let value = Rc::new(Cell::new(0));

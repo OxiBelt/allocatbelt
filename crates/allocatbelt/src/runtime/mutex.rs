@@ -349,21 +349,23 @@ impl<'a, T> Future for LockFuture<'a, T> {
   type Output = Result<MutexGuard<'a, T>, LockError>;
 
   fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-    let this = self.get_mut();
-    if this.completed {
-      return Poll::Ready(Err(LockError::Completed));
-    }
-    match Pin::new(&mut this.acquire).poll(cx) {
-      Poll::Pending => Poll::Pending,
-      Poll::Ready(Ok(permit)) => {
-        this.completed = true;
-        Poll::Ready(make_borrowed_guard(&this.mutex.shared, permit))
+    super::asynchronous::poll_cooperative(cx, |cx| {
+      let this = self.get_mut();
+      if this.completed {
+        return Poll::Ready(Err(LockError::Completed));
       }
-      Poll::Ready(Err(error)) => {
-        this.completed = true;
-        Poll::Ready(Err(map_acquire_error(error)))
+      match Pin::new(&mut this.acquire).poll(cx) {
+        Poll::Pending => Poll::Pending,
+        Poll::Ready(Ok(permit)) => {
+          this.completed = true;
+          Poll::Ready(make_borrowed_guard(&this.mutex.shared, permit))
+        }
+        Poll::Ready(Err(error)) => {
+          this.completed = true;
+          Poll::Ready(Err(map_acquire_error(error)))
+        }
       }
-    }
+    })
   }
 }
 
@@ -371,21 +373,23 @@ impl<T> Future for OwnedLockFuture<T> {
   type Output = Result<OwnedMutexGuard<T>, LockError>;
 
   fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-    let this = self.get_mut();
-    if this.completed {
-      return Poll::Ready(Err(LockError::Completed));
-    }
-    match Pin::new(&mut this.acquire).poll(cx) {
-      Poll::Pending => Poll::Pending,
-      Poll::Ready(Ok(permit)) => {
-        this.completed = true;
-        Poll::Ready(make_owned_guard(Arc::clone(&this.shared), permit))
+    super::asynchronous::poll_cooperative(cx, |cx| {
+      let this = self.get_mut();
+      if this.completed {
+        return Poll::Ready(Err(LockError::Completed));
       }
-      Poll::Ready(Err(error)) => {
-        this.completed = true;
-        Poll::Ready(Err(map_acquire_error(error)))
+      match Pin::new(&mut this.acquire).poll(cx) {
+        Poll::Pending => Poll::Pending,
+        Poll::Ready(Ok(permit)) => {
+          this.completed = true;
+          Poll::Ready(make_owned_guard(Arc::clone(&this.shared), permit))
+        }
+        Poll::Ready(Err(error)) => {
+          this.completed = true;
+          Poll::Ready(Err(map_acquire_error(error)))
+        }
       }
-    }
+    })
   }
 }
 
