@@ -180,7 +180,7 @@ fn reservation_error(_: std::collections::TryReserveError) -> io::Error {
   io::ErrorKind::OutOfMemory.into()
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(loom)))]
 mod tests {
   use super::*;
   use crate::runtime::error::JoinError;

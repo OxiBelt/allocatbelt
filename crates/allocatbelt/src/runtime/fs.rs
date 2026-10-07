@@ -49,8 +49,10 @@ const IO_CHUNK: usize = 64 * 1024;
 mod fs_walk;
 pub use fs_walk::{TreeWalk, WalkEntryKind, WalkLimits, WalkNextOutcome, WalkStep};
 
+#[cfg(not(loom))]
 #[path = "fs_fifo.rs"]
 mod fs_fifo;
+#[cfg(not(loom))]
 pub use fs_fifo::{
   FifoOpenError, FifoOpenOptions, FifoOpenSubmissionError, FifoReceiverJob, FifoSenderJob,
 };
