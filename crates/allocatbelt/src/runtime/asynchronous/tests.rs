@@ -25,6 +25,86 @@ fn wait_until(predicate: impl Fn() -> bool, message: &str) {
   }
 }
 
+#[test]
+fn ready_async_job_waits_at_zero_budget_and_keeps_its_output() {
+  let runtime = runtime(1, 4, 2);
+  let mut job = Box::pin(
+    runtime
+      .handle()
+      .spawn(async { 42_usize })
+      .unwrap_or_else(|error| panic!("spawn failed: {error}")),
+  );
+  wait_until(|| job.as_ref().get_ref().is_finished(), "ready task output");
+  let waker = Waker::noop();
+  let mut context = Context::from_waker(waker);
+  {
+    let _outer_poll = super::entry::CooperativePollGuard::enter();
+    for _ in 0..64 {
+      let mut checkpoint = std::pin::pin!(super::consume_budget());
+      assert!(matches!(
+        checkpoint.as_mut().poll(&mut context),
+        Poll::Ready(())
+      ));
+    }
+    assert!(job.as_mut().poll(&mut context).is_pending());
+  }
+  {
+    let _outer_poll = super::entry::CooperativePollGuard::enter();
+    assert!(matches!(
+      job.as_mut().poll(&mut context),
+      Poll::Ready(Ok(42))
+    ));
+  }
+  runtime
+    .shutdown(AsyncShutdown::Drain)
+    .unwrap_or_else(|error| panic!("shutdown failed: {error}"));
+}
+
+#[test]
+fn ready_blocking_job_waits_at_zero_budget_and_keeps_its_output() {
+  use crate::runtime::blocking::{Config, Runtime, ShutdownMode};
+  use crate::runtime::resources::Resources;
+
+  let mut runtime = Runtime::new(Config {
+    workers: 1,
+    max_outstanding: 2,
+    capacity: Resources::ZERO,
+  })
+  .unwrap_or_else(|error| panic!("blocking runtime construction failed: {error}"));
+  let mut job = Box::pin(
+    runtime
+      .try_spawn(Resources::ZERO, |_| 42_usize)
+      .unwrap_or_else(|error| panic!("blocking spawn failed: {error}")),
+  );
+  wait_until(
+    || job.as_ref().get_ref().is_finished(),
+    "ready blocking job result",
+  );
+  let waker = Waker::noop();
+  let mut context = Context::from_waker(waker);
+  {
+    let _outer_poll = super::entry::CooperativePollGuard::enter();
+    for _ in 0..64 {
+      let mut checkpoint = std::pin::pin!(super::consume_budget());
+      assert!(matches!(
+        checkpoint.as_mut().poll(&mut context),
+        Poll::Ready(())
+      ));
+    }
+    assert!(job.as_mut().poll(&mut context).is_pending());
+  }
+  {
+    let _outer_poll = super::entry::CooperativePollGuard::enter();
+    assert!(matches!(
+      job.as_mut().poll(&mut context),
+      Poll::Ready(Ok(42))
+    ));
+  }
+  runtime
+    .shutdown(ShutdownMode::Drain)
+    .unwrap_or_else(|error| panic!("blocking shutdown failed: {error}"));
+}
+
 struct ReleaseGate(Arc<(Mutex<bool>, Condvar)>);
 
 impl Drop for ReleaseGate {

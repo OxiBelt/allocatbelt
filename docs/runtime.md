@@ -982,8 +982,12 @@ Runtime-owned outer polls also use a shared 64-operation budget for ready
 `channel` send/receive/reservation/closed-wait, oneshot receive/close,
 semaphore acquisition, mutex acquisition and reader-writer-lock acquisition
 polls, plus `Notify`, watch change/closure, broadcast receive/closure and
-barrier waits, managed-pipe, Unix-pipe and blocking-stream I/O polls, and
-`Sleep`, `Timeout` and interval tick polls. A synchronous primitive-to-primitive
+barrier waits, managed-pipe, Unix-pipe and blocking-stream I/O polls,
+`Sleep`, `Timeout` and interval tick polls, and asynchronous or blocking job
+result polls. Job polls gate before cloning a waker, examining the completion
+slot or consuming its output; an exhausted poll preserves an already-published
+result for a later poll. Synchronous job observers remain unchanged.
+A synchronous primitive-to-primitive
 chain charges once; a primitive poll that returns `Pending` restores its
 provisional charge. `Timeout` checks the budget before touching its timer or
 inner future. Its ready result consumes one unit unless a ready supported

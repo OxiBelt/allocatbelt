@@ -104,12 +104,19 @@ fn local_root_and_task_polls_start_with_fresh_cooperative_budgets() {
       )
     }))
     .unwrap();
-  // Each root poll exhausts its own budget before returning Pending. The
-  // executor must reset it again before polling the child's first checkpoint.
+  // The first root poll exhausts its budget. A join poll must remain
+  // unconsumed until a later root poll has a fresh budget, while the child
+  // itself starts with a fresh worker-poll budget.
   let mut job = job;
+  let mut first_poll = true;
   let child = runtime
     .block_on(std::future::poll_fn(|cx| {
-      exhaust_budget();
+      if first_poll {
+        first_poll = false;
+        exhaust_budget();
+        assert!(Pin::new(&mut job).poll(cx).is_pending());
+        return Poll::Pending;
+      }
       Pin::new(&mut job).poll(cx)
     }))
     .unwrap()

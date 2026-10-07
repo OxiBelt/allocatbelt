@@ -200,22 +200,24 @@ impl<T> Future for Job<T> {
   type Output = Result<T, JoinError>;
 
   fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-    // Custom waker clone/drop operations may execute user code. Keep them
-    // outside the packet lock, including when an outcome is already ready.
-    let replacement = cx.waker().clone();
-    let mut slot = self.packet.lock();
-    if let Slot::Pending(waker) = &mut *slot {
-      let old = waker.replace(replacement);
+    crate::runtime::asynchronous::poll_cooperative(cx, |cx| {
+      // Custom waker clone/drop operations may execute user code. Keep them
+      // outside the packet lock, and behind the cooperative gate.
+      let replacement = cx.waker().clone();
+      let mut slot = self.packet.lock();
+      if let Slot::Pending(waker) = &mut *slot {
+        let old = waker.replace(replacement);
+        drop(slot);
+        drop(old);
+        return Poll::Pending;
+      }
+      let taken = std::mem::replace(&mut *slot, Slot::Taken);
       drop(slot);
-      drop(old);
-      return Poll::Pending;
-    }
-    let taken = std::mem::replace(&mut *slot, Slot::Taken);
-    drop(slot);
-    match taken {
-      Slot::Ready(outcome) => Poll::Ready(outcome),
-      Slot::Pending(_) | Slot::Taken => Poll::Ready(Err(JoinError::Cancelled)),
-    }
+      match taken {
+        Slot::Ready(outcome) => Poll::Ready(outcome),
+        Slot::Pending(_) | Slot::Taken => Poll::Ready(Err(JoinError::Cancelled)),
+      }
+    })
   }
 }
 

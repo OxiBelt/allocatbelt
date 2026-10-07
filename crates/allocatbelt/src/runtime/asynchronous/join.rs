@@ -273,28 +273,32 @@ impl<T> Future for AsyncJob<T> {
   type Output = Result<T, AsyncJoinError>;
 
   fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-    let replacement = cx.waker().clone();
-    let mut slot = self.state.lock();
-    match &mut *slot {
-      Slot::Pending(wakers) => {
-        let old = wakers.join.replace(replacement);
-        drop(slot);
-        drop(old);
-        Poll::Pending
+    super::poll_cooperative(cx, |cx| {
+      // Gate before custom waker code and before reading or consuming the
+      // task's terminal slot.
+      let replacement = cx.waker().clone();
+      let mut slot = self.state.lock();
+      match &mut *slot {
+        Slot::Pending(wakers) => {
+          let old = wakers.join.replace(replacement);
+          drop(slot);
+          drop(old);
+          Poll::Pending
+        }
+        Slot::Ready(outcome) => {
+          let result = outcome.take();
+          *slot = Slot::Taken;
+          drop(slot);
+          self.finished = true;
+          Poll::Ready(result.unwrap_or(Err(AsyncJoinError::Cancelled)))
+        }
+        Slot::Taken => {
+          drop(slot);
+          self.finished = true;
+          Poll::Ready(Err(AsyncJoinError::Cancelled))
+        }
       }
-      Slot::Ready(outcome) => {
-        let result = outcome.take();
-        *slot = Slot::Taken;
-        drop(slot);
-        self.finished = true;
-        Poll::Ready(result.unwrap_or(Err(AsyncJoinError::Cancelled)))
-      }
-      Slot::Taken => {
-        drop(slot);
-        self.finished = true;
-        Poll::Ready(Err(AsyncJoinError::Cancelled))
-      }
-    }
+    })
   }
 }
 
