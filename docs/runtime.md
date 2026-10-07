@@ -351,6 +351,27 @@ retain their charges through the final snapshot. Nine native tests, two
 compile-fail examples and three actual-source Loom models cover cleanup,
 recovery, competing publishers and thread boundaries.
 
+## Composing two futures
+
+`runtime::concurrency` supplies `join2`, `try_join2` and `select2` for borrowed,
+local or owned futures. Each input has one ordinary pinned-box allocation;
+there is no `Send`, `'static` or `Unpin` requirement. Each active input is
+polled at most once per helper poll. Join helpers poll in argument order and
+never repoll completed inputs. `select2` chooses either argument-order bias or
+deterministic round-robin priority, alternating after polls where both inputs
+remain pending. This is a two-input port; it does not provide arbitrary-arity
+macros or disabled select branches. Both inputs are constructed by the caller
+and owned immediately.
+
+A completed input is destroyed before its output is retained. Failure or
+selection destroys unfinished inputs and unused partial outputs before
+returning the selected result. Cancellation drops both inputs; earlier side
+effects remain committed. Poll panics resume after cleanup, with secondary
+cleanup panics contained. When normal cleanup first panics, that primary panic
+resumes after all other values are disposed. Cleanup during an existing unwind
+preserves that unwind. Fifteen native tests cover polling order, cancellation,
+borrowed and pinned inputs, retained terminal helpers and adversarial cleanup.
+
 ## Owned asynchronous tasks
 
 `runtime::asynchronous::AsyncRuntime` runs owned `Send + 'static` futures on a

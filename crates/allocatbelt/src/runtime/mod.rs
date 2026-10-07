@@ -77,6 +77,7 @@ mod blocking;
 pub mod buffered_io;
 mod cache;
 pub mod channel;
+pub mod concurrency;
 mod error;
 pub mod fs;
 pub mod io;
