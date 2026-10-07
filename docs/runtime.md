@@ -877,6 +877,49 @@ Workers prefer allocator shards at startup and return allocator caches before
 parking and at exit. The crate does not install a global allocator. With system
 allocation or mimalloc these hooks do not alter those allocators.
 
+## Explicit cgroup controls
+
+`runtime::cgroup::CgroupV2` accepts an owned directory descriptor for a
+caller-supplied cgroup v2 group and finite `CgroupCeilings`. The application
+must arrange delegation and isolation. The library checks the filesystem and
+descriptor, but does not discover or mount a host root, attach processes,
+prove delegation, or change controls on construction. Control names are fixed
+and opened relative to that descriptor with symlink following disabled.
+
+`set_cpu_max`, `set_memory_high`, `set_memory_max` and `set_io_max` validate
+requests before writing and return bounded readback. CPU quotas are compared
+as ratios; memory limits must be aligned to the actual kernel page size.
+Validation excludes kernel numeric unlimited sentinels and device-number
+aliases. I/O requests validate the entire batch against explicit per-device
+ceilings before its first write. Readback accepts at most 16 distinct devices
+and 4096 bytes per control; larger or malformed records return typed errors.
+The finite ranges follow the Linux 7.0 implementations of
+[CPU bandwidth controls](https://github.com/torvalds/linux/blob/v7.0/kernel/sched/core.c),
+[memory page counters](https://github.com/torvalds/linux/blob/v7.0/mm/page_counter.c)
+and [I/O throttling](https://github.com/torvalds/linux/blob/v7.0/block/blk-throttle.c).
+
+Ceilings restrict submitted values; they do not establish limits for existing
+or unmentioned controls. Each control record uses one write, without replaying
+a suffix after a short write or error. Setters are separate kernel effects,
+and a multi-device update can fail after earlier entries were accepted. Typed
+errors retain the requested control, accepted-entry count and any available
+observed state. `observed = None` means state is unknown. There is no rollback
+or automatic restoration on drop. The kernel still checks permissions,
+controller availability and additional control constraints.
+
+Snapshots read four controls separately and are not atomic. Concurrent setters
+or other processes may change values during or after readback. These APIs are
+synchronous: memory limit writes can reclaim, block or trigger OOM handling
+in the supplied group. Applications should use a bounded blocking lane where
+appropriate. Fixed control buffers, descriptors and kernel resources are
+outside the managed-storage ledger. Ten parser and validation tests do not
+write host controls. An isolated native Linux cgroup-namespace integration
+check verified CPU and memory writes/readback in a delegated descendant group,
+and unchanged readback after invalid requests. The namespace root correctly
+rejected a control write. Positive device I/O writes remain unqualified;
+controller and deployment-specific behavior requires further integration
+checks. These checks establish correctness, not application performance.
+
 ## Measurement gate
 
 Compare blocking jobs with Tokio's blocking pool and owned asynchronous tasks

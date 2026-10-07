@@ -77,6 +77,8 @@ mod blocking;
 pub mod broadcast;
 pub mod buffered_io;
 mod cache;
+#[cfg(not(loom))]
+pub mod cgroup;
 pub mod channel;
 pub mod concurrency;
 pub mod concurrency_many;
