@@ -315,6 +315,26 @@ impl Permit {
     self.count
   }
 
+  /// Transfers `count` permits into a separate owned token.
+  ///
+  /// Returns `None` without changing this token when `count` exceeds its
+  /// count. Splitting does not release or acquire any permits, alter FIFO
+  /// order, or wake waiters. Either token can be dropped independently,
+  /// including after semaphore closure. A zero-count split is valid.
+  #[must_use]
+  pub fn split(&mut self, count: usize) -> Option<Self> {
+    if count > self.count {
+      return None;
+    }
+    let shared = Arc::clone(&self.shared);
+    self.count -= count;
+    Some(Self {
+      shared,
+      count,
+      active: true,
+    })
+  }
+
   /// Permanently removes this permit's count from the semaphore.
   ///
   /// The count is no longer returned by `Drop`, reducing the semaphore's
@@ -808,6 +828,45 @@ mod tests {
   }
 
   #[test]
+  fn split_tokens_return_independently_and_rejection_preserves_the_count() {
+    let semaphore = Semaphore::new(3, 0).unwrap();
+    let mut whole = semaphore.try_acquire_many(3).unwrap();
+    assert!(whole.split(4).is_none());
+    assert_eq!(whole.count(), 3);
+    let zero = whole.split(0).unwrap();
+    assert_eq!(zero.count(), 0);
+    drop(zero);
+    assert_eq!(semaphore.available_permits(), 0);
+    let part = whole.split(1).unwrap();
+    assert_eq!((whole.count(), part.count()), (2, 1));
+    drop(part);
+    assert_eq!(semaphore.available_permits(), 1);
+    semaphore.close();
+    drop(whole);
+    assert_eq!(semaphore.available_permits(), 3);
+  }
+
+  #[test]
+  fn splitting_does_not_dispatch_waiters_until_a_token_is_released() {
+    let semaphore = Semaphore::new(2, 1).unwrap();
+    let mut whole = semaphore.try_acquire_many(2).unwrap();
+    let mut waiter = Box::pin(semaphore.acquire_many(1));
+    let waker = noop_waker();
+    assert!(poll(waiter.as_mut(), &waker).is_pending());
+    let part = whole.split(1).unwrap();
+    assert!(poll(waiter.as_mut(), &waker).is_pending());
+    drop(part);
+    let received = match poll(waiter.as_mut(), &waker) {
+      std::task::Poll::Ready(Ok(permit)) => permit,
+      other => panic!("expected split token release to grant waiter, got {other:?}"),
+    };
+    assert_eq!(received.count(), 1);
+    drop(received);
+    drop(whole);
+    assert_eq!(semaphore.available_permits(), 2);
+  }
+
+  #[test]
   fn forgotten_permits_reduce_checked_total_until_explicitly_added() {
     let semaphore = Semaphore::new(usize::MAX, 0).unwrap();
     semaphore.try_acquire_many(2).unwrap().forget();
@@ -1106,6 +1165,26 @@ mod loom_tests {
   use std::task::{Context, Poll, Wake, Waker};
 
   use super::{AcquireError, AcquireMany, Permit, Semaphore};
+
+  #[test]
+  fn split_token_release_racing_close_conserves_issued_permits() {
+    loom::model(|| {
+      let semaphore = Semaphore::new(2, 0).unwrap();
+      let mut whole = semaphore.try_acquire_many(2).unwrap();
+      let part = whole.split(1).unwrap();
+      let closing = semaphore.clone();
+      let release = thread::spawn(move || drop(part));
+      let close = thread::spawn(move || closing.close());
+      drop(whole);
+      release.join().unwrap();
+      close.join().unwrap();
+      assert_eq!(semaphore.available_permits(), 2);
+      assert!(matches!(
+        semaphore.try_acquire_many(1),
+        Err(AcquireError::Closed)
+      ));
+    });
+  }
 
   struct WakeCounter(StdArc<StdAtomicUsize>);
 

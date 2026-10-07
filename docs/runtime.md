@@ -162,9 +162,15 @@ The waiter bound excludes shared helper metadata and arbitrary caller storage.
 Callbacks run outside the ledger lock. Close publishes terminal outcomes but
 does not wait for callbacks already claimed on other threads.
 
-Native tests and three Loom models exercise the production ledger, immediate
+Native tests and four Loom models exercise the production ledger, immediate
 acquisition, queued cancellation/grant races, close and slot-generation reuse.
 The models do not cover arbitrary user waker behavior or every scheduler path.
+
+An issued semaphore `Permit::split` transfers a checked count to another
+owned token without acquiring or releasing permits or waking waiters. Invalid
+splits preserve the original token; zero-count splits are valid. Each token
+returns its own count independently, including after close. Native tests and
+a Loom release/close race check conservation of split permits.
 
 ## Bounded asynchronous mutex
 
