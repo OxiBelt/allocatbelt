@@ -2,10 +2,11 @@
 # Sandbox and virtualization qualification (single-package directive
 # Phase E, §8, §17): behaviour and fallback semantics, no timings.
 #
-# 1. Builds the tests of `allocatbelt` (default features + `io-uring`) as
+# 1. Builds the tests of `allocatbelt` (default features + `io-uring,runtime`) as
 #    static musl binaries and runs every test binary in a hardened Docker
 #    container: user 10001, `--cap-drop ALL`, read-only root, no network,
-#    `no-new-privileges`, Docker's default seccomp profile (which denies
+#    `no-new-privileges`, a bounded writable temporary filesystem and
+#    Docker's default seccomp profile (which denies
 #    io_uring). Baseline correctness needs no extra privilege.
 # 2. Runs the scenarios of `tests/sandbox.rs`, each in its own process,
 #    under the seccomp profiles in `scripts/seccomp/`: io_uring denied
@@ -28,12 +29,21 @@ image=allocatbelt-empty
 
 echo "== building static test binaries (${target})"
 # Test binaries only: `cargo test` also builds the examples, elsewhere.
-mapfile -t bins < <(
-  cargo test --release --locked -p allocatbelt --features io-uring \
-    --target "${target}" --no-run --message-format=json 2>/dev/null |
-    jq -r 'select(.reason == "compiler-artifact" and .executable != null and .profile.test
-      and .target.name != "allocatbelt-bench") | .executable'
-)
+build_work="$(mktemp -d)"
+trap 'rm -rf -- "${build_work}"' EXIT
+if ! cargo test --release --locked -p allocatbelt --features io-uring,runtime \
+  --target "${target}" --no-run --message-format=json >"${build_work}/artifacts.jsonl"; then
+  cat "${build_work}/artifacts.jsonl" >&2
+  echo "FAIL: static test build failed" >&2
+  exit 1
+fi
+if ! jq -r 'select(.reason == "compiler-artifact" and .executable != null and .profile.test
+  and .target.name != "allocatbelt-bench") | .executable' \
+  "${build_work}/artifacts.jsonl" >"${build_work}/binaries"; then
+  echo "FAIL: could not parse static test artifacts" >&2
+  exit 1
+fi
+mapfile -t bins <"${build_work}/binaries"
 [[ ${#bins[@]} -ge 9 ]] || { echo "FAIL: found only ${#bins[@]} test binaries" >&2; exit 1; }
 dir="$(dirname "${bins[0]}")"
 sandbox=""
@@ -48,6 +58,7 @@ if ! docker image inspect "${image}" >/dev/null 2>&1; then
 fi
 hardened=(
   --rm --network none --user 10001:10001 --cap-drop ALL --read-only
+  --tmpfs '/tmp:rw,nosuid,nodev,size=64m,mode=1777'
   --security-opt no-new-privileges:true -v "${dir}:/t:ro"
 )
 

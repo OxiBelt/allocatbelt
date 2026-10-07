@@ -58,6 +58,11 @@ jobs:
       - name: Cargo test
         run: cargo test --release --all-features --locked
 
+      - name: Verification runner regression checks
+        run: |
+          bash scripts/tests/check-miri-test.sh
+          bash scripts/tests/check-sandbox-test.sh
+
       # Verify workload observation and comparator feature separation only.
       # Hosted runners do not qualify allocator or runtime performance.
       - name: Latency collector and comparator checks

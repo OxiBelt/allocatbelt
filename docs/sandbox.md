@@ -42,6 +42,11 @@ Inside a VM (or a VM inside a VM), the allocator uses the guest's view and nothi
 
 `scripts/check-sandbox.sh` (CI job "Sandbox and virtualization" on x86_64 and arm64; needs docker, qemu-user and the musl target). GitHub's hosted runners are VMs, so the container runs there are Docker in a VM.
 
+The static test binaries include the optional runtime. Runtime filesystem and
+Unix-socket tests use a writable `/tmp` tmpfs limited to 64 MiB, with mode 1777,
+`nosuid` and `nodev`; the container root stays read-only. The script checks the
+Cargo build and artifact-parser exit status before running any test binary.
+
 | Environment (directive §17) | How | Checked |
 |---|---|---|
 | bare-metal / normal Linux | the ordinary test jobs | every test; optional facilities selected where the runner allows (`tests/policy.rs`, `tests/maintenance.rs`) |
