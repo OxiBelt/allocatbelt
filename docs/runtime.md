@@ -157,11 +157,17 @@ sequential cursor even beyond the new EOF. Once a one-call mutation starts,
 its side effects cannot be cancelled or rolled back.
 
 Path jobs include canonicalization, existence checks that preserve errors,
-hard and symbolic links, permission changes and empty-directory removal.
+hard and symbolic links, permission changes, single-file copying and
+empty-directory removal. Copy follows `std::fs::copy` behavior and returns the
+copied byte count. It overwrites destination contents, follows a source
+symbolic link, and follows an existing destination symbolic link. An I/O error
+can leave a partially modified destination. Queued cancellation prevents the
+copy from starting; a running copy cannot be interrupted or rolled back and
+retains its disk permit until completion.
 They retain standard filesystem semantics, including relative symlink
 targets and path races. Canonicalization and existence are snapshots, not
-security checks for later operations. Recursive traversal and file-copy
-ports remain separate implementation work.
+security checks for later operations. Recursive traversal remains separate
+implementation work.
 
 Directory iteration yields one entry per job. Entry metadata and type wrappers
 also use disk permits. Returned raw `std::fs::DirEntry` methods can perform
@@ -1303,7 +1309,7 @@ baseline still requires these implementation and qualification steps:
    The initialized-buffer `Take`/`Chain`/`Empty`/`Sink`/`Repeat` family and
    fixed managed buffered endpoints are implemented; this does not include
    those broader stream operations.
-3. Add file-copy operations and bounded recursive traversal.
+3. Add bounded recursive traversal.
 4. Exercise realistic application ports covering cancellation, bounded
    rejection recovery, resource/dependency quotas, retained managed storage,
    partial I/O and explicit driver/process shutdown. The existing CPU, memory,

@@ -190,6 +190,136 @@ fn path_ports_preserve_relative_links_dangling_links_and_nonempty_directories() 
   runtime.shutdown(ShutdownMode::Drain).unwrap();
 }
 
+#[test]
+fn bounded_path_copy_overwrites_contents_and_copies_source_permissions() {
+  let scratch = Scratch::new();
+  let source = scratch.child("copy-source");
+  let destination = scratch.child("copy-destination");
+  fs::write(&source, b"source bytes").unwrap();
+  fs::write(&destination, b"old destination").unwrap();
+  fs::set_permissions(&source, fs::Permissions::from_mode(0o640)).unwrap();
+  fs::set_permissions(&destination, fs::Permissions::from_mode(0o600)).unwrap();
+
+  let mut runtime = runtime(1, 2);
+  let scope = scope(0, 1);
+  let fs_handle = FsHandle::new(runtime.handle(), scope.clone());
+  let copied = fs_handle
+    .copy(source.clone(), destination.clone())
+    .unwrap()
+    .join()
+    .unwrap()
+    .unwrap();
+  assert_eq!(copied, b"source bytes".len() as u64);
+  assert_eq!(fs::read(&destination).unwrap(), b"source bytes");
+  assert_eq!(
+    fs::metadata(destination).unwrap().permissions().mode() & 0o777,
+    0o640
+  );
+
+  let source_target = scratch.child("copy-source-target");
+  let source_link = scratch.child("copy-source-link");
+  let destination_target = scratch.child("copy-destination-target");
+  let destination_link = scratch.child("copy-destination-link");
+  fs::write(&source_target, b"through source link").unwrap();
+  fs::write(&destination_target, b"old target").unwrap();
+  std::os::unix::fs::symlink(&source_target, &source_link).unwrap();
+  std::os::unix::fs::symlink(&destination_target, &destination_link).unwrap();
+  fs_handle
+    .copy(source_link, destination_link.clone())
+    .unwrap()
+    .join()
+    .unwrap()
+    .unwrap();
+  assert_eq!(
+    fs::read(destination_target).unwrap(),
+    b"through source link"
+  );
+  assert!(
+    fs::symlink_metadata(destination_link)
+      .unwrap()
+      .file_type()
+      .is_symlink()
+  );
+
+  assert_eq!(scope.snapshot().disk_ops, 0);
+
+  runtime.shutdown(ShutdownMode::Drain).unwrap();
+}
+
+#[test]
+fn path_copy_returns_rejected_paths_and_queued_cancel_has_no_side_effect() {
+  let scratch = Scratch::new();
+  let source = scratch.child("copy-source");
+  let destination = scratch.child("copy-destination");
+  fs::write(&source, b"must not be copied").unwrap();
+
+  let mut runtime = runtime(1, 1);
+  let (_blocker, started, release) = gated_job(&runtime);
+  started.recv_timeout(WATCHDOG).unwrap();
+  let scope = scope(0, 1);
+  let fs_handle = FsHandle::new(runtime.handle(), scope.clone());
+  let error = fs_handle
+    .copy(source.clone(), destination.clone())
+    .unwrap_err();
+  assert_eq!(
+    error.kind,
+    FsSubmissionErrorKind::Runtime(SubmitErrorKind::Full)
+  );
+  assert_eq!(error.into_input(), (source.clone(), destination.clone()));
+  assert_eq!(scope.snapshot().disk_ops, 0);
+  assert!(!destination.exists());
+  release.send(()).unwrap();
+  runtime.shutdown(ShutdownMode::Drain).unwrap();
+
+  let mut runtime = self::runtime(1, 2);
+  let (blocker, started, release) = gated_job(&runtime);
+  started.recv_timeout(WATCHDOG).unwrap();
+  let fs_handle = FsHandle::new(runtime.handle(), scope.clone());
+  let job = fs_handle.copy(source.clone(), destination.clone()).unwrap();
+  assert_eq!(scope.snapshot().disk_ops, 1);
+  job.cancel();
+  release.send(()).unwrap();
+  assert!(matches!(job.join(), Err(JoinError::Cancelled)));
+  assert!(!destination.exists());
+  assert_eq!(scope.snapshot().disk_ops, 0);
+  blocker.join().unwrap();
+  runtime.shutdown(ShutdownMode::Drain).unwrap();
+
+  let zero_disk_scope = self::scope(0, 0);
+  let mut runtime = self::runtime(1, 1);
+  let zero_disk_handle = FsHandle::new(runtime.handle(), zero_disk_scope.clone());
+  let error = zero_disk_handle
+    .copy(source.clone(), destination.clone())
+    .unwrap_err();
+  assert!(matches!(
+    error.kind,
+    FsSubmissionErrorKind::Resource(crate::runtime::managed::ResourceError::Invalid(_))
+  ));
+  assert_eq!(error.into_input(), (source, destination));
+  assert_eq!(zero_disk_scope.snapshot().disk_ops, 0);
+  runtime.shutdown(ShutdownMode::Drain).unwrap();
+}
+
+#[test]
+fn path_copy_reports_io_errors_without_creating_a_destination() {
+  let scratch = Scratch::new();
+  let missing = scratch.child("missing-source");
+  let destination = scratch.child("must-remain-absent");
+  let mut runtime = runtime(1, 2);
+  let scope = scope(0, 1);
+  let fs_handle = FsHandle::new(runtime.handle(), scope.clone());
+  let error = fs_handle
+    .copy(missing, destination.clone())
+    .unwrap()
+    .join()
+    .unwrap()
+    .unwrap_err();
+  assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+  assert!(!destination.exists());
+  assert_eq!(scope.snapshot().disk_ops, 0);
+  runtime.shutdown(ShutdownMode::Drain).unwrap();
+}
+
 struct Scratch(PathBuf);
 
 impl Scratch {

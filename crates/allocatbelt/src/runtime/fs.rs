@@ -588,6 +588,23 @@ impl FsHandle {
     self.submit((from, to), |(from, to), _token| fs::rename(from, to))
   }
 
+  /// Copies one file using [`std::fs::copy`] semantics on the blocking pool.
+  ///
+  /// The operation returns the number of bytes copied. It follows symbolic
+  /// links for the source, overwrites destination contents, and copies the
+  /// source permissions as the standard library does. An I/O error can leave
+  /// the destination partially modified. A queued cancellation prevents the
+  /// copy from starting. Once the copy starts, dropping or cancelling its job
+  /// cannot interrupt or roll back filesystem changes; the disk permit and both
+  /// paths remain owned until the blocking call completes.
+  pub fn copy(
+    &self,
+    from: PathBuf,
+    to: PathBuf,
+  ) -> Result<Job<io::Result<u64>>, FsSubmissionError<(PathBuf, PathBuf)>> {
+    self.submit((from, to), |(from, to), _token| fs::copy(from, to))
+  }
+
   /// Reads the target of a symbolic link.
   pub fn read_link(
     &self,
