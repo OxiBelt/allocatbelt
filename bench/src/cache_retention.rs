@@ -4,12 +4,20 @@
 //! a distinct `--variant` label. The trace is deterministic and bounded. The
 //! `parked` sample is taken with every worker alive after it has flushed its
 //! cache; the final sample follows worker joins and a main-thread purge.
+//! Set `ALLOCATBELT_RETAINED_SMAPS_PATH` to request an optional, bounded
+//! per-mapping sidecar. The path is read only after the primary parked
+//! rollup and checksum have been validated. Capture is non-atomic and its
+//! own mapping/file activity and stack use happen after that primary sample;
+//! it is diagnostic evidence, not part of the CSV or acceptance gates.
+//! Capture is byte-bounded but filesystem I/O is not time-bounded, so the
+//! external runner must retain its process timeout and require successful exit.
 //! Reported process memory includes stacks, libc thread state, mappings and
 //! kernel residency decisions, so none of the fields directly measure the
 //! logical cache size or establish a latency/performance improvement.
 
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Write};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -25,6 +33,13 @@ const TRACE_ROUNDS: usize = 16;
 const PARK_TIMEOUT: Duration = Duration::from_secs(60);
 const MAX_SMAPS_BYTES: usize = 64 * 1024;
 const SMAPS_BUFFER_BYTES: usize = MAX_SMAPS_BYTES + 1;
+const MAX_SIDECAR_BYTES: usize = 16 * 1024 * 1024;
+const SIDECAR_BUFFER_BYTES: usize = 16 * 1024;
+const SIDECAR_ENV: &str = "ALLOCATBELT_RETAINED_SMAPS_PATH";
+// Readers require this envelope and trailer, plus a successful probe exit;
+// failed or truncated captures cannot be accepted as complete snapshots.
+const SIDECAR_HEADER: &[u8] = b"ALLOCATBELT-SMAPS-SIDECAR-V1\n";
+const SIDECAR_COMPLETE: &[u8] = b"\nALLOCATBELT-SMAPS-COMPLETE-V1\n";
 const PAGE_CLASS_SIZES: [usize; 32] = [
   16, 32, 48, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 384, 448, 512, 640, 768, 896, 1024,
   1280, 1536, 1792, 2048, 2560, 3072, 3584, 4096, 5120, 6144, 7168, 8192,
@@ -114,6 +129,7 @@ enum ProbeError {
   InvalidConfig,
   SmapsRead,
   SmapsParse(ParseRollupError),
+  SmapsSidecar(SidecarError),
   Spawn,
   /// A worker did not enroll at the park gate within the enrollment deadline.
   /// The outer runner timeout separately bounds subsequent joins and purge.
@@ -122,6 +138,14 @@ enum ProbeError {
   ChecksumMismatch,
   ExecutableMetadata,
   Output,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SidecarError {
+  Create,
+  Read,
+  Write,
+  TooLarge,
 }
 
 impl std::fmt::Display for ProbeError {
@@ -197,6 +221,33 @@ fn valid_label(value: &str) -> bool {
 }
 
 fn run(config: ProbeConfig) -> Result<(), ProbeError> {
+  run_with_callbacks(
+    config,
+    || std::env::var_os(SIDECAR_ENV).map(PathBuf::from),
+    |config, binary_bytes, allocations_per_worker, rows| {
+      let stdout = io::stdout();
+      let mut output = stdout.lock();
+      write_rows(
+        &mut output,
+        config,
+        binary_bytes,
+        allocations_per_worker,
+        rows,
+      )
+    },
+  )
+}
+
+fn run_with_callbacks(
+  config: ProbeConfig,
+  sidecar_path: impl FnOnce() -> Option<PathBuf>,
+  emit_rows: impl FnOnce(
+    &ProbeConfig,
+    u64,
+    usize,
+    [(&str, StageCounts, Rollup, u64); 3],
+  ) -> io::Result<()>,
+) -> Result<(), ProbeError> {
   validate_config(&config)?;
   let binary_bytes = std::env::current_exe()
     .and_then(std::fs::metadata)
@@ -228,6 +279,9 @@ fn run(config: ProbeConfig) -> Result<(), ProbeError> {
   let expected = expected_checksum(config.workers, config.trace);
   if parked_checksum != expected {
     return Err(ProbeError::ChecksumMismatch);
+  }
+  if let Some(path) = sidecar_path() {
+    capture_smaps_sidecar(&path).map_err(ProbeError::SmapsSidecar)?;
   }
 
   let joined_checksum = cohort.join()?;
@@ -269,16 +323,8 @@ fn run(config: ProbeConfig) -> Result<(), ProbeError> {
       joined_checksum,
     ),
   ];
-  let stdout = io::stdout();
-  let mut output = stdout.lock();
-  write_rows(
-    &mut output,
-    &config,
-    binary_bytes,
-    trace_allocations_per_worker,
-    rows,
-  )
-  .map_err(|_| ProbeError::Output)
+  emit_rows(&config, binary_bytes, trace_allocations_per_worker, rows)
+    .map_err(|_| ProbeError::Output)
 }
 
 fn prewarm() {
@@ -486,6 +532,70 @@ fn read_rollup_reader(reader: &mut impl Read) -> Result<Rollup, ProbeError> {
   parse_rollup(text).map_err(ProbeError::SmapsParse)
 }
 
+fn capture_smaps_sidecar(path: &Path) -> Result<(), SidecarError> {
+  let mut input = File::open("/proc/self/smaps").map_err(|_| SidecarError::Read)?;
+  capture_smaps_to_path(path, &mut input, MAX_SIDECAR_BYTES)
+}
+
+fn capture_smaps_to_path(
+  path: &Path,
+  reader: &mut impl Read,
+  maximum_bytes: usize,
+) -> Result<(), SidecarError> {
+  let mut output = OpenOptions::new()
+    .write(true)
+    .create_new(true)
+    .open(path)
+    .map_err(|_| SidecarError::Create)?;
+  let result = stream_smaps(reader, &mut output, maximum_bytes);
+  drop(output);
+  if result.is_err() {
+    // Remove partial data when possible. If removal fails, the runner's
+    // recorded nonzero outcome still disqualifies any leftover sidecar.
+    let _ = std::fs::remove_file(path);
+  }
+  result
+}
+
+fn stream_smaps(
+  reader: &mut impl Read,
+  writer: &mut impl Write,
+  maximum_bytes: usize,
+) -> Result<(), SidecarError> {
+  let maximum_body = maximum_bytes
+    .checked_sub(SIDECAR_HEADER.len() + SIDECAR_COMPLETE.len())
+    .ok_or(SidecarError::TooLarge)?;
+  writer
+    .write_all(SIDECAR_HEADER)
+    .map_err(|_| SidecarError::Write)?;
+  let mut buffer = [0u8; SIDECAR_BUFFER_BYTES];
+  let mut copied = 0usize;
+  loop {
+    let count = match reader.read(&mut buffer) {
+      Ok(count) => count,
+      Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+      Err(_) => return Err(SidecarError::Read),
+    };
+    if count == 0 {
+      break;
+    }
+    let next = copied.checked_add(count).ok_or(SidecarError::TooLarge)?;
+    if next > maximum_body {
+      return Err(SidecarError::TooLarge);
+    }
+    writer
+      .write_all(&buffer[..count])
+      .map_err(|_| SidecarError::Write)?;
+    copied = next;
+  }
+  // Flush the body before publishing the completion marker. There is no
+  // fallible output operation after a full marker has been written.
+  writer.flush().map_err(|_| SidecarError::Write)?;
+  writer
+    .write_all(SIDECAR_COMPLETE)
+    .map_err(|_| SidecarError::Write)
+}
+
 fn parse_rollup(text: &str) -> Result<Rollup, ParseRollupError> {
   let mut rss = None;
   let mut pss = None;
@@ -612,6 +722,17 @@ fn write_csv_field(output: &mut impl Write, value: &str) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
   use super::*;
+  use std::sync::atomic::{AtomicU64, Ordering};
+
+  static NEXT_SIDECAR_TEST: AtomicU64 = AtomicU64::new(0);
+
+  fn sidecar_test_path(label: &str) -> PathBuf {
+    let sequence = NEXT_SIDECAR_TEST.fetch_add(1, Ordering::Relaxed);
+    std::env::temp_dir().join(format!(
+      "allocatbelt-smaps-{}-{sequence}-{label}",
+      std::process::id()
+    ))
+  }
 
   #[test]
   fn rollup_requires_exact_fields_and_kilobyte_units() {
@@ -666,6 +787,148 @@ mod tests {
       read_rollup_reader(&mut io::Cursor::new(oversized)),
       Err(ProbeError::SmapsParse(ParseRollupError::TooLarge))
     );
+  }
+
+  #[test]
+  fn smaps_sidecar_is_bounded_complete_and_create_new() {
+    let path = sidecar_test_path("complete");
+    let source = b"1000-2000 rw-p 00000000 00:00 0 [heap]\nRss: 4 kB\n";
+    let maximum_bytes = SIDECAR_HEADER.len() + source.len() + SIDECAR_COMPLETE.len();
+    capture_smaps_to_path(&path, &mut io::Cursor::new(source), maximum_bytes).unwrap();
+    let bytes = std::fs::read(&path).unwrap();
+    assert_eq!(bytes.len(), maximum_bytes);
+    assert!(bytes.starts_with(SIDECAR_HEADER));
+    assert!(bytes.ends_with(SIDECAR_COMPLETE));
+    assert!(bytes.windows(source.len()).any(|window| window == source));
+
+    assert_eq!(
+      capture_smaps_to_path(&path, &mut io::Cursor::new(source), maximum_bytes),
+      Err(SidecarError::Create)
+    );
+    assert_eq!(std::fs::read(&path).unwrap(), bytes);
+    std::fs::remove_file(path).unwrap();
+  }
+
+  #[test]
+  fn sidecar_overflow_read_write_and_path_failures_are_typed_and_incomplete_files_removed() {
+    let sidecar_limit = SIDECAR_HEADER.len() + SIDECAR_COMPLETE.len() + 8;
+    let oversized_path = sidecar_test_path("oversized");
+    assert_eq!(
+      capture_smaps_to_path(
+        &oversized_path,
+        &mut io::Cursor::new(b"more than the configured limit"),
+        sidecar_limit,
+      ),
+      Err(SidecarError::TooLarge)
+    );
+    assert!(!oversized_path.exists());
+
+    struct DeniedReader;
+    impl Read for DeniedReader {
+      fn read(&mut self, _buffer: &mut [u8]) -> io::Result<usize> {
+        Err(io::Error::new(io::ErrorKind::PermissionDenied, "test"))
+      }
+    }
+    let read_path = sidecar_test_path("read-error");
+    assert_eq!(
+      capture_smaps_to_path(&read_path, &mut DeniedReader, sidecar_limit),
+      Err(SidecarError::Read)
+    );
+    assert!(!read_path.exists());
+
+    struct DeniedWriter;
+    impl Write for DeniedWriter {
+      fn write(&mut self, _buffer: &[u8]) -> io::Result<usize> {
+        Err(io::Error::new(io::ErrorKind::PermissionDenied, "test"))
+      }
+      fn flush(&mut self) -> io::Result<()> {
+        Err(io::Error::new(io::ErrorKind::PermissionDenied, "test"))
+      }
+    }
+    assert_eq!(
+      stream_smaps(
+        &mut io::Cursor::new(b"smaps"),
+        &mut DeniedWriter,
+        sidecar_limit,
+      ),
+      Err(SidecarError::Write)
+    );
+
+    struct FlushFailureWriter(Vec<u8>);
+    impl Write for FlushFailureWriter {
+      fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.0.extend_from_slice(bytes);
+        Ok(bytes.len())
+      }
+      fn flush(&mut self) -> io::Result<()> {
+        Err(io::Error::new(io::ErrorKind::PermissionDenied, "test"))
+      }
+    }
+    let mut flush_failure = FlushFailureWriter(Vec::new());
+    assert_eq!(
+      stream_smaps(
+        &mut io::Cursor::new(b"smaps"),
+        &mut flush_failure,
+        sidecar_limit,
+      ),
+      Err(SidecarError::Write)
+    );
+    assert!(!flush_failure.0.ends_with(SIDECAR_COMPLETE));
+
+    let missing_parent = sidecar_test_path("missing-parent").join("sidecar");
+    assert_eq!(
+      capture_smaps_to_path(
+        &missing_parent,
+        &mut io::Cursor::new(b"smaps"),
+        sidecar_limit,
+      ),
+      Err(SidecarError::Create)
+    );
+    assert!(!missing_parent.exists());
+  }
+
+  #[test]
+  fn two_worker_probe_keeps_primary_csv_and_emits_complete_sidecar() {
+    let path = sidecar_test_path("probe");
+    let config = ProbeConfig {
+      variant: "sidecar-test".to_owned(),
+      rustc_version: "rustc test".to_owned(),
+      workers: 2,
+      trace: Trace::Minimal,
+      logical_cache_bytes_per_thread: None,
+    };
+    let mut csv = Vec::new();
+    run_with_callbacks(
+      config,
+      || Some(path.clone()),
+      |config, binary_bytes, allocations_per_worker, rows| {
+        write_rows(&mut csv, config, binary_bytes, allocations_per_worker, rows)
+      },
+    )
+    .unwrap();
+
+    let text = std::str::from_utf8(&csv).unwrap();
+    assert!(text.starts_with(&format!("{CSV_HEADER}\n")));
+    let mut lines = text.lines();
+    assert_eq!(lines.next(), Some(CSV_HEADER));
+    let rows: Vec<Vec<&str>> = lines.map(|line| line.split(',').collect()).collect();
+    assert_eq!(rows.len(), 3);
+    assert!(rows.iter().all(|row| row.len() == 22));
+    assert_eq!(rows[0][10], "warm");
+    assert_eq!(rows[1][10], "parked");
+    assert_eq!(&rows[1][11..14], ["2", "2", "0"]);
+    assert_eq!(rows[2][10], "after_join_purge");
+    assert_eq!(&rows[2][11..14], ["0", "0", "2"]);
+
+    let sidecar = std::fs::read(&path).unwrap();
+    assert!(sidecar.starts_with(SIDECAR_HEADER));
+    assert!(sidecar.ends_with(SIDECAR_COMPLETE));
+    assert!(
+      sidecar
+        .windows(b"VmFlags:".len())
+        .any(|part| part == b"VmFlags:")
+    );
+    std::fs::remove_file(path).unwrap();
   }
 
   #[test]
