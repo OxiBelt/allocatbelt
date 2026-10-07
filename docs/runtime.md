@@ -197,7 +197,17 @@ callback returns `WouldDeadlock`. Dropping the driver closes without joining.
 Two Loom models exercise the production slot publication/registration helpers
 and indexed-queue generation transitions. Service-thread scheduling, condition
 variable waits, ownership and close-drain callbacks are outside those models;
-native tests cover them. A controlled test clock remains to be implemented.
+native tests cover them.
+
+`TimerDriver::new_paused` returns a driver and clonable `ManualClock`.
+`TimerHandle::now` exposes its current time; real elapsed time does not move it.
+`advance` updates that driver's time monotonically and publishes due outcomes
+through fixed batches on the advancing thread. Creation, reset, timeouts and
+all interval policies use the same clock. It does not poll executor tasks or
+automatically jump time when tasks are idle. Concurrent and reentrant advances
+serialize clock updates; already-claimed callbacks can continue, and concurrent
+close can resolve remaining registrations with `Closed`. Native tests cover
+these behaviors; clock control is outside the two helper Loom models.
 
 ## First milestone contract
 

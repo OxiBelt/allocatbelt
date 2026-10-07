@@ -52,11 +52,16 @@
 //!
 //! # Deadlines
 //!
-//! The driver fires a sleep once `Instant::now()` on the service thread has
-//! reached its deadline, never earlier; it is late by the thread's
+//! A real-clock driver fires a sleep once its monotonic clock on the service
+//! thread reaches the deadline, never earlier; it is late by the thread's
 //! scheduling latency. Between deadlines the thread waits on a condition
 //! variable until the earliest deadline or a new earlier registration; it
 //! does not poll. There is no thread per sleep.
+//! [`TimerDriver::new_paused`] instead supplies a [`ManualClock`]: real time
+//! never fires its registrations, and `advance` publishes due outcomes through
+//! fixed batches on the advancing thread. Sleeps, timeouts, intervals and
+//! resets all use that driver's clock. Advancement does not poll executor
+//! tasks or automatically jump to the next deadline when tasks are idle.
 //!
 //! # Locks and user code
 //!
@@ -81,7 +86,7 @@
 //! [`Timeout`] boxes its inner future, so it is `Unpin` without unsafe
 //! pinning. Ties go to the deadline: each poll first checks the timer and
 //! returns [`TimeoutError::Elapsed`] when the sleep has fired or
-//! `Instant::now()` has reached the deadline, or [`TimeoutError::Timer`]
+//! the driver's clock has reached the deadline, or [`TimeoutError::Timer`]
 //! when the driver closed, without polling the inner future. Only otherwise
 //! is the inner future polled. A zero timeout therefore always elapses and
 //! never polls its future. On completion the sleep is dropped, returning its
@@ -206,7 +211,14 @@ struct State {
   close_complete: bool,
   close_owner: Option<ThreadId>,
   next_id: u64,
+  manual_now: Option<Instant>,
   queue: RegistrationQueue,
+}
+
+impl State {
+  fn now(&self) -> Instant {
+    self.manual_now.unwrap_or_else(Instant::now)
+  }
 }
 
 /// Bounded indexed min-heap. Every backing vector is reserved at driver
@@ -607,7 +619,7 @@ impl Shared {
   fn arm_locked(&self, slot: &Arc<Slot>, deadline: Instant) -> Result<Armed, TimerError> {
     let mut state = lock(&self.state);
     let mut armed = lock(&slot.state);
-    let now = Instant::now();
+    let now = state.now();
     self.arm(&mut state, slot, &mut armed, deadline, now)
   }
 
@@ -682,6 +694,10 @@ impl Shared {
     lock(&self.state).queue.len()
   }
 
+  fn now(&self) -> Instant {
+    lock(&self.state).now()
+  }
+
   fn is_closed(&self) -> bool {
     lock(&self.state).closed
   }
@@ -747,7 +763,11 @@ fn drive(shared: &Shared) {
   // Declared last, so released before `_close` takes the lock again.
   let mut state = lock(&shared.state);
   while !state.closed {
-    let now = Instant::now();
+    if state.manual_now.is_some() {
+      state = wait(&shared.wakeup, state, None);
+      continue;
+    }
+    let now = state.now();
     let earliest = state.queue.first_deadline();
     match earliest {
       None => state = wait(&shared.wakeup, state, None),
@@ -781,6 +801,22 @@ impl TimerDriver {
   /// registration storage cannot be reserved, and `Spawn` when the thread
   /// cannot be started.
   pub fn new(max_registered: usize) -> Result<Self, TimerError> {
+    Self::build(max_registered, None)
+  }
+
+  /// Creates a driver whose clock advances only through [`ManualClock::advance`].
+  /// The clock starts at construction's `Instant`; use [`TimerHandle::now`]
+  /// for deadlines. Advancing publishes due outcomes synchronously, without
+  /// automatically driving an executor or jumping time when tasks are idle.
+  pub fn new_paused(max_registered: usize) -> Result<(Self, ManualClock), TimerError> {
+    let driver = Self::build(max_registered, Some(Instant::now()))?;
+    let clock = ManualClock {
+      shared: Arc::clone(&driver.shared),
+    };
+    Ok((driver, clock))
+  }
+
+  fn build(max_registered: usize, manual_now: Option<Instant>) -> Result<Self, TimerError> {
     if max_registered == 0 {
       return Err(TimerError::Invalid);
     }
@@ -790,6 +826,7 @@ impl TimerDriver {
         close_complete: false,
         close_owner: None,
         next_id: 0,
+        manual_now,
         queue: RegistrationQueue::new(max_registered)?,
       }),
       wakeup: Condvar::new(),
@@ -842,6 +879,67 @@ impl TimerDriver {
   }
 }
 
+/// A monotonic manual clock belonging to exactly one paused driver.
+/// Clones share the same clock and do not keep the driver open.
+#[derive(Clone)]
+pub struct ManualClock {
+  shared: Arc<Shared>,
+}
+
+impl ManualClock {
+  /// This driver's current time, unchanged by real elapsed time.
+  #[must_use]
+  pub fn now(&self) -> Instant {
+    self.shared.now()
+  }
+
+  /// Advances by `duration` and publishes outcomes for registrations due at
+  /// the new time. The clock update serializes with arming and other advances.
+  /// Callback code runs outside locks and may advance this clock again.
+  ///
+  /// Returns the time of this update, which can precede a concurrent or
+  /// reentrant advance. Callbacks already claimed by another advance may still
+  /// be running. A concurrent driver close may resolve sleeps with `Closed`.
+  /// `Invalid` (overflow) and a close observed before this update leave the
+  /// clock unchanged. This neither polls tasks nor automatically advances idle
+  /// time, and the real-clock driver cannot be paused after construction.
+  pub fn advance(&self, duration: Duration) -> Result<Instant, TimerError> {
+    let target = {
+      let mut state = lock(&self.shared.state);
+      if state.closed {
+        return Err(TimerError::Closed);
+      }
+      let now = state.manual_now.ok_or(TimerError::Invalid)?;
+      let target = now.checked_add(duration).ok_or(TimerError::Invalid)?;
+      state.manual_now = Some(target);
+      target
+    };
+    let mut batch = FiredBatch::new();
+    loop {
+      {
+        let mut state = lock(&self.shared.state);
+        if state.closed {
+          break;
+        }
+        take_due(&mut state, Some(target), Ok(()), &mut batch);
+      }
+      if batch.is_empty() {
+        break;
+      }
+      complete(&mut batch);
+    }
+    Ok(target)
+  }
+}
+
+impl fmt::Debug for ManualClock {
+  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    f.debug_struct("ManualClock")
+      .field("now", &self.now())
+      .finish()
+  }
+}
+
 impl Drop for TimerDriver {
   fn drop(&mut self) {
     let on_service_thread = self
@@ -872,6 +970,11 @@ pub struct TimerHandle {
 }
 
 impl TimerHandle {
+  /// This driver's clock: real monotonic time, or its controlled paused time.
+  #[must_use]
+  pub fn now(&self) -> Instant {
+    self.shared.now()
+  }
   /// A sleep that completes `duration` from now.
   ///
   /// # Errors
@@ -879,7 +982,8 @@ impl TimerHandle {
   /// As [`TimerHandle::sleep_until`], and `Invalid` when the deadline
   /// cannot be represented.
   pub fn sleep(&self, duration: Duration) -> Result<Sleep, TimerError> {
-    let deadline = Instant::now()
+    let deadline = self
+      .now()
       .checked_add(duration)
       .ok_or(TimerError::Invalid)?;
     self.sleep_until(deadline)
@@ -951,7 +1055,7 @@ impl TimerHandle {
     period: Duration,
     missed: MissedTickBehavior,
   ) -> Result<Interval, TimerError> {
-    self.interval_at(Instant::now(), period, missed)
+    self.interval_at(self.now(), period, missed)
   }
 
   /// An interval whose first tick is at `start` and which then ticks every
@@ -1140,7 +1244,7 @@ impl<F: Future> Future for Timeout<F> {
       Poll::Ready(Ok(())) => Err(TimeoutError::Elapsed),
       Poll::Ready(Err(error)) => Err(TimeoutError::Timer(error)),
       // Reached but not yet fired by the driver: still the deadline's tie.
-      Poll::Pending if Instant::now() >= sleep.deadline() => Err(TimeoutError::Elapsed),
+      Poll::Pending if sleep.shared.now() >= sleep.deadline() => Err(TimeoutError::Elapsed),
       Poll::Pending => match future.as_mut().poll(cx) {
         Poll::Ready(output) => Ok(output),
         Poll::Pending => return Poll::Pending,
@@ -1253,7 +1357,10 @@ impl Interval {
   /// Resets the next tick to `duration` from now, preserving the period and
   /// ignoring the missed-tick behavior. On error the interval is unchanged.
   pub fn reset_after(&mut self, duration: Duration) -> Result<(), TimerError> {
-    let deadline = Instant::now()
+    let deadline = self
+      .sleep
+      .shared
+      .now()
       .checked_add(duration)
       .ok_or(TimerError::Invalid)?;
     self.reset_at(deadline)
@@ -1262,7 +1369,7 @@ impl Interval {
   /// Resets the next tick to now, so the next [`Interval::tick`] is ready
   /// immediately. This ignores the missed-tick behavior.
   pub fn reset_immediately(&mut self) -> Result<(), TimerError> {
-    self.reset_at(Instant::now())
+    self.reset_at(self.sleep.shared.now())
   }
 
   /// Selects what happens when a tick is observed more than five
@@ -1284,7 +1391,7 @@ impl Interval {
       Poll::Pending => Poll::Pending,
       Poll::Ready(Err(error)) => Poll::Ready(Err(error)),
       Poll::Ready(Ok(())) => {
-        let now = Instant::now();
+        let now = self.sleep.shared.now();
         let Some(following) = self.missed.next_deadline(self.next, self.period, now) else {
           return Poll::Ready(Err(TimerError::Invalid));
         };
@@ -1498,6 +1605,162 @@ mod tests {
 
   use super::{BATCH, TimerDriver, TimerError, TimerHandle, lock};
   use super::{Interval, MISSED_TICK_TOLERANCE, MissedTickBehavior, Sleep, Timeout, TimeoutError};
+
+  #[test]
+  fn paused_clock_ignores_real_time_and_reset_generations() {
+    let (driver, clock) = TimerDriver::new_paused(2).unwrap();
+    let handle = driver.handle();
+    let start = handle.now();
+    let mut sleep = handle.sleep(2 * MS).unwrap();
+    let (woken, waker) = counter();
+    assert!(poll_with(&mut sleep, &waker).is_pending());
+    thread::sleep(4 * MS);
+    assert_eq!(handle.now(), start);
+    assert!(poll_with(&mut sleep, &waker).is_pending());
+    sleep.reset(start + 5 * MS).unwrap();
+    assert_eq!(clock.advance(2 * MS).unwrap(), start + 2 * MS);
+    assert!(poll_with(&mut sleep, &waker).is_pending());
+    assert_eq!(woken.wakes(), 0);
+    clock.advance(3 * MS).unwrap();
+    assert_eq!(poll_with(&mut sleep, Waker::noop()), Poll::Ready(Ok(())));
+    assert_eq!(woken.wakes(), 1);
+    assert_eq!(handle.registered(), 0);
+    driver.shutdown().unwrap();
+  }
+
+  #[test]
+  fn paused_intervals_use_the_controlled_clock_for_every_policy_and_reset() {
+    for (policy, expected) in [
+      (MissedTickBehavior::Burst, 20),
+      (MissedTickBehavior::Delay, 45),
+      (MissedTickBehavior::Skip, 40),
+    ] {
+      let (driver, clock) = TimerDriver::new_paused(1).unwrap();
+      let handle = driver.handle();
+      let start = handle.now();
+      let mut interval = handle.interval(10 * MS, policy).unwrap();
+      assert_eq!(
+        interval.poll_tick(&mut Context::from_waker(Waker::noop())),
+        Poll::Ready(Ok(start))
+      );
+      clock.advance(35 * MS).unwrap();
+      assert_eq!(
+        interval.poll_tick(&mut Context::from_waker(Waker::noop())),
+        Poll::Ready(Ok(start + 10 * MS))
+      );
+      assert_eq!(interval.next, start + expected * MS);
+      interval.reset().unwrap();
+      assert_eq!(interval.next, start + 45 * MS);
+      interval.reset_after(2 * MS).unwrap();
+      assert_eq!(interval.next, start + 37 * MS);
+      interval.reset_immediately().unwrap();
+      assert_eq!(interval.next, start + 35 * MS);
+      driver.shutdown().unwrap();
+    }
+  }
+
+  struct ManualOrder {
+    id: usize,
+    log: Arc<Mutex<Vec<usize>>>,
+  }
+
+  impl Wake for ManualOrder {
+    fn wake(self: Arc<Self>) {
+      lock(&self.log).push(self.id);
+    }
+  }
+
+  #[test]
+  fn manual_advance_publishes_multiple_batches_in_equal_deadline_order() {
+    let (driver, clock) = TimerDriver::new_paused(129).unwrap();
+    let handle = driver.handle();
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let mut sleeps = Vec::new();
+    for id in 0..129 {
+      let mut sleep = handle.sleep(MS).unwrap();
+      let waker = Waker::from(Arc::new(ManualOrder {
+        id,
+        log: Arc::clone(&log),
+      }));
+      assert!(poll_with(&mut sleep, &waker).is_pending());
+      sleeps.push(sleep);
+    }
+    clock.advance(MS).unwrap();
+    assert_eq!(*lock(&log), (0..129).collect::<Vec<_>>());
+    assert_eq!(handle.registered(), 0);
+    assert!(
+      sleeps
+        .iter_mut()
+        .all(|sleep| poll_with(sleep, Waker::noop()) == Poll::Ready(Ok(())))
+    );
+    driver.shutdown().unwrap();
+  }
+
+  struct AdvanceOnWake(super::ManualClock);
+
+  impl Wake for AdvanceOnWake {
+    fn wake(self: Arc<Self>) {
+      self.0.advance(2 * MS).unwrap();
+    }
+  }
+
+  #[test]
+  fn manual_advance_callbacks_can_advance_again_without_lock_reentrancy() {
+    let (driver, clock) = TimerDriver::new_paused(2).unwrap();
+    let handle = driver.handle();
+    let start = clock.now();
+    let mut first = handle.sleep(MS).unwrap();
+    let mut second = handle.sleep(3 * MS).unwrap();
+    let waker = Waker::from(Arc::new(AdvanceOnWake(clock.clone())));
+    assert!(poll_with(&mut first, &waker).is_pending());
+    assert!(poll_with(&mut second, Waker::noop()).is_pending());
+    assert_eq!(clock.advance(MS).unwrap(), start + MS);
+    assert_eq!(clock.now(), start + 3 * MS);
+    assert_eq!(poll_with(&mut first, Waker::noop()), Poll::Ready(Ok(())));
+    assert_eq!(poll_with(&mut second, Waker::noop()), Poll::Ready(Ok(())));
+    driver.shutdown().unwrap();
+  }
+
+  #[test]
+  fn manual_clock_overflow_and_closed_advance_leave_time_unchanged() {
+    let (driver, clock) = TimerDriver::new_paused(1).unwrap();
+    let start = clock.now();
+    assert_eq!(clock.advance(Duration::MAX), Err(TimerError::Invalid));
+    assert_eq!(clock.now(), start);
+    drop(driver);
+    assert_eq!(clock.advance(MS), Err(TimerError::Closed));
+    assert_eq!(clock.now(), start);
+  }
+
+  #[test]
+  fn manual_timeout_checks_controlled_deadline_before_polling_its_inner() {
+    let (driver, clock) = TimerDriver::new_paused(1).unwrap();
+    let (inner, polls, dropped) = probe(true);
+    let mut timeout = driver.handle().timeout(MS, inner).unwrap();
+    clock.advance(MS).unwrap();
+    assert_eq!(
+      poll_with(&mut timeout, Waker::noop()),
+      Poll::Ready(Err(TimeoutError::Elapsed))
+    );
+    assert_eq!(polls.load(Ordering::SeqCst), 0);
+    assert!(dropped.load(Ordering::SeqCst));
+    driver.shutdown().unwrap();
+  }
+
+  #[test]
+  fn concurrent_manual_advances_serialize_without_losing_elapsed_time() {
+    let (driver, clock) = TimerDriver::new_paused(1).unwrap();
+    let start = clock.now();
+    let mut sleep = driver.handle().sleep(2 * HOUR).unwrap();
+    let other = clock.clone();
+    let worker = thread::spawn(move || other.advance(HOUR).unwrap());
+    let first = clock.advance(HOUR).unwrap();
+    let second = worker.join().unwrap();
+    assert_ne!(first, second);
+    assert_eq!(clock.now(), start + 2 * HOUR);
+    assert_eq!(poll_with(&mut sleep, Waker::noop()), Poll::Ready(Ok(())));
+    driver.shutdown().unwrap();
+  }
 
   const HOUR: Duration = Duration::from_secs(3600);
   const MS: Duration = Duration::from_millis(1);
