@@ -31,6 +31,7 @@ use std::process::ChildStdout as StdChildStdout;
 use std::process::{ChildStderr as StdChildStderr, ChildStdin as StdChildStdin};
 use std::task::{Context, Poll};
 
+use rustix::fd::OwnedFd;
 use rustix::fs::{OFlags, fcntl_getfl, fcntl_setfl};
 use rustix::io::{read, readv, write, writev};
 
@@ -162,6 +163,19 @@ impl ChildPipeWriter<StdChildStdin> {
     handle: StdChildStdin,
     reactor: &ReactorHandle,
   ) -> Result<Self, PipeRegistrationError<StdChildStdin>> {
+    register(handle, reactor).map(|fd| Self {
+      fd: Some(fd),
+      waiter: None,
+    })
+  }
+}
+
+impl ChildPipeWriter<OwnedFd> {
+  /// Registers an already-validated owned anonymous pipe writer.
+  pub(crate) fn from_owned_pipe(
+    handle: OwnedFd,
+    reactor: &ReactorHandle,
+  ) -> Result<Self, PipeRegistrationError<OwnedFd>> {
     register(handle, reactor).map(|fd| Self {
       fd: Some(fd),
       waiter: None,

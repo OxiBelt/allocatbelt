@@ -169,6 +169,40 @@ models cover ring transitions and lost-wake registration, not TLS budgeting.
 The endpoints use scalar I/O and its vectored fallback; they do not expose a
 borrowed buffered ring view across lock release.
 
+## General Unix pipes
+
+`runtime::unix_pipe::pipe` creates an anonymous Linux pipe with
+`CLOEXEC | NONBLOCK` and registers both descriptors with the caller's
+`ReactorHandle`. If either registration fails, this constructor drops both
+new descriptors and reclaims any registration it already made. `PipeReader`
+and `PipeWriter` implement initialized-buffer `AsyncRead` and `AsyncWrite`,
+including vectored operations, with the reactor's registration and waiter
+bounds. They do not allocate userspace payload buffers or charge the kernel
+pipe buffer to a managed-memory scope.
+
+`from_owned_fd` imports one endpoint at a time. It checks FIFO type and
+compatible access mode before changing flags or registering; it also rejects
+`O_PATH` and writer descriptors with Linux packet-mode `O_DIRECT`. A refusal
+returns the original `OwnedFd`; a registration refusal separately reports
+any failure to restore the original flags. For a separately imported reader,
+Linux does not expose packet mode on the imported read descriptor, so the
+caller must ensure that its writer peer is not in packet mode. Imported
+descriptors share `O_NONBLOCK` status with aliases; aliases must coordinate
+flags for the entire endpoint lifetime: they must not remove nonblocking mode
+or enable packet mode. Opening a FIFO path and importing the result is not descriptor-relative path confinement.
+
+Each trait poll uses the same active-poll cooperative budget as other
+allocatbelt primitives and then delegates to the bounded child-pipe readiness
+poll. A pending read or write waiter remains owned by the endpoint after a
+dropped poll; a completing poll in that direction (including an empty-buffer
+poll), `cancel_io_waits`, endpoint drop, or writer shutdown releases it. Flush
+does not clear a retained write waiter. Writer shutdown closes only that
+descriptor. EOF waits until all writer descriptors and aliases close. Writes with no readers follow the
+process's current `SIGPIPE` disposition; the module never changes signal
+handling process-wide. Native regressions cover fd type/access recovery,
+registration rollback, partial transfer, EOF, backpressure, waiter
+cancellation, cooperative gating and the inherited signal policy.
+
 ## Managed buffers and operation permits
 
 `runtime::managed::ResourceScope` provides a separate shared ledger for managed
@@ -841,8 +875,8 @@ Runtime-owned outer polls also use a shared 64-operation budget for ready
 `channel` send/receive/reservation/closed-wait, oneshot receive/close,
 semaphore acquisition, mutex acquisition and reader-writer-lock acquisition
 polls, plus `Notify`, watch change/closure, broadcast receive/closure and
-barrier waits, and managed-pipe read/write/flush/shutdown polls. A synchronous
-primitive-to-primitive chain charges once; a
+barrier waits, and managed-pipe and Unix-pipe read/write/flush/shutdown polls.
+A synchronous primitive-to-primitive chain charges once; a
 primitive poll that returns `Pending` restores its provisional charge. Once
 exhausted, the next supported primitive arranges a wake and returns `Pending`
 before it dequeues a message, accepts a send, or transfers a permit/lock guard.
@@ -1396,7 +1430,7 @@ baseline still requires these implementation and qualification steps:
 1. Extend automatic cooperative progress beyond the currently listed
    operations. Expand TCP socket-option and listen-builder coverage beyond the
    explicit single-address nonblocking connect and bound-socket operations.
-2. Add standard I/O adapters and general kernel-pipe construction. Managed
+2. Add standard I/O adapters and FIFO path constructors. Anonymous Unix pipes, managed
    in-memory simplex/duplex pipes and caller-buffered bidirectional copy are
    implemented with explicit partial-progress and half-close contracts. The initialized-buffer `Take`/`Chain`/`Empty`/`Sink`/`Repeat` family,
    bounded delimiter/line and whole-stream reads, and fixed managed buffered

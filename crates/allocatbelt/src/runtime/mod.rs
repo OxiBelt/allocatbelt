@@ -122,6 +122,8 @@ mod tests;
 #[cfg(all(test, not(loom)))]
 mod tests_guard;
 pub mod time;
+#[cfg(not(loom))]
+pub mod unix_pipe;
 #[cfg(all(feature = "runtime-io-uring", not(loom)))]
 pub mod uring;
 #[cfg(any(all(feature = "runtime-io-uring", not(loom)), all(test, loom)))]
