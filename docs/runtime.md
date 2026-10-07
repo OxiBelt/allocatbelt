@@ -61,6 +61,35 @@ filled count while preserving the bytes in the destination. These helpers
 provide bounded application ports, not global automatic cooperation for
 arbitrary direct I/O polls.
 
+`copy_bidirectional_with_buffers` borrows two endpoints that each implement
+`AsyncRead` and `AsyncWrite`, plus two nonempty caller-owned initialized
+slices, one per direction; either empty slice fails with InvalidInput before
+any endpoint is polled. Each direction reads, writes everything it read, and at
+source EOF flushes and then shuts down its destination's write side. The
+reverse direction keeps copying while one direction waits, finishes or has a
+pending shutdown, and the future completes only after both shutdowns succeed.
+A completed flush or shutdown is not repeated. When a source waits after
+writes that were not yet flushed, the direction owes a flush: it keeps that
+flush across polls, including after an exhausted budget or a pending flush,
+and polls it before reading or writing again until it succeeds, without
+polling the waiting source again in the same poll. Half-close is only as
+strong as the endpoint's `poll_shutdown`: registered TCP streams shut down
+their write half, while an adapter whose shutdown closes the whole endpoint
+ends or fails the reverse direction. The helper is a serial state machine
+that alternates one endpoint call per direction and starts the next poll with the direction
+whose turn came next. All reads, writes, flushes, shutdowns and Interrupted
+retries of both directions share one 64-call budget per poll; it self-wakes
+only when that budget runs out with work left, not when both directions wait
+on their endpoints. Any other error, including WouldBlock, ends both
+directions without further polls. The future exposes the bytes each
+destination accepted (saturating at `u64::MAX`) and the unwritten range in
+each slice, updated as each count is validated and still readable after an
+error; dropping it keeps accepted bytes, completed flushes and shutdowns, and
+unwritten bytes in the caller's slices without rollback or replay. Polling it
+after completion panics. It allocates nothing, reserves no managed charges and
+needs no endpoint split. Scripted native tests and a loopback TCP relay cover
+these rules; they do not establish performance.
+
 `AsyncReadExt::take` owns a reader and caps reads at a replaceable remaining
 byte allowance without consuming bytes beyond it. `chain` owns two readers
 and switches to the second only after a nonempty first read reports EOF.
@@ -1367,9 +1396,9 @@ baseline still requires these implementation and qualification steps:
 1. Extend automatic cooperative progress beyond the currently listed
    operations. Expand TCP socket-option and listen-builder coverage beyond the
    explicit single-address nonblocking connect and bound-socket operations.
-2. Add standard I/O adapters, general kernel-pipe construction and bidirectional
-   copy with explicit partial-progress and half-close rules. Managed in-memory
-   simplex and duplex pipes are implemented. The initialized-buffer `Take`/`Chain`/`Empty`/`Sink`/`Repeat` family,
+2. Add standard I/O adapters and general kernel-pipe construction. Managed
+   in-memory simplex/duplex pipes and caller-buffered bidirectional copy are
+   implemented with explicit partial-progress and half-close contracts. The initialized-buffer `Take`/`Chain`/`Empty`/`Sink`/`Repeat` family,
    bounded delimiter/line and whole-stream reads, and fixed managed buffered
    endpoints are implemented; these do not include those remaining operations.
 3. Exercise realistic application ports covering cancellation, bounded

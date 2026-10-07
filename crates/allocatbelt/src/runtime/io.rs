@@ -1,7 +1,8 @@
 //! Runtime-neutral asynchronous I/O over initialized byte buffers: the
 //! [`AsyncRead`], [`AsyncWrite`] and [`AsyncSeek`] traits, the futures their
-//! extension traits return, a bounded [`copy_with_buffer`] and endpoints over
-//! borrowed slices. The [`pipes`] module also provides bounded endpoints over
+//! extension traits return, bounded [`copy_with_buffer`] and
+//! [`copy_bidirectional_with_buffers`] copies, and endpoints over borrowed
+//! slices. The [`pipes`] module also provides bounded endpoints over
 //! caller-owned managed buffers. Like the rest of the runtime this is an experimental
 //! research foundation. It provides the capabilities the runtime's tasks
 //! need, not Tokio's API, and it implements no files, sockets or other
@@ -84,7 +85,7 @@
 //! # Fairness
 //!
 //! The looping futures ([`ReadExact`], [`WriteAll`], [`CopyWithBuffer`],
-//! [`ReadToEndBounded`], [`ReadUntilBounded`]) poll their endpoints at most
+//! [`CopyBidirectional`], [`ReadToEndBounded`], [`ReadUntilBounded`]) poll their endpoints at most
 //! [`POLL_BUDGET`] times per poll. When the budget runs out with work left,
 //! they wake their own task and return `Pending`. These loops retry
 //! `ErrorKind::Interrupted`, counting each attempt against the budget.
@@ -104,7 +105,10 @@
 //! beginning of whatever buffer it is given, so the exact offset of the
 //! operation is lost unless the caller read it from the old future first
 //! ([`ReadExact::filled`], [`WriteAll::written`],
-//! [`CopyWithBuffer::transferred`], [`CopyWithBuffer::unwritten`]). Bounded
+//! [`CopyWithBuffer::transferred`], [`CopyWithBuffer::unwritten`],
+//! [`CopyBidirectional::transferred`], [`CopyBidirectional::unwritten`]).
+//! A bidirectional copy also keeps any flush or write-side shutdown it
+//! completed. Bounded
 //! read futures expose [`filled`](ReadToEndBounded::filled) while pending or
 //! before cancellation; their result and [`BoundedReadError`] also carry the
 //! count after completion. Bytes consumed by delimiter reads stay consumed,
@@ -145,6 +149,10 @@ use std::ops::Range;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
+#[path = "io_bidirectional.rs"]
+mod bidirectional;
+pub use bidirectional::{CopyBidirectional, copy_bidirectional_with_buffers};
+
 #[path = "io_pipes.rs"]
 mod io_pipes;
 pub use io_pipes::pipes;
@@ -166,7 +174,7 @@ pub use bounded::{
 mod bounded_tests;
 
 /// Endpoint operations a looping future ([`ReadExact`], [`WriteAll`],
-/// [`CopyWithBuffer`]) performs in one poll before it wakes its own task and
+/// [`CopyWithBuffer`], [`CopyBidirectional`]) performs in one poll before it wakes its own task and
 /// returns `Pending`.
 pub const POLL_BUDGET: usize = 64;
 
