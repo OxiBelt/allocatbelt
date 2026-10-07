@@ -969,6 +969,75 @@ impl UdpSocket {
     self.fd.get_ref()
   }
 
+  /// Sends one datagram to the peer selected by the standard socket's
+  /// `connect`. Empty buffers still send a zero-length datagram. Peer
+  /// selection is explicit; this method performs no DNS or connection retry.
+  pub async fn send(&self, buf: &[u8]) -> io::Result<usize> {
+    let mut attempts = 0;
+    loop {
+      if attempts == IO_BUDGET {
+        yield_once().await;
+        attempts = 0;
+      }
+      let guard = self.fd.writable().await?;
+      attempts += 1;
+      match guard.try_io(|socket| socket.send(buf)) {
+        Err(error)
+          if matches!(
+            error.kind(),
+            io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock
+          ) => {}
+        result => return result,
+      }
+    }
+  }
+
+  /// Receives one datagram, using the kernel's connected-peer filtering when
+  /// the underlying socket is connected. Excess bytes are discarded; an
+  /// empty buffer consumes a datagram, rather than returning early.
+  pub async fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
+    self.readable_operation(|socket| socket.recv(buf)).await
+  }
+
+  /// Inspects a datagram without consuming it. The returned count is capped
+  /// by the buffer, including zero; a subsequent receive still sees the
+  /// complete original datagram, subject to competing descriptor aliases.
+  pub async fn peek(&self, buf: &mut [u8]) -> io::Result<usize> {
+    self.readable_operation(|socket| socket.peek(buf)).await
+  }
+
+  /// Inspects a datagram and its source without consuming it. Connected
+  /// sockets retain kernel peer filtering. Cancellation releases this
+  /// future's readiness waiter without dequeuing the datagram.
+  pub async fn peek_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
+    self
+      .readable_operation(|socket| socket.peek_from(buf))
+      .await
+  }
+
+  async fn readable_operation<T>(
+    &self,
+    mut operation: impl FnMut(&StdUdpSocket) -> io::Result<T>,
+  ) -> io::Result<T> {
+    let mut attempts = 0;
+    loop {
+      if attempts == IO_BUDGET {
+        yield_once().await;
+        attempts = 0;
+      }
+      let guard = self.fd.readable().await?;
+      attempts += 1;
+      match guard.try_io(&mut operation) {
+        Err(error)
+          if matches!(
+            error.kind(),
+            io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock
+          ) => {}
+        result => return result,
+      }
+    }
+  }
+
   /// Sends one complete datagram in one syscall. A short successful count is
   /// returned as reported by the operating system.
   pub async fn send_to(&self, buf: &[u8], address: SocketAddr) -> io::Result<usize> {

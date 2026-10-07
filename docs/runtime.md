@@ -213,6 +213,13 @@ covered by native tests, not by the current Loom helper models.
 ## Network endpoints and DNS
 
 `runtime::net` supplies explicitly registered TCP, UDP and Unix endpoints.
+UDP endpoints support connected `send`/`recv` and non-consuming `peek` and
+`peek_from`. Select the peer through the underlying standard socket's
+`connect`, before or after registration; the kernel then filters received
+peers. Empty sends produce datagrams, empty receives consume them, and peeks
+retain the original message even when the supplied buffer is empty or short.
+Named-method cancellation releases its readiness waiter. Descriptor aliases
+can still compete for messages or change the connected peer.
 Named read, write, accept and datagram methods preserve partial progress,
 EOF and message boundaries. They retry interrupted calls and stale readiness
 after clearing `WouldBlock`, yielding after 64 endpoint calls per poll.
@@ -1233,7 +1240,7 @@ baseline still requires these implementation and qualification steps:
 
 1. Extend automatic cooperative progress beyond the listed channel and lock
    operations. Add cancellation-friendly nonblocking connect and supplied/bound
-   socket ports, connected UDP operations and datagram peeking.
+   socket ports.
 2. Add standard I/O adapters and general pipe construction, bounded delimiter,
    line and whole-stream reads, stream composition, managed in-memory pipes
    and bidirectional copy with explicit partial-progress and half-close rules.

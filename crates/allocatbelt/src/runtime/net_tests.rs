@@ -365,6 +365,73 @@ fn udp_keeps_datagram_boundaries() {
   assert_eq!(&buf[..second_len], b"second");
 }
 
+#[test]
+fn connected_udp_filters_peers_peeks_without_consuming_and_preserves_empty_messages() {
+  let reactor = reactor(2);
+  let handle = reactor.handle();
+  let left = StdUdpSocket::bind("127.0.0.1:0").unwrap();
+  let right = StdUdpSocket::bind("127.0.0.1:0").unwrap();
+  let outsider = StdUdpSocket::bind("127.0.0.1:0").unwrap();
+  let left_addr = left.local_addr().unwrap();
+  let right_addr = right.local_addr().unwrap();
+  left.connect(right_addr).unwrap();
+  right.connect(left_addr).unwrap();
+  let left = UdpSocket::from_std(left, &handle).unwrap();
+  let right = UdpSocket::from_std(right, &handle).unwrap();
+
+  outsider.send_to(b"outsider", right_addr).unwrap();
+  assert_eq!(block_on(left.send(b"first-message")).unwrap(), 13);
+  let mut short = [0; 3];
+  assert_eq!(block_on(right.peek(&mut short)).unwrap(), 3);
+  assert_eq!(&short, b"fir");
+  let mut full = [0; 32];
+  let (length, source) = block_on(right.peek_from(&mut full)).unwrap();
+  assert_eq!(source, left_addr);
+  assert_eq!(&full[..length], b"first-message");
+  assert_eq!(block_on(right.recv(&mut short)).unwrap(), 3);
+  assert_eq!(&short, b"fir");
+
+  // Truncating receive discards the remainder, unlike a short peek.
+  block_on(left.send(b"next")).unwrap();
+  let length = block_on(right.recv(&mut full)).unwrap();
+  assert_eq!(&full[..length], b"next");
+  assert_eq!(block_on(left.send(&[])).unwrap(), 0);
+  assert_eq!(block_on(right.peek(&mut full)).unwrap(), 0);
+  assert_eq!(block_on(right.recv(&mut full)).unwrap(), 0);
+  block_on(left.send(b"discard-by-empty-buffer")).unwrap();
+  assert_eq!(block_on(right.recv(&mut [])).unwrap(), 0);
+  block_on(left.send(b"after-empty")).unwrap();
+  let length = block_on(right.recv(&mut full)).unwrap();
+  assert_eq!(&full[..length], b"after-empty");
+  assert_eq!(handle.waiters(), 0);
+}
+
+#[test]
+fn cancelled_udp_peek_releases_waiter_and_zero_buffer_peek_keeps_datagram() {
+  let reactor = reactor(1);
+  let handle = reactor.handle();
+  let socket = StdUdpSocket::bind("127.0.0.1:0").unwrap();
+  let address = socket.local_addr().unwrap();
+  let peer = StdUdpSocket::bind("127.0.0.1:0").unwrap();
+  let socket = UdpSocket::from_std(socket, &handle).unwrap();
+  let mut byte = [0; 1];
+  {
+    let mut future = pin!(socket.peek_from(&mut byte));
+    let mut context = Context::from_waker(Waker::noop());
+    assert!(future.as_mut().poll(&mut context).is_pending());
+    assert_eq!(handle.waiters(), 1);
+  }
+  assert_eq!(handle.waiters(), 0);
+  peer.send_to(b"preserve", address).unwrap();
+  let (length, source) = block_on(socket.peek_from(&mut [])).unwrap();
+  assert_eq!(length, 0);
+  assert_eq!(source, peer.local_addr().unwrap());
+  let mut bytes = [0; 16];
+  let length = block_on(socket.recv(&mut bytes)).unwrap();
+  assert_eq!(&bytes[..length], b"preserve");
+  assert_eq!(handle.waiters(), 0);
+}
+
 #[cfg(unix)]
 #[test]
 fn unix_datagram_preserves_each_send_as_one_message() {
