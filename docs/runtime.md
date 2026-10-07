@@ -98,6 +98,26 @@ not managed-storage charges or a total memory budget. Socket wrappers and their
 I/O-trait integration require separate APIs. Reactor protocol behavior is
 covered by native tests, not by the current Loom helper models.
 
+## Bounded fair semaphore
+
+`runtime::semaphore::Semaphore` has an explicit preallocated waiter bound.
+FIFO requests prevent both later waiters and immediate acquisitions from
+passing a head request that needs more permits. A full waiter table returns
+`Full`; cancellation removes a request and restores any unobserved grant.
+Zero-sized requests are valid and obey the same queue order.
+
+Closing resolves queued and granted but unobserved acquisitions as `Closed`.
+Issued permits remain valid and return their count on drop; `forget` removes
+that count permanently. Checked `add_permits` can increase the total while
+open. These are cooperative units, independent of the managed resource ledger.
+The waiter bound excludes shared helper metadata and arbitrary caller storage.
+Callbacks run outside the ledger lock. Close publishes terminal outcomes but
+does not wait for callbacks already claimed on other threads.
+
+Native tests and three Loom models exercise the production ledger, immediate
+acquisition, queued cancellation/grant races, close and slot-generation reuse.
+The models do not cover arbitrary user waker behavior or every scheduler path.
+
 ## Owned asynchronous tasks
 
 `runtime::asynchronous::AsyncRuntime` runs owned `Send + 'static` futures on a
@@ -139,7 +159,8 @@ Loom exercises production task transition helpers and managed-ledger methods.
 Some scope models are capped at 10,000 permutations and use a small generation
 table. Full queues, worker parking, actual wakers, ownership and scope pointer
 identity are outside those models; native lifecycle tests cover these paths.
-This foundation supplies no I/O reactor yet.
+The separately constructed epoll reactor and timer driver can wake executor
+tasks; their registration limits are configured independently.
 
 ## Current-thread local tasks
 
@@ -172,8 +193,9 @@ and scope-slot reclamation.
 Dropping the runtime synchronously cancels and drops imported local futures on
 its owner thread, so their destructors may run user code. All task polling,
 future/output destruction, and join callbacks happen outside scheduler and
-admission locks. The executor has no I/O reactor and does not provide borrowed
-spawned tasks, preemption, or a CPU-time quota.
+admission locks. The separately constructed epoll reactor can wake local tasks
+while the owner polls the runtime. Borrowed spawned tasks, preemption and
+CPU-time quotas remain outside the executor contract.
 Future cleanup occurs on the owner thread. A join with a `Send` output can
 move to another thread, where that output may be observed or dropped.
 
@@ -361,10 +383,10 @@ Admission counters are not resource-usage measurements.
 The lifecycle foundation above is implemented. Remaining milestones include:
 
 1. Task utilities and integration of resource permits into active polling.
-2. Timers and a Linux I/O reactor with bounded submission, completion ownership,
-   sandbox fallback and cancellation-safe buffers.
-3. TCP/UDP, file I/O, synchronization and blocking adapters; define compatibility
-   requirements against real Tokio application workloads.
+2. Integrate the implemented timers, epoll readiness and owned filesystem APIs
+   into application ports; complete buffered I/O and socket adapters.
+3. Complete synchronization, processes, signals and concurrency helpers;
+   verify compatibility requirements against real Tokio application workloads.
 4. Resource measurement and optional cgroup-aware feedback, with explicit
    admission versus enforcement semantics and oscillation/overload tests.
 5. Profile-driven scheduler and ISA variants, promoted only after correctness,

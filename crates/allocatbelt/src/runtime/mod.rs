@@ -85,6 +85,7 @@ mod model;
 pub mod reactor;
 mod resources;
 mod scheduler;
+pub mod semaphore;
 mod state;
 mod sync;
 mod task;
