@@ -10,8 +10,10 @@ use std::fs::OpenOptions;
 use std::io::{self, Write};
 use std::process::ExitCode;
 use std::sync::{Arc, Condvar, Mutex, mpsc};
+use std::task::{Context, Poll, Wake, Waker};
 use std::thread;
 use std::time::{Duration, Instant};
+use std::{future::Future, pin::Pin};
 
 use allocatbelt::runtime::asynchronous::{
   AsyncConfig, AsyncError, AsyncHandle, AsyncJob, AsyncRuntime, AsyncShutdown,
@@ -37,7 +39,7 @@ const DRAIN_TIMEOUT: Duration = Duration::from_secs(300);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(60);
 const PROCESS_TIMEOUT: Duration = Duration::from_secs(900);
 const MAX_RETAINED_MEMORY_OUTPUTS: usize = WINDOW;
-const TSV_HEADER: &str = "schema\tallocator\texecutor\tworkload\tmode\tasync_workers\tblocking_workers\ttopology\tlogical_window\tglobal_task_limit\tretained_window\tarrival_rate_per_second\trequested_arrivals\tattempted\tadmitted\trejected_full\trejected_resource\tcompleted_on_time\tcompleted_late\terrors\tcancellations\tunresolved\tlost\tresult_digest\texpected_digest\tcapacity_publications_per_second\tsuccessful_throughput_through_drain_per_second\tsetup_ns\ttimer_pair_median_ns\twall_through_drain_ns\tdrain_tail_ns\tresponse_p50_ns\tresponse_p95_ns\tresponse_p99_ns\tproducer_lateness_mean_ns\tproducer_lateness_max_ns\tmax_observed_managed_bytes\tretained_managed_bytes\tmanaged_limit_bytes\tdisk_limit_ops\tnetwork_limit_ops\tfinal_managed_bytes\tfinal_disk_ops\tfinal_network_ops\trss_before_kib\trss_after_drain_kib\trss_after_shutdown_kib\thwm_before_kib\thwm_after_drain_kib\thwm_after_shutdown_kib\tshutdown_ns";
+const TSV_HEADER: &str = "schema\tallocator\texecutor\tworkload\tmode\tasync_workers\tblocking_workers\ttopology\tlogical_window\tglobal_task_limit\tretained_window\tarrival_rate_per_second\trequested_arrivals\tattempted\tadmitted\trejected_full\trejected_resource\tcompleted_on_time\tcompleted_late\terrors\tcancellations\tunresolved\tlost\tresult_digest\texpected_digest\tcapacity_publications_per_second\tsuccessful_throughput_through_drain_per_second\tsetup_ns\ttimer_pair_median_ns\twall_through_drain_ns\tdrain_tail_ns\tresponse_p50_ns\tresponse_p95_ns\tresponse_p99_ns\tproducer_lateness_mean_ns\tproducer_lateness_max_ns\tmax_observed_managed_bytes\tretained_managed_bytes\tmanaged_limit_bytes\tdisk_limit_ops\tnetwork_limit_ops\tfinal_managed_bytes\tfinal_disk_ops\tfinal_network_ops\trss_before_kib\trss_after_drain_kib\trss_after_shutdown_kib\thwm_before_kib\thwm_after_drain_kib\thwm_after_shutdown_kib\tshutdown_ns\trejected_logical_window\trejected_backend_full";
 
 /// Executor under test.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -174,15 +176,41 @@ impl WorkOutput {
 
 enum Job {
   Bounded(AsyncJob<allocatbelt_app_ports::PortResult<WorkOutput>>),
-  Tokio(tokio::task::JoinHandle<allocatbelt_app_ports::PortResult<WorkOutput>>),
+  Tokio {
+    handle: tokio::task::JoinHandle<allocatbelt_app_ports::PortResult<WorkOutput>>,
+    result: Option<Result<allocatbelt_app_ports::PortResult<WorkOutput>, tokio::task::JoinError>>,
+  },
 }
 
 impl Job {
-  fn is_finished(&self) -> bool {
+  fn poll_finished(&mut self, cx: &mut Context<'_>) -> Poll<()> {
     match self {
-      Self::Bounded(job) => job.is_finished(),
-      Self::Tokio(job) => job.is_finished(),
+      Self::Bounded(job) => Pin::new(job).poll_finished(cx),
+      Self::Tokio { handle, result } => {
+        if result.is_some() {
+          return Poll::Ready(());
+        }
+        match Pin::new(handle).poll(cx) {
+          Poll::Pending => Poll::Pending,
+          Poll::Ready(output) => {
+            *result = Some(output);
+            Poll::Ready(())
+          }
+        }
+      }
     }
+  }
+}
+
+struct ObserverWake(mpsc::SyncSender<ObserverEvent>);
+
+impl Wake for ObserverWake {
+  fn wake(self: Arc<Self>) {
+    let _ = self.0.try_send(ObserverEvent::Ready);
+  }
+
+  fn wake_by_ref(self: &Arc<Self>) {
+    let _ = self.0.try_send(ObserverEvent::Ready);
   }
 }
 
@@ -211,7 +239,7 @@ enum Submitter {
 #[derive(Clone)]
 enum Observer {
   Bounded(AsyncHandle),
-  Tokio(tokio::runtime::Handle),
+  Tokio,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -227,19 +255,13 @@ impl Submitter {
     config: LaneConfig,
     resources: &ResourceScope,
     id: u64,
-    ready_events: mpsc::SyncSender<ObserverEvent>,
   ) -> Result<Job, Rejection> {
     let seed = job_seed(id);
     match self {
       Self::Bounded { handle, disk } => {
         let driver = disk.clone().map(DiskDriver::Native);
         let operation = operation(workload, config, resources.clone(), seed, driver);
-        let future = async move {
-          let result = operation.await;
-          let _ = ready_events.send(ObserverEvent::Ready);
-          result
-        };
-        handle.spawn(future).map(Job::Bounded).map_err(|error| {
+        handle.spawn(operation).map(Job::Bounded).map_err(|error| {
           if error.kind == AsyncError::Full {
             Rejection::Full
           } else {
@@ -264,12 +286,14 @@ impl Submitter {
           slots,
         });
         let operation = operation(workload, config, resources.clone(), seed, driver);
-        Ok(Job::Tokio(handle.spawn(async move {
-          let result = operation.await;
-          let _ = ready_events.send(ObserverEvent::Ready);
-          drop(permit);
-          result
-        })))
+        Ok(Job::Tokio {
+          handle: handle.spawn(async move {
+            let result = operation.await;
+            drop(permit);
+            result
+          }),
+          result: None,
+        })
       }
     }
   }
@@ -320,10 +344,18 @@ impl Observer {
         .map_err(|error| format!("allocatbelt observer root failed: {error}"))?
         .map_err(|error| format!("allocatbelt application task failed: {error}"))?
         .map_err(|error| error.to_string()),
-      (Self::Tokio(handle), Job::Tokio(job)) => handle
-        .block_on(job)
+      (
+        Self::Tokio,
+        Job::Tokio {
+          result: Some(result),
+          ..
+        },
+      ) => result
         .map_err(|error| format!("Tokio application task failed: {error}"))?
         .map_err(|error| error.to_string()),
+      (Self::Tokio, Job::Tokio { result: None, .. }) => {
+        Err("Tokio task was consumed before terminal completion".into())
+      }
       _ => Err("job was delivered to the wrong executor observer".into()),
     }
   }
@@ -357,6 +389,8 @@ struct ProducerReport {
   attempted: usize,
   admitted: usize,
   rejected_full: usize,
+  rejected_logical_window: usize,
+  rejected_backend_full: usize,
   lateness_sum_ns: u128,
   lateness_max_ns: u64,
   started_at: Instant,
@@ -516,6 +550,17 @@ fn run_with_limits(
   let setup_started = Instant::now();
   validate_options(options)?;
   let config = LaneConfig::default();
+  let oracle_count = open_loop_arrivals.unwrap_or(OPEN_LOOP_ARRIVALS);
+  let cpu_oracle = if options.mode == Mode::OpenLoop && options.workload == Workload::Cpu {
+    let mut oracle = Vec::new();
+    oracle
+      .try_reserve_exact(oracle_count)
+      .map_err(|_| "could not reserve bounded CPU oracle".to_owned())?;
+    oracle.extend((0..oracle_count).map(|id| expected_value(Workload::Cpu, &config, id as u64)));
+    Some(Arc::new(oracle))
+  } else {
+    None
+  };
   let limits = resource_limits(options.workload);
   let resources = ResourceScope::new(limits);
   let mut disk_runtime =
@@ -581,7 +626,7 @@ fn run_with_limits(
       if options.workload == Workload::Disk {
         disk_lane::warm_tokio_workers(&handle, 4)?;
       }
-      let observer = Observer::Tokio(handle.clone());
+      let observer = Observer::Tokio;
       (
         Submitter::Tokio {
           handle,
@@ -616,6 +661,8 @@ fn run_with_limits(
   let (credits_tx, credits_rx) = mpsc::sync_channel(WINDOW);
   let (producer_tx, producer_rx) = mpsc::sync_channel(1);
   let observer_ids = id_states.clone();
+  let observer_cpu_oracle = cpu_oracle.clone();
+  let observer_completion_events = events_tx.clone();
   let observer_resources = resources.clone();
   let observer_arrivals = open_loop_arrivals.unwrap_or(OPEN_LOOP_ARRIVALS);
   let observer_pending_limit = if options.mode == Mode::OpenLoop {
@@ -633,10 +680,13 @@ fn run_with_limits(
         config,
         observer_resources,
         events_rx,
+        observer_completion_events,
         credits_tx,
         observer_ids,
         observer_arrivals,
         observer_pending_limit,
+        Duration::from_millis(100),
+        observer_cpu_oracle,
       );
       let _ = observer_tx.send(report);
     })
@@ -679,7 +729,8 @@ fn run_with_limits(
     .join()
     .map_err(|_| "application observer panicked".to_owned())?;
   let rss_after_drain = sample_after_checkpoint_delay()?;
-  let expected_checksum = expected_digest(options, &observer_report, &producer);
+  let expected_checksum =
+    expected_digest(options, &observer_report, &producer, cpu_oracle.as_deref());
   let statuses = observer_report.final_statuses.as_ref();
   validate_counts(
     options,
@@ -999,7 +1050,8 @@ fn produce(
   };
   let mut attempted = 0;
   let mut admitted = 0;
-  let mut rejected_full = 0;
+  let mut rejected_logical_window = 0;
+  let mut rejected_backend_full = 0;
   let mut lateness_sum_ns = 0u128;
   let mut lateness_max_ns = 0u64;
   let mut outstanding = 0usize;
@@ -1062,13 +1114,13 @@ fn produce(
     attempted += 1;
     let state_table = states.as_ref();
     if options.mode == Mode::OpenLoop && outstanding >= WINDOW {
-      rejected_full += 1;
+      rejected_logical_window += 1;
       if let Some(states) = state_table {
         states.lock().unwrap_or_else(|e| e.into_inner())[id as usize] = IdState::Rejected;
       }
       continue;
     }
-    match submitter.submit(options.workload, config, resources, id, events.clone()) {
+    match submitter.submit(options.workload, config, resources, id) {
       Ok(job) => {
         admitted += 1;
         outstanding += 1;
@@ -1085,12 +1137,12 @@ fn produce(
           .map_err(|_| "observer queue closed before publication".to_owned())?;
       }
       Err(Rejection::Full) => {
-        rejected_full += 1;
+        rejected_backend_full += 1;
         if let Some(states) = state_table {
           states.lock().unwrap_or_else(|e| e.into_inner())[id as usize] = IdState::Rejected;
         }
         if options.mode == Mode::Capacity {
-          return Err("capacity mode encountered a task-window Full rejection".into());
+          return Err("capacity mode encountered a backend Full rejection".into());
         }
       }
       Err(Rejection::Closed) => return Err("executor closed during admission".into()),
@@ -1107,7 +1159,9 @@ fn produce(
   Ok(ProducerReport {
     attempted,
     admitted,
-    rejected_full,
+    rejected_full: rejected_logical_window + rejected_backend_full,
+    rejected_logical_window,
+    rejected_backend_full,
     lateness_sum_ns,
     lateness_max_ns,
     started_at: start,
@@ -1123,10 +1177,13 @@ fn observe(
   config: LaneConfig,
   resources: ResourceScope,
   events: mpsc::Receiver<ObserverEvent>,
+  completion_events: mpsc::SyncSender<ObserverEvent>,
   credits: mpsc::SyncSender<()>,
   states: Option<Arc<Mutex<Vec<IdState>>>>,
   open_loop_arrivals: usize,
   pending_limit: usize,
+  watchdog_timeout: Duration,
+  cpu_oracle: Option<Arc<Vec<u64>>>,
 ) -> Result<ObserverReport, String> {
   let mut completed_on_time = 0;
   let mut completed_late = 0;
@@ -1149,8 +1206,9 @@ fn observe(
     .try_reserve_exact(pending_limit)
     .map_err(|_| "could not reserve bounded observer jobs".to_owned())?;
   let mut producer_done = false;
+  let completion_waker = Waker::from(Arc::new(ObserverWake(completion_events)));
   loop {
-    let event = match events.recv_timeout(Duration::from_micros(100)) {
+    let event = match events.recv_timeout(watchdog_timeout) {
       Ok(event) => Some(event),
       Err(mpsc::RecvTimeoutError::Timeout) => None,
       Err(mpsc::RecvTimeoutError::Disconnected) => {
@@ -1185,7 +1243,11 @@ fn observe(
     record_managed_sample(&resources, &mut max_observed_managed_bytes);
     let mut index = 0;
     while index < pending.len() {
-      if !pending[index].3.is_finished() {
+      let poll = {
+        let mut context = Context::from_waker(&completion_waker);
+        pending[index].3.poll_finished(&mut context)
+      };
+      if poll.is_pending() {
         index += 1;
         continue;
       }
@@ -1197,7 +1259,13 @@ fn observe(
       match result {
         Ok(output) => {
           let output_value = output.value();
-          if !validate_output(options.workload, &config, id, &output) {
+          if !validate_output_with_oracle(
+            options.workload,
+            &config,
+            id,
+            &output,
+            cpu_oracle.as_deref(),
+          ) {
             errors += 1;
           } else {
             completed = true;
@@ -1300,9 +1368,26 @@ fn expected_value(workload: Workload, config: &LaneConfig, id: u64) -> u64 {
   }
 }
 
+#[cfg(test)]
 fn validate_output(workload: Workload, config: &LaneConfig, id: u64, output: &WorkOutput) -> bool {
+  validate_output_with_oracle(workload, config, id, output, None)
+}
+
+fn validate_output_with_oracle(
+  workload: Workload,
+  config: &LaneConfig,
+  id: u64,
+  output: &WorkOutput,
+  cpu_oracle: Option<&Vec<u64>>,
+) -> bool {
   match (workload, output) {
-    (Workload::Cpu, WorkOutput::Cpu(value)) => *value == expected_value(workload, config, id),
+    (Workload::Cpu, WorkOutput::Cpu(value)) => {
+      let expected = match cpu_oracle {
+        Some(oracle) => oracle.get(id as usize).copied(),
+        None => Some(expected_value(workload, config, id)),
+      };
+      expected == Some(*value)
+    }
     (Workload::Memory, WorkOutput::Memory(output)) => {
       output.report.charged_after_growth == output.buffer.charged_bytes()
         && output.buffer.len() == config.memory.grown_bytes
@@ -1329,13 +1414,21 @@ fn accept_capacity_id(next: &mut u64, id: u64) -> Result<(), String> {
   Ok(())
 }
 
-fn expected_digest(options: Options, observer: &ObserverReport, producer: &ProducerReport) -> u64 {
+fn expected_digest(
+  options: Options,
+  observer: &ObserverReport,
+  producer: &ProducerReport,
+  cpu_oracle: Option<&Vec<u64>>,
+) -> u64 {
   let mut digest = 0u64;
   match &observer.final_statuses {
     Some(statuses) => {
       for (id, state) in statuses.iter().enumerate() {
         if *state == IdState::Completed {
-          let value = expected_value(options.workload, &LaneConfig::default(), id as u64);
+          let value = match cpu_oracle {
+            Some(oracle) => oracle[id],
+            None => expected_value(options.workload, &LaneConfig::default(), id as u64),
+          };
           digest = digest.wrapping_add(value ^ id as u64);
         }
       }
@@ -1343,7 +1436,10 @@ fn expected_digest(options: Options, observer: &ObserverReport, producer: &Produ
     None => {
       let count = producer.admitted;
       for id in 0..count {
-        let value = expected_value(options.workload, &LaneConfig::default(), id as u64);
+        let value = match cpu_oracle {
+          Some(oracle) => oracle[id],
+          None => expected_value(options.workload, &LaneConfig::default(), id as u64),
+        };
         digest = digest.wrapping_add(value ^ id as u64);
       }
     }
@@ -1360,6 +1456,9 @@ fn validate_counts(
   open_loop_arrivals: usize,
 ) -> Result<(), String> {
   let completed = observer.completed_on_time + observer.completed_late;
+  if producer.rejected_full != producer.rejected_logical_window + producer.rejected_backend_full {
+    return Err("Full rejection counters do not reconcile".into());
+  }
   if observer.digest != expected_checksum {
     return Err("per-ID validated results do not match the independent digest".into());
   }
@@ -1500,7 +1599,7 @@ fn print_row(allocator: &str, options: Options, counts: &Counts) {
     _ => WINDOW,
   };
   let fields = [
-    "1".to_owned(),
+    "2".to_owned(),
     allocator.to_owned(),
     options.executor.label().to_owned(),
     options.workload.label().to_owned(),
@@ -1574,6 +1673,8 @@ fn print_row(allocator: &str, options: Options, counts: &Counts) {
     counts.rss_after_drain.hwm_kib.to_string(),
     counts.rss_after_shutdown.hwm_kib.to_string(),
     counts.driver_shutdown_ns.to_string(),
+    counts.producer.rejected_logical_window.to_string(),
+    counts.producer.rejected_backend_full.to_string(),
   ];
   debug_assert_eq!(fields.len(), TSV_HEADER.split('\t').count());
   println!("{TSV_HEADER}");
@@ -1595,13 +1696,14 @@ fn percentile(samples: &[u64], percentile: usize) -> u64 {
 #[cfg(test)]
 mod tests {
   use super::{
-    DiskReport, Executor, IdState, Job, LaneConfig, Mode, Observer, ObserverEvent, Options,
-    WorkOutput, Workload, accept_capacity_id, observe, resource_limits, run_with_limits,
-    validate_output,
+    AsyncConfig, AsyncRuntime, AsyncShutdown, DiskReport, Executor, IdState, Job, LaneConfig, Mode,
+    Observer, ObserverEvent, Options, WorkOutput, Workload, accept_capacity_id, observe,
+    resource_limits, run_with_limits, validate_output,
   };
   use allocatbelt::runtime::managed::{ResourceLimits, ResourceScope};
   use std::sync::{Arc, Mutex, mpsc};
-  use std::time::Instant;
+  use std::task::Waker;
+  use std::time::{Duration, Instant};
 
   #[test]
   fn cpu_result_validation_checks_each_job_against_its_stable_id() {
@@ -1625,6 +1727,77 @@ mod tests {
       8,
       &WorkOutput::Cpu(expected)
     ));
+  }
+
+  #[test]
+  fn precomputed_open_loop_cpu_oracle_rejects_corruption_and_wrong_ids() {
+    let config = LaneConfig::default();
+    let oracle = vec![
+      super::expected_value(Workload::Cpu, &config, 0),
+      super::expected_value(Workload::Cpu, &config, 1),
+    ];
+    assert!(super::validate_output_with_oracle(
+      Workload::Cpu,
+      &config,
+      1,
+      &WorkOutput::Cpu(oracle[1]),
+      Some(&oracle),
+    ));
+    assert!(!super::validate_output_with_oracle(
+      Workload::Cpu,
+      &config,
+      1,
+      &WorkOutput::Cpu(oracle[1] ^ 1),
+      Some(&oracle),
+    ));
+    assert!(!super::validate_output_with_oracle(
+      Workload::Cpu,
+      &config,
+      2,
+      &WorkOutput::Cpu(oracle[1]),
+      Some(&oracle),
+    ));
+  }
+
+  #[test]
+  fn allocatbelt_terminal_poll_wakes_the_observer_only_after_publication() {
+    let runtime = AsyncRuntime::new(AsyncConfig {
+      workers: 1,
+      max_outstanding: 1,
+      max_scopes: 1,
+    })
+    .expect("allocatbelt runtime");
+    let handle = runtime.handle();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+    let mut job = Job::Bounded(
+      handle
+        .spawn(async move {
+          release_rx.await.map_err(|_| "gate closed".to_owned())?;
+          Ok(WorkOutput::Cpu(42))
+        })
+        .expect("admit gated task"),
+    );
+    let (completion_tx, completion_rx) = mpsc::sync_channel(1);
+    let completion_waker = Waker::from(Arc::new(super::ObserverWake(completion_tx)));
+    let mut context = std::task::Context::from_waker(&completion_waker);
+    assert!(job.poll_finished(&mut context).is_pending());
+    release_tx.send(()).expect("release gated task");
+    completion_rx
+      .recv_timeout(Duration::from_secs(2))
+      .expect("terminal publication must wake the observer");
+    assert!(job.poll_finished(&mut context).is_ready());
+    let output = match job {
+      Job::Bounded(job) => handle
+        .block_on(job)
+        .expect("root poll")
+        .expect("task result")
+        .expect("workload result"),
+      Job::Tokio { .. } => unreachable!(),
+    };
+    assert_eq!(output.value(), 42);
+    runtime
+      .shutdown(AsyncShutdown::Drain)
+      .expect("runtime drains after join consumption");
   }
 
   #[test]
@@ -1737,16 +1910,23 @@ mod tests {
     let config = LaneConfig::default();
     let first_value = super::expected_value(Workload::Cpu, &config, 0);
     let second_value = super::expected_value(Workload::Cpu, &config, 1);
-    let first = Job::Tokio(handle.spawn(async move {
-      first_gate
-        .await
-        .map_err(|_| "test gate closed".to_owned())?;
-      Ok(WorkOutput::Cpu(first_value))
-    }));
-    let second = Job::Tokio(handle.spawn(async move { Ok(WorkOutput::Cpu(second_value)) }));
+    let first = Job::Tokio {
+      handle: handle.spawn(async move {
+        first_gate
+          .await
+          .map_err(|_| "test gate closed".to_owned())?;
+        Ok(WorkOutput::Cpu(first_value))
+      }),
+      result: None,
+    };
+    let second = Job::Tokio {
+      handle: handle.spawn(async move { Ok(WorkOutput::Cpu(second_value)) }),
+      result: None,
+    };
     let started = Instant::now();
     let horizon = started + std::time::Duration::from_secs(5);
-    let (events_tx, events_rx) = mpsc::channel();
+    let (events_tx, events_rx) = mpsc::sync_channel(16);
+    let completion_tx = events_tx.clone();
     let (credits_tx, credits_rx) = mpsc::sync_channel(8);
     events_tx
       .send(ObserverEvent::Job {
@@ -1775,7 +1955,7 @@ mod tests {
     let (report_tx, report_rx) = mpsc::sync_channel(1);
     let observer = std::thread::spawn(move || {
       let _ = report_tx.send(observe(
-        Observer::Tokio(handle),
+        Observer::Tokio,
         Options {
           executor: Executor::Tokio,
           workload: Workload::Cpu,
@@ -1785,10 +1965,13 @@ mod tests {
         config,
         ResourceScope::new(resource_limits(Workload::Cpu)),
         events_rx,
+        completion_tx,
         credits_tx,
         Some(Arc::clone(&states)),
         2,
         8,
+        Duration::from_secs(5),
+        None,
       ));
     });
 
@@ -1823,39 +2006,46 @@ mod tests {
     let (started_tx, started_rx) = mpsc::sync_channel(1);
     let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
     let checksum = super::expected_value(Workload::Disk, &config, 0);
-    let job = Job::Tokio(handle.spawn(async move {
-      let buffer = job_resources
-        .try_alloc_zeroed(512)
-        .map_err(|error| error.to_string())?;
-      started_tx.send(()).expect("test observes allocation");
-      release_rx
-        .await
-        .map_err(|_| "test gate closed".to_owned())?;
-      drop(buffer);
-      Ok(WorkOutput::Disk(DiskReport {
-        offset: disk_config.offset,
-        bytes: disk_config.bytes,
-        checksum,
-        resources_after_cleanup: job_resources.snapshot(),
-        temp_directory_removed: true,
-      }))
-    }));
+    let job = Job::Tokio {
+      handle: handle.spawn(async move {
+        let buffer = job_resources
+          .try_alloc_zeroed(512)
+          .map_err(|error| error.to_string())?;
+        started_tx.send(()).expect("test observes allocation");
+        release_rx
+          .await
+          .map_err(|_| "test gate closed".to_owned())?;
+        drop(buffer);
+        Ok(WorkOutput::Disk(DiskReport {
+          offset: disk_config.offset,
+          bytes: disk_config.bytes,
+          checksum,
+          resources_after_cleanup: job_resources.snapshot(),
+          temp_directory_removed: true,
+        }))
+      }),
+      result: None,
+    };
     started_rx
       .recv_timeout(std::time::Duration::from_secs(2))
       .expect("disk job should hold its managed buffer before observer startup");
     let ready_checksum = super::expected_value(Workload::Disk, &config, 1);
-    let ready_job = Job::Tokio(handle.spawn(async move {
-      Ok(WorkOutput::Disk(DiskReport {
-        offset: disk_config.offset,
-        bytes: disk_config.bytes,
-        checksum: ready_checksum,
-        resources_after_cleanup: ready_job_resources.snapshot(),
-        temp_directory_removed: true,
-      }))
-    }));
+    let ready_job = Job::Tokio {
+      handle: handle.spawn(async move {
+        Ok(WorkOutput::Disk(DiskReport {
+          offset: disk_config.offset,
+          bytes: disk_config.bytes,
+          checksum: ready_checksum,
+          resources_after_cleanup: ready_job_resources.snapshot(),
+          temp_directory_removed: true,
+        }))
+      }),
+      result: None,
+    };
     let started = Instant::now();
     let horizon = started + std::time::Duration::from_secs(5);
-    let (events_tx, events_rx) = mpsc::channel();
+    let (events_tx, events_rx) = mpsc::sync_channel(16);
+    let completion_tx = events_tx.clone();
     let (credits_tx, credits_rx) = mpsc::sync_channel(8);
     events_tx
       .send(ObserverEvent::Job {
@@ -1884,7 +2074,7 @@ mod tests {
     let (report_tx, report_rx) = mpsc::sync_channel(1);
     let observer = std::thread::spawn(move || {
       let _ = report_tx.send(observe(
-        Observer::Tokio(handle),
+        Observer::Tokio,
         Options {
           executor: Executor::Tokio,
           workload: Workload::Disk,
@@ -1894,10 +2084,13 @@ mod tests {
         config,
         resources,
         events_rx,
+        completion_tx,
         credits_tx,
         Some(states),
         2,
         8,
+        Duration::from_millis(100),
+        None,
       ));
     });
 
@@ -1950,6 +2143,10 @@ mod tests {
     )
     .expect("short open-loop lane should drain and validate");
     assert_eq!(counts.producer.attempted, 128);
+    assert_eq!(
+      counts.producer.rejected_full,
+      counts.producer.rejected_logical_window + counts.producer.rejected_backend_full
+    );
     assert_eq!(
       counts.producer.admitted + counts.producer.rejected_full,
       128

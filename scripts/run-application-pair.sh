@@ -116,7 +116,7 @@ validate_output() {
       fi
       ;;
   esac
-  local expected_header='schema	allocator	executor	workload	mode	async_workers	blocking_workers	topology	logical_window	global_task_limit	retained_window	arrival_rate_per_second	requested_arrivals	attempted	admitted	rejected_full	rejected_resource	completed_on_time	completed_late	errors	cancellations	unresolved	lost	result_digest	expected_digest	capacity_publications_per_second	successful_throughput_through_drain_per_second	setup_ns	timer_pair_median_ns	wall_through_drain_ns	drain_tail_ns	response_p50_ns	response_p95_ns	response_p99_ns	producer_lateness_mean_ns	producer_lateness_max_ns	max_observed_managed_bytes	retained_managed_bytes	managed_limit_bytes	disk_limit_ops	network_limit_ops	final_managed_bytes	final_disk_ops	final_network_ops	rss_before_kib	rss_after_drain_kib	rss_after_shutdown_kib	hwm_before_kib	hwm_after_drain_kib	hwm_after_shutdown_kib	shutdown_ns'
+  local expected_header='schema	allocator	executor	workload	mode	async_workers	blocking_workers	topology	logical_window	global_task_limit	retained_window	arrival_rate_per_second	requested_arrivals	attempted	admitted	rejected_full	rejected_resource	completed_on_time	completed_late	errors	cancellations	unresolved	lost	result_digest	expected_digest	capacity_publications_per_second	successful_throughput_through_drain_per_second	setup_ns	timer_pair_median_ns	wall_through_drain_ns	drain_tail_ns	response_p50_ns	response_p95_ns	response_p99_ns	producer_lateness_mean_ns	producer_lateness_max_ns	max_observed_managed_bytes	retained_managed_bytes	managed_limit_bytes	disk_limit_ops	network_limit_ops	final_managed_bytes	final_disk_ops	final_network_ops	rss_before_kib	rss_after_drain_kib	rss_after_shutdown_kib	hwm_before_kib	hwm_after_drain_kib	hwm_after_shutdown_kib	shutdown_ns	rejected_logical_window	rejected_backend_full'
   [[ $(wc -l < "$output") -eq 2 ]] || return 1
   header=$(sed -n '1p' "$output")
   [[ "$header" == "$expected_header" ]] || return 1
@@ -134,19 +134,20 @@ from pathlib import Path
 ) = sys.argv[1:]
 lines = Path(path).read_text(encoding="utf-8").splitlines()
 headers = expected_header.split("\t")
-if len(headers) != 51 or len(set(headers)) != 51 or lines[0] != expected_header:
+if len(headers) != 53 or len(set(headers)) != 53 or lines[0] != expected_header:
     raise SystemExit(1)
 values = lines[1].split("\t")
 if len(values) != len(headers):
     raise SystemExit(1)
 row = dict(zip(headers, values, strict=True))
 if (row["schema"], row["allocator"], row["executor"], row["workload"], row["mode"]) != (
-    "1", allocator, executor, workload, mode,
+    "2", allocator, executor, workload, mode,
 ):
     raise SystemExit(1)
 
 integer_fields = """schema async_workers blocking_workers logical_window global_task_limit
-retained_window requested_arrivals attempted admitted rejected_full rejected_resource
+retained_window requested_arrivals attempted admitted rejected_full rejected_logical_window
+rejected_backend_full rejected_resource
 completed_on_time completed_late errors cancellations unresolved lost result_digest
 expected_digest setup_ns timer_pair_median_ns wall_through_drain_ns drain_tail_ns
 response_p50_ns response_p95_ns response_p99_ns producer_lateness_mean_ns
@@ -208,6 +209,8 @@ if any(number > attempted for number in (
 )):
     raise SystemExit(1)
 if attempted != admitted + rejected_full + rejected_resource:
+    raise SystemExit(1)
+if rejected_full != int(row["rejected_logical_window"]) + int(row["rejected_backend_full"]):
     raise SystemExit(1)
 if admitted != completed + errors + cancellations + unresolved:
     raise SystemExit(1)

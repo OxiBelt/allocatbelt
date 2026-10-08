@@ -117,6 +117,8 @@ struct ProducerReport {
   attempted: usize,
   admitted: usize,
   rejected_full: usize,
+  rejected_logical_window: usize,
+  rejected_backend_full: usize,
   lateness_sum_ns: u128,
   lateness_max_ns: u64,
   started_at: Instant,
@@ -899,7 +901,8 @@ fn produce(
   };
   let mut attempted = 0usize;
   let mut admitted = 0usize;
-  let mut rejected_full = 0usize;
+  let mut rejected_logical_window = 0usize;
+  let mut rejected_backend_full = 0usize;
   let mut lateness_sum_ns = 0u128;
   let mut lateness_max_ns = 0u64;
   let mut outstanding = 0usize;
@@ -961,7 +964,7 @@ fn produce(
     lateness_max_ns = lateness_max_ns.max(lateness_ns.min(u128::from(u64::MAX)) as u64);
     attempted += 1;
     if options.mode == Mode::OpenLoop && outstanding >= WINDOW {
-      rejected_full += 1;
+      rejected_logical_window += 1;
       events
         .send(Event::Rejected(id))
         .map_err(|_| "HTTP observer queue closed before rejection publication".to_owned())?;
@@ -984,14 +987,14 @@ fn produce(
           .map_err(|_| "HTTP observer queue closed before client publication".to_owned())?;
       }
       Err(SubmitResult::Full) => {
-        rejected_full += 1;
+        rejected_backend_full += 1;
         if options.mode == Mode::OpenLoop {
           events
             .send(Event::Rejected(id))
             .map_err(|_| "HTTP observer queue closed before rejection publication".to_owned())?;
         }
         if options.mode == Mode::Capacity {
-          return Err("HTTP capacity lane encountered a task-window Full rejection".into());
+          return Err("HTTP capacity lane encountered a backend Full rejection".into());
         }
       }
       Err(SubmitResult::Closed) => {
@@ -1004,7 +1007,9 @@ fn produce(
   let report = ProducerReport {
     attempted,
     admitted,
-    rejected_full,
+    rejected_full: rejected_logical_window + rejected_backend_full,
+    rejected_logical_window,
+    rejected_backend_full,
     lateness_sum_ns,
     lateness_max_ns,
     started_at,
@@ -1402,7 +1407,8 @@ fn validate_pair_counts(
   observer: &ObserverReport,
 ) -> Result<(), String> {
   let completed = observer.on_time + observer.late;
-  if producer.attempted != producer.admitted + producer.rejected_full
+  if producer.rejected_full != producer.rejected_logical_window + producer.rejected_backend_full
+    || producer.attempted != producer.admitted + producer.rejected_full
     || producer.admitted != completed
   {
     return Err("HTTP producer and paired completion counts do not balance".into());
@@ -1488,7 +1494,7 @@ fn print_row(allocator: &str, options: Options, report: &Report) {
   let drained_rate =
     (report.on_time + report.late) as f64 / wall_ns.max(1) as f64 * 1_000_000_000.0;
   let values = [
-    "1".to_owned(),
+    "2".to_owned(),
     allocator.to_owned(),
     options.executor.label().to_owned(),
     "http".to_owned(),
@@ -1557,6 +1563,8 @@ fn print_row(allocator: &str, options: Options, report: &Report) {
     report.rss_after_drain.hwm_kib.to_string(),
     report.rss_after_shutdown.hwm_kib.to_string(),
     report.shutdown_ns.to_string(),
+    report.producer.rejected_logical_window.to_string(),
+    report.producer.rejected_backend_full.to_string(),
   ];
   debug_assert_eq!(values.len(), super::TSV_HEADER.split('\t').count());
   println!("{}", super::TSV_HEADER);
@@ -1695,6 +1703,8 @@ mod tests {
         attempted: 2,
         admitted: 2,
         rejected_full: 0,
+        rejected_logical_window: 0,
+        rejected_backend_full: 0,
         lateness_sum_ns: 0,
         lateness_max_ns: 0,
         started_at: started,

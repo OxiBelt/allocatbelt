@@ -14,7 +14,10 @@ allocators. Build and audit it separately from the secure baseline.
 Each application binary selects its global allocator and accepts
 `--executor bounded|tokio --workload cpu|memory|http|disk --mode capacity|open_loop`.
 Open-loop runs also require `--rate`. A process executes one cell and emits a
-TSV header plus one result row. The row records the executor topology, window
+TSV header plus one result row. Schema 2 appends `rejected_logical_window` and
+`rejected_backend_full`, retaining the schema 1 columns and their order. The
+legacy `rejected_full` value remains their sum, so existing aggregate fields
+keep the same meaning. The row records the executor topology, window
 and resource limits, attempt/admission/completion counts, checksum validation,
 capacity publications or observer-consumed response quantiles, producer
 lateness, setup/drain/shutdown time, and final ledger state. `lost` is derived
@@ -38,11 +41,14 @@ one bounded blocking connector and its integrated I/O driver. Disk uses four
 filesystem/blocking workers and at most eight transactions or filesystem steps.
 These are declared topology differences, not equal-total-thread claims. Each
 HTTP transaction validates matching client and server results by request ID.
-Observers retain bounded join handles and poll completion readiness from a
-bounded event queue; they consume whichever published results are ready,
-rather than blocking behind the oldest still-running task. This keeps the
-admission window charged through join consumption while avoiding a FIFO join
-dependency.
+The CPU, memory, and disk observers retain bounded join handles, register a
+task-completion waker, and consume whichever terminal results are ready rather
+than blocking behind the oldest still-running task. Tokio join handles are
+polled directly; allocatbelt uses `AsyncJob::poll_finished`. Their bounded
+event queue also carries producer events, with a 100 ms watchdog receive
+timeout. Logical-window credit stays charged through join consumption while
+backend admission remains independently observable. HTTP keeps its paired
+client and handler records and matches both by request ID before completion.
 Disk transactions use unique create-new files, positional I/O, readback
 checksums, and cleanup. Open-loop arrivals use absolute deadlines and are not
 retried after admission rejection or syscall entry.
@@ -62,6 +68,14 @@ check, not the only oracle. HTTP response time is captured after consuming both
 paired joins and before request-ID/checksum validation. Only successful
 transactions count as on-time or late completions; failed admitted operations
 remain in the error/lost accounting.
+
+For bounded 5,000-ID open-loop CPU lanes, the serial per-ID oracle is computed
+during setup before the producer's arrival clock starts. Timed CPU operations
+are checked against those stable IDs, and the aggregate digest is rebuilt from
+the immutable oracle. Capacity mode keeps its monotonically assigned IDs and
+validates each result against the scalar kernel.
+Whole-process CPU measurements include oracle setup; the arrival clock and
+response latency measurements begin after setup.
 
 `scripts/run-application-pair.sh` prepares one fresh bounded/Tokio pair for a
 single allocator/workload/mode/rate. It pins both processes to the supplied CPU
@@ -89,8 +103,8 @@ the last consumed result as its endpoint, so early completion cannot shorten
 the denominator below the full production horizon.
 
 Each process writes a separate shutdown report to the unique path supplied by
-`ALLOCATBELT_APP_SHUTDOWN_REPORT`; the report leaves the 51-column row schema
-unchanged. It records the measured producer-trace duration and every explicit
+`ALLOCATBELT_APP_SHUTDOWN_REPORT`; the report leaves the 53-column schema 2
+row unchanged. It records the measured producer-trace duration and every explicit
 driver shutdown duration in order. The runner rejects a missing, partial,
 reordered, over-budget, or pre-existing report. Native allocatbelt reports its
 async runtime, then its filesystem runtime for disk, or its async runtime,
