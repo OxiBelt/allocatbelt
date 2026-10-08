@@ -929,8 +929,14 @@ fn tcp_socket_device_binding_validates_inputs_and_reads_back_kernel_state() {
   match socket.bind_device(Some(b"lo")) {
     Ok(()) => {
       assert_eq!(socket.device().unwrap().as_deref(), Some(b"lo".as_slice()));
-      socket.bind_device(None).unwrap();
-      assert_eq!(socket.device().unwrap(), None);
+      match socket.bind_device(None) {
+        Ok(()) => assert_eq!(socket.device().unwrap(), None),
+        Err(error) if matches!(error.raw_os_error(), Some(libc::EPERM | libc::EACCES)) => {
+          // Linux may allow the first binding while requiring CAP_NET_RAW to clear it.
+          assert_eq!(socket.device().unwrap().as_deref(), Some(b"lo".as_slice()));
+        }
+        Err(error) => panic!("clearing the loopback binding failed unexpectedly: {error}"),
+      }
     }
     Err(error) if matches!(error.raw_os_error(), Some(libc::EPERM | libc::EACCES)) => {
       // Some containers do not grant the network capability needed for this option.
