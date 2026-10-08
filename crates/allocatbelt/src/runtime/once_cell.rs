@@ -325,87 +325,90 @@ where
     if this.completed {
       return Poll::Ready(Err(InitError::Completed));
     }
-    if this.permit.is_none() {
-      if let Some(snapshot) = get(&this.shared) {
-        return this.existing(snapshot);
-      }
-      let Some(acquire) = this.acquire.as_mut() else {
-        this.completed = true;
-        return Poll::Ready(Err(InitError::Completed));
-      };
-      let acquired = panic::catch_unwind(AssertUnwindSafe(|| Pin::new(acquire).poll(cx)));
-      match acquired {
-        Err(payload) => this.fail_panic(payload),
-        Ok(Poll::Pending) => return Poll::Pending,
-        Ok(Poll::Ready(Ok(permit))) => {
-          this.permit = Some(permit);
-          this.acquire = None;
+    super::asynchronous::poll_cooperative_composed(cx, |cx| {
+      if this.permit.is_none() {
+        if let Some(snapshot) = get(&this.shared) {
+          return this.existing(snapshot);
         }
-        Ok(Poll::Ready(Err(kind))) => {
-          if let Some(snapshot) = get(&this.shared) {
-            return this.existing(snapshot);
-          }
+        let Some(acquire) = this.acquire.as_mut() else {
           this.completed = true;
-          let factory = this.factory.take();
+          return Poll::Ready(Err(InitError::Completed));
+        };
+        let acquired = panic::catch_unwind(AssertUnwindSafe(|| Pin::new(acquire).poll(cx)));
+        match acquired {
+          Err(payload) => this.fail_panic(payload),
+          Ok(Poll::Pending) => return Poll::Pending,
+          Ok(Poll::Ready(Ok(permit))) => {
+            this.permit = Some(permit);
+            this.acquire = None;
+          }
+          Ok(Poll::Ready(Err(kind))) => {
+            if let Some(snapshot) = get(&this.shared) {
+              return this.existing(snapshot);
+            }
+            this.completed = true;
+            let factory = this.factory.take();
+            if let Some(payload) = this.cleanup() {
+              drop_contained(factory);
+              panic::resume_unwind(payload);
+            }
+            return Poll::Ready(Err(match factory {
+              Some(factory) => InitError::Admission { kind, factory },
+              None => InitError::Completed,
+            }));
+          }
+        }
+        if let Some(snapshot) = get(&this.shared) {
+          return this.existing(snapshot);
+        }
+      }
+      if this.initializer.is_none() {
+        let Some(factory) = this.factory.take() else {
+          this.completed = true;
           if let Some(payload) = this.cleanup() {
-            drop_contained(factory);
             panic::resume_unwind(payload);
           }
-          return Poll::Ready(Err(match factory {
-            Some(factory) => InitError::Admission { kind, factory },
-            None => InitError::Completed,
-          }));
+          return Poll::Ready(Err(InitError::Completed));
+        };
+        match panic::catch_unwind(AssertUnwindSafe(factory)) {
+          Ok(initializer) => this.initializer = Some(Box::pin(initializer)),
+          Err(payload) => this.fail_panic(payload),
         }
       }
-      if let Some(snapshot) = get(&this.shared) {
-        return this.existing(snapshot);
-      }
-    }
-    if this.initializer.is_none() {
-      let Some(factory) = this.factory.take() else {
-        this.completed = true;
-        if let Some(payload) = this.cleanup() {
-          panic::resume_unwind(payload);
-        }
-        return Poll::Ready(Err(InitError::Completed));
-      };
-      match panic::catch_unwind(AssertUnwindSafe(factory)) {
-        Ok(initializer) => this.initializer = Some(Box::pin(initializer)),
+      let polled = panic::catch_unwind(AssertUnwindSafe(|| match this.initializer.as_mut() {
+        Some(initializer) => initializer.as_mut().poll(cx),
+        None => Poll::Pending,
+      }));
+      let output = match polled {
         Err(payload) => this.fail_panic(payload),
+        Ok(Poll::Pending) => return Poll::Pending,
+        Ok(Poll::Ready(output)) => output,
+      };
+      // Keep the permit while destroying the completed initializer. If its Drop
+      // panics, discard the proposed result and allow a later initializer retry.
+      if let Err(payload) = panic::catch_unwind(AssertUnwindSafe(|| drop(this.initializer.take())))
+      {
+        drop_contained(output);
+        this.fail_panic(payload);
       }
-    }
-    let polled = panic::catch_unwind(AssertUnwindSafe(|| match this.initializer.as_mut() {
-      Some(initializer) => initializer.as_mut().poll(cx),
-      None => Poll::Pending,
-    }));
-    let output = match polled {
-      Err(payload) => this.fail_panic(payload),
-      Ok(Poll::Pending) => return Poll::Pending,
-      Ok(Poll::Ready(output)) => output,
-    };
-    // Keep the permit while destroying the completed initializer. If its Drop
-    // panics, discard the proposed result and allow a later initializer retry.
-    if let Err(payload) = panic::catch_unwind(AssertUnwindSafe(|| drop(this.initializer.take()))) {
-      drop_contained(output);
-      this.fail_panic(payload);
-    }
-    let result = (this.convert)(output);
-    this.completed = true;
-    let outcome = match result {
-      Ok(value) => {
-        let snapshot = Arc::new(value);
-        let old = { lock(&this.shared.value).replace(Arc::clone(&snapshot)) };
-        debug_assert!(old.is_none());
-        drop_contained(old);
-        Ok(snapshot)
+      let result = (this.convert)(output);
+      this.completed = true;
+      let outcome = match result {
+        Ok(value) => {
+          let snapshot = Arc::new(value);
+          let old = { lock(&this.shared.value).replace(Arc::clone(&snapshot)) };
+          debug_assert!(old.is_none());
+          drop_contained(old);
+          Ok(snapshot)
+        }
+        Err(error) => Err(InitError::Initialization(error)),
+      };
+      if let Some(payload) = this.cleanup() {
+        drop_contained(outcome);
+        panic::resume_unwind(payload);
       }
-      Err(error) => Err(InitError::Initialization(error)),
-    };
-    if let Some(payload) = this.cleanup() {
-      drop_contained(outcome);
-      panic::resume_unwind(payload);
-    }
-    Poll::Ready(outcome)
+      Poll::Ready(outcome)
+    })
   }
 }
 

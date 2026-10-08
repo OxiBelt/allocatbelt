@@ -4,9 +4,11 @@
 //! on its caller thread. Spawned work remains owned and `Send + 'static`.
 //! Runtime-owned outer polls enable a shared 64-operation cooperative budget
 //! for ready channel, oneshot, semaphore, mutex, reader-writer-lock, notify,
-//! watch, broadcast, barrier, sleep, timeout, and interval-tick futures. The
-//! budget is scoped to those polls; a timeout coalesces its charge with a
-//! ready supported primitive in its inner future. Manual polls and
+//! watch, broadcast, barrier, sleep, timeout, interval-tick, and live
+//! asynchronous initialization futures. The budget is scoped to those polls;
+//! timeout and initialization polls coalesce a ready charge with supported
+//! descendants, retaining descendant charges on pending polls or unwinding.
+//! Completed initialization futures retain their immediate error. Manual polls and
 //! futures polled by another executor bypass automatic accounting.
 //! [`yield_now`] schedules one self-wake; [`consume_budget`] remains an
 //! explicit checkpoint for other long-running future work. No checkpoint

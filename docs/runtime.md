@@ -761,6 +761,14 @@ Primary panics resume after cleanup, while secondary panic payload destruction
 is contained. Completed futures release admission immediately. Recursive
 initialization can wait for itself and deadlock.
 
+Live initialization futures share the runtime's cooperative operation budget,
+including the path that returns an already initialized snapshot. An exhausted
+poll schedules a wake and leaves admission, the factory, the initializer and
+publication untouched. Calls into supported primitives from a factory or
+initializer retain their own charges, including when initialization remains
+pending or unwinds. Polling a completed future returns its existing error
+without this gate; manual polls outside the runtime bypass automatic accounting.
+
 This explicit port returns owned snapshots instead of Tokio references and
 provides no cell clone, reset, mutable-reference or constant-construction API.
 Threaded cells and snapshots require `T: Send + Sync`; local values can borrow
@@ -980,7 +988,8 @@ await it, and it does not impose a fairness or latency bound.
 
 Runtime-owned outer polls also use a shared 64-operation budget for ready
 `channel` send/receive/reservation/closed-wait, oneshot receive/close,
-semaphore acquisition, mutex acquisition and reader-writer-lock acquisition
+semaphore acquisition, mutex acquisition, reader-writer-lock acquisition and
+live asynchronous initialization
 polls, plus `Notify`, watch change/closure, broadcast receive/closure and
 barrier waits, managed-pipe, Unix-pipe and blocking-stream I/O polls,
 `Sleep`, `Timeout` and interval tick polls, and asynchronous or blocking job
@@ -999,7 +1008,10 @@ chain charges once; a primitive poll that returns `Pending` restores its
 provisional charge. `Timeout` checks the budget before touching its timer or
 inner future. Its ready result consumes one unit unless a ready supported
 primitive inside the inner future already consumed one; charges made by inner
-primitives remain spent when the timeout poll returns `Pending` or unwinds. Once
+primitives remain spent when the timeout poll returns `Pending` or unwinds.
+Live `AsyncOnceCell` initialization polls use the same composed accounting:
+a ready result charges once unless a supported descendant already spent a
+unit, while descendant charges remain spent on `Pending` or unwinding. Once
 exhausted, the next supported primitive arranges a wake and returns `Pending`
 before it dequeues a message, accepts a send, or transfers a permit/lock guard.
 This applies only while the runtime is polling an owned Send/local task or a
