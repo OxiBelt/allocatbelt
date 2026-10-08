@@ -1143,11 +1143,10 @@ fn observe_events(
 ) -> Result<ObserverReport, String> {
   let mut pending = HashMap::<u64, PendingPair>::new();
   pending
-    .try_reserve(if options.mode == Mode::OpenLoop {
-      settings.arrivals
-    } else {
-      WINDOW + 1
-    })
+    // Admitted work remains within the live producer window until the
+    // observer removes a completed pair and returns its credit. The ID state
+    // and latency tables below still cover the full open-loop trace.
+    .try_reserve(WINDOW + 1)
     .map_err(|_| "could not reserve bounded HTTP pair table".to_owned())?;
   let mut handler_jobs = Vec::<(u64, HandlerJob, RoleLease)>::new();
   handler_jobs
@@ -1689,7 +1688,7 @@ fn print_row(allocator: &str, options: Options, report: &Report) {
 mod tests {
   use super::{
     ClientJob, Event, HandlerJob, HandlerRecord, Joiner, Mode, ProducerReport, RoleLease, Settings,
-    expected_request_checksum, observe_events, run_bounded, run_tokio,
+    WINDOW, expected_request_checksum, observe_events, run_bounded, run_tokio,
   };
   use crate::application::{Executor, Options, Workload};
   use allocatbelt::runtime::managed::ResourceScope;
@@ -1827,6 +1826,62 @@ mod tests {
 
   #[test]
   fn later_http_pair_is_observed_while_an_earlier_client_remains_pending() {
+    const ARRIVALS: usize = 64;
+
+    fn queue_handler(
+      handle: &tokio::runtime::Handle,
+      events: &mpsc::Sender<Event>,
+      lease_guards: &mut Vec<std::sync::Weak<()>>,
+      record_id: u64,
+      result_id: u64,
+      checksum: u64,
+    ) {
+      let lease = Arc::new(());
+      let lease_weak = Arc::downgrade(&lease);
+      let event_lease = Arc::clone(&lease);
+      lease_guards.push(lease_weak);
+      let job = HandlerJob::Tokio {
+        handle: handle
+          .spawn(async move { (Ok((result_id, checksum)), RoleLease { _hold: lease }) }),
+        result: None,
+      };
+      events
+        .send(Event::Handler(HandlerRecord {
+          id: record_id,
+          _lease: RoleLease { _hold: event_lease },
+          job,
+        }))
+        .expect("handler event");
+    }
+
+    fn queue_client(
+      handle: &tokio::runtime::Handle,
+      events: &mpsc::Sender<Event>,
+      id: u64,
+      checksum: u64,
+      started: Instant,
+      horizon: Instant,
+      gate: Option<tokio::sync::oneshot::Receiver<()>>,
+    ) {
+      let job = ClientJob::Tokio {
+        handle: handle.spawn(async move {
+          if let Some(gate) = gate {
+            gate.await.map_err(|_| "test gate closed".to_owned())?;
+          }
+          Ok(checksum)
+        }),
+        result: None,
+      };
+      events
+        .send(Event::Client {
+          id,
+          scheduled: started,
+          horizon_end: horizon,
+          job,
+        })
+        .expect("client event");
+    }
+
     let runtime = tokio::runtime::Builder::new_multi_thread()
       .worker_threads(2)
       .enable_all()
@@ -1834,101 +1889,41 @@ mod tests {
       .expect("test runtime");
     let handle = runtime.handle().clone();
     let (release_first, first_gate) = tokio::sync::oneshot::channel::<()>();
-    let first_checksum = expected_request_checksum(0, 256);
-    let second_checksum = expected_request_checksum(1, 256);
-    let first_client = ClientJob::Tokio {
-      handle: handle.spawn(async move {
-        first_gate
-          .await
-          .map_err(|_| "test gate closed".to_owned())?;
-        Ok(first_checksum)
-      }),
-      result: None,
-    };
-    let second_client = ClientJob::Tokio {
-      handle: handle.spawn(async move { Ok(second_checksum) }),
-      result: None,
-    };
-    let first_handler = HandlerJob::Tokio {
-      handle: handle.spawn(async move {
-        (
-          Ok((0, first_checksum)),
-          RoleLease {
-            _hold: Arc::new(()),
-          },
-        )
-      }),
-      result: None,
-    };
-    let second_handler = HandlerJob::Tokio {
-      handle: handle.spawn(async move {
-        (
-          Ok((1, second_checksum)),
-          RoleLease {
-            _hold: Arc::new(()),
-          },
-        )
-      }),
-      result: None,
-    };
     let started = Instant::now();
-    let horizon = started + Duration::from_secs(5);
+    let horizon = started + Duration::from_secs(30);
     let (events_tx, events_rx) = mpsc::channel();
     let (credits_tx, credits_rx) = mpsc::sync_channel(8);
-    events_tx
-      .send(Event::Client {
-        id: 0,
-        scheduled: started,
-        horizon_end: horizon,
-        job: first_client,
-      })
-      .expect("first client event");
-    events_tx
-      .send(Event::Client {
-        id: 1,
-        scheduled: started,
-        horizon_end: horizon,
-        job: second_client,
-      })
-      .expect("second client event");
-    events_tx
-      .send(Event::Handler(HandlerRecord {
-        id: 0,
-        _lease: RoleLease {
-          _hold: Arc::new(()),
-        },
-        job: first_handler,
-      }))
-      .expect("first handler event");
-    events_tx
-      .send(Event::Handler(HandlerRecord {
-        id: 1,
-        _lease: RoleLease {
-          _hold: Arc::new(()),
-        },
-        job: second_handler,
-      }))
-      .expect("second handler event");
-    events_tx
-      .send(Event::Done(ProducerReport {
-        attempted: 2,
-        admitted: 2,
-        rejected_full: 0,
-        rejected_logical_window: 0,
-        rejected_backend_full: 0,
-        lateness_sum_ns: 0,
-        lateness_max_ns: 0,
-        started_at: started,
-        production_end: Instant::now(),
-        trace_overrun: false,
-      }))
-      .expect("producer completion event");
-    drop(events_tx);
+    let mut lease_guards = Vec::with_capacity(ARRIVALS);
+
+    // Let all first-window handlers arrive first, with event IDs deliberately
+    // reordered; their completed results carry the actual request IDs.
+    for id in 0..WINDOW as u64 {
+      queue_handler(
+        &handle,
+        &events_tx,
+        &mut lease_guards,
+        WINDOW as u64 - 1 - id,
+        id,
+        expected_request_checksum(id, 256),
+      );
+    }
+    let mut first_gate = Some(first_gate);
+    for id in 0..WINDOW as u64 {
+      queue_client(
+        &handle,
+        &events_tx,
+        id,
+        expected_request_checksum(id, 256),
+        started,
+        horizon,
+        if id == 0 { first_gate.take() } else { None },
+      );
+    }
 
     let selected_options = options(Executor::Tokio, Mode::OpenLoop, Some(1000));
     let selected_settings = Settings {
       horizon: Duration::from_secs(1),
-      arrivals: 2,
+      arrivals: ARRIVALS,
       body_bytes: 256,
     };
     let (report_tx, report_rx) = mpsc::sync_channel(1);
@@ -1943,20 +1938,134 @@ mod tests {
       ));
     });
 
-    credits_rx
-      .recv_timeout(Duration::from_secs(2))
-      .expect("second pair should return a credit while pair zero is pending");
+    let credit_watchdog = Instant::now() + Duration::from_secs(10);
+    let mut first_window_error = None;
+    for _ in 0..WINDOW - 1 {
+      if credits_rx
+        .recv_timeout(credit_watchdog.saturating_duration_since(Instant::now()))
+        .is_err()
+      {
+        first_window_error = Some("later pairs should return credits while pair zero is pending");
+        break;
+      }
+    }
+    if first_window_error.is_none()
+      && !matches!(credits_rx.try_recv(), Err(mpsc::TryRecvError::Empty))
+    {
+      first_window_error = Some("the gated first pair must retain the eighth credit");
+    }
+    if let Some(error) = first_window_error {
+      let _ = release_first.send(());
+      drop(events_tx);
+      drop(credits_rx);
+      let _ = report_rx.recv_timeout(Duration::from_secs(10));
+      runtime.shutdown_timeout(Duration::from_secs(2));
+      observer
+        .join()
+        .expect("HTTP observer thread should stop after watchdog cleanup");
+      panic!("{error}");
+    }
+
+    // Reuse seven returned slots, then keep no more than WINDOW requests
+    // outstanding as credits arrive for the rest of the longer trace.
+    let mut outstanding = 1;
+    for id in WINDOW as u64..(2 * WINDOW - 1) as u64 {
+      queue_handler(
+        &handle,
+        &events_tx,
+        &mut lease_guards,
+        id,
+        id,
+        expected_request_checksum(id, 256),
+      );
+      queue_client(
+        &handle,
+        &events_tx,
+        id,
+        expected_request_checksum(id, 256),
+        started,
+        horizon,
+        None,
+      );
+      outstanding += 1;
+    }
+    for id in (2 * WINDOW - 1) as u64..ARRIVALS as u64 {
+      if credits_rx
+        .recv_timeout(credit_watchdog.saturating_duration_since(Instant::now()))
+        .is_err()
+      {
+        let _ = release_first.send(());
+        drop(events_tx);
+        drop(credits_rx);
+        let _ = report_rx.recv_timeout(Duration::from_secs(10));
+        runtime.shutdown_timeout(Duration::from_secs(2));
+        observer
+          .join()
+          .expect("HTTP observer thread should stop after watchdog cleanup");
+        panic!("producer window credit should arrive before the watchdog");
+      }
+      outstanding -= 1;
+      queue_handler(
+        &handle,
+        &events_tx,
+        &mut lease_guards,
+        id,
+        id,
+        expected_request_checksum(id, 256),
+      );
+      queue_client(
+        &handle,
+        &events_tx,
+        id,
+        expected_request_checksum(id, 256),
+        started,
+        horizon,
+        None,
+      );
+      outstanding += 1;
+    }
+    assert_eq!(outstanding, WINDOW);
+    events_tx
+      .send(Event::Done(ProducerReport {
+        attempted: ARRIVALS,
+        admitted: ARRIVALS,
+        rejected_full: 0,
+        rejected_logical_window: 0,
+        rejected_backend_full: 0,
+        lateness_sum_ns: 0,
+        lateness_max_ns: 0,
+        started_at: started,
+        production_end: Instant::now(),
+        trace_overrun: false,
+      }))
+      .expect("producer completion event");
+    drop(events_tx);
+
     release_first.send(()).expect("release first client");
-    let report = report_rx
-      .recv_timeout(Duration::from_secs(2))
+    let observed = report_rx.recv_timeout(Duration::from_secs(10));
+    if observed.is_err() {
+      drop(credits_rx);
+      runtime.shutdown_timeout(Duration::from_secs(2));
+      observer
+        .join()
+        .expect("HTTP observer thread should stop after watchdog cleanup");
+      panic!("HTTP observer completion should arrive before the watchdog");
+    }
+    observer.join().expect("observer thread should not panic");
+    let trailing_credits = credits_rx.try_iter().count();
+    runtime.shutdown_timeout(Duration::from_secs(2));
+    let report = observed
       .expect("HTTP observer completion should arrive before the watchdog")
       .expect("all pairs should drain");
-    observer.join().expect("observer thread should not panic");
-    assert_eq!(report.on_time + report.late, 2);
+    assert_eq!(report.on_time + report.late, ARRIVALS);
     assert_eq!(report.errors, 0);
-    assert_eq!(report.digest, first_checksum.wrapping_add(second_checksum));
+    assert_eq!(report.latencies.len(), ARRIVALS);
     assert_eq!(report.digest, report.expected);
-    assert_eq!(credits_rx.try_iter().count(), 1);
+    assert_eq!(
+      trailing_credits + (WINDOW - 1) + (ARRIVALS - (2 * WINDOW - 1)),
+      ARRIVALS
+    );
+    assert!(lease_guards.iter().all(|lease| lease.upgrade().is_none()));
   }
 
   #[test]
