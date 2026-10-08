@@ -1258,6 +1258,7 @@ fn allocation_runs_due_decay_passes() {
   h.retire(&tc);
 }
 
+#[cfg(not(miri))]
 #[test]
 fn small_refills_run_due_decay_passes() {
   let h = heap();
@@ -1273,6 +1274,97 @@ fn small_refills_run_due_decay_passes() {
     free_c(h, &tc, o);
   }
   h.retire(&tc);
+}
+
+#[cfg(miri)]
+#[test]
+fn small_refills_run_due_decay_passes() {
+  let h = heap();
+  h.set_purge_delay_ms(0);
+  let tc = cache(h);
+  let run = alloc_c(h, &tc, 5 * PAGE_SIZE, 8);
+  free_c(h, &tc, run);
+  assert_eq!(h.dirty_pages(), 5);
+  let purged = h.os().purged.load(Ordering::Relaxed);
+  let refills = h.search_stats().refills;
+  let run_page = run / PAGE_SIZE;
+  let segment = run / SEGMENT_SIZE;
+  let mut blocks = Vec::new();
+
+  // Native exhausts 40 full 64-block words. Miri keeps the same 16-byte
+  // class, one small page, owned segment and 40 real refill ticks, but
+  // returns each refill's unused claims before the next allocation.
+  // Thus it retains 40 live blocks instead of 2560, and changes the
+  // claimed-word occupancy and return pattern, not the decay sampling.
+  // The page-run allocation/free already supplied the first two ticks.
+  for refill in 0..40 {
+    if refill == 14 {
+      // Tick 16 sampled time zero without purging. The next sample is
+      // tick 32, on refill 30, after the clock advances to the due time.
+      assert_eq!(h.dirty_pages(), 4);
+      assert_eq!(h.os().purged.load(Ordering::Relaxed), purged);
+      h.check_indexes();
+      h.os().advance(1);
+    }
+    assert_eq!(h.cache_stats(&tc).claimed_blocks, 0);
+    let offset = alloc_c(h, &tc, 16, 8);
+    blocks.push(offset);
+    assert_eq!(offset / PAGE_SIZE, run_page);
+    assert_eq!(offset / SEGMENT_SIZE, segment);
+    assert_eq!(h.search_stats().refills - refills, refill + 1);
+    assert_eq!(h.cache_stats(&tc).claimed_blocks, 63 - refill);
+    if refill < 29 {
+      // Reuse of the run's first dirty page leaves four other dirty pages.
+      assert_eq!(h.dirty_pages(), 4);
+      assert_eq!(h.os().purged.load(Ordering::Relaxed), purged);
+      assert!((run_page..run_page + 5).all(|page| h.os().written.lock().unwrap().contains(&page)));
+    } else {
+      assert_eq!(h.dirty_pages(), 0);
+      assert_eq!(
+        h.os().purged.load(Ordering::Relaxed),
+        purged + 4 * PAGE_SIZE
+      );
+      assert_eq!(*h.os().written.lock().unwrap(), BTreeSet::from([run_page]));
+    }
+    let before_flush = h.search_stats();
+    h.flush(&tc);
+    assert_eq!(h.cache_stats(&tc).claimed_blocks, 0);
+    assert_eq!(h.search_stats(), before_flush);
+    // flush returns unused claims without advancing the refill clock or
+    // introducing maintenance: the due sample remains precisely refill 30.
+    assert_eq!(h.dirty_pages(), if refill < 29 { 4 } else { 0 });
+    assert_eq!(
+      h.os().purged.load(Ordering::Relaxed),
+      purged + if refill < 29 { 0 } else { 4 * PAGE_SIZE }
+    );
+  }
+  assert_eq!(blocks.iter().copied().collect::<BTreeSet<_>>().len(), 40);
+  assert_eq!(h.os().live.lock().unwrap().len(), 40);
+  assert_eq!(h.search_stats().refills - refills, 40);
+  assert_eq!(h.segments_in_use(), 1);
+  assert_eq!(h.usage().small_pages, 1);
+  assert_eq!(h.usage().small_bytes_out, 40 * 16);
+  h.check_indexes();
+  for offset in blocks {
+    free_c(h, &tc, offset);
+  }
+  h.retire(&tc);
+  let stats = h.cache_stats(&tc);
+  assert!(!stats.attached);
+  assert_eq!(stats.claimed_blocks, 0);
+  assert_eq!(stats.buffered_blocks, 0);
+  assert_eq!(stats.buffered_words, 0);
+  assert!(h.os().live.lock().unwrap().is_empty());
+  assert_eq!(h.usage().small_bytes_out, 0);
+  h.check_indexes();
+  h.purge();
+  h.purge();
+  assert_eq!(h.dirty_pages(), 0);
+  // The newest empty page of the class is retained, with no live blocks.
+  assert_eq!(h.usage().small_pages, 1);
+  assert_eq!(h.usage().small_bytes_out, 0);
+  assert!(h.os().written.lock().unwrap().is_empty());
+  h.check_indexes();
 }
 
 #[test]

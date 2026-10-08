@@ -103,6 +103,13 @@ retain the helper's full segment scan; under Miri, the test proves that those
 blocks occupy two pages in its only owned segment and clears that segment's
 empty-candidate metadata directly, preserving the same owned-segment
 corruption without scanning every possible segment.
+The refill-driven decay fixture keeps its 2,560 native 16-byte allocations.
+Under Miri it retains 40 live blocks on the same small page and returns each
+refill's unused claims before requesting the next block. Both paths exercise
+40 genuine refills; the Miri witness changes word occupancy and claim returns,
+and checks the exact time-zero and due-time maintenance samples, four-page
+purge, cache retirement and retained empty page. It does not replace the
+separate multiword fixtures or establish a complete Miri campaign pass.
 The Miri model workload uses at most 96 semantic instructions and a bounded
 cumulative allocation-page allowance, checked by an independent decoder. Its
 deterministic prefix covers route changes, cross-cache frees, resize, maintenance and failed
