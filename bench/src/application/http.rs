@@ -15,7 +15,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use allocatbelt::runtime::asynchronous::{
-  AsyncConfig, AsyncHandle, AsyncJob, AsyncRuntime, AsyncShutdown,
+  AsyncConfig, AsyncHandle, AsyncJob, AsyncJoinError, AsyncRuntime, AsyncShutdown,
 };
 use allocatbelt::runtime::channel;
 use allocatbelt::runtime::io::{AsyncRead, AsyncWrite};
@@ -54,7 +54,10 @@ struct PairToken {
 }
 
 enum ClientJob {
-  Bounded(AsyncJob<Result<u64, String>>),
+  Bounded {
+    job: AsyncJob<Result<u64, String>>,
+    result: Option<Result<Result<u64, String>, AsyncJoinError>>,
+  },
   Tokio {
     handle: tokio::task::JoinHandle<Result<u64, String>>,
     result: Option<Result<Result<u64, String>, tokio::task::JoinError>>,
@@ -64,7 +67,18 @@ enum ClientJob {
 impl ClientJob {
   fn poll_finished(&mut self, cx: &mut Context<'_>) -> Poll<()> {
     match self {
-      Self::Bounded(job) => Pin::new(job).poll_finished(cx),
+      Self::Bounded { job, result } => {
+        if result.is_some() {
+          return Poll::Ready(());
+        }
+        match Pin::new(job).poll(cx) {
+          Poll::Pending => Poll::Pending,
+          Poll::Ready(output) => {
+            *result = Some(output);
+            Poll::Ready(())
+          }
+        }
+      }
       Self::Tokio { handle, result } => {
         if result.is_some() {
           return Poll::Ready(());
@@ -82,7 +96,9 @@ impl ClientJob {
 
   fn is_finished(&self) -> bool {
     match self {
-      Self::Bounded(job) => job.is_finished(),
+      // Readiness is published only after this observer has cached the
+      // terminal output; the task's publication flag alone is insufficient.
+      Self::Bounded { result, .. } => result.is_some(),
       // `handle.is_finished()` can become true after the last poll returned
       // Pending but before this predicate is checked. Keep readiness tied to
       // the cached output so the observer polls and stores the result first.
@@ -96,7 +112,10 @@ type HandlerOutput = (HandlerResult, RoleLease);
 type JoinedHandler = HandlerOutput;
 
 enum HandlerJob {
-  Bounded(AsyncJob<HandlerOutput>),
+  Bounded {
+    job: AsyncJob<HandlerOutput>,
+    result: Option<Result<HandlerOutput, AsyncJoinError>>,
+  },
   Tokio {
     handle: tokio::task::JoinHandle<HandlerOutput>,
     result: Option<Result<HandlerOutput, tokio::task::JoinError>>,
@@ -106,7 +125,18 @@ enum HandlerJob {
 impl HandlerJob {
   fn poll_finished(&mut self, cx: &mut Context<'_>) -> Poll<()> {
     match self {
-      Self::Bounded(job) => Pin::new(job).poll_finished(cx),
+      Self::Bounded { job, result } => {
+        if result.is_some() {
+          return Poll::Ready(());
+        }
+        match Pin::new(job).poll(cx) {
+          Poll::Pending => Poll::Pending,
+          Poll::Ready(output) => {
+            *result = Some(output);
+            Poll::Ready(())
+          }
+        }
+      }
       Self::Tokio { handle, result } => {
         if result.is_some() {
           return Poll::Ready(());
@@ -362,14 +392,13 @@ fn run_bounded(options: Options, settings: Settings) -> Result<Report, String> {
 
   let (credits_tx, credits_rx) = mpsc::sync_channel(WINDOW);
   let (producer_tx, producer_rx) = mpsc::sync_channel(1);
-  let observer_handle = async_handle.clone();
   let observer_resources = resources.clone();
   let (observer_tx, observer_rx) = mpsc::sync_channel(1);
   let observer_thread = thread::Builder::new()
     .name("http-application-observer".into())
     .spawn(move || {
       let report = observe_events(
-        Joiner::Bounded(observer_handle),
+        Joiner::Bounded,
         options,
         settings,
         observer_resources,
@@ -729,7 +758,7 @@ async fn accept_native(
       .send(Event::Handler(HandlerRecord {
         id,
         _lease: observer_lease,
-        job: HandlerJob::Bounded(job),
+        job: HandlerJob::Bounded { job, result: None },
       }))
       .map_err(|_| "HTTP observer queue closed while publishing handler".to_owned())?;
   }
@@ -862,7 +891,7 @@ fn produce_native(
       .block_on(role_sender.send(token))
       .map_err(|_| SubmitResult::Closed)?
       .map_err(|_| SubmitResult::Closed)?;
-    Ok(ClientJob::Bounded(job))
+    Ok(ClientJob::Bounded { job, result: None })
   })
 }
 
@@ -1083,17 +1112,23 @@ fn produce(
 }
 
 enum Joiner {
-  Bounded(AsyncHandle),
+  Bounded,
   Tokio,
 }
 
 impl Joiner {
   fn client(&self, job: ClientJob) -> Result<u64, String> {
     match (self, job) {
-      (Self::Bounded(handle), ClientJob::Bounded(job)) => handle
-        .block_on(job)
-        .map_err(|error| format!("allocatbelt client root failed: {error}"))?
-        .map_err(|error| format!("allocatbelt client task failed: {error}"))?,
+      (
+        Self::Bounded,
+        ClientJob::Bounded {
+          result: Some(result),
+          ..
+        },
+      ) => result.map_err(|error| format!("allocatbelt client task failed: {error}"))?,
+      (Self::Bounded, ClientJob::Bounded { result: None, .. }) => {
+        Err("allocatbelt client was consumed before terminal completion".into())
+      }
       (
         Self::Tokio,
         ClientJob::Tokio {
@@ -1113,10 +1148,16 @@ impl Joiner {
 
   fn handler(&self, job: HandlerJob) -> Result<JoinedHandler, String> {
     let (result, task_lease) = match (self, job) {
-      (Self::Bounded(handle), HandlerJob::Bounded(job)) => handle
-        .block_on(job)
-        .map_err(|error| format!("allocatbelt handler root failed: {error}"))?
-        .map_err(|error| format!("allocatbelt handler task failed: {error}"))?,
+      (
+        Self::Bounded,
+        HandlerJob::Bounded {
+          result: Some(result),
+          ..
+        },
+      ) => result.map_err(|error| format!("allocatbelt handler task failed: {error}"))?,
+      (Self::Bounded, HandlerJob::Bounded { result: None, .. }) => {
+        return Err("allocatbelt handler was consumed before terminal completion".into());
+      }
       (
         Self::Tokio,
         HandlerJob::Tokio {
@@ -1687,8 +1728,9 @@ fn print_row(allocator: &str, options: Options, report: &Report) {
 #[cfg(test)]
 mod tests {
   use super::{
-    ClientJob, Event, HandlerJob, HandlerRecord, Joiner, Mode, ProducerReport, RoleLease, Settings,
-    WINDOW, expected_request_checksum, observe_events, run_bounded, run_tokio,
+    AsyncConfig, AsyncHandle, AsyncRuntime, AsyncShutdown, ClientJob, Event, HandlerJob,
+    HandlerRecord, Joiner, Mode, ProducerReport, RoleLease, Settings, TASK_LIMIT, WINDOW,
+    expected_request_checksum, observe_events, run_bounded, run_tokio,
   };
   use crate::application::{Executor, Options, Workload};
   use allocatbelt::runtime::managed::ResourceScope;
@@ -1715,6 +1757,19 @@ mod tests {
     }
   }
 
+  fn shutdown_bounded_runtime(
+    handle: AsyncHandle,
+    scope: allocatbelt::runtime::asynchronous::OwnedTaskScope,
+    runtime: AsyncRuntime,
+  ) {
+    handle
+      .block_on(scope.close())
+      .expect("bounded scope close root");
+    runtime
+      .shutdown(AsyncShutdown::Drain)
+      .expect("bounded runtime shutdown");
+  }
+
   #[test]
   fn tokio_client_readiness_requires_a_cached_terminal_result() {
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -1738,6 +1793,101 @@ mod tests {
     assert!(job.is_finished());
     assert_eq!(Joiner::Tokio.client(job), Ok(71));
     runtime.shutdown_timeout(Duration::from_secs(2));
+  }
+
+  #[test]
+  fn bounded_client_readiness_requires_a_cached_terminal_result() {
+    let runtime = AsyncRuntime::new(AsyncConfig {
+      workers: 1,
+      max_outstanding: 1,
+      max_scopes: 2,
+    })
+    .expect("bounded runtime");
+    let scope = runtime.scope().expect("bounded task scope");
+    let handle = scope.handle();
+    let job = handle
+      .spawn(async { Ok::<u64, String>(71) })
+      .expect("bounded client task");
+    let finished = job.abort_handle();
+    let mut client = ClientJob::Bounded { job, result: None };
+    let waker = Waker::from(Arc::new(
+      crate::application::ObserverWake(thread::current()),
+    ));
+    let mut context = Context::from_waker(&waker);
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while !finished.is_finished() && Instant::now() < deadline {
+      thread::yield_now();
+    }
+    assert!(
+      finished.is_finished(),
+      "bounded task should publish completion"
+    );
+    assert!(
+      !client.is_finished(),
+      "task publication must not bypass observer result caching"
+    );
+    assert!(client.poll_finished(&mut context).is_ready());
+    assert!(client.poll_finished(&mut context).is_ready());
+    assert!(client.is_finished());
+    assert_eq!(Joiner::Bounded.client(client), Ok(71));
+
+    handle.block_on(scope.close()).expect("scope close root");
+    runtime
+      .shutdown(AsyncShutdown::Drain)
+      .expect("bounded runtime shutdown");
+  }
+
+  #[test]
+  fn bounded_client_consumes_cached_errors_and_rejects_uncached_results() {
+    let runtime = AsyncRuntime::new(AsyncConfig {
+      workers: 1,
+      max_outstanding: 2,
+      max_scopes: 2,
+    })
+    .expect("bounded runtime");
+    let scope = runtime.scope().expect("bounded task scope");
+    let handle = scope.handle();
+    let job = handle
+      .spawn(std::future::pending::<Result<u64, String>>())
+      .expect("pending bounded client task");
+    let abort = job.abort_handle();
+    abort.abort();
+    let mut client = ClientJob::Bounded { job, result: None };
+    let waker = Waker::from(Arc::new(
+      crate::application::ObserverWake(thread::current()),
+    ));
+    let mut context = Context::from_waker(&waker);
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while !abort.is_finished() && Instant::now() < deadline {
+      thread::yield_now();
+    }
+    assert!(
+      abort.is_finished(),
+      "cancelled task should publish completion"
+    );
+    assert!(client.poll_finished(&mut context).is_ready());
+    assert!(client.poll_finished(&mut context).is_ready());
+    assert_eq!(
+      Joiner::Bounded.client(client),
+      Err("allocatbelt client task failed: async task was cancelled".into())
+    );
+
+    let premature = ClientJob::Bounded {
+      job: handle
+        .spawn(std::future::pending::<Result<u64, String>>())
+        .expect("second bounded client task"),
+      result: None,
+    };
+    assert_eq!(
+      Joiner::Bounded.client(premature),
+      Err("allocatbelt client was consumed before terminal completion".into())
+    );
+
+    handle.block_on(scope.close()).expect("scope close root");
+    runtime
+      .shutdown(AsyncShutdown::Drain)
+      .expect("bounded runtime shutdown");
   }
 
   #[test]
@@ -1829,7 +1979,7 @@ mod tests {
     const ARRIVALS: usize = 64;
 
     fn queue_handler(
-      handle: &tokio::runtime::Handle,
+      handle: &AsyncHandle,
       events: &mpsc::Sender<Event>,
       lease_guards: &mut Vec<std::sync::Weak<()>>,
       record_id: u64,
@@ -1840,9 +1990,10 @@ mod tests {
       let lease_weak = Arc::downgrade(&lease);
       let event_lease = Arc::clone(&lease);
       lease_guards.push(lease_weak);
-      let job = HandlerJob::Tokio {
-        handle: handle
-          .spawn(async move { (Ok((result_id, checksum)), RoleLease { _hold: lease }) }),
+      let job = HandlerJob::Bounded {
+        job: handle
+          .spawn(async move { (Ok((result_id, checksum)), RoleLease { _hold: lease }) })
+          .expect("bounded handler task"),
         result: None,
       };
       events
@@ -1855,7 +2006,7 @@ mod tests {
     }
 
     fn queue_client(
-      handle: &tokio::runtime::Handle,
+      handle: &AsyncHandle,
       events: &mpsc::Sender<Event>,
       id: u64,
       checksum: u64,
@@ -1863,13 +2014,15 @@ mod tests {
       horizon: Instant,
       gate: Option<tokio::sync::oneshot::Receiver<()>>,
     ) {
-      let job = ClientJob::Tokio {
-        handle: handle.spawn(async move {
-          if let Some(gate) = gate {
-            gate.await.map_err(|_| "test gate closed".to_owned())?;
-          }
-          Ok(checksum)
-        }),
+      let job = ClientJob::Bounded {
+        job: handle
+          .spawn(async move {
+            if let Some(gate) = gate {
+              gate.await.map_err(|_| "test gate closed".to_owned())?;
+            }
+            Ok(checksum)
+          })
+          .expect("bounded client task"),
         result: None,
       };
       events
@@ -1882,12 +2035,15 @@ mod tests {
         .expect("client event");
     }
 
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-      .worker_threads(2)
-      .enable_all()
-      .build()
-      .expect("test runtime");
-    let handle = runtime.handle().clone();
+    let runtime = AsyncRuntime::new(AsyncConfig {
+      workers: 2,
+      max_outstanding: TASK_LIMIT,
+      max_scopes: 2,
+    })
+    .expect("bounded test runtime");
+    let scope = runtime.scope().expect("bounded test scope");
+    let handle = scope.handle();
+    let shutdown_handle = handle.clone();
     let (release_first, first_gate) = tokio::sync::oneshot::channel::<()>();
     let started = Instant::now();
     let horizon = started + Duration::from_secs(30);
@@ -1920,7 +2076,7 @@ mod tests {
       );
     }
 
-    let selected_options = options(Executor::Tokio, Mode::OpenLoop, Some(1000));
+    let selected_options = options(Executor::Bounded, Mode::OpenLoop, Some(1000));
     let selected_settings = Settings {
       horizon: Duration::from_secs(1),
       arrivals: ARRIVALS,
@@ -1929,7 +2085,7 @@ mod tests {
     let (report_tx, report_rx) = mpsc::sync_channel(1);
     let observer = std::thread::spawn(move || {
       let _ = report_tx.send(observe_events(
-        Joiner::Tokio,
+        Joiner::Bounded,
         selected_options,
         selected_settings,
         ResourceScope::new(super::limits()),
@@ -1959,7 +2115,7 @@ mod tests {
       drop(events_tx);
       drop(credits_rx);
       let _ = report_rx.recv_timeout(Duration::from_secs(10));
-      runtime.shutdown_timeout(Duration::from_secs(2));
+      shutdown_bounded_runtime(shutdown_handle, scope, runtime);
       observer
         .join()
         .expect("HTTP observer thread should stop after watchdog cleanup");
@@ -1998,7 +2154,7 @@ mod tests {
         drop(events_tx);
         drop(credits_rx);
         let _ = report_rx.recv_timeout(Duration::from_secs(10));
-        runtime.shutdown_timeout(Duration::from_secs(2));
+        shutdown_bounded_runtime(shutdown_handle, scope, runtime);
         observer
           .join()
           .expect("HTTP observer thread should stop after watchdog cleanup");
@@ -2045,7 +2201,7 @@ mod tests {
     let observed = report_rx.recv_timeout(Duration::from_secs(10));
     if observed.is_err() {
       drop(credits_rx);
-      runtime.shutdown_timeout(Duration::from_secs(2));
+      shutdown_bounded_runtime(shutdown_handle, scope, runtime);
       observer
         .join()
         .expect("HTTP observer thread should stop after watchdog cleanup");
@@ -2053,7 +2209,7 @@ mod tests {
     }
     observer.join().expect("observer thread should not panic");
     let trailing_credits = credits_rx.try_iter().count();
-    runtime.shutdown_timeout(Duration::from_secs(2));
+    shutdown_bounded_runtime(shutdown_handle, scope, runtime);
     let report = observed
       .expect("HTTP observer completion should arrive before the watchdog")
       .expect("all pairs should drain");
