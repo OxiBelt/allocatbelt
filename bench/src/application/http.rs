@@ -5,11 +5,12 @@
 //! executor-specific endpoint adapters.
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::io;
 use std::net::{SocketAddr, TcpListener as StdTcpListener, TcpStream as StdTcpStream};
 use std::pin::Pin;
-use std::sync::{Arc, mpsc};
-use std::task::{Context, Poll};
+use std::sync::{Arc, OnceLock, mpsc};
+use std::task::{Context, Poll, Waker};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -28,7 +29,7 @@ use allocatbelt_app_ports::http::{self, HttpConfig};
 use allocatbelt_app_ports::memory::pattern_byte;
 use tokio::io::{AsyncRead as TokioAsyncRead, AsyncWrite as TokioAsyncWrite};
 
-use super::{Executor, Mode, Options, WORKERS};
+use super::{Executor, Mode, ObserverEventSender, ObserverWake, Options, WORKERS};
 
 const WINDOW: usize = 8;
 const TASK_LIMIT: usize = 2 * WINDOW + 1;
@@ -54,14 +55,38 @@ struct PairToken {
 
 enum ClientJob {
   Bounded(AsyncJob<Result<u64, String>>),
-  Tokio(tokio::task::JoinHandle<Result<u64, String>>),
+  Tokio {
+    handle: tokio::task::JoinHandle<Result<u64, String>>,
+    result: Option<Result<Result<u64, String>, tokio::task::JoinError>>,
+  },
 }
 
 impl ClientJob {
+  fn poll_finished(&mut self, cx: &mut Context<'_>) -> Poll<()> {
+    match self {
+      Self::Bounded(job) => Pin::new(job).poll_finished(cx),
+      Self::Tokio { handle, result } => {
+        if result.is_some() {
+          return Poll::Ready(());
+        }
+        match Pin::new(handle).poll(cx) {
+          Poll::Pending => Poll::Pending,
+          Poll::Ready(output) => {
+            *result = Some(output);
+            Poll::Ready(())
+          }
+        }
+      }
+    }
+  }
+
   fn is_finished(&self) -> bool {
     match self {
       Self::Bounded(job) => job.is_finished(),
-      Self::Tokio(job) => job.is_finished(),
+      // `handle.is_finished()` can become true after the last poll returned
+      // Pending but before this predicate is checked. Keep readiness tied to
+      // the cached output so the observer polls and stores the result first.
+      Self::Tokio { result, .. } => result.is_some(),
     }
   }
 }
@@ -72,14 +97,28 @@ type JoinedHandler = HandlerOutput;
 
 enum HandlerJob {
   Bounded(AsyncJob<HandlerOutput>),
-  Tokio(tokio::task::JoinHandle<HandlerOutput>),
+  Tokio {
+    handle: tokio::task::JoinHandle<HandlerOutput>,
+    result: Option<Result<HandlerOutput, tokio::task::JoinError>>,
+  },
 }
 
 impl HandlerJob {
-  fn is_finished(&self) -> bool {
+  fn poll_finished(&mut self, cx: &mut Context<'_>) -> Poll<()> {
     match self {
-      Self::Bounded(job) => job.is_finished(),
-      Self::Tokio(job) => job.is_finished(),
+      Self::Bounded(job) => Pin::new(job).poll_finished(cx),
+      Self::Tokio { handle, result } => {
+        if result.is_some() {
+          return Poll::Ready(());
+        }
+        match Pin::new(handle).poll(cx) {
+          Poll::Pending => Poll::Pending,
+          Poll::Ready(output) => {
+            *result = Some(output);
+            Poll::Ready(())
+          }
+        }
+      }
     }
   }
 }
@@ -298,6 +337,8 @@ fn run_bounded(options: Options, settings: Settings) -> Result<Report, String> {
   let (roles_tx, roles_rx) = channel::channel(WINDOW, WINDOW)
     .map_err(|error| format!("HTTP accept-role channel setup failed: {error}"))?;
   let (events_tx, events_rx) = mpsc::sync_channel(settings.event_capacity(options.mode));
+  let observer_thread_target = Arc::new(OnceLock::new());
+  let events_tx = ObserverEventSender::new(events_tx, Arc::clone(&observer_thread_target));
   let (ready_tx, ready_rx) = mpsc::sync_channel(1);
   let accept_handle = async_handle.clone();
   let accept_resources = resources.clone();
@@ -338,6 +379,12 @@ fn run_bounded(options: Options, settings: Settings) -> Result<Report, String> {
       let _ = observer_tx.send(report);
     })
     .map_err(|error| format!("HTTP observer thread start failed: {error}"))?;
+  if observer_thread_target
+    .set(observer_thread.thread().clone())
+    .is_err()
+  {
+    return Err("HTTP observer thread was registered twice".into());
+  }
 
   let timer_pair_median_ns = super::measure_timer_pair_median_ns();
   let rss_before = super::sample_process_memory()?;
@@ -488,6 +535,8 @@ fn run_tokio(options: Options, settings: Settings) -> Result<Report, String> {
   let (roles_tx, roles_rx) = channel::channel(WINDOW, WINDOW)
     .map_err(|error| format!("HTTP accept-role channel setup failed: {error}"))?;
   let (events_tx, events_rx) = mpsc::sync_channel(settings.event_capacity(options.mode));
+  let observer_thread_target = Arc::new(OnceLock::new());
+  let events_tx = ObserverEventSender::new(events_tx, Arc::clone(&observer_thread_target));
   let (ready_tx, ready_rx) = mpsc::sync_channel(1);
   let accept_handle = handle.clone();
   let accept_resources = resources.clone();
@@ -512,14 +561,13 @@ fn run_tokio(options: Options, settings: Settings) -> Result<Report, String> {
 
   let (credits_tx, credits_rx) = mpsc::sync_channel(WINDOW);
   let (producer_tx, producer_rx) = mpsc::sync_channel(1);
-  let observer_handle = handle.clone();
   let observer_resources = resources.clone();
   let (observer_tx, observer_rx) = mpsc::sync_channel(1);
   let observer_thread = thread::Builder::new()
     .name("http-application-observer".into())
     .spawn(move || {
       let report = observe_events(
-        Joiner::Tokio(observer_handle),
+        Joiner::Tokio,
         options,
         settings,
         observer_resources,
@@ -529,6 +577,12 @@ fn run_tokio(options: Options, settings: Settings) -> Result<Report, String> {
       let _ = observer_tx.send(report);
     })
     .map_err(|error| format!("HTTP observer thread start failed: {error}"))?;
+  if observer_thread_target
+    .set(observer_thread.thread().clone())
+    .is_err()
+  {
+    return Err("HTTP observer thread was registered twice".into());
+  }
   let timer_pair_median_ns = super::measure_timer_pair_median_ns();
   let rss_before = super::sample_process_memory()?;
   let producer_handle = handle.clone();
@@ -630,7 +684,7 @@ async fn accept_native(
   mut roles: channel::Receiver<PairToken>,
   handle: AsyncHandle,
   resources: ResourceScope,
-  events: mpsc::SyncSender<Event>,
+  events: ObserverEventSender<Event>,
 ) -> Result<(), String> {
   while let Some(token) = roles.recv().await {
     // A producer-issued role token is consumed before accept, so the listener
@@ -688,7 +742,7 @@ async fn accept_tokio(
   handle: tokio::runtime::Handle,
   slots: Arc<tokio::sync::Semaphore>,
   resources: ResourceScope,
-  events: mpsc::SyncSender<Event>,
+  events: ObserverEventSender<Event>,
 ) -> Result<(), String> {
   while let Some(token) = roles.recv().await {
     // Reserve global task capacity and the pair role before accepting a file
@@ -737,7 +791,10 @@ async fn accept_tokio(
       .send(Event::Handler(HandlerRecord {
         id,
         _lease: observer_lease,
-        job: HandlerJob::Tokio(job),
+        job: HandlerJob::Tokio {
+          handle: job,
+          result: None,
+        },
       }))
       .map_err(|_| "HTTP observer queue closed while publishing handler".to_owned())?;
   }
@@ -751,7 +808,7 @@ fn produce_native(
   resources: ResourceScope,
   address: SocketAddr,
   roles: channel::Sender<PairToken>,
-  events: mpsc::SyncSender<Event>,
+  events: ObserverEventSender<Event>,
   credits: mpsc::Receiver<()>,
   options: Options,
   settings: Settings,
@@ -816,7 +873,7 @@ fn produce_tokio(
   resources: ResourceScope,
   address: SocketAddr,
   roles: channel::Sender<PairToken>,
-  events: mpsc::SyncSender<Event>,
+  events: ObserverEventSender<Event>,
   credits: mpsc::Receiver<()>,
   options: Options,
   settings: Settings,
@@ -866,12 +923,15 @@ fn produce_tokio(
       result
     };
     let ready_events = ready_events.clone();
-    Ok(ClientJob::Tokio(handle.spawn(async move {
-      let _task_slot = task_slot;
-      let result = operation.await;
-      let _ = ready_events.send(Event::Ready);
-      result
-    })))
+    Ok(ClientJob::Tokio {
+      handle: handle.spawn(async move {
+        let _task_slot = task_slot;
+        let result = operation.await;
+        let _ = ready_events.send(Event::Ready);
+        result
+      }),
+      result: None,
+    })
   })
 }
 
@@ -884,7 +944,7 @@ enum SubmitResult {
 fn produce(
   options: Options,
   settings: Settings,
-  events: mpsc::SyncSender<Event>,
+  events: ObserverEventSender<Event>,
   credits: mpsc::Receiver<()>,
   mut submit: impl FnMut(u64, RoleLease) -> Result<ClientJob, SubmitResult>,
 ) -> Result<ProducerReport, String> {
@@ -1024,7 +1084,7 @@ fn produce(
 
 enum Joiner {
   Bounded(AsyncHandle),
-  Tokio(tokio::runtime::Handle),
+  Tokio,
 }
 
 impl Joiner {
@@ -1034,9 +1094,19 @@ impl Joiner {
         .block_on(job)
         .map_err(|error| format!("allocatbelt client root failed: {error}"))?
         .map_err(|error| format!("allocatbelt client task failed: {error}"))?,
-      (Self::Tokio(handle), ClientJob::Tokio(job)) => handle
-        .block_on(job)
-        .map_err(|error| format!("Tokio client join failed: {error}"))?,
+      (
+        Self::Tokio,
+        ClientJob::Tokio {
+          result: Some(result),
+          ..
+        },
+      ) => match result {
+        Err(error) => Err(format!("Tokio client join failed: {error}")),
+        Ok(result) => result,
+      },
+      (Self::Tokio, ClientJob::Tokio { result: None, .. }) => {
+        Err("Tokio client was consumed before terminal completion".into())
+      }
       _ => Err("HTTP client job belongs to the wrong executor".into()),
     }
   }
@@ -1047,9 +1117,16 @@ impl Joiner {
         .block_on(job)
         .map_err(|error| format!("allocatbelt handler root failed: {error}"))?
         .map_err(|error| format!("allocatbelt handler task failed: {error}"))?,
-      (Self::Tokio(handle), HandlerJob::Tokio(job)) => handle
-        .block_on(job)
-        .map_err(|error| format!("Tokio handler join failed: {error}"))?,
+      (
+        Self::Tokio,
+        HandlerJob::Tokio {
+          result: Some(result),
+          ..
+        },
+      ) => result.map_err(|error| format!("Tokio handler join failed: {error}"))?,
+      (Self::Tokio, HandlerJob::Tokio { result: None, .. }) => {
+        return Err("Tokio handler was consumed before terminal completion".into());
+      }
       _ => return Err("HTTP handler job belongs to the wrong executor".into()),
     };
     Ok((result, task_lease))
@@ -1102,20 +1179,23 @@ fn observe_events(
   }
   let mut max_observed_managed_bytes = 0usize;
   let mut last_observed = Instant::now();
+  let completion_waker = Waker::from(Arc::new(ObserverWake(thread::current())));
 
   loop {
     max_observed_managed_bytes =
       max_observed_managed_bytes.max(resources.snapshot().managed_memory);
+    let mut made_progress = false;
     let mut events_disconnected = false;
-    let event = match events.recv_timeout(Duration::from_millis(1)) {
+    let event = match events.try_recv() {
       Ok(event) => Some(event),
-      Err(mpsc::RecvTimeoutError::Timeout) => None,
-      Err(mpsc::RecvTimeoutError::Disconnected) => {
+      Err(mpsc::TryRecvError::Empty) => None,
+      Err(mpsc::TryRecvError::Disconnected) => {
         events_disconnected = true;
         None
       }
     };
     if let Some(event) = event {
+      made_progress = true;
       match event {
         Event::Done(report) => producer = Some(report),
         Event::Client {
@@ -1164,13 +1244,19 @@ fn observe_events(
       }
     }
 
+    let mut context = Context::from_waker(&completion_waker);
     let mut index = 0;
     while index < handler_jobs.len() {
-      if !handler_jobs[index].1.is_finished() {
+      if handler_jobs[index]
+        .1
+        .poll_finished(&mut context)
+        .is_pending()
+      {
         index += 1;
         continue;
       }
       let (id, job, event_lease) = handler_jobs.swap_remove(index);
+      made_progress = true;
       let (handler_result, task_lease) = joiner.handler(job)?;
       let pair_id = handler_result
         .as_ref()
@@ -1185,6 +1271,12 @@ fn observe_events(
       }
     }
 
+    for pair in pending.values_mut() {
+      if let Some((_, _, job)) = pair.client.as_mut() {
+        let _ = job.poll_finished(&mut context);
+      }
+    }
+
     while let Some(id) = pending.iter().find_map(|(id, pair)| {
       (pair
         .client
@@ -1194,6 +1286,7 @@ fn observe_events(
       .then_some(*id)
     }) {
       let mut pair = pending.remove(&id).expect("ready pair remains present");
+      made_progress = true;
       let (scheduled, horizon_end, client_job) = pair.client.take().expect("ready client exists");
       let (handler_result, event_lease, task_lease) =
         pair.handler.take().expect("ready handler exists");
@@ -1260,13 +1353,34 @@ fn observe_events(
     if producer.is_some_and(|report| completed >= report.admitted) {
       break;
     }
-    if events_disconnected && handler_jobs.is_empty() && pending.is_empty() {
-      return Err(format!(
-        "HTTP event channel closed without a complete pair drain (completed {completed}, admitted {}, pending {}, done {})",
-        producer.map_or(0, |report| report.admitted),
-        pending.len(),
-        producer.is_some(),
-      ));
+    if events_disconnected {
+      if producer.is_none() {
+        return Err(format!(
+          "HTTP event channel closed before producer completion (completed {completed}, handler jobs {}, pending {})",
+          handler_jobs.len(),
+          pending.len(),
+        ));
+      }
+      if handler_jobs.is_empty()
+        && pending
+          .values()
+          .any(|pair| pair.client.is_none() || pair.handler.is_none())
+      {
+        return Err(format!(
+          "HTTP event channel closed with an admitted pair missing a role (completed {completed}, admitted {}, pending {})",
+          producer.map_or(0, |report| report.admitted),
+          pending.len(),
+        ));
+      }
+      if handler_jobs.is_empty() && pending.is_empty() && completed < producer.unwrap().admitted {
+        return Err(format!(
+          "HTTP event channel closed before all admitted pairs were reported (completed {completed}, admitted {})",
+          producer.unwrap().admitted,
+        ));
+      }
+    }
+    if !made_progress {
+      thread::park_timeout(Duration::from_millis(1));
     }
   }
   let producer = producer.ok_or_else(|| "HTTP producer completion record missing".to_owned())?;
@@ -1580,6 +1694,8 @@ mod tests {
   use crate::application::{Executor, Options, Workload};
   use allocatbelt::runtime::managed::ResourceScope;
   use std::sync::{Arc, mpsc};
+  use std::task::{Context, Waker};
+  use std::thread;
   use std::time::Duration;
   use std::time::Instant;
 
@@ -1598,6 +1714,89 @@ mod tests {
       arrivals: if mode == Mode::OpenLoop { 32 } else { 64 },
       body_bytes: 256,
     }
+  }
+
+  #[test]
+  fn tokio_client_readiness_requires_a_cached_terminal_result() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+      .enable_all()
+      .build()
+      .expect("test runtime");
+    let handle = runtime.spawn(async { Ok::<u64, String>(71) });
+    runtime.block_on(async { tokio::task::yield_now().await });
+    assert!(handle.is_finished());
+
+    let mut job = ClientJob::Tokio {
+      handle,
+      result: None,
+    };
+    assert!(!job.is_finished());
+    let waker = Waker::from(Arc::new(
+      crate::application::ObserverWake(thread::current()),
+    ));
+    let mut context = Context::from_waker(&waker);
+    assert!(job.poll_finished(&mut context).is_ready());
+    assert!(job.is_finished());
+    assert_eq!(Joiner::Tokio.client(job), Ok(71));
+    runtime.shutdown_timeout(Duration::from_secs(2));
+  }
+
+  #[test]
+  fn disconnected_done_channel_rejects_a_terminal_client_missing_its_handler() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+      .enable_all()
+      .build()
+      .expect("test runtime");
+    let handle = runtime.handle().clone();
+    let client_handle = handle.spawn(async { Ok::<u64, String>(71) });
+    runtime.block_on(async { tokio::task::yield_now().await });
+    assert!(client_handle.is_finished());
+    let client = ClientJob::Tokio {
+      handle: client_handle,
+      result: None,
+    };
+
+    let started = Instant::now();
+    let (events_tx, events_rx) = mpsc::sync_channel(2);
+    events_tx
+      .send(Event::Client {
+        id: 0,
+        scheduled: started,
+        horizon_end: started + Duration::from_secs(1),
+        job: client,
+      })
+      .expect("client event");
+    events_tx
+      .send(Event::Done(ProducerReport {
+        attempted: 1,
+        admitted: 1,
+        rejected_full: 0,
+        rejected_logical_window: 0,
+        rejected_backend_full: 0,
+        lateness_sum_ns: 0,
+        lateness_max_ns: 0,
+        started_at: started,
+        production_end: Instant::now(),
+        trace_overrun: false,
+      }))
+      .expect("producer completion event");
+    drop(events_tx);
+
+    let error = observe_events(
+      Joiner::Tokio,
+      options(Executor::Tokio, Mode::OpenLoop, Some(1000)),
+      Settings {
+        horizon: Duration::from_secs(1),
+        arrivals: 1,
+        body_bytes: 256,
+      },
+      ResourceScope::new(super::limits()),
+      events_rx,
+      mpsc::sync_channel(1).0,
+    )
+    .expect_err("a disconnected channel cannot supply the missing handler");
+    assert!(error.contains("admitted pair missing a role"));
+    runtime.shutdown_timeout(Duration::from_secs(2));
   }
 
   #[test]
@@ -1637,29 +1836,41 @@ mod tests {
     let (release_first, first_gate) = tokio::sync::oneshot::channel::<()>();
     let first_checksum = expected_request_checksum(0, 256);
     let second_checksum = expected_request_checksum(1, 256);
-    let first_client = ClientJob::Tokio(handle.spawn(async move {
-      first_gate
-        .await
-        .map_err(|_| "test gate closed".to_owned())?;
-      Ok(first_checksum)
-    }));
-    let second_client = ClientJob::Tokio(handle.spawn(async move { Ok(second_checksum) }));
-    let first_handler = HandlerJob::Tokio(handle.spawn(async move {
-      (
-        Ok((0, first_checksum)),
-        RoleLease {
-          _hold: Arc::new(()),
-        },
-      )
-    }));
-    let second_handler = HandlerJob::Tokio(handle.spawn(async move {
-      (
-        Ok((1, second_checksum)),
-        RoleLease {
-          _hold: Arc::new(()),
-        },
-      )
-    }));
+    let first_client = ClientJob::Tokio {
+      handle: handle.spawn(async move {
+        first_gate
+          .await
+          .map_err(|_| "test gate closed".to_owned())?;
+        Ok(first_checksum)
+      }),
+      result: None,
+    };
+    let second_client = ClientJob::Tokio {
+      handle: handle.spawn(async move { Ok(second_checksum) }),
+      result: None,
+    };
+    let first_handler = HandlerJob::Tokio {
+      handle: handle.spawn(async move {
+        (
+          Ok((0, first_checksum)),
+          RoleLease {
+            _hold: Arc::new(()),
+          },
+        )
+      }),
+      result: None,
+    };
+    let second_handler = HandlerJob::Tokio {
+      handle: handle.spawn(async move {
+        (
+          Ok((1, second_checksum)),
+          RoleLease {
+            _hold: Arc::new(()),
+          },
+        )
+      }),
+      result: None,
+    };
     let started = Instant::now();
     let horizon = started + Duration::from_secs(5);
     let (events_tx, events_rx) = mpsc::channel();
@@ -1723,7 +1934,7 @@ mod tests {
     let (report_tx, report_rx) = mpsc::sync_channel(1);
     let observer = std::thread::spawn(move || {
       let _ = report_tx.send(observe_events(
-        Joiner::Tokio(handle),
+        Joiner::Tokio,
         selected_options,
         selected_settings,
         ResourceScope::new(super::limits()),
@@ -1746,5 +1957,110 @@ mod tests {
     assert_eq!(report.digest, first_checksum.wrapping_add(second_checksum));
     assert_eq!(report.digest, report.expected);
     assert_eq!(credits_rx.try_iter().count(), 1);
+  }
+
+  #[test]
+  fn ready_hint_does_not_credit_http_pair_until_both_jobs_are_terminal() {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+      .worker_threads(2)
+      .enable_all()
+      .build()
+      .expect("test runtime");
+    let handle = runtime.handle().clone();
+    let (release_client, client_gate) = tokio::sync::oneshot::channel::<()>();
+    let checksum = expected_request_checksum(0, 256);
+    let client = ClientJob::Tokio {
+      handle: handle.spawn(async move {
+        client_gate
+          .await
+          .map_err(|_| "test gate closed".to_owned())?;
+        Ok(checksum)
+      }),
+      result: None,
+    };
+    let handler = HandlerJob::Tokio {
+      handle: handle.spawn(async move {
+        (
+          Ok((0, checksum)),
+          RoleLease {
+            _hold: Arc::new(()),
+          },
+        )
+      }),
+      result: None,
+    };
+    let started = Instant::now();
+    let (events_tx, events_rx) = mpsc::sync_channel(8);
+    let (credits_tx, credits_rx) = mpsc::sync_channel(1);
+    events_tx
+      .send(Event::Client {
+        id: 0,
+        scheduled: started,
+        horizon_end: started + Duration::from_secs(5),
+        job: client,
+      })
+      .expect("client event");
+    events_tx
+      .send(Event::Handler(HandlerRecord {
+        id: 0,
+        _lease: RoleLease {
+          _hold: Arc::new(()),
+        },
+        job: handler,
+      }))
+      .expect("handler event");
+    events_tx.send(Event::Ready).expect("early ready hint");
+    events_tx
+      .send(Event::Done(ProducerReport {
+        attempted: 1,
+        admitted: 1,
+        rejected_full: 0,
+        rejected_logical_window: 0,
+        rejected_backend_full: 0,
+        lateness_sum_ns: 0,
+        lateness_max_ns: 0,
+        started_at: started,
+        production_end: Instant::now(),
+        trace_overrun: false,
+      }))
+      .expect("producer completion event");
+    drop(events_tx);
+
+    let selected_options = options(Executor::Tokio, Mode::OpenLoop, Some(1000));
+    let selected_settings = Settings {
+      horizon: Duration::from_secs(1),
+      arrivals: 1,
+      body_bytes: 256,
+    };
+    let (report_tx, report_rx) = mpsc::sync_channel(1);
+    let observer = std::thread::spawn(move || {
+      let _ = report_tx.send(observe_events(
+        Joiner::Tokio,
+        selected_options,
+        selected_settings,
+        ResourceScope::new(super::limits()),
+        events_rx,
+        credits_tx,
+      ));
+    });
+
+    assert!(
+      credits_rx.recv_timeout(Duration::from_millis(20)).is_err(),
+      "a Ready hint and one terminal role cannot return pair credit"
+    );
+    release_client.send(()).expect("release client");
+    credits_rx
+      .recv_timeout(Duration::from_secs(2))
+      .expect("pair credit follows both terminal jobs");
+    let report = report_rx
+      .recv_timeout(Duration::from_secs(2))
+      .expect("HTTP observer completes")
+      .expect("valid paired result");
+    observer.join().expect("observer should not panic");
+    assert_eq!(report.on_time + report.late, 1);
+    assert_eq!(report.errors, 0);
+    assert_eq!(report.digest, checksum);
+    assert_eq!(report.digest, report.expected);
+    runtime.shutdown_timeout(Duration::from_secs(2));
   }
 }

@@ -9,7 +9,7 @@ use std::env;
 use std::fs::OpenOptions;
 use std::io::{self, Write};
 use std::process::ExitCode;
-use std::sync::{Arc, Condvar, Mutex, mpsc};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, mpsc};
 use std::task::{Context, Poll, Wake, Waker};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -202,15 +202,66 @@ impl Job {
   }
 }
 
-struct ObserverWake(mpsc::SyncSender<ObserverEvent>);
+pub(super) struct ObserverEventSender<T> {
+  sender: Option<mpsc::SyncSender<T>>,
+  observer: Arc<OnceLock<thread::Thread>>,
+}
+
+impl<T> ObserverEventSender<T> {
+  pub(super) fn new(sender: mpsc::SyncSender<T>, observer: Arc<OnceLock<thread::Thread>>) -> Self {
+    Self {
+      sender: Some(sender),
+      observer,
+    }
+  }
+
+  fn wake_observer(&self) {
+    if let Some(observer) = self.observer.get() {
+      observer.unpark();
+    }
+  }
+
+  pub(super) fn send(&self, event: T) -> Result<(), mpsc::SendError<T>> {
+    let result = match &self.sender {
+      Some(sender) => sender.send(event),
+      None => return Err(mpsc::SendError(event)),
+    };
+    if result.is_ok() {
+      self.wake_observer();
+    }
+    result
+  }
+}
+
+impl<T> Clone for ObserverEventSender<T> {
+  fn clone(&self) -> Self {
+    Self {
+      sender: self.sender.as_ref().cloned(),
+      observer: Arc::clone(&self.observer),
+    }
+  }
+}
+
+impl<T> Drop for ObserverEventSender<T> {
+  fn drop(&mut self) {
+    // Drop the real sender before waking so a receiver that runs immediately
+    // can observe Disconnected when this was the final sender.
+    if let Some(sender) = self.sender.take() {
+      drop(sender);
+    }
+    self.wake_observer();
+  }
+}
+
+pub(super) struct ObserverWake(thread::Thread);
 
 impl Wake for ObserverWake {
   fn wake(self: Arc<Self>) {
-    let _ = self.0.try_send(ObserverEvent::Ready);
+    self.0.unpark();
   }
 
   fn wake_by_ref(self: &Arc<Self>) {
-    let _ = self.0.try_send(ObserverEvent::Ready);
+    self.0.unpark();
   }
 }
 
@@ -372,7 +423,6 @@ enum ObserverEvent {
     attempted: usize,
     horizon_end: Instant,
   },
-  Ready,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -658,11 +708,12 @@ fn run_with_limits(
     Mode::OpenLoop => 4 * open_loop_arrivals.unwrap_or(OPEN_LOOP_ARRIVALS) + 1,
   };
   let (events_tx, events_rx) = mpsc::sync_channel(event_capacity);
+  let observer_thread_target = Arc::new(OnceLock::new());
+  let events_tx = ObserverEventSender::new(events_tx, Arc::clone(&observer_thread_target));
   let (credits_tx, credits_rx) = mpsc::sync_channel(WINDOW);
   let (producer_tx, producer_rx) = mpsc::sync_channel(1);
   let observer_ids = id_states.clone();
   let observer_cpu_oracle = cpu_oracle.clone();
-  let observer_completion_events = events_tx.clone();
   let observer_resources = resources.clone();
   let observer_arrivals = open_loop_arrivals.unwrap_or(OPEN_LOOP_ARRIVALS);
   let observer_pending_limit = if options.mode == Mode::OpenLoop {
@@ -680,7 +731,6 @@ fn run_with_limits(
         config,
         observer_resources,
         events_rx,
-        observer_completion_events,
         credits_tx,
         observer_ids,
         observer_arrivals,
@@ -691,6 +741,12 @@ fn run_with_limits(
       let _ = observer_tx.send(report);
     })
     .map_err(|error| format!("observer thread start failed: {error}"))?;
+  if observer_thread_target
+    .set(observer_thread.thread().clone())
+    .is_err()
+  {
+    return Err("application observer thread was registered twice".into());
+  }
 
   let timer_pair_median_ns = measure_timer_pair_median_ns();
   let rss_before = sample_process_memory()?;
@@ -1033,7 +1089,7 @@ fn produce(
   options: Options,
   config: LaneConfig,
   resources: &ResourceScope,
-  events: mpsc::SyncSender<ObserverEvent>,
+  events: ObserverEventSender<ObserverEvent>,
   credits: mpsc::Receiver<()>,
   states: Option<Arc<Mutex<Vec<IdState>>>>,
   capacity_horizon: Duration,
@@ -1177,7 +1233,6 @@ fn observe(
   config: LaneConfig,
   resources: ResourceScope,
   events: mpsc::Receiver<ObserverEvent>,
-  completion_events: mpsc::SyncSender<ObserverEvent>,
   credits: mpsc::SyncSender<()>,
   states: Option<Arc<Mutex<Vec<IdState>>>>,
   open_loop_arrivals: usize,
@@ -1206,12 +1261,13 @@ fn observe(
     .try_reserve_exact(pending_limit)
     .map_err(|_| "could not reserve bounded observer jobs".to_owned())?;
   let mut producer_done = false;
-  let completion_waker = Waker::from(Arc::new(ObserverWake(completion_events)));
+  let completion_waker = Waker::from(Arc::new(ObserverWake(thread::current())));
   loop {
-    let event = match events.recv_timeout(watchdog_timeout) {
+    let mut made_progress = false;
+    let event = match events.try_recv() {
       Ok(event) => Some(event),
-      Err(mpsc::RecvTimeoutError::Timeout) => None,
-      Err(mpsc::RecvTimeoutError::Disconnected) => {
+      Err(mpsc::TryRecvError::Empty) => None,
+      Err(mpsc::TryRecvError::Disconnected) => {
         if !producer_done {
           return Err("observer queue closed before pending jobs were consumed".into());
         }
@@ -1219,6 +1275,7 @@ fn observe(
       }
     };
     if let Some(event) = event {
+      made_progress = true;
       match event {
         ObserverEvent::Done {
           attempted: _attempted,
@@ -1226,7 +1283,6 @@ fn observe(
         } => {
           producer_done = true;
         }
-        ObserverEvent::Ready => {}
         ObserverEvent::Job {
           id,
           scheduled,
@@ -1252,6 +1308,7 @@ fn observe(
         continue;
       }
       let (id, scheduled, horizon_end, job) = pending.swap_remove(index);
+      made_progress = true;
       let result = observer.join(job);
       let observed = Instant::now();
       last_observed = observed;
@@ -1329,6 +1386,9 @@ fn observe(
         final_statuses,
         last_observed,
       });
+    }
+    if !made_progress {
+      thread::park_timeout(watchdog_timeout);
     }
   }
 }
@@ -1697,12 +1757,13 @@ fn percentile(samples: &[u64], percentile: usize) -> u64 {
 mod tests {
   use super::{
     AsyncConfig, AsyncRuntime, AsyncShutdown, DiskReport, Executor, IdState, Job, LaneConfig, Mode,
-    Observer, ObserverEvent, Options, WorkOutput, Workload, accept_capacity_id, observe,
-    resource_limits, run_with_limits, validate_output,
+    Observer, ObserverEvent, ObserverEventSender, Options, WorkOutput, Workload,
+    accept_capacity_id, observe, resource_limits, run_with_limits, validate_output,
   };
   use allocatbelt::runtime::managed::{ResourceLimits, ResourceScope};
-  use std::sync::{Arc, Mutex, mpsc};
+  use std::sync::{Arc, Mutex, OnceLock, mpsc};
   use std::task::Waker;
+  use std::thread;
   use std::time::{Duration, Instant};
 
   #[test]
@@ -1777,15 +1838,23 @@ mod tests {
         })
         .expect("admit gated task"),
     );
-    let (completion_tx, completion_rx) = mpsc::sync_channel(1);
-    let completion_waker = Waker::from(Arc::new(super::ObserverWake(completion_tx)));
+    let completion_waker = Waker::from(Arc::new(super::ObserverWake(thread::current())));
     let mut context = std::task::Context::from_waker(&completion_waker);
     assert!(job.poll_finished(&mut context).is_pending());
     release_tx.send(()).expect("release gated task");
-    completion_rx
-      .recv_timeout(Duration::from_secs(2))
-      .expect("terminal publication must wake the observer");
-    assert!(job.poll_finished(&mut context).is_ready());
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let mut terminal = false;
+    while Instant::now() < deadline {
+      if job.poll_finished(&mut context).is_ready() {
+        terminal = true;
+        break;
+      }
+      thread::park_timeout(deadline.saturating_duration_since(Instant::now()));
+    }
+    assert!(
+      terminal,
+      "terminal publication must wake the observer before its bound"
+    );
     let output = match job {
       Job::Bounded(job) => handle
         .block_on(job)
@@ -1798,6 +1867,173 @@ mod tests {
     runtime
       .shutdown(AsyncShutdown::Drain)
       .expect("runtime drains after join consumption");
+  }
+
+  #[test]
+  fn observer_event_send_unparks_a_parked_observer() {
+    let (raw_events_tx, events_rx) = mpsc::sync_channel(1);
+    let observer_target = Arc::new(OnceLock::new());
+    let events_tx = ObserverEventSender::new(raw_events_tx, Arc::clone(&observer_target));
+    let (park_ready_tx, park_ready_rx) = mpsc::sync_channel(1);
+    let (awake_tx, awake_rx) = mpsc::sync_channel(1);
+    let observer = thread::spawn(move || {
+      observer_target
+        .set(thread::current())
+        .expect("register observer thread once");
+      park_ready_tx.send(()).expect("publish park readiness");
+      thread::park_timeout(Duration::from_secs(5));
+      awake_tx.send(()).expect("publish wake");
+      assert!(matches!(
+        events_rx.try_recv(),
+        Ok(ObserverEvent::Done { attempted: 0, .. })
+      ));
+    });
+    park_ready_rx
+      .recv_timeout(Duration::from_secs(1))
+      .expect("observer registers before producer sends");
+
+    events_tx
+      .send(ObserverEvent::Done {
+        attempted: 0,
+        horizon_end: Instant::now(),
+      })
+      .expect("send producer completion");
+    awake_rx
+      .recv_timeout(Duration::from_secs(1))
+      .expect("event send wakes the parked observer");
+    observer.join().expect("observer should exit cleanly");
+    drop(events_tx);
+  }
+
+  #[test]
+  fn producer_panic_disconnects_observer_without_pending_jobs() {
+    let (raw_events_tx, events_rx) = mpsc::sync_channel(1);
+    let observer_target = Arc::new(OnceLock::new());
+    let events_tx = ObserverEventSender::new(raw_events_tx, Arc::clone(&observer_target));
+    let (started_tx, started_rx) = mpsc::sync_channel(1);
+    let (report_tx, report_rx) = mpsc::sync_channel(1);
+    let observer = thread::spawn(move || {
+      observer_target
+        .set(thread::current())
+        .expect("register observer thread once");
+      let _ = started_tx.send(());
+      let result = observe(
+        Observer::Tokio,
+        Options {
+          executor: Executor::Tokio,
+          workload: Workload::Cpu,
+          mode: Mode::OpenLoop,
+          rate_per_second: Some(1000),
+        },
+        LaneConfig::default(),
+        ResourceScope::new(resource_limits(Workload::Cpu)),
+        events_rx,
+        mpsc::sync_channel(8).0,
+        None,
+        0,
+        0,
+        Duration::from_secs(5),
+        None,
+      );
+      let _ = report_tx.send(result);
+    });
+    started_rx
+      .recv_timeout(Duration::from_secs(1))
+      .expect("observer starts");
+
+    let producer = thread::spawn(move || {
+      drop(events_tx);
+      panic!("injected producer failure before Done");
+    });
+    assert!(producer.join().is_err());
+    let error = report_rx
+      .recv_timeout(Duration::from_secs(1))
+      .expect("last sender drop must wake observer")
+      .expect_err("missing Done must remain an error");
+    assert!(error.contains("observer queue closed before pending jobs"));
+    observer.join().expect("observer thread should exit");
+  }
+
+  #[test]
+  fn producer_panic_disconnects_observer_with_a_pending_job() {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+      .worker_threads(1)
+      .enable_all()
+      .build()
+      .expect("test runtime");
+    let handle = runtime.handle().clone();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+    let job = Job::Tokio {
+      handle: handle.spawn(async move {
+        release_rx
+          .await
+          .map_err(|_| "test gate closed".to_owned())?;
+        Ok(WorkOutput::Cpu(42))
+      }),
+      result: None,
+    };
+    let (raw_events_tx, events_rx) = mpsc::sync_channel(2);
+    let observer_target = Arc::new(OnceLock::new());
+    let events_tx = ObserverEventSender::new(raw_events_tx, Arc::clone(&observer_target));
+    let scheduled = Instant::now();
+    events_tx
+      .send(ObserverEvent::Job {
+        id: 0,
+        scheduled,
+        horizon_end: scheduled + Duration::from_secs(5),
+        job,
+      })
+      .expect("publish pending job");
+    let (started_tx, started_rx) = mpsc::sync_channel(1);
+    let (report_tx, report_rx) = mpsc::sync_channel(1);
+    let observer = thread::spawn(move || {
+      if observer_target.set(thread::current()).is_err() {
+        let _ = report_tx.send(Err("observer target set twice".to_owned()));
+        return;
+      }
+      let _ = started_tx.send(());
+      let result = observe(
+        Observer::Tokio,
+        Options {
+          executor: Executor::Tokio,
+          workload: Workload::Cpu,
+          mode: Mode::OpenLoop,
+          rate_per_second: Some(1000),
+        },
+        LaneConfig::default(),
+        ResourceScope::new(resource_limits(Workload::Cpu)),
+        events_rx,
+        mpsc::sync_channel(8).0,
+        Some(Arc::new(Mutex::new(vec![IdState::Admitted]))),
+        1,
+        1,
+        Duration::from_secs(5),
+        None,
+      );
+      let _ = report_tx.send(result);
+    });
+    started_rx
+      .recv_timeout(Duration::from_secs(1))
+      .expect("observer starts");
+
+    let producer_sender = events_tx.clone();
+    let producer = thread::spawn(move || {
+      drop(producer_sender);
+      panic!("injected producer failure before Done");
+    });
+    drop(events_tx);
+    assert!(producer.join().is_err());
+    let error = report_rx
+      .recv_timeout(Duration::from_secs(1))
+      .expect("last sender drop must wake observer")
+      .expect_err("missing Done must remain an error");
+    assert!(error.contains("observer queue closed before pending jobs"));
+    observer.join().expect("observer thread should exit");
+
+    release_tx
+      .send(())
+      .expect("release pending task for runtime shutdown");
+    runtime.shutdown_timeout(Duration::from_secs(2));
   }
 
   #[test]
@@ -1926,7 +2162,6 @@ mod tests {
     let started = Instant::now();
     let horizon = started + std::time::Duration::from_secs(5);
     let (events_tx, events_rx) = mpsc::sync_channel(16);
-    let completion_tx = events_tx.clone();
     let (credits_tx, credits_rx) = mpsc::sync_channel(8);
     events_tx
       .send(ObserverEvent::Job {
@@ -1965,7 +2200,6 @@ mod tests {
         config,
         ResourceScope::new(resource_limits(Workload::Cpu)),
         events_rx,
-        completion_tx,
         credits_tx,
         Some(Arc::clone(&states)),
         2,
@@ -2045,7 +2279,6 @@ mod tests {
     let started = Instant::now();
     let horizon = started + std::time::Duration::from_secs(5);
     let (events_tx, events_rx) = mpsc::sync_channel(16);
-    let completion_tx = events_tx.clone();
     let (credits_tx, credits_rx) = mpsc::sync_channel(8);
     events_tx
       .send(ObserverEvent::Job {
@@ -2084,7 +2317,6 @@ mod tests {
         config,
         resources,
         events_rx,
-        completion_tx,
         credits_tx,
         Some(states),
         2,
