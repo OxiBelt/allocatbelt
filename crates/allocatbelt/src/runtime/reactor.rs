@@ -2520,6 +2520,7 @@ mod tests {
     assert_eq!(handle.registrations(), 1);
 
     peer.write_all(b"x").unwrap();
+    wait_until(|| woken.wakes() == 1);
     let mut guard = None;
     wait_until(|| match poll_with(&mut readiness, &waker) {
       Poll::Ready(Ok(ready)) => {
