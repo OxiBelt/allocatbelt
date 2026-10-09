@@ -25,9 +25,13 @@ explicit 30-second timer policy around the entire transaction. This is an
 example caller choice, not a default port policy. The dedicated
 `tests/nonblocking_http_port.rs` cases run behind whole-test 45-second
 subprocess watchdogs that kill and reap the test process on timeout. Their
-scope-task snapshots are read before the consuming `scope.close()` call; the
-close barrier is followed by independent resource/reactor checks. The cases
-are
+joined HTTP paths check resource and reactor cleanup immediately, then wait for
+scope task-accounting callbacks to finish before asserting an exact zero task
+count. The test-only wait is bounded to five seconds and leaves the scope open
+for the subsequent sentinel-admission checks. Invalid-body and timer-admission
+refusal cases retain their immediate zero-task assertions because they admit no
+task. All scope snapshots remain before the consuming `scope.close()` call; the
+close barrier is followed by independent resource/reactor checks. The cases are
 `reusable_http_registration_rejection_aborts_server_and_frees_listener`,
 `reusable_http_preoccupied_network_admission_is_clean`,
 `reusable_http_capacity_one_refuses_two_live_endpoints`,

@@ -1219,10 +1219,10 @@ mod tests {
   #![allow(clippy::unwrap_used, clippy::expect_used, reason = "tests")]
 
   use std::fs::{File, OpenOptions};
-  use std::io::Read as _;
+  use std::io::{Read as _, Write as _};
   use std::os::unix::fs::OpenOptionsExt;
   use std::os::unix::process::ExitStatusExt;
-  use std::path::PathBuf;
+  use std::path::{Path, PathBuf};
   use std::process::{Command, Stdio};
   use std::string::String;
   use std::sync::atomic::AtomicUsize;
@@ -1234,6 +1234,7 @@ mod tests {
   use crate::runtime::managed::{ResourceLimits, ResourceScope};
 
   const CHILD_ENV: &str = "ALLOCATBELT_RUNTIME_RING_CHILD";
+  const CHILD_FILE_ENV: &str = "ALLOCATBELT_RUNTIME_RING_CHILD_FILE";
   /// Set to make an unavailable io_uring fail the kernel tests instead of
   /// recording them as not run.
   const REQUIRE_ENV: &str = "ALLOCATBELT_REQUIRE_IO_URING";
@@ -1286,8 +1287,16 @@ mod tests {
         "allocatbelt-runtime-ring-{}-{n}",
         std::process::id()
       ));
-      std::fs::write(&path, contents).unwrap();
-      Self(path)
+      // Never truncate a stale path from another test-process lifetime.
+      let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .unwrap();
+      let owned = Self(path);
+      file.write_all(contents).unwrap();
+      drop(file);
+      owned
     }
 
     fn open(&self, options: &mut OpenOptions) -> OwnedFd {
@@ -1295,7 +1304,7 @@ mod tests {
     }
 
     fn read_write(&self) -> OwnedFd {
-      self.open(OpenOptions::new().read(true).write(true))
+      open_read_write(&self.0)
     }
 
     fn contents(&self) -> Vec<u8> {
@@ -1308,6 +1317,23 @@ mod tests {
   impl Drop for TempFile {
     fn drop(&mut self) {
       let _ = std::fs::remove_file(&self.0);
+    }
+  }
+
+  fn open_read_write(path: &Path) -> OwnedFd {
+    OpenOptions::new()
+      .read(true)
+      .write(true)
+      .open(path)
+      .unwrap()
+      .into()
+  }
+
+  fn assert_temp_file_absent(path: &Path) {
+    match std::fs::symlink_metadata(path) {
+      Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+      Ok(_) => panic!("parent-owned abort fixture remained after its guard dropped"),
+      Err(error) => panic!("could not verify abort fixture cleanup: {error}"),
     }
   }
 
@@ -1886,6 +1912,9 @@ mod tests {
 
   /// Runs `mode` in a child and expects it to abort with `message`.
   fn expect_abort(mode: &str, message: &str) {
+    // The parent owns the fixture because SIGABRT skips child destructors.
+    let file = TempFile::new(b"abcdefgh");
+    let file_path = file.0.clone();
     let test = module_path!()
       .strip_prefix("allocatbelt::")
       .unwrap_or(module_path!());
@@ -1897,6 +1926,7 @@ mod tests {
         "--test-threads=1",
       ])
       .env(CHILD_ENV, mode)
+      .env(CHILD_FILE_ENV, &file.0)
       .stdout(Stdio::null())
       .stderr(Stdio::piped())
       .spawn()
@@ -1922,6 +1952,8 @@ mod tests {
       .unwrap();
     if status.code() == Some(UNAVAILABLE) {
       not_run(&std::format!("fail-stop child {mode}"), &stderr.trim());
+      drop(file);
+      assert_temp_file_absent(&file_path);
       return;
     }
     assert_eq!(
@@ -1934,6 +1966,8 @@ mod tests {
       stderr.contains(&std::format!("fail-stop: {message}")),
       "{mode}: {stderr}"
     );
+    drop(file);
+    assert_temp_file_absent(&file_path);
   }
 
   /// The child side of [`expect_abort`]; a no-op unless `CHILD_ENV` is set.
@@ -1957,12 +1991,15 @@ mod tests {
         std::process::exit(if denied(&e) { UNAVAILABLE } else { 1 });
       }
     };
-    let file = TempFile::new(b"abcdefgh");
+    // This borrowed pathname must not install a child-side unlink guard.
+    let file_path = PathBuf::from(
+      std::env::var_os(CHILD_FILE_ENV).expect("parent abort harness must supply its file path"),
+    );
     let scope = scope(64);
     let read = |user_data| {
       op(
         user_data,
-        file.read_write(),
+        open_read_write(&file_path),
         scope.try_alloc_zeroed(4).unwrap(),
         0,
         OperationKind::ReadAt,

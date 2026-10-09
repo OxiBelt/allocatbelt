@@ -2,12 +2,14 @@ use std::future::{self, Future};
 use std::pin::Pin;
 use std::process::{Child, Command};
 use std::sync::mpsc;
-use std::task::{Context, Poll};
+use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll, Wake, Waker};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use allocatbelt::runtime::asynchronous::{
-  AsyncConfig, AsyncError, AsyncRuntime, AsyncShutdown, consume_budget,
+  AsyncConfig, AsyncError, AsyncJoinError, AsyncRuntime, AsyncShutdown, OwnedTaskScope,
+  consume_budget, yield_now,
 };
 use allocatbelt::runtime::managed::{OperationRequest, ResourceLimits, ResourceScope};
 use allocatbelt::runtime::reactor::{Reactor, ReactorConfig, ReactorHandle};
@@ -52,17 +54,32 @@ fn reactor(max_registrations: usize) -> Reactor {
 }
 
 fn assert_clean(
-  scope: &allocatbelt::runtime::asynchronous::OwnedTaskScope,
+  scope: &OwnedTaskScope,
+  runtime: &AsyncRuntime,
   resources: &ResourceScope,
   reactor: &ReactorHandle,
 ) {
+  assert_resources_clean(resources, reactor);
+  runtime
+    .block_on(await_scope_accounting(scope))
+    .expect("scope-accounting root poll should complete");
   assert_eq!(scope.snapshot().active_tasks, 0);
-  let snapshot = resources.snapshot();
-  assert_eq!(snapshot.managed_memory, 0);
-  assert_eq!(snapshot.disk_ops, 0);
-  assert_eq!(snapshot.network_ops, 0);
-  assert_eq!(reactor.registrations(), 0);
-  assert_eq!(reactor.waiters(), 0);
+  assert_resources_clean(resources, reactor);
+}
+
+async fn await_scope_accounting(scope: &OwnedTaskScope) {
+  let deadline = Instant::now() + Duration::from_secs(5);
+  loop {
+    let active_tasks = scope.snapshot().active_tasks;
+    if active_tasks == 0 {
+      return;
+    }
+    assert!(
+      Instant::now() < deadline,
+      "scope task accounting did not reach zero before the deadline; active_tasks={active_tasks}"
+    );
+    yield_now().await;
+  }
 }
 
 fn assert_resources_clean(resources: &ResourceScope, reactor: &ReactorHandle) {
@@ -154,6 +171,36 @@ impl Drop for ReleaseGate {
   }
 }
 
+struct PublicationGate {
+  entered: mpsc::Sender<()>,
+  release: Mutex<mpsc::Receiver<()>>,
+}
+
+impl PublicationGate {
+  fn pause(&self) {
+    self
+      .entered
+      .send(())
+      .expect("publication-gate observer should remain connected");
+    self
+      .release
+      .lock()
+      .expect("publication-gate receiver should remain available")
+      .recv()
+      .expect("the test releases its publication gate");
+  }
+}
+
+impl Wake for PublicationGate {
+  fn wake(self: Arc<Self>) {
+    self.pause();
+  }
+
+  fn wake_by_ref(self: &Arc<Self>) {
+    self.pause();
+  }
+}
+
 fn reusable_http_registration_rejection_aborts_server_and_frees_listener_case() {
   let mut blocking = blocking_runtime();
   let reactor = reactor(1);
@@ -177,10 +224,13 @@ fn reusable_http_registration_rejection_aborts_server_and_frees_listener_case() 
     ))
     .expect("HTTP root poll should complete");
   assert!(outcome.is_err(), "client registration must be refused");
-  assert_eq!(scope.snapshot().active_tasks, 0);
   assert_eq!(reactor_handle.registrations(), 0);
   assert_eq!(reactor_handle.waiters(), 0);
   assert_eq!(resources.snapshot().network_ops, 0);
+  runtime
+    .block_on(await_scope_accounting(&scope))
+    .expect("scope-accounting root poll should complete");
+  assert_eq!(scope.snapshot().active_tasks, 0);
 
   let sentinel = scope
     .spawn(async { 0x51u8 })
@@ -192,7 +242,7 @@ fn reusable_http_registration_rejection_aborts_server_and_frees_listener_case() 
       .expect("sentinel should join"),
     0x51
   );
-  assert_clean(&scope, &resources, &reactor_handle);
+  assert_clean(&scope, &runtime, &resources, &reactor_handle);
   runtime
     .block_on(scope.close())
     .expect("HTTP scope should close");
@@ -204,6 +254,79 @@ fn reusable_http_registration_rejection_aborts_server_and_frees_listener_case() 
     .shutdown(ShutdownMode::Drain)
     .expect("blocking runtime should stop");
   reactor.shutdown().expect("reactor should stop");
+}
+
+fn scope_accounting_helper_waits_for_join_publication_callbacks_case() {
+  let runtime = async_runtime(1);
+  let scope = runtime.scope().expect("test scope should open");
+  let (started_sender, started_receiver) = mpsc::channel();
+  let mut job = Box::pin(
+    scope
+      .spawn(async move {
+        started_sender
+          .send(())
+          .expect("test should observe the task's first poll");
+        future::pending::<()>().await;
+        0x61u8
+      })
+      .expect("pending task should be admitted"),
+  );
+
+  let (entered_sender, entered_receiver) = mpsc::channel();
+  let (release_sender, release_receiver) = mpsc::channel();
+  let mut release_gate = ReleaseGate(Some(release_sender));
+  let gate_waker = Waker::from(Arc::new(PublicationGate {
+    entered: entered_sender,
+    release: Mutex::new(release_receiver),
+  }));
+  let mut gate_context = Context::from_waker(&gate_waker);
+  assert!(job.as_mut().poll(&mut gate_context).is_pending());
+  started_receiver
+    .recv_timeout(Duration::from_secs(5))
+    .expect("worker should begin the pending task");
+
+  job.as_ref().get_ref().abort();
+  entered_receiver
+    .recv_timeout(Duration::from_secs(5))
+    .expect("terminal publication should enter the gated join callback");
+
+  let mut noop_context = Context::from_waker(Waker::noop());
+  assert!(matches!(
+    job.as_mut().poll(&mut noop_context),
+    Poll::Ready(Err(AsyncJoinError::Cancelled))
+  ));
+  assert_eq!(scope.snapshot().active_tasks, 1);
+
+  let mut accounting = Box::pin(await_scope_accounting(&scope));
+  assert!(accounting.as_mut().poll(&mut noop_context).is_pending());
+  assert_eq!(scope.snapshot().active_tasks, 1);
+
+  release_gate.release();
+  runtime
+    .block_on(accounting)
+    .expect("scope-accounting root poll should complete");
+  assert_eq!(scope.snapshot().active_tasks, 0);
+
+  let sentinel = scope
+    .spawn(async { 0x51u8 })
+    .expect("cleaned-up scope slot should admit the sentinel");
+  assert_eq!(
+    runtime
+      .block_on(sentinel)
+      .expect("sentinel root poll should complete")
+      .expect("sentinel task should join"),
+    0x51
+  );
+  runtime
+    .block_on(await_scope_accounting(&scope))
+    .expect("sentinel scope-accounting poll should complete");
+  assert_eq!(scope.snapshot().active_tasks, 0);
+  runtime
+    .block_on(scope.close())
+    .expect("test scope should close");
+  runtime
+    .shutdown(AsyncShutdown::Drain)
+    .expect("async runtime should stop");
 }
 
 fn reusable_http_preoccupied_network_admission_is_clean_case() {
@@ -237,7 +360,7 @@ fn reusable_http_preoccupied_network_admission_is_clean_case() {
   assert!(outcome.is_err(), "preoccupied network capacity must reject");
   assert_eq!(resources.snapshot().network_ops, 1);
   drop(occupied);
-  assert_clean(&scope, &resources, &reactor_handle);
+  assert_clean(&scope, &runtime, &resources, &reactor_handle);
   runtime
     .block_on(scope.close())
     .expect("HTTP scope should close");
@@ -277,7 +400,7 @@ fn reusable_http_capacity_one_refuses_two_live_endpoints_case() {
     outcome.is_err(),
     "the two endpoints cannot share one permit"
   );
-  assert_clean(&scope, &resources, &reactor_handle);
+  assert_clean(&scope, &runtime, &resources, &reactor_handle);
   runtime
     .block_on(scope.close())
     .expect("HTTP scope should close");
@@ -317,7 +440,7 @@ fn reusable_http_rejects_invalid_body_before_listener_registration_case() {
   assert_eq!(scope.snapshot().active_tasks, 0);
   assert_eq!(reactor_handle.registrations(), 0);
   assert_eq!(resources.snapshot().network_ops, 0);
-  assert_clean(&scope, &resources, &reactor_handle);
+  assert_clean(&scope, &runtime, &resources, &reactor_handle);
   runtime
     .block_on(scope.close())
     .expect("HTTP scope should close");
@@ -377,7 +500,7 @@ fn reusable_http_full_scope_rejects_server_and_drops_listener_case() {
       .expect("gate task should finish"),
     0x81
   );
-  assert_clean(&scope, &resources, &reactor_handle);
+  assert_clean(&scope, &runtime, &resources, &reactor_handle);
   runtime
     .block_on(scope.close())
     .expect("full-admission scope should close after releasing its gate");
@@ -458,7 +581,7 @@ fn reusable_http_cancellation_after_connect_admission_reclaims_server_task_case(
   );
   drop(transaction);
   admit_sentinel_after_server_cleanup(&scope, &runtime);
-  assert_clean(&scope, &resources, &reactor_handle);
+  assert_clean(&scope, &runtime, &resources, &reactor_handle);
   runtime
     .block_on(scope.close())
     .expect("server abort cleanup should finish");
@@ -508,7 +631,7 @@ fn reusable_http_timer_full_refuses_before_listener_or_task_admission_case() {
   assert_eq!(resources.snapshot().network_ops, 0);
   drop(held);
   assert_eq!(timer_handle.registered(), 0);
-  assert_clean(&scope, &resources, &reactor_handle);
+  assert_clean(&scope, &runtime, &resources, &reactor_handle);
   runtime
     .block_on(scope.close())
     .expect("HTTP scope should close");
@@ -581,7 +704,7 @@ fn reusable_http_timeout_cleans_admitted_transaction_case() {
   assert!(matches!(outcome, Err(TimeoutError::Elapsed)));
   assert_eq!(timer_handle.registered(), 0);
   admit_sentinel_after_server_cleanup(&scope, &runtime);
-  assert_clean(&scope, &resources, &reactor_handle);
+  assert_clean(&scope, &runtime, &resources, &reactor_handle);
   runtime
     .block_on(scope.close())
     .expect("aborted server cleanup should finish");
@@ -648,7 +771,7 @@ fn reusable_http_timeout_preserves_timer_closed_error_case() {
   ));
   assert_eq!(timer_handle.registered(), 0);
   admit_sentinel_after_server_cleanup(&scope, &runtime);
-  assert_clean(&scope, &resources, &reactor_handle);
+  assert_clean(&scope, &runtime, &resources, &reactor_handle);
   runtime
     .block_on(scope.close())
     .expect("aborted server cleanup should finish");
@@ -665,6 +788,10 @@ fn reusable_http_timeout_preserves_timer_closed_error_case() {
 watchdog_test!(
   reusable_http_registration_rejection_aborts_server_and_frees_listener,
   reusable_http_registration_rejection_aborts_server_and_frees_listener_case
+);
+watchdog_test!(
+  scope_accounting_helper_waits_for_join_publication_callbacks,
+  scope_accounting_helper_waits_for_join_publication_callbacks_case
 );
 watchdog_test!(
   reusable_http_preoccupied_network_admission_is_clean,
