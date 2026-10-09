@@ -87,8 +87,10 @@ The `tests/relay.rs` cases have whole-test subprocess watchdogs and cover
 constructor recovery, bounded-pipe backpressure with retained suffix bytes,
 scripted short-write/Pending/error progress, real TCP half-close/reverse
 response, canceled borrowed-run output publication after a positive prefix,
-no-restart refusal, and final buffer-clone charge lifetime. The suite is
-source-only in this candidate; no native test or build has been run.
+no-restart refusal, and final buffer-clone charge lifetime. The nine relay
+cases and nine reusable HTTP cases passed on a Linux guest, along with the
+release workspace suite, focused runtime regressions, same-source OnceCell
+Loom models, feature combinations and package consumers.
 
 The relay suite includes `generic_buffer_validation_precedes_endpoint_polls`,
 `generic_relay_reports_bounded_duplex_backpressure`,
