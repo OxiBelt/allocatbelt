@@ -1,43 +1,91 @@
 use std::future::{self, Future};
 use std::os::fd::AsRawFd;
+use std::process::{Child, Command};
 use std::sync::mpsc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use allocatbelt::runtime::asynchronous::{
   AsyncConfig, AsyncJoinError, AsyncRuntime, AsyncShutdown,
 };
-use allocatbelt::runtime::managed::{OperationRequest, ResourceLimits, ResourceScope};
+use allocatbelt::runtime::managed::{ResourceLimits, ResourceScope};
 use allocatbelt::runtime::net::{NetHandle, TcpConnectError, TcpConnectRejectKind, TcpSocket};
 use allocatbelt::runtime::reactor::{Reactor, ReactorConfig};
 use allocatbelt::runtime::{
   Config as BlockingConfig, Resources, Runtime as BlockingRuntime, ShutdownMode,
 };
-use allocatbelt_app_ports::http::{self, HttpConfig, MAX_REQUEST_BYTES};
+use allocatbelt_app_ports::http::{self, HttpConfig, MAX_BODY_BYTES, MAX_REQUEST_BYTES};
 use allocatbelt_app_ports::memory::{checksum, pattern_byte};
 
 #[test]
 fn nonblocking_socket_http_progresses_with_a_full_blocking_pool() {
-  within_watchdog(nonblocking_exchange);
+  within_watchdog(
+    "nonblocking_socket_http_progresses_with_a_full_blocking_pool",
+    nonblocking_exchange,
+  );
 }
 
 #[test]
 fn registration_rejection_cleans_up_the_scope_owned_http_server() {
-  within_watchdog(registration_rejection);
+  within_watchdog(
+    "registration_rejection_cleans_up_the_scope_owned_http_server",
+    registration_rejection,
+  );
 }
 
-fn within_watchdog(run: fn()) {
-  let (done_tx, done_rx) = mpsc::channel();
-  let worker = thread::spawn(move || {
+fn within_watchdog(test_name: &str, run: fn()) {
+  const CHILD_MARKER: &str = "ALLOCATBELT_HTTP_SOCKET_WATCHDOG_CHILD";
+  if std::env::var_os(CHILD_MARKER).is_some() {
     run();
-    done_tx
-      .send(())
-      .expect("qualification receiver remains live");
-  });
-  done_rx
-    .recv_timeout(Duration::from_secs(10))
-    .expect("nonblocking HTTP exchange must finish within its watchdog");
-  worker.join().expect("qualification worker must finish");
+    return;
+  }
+
+  let mut child = WatchdogChild(
+    Command::new(std::env::current_exe().expect("test executable path should resolve"))
+      .args(["--exact", test_name, "--nocapture"])
+      .env(CHILD_MARKER, "1")
+      .spawn()
+      .expect("watchdog child should start"),
+  );
+  let deadline = Instant::now() + Duration::from_secs(45);
+  loop {
+    if let Some(status) = child
+      .0
+      .try_wait()
+      .expect("watchdog child status should be readable")
+    {
+      assert!(
+        status.success(),
+        "child case {test_name} failed with {status:?}"
+      );
+      return;
+    }
+    if Instant::now() >= deadline {
+      child
+        .0
+        .kill()
+        .expect("timed-out test process should be killed");
+      let status = child
+        .0
+        .wait()
+        .expect("killed test process should be reaped");
+      panic!(
+        "whole test case {test_name} exceeded its 45-second watchdog; child status {status:?}"
+      );
+    }
+    thread::sleep(Duration::from_millis(10));
+  }
+}
+
+struct WatchdogChild(Child);
+
+impl Drop for WatchdogChild {
+  fn drop(&mut self) {
+    if !matches!(self.0.try_wait(), Ok(Some(_))) {
+      let _ = self.0.kill();
+      let _ = self.0.wait();
+    }
+  }
 }
 
 fn nonblocking_exchange() {
@@ -55,7 +103,7 @@ fn nonblocking_exchange() {
       started_tx.send(()).expect("gate receiver remains live");
       release_rx
         .recv_timeout(Duration::from_secs(5))
-        .expect("exchange must finish before the blocking gate is released");
+        .expect("exchange finishes before the blocking gate is released");
     })
     .expect("gate should occupy the only blocking admission slot");
   started_rx
@@ -75,85 +123,41 @@ fn nonblocking_exchange() {
   })
   .expect("async runtime should start");
   let resources = ResourceScope::new(ResourceLimits {
-    managed_memory: 3 * MAX_REQUEST_BYTES + 256,
+    managed_memory: 3 * MAX_REQUEST_BYTES + 512,
     disk_concurrent_ops: 0,
     network_concurrent_ops: 2,
   });
   let scope = runtime
     .scope_with_resources(&resources)
     .expect("HTTP scope should open");
-  let socket = TcpSocket::new_v4().expect("listener socket should open");
-  socket
-    .bind("127.0.0.1:0".parse().expect("valid loopback address"))
-    .expect("listener socket should bind");
-  let address = socket
-    .local_addr()
-    .expect("bound address should be available");
-  let listener = socket
-    .listen(1, &reactor_handle)
-    .expect("listener socket should register");
-  let server_resources = resources.clone();
-  let server = scope
-    .spawn(async move {
-      let (stream, _) = listener.accept().await.expect("client should connect");
-      http::serve_connection_with_id(stream, server_resources).await
-    })
-    .expect("server task should be admitted");
-  let net = NetHandle::new(
-    blocking_handle.clone(),
-    resources.clone(),
-    reactor_handle.clone(),
-    1,
-  )
-  .expect("network handle should initialize");
-  let request_id = 0x5351;
-  let config = HttpConfig {
-    body_bytes: 1739,
-    seed: 91,
-  };
-  let (client_checksum, server_result) = runtime
-    .block_on(async {
-      let socket = TcpSocket::new_v4().expect("client socket should open");
-      socket
-        .set_nodelay(true)
-        .expect("client option should apply");
-      assert!(socket.nodelay().expect("client option should read back"));
-      socket
-        .bind("127.0.0.1:0".parse().expect("valid client address"))
-        .expect("client socket should bind explicitly");
-      let mut stream = net
-        .connect_socket(socket, address)
-        .await
-        .expect("nonblocking connect must not need blocking-pool admission");
-      let endpoint_permit = resources
-        .try_acquire(OperationRequest {
-          disk: 0,
-          network: 1,
-        })
-        .expect("client endpoint should retain its network charge");
-      let actual = http::transact_client_io(&mut stream, &resources, request_id, config)
-        .await
-        .expect("shared client kernel should finish");
-      drop(stream);
-      drop(endpoint_permit);
-      let served = server
-        .await
-        .expect("server join should finish")
-        .expect("shared server kernel should finish");
-      (actual, served)
-    })
-    .expect("HTTP root should finish");
-  let expected = checksum(
-    &(0..config.body_bytes)
-      .map(|index| pattern_byte(config.seed, index))
-      .collect::<Vec<_>>(),
-  );
-  assert_eq!(client_checksum, expected);
-  assert_eq!(server_result, (request_id, expected));
-  assert_eq!(blocking_handle.snapshot().outstanding, 1);
+
+  for (body_bytes, seed, request_id) in [(0, 0x91, 0x51), (MAX_BODY_BYTES, 0x9182, u64::MAX)] {
+    let config = HttpConfig { body_bytes, seed };
+    let (server_id, actual) = runtime
+      .block_on(http::loopback_transaction_nonblocking_with_id(
+        &scope,
+        blocking_handle.clone(),
+        reactor_handle.clone(),
+        resources.clone(),
+        config,
+        request_id,
+      ))
+      .expect("HTTP root poll should complete")
+      .expect("reusable nonblocking transaction should complete");
+    let expected = checksum(
+      &(0..body_bytes)
+        .map(|index| pattern_byte(seed, index))
+        .collect::<Vec<_>>(),
+    );
+    assert_eq!(server_id, request_id);
+    assert_eq!(actual, expected);
+    assert_eq!(blocking_handle.snapshot().outstanding, 1);
+  }
 
   assert_eq!(scope.snapshot().active_tasks, 0);
-  runtime.block_on(scope.close()).expect("scope should close");
+  runtime
+    .block_on(scope.close())
+    .expect("HTTP scope should close");
   assert_eq!(resources.snapshot().managed_memory, 0);
   assert_eq!(resources.snapshot().network_ops, 0);
   assert_eq!(reactor_handle.registrations(), 0);

@@ -1,14 +1,16 @@
 //! Bounded HTTP/1.1 checksum exchange over allocatbelt's readiness TCP API.
 
+use std::error::Error;
+use std::fmt;
 use std::io;
-use std::net::{SocketAddr, TcpListener as StdTcpListener};
+use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpListener as StdTcpListener};
 use std::ops::{Deref, DerefMut};
 
 use allocatbelt::runtime::Handle as BlockingHandle;
 use allocatbelt::runtime::asynchronous::{AbortHandle, AsyncJob, AsyncJoinError, OwnedTaskScope};
 use allocatbelt::runtime::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use allocatbelt::runtime::managed::{OperationPermit, OperationRequest, ResourceScope};
-use allocatbelt::runtime::net::{NetHandle, TcpListener, TcpStream};
+use allocatbelt::runtime::net::{NetHandle, TcpListener, TcpSocket, TcpStream};
 use allocatbelt::runtime::reactor::ReactorHandle;
 
 use crate::memory::{checksum, pattern_byte};
@@ -28,6 +30,12 @@ const REQUEST_ID_PREFIX: &[u8] = b"\r\nX-Request-ID: ";
 const MAX_RESPONSE_BYTES: usize = 128;
 const REQUEST_READ_CHUNK: usize = 127;
 const RESPONSE_READ_CHUNK: usize = 7;
+
+#[derive(Clone, Copy)]
+enum ConnectMode {
+  Blocking,
+  Nonblocking,
+}
 
 /// Couples one endpoint with its accounting permit. The stream field is
 /// declared first so Rust drops the socket before releasing its permit.
@@ -69,6 +77,28 @@ impl<T> AbortOnDrop<T> {
 impl<T> Drop for AbortOnDrop<T> {
   fn drop(&mut self) {
     self.abort();
+  }
+}
+
+#[derive(Debug)]
+struct HttpTransactionError {
+  client: Box<dyn Error + Send + Sync>,
+  server: String,
+}
+
+impl fmt::Display for HttpTransactionError {
+  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    write!(
+      f,
+      "{}; HTTP server cleanup failed: {}",
+      self.client, self.server
+    )
+  }
+}
+
+impl Error for HttpTransactionError {
+  fn source(&self) -> Option<&(dyn Error + 'static)> {
+    Some(self.client.as_ref())
   }
 }
 
@@ -616,9 +646,43 @@ pub async fn loopback_transaction(
   resources: ResourceScope,
   config: HttpConfig,
 ) -> PortResult<u64> {
-  loopback_transaction_inner(scope, blocking, reactor, resources, config, None)
-    .await
-    .map(|(_, checksum)| checksum)
+  loopback_transaction_inner(
+    scope,
+    blocking,
+    reactor,
+    resources,
+    config,
+    None,
+    ConnectMode::Blocking,
+  )
+  .await
+  .map(|(_, checksum)| checksum)
+}
+
+/// Runs one loopback transaction using an explicitly bound readiness TCP
+/// listener and one nonblocking connect attempt. The supplied blocking handle
+/// is retained because [`NetHandle`] requires one, but this transport path
+/// does not submit work to its pool. Timeout policy remains caller-owned; wrap
+/// the whole returned future with a caller-selected timer deadline
+/// when a timeout is required.
+pub async fn loopback_transaction_nonblocking(
+  scope: &OwnedTaskScope,
+  blocking: BlockingHandle,
+  reactor: ReactorHandle,
+  resources: ResourceScope,
+  config: HttpConfig,
+) -> PortResult<u64> {
+  loopback_transaction_inner(
+    scope,
+    blocking,
+    reactor,
+    resources,
+    config,
+    None,
+    ConnectMode::Nonblocking,
+  )
+  .await
+  .map(|(_, checksum)| checksum)
 }
 
 /// Runs an ID-aware native loopback exchange through the same transport-
@@ -638,6 +702,32 @@ pub async fn loopback_transaction_with_id(
     resources,
     config,
     Some(request_id),
+    ConnectMode::Blocking,
+  )
+  .await
+}
+
+/// Runs an ID-aware loopback exchange using the explicit readiness listener
+/// and nonblocking `NetHandle::connect_socket` path. The blocking handle is a
+/// required dependency of `NetHandle`; this operation never submits a
+/// blocking-pool job. Apply a caller-owned timer around this entire future if
+/// a timeout is desired.
+pub async fn loopback_transaction_nonblocking_with_id(
+  scope: &OwnedTaskScope,
+  blocking: BlockingHandle,
+  reactor: ReactorHandle,
+  resources: ResourceScope,
+  config: HttpConfig,
+  request_id: u64,
+) -> PortResult<(u64, u64)> {
+  loopback_transaction_inner(
+    scope,
+    blocking,
+    reactor,
+    resources,
+    config,
+    Some(request_id),
+    ConnectMode::Nonblocking,
   )
   .await
 }
@@ -649,13 +739,24 @@ async fn loopback_transaction_inner(
   resources: ResourceScope,
   config: HttpConfig,
   request_id: Option<u64>,
+  connect_mode: ConnectMode,
 ) -> PortResult<(u64, u64)> {
   if config.body_bytes > MAX_BODY_BYTES {
     return Err(message("HTTP config exceeds its body bound").into());
   }
-  let listener = StdTcpListener::bind(("127.0.0.1", 0))?;
-  let address = listener.local_addr()?;
-  let listener = TcpListener::from_std(listener, &reactor)?;
+  let (listener, address) = match connect_mode {
+    ConnectMode::Blocking => {
+      let listener = StdTcpListener::bind(("127.0.0.1", 0))?;
+      let address = listener.local_addr()?;
+      (TcpListener::from_std(listener, &reactor)?, address)
+    }
+    ConnectMode::Nonblocking => {
+      let socket = TcpSocket::new_v4()?;
+      socket.bind(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)))?;
+      let address = socket.local_addr()?;
+      (socket.listen(1, &reactor)?, address)
+    }
+  };
   let server_resources = resources.clone();
   let server = scope
     .spawn(async move {
@@ -671,6 +772,7 @@ async fn loopback_transaction_inner(
     address,
     request_id,
     config,
+    connect_mode,
   )
   .await;
   match client_result {
@@ -690,8 +792,23 @@ async fn loopback_transaction_inner(
     Err(error) => {
       server.abort();
       match server.join().await {
+        Ok(Err(server_error)) if matches!(connect_mode, ConnectMode::Nonblocking) => {
+          Err(Box::new(HttpTransactionError {
+            client: error,
+            server: server_error.to_string(),
+          }))
+        }
         Ok(Err(server_error)) => {
           Err(message(format!("{}; HTTP server failed: {server_error}", error)).into())
+        }
+        Err(AsyncJoinError::Cancelled) if matches!(connect_mode, ConnectMode::Nonblocking) => {
+          Err(error)
+        }
+        Err(server_error) if matches!(connect_mode, ConnectMode::Nonblocking) => {
+          Err(Box::new(HttpTransactionError {
+            client: error,
+            server: format!("server task join failed: {server_error}"),
+          }))
         }
         Err(server_error) => Err(
           message(format!(
@@ -713,14 +830,27 @@ async fn transact_client(
   address: SocketAddr,
   request_id: Option<u64>,
   config: HttpConfig,
+  connect_mode: ConnectMode,
 ) -> PortResult<u64> {
   let net = NetHandle::new(blocking, resources.clone(), reactor, 1)?;
-  // NetHandle uses a bounded blocking-pool connect, then registers the stream
-  // with the same reactor used by the accepting side.
-  let stream = net
-    .connect(address)
-    .await
-    .map_err(|error| message(error.to_string()))?;
+  let stream = match connect_mode {
+    ConnectMode::Blocking => {
+      // Keep the original transport for callers that select the blocking API.
+      net
+        .connect(address)
+        .await
+        .map_err(|error| message(error.to_string()))?
+    }
+    ConnectMode::Nonblocking => {
+      let socket = TcpSocket::new_v4()?;
+      socket.set_nodelay(true)?;
+      socket.bind(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)))?;
+      net
+        .connect_socket(socket, address)
+        .await
+        .map_err(|error| message(error.to_string()))?
+    }
+  };
   let network: OperationPermit = resources.try_acquire(OperationRequest {
     disk: 0,
     network: 1,

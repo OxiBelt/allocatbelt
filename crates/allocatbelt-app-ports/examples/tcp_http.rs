@@ -1,9 +1,11 @@
 use allocatbelt::runtime::asynchronous::{AsyncConfig, AsyncRuntime, AsyncShutdown};
 use allocatbelt::runtime::managed::{ResourceLimits, ResourceScope};
 use allocatbelt::runtime::reactor::{Reactor, ReactorConfig};
+use allocatbelt::runtime::time::TimerDriver;
 use allocatbelt::runtime::{Config, Resources, Runtime, ShutdownMode};
 use allocatbelt_app_ports::PortResult;
 use allocatbelt_app_ports::http::{self, HttpConfig, MAX_BODY_BYTES, MAX_REQUEST_BYTES};
+use std::time::Duration;
 
 fn main() -> PortResult<()> {
   let mut config = HttpConfig::default();
@@ -34,23 +36,30 @@ fn main() -> PortResult<()> {
     network_concurrent_ops: 2,
   });
   let scope = async_runtime.scope_with_resources(&resources)?;
-  let transaction = async_runtime.block_on(http::loopback_transaction(
-    &scope,
-    blocking.handle(),
-    reactor.handle(),
-    resources.clone(),
-    config,
-  ));
+  let timer = TimerDriver::new(1)?;
+  let transaction = timer.handle().timeout(
+    Duration::from_secs(30),
+    http::loopback_transaction_nonblocking(
+      &scope,
+      blocking.handle(),
+      reactor.handle(),
+      resources.clone(),
+      config,
+    ),
+  )?;
+  let transaction = async_runtime.block_on(transaction);
 
   let close = async_runtime.block_on(scope.close());
   let async_shutdown = async_runtime.shutdown(AsyncShutdown::Drain);
   let blocking_shutdown = blocking.shutdown(ShutdownMode::Drain);
   let reactor_shutdown = reactor.shutdown();
-  let checksum = transaction??;
+  let timer_shutdown = timer.shutdown();
+  let checksum = transaction???;
   close?;
   async_shutdown?;
   blocking_shutdown?;
   reactor_shutdown?;
+  timer_shutdown?;
   let snapshot = resources.snapshot();
   if snapshot.managed_memory != 0 || snapshot.disk_ops != 0 || snapshot.network_ops != 0 {
     return Err(std::io::Error::other("HTTP workload retained a managed charge").into());

@@ -13,6 +13,12 @@
 //! belong after all operations and retained outputs have drained. Runtime,
 //! reactor and filesystem handles remain caller-owned and must be shut down
 //! explicitly.
+//! HTTP callers may keep the original blocking-pool connect API or select the
+//! additive explicitly bound, nonblocking loopback transaction. The latter
+//! uses `BlockingHandle` only to construct `NetHandle`; it submits no blocking
+//! connect job. Neither API creates a timer or chooses a timeout. Callers that
+//! need a deadline should wrap the entire transaction, including its server
+//! join, with their own timer and close the scope after the wrapper completes.
 //! The qualification tests exercise recovered bounded-admission inputs,
 //! returned managed-buffer clone lifetime, canceled HTTP server cleanup,
 //! detached multi-chunk filesystem work, and explicit process reaping. These
@@ -27,6 +33,7 @@ pub mod cpu;
 pub mod disk;
 pub mod http;
 pub mod memory;
+pub mod relay;
 
 /// Errors returned by an application port.
 pub type PortResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
