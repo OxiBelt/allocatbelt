@@ -83,6 +83,44 @@ Use independent specification/correctness reviews before signed commits. Every
 commit includes the required assistance trailer. A passing milestone does not
 establish full capability parity or performance qualification.
 
+### Child-process output acceptance
+
+The bounded process-output integration suite has a focused Linux correctness
+pass: its fourteen selected cases passed individually, along with test-target
+formatting, Clippy, compilation and exact test-list validation. The helper
+child remains ignored. This is one environment's component evidence, not a
+complete Linux host matrix, release gate, or performance result.
+
+Run the workspace checks required by [CONTRIBUTING.md](../../CONTRIBUTING.md)
+and the bounded acceptance script:
+
+```sh
+cargo fmt --all --check
+cargo clippy --all-targets --all-features --locked -- -D warnings
+cargo test --release --all-features --locked
+scripts/test-process-output-acceptance.sh
+```
+
+The acceptance script verifies the exact list of fourteen cases plus the
+ignored helper, then starts each selected test in its own process with a
+45-second TERM deadline and a three-second KILL grace. It creates a unique
+short mode-0700 `TMPDIR` for Unix-domain sockets and removes only that directory
+when empty. Keep an outer finite process-group watchdog for the whole script;
+the per-test bounds cover child waits and cleanup that do not have in-test
+deadlines. A timeout or missing witness is a failure, not a pass.
+
+These fixtures cover concurrent stdout/stderr drains, bounded prefixes and
+overflow recovery, actual reaping, cancellation and admission ownership,
+scalar/vectored child-pipe budget gates, sibling progress, and a witnessed full
+stdin pipe with pending/refund/cancel/resume behavior. They do not establish
+inherited-grandchild behavior, private partial-byte recovery after
+cancellation, the `OutputFuture` collector's own 64-operation shared-budget
+boundary, or complete kernel-pipe drain in the sibling-progress case. The
+ignored helper is fixture machinery rather than an independent test. Continue
+with the complete supported-platform, standard release and Miri/Loom gates
+appropriate to a release; do not promote this focused run into a platform or
+performance claim.
+
 ## Functional application ports
 
 The unpublished `allocatbelt-app-ports` workspace package contains deterministic

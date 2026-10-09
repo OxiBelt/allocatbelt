@@ -25,7 +25,7 @@ and ownership recovery, rather than exact Tokio API or binary compatibility.
 | Files, directories and owned blocking/standard streams | [Filesystem tests](../../crates/allocatbelt/src/runtime/fs_tests.rs), [blocking-stream tests](../../crates/allocatbelt/src/runtime/blocking_io_tests.rs) | Application acceptance for detached cancellation, recovered inputs and completion-held permits/storage |
 | Anonymous pipes and named FIFOs | [Pipe tests](../../crates/allocatbelt/src/runtime/unix_pipe_tests.rs), [FIFO tests](../../crates/allocatbelt/src/runtime/fs_fifo_tests.rs) | Buffered/FIFO migration with backpressure, partial cancellation, peer close and explicit driver cleanup |
 | Managed simplex/duplex, buffering and stream utilities | [Managed pipes](../../crates/allocatbelt/src/runtime/io_pipes.rs), [buffered I/O](../../crates/allocatbelt/src/runtime/buffered_io.rs), [bounded-read tests](../../crates/allocatbelt/src/runtime/io_bounded_tests.rs), [bidirectional tests](../../crates/allocatbelt/src/runtime/io_bidirectional_tests.rs) | Application acceptance for exact retained suffixes, permits and cancellation recovery |
-| Child lifecycle, pipes, bounded output and signals | [Child pipes and tests](../../crates/allocatbelt/src/runtime/process/pipe.rs), [bounded output](../../crates/allocatbelt/src/runtime/process/output.rs), [signal protocol tests](../../crates/allocatbelt/src/runtime/signal/protocol_tests.rs) | Process-output migration with simultaneous drains, bounded output and actual reaping; retain explicit ChildWait and SignalRecv accounting limits |
+| Child lifecycle, pipes, bounded output and signals | [Child pipes and tests](../../crates/allocatbelt/src/runtime/process/pipe.rs), [bounded output](../../crates/allocatbelt/src/runtime/process/output.rs), [process-output acceptance tests](../../crates/allocatbelt-app-ports/tests/process_output.rs), [signal protocol tests](../../crates/allocatbelt/src/runtime/signal/protocol_tests.rs) | Focused process-output cases passed once on Linux; broader platform, lifecycle and release qualification remains open, including explicit ChildWait and SignalRecv accounting limits |
 | Heterogeneous join, error-join and selection | [Composition](../../crates/allocatbelt/src/runtime/concurrency_many.rs), [declarative helpers](../../crates/allocatbelt/src/runtime/concurrency_macros.rs) | Preserve borrowing, disabled branches, selection policy and loser cleanup; randomized selection is outside the contract |
 | Resource ledgers and explicit cgroup/adaptive controls | [Managed storage](../../crates/allocatbelt/src/runtime/managed.rs), [cgroup controls](../../crates/allocatbelt/src/runtime/cgroup.rs), [adaptive policy](../../crates/allocatbelt/src/runtime/adaptive.rs) | Real-pressure and overload qualification with readback failures; synthetic samples and successful writes establish correctness only |
 | Owned-buffer runtime io_uring | [Runtime ring](../../crates/allocatbelt/src/runtime/uring.rs), [ring protocol](../../crates/allocatbelt/src/runtime/uring_protocol.rs) | Supported-kernel qualification, denial and no replay after submission; this additional capability is separate from the stable Tokio baseline |
@@ -72,3 +72,36 @@ The [foundation report](runtime-foundation.md) remains a historical milestone.
 Its earlier test counts and measurements are not the current release inventory.
 Update this ledger when public operations or acceptance fixtures change; publish
 only sanitized, source-specific qualification conclusions.
+
+### Process-output acceptance scope
+
+The focused application acceptance suite has one Linux correctness pass: all
+fourteen selected tests passed under individual process-group timeouts, with
+the helper child left ignored. Formatting, targeted Clippy, target compilation
+and the exact test-list check also passed in that run. This result covers only
+that bounded acceptance set and environment; it is not a complete Linux
+platform matrix or release qualification.
+
+| Acceptance test | Witness |
+| --- | --- |
+| `owned_scope_collects_finite_concurrent_streams_into_exact_managed_prefixes` | Concurrent stdout/stderr drain and exact retained prefixes |
+| `owned_scope_distinguishes_exact_capacity_from_one_byte_overflow_and_recovers_parts` | Exact-capacity completion, overflow policy and ownership recovery |
+| `dropping_pending_collector_cancels_waiters_while_reaper_keeps_detached_child` | Pending collector drop, waiter cancellation and child reaping |
+| `stderr_overflow_returns_original_parts_and_resumes_without_replaying_probe` | Partial overflow recovery and resumed stderr without replay |
+| `kill_and_wait_overflow_preserves_the_prefix_probe_and_reaps` | Kill-and-wait overflow handling with retained prefix and reaping |
+| `process_slot_rejection_preserves_and_retries_the_same_command_after_reap` | Rejected command ownership and retry after actual reap |
+| `task_and_scope_cancellation_follow_real_pending_output_and_release_waiters` | Task/scope cancellation after pending output and waiter release |
+| `one_worker_runs_a_gated_sibling_after_producer_completion_while_collector_is_pending` | Sibling progress while the collector is pending after producer completion |
+| `public_scalar_read_charge_and_zero_budget_gate_preserve_state` | Scalar child-pipe read charge and exhausted-budget state preservation |
+| `public_vectored_read_charge_and_zero_budget_gate_preserve_state` | Vectored child-pipe read charge and exhausted-budget state preservation |
+| `public_scalar_write_charge_and_zero_budget_gate_preserve_state` | Scalar child-pipe write charge and exhausted-budget state preservation |
+| `public_vectored_write_charge_and_zero_budget_gate_preserve_state` | Vectored child-pipe write charge and exhausted-budget state preservation |
+| `sixty_four_ready_pipe_reads_yield_to_a_gated_single_worker_sibling` | Sixty-four ready pipe reads followed by sibling progress |
+| `full_child_stdin_pending_cancels_waiter_and_resumes_same_writer_once` | Actual full-pipe pending, waiter cancellation and single resumption |
+
+The suite does not establish inherited-grandchild behavior, private partial-byte
+recovery after cancellation, the collector's own 64-operation shared-budget
+boundary, or complete pipe drain in the sibling-progress case. The ignored
+`process_output_helper_child` supports the parent cases but is not an
+independently selected acceptance case. These gaps remain for future focused
+fixtures and supported-platform qualification.
