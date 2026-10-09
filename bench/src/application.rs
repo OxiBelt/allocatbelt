@@ -39,6 +39,7 @@ const DRAIN_TIMEOUT: Duration = Duration::from_secs(300);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(60);
 const PROCESS_TIMEOUT: Duration = Duration::from_secs(900);
 const MAX_RETAINED_MEMORY_OUTPUTS: usize = WINDOW;
+pub(super) const HTTP_CONNECT_POLICY_SCHEMA: &str = "http-nonblocking-connect-v1";
 const TSV_HEADER: &str = "schema\tallocator\texecutor\tworkload\tmode\tasync_workers\tblocking_workers\ttopology\tlogical_window\tglobal_task_limit\tretained_window\tarrival_rate_per_second\trequested_arrivals\tattempted\tadmitted\trejected_full\trejected_resource\tcompleted_on_time\tcompleted_late\terrors\tcancellations\tunresolved\tlost\tresult_digest\texpected_digest\tcapacity_publications_per_second\tsuccessful_throughput_through_drain_per_second\tsetup_ns\ttimer_pair_median_ns\twall_through_drain_ns\tdrain_tail_ns\tresponse_p50_ns\tresponse_p95_ns\tresponse_p99_ns\tproducer_lateness_mean_ns\tproducer_lateness_max_ns\tmax_observed_managed_bytes\tretained_managed_bytes\tmanaged_limit_bytes\tdisk_limit_ops\tnetwork_limit_ops\tfinal_managed_bytes\tfinal_disk_ops\tfinal_network_ops\trss_before_kib\trss_after_drain_kib\trss_after_shutdown_kib\thwm_before_kib\thwm_after_drain_kib\thwm_after_shutdown_kib\tshutdown_ns\trejected_logical_window\trejected_backend_full";
 
 /// Executor under test.
@@ -601,13 +602,15 @@ fn run_with_limits(
   validate_options(options)?;
   let config = LaneConfig::default();
   let oracle_count = open_loop_arrivals.unwrap_or(OPEN_LOOP_ARRIVALS);
-  let cpu_oracle = if options.mode == Mode::OpenLoop && options.workload == Workload::Cpu {
-    let mut oracle = Vec::new();
-    oracle
-      .try_reserve_exact(oracle_count)
-      .map_err(|_| "could not reserve bounded CPU oracle".to_owned())?;
-    oracle.extend((0..oracle_count).map(|id| expected_value(Workload::Cpu, &config, id as u64)));
-    Some(Arc::new(oracle))
+  // Open-loop reference work is bounded and belongs to setup: recomputing the
+  // memory or disk reference payload after observing a result delays the
+  // credit that releases the producer's unchanged eight-operation window.
+  let open_loop_oracle = if options.mode == Mode::OpenLoop {
+    Some(build_expected_oracle(
+      options.workload,
+      &config,
+      oracle_count,
+    )?)
   } else {
     None
   };
@@ -713,7 +716,7 @@ fn run_with_limits(
   let (credits_tx, credits_rx) = mpsc::sync_channel(WINDOW);
   let (producer_tx, producer_rx) = mpsc::sync_channel(1);
   let observer_ids = id_states.clone();
-  let observer_cpu_oracle = cpu_oracle.clone();
+  let observer_open_loop_oracle = open_loop_oracle.clone();
   let observer_resources = resources.clone();
   let observer_arrivals = open_loop_arrivals.unwrap_or(OPEN_LOOP_ARRIVALS);
   let observer_pending_limit = if options.mode == Mode::OpenLoop {
@@ -736,7 +739,7 @@ fn run_with_limits(
         observer_arrivals,
         observer_pending_limit,
         Duration::from_millis(100),
-        observer_cpu_oracle,
+        observer_open_loop_oracle,
       );
       let _ = observer_tx.send(report);
     })
@@ -785,8 +788,12 @@ fn run_with_limits(
     .join()
     .map_err(|_| "application observer panicked".to_owned())?;
   let rss_after_drain = sample_after_checkpoint_delay()?;
-  let expected_checksum =
-    expected_digest(options, &observer_report, &producer, cpu_oracle.as_deref());
+  let expected_checksum = expected_digest(
+    options,
+    &observer_report,
+    &producer,
+    open_loop_oracle.as_deref(),
+  );
   let statuses = observer_report.final_statuses.as_ref();
   validate_counts(
     options,
@@ -1238,7 +1245,7 @@ fn observe(
   open_loop_arrivals: usize,
   pending_limit: usize,
   watchdog_timeout: Duration,
-  cpu_oracle: Option<Arc<Vec<u64>>>,
+  open_loop_oracle: Option<Arc<Vec<u64>>>,
 ) -> Result<ObserverReport, String> {
   let mut completed_on_time = 0;
   let mut completed_late = 0;
@@ -1321,7 +1328,7 @@ fn observe(
             &config,
             id,
             &output,
-            cpu_oracle.as_deref(),
+            open_loop_oracle.as_deref(),
           ) {
             errors += 1;
           } else {
@@ -1428,6 +1435,22 @@ fn expected_value(workload: Workload, config: &LaneConfig, id: u64) -> u64 {
   }
 }
 
+fn build_expected_oracle(
+  workload: Workload,
+  config: &LaneConfig,
+  count: usize,
+) -> Result<Arc<Vec<u64>>, String> {
+  if count > OPEN_LOOP_ARRIVALS {
+    return Err("open-loop reference oracle exceeds the 5,000-ID bound".into());
+  }
+  let mut oracle = Vec::new();
+  oracle
+    .try_reserve_exact(count)
+    .map_err(|_| "could not reserve bounded open-loop result oracle".to_owned())?;
+  oracle.extend((0..count).map(|id| expected_value(workload, config, id as u64)));
+  Ok(Arc::new(oracle))
+}
+
 #[cfg(test)]
 fn validate_output(workload: Workload, config: &LaneConfig, id: u64, output: &WorkOutput) -> bool {
   validate_output_with_oracle(workload, config, id, output, None)
@@ -1438,26 +1461,34 @@ fn validate_output_with_oracle(
   config: &LaneConfig,
   id: u64,
   output: &WorkOutput,
-  cpu_oracle: Option<&Vec<u64>>,
+  open_loop_oracle: Option<&Vec<u64>>,
 ) -> bool {
   match (workload, output) {
     (Workload::Cpu, WorkOutput::Cpu(value)) => {
-      let expected = match cpu_oracle {
+      let expected = match open_loop_oracle {
         Some(oracle) => oracle.get(id as usize).copied(),
         None => Some(expected_value(workload, config, id)),
       };
       expected == Some(*value)
     }
     (Workload::Memory, WorkOutput::Memory(output)) => {
+      let expected = match open_loop_oracle {
+        Some(oracle) => oracle.get(id as usize).copied(),
+        None => Some(expected_value(workload, config, id)),
+      };
       output.report.charged_after_growth == output.buffer.charged_bytes()
         && output.buffer.len() == config.memory.grown_bytes
         && output.report.checksum == memory::checksum(output.buffer.as_slice())
-        && output.report.checksum == expected_value(workload, config, id)
+        && expected == Some(output.report.checksum)
     }
     (Workload::Disk, WorkOutput::Disk(output)) => {
+      let expected = match open_loop_oracle {
+        Some(oracle) => oracle.get(id as usize).copied(),
+        None => Some(expected_value(workload, config, id)),
+      };
       output.offset == config.disk.offset
         && output.bytes == config.disk.bytes
-        && output.checksum == expected_value(workload, config, id)
+        && expected == Some(output.checksum)
         && output.temp_directory_removed
     }
     _ => false,
@@ -1478,14 +1509,14 @@ fn expected_digest(
   options: Options,
   observer: &ObserverReport,
   producer: &ProducerReport,
-  cpu_oracle: Option<&Vec<u64>>,
+  open_loop_oracle: Option<&Vec<u64>>,
 ) -> u64 {
   let mut digest = 0u64;
   match &observer.final_statuses {
     Some(statuses) => {
       for (id, state) in statuses.iter().enumerate() {
         if *state == IdState::Completed {
-          let value = match cpu_oracle {
+          let value = match open_loop_oracle {
             Some(oracle) => oracle[id],
             None => expected_value(options.workload, &LaneConfig::default(), id as u64),
           };
@@ -1496,7 +1527,7 @@ fn expected_digest(
     None => {
       let count = producer.admitted;
       for id in 0..count {
-        let value = match cpu_oracle {
+        let value = match open_loop_oracle {
           Some(oracle) => oracle[id],
           None => expected_value(options.workload, &LaneConfig::default(), id as u64),
         };
@@ -1757,8 +1788,9 @@ fn percentile(samples: &[u64], percentile: usize) -> u64 {
 mod tests {
   use super::{
     AsyncConfig, AsyncRuntime, AsyncShutdown, DiskReport, Executor, IdState, Job, LaneConfig, Mode,
-    Observer, ObserverEvent, ObserverEventSender, Options, WorkOutput, Workload,
-    accept_capacity_id, observe, resource_limits, run_with_limits, validate_output,
+    Observer, ObserverEvent, ObserverEventSender, ObserverReport, Options, ProducerReport,
+    WorkOutput, Workload, accept_capacity_id, observe, resource_limits, run_with_limits,
+    validate_output,
   };
   use allocatbelt::runtime::managed::{ResourceLimits, ResourceScope};
   use std::sync::{Arc, Mutex, OnceLock, mpsc};
@@ -1818,6 +1850,181 @@ mod tests {
       &WorkOutput::Cpu(oracle[1]),
       Some(&oracle),
     ));
+  }
+
+  #[test]
+  fn bounded_memory_oracle_preserves_buffer_integrity_checks() {
+    let config = LaneConfig::default();
+    let oracle =
+      super::build_expected_oracle(Workload::Memory, &config, 2).expect("bounded memory oracle");
+    let seed = super::job_seed(1);
+    let resources = ResourceScope::new(super::resource_limits(Workload::Memory));
+    let mut buffer = resources
+      .try_alloc_zeroed(config.memory.grown_bytes)
+      .expect("test buffer allocation");
+    for (index, byte) in buffer
+      .get_mut()
+      .expect("unique buffer")
+      .iter_mut()
+      .enumerate()
+    {
+      *byte = super::memory::pattern_byte(seed, index);
+    }
+    let output = || {
+      WorkOutput::Memory(super::MemoryOutput {
+        report: super::memory::MemoryReport {
+          peak_replacement_was_enforced: false,
+          charged_after_growth: buffer.charged_bytes(),
+          checksum: super::memory::checksum(buffer.as_slice()),
+        },
+        buffer: buffer.clone(),
+      })
+    };
+    let valid = output();
+    assert!(super::validate_output_with_oracle(
+      Workload::Memory,
+      &config,
+      1,
+      &valid,
+      Some(&oracle),
+    ));
+    assert!(!super::validate_output_with_oracle(
+      Workload::Memory,
+      &config,
+      2,
+      &valid,
+      Some(&oracle),
+    ));
+
+    let mut corrupted = resources
+      .try_alloc_zeroed(config.memory.grown_bytes)
+      .expect("corruption-test buffer allocation");
+    for (index, byte) in corrupted
+      .get_mut()
+      .expect("unique corruption-test buffer")
+      .iter_mut()
+      .enumerate()
+    {
+      *byte = super::memory::pattern_byte(seed, index);
+    }
+    corrupted.get_mut().expect("unique corruption-test buffer")[7] ^= 1;
+    let corrupted_checksum = super::memory::checksum(corrupted.as_slice());
+    let corrupted_output = WorkOutput::Memory(super::MemoryOutput {
+      report: super::memory::MemoryReport {
+        peak_replacement_was_enforced: false,
+        charged_after_growth: corrupted.charged_bytes(),
+        checksum: corrupted_checksum,
+      },
+      buffer: corrupted,
+    });
+    assert!(!super::validate_output_with_oracle(
+      Workload::Memory,
+      &config,
+      1,
+      &corrupted_output,
+      Some(&oracle),
+    ));
+    drop(resources);
+  }
+
+  #[test]
+  fn bounded_disk_oracle_validates_id_specific_checksum() {
+    let config = LaneConfig::default();
+    let oracle =
+      super::build_expected_oracle(Workload::Disk, &config, 2).expect("bounded disk oracle");
+    let id = 1u64;
+    let expected_from_payload =
+      (0..config.disk.bytes).fold(0xcbf2_9ce4_8422_2325, |hash, index| {
+        (hash ^ u64::from(super::disk::payload_byte(super::job_seed(id), index)))
+          .wrapping_mul(0x0000_0100_0000_01b3)
+      });
+    assert_eq!(oracle[id as usize], expected_from_payload);
+    let output = |checksum| {
+      WorkOutput::Disk(DiskReport {
+        offset: config.disk.offset,
+        bytes: config.disk.bytes,
+        checksum,
+        resources_after_cleanup: ResourceScope::new(ResourceLimits {
+          managed_memory: 0,
+          disk_concurrent_ops: 0,
+          network_concurrent_ops: 0,
+        })
+        .snapshot(),
+        temp_directory_removed: true,
+      })
+    };
+    assert!(super::validate_output_with_oracle(
+      Workload::Disk,
+      &config,
+      id,
+      &output(expected_from_payload),
+      Some(&oracle),
+    ));
+    assert!(!super::validate_output_with_oracle(
+      Workload::Disk,
+      &config,
+      id,
+      &output(expected_from_payload ^ 1),
+      Some(&oracle),
+    ));
+    assert!(!super::validate_output_with_oracle(
+      Workload::Disk,
+      &config,
+      id + 1,
+      &output(expected_from_payload),
+      Some(&oracle),
+    ));
+  }
+
+  #[test]
+  fn open_loop_expected_digest_uses_only_completed_ids_from_the_oracle() {
+    let config = LaneConfig::default();
+    let oracle =
+      super::build_expected_oracle(Workload::Memory, &config, 4).expect("bounded memory oracle");
+    let observer = ObserverReport {
+      completed_on_time: 1,
+      completed_late: 1,
+      errors: 1,
+      cancellations: 0,
+      digest: 0,
+      latencies_ns: Vec::new(),
+      max_observed_managed_bytes: 0,
+      retained_managed_bytes: 0,
+      final_statuses: Some(vec![
+        IdState::Completed,
+        IdState::Rejected,
+        IdState::Completed,
+        IdState::Failed,
+      ]),
+      last_observed: Instant::now(),
+    };
+    let producer = ProducerReport {
+      attempted: 4,
+      admitted: 3,
+      rejected_full: 1,
+      rejected_logical_window: 1,
+      rejected_backend_full: 0,
+      lateness_sum_ns: 0,
+      lateness_max_ns: 0,
+      started_at: Instant::now(),
+      production_end: Instant::now(),
+      trace_overrun: false,
+    };
+    let expected = oracle[0].wrapping_add(oracle[2] ^ 2);
+    assert_eq!(
+      super::expected_digest(
+        Options {
+          executor: Executor::Bounded,
+          workload: Workload::Memory,
+          mode: Mode::OpenLoop,
+          rate_per_second: Some(100),
+        },
+        &observer,
+        &producer,
+        Some(&oracle),
+      ),
+      expected
+    );
   }
 
   #[test]
@@ -2384,6 +2591,27 @@ mod tests {
       128
     );
     assert_eq!(counts.observer.digest, counts.expected_checksum);
+  }
+
+  #[test]
+  fn synthetic_open_loop_memory_run_uses_the_bounded_oracle() {
+    let counts = run_with_limits(
+      Options {
+        executor: Executor::Bounded,
+        workload: Workload::Memory,
+        mode: Mode::OpenLoop,
+        rate_per_second: Some(100),
+      },
+      None,
+      Some(4),
+    )
+    .expect("short open-loop memory lane should drain and validate");
+    assert_eq!(counts.producer.attempted, 4);
+    assert_eq!(counts.producer.admitted, 4);
+    assert_eq!(counts.observer.errors, 0);
+    assert_eq!(counts.observer.digest, counts.expected_checksum);
+    assert!(counts.observer.retained_managed_bytes <= 4 * 8192);
+    assert_eq!(counts.final_resources.managed_memory, 0);
   }
 
   #[test]

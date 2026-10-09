@@ -7,7 +7,7 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::io;
-use std::net::{SocketAddr, TcpListener as StdTcpListener, TcpStream as StdTcpStream};
+use std::net::{SocketAddr, SocketAddrV4, TcpListener as StdTcpListener};
 use std::pin::Pin;
 use std::sync::{Arc, OnceLock, mpsc};
 use std::task::{Context, Poll, Waker};
@@ -298,28 +298,39 @@ pub(super) fn limits() -> ResourceLimits {
   }
 }
 
-fn native_address(reactor: &ReactorHandle) -> Result<(NativeListener, SocketAddr), String> {
+fn checked_loopback_v4(address: SocketAddr) -> Result<SocketAddrV4, String> {
+  match address {
+    SocketAddr::V4(address) if address.ip().is_loopback() => Ok(address),
+    SocketAddr::V4(address) => Err(format!("HTTP listener is not IPv4 loopback: {address}")),
+    SocketAddr::V6(address) => Err(format!("HTTP listener is not IPv4: {address}")),
+  }
+}
+
+fn native_address(reactor: &ReactorHandle) -> Result<(NativeListener, SocketAddrV4), String> {
   let listener = StdTcpListener::bind(("127.0.0.1", 0))
     .map_err(|error| format!("loopback listener bind failed: {error}"))?;
   let address = listener
     .local_addr()
     .map_err(|error| format!("loopback listener address failed: {error}"))?;
+  let address = checked_loopback_v4(address)?;
   let listener = NativeListener::from_std(listener, reactor)
     .map_err(|error| format!("loopback listener registration failed: {}", error.error))?;
   Ok((listener, address))
 }
 
-fn std_listener() -> Result<(StdTcpListener, SocketAddr), String> {
+fn std_listener() -> Result<(StdTcpListener, SocketAddrV4), String> {
   let listener = StdTcpListener::bind(("127.0.0.1", 0))
     .map_err(|error| format!("loopback listener bind failed: {error}"))?;
   let address = listener
     .local_addr()
     .map_err(|error| format!("loopback listener address failed: {error}"))?;
+  let address = checked_loopback_v4(address)?;
   Ok((listener, address))
 }
 
 fn run_bounded(options: Options, settings: Settings) -> Result<Report, String> {
   let setup_started = Instant::now();
+  let expected_oracle = build_open_loop_checksum_oracle(options.mode, settings)?;
   let resources = ResourceScope::new(limits());
   let async_runtime = AsyncRuntime::new(AsyncConfig {
     workers: WORKERS,
@@ -393,6 +404,7 @@ fn run_bounded(options: Options, settings: Settings) -> Result<Report, String> {
   let (credits_tx, credits_rx) = mpsc::sync_channel(WINDOW);
   let (producer_tx, producer_rx) = mpsc::sync_channel(1);
   let observer_resources = resources.clone();
+  let observer_expected_oracle = expected_oracle.clone();
   let (observer_tx, observer_rx) = mpsc::sync_channel(1);
   let observer_thread = thread::Builder::new()
     .name("http-application-observer".into())
@@ -404,6 +416,7 @@ fn run_bounded(options: Options, settings: Settings) -> Result<Report, String> {
         observer_resources,
         events_rx,
         credits_tx,
+        observer_expected_oracle,
       );
       let _ = observer_tx.send(report);
     })
@@ -525,12 +538,13 @@ fn run_bounded(options: Options, settings: Settings) -> Result<Report, String> {
     final_resources,
     shutdown_ns,
     1,
-    "4 async + 1 blocking + dedicated reactor",
+    "4 async + 1 reserved blocking worker (unused by HTTP connect) + dedicated reactor; NetHandle::connect_nonblocking",
   ))
 }
 
 fn run_tokio(options: Options, settings: Settings) -> Result<Report, String> {
   let setup_started = Instant::now();
+  let expected_oracle = build_open_loop_checksum_oracle(options.mode, settings)?;
   let resources = ResourceScope::new(limits());
   let runtime = tokio::runtime::Builder::new_multi_thread()
     .worker_threads(WORKERS)
@@ -591,6 +605,7 @@ fn run_tokio(options: Options, settings: Settings) -> Result<Report, String> {
   let (credits_tx, credits_rx) = mpsc::sync_channel(WINDOW);
   let (producer_tx, producer_rx) = mpsc::sync_channel(1);
   let observer_resources = resources.clone();
+  let observer_expected_oracle = expected_oracle.clone();
   let (observer_tx, observer_rx) = mpsc::sync_channel(1);
   let observer_thread = thread::Builder::new()
     .name("http-application-observer".into())
@@ -602,6 +617,7 @@ fn run_tokio(options: Options, settings: Settings) -> Result<Report, String> {
         observer_resources,
         events_rx,
         credits_tx,
+        observer_expected_oracle,
       );
       let _ = observer_tx.send(report);
     })
@@ -704,7 +720,7 @@ fn run_tokio(options: Options, settings: Settings) -> Result<Report, String> {
     final_resources,
     shutdown_ns,
     1,
-    "4 async + 1 blocking + integrated I/O driver",
+    "4 async + 1 reserved blocking worker (unused by HTTP connect) + integrated I/O driver; Tokio TcpSocket::connect",
   ))
 }
 
@@ -835,7 +851,7 @@ fn produce_native(
   handle: AsyncHandle,
   net: NetHandle,
   resources: ResourceScope,
-  address: SocketAddr,
+  address: SocketAddrV4,
   roles: channel::Sender<PairToken>,
   events: ObserverEventSender<Event>,
   credits: mpsc::Receiver<()>,
@@ -849,7 +865,7 @@ fn produce_native(
     let resources = resources.clone();
     let operation = async move {
       let mut stream = net
-        .connect(address)
+        .connect_nonblocking(SocketAddr::V4(address))
         .await
         .map_err(|error| format!("allocatbelt HTTP connect failed: {error}"))?;
       let permit = resources
@@ -900,7 +916,7 @@ fn produce_tokio(
   handle: tokio::runtime::Handle,
   slots: Arc<tokio::sync::Semaphore>,
   resources: ResourceScope,
-  address: SocketAddr,
+  address: SocketAddrV4,
   roles: channel::Sender<PairToken>,
   events: ObserverEventSender<Event>,
   credits: mpsc::Receiver<()>,
@@ -921,10 +937,9 @@ fn produce_tokio(
     handle
       .block_on(role_sender.send(token))
       .map_err(|_| SubmitResult::Closed)?;
-    let handle_for_connect = handle.clone();
     let resources_for_client = resources.clone();
     let operation = async move {
-      let stream = tokio_connect(&handle_for_connect, &resources_for_client, address)
+      let stream = tokio_connect_nonblocking(&resources_for_client, address)
         .await
         .map_err(|error| format!("Tokio HTTP connect failed: {error}"))?;
       let permit = resources_for_client
@@ -1181,6 +1196,7 @@ fn observe_events(
   resources: ResourceScope,
   events: mpsc::Receiver<Event>,
   credits: mpsc::SyncSender<()>,
+  expected_oracle: Option<Arc<Vec<u64>>>,
 ) -> Result<ObserverReport, String> {
   let mut pending = HashMap::<u64, PendingPair>::new();
   pending
@@ -1342,15 +1358,15 @@ fn observe_events(
         latencies.push(observed.saturating_duration_since(scheduled).as_nanos() as u64);
       }
       let result = match (client_result, handler_result) {
-        (Ok(client_checksum), Ok((handler_id, handler_checksum))) => {
-          if handler_id != id || handler_checksum != client_checksum {
-            Err("HTTP client/handler request IDs or checksums differ".to_owned())
-          } else if client_checksum != expected_request_checksum(id, settings.body_bytes) {
-            Err("HTTP response checksum does not match its request ID".to_owned())
-          } else {
-            Ok(client_checksum)
-          }
-        }
+        (Ok(client_checksum), Ok((handler_id, handler_checksum))) => validate_response_pair(
+          id,
+          client_checksum,
+          handler_id,
+          handler_checksum,
+          expected_oracle.as_deref(),
+          settings,
+        )
+        .map_err(|error| error.to_owned()),
         (Err(error), _) | (_, Err(error)) => Err(error),
       };
       match result {
@@ -1450,8 +1466,14 @@ fn observe_events(
       for (id, state) in values.iter().enumerate() {
         match state {
           IdState::Completed => {
-            expected =
-              expected.wrapping_add(expected_request_checksum(id as u64, settings.body_bytes));
+            let expected_value = match &expected_oracle {
+              Some(oracle) => oracle
+                .get(id)
+                .copied()
+                .ok_or_else(|| "HTTP open-loop checksum oracle missed a completed ID".to_owned())?,
+              None => expected_request_checksum(id as u64, settings.body_bytes),
+            };
+            expected = expected.wrapping_add(expected_value);
           }
           IdState::Rejected => {}
           _ => return Err("HTTP open-loop ID table has an unresolved request".into()),
@@ -1517,37 +1539,78 @@ impl AsyncWrite for TokioEndpoint {
   }
 }
 
-async fn tokio_connect(
-  handle: &tokio::runtime::Handle,
+async fn tokio_connect_nonblocking(
   resources: &ResourceScope,
-  address: SocketAddr,
-) -> Result<tokio::net::TcpStream, String> {
-  // Match NetHandle::connect: one temporary slot covers the blocking connect
-  // and registration phase, then drops in the worker before publication.
+  address: SocketAddrV4,
+) -> io::Result<tokio::net::TcpStream> {
+  // Match NetHandle::connect_nonblocking: one temporary slot covers socket
+  // creation and registration/connect, then drops before endpoint admission.
   let temporary = resources
     .try_acquire(OperationRequest {
       disk: 0,
       network: 1,
     })
-    .map_err(|error| format!("Tokio connect operation admission failed: {error}"))?;
-  let entered_handle = handle.clone();
-  handle
-    .spawn_blocking(move || -> io::Result<tokio::net::TcpStream> {
-      let _temporary = temporary;
-      let stream = StdTcpStream::connect(address)?;
-      stream.set_nonblocking(true)?;
-      let _entered = entered_handle.enter();
-      tokio::net::TcpStream::from_std(stream)
-    })
-    .await
-    .map_err(|error| format!("Tokio blocking connect task failed: {error}"))?
-    .map_err(|error| format!("Tokio blocking connect/registration failed: {error}"))
+    .map_err(|error| {
+      io::Error::other(format!("Tokio connect operation admission failed: {error}"))
+    })?;
+  let socket = tokio::net::TcpSocket::new_v4()?;
+  let stream = socket.connect(SocketAddr::V4(address)).await?;
+  drop(temporary);
+  Ok(stream)
 }
 
 fn expected_request_checksum(id: u64, body_bytes: usize) -> u64 {
   (0..body_bytes).fold(0xcbf2_9ce4_8422_2325, |hash, index| {
     (hash ^ u64::from(pattern_byte(request_seed(id), index))).wrapping_mul(0x0000_0100_0000_01b3)
   })
+}
+
+fn expected_response_checksum(
+  oracle: Option<&Vec<u64>>,
+  id: u64,
+  settings: Settings,
+) -> Option<u64> {
+  match oracle {
+    Some(values) => values.get(id as usize).copied(),
+    None => Some(expected_request_checksum(id, settings.body_bytes)),
+  }
+}
+
+fn validate_response_pair(
+  request_id: u64,
+  client_checksum: u64,
+  handler_id: u64,
+  handler_checksum: u64,
+  oracle: Option<&Vec<u64>>,
+  settings: Settings,
+) -> Result<u64, &'static str> {
+  if handler_id != request_id || handler_checksum != client_checksum {
+    return Err("HTTP client/handler request IDs or checksums differ");
+  }
+  if expected_response_checksum(oracle, request_id, settings) != Some(client_checksum) {
+    return Err("HTTP response checksum does not match its request ID");
+  }
+  Ok(client_checksum)
+}
+
+fn build_open_loop_checksum_oracle(
+  mode: Mode,
+  settings: Settings,
+) -> Result<Option<Arc<Vec<u64>>>, String> {
+  if mode != Mode::OpenLoop {
+    return Ok(None);
+  }
+  if settings.arrivals > OPEN_LOOP_ARRIVALS {
+    return Err("HTTP checksum oracle exceeds the 5,000-ID open-loop bound".into());
+  }
+  let mut oracle = Vec::new();
+  oracle
+    .try_reserve_exact(settings.arrivals)
+    .map_err(|_| "could not reserve bounded HTTP checksum oracle".to_owned())?;
+  oracle.extend(
+    (0..settings.arrivals).map(|id| expected_request_checksum(id as u64, settings.body_bytes)),
+  );
+  Ok(Some(Arc::new(oracle)))
 }
 
 fn request_seed(id: u64) -> u64 {
@@ -1648,7 +1711,7 @@ fn print_row(allocator: &str, options: Options, report: &Report) {
   let drained_rate =
     (report.on_time + report.late) as f64 / wall_ns.max(1) as f64 * 1_000_000_000.0;
   let values = [
-    "2".to_owned(),
+    super::HTTP_CONNECT_POLICY_SCHEMA.to_owned(),
     allocator.to_owned(),
     options.executor.label().to_owned(),
     "http".to_owned(),
@@ -1730,10 +1793,22 @@ mod tests {
   use super::{
     AsyncConfig, AsyncHandle, AsyncRuntime, AsyncShutdown, ClientJob, Event, HandlerJob,
     HandlerRecord, Joiner, Mode, ProducerReport, RoleLease, Settings, TASK_LIMIT, WINDOW,
-    expected_request_checksum, observe_events, run_bounded, run_tokio,
+    build_open_loop_checksum_oracle, checked_loopback_v4, expected_request_checksum,
+    observe_events, run_bounded, run_tokio, tokio_connect_nonblocking, validate_response_pair,
   };
-  use crate::application::{Executor, Options, Workload};
+  use crate::application::{Executor, HTTP_CONNECT_POLICY_SCHEMA, Options, Workload};
   use allocatbelt::runtime::managed::ResourceScope;
+  use allocatbelt::runtime::managed::{OperationRequest, ResourceLimits};
+  use allocatbelt::runtime::net::{
+    NetHandle, NetworkError, TcpConnectError, TcpListener as NativeTcpListener,
+    TcpSocket as NativeTcpSocket,
+  };
+  use allocatbelt::runtime::reactor::{Reactor, ReactorConfig};
+  use allocatbelt::runtime::{Config as BlockingConfig, Resources, Runtime, ShutdownMode};
+  use std::future::Future;
+  use std::io;
+  use std::net::{SocketAddr, TcpListener, TcpStream as StdTcpStream};
+  use std::process::{Command, Stdio};
   use std::sync::{Arc, mpsc};
   use std::task::{Context, Waker};
   use std::thread;
@@ -1754,6 +1829,385 @@ mod tests {
       horizon: Duration::from_millis(40),
       arrivals: if mode == Mode::OpenLoop { 32 } else { 64 },
       body_bytes: 256,
+    }
+  }
+
+  fn in_watchdog_child(case: &str) -> bool {
+    std::env::var("ALLOCATBELT_HTTP_CONNECT_CASE")
+      .ok()
+      .as_deref()
+      == Some(case)
+  }
+
+  fn run_with_external_watchdog(case: &str) {
+    const WATCHDOG: Duration = Duration::from_secs(45);
+    let executable = std::env::current_exe().expect("test executable path");
+    let listing = Command::new(&executable)
+      .args(["--list", "--format", "terse"])
+      .output()
+      .expect("list connector test cases");
+    assert!(listing.status.success(), "test listing failed: {listing:?}");
+    let candidates = String::from_utf8_lossy(&listing.stdout)
+      .lines()
+      .filter_map(|line| {
+        let (name, kind) = line.split_once(": ")?;
+        (kind == "test" && name.rsplit("::").next() == Some(case)).then_some(name.to_owned())
+      })
+      .collect::<Vec<_>>();
+    assert_eq!(candidates.len(), 1, "expected one test named {case}");
+    let mut child = Command::new(executable)
+      .arg("--exact")
+      .arg(&candidates[0])
+      .arg("--nocapture")
+      .env("ALLOCATBELT_HTTP_CONNECT_CASE", case)
+      .stdout(Stdio::inherit())
+      .stderr(Stdio::inherit())
+      .spawn()
+      .expect("start connector case under watchdog");
+    let deadline = Instant::now() + WATCHDOG;
+    loop {
+      if let Some(status) = child.try_wait().expect("poll connector child") {
+        assert!(status.success(), "connector child {case} failed: {status}");
+        return;
+      }
+      if Instant::now() >= deadline {
+        child.kill().expect("kill stalled connector child");
+        let status = child.wait().expect("reap stalled connector child");
+        panic!("connector child {case} exceeded {WATCHDOG:?}; reaped {status}");
+      }
+      thread::sleep(Duration::from_millis(10));
+    }
+  }
+
+  fn assert_connection_refused(error: io::Error) {
+    assert_eq!(
+      error.kind(),
+      io::ErrorKind::ConnectionRefused,
+      "expected the bound non-listening loopback socket to refuse connect: {error}"
+    );
+  }
+
+  fn tokio_permit_lifecycle_case() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+      .enable_all()
+      .build()
+      .expect("test runtime");
+    assert_eq!(HTTP_CONNECT_POLICY_SCHEMA, "http-nonblocking-connect-v1");
+    let loopback: SocketAddr = "127.0.0.1:8080".parse().expect("IPv4 loopback");
+    assert!(checked_loopback_v4(loopback).is_ok());
+    let external: SocketAddr = "192.0.2.1:8080".parse().expect("IPv4 address");
+    assert!(checked_loopback_v4(external).is_err());
+    let ipv6: SocketAddr = "[::1]:8080".parse().expect("IPv6 loopback");
+    assert!(checked_loopback_v4(ipv6).is_err());
+    let resources = ResourceScope::new(ResourceLimits {
+      managed_memory: 0,
+      disk_concurrent_ops: 0,
+      network_concurrent_ops: 1,
+    });
+    let listener = runtime
+      .block_on(async { tokio::net::TcpListener::bind("127.0.0.1:0").await })
+      .expect("loopback listener");
+    let address = match listener.local_addr().expect("listener address") {
+      SocketAddr::V4(address) if address.ip().is_loopback() => address,
+      address => panic!("expected checked IPv4 loopback address, got {address}"),
+    };
+    let held = resources
+      .try_acquire(OperationRequest {
+        disk: 0,
+        network: 1,
+      })
+      .expect("reserve the only temporary connector permit");
+    assert!(
+      runtime
+        .block_on(tokio_connect_nonblocking(&resources, address))
+        .is_err()
+    );
+    assert_eq!(resources.snapshot().network_ops, 1);
+    drop(held);
+    let stream = runtime
+      .block_on(tokio_connect_nonblocking(&resources, address))
+      .expect("nonblocking loopback connect");
+    assert_eq!(resources.snapshot().network_ops, 0);
+    let endpoint = resources
+      .try_acquire(OperationRequest {
+        disk: 0,
+        network: 1,
+      })
+      .expect("temporary permit released before endpoint admission");
+    let (peer, _) = runtime
+      .block_on(listener.accept())
+      .expect("accept connected peer");
+    drop(stream);
+    drop(peer);
+    drop(endpoint);
+
+    let refusal_socket = tokio::net::TcpSocket::new_v4().expect("refusal socket");
+    refusal_socket
+      .bind("127.0.0.1:0".parse().expect("IPv4 bind address"))
+      .expect("bind non-listening refusal socket");
+    let refused = checked_loopback_v4(refusal_socket.local_addr().expect("refusal address"))
+      .expect("checked refusal address");
+    assert_connection_refused(
+      runtime
+        .block_on(tokio_connect_nonblocking(&resources, refused))
+        .expect_err("non-listening bound port must refuse connect"),
+    );
+    assert_eq!(resources.snapshot().network_ops, 0);
+    drop(refusal_socket);
+    drop(listener);
+    runtime.shutdown_timeout(Duration::from_secs(2));
+  }
+
+  #[test]
+  fn tokio_nonblocking_connector_permit_lifecycle() {
+    const CASE: &str = "tokio_nonblocking_connector_permit_lifecycle";
+    if in_watchdog_child(CASE) {
+      tokio_permit_lifecycle_case();
+    } else {
+      run_with_external_watchdog(CASE);
+    }
+  }
+
+  fn native_permit_lifecycle_case() {
+    let async_runtime = AsyncRuntime::new(AsyncConfig {
+      workers: 1,
+      max_outstanding: 4,
+      max_scopes: 2,
+    })
+    .expect("async runtime");
+    let task_scope = async_runtime.scope().expect("task scope");
+    let async_handle = task_scope.handle();
+    let mut blocking = Runtime::new(BlockingConfig {
+      workers: 1,
+      max_outstanding: 1,
+      capacity: Resources::ZERO,
+    })
+    .expect("blocking runtime");
+    let reactor = Reactor::new(ReactorConfig {
+      max_registrations: 4,
+      max_waiters: 8,
+    })
+    .expect("reactor");
+    let scope = ResourceScope::new(ResourceLimits {
+      managed_memory: 0,
+      disk_concurrent_ops: 0,
+      network_concurrent_ops: 1,
+    });
+    let net = NetHandle::new(blocking.handle(), scope.clone(), reactor.handle(), 1)
+      .expect("network handle");
+    let listener = TcpListener::bind("127.0.0.1:0").expect("loopback listener");
+    let address = checked_loopback_v4(listener.local_addr().expect("listener address"))
+      .expect("checked IPv4 loopback");
+
+    let held = scope
+      .try_acquire(OperationRequest {
+        disk: 0,
+        network: 1,
+      })
+      .expect("reserve the only temporary connector permit");
+    assert!(
+      async_handle
+        .block_on(net.connect_nonblocking(SocketAddr::V4(address)))
+        .expect("root task")
+        .is_err()
+    );
+    assert_eq!(scope.snapshot().network_ops, 1);
+    drop(held);
+
+    let stream = async_handle
+      .block_on(net.connect_nonblocking(SocketAddr::V4(address)))
+      .expect("root task")
+      .expect("native nonblocking loopback connect");
+    assert_eq!(scope.snapshot().network_ops, 0);
+    let endpoint = scope
+      .try_acquire(OperationRequest {
+        disk: 0,
+        network: 1,
+      })
+      .expect("temporary permit released before endpoint admission");
+    let (peer, _) = listener.accept().expect("accept connected peer");
+    drop(stream);
+    drop(peer);
+    drop(endpoint);
+
+    let refusal_socket = NativeTcpSocket::new_v4().expect("refusal socket");
+    refusal_socket
+      .bind(SocketAddr::V4(
+        "127.0.0.1:0".parse().expect("IPv4 bind address"),
+      ))
+      .expect("bind non-listening refusal socket");
+    let refused = checked_loopback_v4(refusal_socket.local_addr().expect("refusal address"))
+      .expect("checked refusal address");
+    let failure = async_handle
+      .block_on(net.connect_nonblocking(SocketAddr::V4(refused)))
+      .expect("root task");
+    match failure {
+      Err(TcpConnectError::Operation(NetworkError::Io(error))) => {
+        assert_connection_refused(error);
+      }
+      Err(error) => panic!("expected connection refusal, got {error}"),
+      Ok(_) => panic!("bound non-listening loopback socket accepted a connection"),
+    }
+    assert_eq!(scope.snapshot().network_ops, 0);
+    assert_eq!(reactor.handle().registrations(), 0);
+    assert_eq!(reactor.handle().waiters(), 0);
+    drop(refusal_socket);
+    shutdown_bounded_runtime(async_handle, task_scope, async_runtime);
+    blocking
+      .shutdown(ShutdownMode::Drain)
+      .expect("runtime shutdown");
+  }
+
+  #[test]
+  fn native_nonblocking_connector_permit_lifecycle() {
+    const CASE: &str = "native_nonblocking_connector_permit_lifecycle";
+    if in_watchdog_child(CASE) {
+      native_permit_lifecycle_case();
+    } else {
+      run_with_external_watchdog(CASE);
+    }
+  }
+
+  fn tokio_pending_cancellation_case() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+      .enable_all()
+      .build()
+      .expect("test runtime");
+    let resources = ResourceScope::new(ResourceLimits {
+      managed_memory: 0,
+      disk_concurrent_ops: 0,
+      network_concurrent_ops: 1,
+    });
+    let (listener, address) = runtime.block_on(async {
+      let listener_socket = tokio::net::TcpSocket::new_v4().expect("listener socket");
+      listener_socket
+        .bind("127.0.0.1:0".parse().expect("IPv4 bind address"))
+        .expect("bind loopback listener socket");
+      let listener = listener_socket.listen(0).expect("listen with zero backlog");
+      let address = checked_loopback_v4(listener.local_addr().expect("listener address"))
+        .expect("checked listener address");
+      (listener, address)
+    });
+    // Occupy the zero-backlog accept slot so the second connect stays pending.
+    let filler =
+      StdTcpStream::connect(SocketAddr::V4(address)).expect("fill the zero-backlog listener queue");
+    let mut attempt = Box::pin(tokio_connect_nonblocking(&resources, address));
+    let pending = runtime.block_on(std::future::poll_fn(|cx| {
+      std::task::Poll::Ready(attempt.as_mut().poll(cx).is_pending())
+    }));
+    assert!(pending, "connect did not expose an admitted pending phase");
+    assert_eq!(resources.snapshot().network_ops, 1);
+    drop(attempt);
+    assert_eq!(resources.snapshot().network_ops, 0);
+    let sentinel = resources
+      .try_acquire(OperationRequest {
+        disk: 0,
+        network: 1,
+      })
+      .expect("permit reusable after pending connect cancellation");
+    assert_eq!(resources.snapshot().network_ops, 1);
+    drop(sentinel);
+    assert_eq!(resources.snapshot().network_ops, 0);
+    drop(filler);
+    drop(listener);
+    runtime.shutdown_timeout(Duration::from_secs(2));
+  }
+
+  #[test]
+  fn tokio_nonblocking_connector_pending_cancellation_releases_admission() {
+    const CASE: &str = "tokio_nonblocking_connector_pending_cancellation_releases_admission";
+    if in_watchdog_child(CASE) {
+      tokio_pending_cancellation_case();
+    } else {
+      run_with_external_watchdog(CASE);
+    }
+  }
+
+  fn native_pending_cancellation_case() {
+    let async_runtime = AsyncRuntime::new(AsyncConfig {
+      workers: 1,
+      max_outstanding: 4,
+      max_scopes: 2,
+    })
+    .expect("async runtime");
+    let task_scope = async_runtime.scope().expect("task scope");
+    let async_handle = task_scope.handle();
+    let mut blocking = Runtime::new(BlockingConfig {
+      workers: 1,
+      max_outstanding: 1,
+      capacity: Resources::ZERO,
+    })
+    .expect("blocking runtime");
+    let reactor = Reactor::new(ReactorConfig {
+      max_registrations: 4,
+      max_waiters: 8,
+    })
+    .expect("reactor");
+    let scope = ResourceScope::new(ResourceLimits {
+      managed_memory: 0,
+      disk_concurrent_ops: 0,
+      network_concurrent_ops: 1,
+    });
+    let net = NetHandle::new(blocking.handle(), scope.clone(), reactor.handle(), 1)
+      .expect("network handle");
+    let listener_socket = NativeTcpSocket::new_v4().expect("listener socket");
+    listener_socket
+      .bind(SocketAddr::V4(
+        "127.0.0.1:0".parse().expect("IPv4 bind address"),
+      ))
+      .expect("bind loopback listener socket");
+    let listener: NativeTcpListener = listener_socket
+      .listen(0, &reactor.handle())
+      .expect("listen with zero backlog");
+    let address = checked_loopback_v4(listener.get_ref().local_addr().expect("listener address"))
+      .expect("checked listener address");
+    // Occupy the zero-backlog accept slot so the second connect stays pending.
+    let filler =
+      StdTcpStream::connect(SocketAddr::V4(address)).expect("fill the zero-backlog listener queue");
+    let mut attempt = Box::pin(net.connect_nonblocking(SocketAddr::V4(address)));
+    let pending = async_handle
+      .block_on(std::future::poll_fn(|cx| match attempt.as_mut().poll(cx) {
+        std::task::Poll::Pending if reactor.handle().waiters() > 0 => std::task::Poll::Ready(true),
+        std::task::Poll::Pending => {
+          cx.waker().wake_by_ref();
+          std::task::Poll::Pending
+        }
+        std::task::Poll::Ready(_) => std::task::Poll::Ready(false),
+      }))
+      .expect("poll owning task");
+    assert!(pending, "connect did not expose an admitted pending phase");
+    assert_eq!(scope.snapshot().network_ops, 1);
+    assert_eq!(reactor.handle().registrations(), 2);
+    assert!(reactor.handle().waiters() > 0);
+    drop(attempt);
+    assert_eq!(scope.snapshot().network_ops, 0);
+    assert_eq!(reactor.handle().registrations(), 1);
+    assert_eq!(reactor.handle().waiters(), 0);
+    let sentinel = scope
+      .try_acquire(OperationRequest {
+        disk: 0,
+        network: 1,
+      })
+      .expect("permit reusable after pending connect cancellation");
+    assert_eq!(scope.snapshot().network_ops, 1);
+    drop(sentinel);
+    assert_eq!(scope.snapshot().network_ops, 0);
+    drop(filler);
+    drop(listener);
+    assert_eq!(reactor.handle().registrations(), 0);
+    shutdown_bounded_runtime(async_handle, task_scope, async_runtime);
+    blocking
+      .shutdown(ShutdownMode::Drain)
+      .expect("runtime shutdown");
+  }
+
+  #[test]
+  fn native_nonblocking_connector_pending_cancellation_releases_admission() {
+    const CASE: &str = "native_nonblocking_connector_pending_cancellation_releases_admission";
+    if in_watchdog_child(CASE) {
+      native_pending_cancellation_case();
+    } else {
+      run_with_external_watchdog(CASE);
     }
   }
 
@@ -1942,10 +2396,63 @@ mod tests {
       ResourceScope::new(super::limits()),
       events_rx,
       mpsc::sync_channel(1).0,
+      None, // This test verifies role reconciliation, not checksum validation.
     )
     .expect_err("a disconnected channel cannot supply the missing handler");
     assert!(error.contains("admitted pair missing a role"));
     runtime.shutdown_timeout(Duration::from_secs(2));
+  }
+
+  #[test]
+  fn open_loop_http_oracle_is_bounded_and_matches_request_reference() {
+    let selected = Settings {
+      horizon: Duration::from_millis(40),
+      arrivals: 3,
+      body_bytes: 256,
+    };
+    let oracle = build_open_loop_checksum_oracle(Mode::OpenLoop, selected)
+      .expect("small bounded HTTP oracle")
+      .expect("open-loop oracle exists");
+    assert_eq!(oracle.len(), selected.arrivals);
+    for (id, actual) in oracle.iter().enumerate() {
+      assert_eq!(
+        *actual,
+        expected_request_checksum(id as u64, selected.body_bytes)
+      );
+      assert_eq!(
+        super::expected_response_checksum(Some(&oracle), id as u64, selected),
+        Some(*actual)
+      );
+    }
+    assert_eq!(oracle.get(selected.arrivals), None);
+    assert_eq!(
+      super::expected_response_checksum(Some(&oracle), selected.arrivals as u64, selected),
+      None
+    );
+    assert_eq!(
+      super::expected_response_checksum(None, 0, selected),
+      Some(expected_request_checksum(0, selected.body_bytes))
+    );
+    let expected = oracle[1];
+    assert_eq!(
+      validate_response_pair(1, expected, 1, expected, Some(&oracle), selected),
+      Ok(expected)
+    );
+    assert!(validate_response_pair(1, expected, 2, expected, Some(&oracle), selected).is_err());
+    assert!(validate_response_pair(1, expected, 1, expected ^ 1, Some(&oracle), selected).is_err());
+    assert!(
+      validate_response_pair(1, expected ^ 1, 1, expected ^ 1, Some(&oracle), selected).is_err()
+    );
+    assert!(
+      build_open_loop_checksum_oracle(Mode::Capacity, selected)
+        .expect("capacity keeps existing reference path")
+        .is_none()
+    );
+    let oversized = Settings {
+      arrivals: super::OPEN_LOOP_ARRIVALS + 1,
+      ..selected
+    };
+    assert!(build_open_loop_checksum_oracle(Mode::OpenLoop, oversized).is_err());
   }
 
   #[test]
@@ -2082,6 +2589,9 @@ mod tests {
       arrivals: ARRIVALS,
       body_bytes: 256,
     };
+    let expected_oracle = build_open_loop_checksum_oracle(Mode::OpenLoop, selected_settings)
+      .expect("64-ID HTTP checksum oracle")
+      .expect("open-loop oracle exists");
     let (report_tx, report_rx) = mpsc::sync_channel(1);
     let observer = std::thread::spawn(move || {
       let _ = report_tx.send(observe_events(
@@ -2091,6 +2601,7 @@ mod tests {
         ResourceScope::new(super::limits()),
         events_rx,
         credits_tx,
+        Some(expected_oracle),
       ));
     });
 
@@ -2306,6 +2817,7 @@ mod tests {
         ResourceScope::new(super::limits()),
         events_rx,
         credits_tx,
+        None, // This test verifies terminal pairing, not checksum validation.
       ));
     });
 

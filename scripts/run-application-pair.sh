@@ -95,16 +95,18 @@ failed=0
 
 validate_output() {
   local output=$1 expected_executor=$2 header
+  local expected_schema=2
   local expected_blocking=0 expected_topology='4 async workers' expected_task_limit=8
   local expected_retained=0 expected_managed=0 expected_disk=0 expected_network=0
   case "$workload" in
     memory) expected_retained=8; expected_managed=163840 ;;
     http)
+      expected_schema=http-nonblocking-connect-v1
       expected_blocking=1 expected_task_limit=17 expected_managed=141312 expected_network=16
       if [[ "$expected_executor" == allocatbelt ]]; then
-        expected_topology='4 async + 1 blocking + dedicated reactor'
+        expected_topology='4 async + 1 reserved blocking worker (unused by HTTP connect) + dedicated reactor; NetHandle::connect_nonblocking'
       else
-        expected_topology='4 async + 1 blocking + integrated I/O driver'
+        expected_topology='4 async + 1 reserved blocking worker (unused by HTTP connect) + integrated I/O driver; Tokio TcpSocket::connect'
       fi
       ;;
     disk)
@@ -122,7 +124,8 @@ validate_output() {
   [[ "$header" == "$expected_header" ]] || return 1
   python3 - "$output" "$expected_header" "$allocator" "$expected_executor" "$workload" "$mode" \
     "$rate" "$expected_blocking" "$expected_topology" "$expected_task_limit" \
-    "$expected_retained" "$expected_managed" "$expected_disk" "$expected_network" <<'PY'
+    "$expected_retained" "$expected_managed" "$expected_disk" "$expected_network" \
+    "$expected_schema" <<'PY'
 import re
 import sys
 from decimal import Decimal, InvalidOperation
@@ -130,7 +133,7 @@ from pathlib import Path
 
 (
     path, expected_header, allocator, executor, workload, mode, rate,
-    blocking, topology, task_limit, retained, managed, disk, network,
+    blocking, topology, task_limit, retained, managed, disk, network, expected_schema,
 ) = sys.argv[1:]
 lines = Path(path).read_text(encoding="utf-8").splitlines()
 headers = expected_header.split("\t")
@@ -141,11 +144,11 @@ if len(values) != len(headers):
     raise SystemExit(1)
 row = dict(zip(headers, values, strict=True))
 if (row["schema"], row["allocator"], row["executor"], row["workload"], row["mode"]) != (
-    "2", allocator, executor, workload, mode,
+    expected_schema, allocator, executor, workload, mode,
 ):
     raise SystemExit(1)
 
-integer_fields = """schema async_workers blocking_workers logical_window global_task_limit
+integer_fields = """async_workers blocking_workers logical_window global_task_limit
 retained_window requested_arrivals attempted admitted rejected_full rejected_logical_window
 rejected_backend_full rejected_resource
 completed_on_time completed_late errors cancellations unresolved lost result_digest
