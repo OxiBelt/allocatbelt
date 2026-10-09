@@ -7,8 +7,10 @@
 //! retain bytes accepted from callers until the wrapped endpoint accepts them.
 //!
 //! Each poll makes at most [`POLL_BUDGET`] calls to the wrapped endpoint,
-//! including calls made while flushing or shutting down. `Interrupted` is
-//! retried within that budget. Other errors, including `WouldBlock`, are
+//! including calls made while flushing or shutting down. Runtime-owned outer
+//! polls also charge each buffered operation through the shared cooperative
+//! budget; manual polls and polls by another executor do not. `Interrupted` is
+//! retried within the local bound. Other errors, including `WouldBlock`, are
 //! returned to the caller. A pending writer retains its unwritten range, which
 //! remains available from [`BufferedWriter::into_parts`] after cancellation.
 //! Dropping a writer does not flush it.
@@ -157,35 +159,12 @@ pub trait AsyncBufRead: AsyncRead {
 impl<R: AsyncRead + Unpin> AsyncBufRead for BufferedReader<R> {
   fn poll_fill_buf(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<&[u8]>> {
     let this = self.get_mut();
-    if this.start < this.end {
-      return Poll::Ready(Ok(&this.buffer.as_slice()[this.start..this.end]));
-    }
-
-    this.start = 0;
-    this.end = 0;
-    let mut calls = 0;
-    loop {
-      if calls == POLL_BUDGET {
-        cx.waker().wake_by_ref();
-        return Poll::Pending;
-      }
-      calls += 1;
-      let storage = match this.buffer.get_mut() {
-        Some(storage) => storage,
-        None => unreachable!("buffer storage stays uniquely owned"),
-      };
-      match Pin::new(&mut this.inner).poll_read(cx, storage) {
-        Poll::Pending => return Poll::Pending,
-        Poll::Ready(Ok(count)) if count > storage.len() => {
-          return Poll::Ready(Err(ErrorKind::InvalidData.into()));
-        }
-        Poll::Ready(Ok(count)) => {
-          this.end = count;
-          return Poll::Ready(Ok(&this.buffer.as_slice()[..count]));
-        }
-        Poll::Ready(Err(error)) if error.kind() == ErrorKind::Interrupted => {}
-        Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
-      }
+    let result =
+      crate::runtime::asynchronous::poll_cooperative_composed(cx, |cx| this.poll_fill_range(cx));
+    match result {
+      Poll::Pending => Poll::Pending,
+      Poll::Ready(Err(error)) => Poll::Ready(Err(error)),
+      Poll::Ready(Ok(range)) => Poll::Ready(Ok(&this.buffer.as_slice()[range])),
     }
   }
 
@@ -196,6 +175,41 @@ impl<R: AsyncRead + Unpin> AsyncBufRead for BufferedReader<R> {
   }
 }
 
+impl<R: AsyncRead + Unpin> BufferedReader<R> {
+  fn poll_fill_range(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<Range<usize>>> {
+    if self.start < self.end {
+      return Poll::Ready(Ok(self.start..self.end));
+    }
+
+    self.start = 0;
+    self.end = 0;
+    let mut calls = 0;
+    loop {
+      if calls == POLL_BUDGET {
+        cx.waker().wake_by_ref();
+        return Poll::Pending;
+      }
+      calls += 1;
+      let storage = match self.buffer.get_mut() {
+        Some(storage) => storage,
+        None => unreachable!("buffer storage stays uniquely owned"),
+      };
+      match Pin::new(&mut self.inner).poll_read(cx, storage) {
+        Poll::Pending => return Poll::Pending,
+        Poll::Ready(Ok(count)) if count > storage.len() => {
+          return Poll::Ready(Err(ErrorKind::InvalidData.into()));
+        }
+        Poll::Ready(Ok(count)) => {
+          self.end = count;
+          return Poll::Ready(Ok(0..count));
+        }
+        Poll::Ready(Err(error)) if error.kind() == ErrorKind::Interrupted => {}
+        Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+      }
+    }
+  }
+}
+
 impl<R: AsyncRead + Unpin> AsyncRead for BufferedReader<R> {
   fn poll_read(
     mut self: Pin<&mut Self>,
@@ -203,7 +217,7 @@ impl<R: AsyncRead + Unpin> AsyncRead for BufferedReader<R> {
     output: &mut [u8],
   ) -> Poll<io::Result<usize>> {
     if output.is_empty() {
-      return Poll::Ready(Ok(0));
+      return crate::runtime::asynchronous::poll_cooperative_composed(cx, |_| Poll::Ready(Ok(0)));
     }
     match self.as_mut().poll_fill_buf(cx) {
       Poll::Pending => Poll::Pending,
@@ -347,70 +361,76 @@ impl<W: AsyncWrite + Unpin> AsyncWrite for BufferedWriter<W> {
     input: &[u8],
   ) -> Poll<io::Result<usize>> {
     let this = self.as_mut().get_mut();
-    if input.is_empty() {
-      return Poll::Ready(Ok(0));
-    }
-    if this.end == this.buffer.len() {
-      this.compact();
-    }
-    if this.end == this.buffer.len() {
-      let mut calls = 0;
-      match this.poll_flush_pending(cx, &mut calls) {
-        Poll::Pending => return Poll::Pending,
-        Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
-        Poll::Ready(Ok(())) => {}
+    crate::runtime::asynchronous::poll_cooperative_composed(cx, |cx| {
+      if input.is_empty() {
+        return Poll::Ready(Ok(0));
       }
-    }
-    let available = this.buffer.len() - this.end;
-    let count = available.min(input.len());
-    let storage = match this.buffer.get_mut() {
-      Some(storage) => storage,
-      None => unreachable!("buffer storage stays uniquely owned"),
-    };
-    storage[this.end..this.end + count].copy_from_slice(&input[..count]);
-    this.end += count;
-    if count != 0 {
-      this.shutdown_flushed = false;
-      this.shutdown_complete = false;
-    }
-    Poll::Ready(Ok(count))
+      if this.end == this.buffer.len() {
+        this.compact();
+      }
+      if this.end == this.buffer.len() {
+        let mut calls = 0;
+        match this.poll_flush_pending(cx, &mut calls) {
+          Poll::Pending => return Poll::Pending,
+          Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+          Poll::Ready(Ok(())) => {}
+        }
+      }
+      let available = this.buffer.len() - this.end;
+      let count = available.min(input.len());
+      let storage = match this.buffer.get_mut() {
+        Some(storage) => storage,
+        None => unreachable!("buffer storage stays uniquely owned"),
+      };
+      storage[this.end..this.end + count].copy_from_slice(&input[..count]);
+      this.end += count;
+      if count != 0 {
+        this.shutdown_flushed = false;
+        this.shutdown_complete = false;
+      }
+      Poll::Ready(Ok(count))
+    })
   }
 
   fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
     let this = self.as_mut().get_mut();
-    let mut calls = 0;
-    this.poll_flush_pending(cx, &mut calls)
+    crate::runtime::asynchronous::poll_cooperative_composed(cx, |cx| {
+      let mut calls = 0;
+      this.poll_flush_pending(cx, &mut calls)
+    })
   }
 
   fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
     let this = self.as_mut().get_mut();
-    if this.shutdown_complete {
-      return Poll::Ready(Ok(()));
-    }
-    let mut calls = 0;
-    if !this.shutdown_flushed {
-      match this.poll_flush_pending(cx, &mut calls) {
-        Poll::Pending => return Poll::Pending,
-        Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
-        Poll::Ready(Ok(())) => this.shutdown_flushed = true,
+    crate::runtime::asynchronous::poll_cooperative_composed(cx, |cx| {
+      if this.shutdown_complete {
+        return Poll::Ready(Ok(()));
       }
-    }
-    loop {
-      if calls == POLL_BUDGET {
-        cx.waker().wake_by_ref();
-        return Poll::Pending;
-      }
-      calls += 1;
-      match Pin::new(&mut this.inner).poll_shutdown(cx) {
-        Poll::Pending => return Poll::Pending,
-        Poll::Ready(Ok(())) => {
-          this.shutdown_complete = true;
-          return Poll::Ready(Ok(()));
+      let mut calls = 0;
+      if !this.shutdown_flushed {
+        match this.poll_flush_pending(cx, &mut calls) {
+          Poll::Pending => return Poll::Pending,
+          Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+          Poll::Ready(Ok(())) => this.shutdown_flushed = true,
         }
-        Poll::Ready(Err(error)) if error.kind() == ErrorKind::Interrupted => {}
-        Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
       }
-    }
+      loop {
+        if calls == POLL_BUDGET {
+          cx.waker().wake_by_ref();
+          return Poll::Pending;
+        }
+        calls += 1;
+        match Pin::new(&mut this.inner).poll_shutdown(cx) {
+          Poll::Pending => return Poll::Pending,
+          Poll::Ready(Ok(())) => {
+            this.shutdown_complete = true;
+            return Poll::Ready(Ok(()));
+          }
+          Poll::Ready(Err(error)) if error.kind() == ErrorKind::Interrupted => {}
+          Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+        }
+      }
+    })
   }
 }
 

@@ -10,9 +10,12 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use super::{AsyncConfig, AsyncJoinError, AsyncRuntime, AsyncShutdown};
+use crate::runtime::buffered_io::{AsyncBufRead, BufferedReader, BufferedWriter};
 use crate::runtime::io::{AsyncRead, AsyncWrite};
+use crate::runtime::managed::{ManagedBuf, ResourceLimits, ResourceScope};
 use crate::runtime::process::pipe::{AsyncChildStdin, AsyncChildStdout};
 use crate::runtime::reactor::{Reactor, ReactorConfig};
+use crate::runtime::time::TimerDriver;
 
 const WATCHDOG: Duration = Duration::from_secs(3);
 const DEFAULT_BUDGET: usize = 64;
@@ -1004,4 +1007,681 @@ fn external_executor_child_pipe_polls_keep_noop_accounting() {
   assert!(Pin::new(&mut writer).poll_shutdown(&mut context).is_ready());
   assert_eq!(super::entry::budget_remaining(), DEFAULT_BUDGET as u16);
   reactor.shutdown().unwrap();
+}
+
+fn cooperative_managed_buffer(size: usize) -> ManagedBuf {
+  ResourceScope::new(ResourceLimits {
+    managed_memory: size,
+    ..ResourceLimits::default()
+  })
+  .try_alloc_zeroed(size)
+  .unwrap()
+}
+
+#[derive(Default)]
+struct AccountedBufferedReader {
+  bytes: Vec<u8>,
+  offset: usize,
+  calls: usize,
+  error: Option<std::io::ErrorKind>,
+}
+
+impl AsyncRead for AccountedBufferedReader {
+  fn poll_read(
+    mut self: Pin<&mut Self>,
+    cx: &mut Context<'_>,
+    output: &mut [u8],
+  ) -> Poll<std::io::Result<usize>> {
+    self.calls += 1;
+    if self.offset == self.bytes.len() {
+      if let Some(kind) = self.error.take() {
+        return Poll::Ready(Err(kind.into()));
+      }
+      return super::poll_cooperative(cx, |_| Poll::Ready(Ok(0)));
+    }
+    let count = output.len().min(self.bytes.len() - self.offset);
+    match super::poll_cooperative(cx, |_| Poll::Ready(())) {
+      Poll::Pending => Poll::Pending,
+      Poll::Ready(()) => {
+        let start = self.offset;
+        output[..count].copy_from_slice(&self.bytes[start..start + count]);
+        self.offset += count;
+        Poll::Ready(Ok(count))
+      }
+    }
+  }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum BufferedWriteStep {
+  Accept(usize),
+  Pending,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum BufferedFlushStep {
+  Ready,
+  DescendantPending,
+  DescendantReady,
+  DescendantReadyThenPending,
+  DescendantPanic,
+}
+
+#[derive(Default)]
+struct CooperativeBufferedWriter {
+  writes: std::collections::VecDeque<BufferedWriteStep>,
+  flushes: std::collections::VecDeque<BufferedFlushStep>,
+  shutdowns: usize,
+  output: Vec<u8>,
+  write_calls: usize,
+  flush_calls: usize,
+}
+
+impl AsyncWrite for CooperativeBufferedWriter {
+  fn poll_write(
+    mut self: Pin<&mut Self>,
+    cx: &mut Context<'_>,
+    input: &[u8],
+  ) -> Poll<std::io::Result<usize>> {
+    self.write_calls += 1;
+    match self
+      .writes
+      .pop_front()
+      .unwrap_or(BufferedWriteStep::Accept(input.len()))
+    {
+      BufferedWriteStep::Accept(count) => {
+        if count <= input.len() {
+          self.output.extend_from_slice(&input[..count]);
+        }
+        Poll::Ready(Ok(count))
+      }
+      BufferedWriteStep::Pending => {
+        cx.waker().wake_by_ref();
+        Poll::Pending
+      }
+    }
+  }
+
+  fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+    self.flush_calls += 1;
+    match self.flushes.pop_front().unwrap_or(BufferedFlushStep::Ready) {
+      BufferedFlushStep::Ready => Poll::Ready(Ok(())),
+      BufferedFlushStep::DescendantPending => super::poll_cooperative(cx, |cx| {
+        cx.waker().wake_by_ref();
+        Poll::Pending
+      }),
+      BufferedFlushStep::DescendantReady => {
+        super::poll_cooperative(cx, |_| Poll::Ready(())).map(|()| Ok(()))
+      }
+      BufferedFlushStep::DescendantReadyThenPending => {
+        assert!(super::poll_cooperative(cx, |_| Poll::Ready(())).is_ready());
+        super::poll_cooperative(cx, |cx| {
+          cx.waker().wake_by_ref();
+          Poll::Pending
+        })
+        .map(|()| Ok(()))
+      }
+      BufferedFlushStep::DescendantPanic => {
+        assert!(super::poll_cooperative(cx, |_| Poll::Ready(())).is_ready());
+        panic!("injected buffered descendant panic");
+      }
+    }
+  }
+
+  fn poll_shutdown(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+    self.shutdowns += 1;
+    Poll::Ready(Ok(()))
+  }
+}
+
+#[test]
+fn buffered_reader_gates_cached_data_and_empty_reads_before_mutation() {
+  let runtime = AsyncRuntime::new(AsyncConfig {
+    workers: 1,
+    max_outstanding: 2,
+    max_scopes: 1,
+  })
+  .unwrap();
+  let mut reader = BufferedReader::new(
+    AccountedBufferedReader {
+      bytes: b"cached".to_vec(),
+      ..AccountedBufferedReader::default()
+    },
+    cooperative_managed_buffer(8),
+  )
+  .unwrap();
+
+  runtime
+    .block_on(poll_fn(|cx| {
+      let before = super::entry::budget_remaining();
+      match Pin::new(&mut reader).poll_fill_buf(cx) {
+        Poll::Ready(Ok(bytes)) => {
+          assert_eq!(bytes, b"cached");
+          assert_eq!(super::entry::budget_remaining(), before - 1);
+          Poll::Ready(())
+        }
+        Poll::Ready(Err(error)) => panic!("buffer fill failed: {error}"),
+        Poll::Pending => Poll::Pending,
+      }
+    }))
+    .unwrap();
+  Pin::new(&mut reader).consume(2);
+  assert_eq!(reader.buffered(), b"ched");
+  let mut output = [0_u8; 1];
+  runtime
+    .block_on(poll_fn(|cx| {
+      let before = super::entry::budget_remaining();
+      match Pin::new(&mut reader).poll_read(cx, &mut output) {
+        Poll::Ready(Ok(1)) => {
+          assert_eq!(super::entry::budget_remaining(), before - 1);
+          Poll::Ready(())
+        }
+        Poll::Ready(Ok(count)) => panic!("unexpected buffered read count: {count}"),
+        Poll::Ready(Err(error)) => panic!("buffered read failed: {error}"),
+        Poll::Pending => Poll::Pending,
+      }
+    }))
+    .unwrap();
+  assert_eq!(&output, b"c");
+  assert_eq!(reader.buffered(), b"hed");
+
+  let mut first_poll = true;
+  runtime
+    .block_on(poll_fn(|cx| {
+      if first_poll {
+        first_poll = false;
+        exhaust_budget(cx);
+        let calls = reader.get_ref().calls;
+        assert!(Pin::new(&mut reader).poll_fill_buf(cx).is_pending());
+        assert_eq!(reader.buffered(), b"hed");
+        let mut empty = [];
+        assert!(Pin::new(&mut reader).poll_read(cx, &mut empty).is_pending());
+        assert_eq!(reader.get_ref().calls, calls);
+        assert_eq!(reader.buffered(), b"hed");
+        assert_eq!(super::entry::budget_remaining(), 0);
+        Poll::Pending
+      } else {
+        let before = super::entry::budget_remaining();
+        assert!(matches!(
+          Pin::new(&mut reader).poll_fill_buf(cx),
+          Poll::Ready(Ok(bytes)) if bytes == b"hed"
+        ));
+        assert_eq!(super::entry::budget_remaining(), before - 1);
+        let mut empty = [];
+        assert!(matches!(
+          Pin::new(&mut reader).poll_read(cx, &mut empty),
+          Poll::Ready(Ok(0))
+        ));
+        assert_eq!(super::entry::budget_remaining(), before - 2);
+        assert_eq!(reader.buffered(), b"hed");
+        Poll::Ready(())
+      }
+    }))
+    .unwrap();
+  assert_eq!(reader.get_ref().calls, 1);
+  runtime.shutdown(AsyncShutdown::Drain).unwrap();
+}
+
+#[test]
+fn buffered_reader_zero_budget_preserves_offsets_and_ready_errors_are_charged() {
+  let runtime = AsyncRuntime::new(AsyncConfig {
+    workers: 1,
+    max_outstanding: 2,
+    max_scopes: 1,
+  })
+  .unwrap();
+  let mut reader = BufferedReader::new(
+    AccountedBufferedReader {
+      bytes: b"x".to_vec(),
+      error: Some(std::io::ErrorKind::WouldBlock),
+      ..AccountedBufferedReader::default()
+    },
+    cooperative_managed_buffer(4),
+  )
+  .unwrap();
+  let mut manual_context = Context::from_waker(std::task::Waker::noop());
+  assert!(matches!(
+    Pin::new(&mut reader).poll_fill_buf(&mut manual_context),
+    Poll::Ready(Ok(bytes)) if bytes == b"x"
+  ));
+  Pin::new(&mut reader).consume(usize::MAX);
+  assert!(reader.buffered().is_empty());
+  runtime
+    .block_on(poll_fn(|cx| {
+      exhaust_budget(cx);
+      assert!(Pin::new(&mut reader).poll_fill_buf(cx).is_pending());
+      assert_eq!(reader.get_ref().calls, 1);
+      Poll::Ready(())
+    }))
+    .unwrap();
+  let (inner, buffer, range) = reader.into_parts();
+  assert_eq!(range, 1..1);
+  assert_eq!(inner.calls, 1);
+  assert_eq!(&buffer.as_slice()[..1], b"x");
+  drop(buffer);
+
+  let mut failing = BufferedReader::new(
+    AccountedBufferedReader {
+      error: Some(std::io::ErrorKind::WouldBlock),
+      ..AccountedBufferedReader::default()
+    },
+    cooperative_managed_buffer(4),
+  )
+  .unwrap();
+  runtime
+    .block_on(poll_fn(|cx| {
+      let before = super::entry::budget_remaining();
+      match Pin::new(&mut failing).poll_fill_buf(cx) {
+        Poll::Ready(Err(error)) => {
+          assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+          assert_eq!(super::entry::budget_remaining(), before - 1);
+          Poll::Ready(())
+        }
+        Poll::Ready(Ok(bytes)) => panic!("unexpected buffered data after error: {bytes:?}"),
+        Poll::Pending => Poll::Pending,
+      }
+    }))
+    .unwrap();
+
+  let mut eof = BufferedReader::new(
+    AccountedBufferedReader::default(),
+    cooperative_managed_buffer(4),
+  )
+  .unwrap();
+  runtime
+    .block_on(poll_fn(|cx| {
+      exhaust_budget(cx);
+      assert!(Pin::new(&mut eof).poll_fill_buf(cx).is_pending());
+      assert_eq!(eof.get_ref().calls, 0);
+      Poll::Ready(())
+    }))
+    .unwrap();
+  runtime
+    .block_on(poll_fn(|cx| {
+      let before = super::entry::budget_remaining();
+      match Pin::new(&mut eof).poll_fill_buf(cx) {
+        Poll::Ready(Ok(bytes)) => {
+          assert!(bytes.is_empty());
+          assert_eq!(super::entry::budget_remaining(), before - 1);
+          Poll::Ready(())
+        }
+        Poll::Ready(Err(error)) => panic!("unexpected buffered EOF error: {error}"),
+        Poll::Pending => Poll::Pending,
+      }
+    }))
+    .unwrap();
+  runtime.shutdown(AsyncShutdown::Drain).unwrap();
+}
+
+#[test]
+fn buffered_writer_gates_empty_and_compacting_paths_and_completed_shutdown() {
+  let runtime = AsyncRuntime::new(AsyncConfig {
+    workers: 1,
+    max_outstanding: 2,
+    max_scopes: 1,
+  })
+  .unwrap();
+  let mut writer = BufferedWriter::new(
+    CooperativeBufferedWriter {
+      writes: [BufferedWriteStep::Accept(1), BufferedWriteStep::Pending].into(),
+      ..CooperativeBufferedWriter::default()
+    },
+    cooperative_managed_buffer(4),
+  )
+  .unwrap();
+  let mut setup_context = Context::from_waker(std::task::Waker::noop());
+  assert!(matches!(
+    Pin::new(&mut writer).poll_write(&mut setup_context, b"abcd"),
+    Poll::Ready(Ok(4))
+  ));
+  assert!(
+    Pin::new(&mut writer)
+      .poll_flush(&mut setup_context)
+      .is_pending()
+  );
+  assert_eq!(writer.unwritten(), b"bcd");
+  assert_eq!(writer.get_ref().write_calls, 2);
+  let mut first_poll = true;
+  runtime
+    .block_on(poll_fn(|cx| {
+      if first_poll {
+        first_poll = false;
+        exhaust_budget(cx);
+        assert!(Pin::new(&mut writer).poll_write(cx, b"").is_pending());
+        assert!(Pin::new(&mut writer).poll_write(cx, b"z").is_pending());
+        assert!(Pin::new(&mut writer).poll_flush(cx).is_pending());
+        assert_eq!(writer.unwritten(), b"bcd");
+        assert_eq!(writer.get_ref().write_calls, 2);
+        assert_eq!(writer.get_ref().flush_calls, 0);
+        Poll::Pending
+      } else {
+        let before = super::entry::budget_remaining();
+        assert!(matches!(
+          Pin::new(&mut writer).poll_write(cx, b"z"),
+          Poll::Ready(Ok(1))
+        ));
+        assert_eq!(super::entry::budget_remaining(), before - 1);
+        assert_eq!(writer.unwritten(), b"bcdz");
+        Poll::Ready(())
+      }
+    }))
+    .unwrap();
+  let (inner, buffer, range) = writer.into_parts();
+  assert_eq!(range, 0..4);
+  assert_eq!(&buffer.as_slice()[range], b"bcdz");
+  drop(inner);
+  drop(buffer);
+
+  let mut completed = BufferedWriter::new(
+    CooperativeBufferedWriter::default(),
+    cooperative_managed_buffer(4),
+  )
+  .unwrap();
+  runtime
+    .block_on(poll_fn(|cx| {
+      assert!(matches!(
+        Pin::new(&mut completed).poll_write(cx, b"x"),
+        Poll::Ready(Ok(1))
+      ));
+      assert!(Pin::new(&mut completed).poll_shutdown(cx).is_ready());
+      assert_eq!(completed.get_ref().shutdowns, 1);
+      Poll::Ready(())
+    }))
+    .unwrap();
+  let shutdown_calls = completed.get_ref().shutdowns;
+  let mut first_poll = true;
+  runtime
+    .block_on(poll_fn(|cx| {
+      if first_poll {
+        first_poll = false;
+        exhaust_budget(cx);
+        assert!(Pin::new(&mut completed).poll_shutdown(cx).is_pending());
+        assert!(Pin::new(&mut completed).poll_write(cx, b"").is_pending());
+        assert_eq!(completed.get_ref().shutdowns, shutdown_calls);
+        assert_eq!(super::entry::budget_remaining(), 0);
+        Poll::Pending
+      } else {
+        let before = super::entry::budget_remaining();
+        assert!(Pin::new(&mut completed).poll_shutdown(cx).is_ready());
+        assert_eq!(completed.get_ref().shutdowns, shutdown_calls);
+        assert_eq!(super::entry::budget_remaining(), before - 1);
+        Poll::Ready(())
+      }
+    }))
+    .unwrap();
+  runtime.shutdown(AsyncShutdown::Drain).unwrap();
+}
+
+#[test]
+fn buffered_writer_cancellation_keeps_the_unwritten_suffix_and_exact_range() {
+  let runtime = AsyncRuntime::new(AsyncConfig {
+    workers: 1,
+    max_outstanding: 2,
+    max_scopes: 1,
+  })
+  .unwrap();
+  let mut writer = BufferedWriter::new(
+    CooperativeBufferedWriter {
+      writes: [BufferedWriteStep::Accept(1), BufferedWriteStep::Pending].into(),
+      ..CooperativeBufferedWriter::default()
+    },
+    cooperative_managed_buffer(4),
+  )
+  .unwrap();
+  runtime
+    .block_on(poll_fn(|cx| {
+      assert!(matches!(
+        Pin::new(&mut writer).poll_write(cx, b"abcd"),
+        Poll::Ready(Ok(4))
+      ));
+      {
+        let mut flush = std::pin::pin!(poll_fn(|cx| Pin::new(&mut writer).poll_flush(cx)));
+        assert!(flush.as_mut().poll(cx).is_pending());
+      }
+      Poll::Ready(())
+    }))
+    .unwrap();
+  assert_eq!(writer.unwritten(), b"bcd");
+  let (inner, buffer, range) = writer.into_parts();
+  assert_eq!(range, 1..4);
+  assert_eq!(&buffer.as_slice()[range], b"bcd");
+  assert_eq!(inner.output, b"a");
+  runtime.shutdown(AsyncShutdown::Drain).unwrap();
+}
+
+#[test]
+fn buffered_composite_preserves_descendant_pending_ready_and_unwind_charges() {
+  use std::panic::{AssertUnwindSafe, catch_unwind};
+
+  let runtime = AsyncRuntime::new(AsyncConfig {
+    workers: 1,
+    max_outstanding: 2,
+    max_scopes: 1,
+  })
+  .unwrap();
+  let mut writer = BufferedWriter::new(
+    CooperativeBufferedWriter {
+      flushes: [
+        BufferedFlushStep::DescendantPending,
+        BufferedFlushStep::DescendantReadyThenPending,
+        BufferedFlushStep::DescendantReady,
+        BufferedFlushStep::DescendantPanic,
+      ]
+      .into(),
+      ..CooperativeBufferedWriter::default()
+    },
+    cooperative_managed_buffer(4),
+  )
+  .unwrap();
+  let mut stage = 0;
+  runtime
+    .block_on(poll_fn(|cx| match stage {
+      0 => {
+        let before = super::entry::budget_remaining();
+        assert!(Pin::new(&mut writer).poll_flush(cx).is_pending());
+        assert_eq!(super::entry::budget_remaining(), before);
+        stage = 1;
+        Poll::Pending
+      }
+      1 => {
+        let before = super::entry::budget_remaining();
+        assert!(Pin::new(&mut writer).poll_flush(cx).is_pending());
+        assert_eq!(super::entry::budget_remaining(), before - 1);
+        stage = 2;
+        Poll::Pending
+      }
+      2 => {
+        let before = super::entry::budget_remaining();
+        assert!(Pin::new(&mut writer).poll_flush(cx).is_ready());
+        assert_eq!(super::entry::budget_remaining(), before - 1);
+        let before_panic = super::entry::budget_remaining();
+        assert!(
+          catch_unwind(AssertUnwindSafe(|| {
+            Pin::new(&mut writer).poll_flush(cx)
+          }))
+          .is_err()
+        );
+        assert_eq!(super::entry::budget_remaining(), before_panic - 1);
+        Poll::Ready(())
+      }
+      _ => panic!("unexpected buffered flush test stage"),
+    }))
+    .unwrap();
+  runtime.shutdown(AsyncShutdown::Drain).unwrap();
+}
+
+#[test]
+fn buffered_child_pipe_round_trip_handles_partial_reads_and_budget_yields() {
+  let runtime = AsyncRuntime::new(AsyncConfig {
+    workers: 1,
+    max_outstanding: 2,
+    max_scopes: 1,
+  })
+  .unwrap();
+  let (reactor, handle) = pipe_reactor(2, 2);
+  let mut child = child("IFS= read -r value; printf '%s' \"$value\"", true);
+  let write_endpoint = AsyncChildStdin::from_std(child.0.stdin.take().unwrap(), &handle).unwrap();
+  let read_endpoint = AsyncChildStdout::from_std(child.0.stdout.take().unwrap(), &handle).unwrap();
+  let mut writer = BufferedWriter::new(write_endpoint, cooperative_managed_buffer(32)).unwrap();
+  let mut reader = BufferedReader::new(read_endpoint, cooperative_managed_buffer(32)).unwrap();
+  let timer_driver = TimerDriver::new(1).unwrap();
+  let future = async {
+    poll_fn(|cx| {
+      let before = super::entry::budget_remaining();
+      match Pin::new(&mut writer).poll_write(cx, b"buffered-child\n") {
+        Poll::Ready(Ok(15)) => {
+          assert_eq!(super::entry::budget_remaining(), before - 1);
+          Poll::Ready(())
+        }
+        Poll::Ready(Ok(count)) => panic!("unexpected buffered child-pipe write: {count}"),
+        Poll::Ready(Err(error)) => panic!("buffered child-pipe write failed: {error}"),
+        Poll::Pending => Poll::Pending,
+      }
+    })
+    .await;
+    poll_fn(|cx| {
+      let before = super::entry::budget_remaining();
+      match Pin::new(&mut writer).poll_flush(cx) {
+        Poll::Pending => {
+          assert!(before - super::entry::budget_remaining() <= 64);
+          Poll::Pending
+        }
+        Poll::Ready(Ok(())) => {
+          let spent = before - super::entry::budget_remaining();
+          assert!((1..=64).contains(&spent));
+          Poll::Ready(())
+        }
+        Poll::Ready(Err(error)) => panic!("buffered child-pipe flush failed: {error}"),
+      }
+    })
+    .await;
+    let mut contents = Vec::new();
+    loop {
+      let chunk = poll_fn(|cx| {
+        let before = super::entry::budget_remaining();
+        match Pin::new(&mut reader).poll_fill_buf(cx) {
+          Poll::Pending => {
+            assert!(before - super::entry::budget_remaining() <= 64);
+            Poll::Pending
+          }
+          Poll::Ready(Ok(bytes)) => {
+            let spent = before - super::entry::budget_remaining();
+            assert!((1..=64).contains(&spent));
+            if bytes.is_empty() {
+              Poll::Ready(None)
+            } else {
+              Poll::Ready(Some(bytes.to_vec()))
+            }
+          }
+          Poll::Ready(Err(error)) => panic!("buffered child-pipe read failed: {error}"),
+        }
+      })
+      .await;
+      let Some(chunk) = chunk else {
+        break;
+      };
+      Pin::new(&mut reader).consume(chunk.len());
+      contents.extend_from_slice(&chunk);
+    }
+    contents
+  };
+  let result = runtime.block_on(timer_driver.handle().timeout(WATCHDOG, future).unwrap());
+  timer_driver.shutdown().unwrap();
+  let contents = match result {
+    Ok(Ok(contents)) => contents,
+    Ok(Err(timeout_error)) => {
+      let _ = child.0.kill();
+      let _ = child.0.wait();
+      panic!("buffered child-pipe round trip failed: {timeout_error:?}");
+    }
+    Err(runtime_error) => {
+      let _ = child.0.kill();
+      let _ = child.0.wait();
+      panic!("buffered child-pipe runtime failed: {runtime_error:?}");
+    }
+  };
+  assert_eq!(contents, b"buffered-child");
+  assert!(child.0.wait().unwrap().success());
+  drop(writer);
+  drop(reader);
+  runtime.shutdown(AsyncShutdown::Drain).unwrap();
+  reactor.shutdown().unwrap();
+}
+
+#[test]
+fn buffered_manual_polls_remain_outside_cooperative_accounting() {
+  let mut context = Context::from_waker(std::task::Waker::noop());
+  let mut reader = BufferedReader::new(
+    AccountedBufferedReader {
+      bytes: b"manual".to_vec(),
+      ..AccountedBufferedReader::default()
+    },
+    cooperative_managed_buffer(8),
+  )
+  .unwrap();
+  let mut writer = BufferedWriter::new(
+    CooperativeBufferedWriter::default(),
+    cooperative_managed_buffer(8),
+  )
+  .unwrap();
+  super::entry::reset_budget();
+  assert!(!super::entry::cooperative_poll_active());
+  assert!(matches!(
+    Pin::new(&mut reader).poll_fill_buf(&mut context),
+    Poll::Ready(Ok(bytes)) if bytes == b"manual"
+  ));
+  assert_eq!(super::entry::budget_remaining(), DEFAULT_BUDGET as u16);
+  assert!(matches!(
+    Pin::new(&mut writer).poll_write(&mut context, b"manual"),
+    Poll::Ready(Ok(6))
+  ));
+  assert_eq!(super::entry::budget_remaining(), DEFAULT_BUDGET as u16);
+  assert!(Pin::new(&mut writer).poll_flush(&mut context).is_ready());
+  assert_eq!(super::entry::budget_remaining(), DEFAULT_BUDGET as u16);
+}
+
+#[test]
+fn buffered_ready_reader_yields_to_a_sibling_task() {
+  struct RepeatingReader;
+
+  impl AsyncRead for RepeatingReader {
+    fn poll_read(
+      self: Pin<&mut Self>,
+      _cx: &mut Context<'_>,
+      output: &mut [u8],
+    ) -> Poll<std::io::Result<usize>> {
+      output.fill(b'r');
+      Poll::Ready(Ok(output.len()))
+    }
+  }
+
+  let mut reader = BufferedReader::new(RepeatingReader, cooperative_managed_buffer(8)).unwrap();
+  let progress = Arc::new(AtomicUsize::new(0));
+  let ready_reads = Arc::new(AtomicUsize::new(0));
+  let max_batch = Arc::new(AtomicUsize::new(0));
+  let loop_progress = Arc::clone(&progress);
+  let loop_ready_reads = Arc::clone(&ready_reads);
+  let loop_max_batch = Arc::clone(&max_batch);
+  let future = async move {
+    let mut batch = 0;
+    let mut previous_remaining = DEFAULT_BUDGET as u16;
+    loop {
+      let count = poll_fn(|cx| match Pin::new(&mut reader).poll_fill_buf(cx) {
+        Poll::Ready(Ok(bytes)) => Poll::Ready(bytes.len()),
+        Poll::Ready(Err(error)) => panic!("buffered ready read failed: {error}"),
+        Poll::Pending => Poll::Pending,
+      })
+      .await;
+      assert_eq!(count, 8);
+      Pin::new(&mut reader).consume(count);
+      record_ready(
+        &loop_ready_reads,
+        &loop_max_batch,
+        &mut batch,
+        &mut previous_remaining,
+      );
+      loop_progress.fetch_add(1, Ordering::SeqCst);
+    }
+  };
+  assert_ready_loop_yields(future, progress, max_batch);
 }

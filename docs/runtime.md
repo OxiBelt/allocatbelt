@@ -120,12 +120,18 @@ initialized storage; they do not allocate a separate byte buffer. `into_parts`
 returns the endpoint, charged storage and exact unread or unwritten range for
 recovery. Consuming too much reader data is clamped to the available length.
 
-Buffered operations share a budget of 64 endpoint calls per poll, including
-flush and shutdown. Interrupted calls count toward that bound; other errors,
-including `WouldBlock`, propagate. Shutdown retains a completed flush phase
-across budget yields and pending shutdown calls. Accepting subsequent writes
-starts a fresh flush/shutdown sequence. Dropping a writer does not flush it;
-bytes already accepted by the underlying endpoint remain committed.
+Buffered operations share a local budget of 64 endpoint calls per poll,
+including flush and shutdown. On runtime-owned outer polls, each completed
+buffered operation also uses the shared cooperative budget. Cached reader data,
+empty reads and writes, and already completed shutdowns pass through that gate
+before returning; composed endpoint operations preserve their descendant
+charges without charging twice. Manual polls and polls by another executor do
+not use automatic accounting. Interrupted calls count toward the local bound;
+other errors, including `WouldBlock`, propagate. Shutdown retains a completed
+flush phase across budget yields and pending shutdown calls. Accepting
+subsequent writes starts a fresh flush/shutdown sequence. Dropping a writer does
+not flush it; bytes already accepted by the underlying endpoint remain
+committed.
 
 `runtime::split_io::split` pins one bidirectional endpoint and returns unique
 read and write halves. It supports borrowed, local and `!Unpin` endpoints.
@@ -1023,9 +1029,13 @@ bounded polling. Registered child-pipe `AsyncRead` and `AsyncWrite` trait
 polls also use the shared budget: ready fast paths and each readiness-plus-
 syscall attempt are gated, `Interrupted` spends a unit, and stale
 `WouldBlock` refunds it. Each such poll keeps a local 64-attempt retry cap.
-Raw readiness waits and cached `AsyncBufRead` operations remain outside this
-automatic accounting; looping I/O helpers and buffered endpoints enforce
-their own 64-call-per-poll limits.
+Raw readiness waits remain outside this automatic accounting. The concrete
+`runtime::buffered_io` `BufferedReader` and `BufferedWriter` poll methods are
+covered below, including cached and empty/completed paths. This does not make
+arbitrary `AsyncBufRead` or `AsyncWrite` implementations, synchronous consume
+or observers, or manual/external-executor polls automatically cooperative.
+Looping I/O helpers and buffered endpoints retain their local 64-call-per-poll
+limits.
 
 `AsyncJob` is awaitable; dropping it detaches, while `abort` requests cleanup
 after any in-flight poll returns. Owned scopes cancel their children on drop;
