@@ -300,21 +300,45 @@ fn zero_entry_limit_skips_filesystem_and_terminal_path_errors_cannot_resume() {
 #[cfg(unix)]
 #[test]
 fn recursive_walk_rejects_root_symlinks_and_short_or_shared_output_before_admission() {
+  use std::os::unix::ffi::OsStrExt;
+
   let scratch = Scratch::new();
   let directory = scratch.child("directory");
   fs::create_dir(&directory).unwrap();
   let link = scratch.child("root-link");
   std::os::unix::fs::symlink(&directory, &link).unwrap();
+  let path_limit = directory
+    .as_os_str()
+    .as_bytes()
+    .len()
+    .max(link.as_os_str().as_bytes().len() + 1)
+    .max(128);
   let mut runtime = runtime(1, 2);
-  let scope = scope(512, 1);
+  let scope = scope(path_limit * 4, 1);
   let handle = FsHandle::new(runtime.handle(), scope.clone());
+  let result = handle
+    .walk_dir(
+      directory.clone(),
+      WalkLimits {
+        max_entries: 4,
+        max_depth: 2,
+        max_path_bytes: directory.as_os_str().as_bytes().len() - 1,
+      },
+    )
+    .unwrap()
+    .join()
+    .unwrap();
+  assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::InvalidInput);
+  assert_eq!(scope.snapshot().disk_ops, 0);
+  assert_eq!(scope.snapshot().managed_memory, 0);
+
   let result = handle
     .walk_dir(
       link.clone(),
       WalkLimits {
         max_entries: 4,
         max_depth: 2,
-        max_path_bytes: 128,
+        max_path_bytes: path_limit,
       },
     )
     .unwrap()
@@ -329,7 +353,7 @@ fn recursive_walk_rejects_root_symlinks_and_short_or_shared_output_before_admiss
       WalkLimits {
         max_entries: 4,
         max_depth: 2,
-        max_path_bytes: 128,
+        max_path_bytes: path_limit,
       },
     )
     .unwrap()
@@ -343,14 +367,14 @@ fn recursive_walk_rejects_root_symlinks_and_short_or_shared_output_before_admiss
       WalkLimits {
         max_entries: 4,
         max_depth: 2,
-        max_path_bytes: 128,
+        max_path_bytes: path_limit,
       },
     )
     .unwrap()
     .join()
     .unwrap()
     .unwrap();
-  let small = scope.try_alloc_zeroed(127).unwrap();
+  let small = scope.try_alloc_zeroed(path_limit - 1).unwrap();
   let error = handle.walk_next(walk, small).unwrap_err();
   assert_eq!(
     error.kind,
@@ -359,7 +383,7 @@ fn recursive_walk_rejects_root_symlinks_and_short_or_shared_output_before_admiss
     ))
   );
   let (walk, small) = error.into_input();
-  assert_eq!(small.len(), 127);
+  assert_eq!(small.len(), path_limit - 1);
   assert_eq!(scope.snapshot().disk_ops, 0);
   drop((walk, small));
 
@@ -369,14 +393,14 @@ fn recursive_walk_rejects_root_symlinks_and_short_or_shared_output_before_admiss
       WalkLimits {
         max_entries: 4,
         max_depth: 2,
-        max_path_bytes: 128,
+        max_path_bytes: path_limit,
       },
     )
     .unwrap()
     .join()
     .unwrap()
     .unwrap();
-  let shared = scope.try_alloc_zeroed(128).unwrap();
+  let shared = scope.try_alloc_zeroed(path_limit).unwrap();
   let clone = shared.clone();
   let error = handle.walk_next(walk, shared).unwrap_err();
   assert_eq!(
@@ -393,9 +417,12 @@ fn recursive_walk_rejects_root_symlinks_and_short_or_shared_output_before_admiss
 #[cfg(unix)]
 #[test]
 fn completed_walk_cursor_is_terminal_on_repoll() {
+  use std::os::unix::ffi::OsStrExt;
+
   let scratch = Scratch::new();
+  let path_limit = scratch.0.as_os_str().as_bytes().len().max(128);
   let mut runtime = runtime(1, 2);
-  let scope = scope(256, 1);
+  let scope = scope(path_limit * 2, 1);
   let handle = FsHandle::new(runtime.handle(), scope.clone());
   let walk = handle
     .walk_dir(
@@ -403,7 +430,7 @@ fn completed_walk_cursor_is_terminal_on_repoll() {
       WalkLimits {
         max_entries: 4,
         max_depth: 0,
-        max_path_bytes: 128,
+        max_path_bytes: path_limit,
       },
     )
     .unwrap()
@@ -411,7 +438,7 @@ fn completed_walk_cursor_is_terminal_on_repoll() {
     .unwrap()
     .unwrap();
   let root = handle
-    .walk_next(walk, scope.try_alloc_zeroed(128).unwrap())
+    .walk_next(walk, scope.try_alloc_zeroed(path_limit).unwrap())
     .unwrap()
     .join()
     .unwrap();
@@ -436,10 +463,14 @@ fn completed_walk_cursor_is_terminal_on_repoll() {
 #[cfg(unix)]
 #[test]
 fn queued_walk_cancellation_retains_then_releases_cursor_buffer_and_disk_slot() {
+  use std::os::unix::ffi::OsStrExt;
+
   let scratch = Scratch::new();
-  fs::write(scratch.child("item"), b"").unwrap();
+  let item = scratch.child("item");
+  fs::write(&item, b"").unwrap();
+  let path_limit = item.as_os_str().as_bytes().len().max(128);
   let mut runtime = runtime(1, 3);
-  let scope = scope(256, 1);
+  let scope = scope(path_limit * 2, 1);
   let handle = FsHandle::new(runtime.handle(), scope.clone());
   let walk = handle
     .walk_dir(
@@ -447,7 +478,7 @@ fn queued_walk_cancellation_retains_then_releases_cursor_buffer_and_disk_slot() 
       WalkLimits {
         max_entries: 4,
         max_depth: 2,
-        max_path_bytes: 128,
+        max_path_bytes: path_limit,
       },
     )
     .unwrap()
@@ -456,10 +487,10 @@ fn queued_walk_cancellation_retains_then_releases_cursor_buffer_and_disk_slot() 
     .unwrap();
   let (blocker, started, release) = gated_job(&runtime);
   started.recv_timeout(WATCHDOG).unwrap();
-  let path = scope.try_alloc_zeroed(128).unwrap();
+  let path = scope.try_alloc_zeroed(path_limit).unwrap();
   let job = handle.walk_next(walk, path).unwrap();
   assert_eq!(scope.snapshot().disk_ops, 1);
-  assert_eq!(scope.snapshot().managed_memory, 128);
+  assert_eq!(scope.snapshot().managed_memory, path_limit);
   job.cancel();
   release.send(()).unwrap();
   blocker.join().unwrap();
