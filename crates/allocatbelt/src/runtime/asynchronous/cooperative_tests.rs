@@ -1,6 +1,8 @@
 use std::future::Future;
 use std::future::poll_fn;
+use std::io::{IoSlice, IoSliceMut};
 use std::pin::Pin;
+use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Context, Poll};
@@ -8,6 +10,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use super::{AsyncConfig, AsyncJoinError, AsyncRuntime, AsyncShutdown};
+use crate::runtime::io::{AsyncRead, AsyncWrite};
+use crate::runtime::process::pipe::{AsyncChildStdin, AsyncChildStdout};
+use crate::runtime::reactor::{Reactor, ReactorConfig};
 
 const WATCHDOG: Duration = Duration::from_secs(3);
 const DEFAULT_BUDGET: usize = 64;
@@ -17,6 +22,37 @@ fn exhaust_budget(context: &mut Context<'_>) {
     assert!(super::poll_cooperative(context, |_| Poll::Ready(())).is_ready());
   }
   assert_eq!(super::entry::budget_remaining(), 0);
+}
+
+struct TestChild(Child);
+
+impl Drop for TestChild {
+  fn drop(&mut self) {
+    let _ = self.0.kill();
+    let _ = self.0.wait();
+  }
+}
+
+fn child(script: &str, stdin: bool) -> TestChild {
+  let mut command = Command::new("/bin/bash");
+  command.args(["-c", script]).stdout(Stdio::piped());
+  if stdin {
+    command.stdin(Stdio::piped());
+  }
+  TestChild(command.spawn().expect("test child should start"))
+}
+
+fn pipe_reactor(
+  registrations: usize,
+  waiters: usize,
+) -> (Reactor, crate::runtime::reactor::ReactorHandle) {
+  let reactor = Reactor::new(ReactorConfig {
+    max_registrations: registrations,
+    max_waiters: waiters,
+  })
+  .expect("test reactor should start");
+  let handle = reactor.handle();
+  (reactor, handle)
 }
 
 fn assert_ready_loop_yields(
@@ -660,4 +696,312 @@ fn exhausted_budget_does_not_enroll_or_advance_a_ready_barrier_wait() {
     .unwrap();
   assert!(outcome.leader);
   runtime.shutdown(AsyncShutdown::Drain).unwrap();
+}
+
+#[test]
+fn child_pipe_vectored_polls_charge_once_and_gate_closed_fast_paths() {
+  let runtime = AsyncRuntime::new(AsyncConfig {
+    workers: 1,
+    max_outstanding: 2,
+    max_scopes: 1,
+  })
+  .unwrap();
+  let (reactor, handle) = pipe_reactor(2, 2);
+  let mut child = child(
+    "IFS= read -r value; printf '%s' \"$value\"; exec sleep 20",
+    true,
+  );
+  let mut writer = AsyncChildStdin::from_std(child.0.stdin.take().unwrap(), &handle).unwrap();
+  let mut reader = AsyncChildStdout::from_std(child.0.stdout.take().unwrap(), &handle).unwrap();
+  let mut write_stage = 0;
+  let mut first = [0_u8; 6];
+  let mut second = [0_u8; 7];
+  let mut received = 0;
+  let total = first.len() + second.len();
+
+  let read = runtime
+    .block_on(poll_fn(|context| {
+      let before = super::entry::budget_remaining();
+      if write_stage == 0 {
+        match Pin::new(&mut writer).poll_write(context, b"scalar-") {
+          Poll::Pending => {
+            assert_eq!(super::entry::budget_remaining(), before);
+            return Poll::Pending;
+          }
+          Poll::Ready(Ok(7)) => {
+            write_stage = 1;
+            assert_eq!(super::entry::budget_remaining(), before - 1);
+          }
+          Poll::Ready(Ok(count)) => panic!("unexpected scalar pipe write: {count}"),
+          Poll::Ready(Err(error)) => panic!("child pipe write failed: {error}"),
+        }
+      }
+      if write_stage == 1 {
+        let before_vector = super::entry::budget_remaining();
+        let bufs = [IoSlice::new(b"vector\n")];
+        match Pin::new(&mut writer).poll_write_vectored(context, &bufs) {
+          Poll::Pending => {
+            assert_eq!(super::entry::budget_remaining(), before_vector);
+            return Poll::Pending;
+          }
+          Poll::Ready(Ok(7)) => {
+            write_stage = 2;
+            assert_eq!(super::entry::budget_remaining(), before_vector - 1);
+          }
+          Poll::Ready(Ok(count)) => panic!("unexpected vectored pipe write: {count}"),
+          Poll::Ready(Err(error)) => panic!("child pipe write failed: {error}"),
+        }
+      }
+
+      while received < total {
+        let before_read = super::entry::budget_remaining();
+        let offered = total - received;
+        let first_offset = received.min(first.len());
+        let second_offset = received.saturating_sub(first.len());
+        let mut bufs = [
+          IoSliceMut::new(&mut first[first_offset..]),
+          IoSliceMut::new(&mut second[second_offset..]),
+        ];
+        match Pin::new(&mut reader).poll_read_vectored(context, &mut bufs) {
+          Poll::Pending => {
+            assert_eq!(super::entry::budget_remaining(), before_read);
+            return Poll::Pending;
+          }
+          Poll::Ready(Ok(0)) => panic!("child pipe reached EOF before the full payload"),
+          Poll::Ready(Ok(count)) => {
+            assert!(count <= offered);
+            assert_eq!(super::entry::budget_remaining(), before_read - 1);
+            received += count;
+          }
+          Poll::Ready(Err(error)) => panic!("child pipe read failed: {error}"),
+        }
+      }
+      Poll::Ready(received)
+    }))
+    .unwrap();
+  assert_eq!(read, 13);
+  assert_eq!(&first, b"scalar");
+  assert_eq!(&second, b"-vector");
+  let _ = child.0.kill();
+  let _ = child.0.wait();
+
+  let mut first_fast_path_poll = true;
+  runtime
+    .block_on(poll_fn(|context| {
+      if first_fast_path_poll {
+        first_fast_path_poll = false;
+        exhaust_budget(context);
+        assert!(Pin::new(&mut writer).poll_shutdown(context).is_pending());
+        assert_eq!(super::entry::budget_remaining(), 0);
+        assert!(writer.get_ref().is_some());
+        assert!(Pin::new(&mut writer).poll_flush(context).is_pending());
+        assert_eq!(super::entry::budget_remaining(), 0);
+        assert!(writer.get_ref().is_some());
+        Poll::Pending
+      } else {
+        let before = super::entry::budget_remaining();
+        assert!(Pin::new(&mut writer).poll_shutdown(context).is_ready());
+        assert_eq!(super::entry::budget_remaining(), before - 1);
+        assert!(writer.get_ref().is_none());
+        assert_eq!(
+          Pin::new(&mut writer)
+            .poll_write(context, b"closed")
+            .map(|result| result.unwrap_err().kind()),
+          Poll::Ready(std::io::ErrorKind::BrokenPipe)
+        );
+        assert_eq!(super::entry::budget_remaining(), before - 2);
+        assert!(Pin::new(&mut writer).poll_flush(context).is_ready());
+        assert_eq!(super::entry::budget_remaining(), before - 3);
+        Poll::Ready(())
+      }
+    }))
+    .unwrap();
+  runtime.shutdown(AsyncShutdown::Drain).unwrap();
+  reactor.shutdown().unwrap();
+}
+
+#[test]
+fn exhausted_child_pipe_polls_preserve_buffer_and_waiter_then_resume() {
+  let runtime = AsyncRuntime::new(AsyncConfig {
+    workers: 1,
+    max_outstanding: 2,
+    max_scopes: 1,
+  })
+  .unwrap();
+  let (reactor, handle) = pipe_reactor(1, 1);
+  let mut child = child("IFS= read -r value; printf x; exec sleep 20", true);
+  let mut signal = child.0.stdin.take().unwrap();
+  let mut reader = AsyncChildStdout::from_std(child.0.stdout.take().unwrap(), &handle).unwrap();
+  let mut buffer = [0_u8; 1];
+  let mut first_poll = true;
+
+  runtime
+    .block_on(poll_fn(|context| {
+      if first_poll {
+        first_poll = false;
+        assert!(
+          Pin::new(&mut reader)
+            .poll_read(context, &mut buffer)
+            .is_pending()
+        );
+        assert_eq!(super::entry::budget_remaining(), DEFAULT_BUDGET as u16);
+        assert!(format!("{reader:?}").contains("waiting: true"));
+
+        exhaust_budget(context);
+        assert!(
+          Pin::new(&mut reader)
+            .poll_read(context, &mut buffer)
+            .is_pending()
+        );
+        assert_eq!(super::entry::budget_remaining(), 0);
+        assert_eq!(buffer, [0]);
+        assert!(format!("{reader:?}").contains("waiting: true"));
+
+        assert!(
+          Pin::new(&mut reader)
+            .poll_read(context, &mut [])
+            .is_pending()
+        );
+        assert_eq!(super::entry::budget_remaining(), 0);
+        assert!(format!("{reader:?}").contains("waiting: true"));
+        Poll::Pending
+      } else {
+        assert!(matches!(
+          Pin::new(&mut reader).poll_read(context, &mut []),
+          Poll::Ready(Ok(0))
+        ));
+        assert_eq!(super::entry::budget_remaining(), DEFAULT_BUDGET as u16 - 1);
+        assert!(format!("{reader:?}").contains("waiting: false"));
+        Poll::Ready(())
+      }
+    }))
+    .unwrap();
+
+  std::io::Write::write_all(&mut signal, b"go\n").unwrap();
+  runtime
+    .block_on(poll_fn(|context| {
+      match Pin::new(&mut reader).poll_read(context, &mut buffer) {
+        Poll::Pending => {
+          assert_eq!(super::entry::budget_remaining(), DEFAULT_BUDGET as u16);
+          Poll::Pending
+        }
+        Poll::Ready(Ok(1)) => {
+          assert_eq!(super::entry::budget_remaining(), DEFAULT_BUDGET as u16 - 1);
+          Poll::Ready(())
+        }
+        Poll::Ready(Ok(count)) => panic!("unexpected child pipe read count: {count}"),
+        Poll::Ready(Err(error)) => panic!("child pipe read failed: {error}"),
+      }
+    }))
+    .unwrap();
+  assert_eq!(buffer, [b'x']);
+  let _ = child.0.kill();
+  let _ = child.0.wait();
+  runtime.shutdown(AsyncShutdown::Drain).unwrap();
+  reactor.shutdown().unwrap();
+}
+
+#[test]
+fn child_pipe_data_and_eof_ready_loop_yields_to_a_sibling_task() {
+  let (reactor, handle) = pipe_reactor(1, 1);
+  let mut child = child("head -c 16777216 /dev/zero", false);
+  let mut reader = AsyncChildStdout::from_std(child.0.stdout.take().unwrap(), &handle).unwrap();
+  let progress = Arc::new(AtomicUsize::new(0));
+  let ready_reads = Arc::new(AtomicUsize::new(0));
+  let max_batch = Arc::new(AtomicUsize::new(0));
+  let loop_progress = Arc::clone(&progress);
+  let loop_ready_reads = Arc::clone(&ready_reads);
+  let loop_max_batch = Arc::clone(&max_batch);
+  let future = async move {
+    let mut buffer = [0_u8; 8192];
+    let mut batch = 0;
+    let mut previous_remaining = DEFAULT_BUDGET as u16;
+    loop {
+      let count = poll_fn(|context| Pin::new(&mut reader).poll_read(context, &mut buffer))
+        .await
+        .expect("child pipe read should succeed");
+      record_ready(
+        &loop_ready_reads,
+        &loop_max_batch,
+        &mut batch,
+        &mut previous_remaining,
+      );
+      if count == 0 {
+        // The finite producer has reached EOF. Keep polling the immediately
+        // ready EOF result until the harness aborts this task, so normal
+        // completion cannot race the sibling/cancellation assertions.
+        // Signal the harness only after this continuously-ready phase starts.
+        loop_progress.fetch_add(1, Ordering::SeqCst);
+        continue;
+      }
+    }
+  };
+  assert_ready_loop_yields(future, progress, max_batch);
+  let _ = child.0.kill();
+  let _ = child.0.wait();
+  reactor.shutdown().unwrap();
+}
+
+#[test]
+fn external_executor_child_pipe_polls_keep_noop_accounting() {
+  let (reactor, handle) = pipe_reactor(2, 2);
+  let mut child = child("IFS= read -r value; printf '%s' \"$value\"", true);
+  let mut writer = AsyncChildStdin::from_std(child.0.stdin.take().unwrap(), &handle).unwrap();
+  let mut reader = AsyncChildStdout::from_std(child.0.stdout.take().unwrap(), &handle).unwrap();
+  let mut context = Context::from_waker(std::task::Waker::noop());
+  let deadline = Instant::now() + WATCHDOG;
+  let write_bufs = [IoSlice::new(b"manual-"), IoSlice::new(b"pipe\n")];
+  let mut written = None;
+
+  super::entry::reset_budget();
+  assert!(!super::entry::cooperative_poll_active());
+  while written.is_none() {
+    assert!(
+      Instant::now() < deadline,
+      "manual child-pipe write timed out"
+    );
+    match Pin::new(&mut writer).poll_write_vectored(&mut context, &write_bufs) {
+      Poll::Pending => thread::sleep(Duration::from_millis(1)),
+      Poll::Ready(Ok(count)) => written = Some(count),
+      Poll::Ready(Err(error)) => panic!("manual child-pipe write failed: {error}"),
+    }
+    assert_eq!(super::entry::budget_remaining(), DEFAULT_BUDGET as u16);
+  }
+  assert_eq!(written, Some(12));
+
+  let mut first = [0_u8; 6];
+  let mut second = [0_u8; 5];
+  let mut received = 0;
+  let total = first.len() + second.len();
+  while received < total {
+    assert!(
+      Instant::now() < deadline,
+      "manual child-pipe read timed out"
+    );
+    let offered = total - received;
+    let first_offset = received.min(first.len());
+    let second_offset = received.saturating_sub(first.len());
+    let mut bufs = [
+      IoSliceMut::new(&mut first[first_offset..]),
+      IoSliceMut::new(&mut second[second_offset..]),
+    ];
+    match Pin::new(&mut reader).poll_read_vectored(&mut context, &mut bufs) {
+      Poll::Pending => thread::sleep(Duration::from_millis(1)),
+      Poll::Ready(Ok(0)) => panic!("manual child pipe reached EOF before the full payload"),
+      Poll::Ready(Ok(count)) => {
+        assert!(count <= offered);
+        received += count;
+      }
+      Poll::Ready(Err(error)) => panic!("manual child-pipe read failed: {error}"),
+    }
+    assert_eq!(super::entry::budget_remaining(), DEFAULT_BUDGET as u16);
+  }
+  assert_eq!(received, total);
+  assert_eq!(&first, b"manual");
+  assert_eq!(&second, b"-pipe");
+  assert!(child.0.wait().unwrap().success());
+  assert!(Pin::new(&mut writer).poll_flush(&mut context).is_ready());
+  assert!(Pin::new(&mut writer).poll_shutdown(&mut context).is_ready());
+  assert_eq!(super::entry::budget_remaining(), DEFAULT_BUDGET as u16);
+  reactor.shutdown().unwrap();
 }

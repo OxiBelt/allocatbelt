@@ -5,7 +5,8 @@
 //! Runtime-owned outer polls enable a shared 64-operation cooperative budget
 //! for ready channel, oneshot, semaphore, mutex, reader-writer-lock, notify,
 //! watch, broadcast, barrier, sleep, timeout, interval-tick, and live
-//! asynchronous initialization futures. The budget is scoped to those polls;
+//! asynchronous initialization futures, and registered child-pipe I/O trait
+//! polls. The budget is scoped to those polls;
 //! timeout and initialization polls coalesce a ready charge with supported
 //! descendants, retaining descendant charges on pending polls or unwinding.
 //! Completed initialization futures retain their immediate error. Manual polls and

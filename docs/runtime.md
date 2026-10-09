@@ -1019,11 +1019,13 @@ borrowed `block_on` root.
 Manual polls and futures driven by external executors bypass automatic
 accounting. Other arbitrary futures are not automatically cooperative; long-running
 work outside the listed primitives still needs explicit checkpoints or its own
-bounded polling. Raw readiness waits and other direct I/O endpoint
-polls, including direct child-pipe and `AsyncBufRead` operations, are outside
-this automatic accounting; the looping I/O helpers and buffered endpoints
-enforce their own 64-call-per-poll
-limits.
+bounded polling. Registered child-pipe `AsyncRead` and `AsyncWrite` trait
+polls also use the shared budget: ready fast paths and each readiness-plus-
+syscall attempt are gated, `Interrupted` spends a unit, and stale
+`WouldBlock` refunds it. Each such poll keeps a local 64-attempt retry cap.
+Raw readiness waits and cached `AsyncBufRead` operations remain outside this
+automatic accounting; looping I/O helpers and buffered endpoints enforce
+their own 64-call-per-poll limits.
 
 `AsyncJob` is awaitable; dropping it detaches, while `abort` requests cleanup
 after any in-flight poll returns. Owned scopes cancel their children on drop;
@@ -1556,6 +1558,10 @@ caller-clock samples and does not establish response under real resource
 pressure or a native application benefit.
 
 ## Path toward replacing Tokio
+
+The [capability and acceptance ledger](research/runtime-capability-status.md)
+links implemented operations and focused fixtures to their remaining migration
+and qualification requirements.
 
 Task utilities, resource-bound polling, the synchronization families,
 processes, signals, concurrency helpers and explicit cgroup feedback are

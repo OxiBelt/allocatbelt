@@ -55,6 +55,9 @@ use super::error::{JoinError, SubmitErrorKind};
 use super::io::{AsyncRead, AsyncWrite};
 use super::managed::{ManagedBuf, OperationPermit, OperationRequest, ResourceError, ResourceScope};
 use super::reactor::{AsyncFd, OwnedReadiness, ReactorHandle, RegisterError};
+#[cfg(test)]
+pub(super) use super::readiness_io::{IoAttempt, poll_io_attempt};
+pub(super) use super::readiness_io::{IoDirection, poll_io_with_retry};
 use super::resources::Resources;
 
 const IO_BUDGET: usize = 64;
@@ -2091,99 +2094,10 @@ pub use unix::{
   PublicUnixListener as UnixListener, PublicUnixStream as UnixStream,
 };
 
-#[derive(Clone, Copy)]
-enum IoDirection {
-  Read,
-  Write,
-}
-
-#[derive(Debug)]
-enum IoAttempt<T> {
-  RetryCharged,
-  RetryRefunded,
-  Complete(io::Result<T>),
-}
-
 enum VectoredCall {
   Empty,
   Offered(usize),
   Count(usize),
-}
-
-/// Polls one readiness-plus-syscall attempt behind the shared cooperative
-/// gate. `Interrupted` commits the unit. Stale `WouldBlock` returns Pending
-/// inside the gate to refund the unit, then is translated to a retry so the
-/// loop re-registers readiness before it can return Pending to its caller.
-/// The owned waiter remains in `waiter` across readiness Pending and is
-/// removed before a terminal result.
-fn poll_io_attempt<T, R>(
-  cx: &mut Context<'_>,
-  fd: &AsyncFd<T>,
-  waiter: &mut Option<OwnedReadiness<T>>,
-  direction: IoDirection,
-  operation: impl FnOnce(&T) -> io::Result<R>,
-) -> Poll<IoAttempt<R>> {
-  let mut stale_would_block = false;
-  let result = super::asynchronous::poll_cooperative(cx, |cx| {
-    if waiter.is_none() {
-      *waiter = Some(match direction {
-        IoDirection::Read => fd.readable_owned(),
-        IoDirection::Write => fd.writable_owned(),
-      });
-    }
-    let readiness = match waiter.as_mut() {
-      Some(readiness) => Pin::new(readiness).poll(cx),
-      None => unreachable!("readiness waiter was just created"),
-    };
-    match readiness {
-      Poll::Pending => Poll::Pending,
-      Poll::Ready(Err(error)) => {
-        drop(waiter.take());
-        Poll::Ready(IoAttempt::Complete(Err(error)))
-      }
-      Poll::Ready(Ok(guard)) => {
-        drop(waiter.take());
-        match guard.try_io(operation) {
-          Err(error) if error.kind() == io::ErrorKind::Interrupted => {
-            Poll::Ready(IoAttempt::RetryCharged)
-          }
-          Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-            stale_would_block = true;
-            Poll::Pending
-          }
-          result => Poll::Ready(IoAttempt::Complete(result)),
-        }
-      }
-    }
-  });
-  match result {
-    Poll::Pending if stale_would_block => Poll::Ready(IoAttempt::RetryRefunded),
-    result => result,
-  }
-}
-
-/// Polls at most `IO_BUDGET` endpoint attempts in one poll. On that local cap,
-/// readiness has already been cleared by the last stale syscall, so self-wake
-/// before returning Pending; every next syscall must pass the shared gate.
-fn poll_io_with_retry<T, R>(
-  cx: &mut Context<'_>,
-  fd: &AsyncFd<T>,
-  waiter: &mut Option<OwnedReadiness<T>>,
-  direction: IoDirection,
-  mut operation: impl FnMut(&T) -> io::Result<R>,
-) -> Poll<io::Result<R>> {
-  let mut attempts = 0;
-  loop {
-    if attempts == IO_BUDGET {
-      cx.waker().wake_by_ref();
-      return Poll::Pending;
-    }
-    match poll_io_attempt(cx, fd, waiter, direction, |value| operation(value)) {
-      Poll::Pending => return Poll::Pending,
-      Poll::Ready(IoAttempt::RetryCharged | IoAttempt::RetryRefunded) => attempts += 1,
-      Poll::Ready(IoAttempt::Complete(result)) => return Poll::Ready(result),
-    }
-  }
 }
 
 fn poll_vectored_io_with_retry<T>(

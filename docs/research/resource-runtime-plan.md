@@ -14,6 +14,10 @@ futures; scoped borrowing is outside this contract.
 
 ## Dependency order and acceptance
 
+The [capability status ledger](runtime-capability-status.md) records implemented
+operations and remaining acceptance work. The table below defines requirements;
+it is not a completion checklist.
+
 | Stage | Deliverable | Acceptance |
 |---|---|---|
 | Package | Move the existing blocking pool into the allocator package | Packaged consumer works; production graph excludes Tokio; allocator defaults unchanged |
