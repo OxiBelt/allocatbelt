@@ -98,3 +98,7 @@ workspace = true
 [[test]]
 name = "runtime_allocator"
 required-features = ["runtime"]
+
+[[example]]
+name = "runtime-uring-denied"
+required-features = ["runtime-io-uring"]

@@ -1530,6 +1530,18 @@ bounded lifecycle transitions, not kernel execution. Real-kernel tests with
 failure from a successful kernel transfer/fail-stop qualification. No native
 performance benefit has been established for this optional service.
 
+The standalone [`runtime-uring-denied` example](../crates/allocatbelt/examples/runtime-uring-denied.rs)
+checks the public startup path under an externally imposed setup denial. It
+requires a non-root process with no capabilities, no-new-privileges and seccomp
+enabled, and accepts only the typed `Ring` error at phase `setup` with `EPERM`.
+It checks that caller-held managed memory and a disk permit remain unchanged,
+that their budgets can be reused after drop, and that the failed issuer leaves
+no thread. Build it with `--no-default-features --features runtime-io-uring`;
+the caller must impose the denial and bound the complete process externally.
+Its marker alone does not establish which policy caused the denial or prove
+process cleanup; qualification also checks the installed policy and terminal
+process state.
+
 ## Explicit adaptive cgroup feedback
 
 `runtime::adaptive::AdaptiveController` takes an already-delegated `CgroupV2`

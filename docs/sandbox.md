@@ -29,6 +29,17 @@ runs the allocator unchanged. Optional capabilities that such a sandbox refuses 
 
 To make the ring available in a container, an operator may use a seccomp profile that adds `io_uring_setup`, `io_uring_enter` and `io_uring_register` to Docker's default profile. Nothing depends on it; the allocator never asks for `seccomp=unconfined`.
 
+The independent owned-buffer runtime driver (`runtime-io-uring`) returns a
+typed startup error before admission when setup is denied. The
+[`runtime-uring-denied` example](../crates/allocatbelt/examples/runtime-uring-denied.rs)
+checks genuine public startup, caller-owned resources, budget reuse and issuer
+thread cleanup under a verified external `io_uring_setup` denial. It requires
+seccomp, no-new-privileges, non-root credentials and zero capabilities. Build
+with `--no-default-features --features runtime-io-uring` and run with an external
+process deadline; an unrestricted run fails. The allocator purge tests in the
+sandbox script exercise a separate policy. This example does not by itself
+attribute `EPERM` to seccomp or establish final process closure.
+
 ## Only what the process sees
 
 Inside a VM (or a VM inside a VM), the allocator uses the guest's view and nothing else:
