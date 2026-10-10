@@ -63,6 +63,16 @@ core and checker sources match that campaign's reviewed source bridge. This
 qualifies that core campaign; runtime, platform and performance gates remain
 separate.
 
+A subsequent bounded workspace campaign passed formatting, Clippy with all
+targets and features, and release tests with all features on materialized source
+equivalent to signed revision `282124453db18ee3ff8958388e983aa947d84a32`.
+Independent audit verified all 314 materialized source entries, original and protected result equality,
+zero command exits and owned-process cleanup. The captured release log contains
+1,359 reported passes, zero reported failures and four reported ignored results
+across 100 summary reports, including nested child-test runs; these are not distinct
+test counts. Later documentation changes are outside that full source bridge.
+Feature, package, platform and performance qualification remain separate.
+
 Release requires source-specific ownership and lifecycle review, appropriate
 concurrent models, standard checks, the complete isolated core Miri campaign,
 supported-platform checks, feature combinations, a packaged consumer, and the
