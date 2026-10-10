@@ -54,6 +54,15 @@ and policy checks also passed for the identical dependency inputs.
 These checks establish the component behavior; remaining release checks and
 application performance acceptance are still required.
 
+The repaired complete isolated core Miri campaign at signed source revision
+`c3ed95db4f9ba9b6ffd9d84d7651a3b5963de2c5` passed 135 tests and retained the
+one intentional ignored contention benchmark. All 136 test-process and log-
+writer exits were zero; no case timed out or was cancelled. Independent audit
+verified the complete manifest, logs and owned-process closure. The current
+core and checker sources match that campaign's reviewed source bridge. This
+qualifies that core campaign; runtime, platform and performance gates remain
+separate.
+
 Release requires source-specific ownership and lifecycle review, appropriate
 concurrent models, standard checks, the complete isolated core Miri campaign,
 supported-platform checks, feature combinations, a packaged consumer, and the
@@ -72,6 +81,18 @@ The [foundation report](runtime-foundation.md) remains a historical milestone.
 Its earlier test counts and measurements are not the current release inventory.
 Update this ledger when public operations or acceptance fixtures change; publish
 only sanitized, source-specific qualification conclusions.
+
+### FIFO application acceptance scope
+
+Five focused [FIFO application cases](../../crates/allocatbelt-app-ports/tests/fifo_pipeline.rs)
+passed individually under bounded timeouts. They cover admission and peer
+behavior, split UTF-8 buffering, partial writes under kernel backpressure,
+cancellation after a committed prefix with exact suffix recovery, and file-
+descriptor recovery after registration refusal. The committed-prefix case
+keeps the worker permit and managed buffer charged until actual completion and
+checks final waiter, registration and scratch cleanup. This is focused Linux
+functional evidence; broader migration and performance qualification remain
+open.
 
 ### Process-output acceptance scope
 
