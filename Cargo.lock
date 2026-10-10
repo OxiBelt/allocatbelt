@@ -36,6 +36,7 @@ dependencies = [
  "allocatbelt-profile",
  "allocatbelt-runtime",
  "mimalloc",
+ "rustix",
  "tokio",
 ]
 

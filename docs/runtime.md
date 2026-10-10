@@ -1567,6 +1567,40 @@ without replay and explicit readback recovery. The fixture uses synthetic
 caller-clock samples and does not establish response under real resource
 pressure or a native application benefit.
 
+`allocatbelt-bench::adaptive_feedback` supplies a bounded caller-side adapter
+for source experiments. It reads fixed CPU, memory, event and PSI files from
+an explicitly supplied cgroup directory descriptor, retains the bytes and
+read chronology, computes quota-normalized CPU and fixed-original-
+`memory.max` ratios, and forms feedback only from nonempty completed-response
+windows. It reports raw CPU ratios above 100% separately from the clamped
+controller input. Missing or malformed sensors, changed controls, counter
+regressions, empty latency windows and memory safety events do not produce a
+feedback sample. `bench-adaptive-pressure` consumes an externally supervised
+event stream and never creates work or moves processes. Native qualification
+passed formatting, all-target compilation, strict all-target/all-feature
+Clippy, 22 adapter tests, six CLI tests and the full release workspace suite.
+Real pressure transitions, recovery and performance remain unqualified.
+Work events carry actual callback timestamps in the same host `CLOCK_MONOTONIC`
+domain as the adapter's separately recorded receipt timestamps. Event delivery
+older than 250 ms, a future timestamp, or an unproven clock relationship is
+ineligible for feedback. The offered schedule is sealed before dispatch; final
+drain permits starts and terminal events for already admitted work, while new
+offers and admissions remain closed.
+Each `cpu.stat`, `cpu.pressure` and `memory.pressure` read retains its own
+monotonic start/end bracket. CPU and PSI denominators use per-file bracket
+midpoints and refuse samples whose conservative read uncertainty exceeds
+10 ms. A pre-dispatch schedule seal and acknowledgement watermark are stored
+immutably for each offered ID. New callbacks must follow their ID's own
+acknowledgement; buffered callbacks for carried IDs remain valid against their
+original watermark across later windows and final drain. The final drain performs a real
+sensor/control safety boundary before success and refuses success when the
+final read is unavailable or the invocation-wide memory safety counters changed.
+Every successful carried or drained completion contributes its unchanged
+source-time `finish - scheduled` latency once. A buffered carryover is recorded
+in the active ledger window when accepted, even if its source completion
+predates that window's sensor boundary; per-ID chronology and receipt-delay
+limits remain separate, and no response is censored or retimestamped.
+
 ## Path toward replacing Tokio
 
 The [capability and acceptance ledger](research/runtime-capability-status.md)

@@ -20,6 +20,7 @@ use std::time::{Duration, Instant};
 
 use allocatbelt_profile::Usage;
 
+pub mod adaptive_feedback;
 pub mod application;
 pub mod runtime;
 

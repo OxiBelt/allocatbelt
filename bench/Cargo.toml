@@ -14,6 +14,7 @@ allocatbelt-runtime.workspace = true
 allocatbelt-app-ports.workspace = true
 mimalloc.workspace = true
 tokio.workspace = true
+rustix = { workspace = true, features = ["time"] }
 
 [lints]
 workspace = true
