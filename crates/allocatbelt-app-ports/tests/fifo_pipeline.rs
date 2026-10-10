@@ -7,7 +7,7 @@ use std::os::unix::fs::{DirBuilderExt, FileTypeExt};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{self, Sender};
+use std::sync::mpsc::{self, Sender, TryRecvError};
 use std::sync::{Arc, Condvar, Mutex};
 use std::task::{Context, Poll, Wake, Waker};
 use std::thread;
@@ -50,6 +50,18 @@ impl Scratch {
 
   fn child(&self, name: &str) -> PathBuf {
     self.0.join(name)
+  }
+
+  /// Explicit success-path cleanup; Drop remains best-effort for unwinding.
+  fn remove(self) {
+    std::fs::remove_dir_all(&self.0)
+      .expect("scratch directory should be removed after its owners drop");
+    assert_eq!(
+      std::fs::symlink_metadata(&self.0)
+        .expect_err("removed scratch directory must not remain")
+        .kind(),
+      io::ErrorKind::NotFound
+    );
   }
 }
 
@@ -258,6 +270,8 @@ fn fifo_admission_rejection_enxio_late_data_and_self_peer_are_explicit() {
   drop(self_peer);
   drop(self_reader);
 
+  assert_eq!(reactor.registrations(), 0);
+  assert_eq!(reactor.waiters(), 0);
   assert_eq!(resources.snapshot().disk_ops, 0);
   drop(filesystem);
   drop(exhausted);
@@ -267,6 +281,7 @@ fn fifo_admission_rejection_enxio_late_data_and_self_peer_are_explicit() {
   _reactor
     .shutdown()
     .expect("all FIFO registrations should be closed");
+  scratch.remove();
 }
 
 #[test]
@@ -360,12 +375,15 @@ fn buffered_fifo_line_resumes_split_utf8_and_capacity_without_replay() {
   assert_eq!(resources.snapshot().managed_memory, 0);
   drop(writer);
   drop(filesystem);
+  assert_eq!(reactor.registrations(), 0);
+  assert_eq!(reactor.waiters(), 0);
   runtime
     .shutdown(ShutdownMode::Drain)
     .expect("FIFO-open workers should be idle");
   _reactor
     .shutdown()
     .expect("reader and writer registrations should be gone");
+  scratch.remove();
 }
 
 #[derive(Debug, Default)]
@@ -688,6 +706,7 @@ fn buffered_pipe_writer_observes_kernel_would_block_partial_progress_and_suffix_
   assert_eq!(resources.snapshot().managed_memory, 0);
   drop(registered_reader);
   assert_eq!(reactor_handle.registrations(), 0);
+  assert_eq!(reactor_handle.waiters(), 0);
   reactor
     .shutdown()
     .expect("pipe registrations should be released");
@@ -755,27 +774,44 @@ impl Drop for ReleaseGate {
 #[derive(Default)]
 struct BlockingWriteState {
   bytes: Vec<u8>,
+  inputs: Vec<Vec<u8>>,
+  accepted: Vec<usize>,
   calls: usize,
   flushes: usize,
 }
 
-struct GatePartialWriter {
+struct CallGate {
+  call: usize,
   gate: Arc<Gate>,
   started: Option<Sender<()>>,
+}
+
+struct GatePartialWriter {
+  gates: Vec<CallGate>,
   state: Arc<Mutex<BlockingWriteState>>,
 }
 
 impl Write for GatePartialWriter {
   fn write(&mut self, input: &[u8]) -> io::Result<usize> {
-    if let Some(started) = self.started.take() {
+    // Every submitted input is recorded before its gate, so a replayed call
+    // appears as an extra entry even if it never commits a byte.
+    let call = {
+      let mut state = self.state.lock().expect("writer state mutex is healthy");
+      state.inputs.push(input.to_vec());
+      state.inputs.len()
+    };
+    if let Some(gated) = self.gates.iter_mut().find(|gated| gated.call == call)
+      && let Some(started) = gated.started.take()
+    {
       started
         .send(())
         .map_err(|_| io::Error::other("test observer disappeared"))?;
-      self.gate.wait()?;
+      gated.gate.wait()?;
     }
     let count = input.len().min(2);
     let mut state = self.state.lock().expect("writer state mutex is healthy");
     state.calls += 1;
+    state.accepted.push(count);
     state.bytes.extend_from_slice(&input[..count]);
     Ok(count)
   }
@@ -800,11 +836,24 @@ fn blocking_writer_cancellation_keeps_worker_permit_and_recovers_without_replay(
   let resources = resource_scope(8, 0);
   let gate = Arc::new(Gate::new());
   let _release_on_unwind = ReleaseGate(Arc::clone(&gate));
+  let second_gate = Arc::new(Gate::new());
+  let _release_second_on_unwind = ReleaseGate(Arc::clone(&second_gate));
   let (started_tx, started_rx) = mpsc::channel();
+  let (second_started_tx, second_started_rx) = mpsc::channel();
   let state = Arc::new(Mutex::new(BlockingWriteState::default()));
   let stream = GatePartialWriter {
-    gate: Arc::clone(&gate),
-    started: Some(started_tx),
+    gates: vec![
+      CallGate {
+        call: 1,
+        gate: Arc::clone(&gate),
+        started: Some(started_tx),
+      },
+      CallGate {
+        call: 2,
+        gate: Arc::clone(&second_gate),
+        started: Some(second_started_tx),
+      },
+    ],
     state: Arc::clone(&state),
   };
   let buffer = managed(&resources, 8);
@@ -826,27 +875,93 @@ fn blocking_writer_cancellation_keeps_worker_permit_and_recovers_without_replay(
   assert_eq!(held.running, 1);
   assert_eq!(held.reserved.disk, request.disk);
   assert_eq!(resources.snapshot().managed_memory, 8);
-  assert!(
-    state
-      .lock()
-      .expect("writer state mutex is healthy")
-      .bytes
-      .is_empty()
-  );
+  let observed = state.lock().expect("writer state mutex is healthy");
+  assert!(observed.bytes.is_empty());
+  assert!(observed.accepted.is_empty());
+  assert_eq!(observed.inputs, [b"abcdefg".as_slice()]);
+  drop(observed);
+  assert!(matches!(
+    second_started_rx.try_recv(),
+    Err(TryRecvError::Empty)
+  ));
 
+  // Once released, the first call commits exactly `ab`; the fresh observer then
+  // submits the second call, whose gate arrival is witnessed before cancel.
   gate.release();
+  let mut second_observer = Box::pin(writer.flush());
+  let waker = Waker::from(Arc::new(ThreadWake(thread::current())));
+  let mut context = Context::from_waker(&waker);
+  let deadline = Instant::now() + WAIT;
+  loop {
+    match second_observer.as_mut().poll(&mut context) {
+      Poll::Ready(_) => panic!("the gated second worker call must keep the flush pending"),
+      Poll::Pending => match second_started_rx.try_recv() {
+        Ok(()) => break,
+        Err(TryRecvError::Empty) => {
+          assert!(
+            Instant::now() < deadline,
+            "the second blocking worker call did not reach its gate in time"
+          );
+          thread::park_timeout(Duration::from_millis(2));
+        }
+        Err(TryRecvError::Disconnected) => {
+          panic!("the second worker call dropped its gate announcer without arriving")
+        }
+      },
+    }
+  }
+  drop(second_observer);
+
+  let held = runtime.snapshot();
+  assert_eq!(held.outstanding, 1);
+  assert_eq!(held.running, 1);
+  assert_eq!(held.reserved.disk, request.disk);
+  assert_eq!(resources.snapshot().managed_memory, 8);
+  let observed = state.lock().expect("writer state mutex is healthy");
+  assert_eq!(observed.bytes.as_slice(), b"ab");
+  assert_eq!(observed.accepted, [2]);
+  assert_eq!(
+    observed.inputs,
+    [b"abcdefg".as_slice(), b"cdefg".as_slice()]
+  );
+  drop(observed);
+
+  second_gate.release();
   block_on(writer.flush()).expect("a fresh observer should collect the completed worker result");
-  assert_eq!(runtime.snapshot().outstanding, 0);
+  let settled = runtime.snapshot();
+  assert_eq!(settled.outstanding, 0);
+  assert_eq!(settled.running, 0);
+  assert_eq!(settled.reserved.disk, 0);
   assert_eq!(resources.snapshot().managed_memory, 8);
   block_on(writer.shutdown()).expect("shutdown should flush before completing");
   let observed = state.lock().expect("writer state mutex is healthy");
   assert_eq!(observed.bytes.as_slice(), b"abcdefg");
+  assert_eq!(observed.accepted, [2, 2, 2, 1]);
+  assert_eq!(
+    observed.inputs,
+    [
+      b"abcdefg".as_slice(),
+      b"cdefg".as_slice(),
+      b"efg".as_slice(),
+      b"g".as_slice()
+    ],
+    "neither cancelled worker call may be re-executed"
+  );
   assert_eq!(
     observed.calls, 4,
     "partial worker calls must not replay any prefix"
   );
   assert!(observed.flushes >= 1);
   drop(observed);
+  let settled = runtime.snapshot();
+  assert_eq!(settled.outstanding, 0);
+  assert_eq!(settled.running, 0);
+  assert_eq!(settled.reserved.disk, 0);
+  assert_eq!(
+    resources.snapshot().managed_memory,
+    8,
+    "the writer remains the staging buffer's final owner"
+  );
   drop(writer);
   assert_eq!(resources.snapshot().managed_memory, 0);
   runtime
@@ -914,6 +1029,7 @@ fn pipe_registration_refusal_returns_original_fd_and_restores_flags() {
   );
   drop(reader);
   assert_eq!(reactor_handle.registrations(), 0);
+  assert_eq!(reactor_handle.waiters(), 0);
   reactor
     .shutdown()
     .expect("all endpoint registrations should be removed");
