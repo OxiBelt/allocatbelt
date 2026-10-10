@@ -12,7 +12,9 @@
 #   `.cargo/config.toml`, builds and runs the unpacked crate as its global
 #   allocator with the default features, with `default-features = false`,
 #   and with each optional feature, and each build reports exactly its
-#   features in `CompiledCapabilities`;
+#   features in `CompiledCapabilities`; runtime consumers also recover an
+#   initially shared pipe buffer and transfer a bounded payload in an owned
+#   async scope, then explicitly close the pipe, scope and runtime;
 # - on x86_64, that consumer fails with the gate's message without
 #   `-C target-cpu=x86-64-v3`, and builds with it.
 #
@@ -156,6 +158,7 @@ fn main() {
     }).unwrap();
     assert_eq!(rt.try_spawn(Resources::ZERO, |_| 42).unwrap().join().unwrap(), 42);
     rt.shutdown(ShutdownMode::Drain).unwrap();
+    check_async_runtime();
   }
   let v: Vec<Box<[u8]>> = (1..2000).map(|n| vec![7u8; n * 3].into()).collect();
   assert!(v.iter().all(|b| b.iter().all(|&x| x == 7)));
@@ -166,6 +169,58 @@ fn main() {
   GLOBAL.configure(allocatbelt::Policy::DEFAULT).unwrap();
   println!("{}", GLOBAL.report());
 }
+
+#[cfg(feature = "runtime")]
+fn check_async_runtime() {
+  use allocatbelt::runtime::asynchronous::{AsyncConfig, AsyncRuntime, AsyncShutdown};
+  use allocatbelt::runtime::io::{AsyncReadExt, AsyncWriteExt, pipes};
+  use allocatbelt::runtime::managed::{ResourceLimits, ResourceScope};
+
+  let resources = ResourceScope::new(ResourceLimits {
+    managed_memory: 8,
+    disk_concurrent_ops: 0,
+    network_concurrent_ops: 0,
+  });
+  let buffer = resources.try_alloc_zeroed(8).unwrap();
+  let pointer = buffer.as_slice().as_ptr();
+  let shared = buffer.clone();
+  let refused = pipes::pipe(buffer).unwrap_err();
+  assert_eq!(refused.kind, pipes::PipeInitErrorKind::Shared);
+  assert_eq!(refused.buffers.as_slice().as_ptr(), pointer);
+  assert_eq!(resources.snapshot().managed_memory, 8);
+  drop(shared);
+  let (mut reader, mut writer) = pipes::pipe(refused.buffers).unwrap();
+
+  let runtime = AsyncRuntime::new(AsyncConfig {
+    workers: 1,
+    max_outstanding: 2,
+    max_scopes: 2,
+  }).unwrap();
+  let scope = runtime.scope_with_resources(&resources).unwrap();
+  let send = scope.spawn(async move {
+    writer.write_all(b"package async").await.unwrap();
+    writer.flush().await.unwrap();
+    writer.shutdown().await.unwrap();
+  }).unwrap();
+  let receive = scope.spawn(async move {
+    let mut received = [0; 13];
+    let mut offset = 0;
+    while offset < received.len() {
+      let count = reader.read(&mut received[offset..]).await.unwrap();
+      assert!(count > 0);
+      offset += count;
+    }
+    assert_eq!(&received, b"package async");
+    assert_eq!(reader.read(&mut [0]).await.unwrap(), 0);
+    received
+  }).unwrap();
+  runtime.block_on(send).unwrap().unwrap();
+  assert_eq!(&runtime.block_on(receive).unwrap().unwrap(), b"package async");
+  runtime.block_on(scope.close()).unwrap();
+  assert_eq!(resources.snapshot().managed_memory, 0);
+  runtime.shutdown(AsyncShutdown::Drain).unwrap();
+  println!("consumer ok: async pipe recovery, transfer and cleanup");
+}
 EOF
 # The same dependency versions as this workspace.
 cp Cargo.lock "${consumer}/"
@@ -174,7 +229,7 @@ build() {
   # build <RUSTFLAGS> [cargo args...]
   local flags="$1"
   shift
-  (cd "${consumer}" && env -u CARGO_BUILD_RUSTFLAGS RUSTFLAGS="${flags}" \
+  (cd "${consumer}" && env -u CARGO_BUILD_RUSTFLAGS RUSTFLAGS="${flags}" RUSTDOCFLAGS="${flags}" \
     cargo build --quiet --target-dir "${work}/target" "$@")
 }
 
@@ -194,7 +249,9 @@ run() {
   local expect="$1"
   shift
   local out
-  out="$(cd "${consumer}" && RUSTFLAGS="${v3[*]:-}" cargo run --quiet --target-dir "${work}/target" "$@")"
+  out="$(cd "${consumer}" && env -u CARGO_BUILD_RUSTFLAGS RUSTFLAGS="${v3[*]:-}" \
+    RUSTDOCFLAGS="${v3[*]:-}" timeout --signal=TERM --kill-after=5s 180s \
+    cargo run --quiet --target-dir "${work}/target" "$@")"
   echo "${out}"
   grep -qF "${expect}" <<<"${out}" || fail "expected ${expect}"
   echo "ok: consumer builds and runs (${*:-default features})"
