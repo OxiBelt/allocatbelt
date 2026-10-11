@@ -73,6 +73,24 @@ across 100 summary reports, including nested child-test runs; these are not dist
 test counts. Later documentation changes are outside that full source bridge.
 Feature, package, platform and performance qualification remain separate.
 
+At revision `12fbb9adedecd76ad181bcc503ac5b37b662cab5`, the completed
+[CI check campaign](https://github.com/OxiBelt/allocatbelt/actions/runs/38057356209)
+passed the native x86_64 and ARM64 standard checks, all supported feature
+combinations and packaged consumers. Its allocator/runtime Loom, region Miri,
+platform, scalar ISA, SVE/SVE2, RVV, rseq, user-mode RISC-V, mutation and
+dependency checks also passed. These are source-specific correctness results;
+hosted timings do not establish performance. The conditional fuzz job was
+skipped and is not qualified by this campaign.
+
+The same campaign failed both hardened sandbox jobs because the SIGCHLD
+fixture required a shell absent from the empty image. The separate
+[full-system RISC-V campaign](https://github.com/OxiBelt/allocatbelt/actions/runs/38057356207)
+failed its baseline runtime suite: 33 cases encountered missing Bash,
+uninitialized loopback or unavailable socket device-binding support. The
+guest rejected that run correctly. Fixture and guest-prerequisite repairs
+require fresh remote verification; the successful jobs above do not qualify
+those changed inputs or close sandbox and full-system guest acceptance.
+
 Release requires source-specific ownership and lifecycle review, appropriate
 concurrent models, standard checks, the complete isolated core Miri campaign,
 supported-platform checks, feature combinations, a packaged consumer, and the
