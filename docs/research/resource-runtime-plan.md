@@ -63,11 +63,12 @@ rejections and late arrivals separately; failed admission is not completed
 work. Allocation-churn latency includes payload access and freeing, and is
 distinct from raw allocation/free latency and application response latency.
 
-Run the current native campaign on two KVM guests, using each guest's native
-instruction execution. Analyze the guests separately, do not pool their
-measurements, and draw explicit conclusions for each guest. Defer bare-metal
-validation until a suitable bare-metal venue is available. Docker and QEMU
-instruction emulation establish correctness, not performance.
+Run the native campaign on two KVM guests and an available bare-metal venue,
+using native instruction execution on each machine. Prefer bare metal for new
+benchmark work while preserving the guest campaigns. Analyze each machine
+separately, do not pool measurements, and draw explicit conclusions for each
+venue. Docker and QEMU instruction emulation establish correctness, not
+performance.
 Keep raw measurements, profiles, security findings and Miri logs in the private
 resources checkout. Public reports contain sanitized conclusions and
 reproducible configuration.
