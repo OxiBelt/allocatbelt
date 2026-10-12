@@ -522,6 +522,13 @@ impl ServiceOptions {
           DriverBuildError::InvalidConfiguration("reactor metadata exceeds its facade"),
         )?;
       }
+      if self.process_children.is_some() {
+        bytes = bytes
+          .checked_sub(std::mem::size_of::<ProcessDriver>())
+          .ok_or(DriverBuildError::InvalidConfiguration(
+            "process metadata exceeds its facade",
+          ))?;
+      }
       let timers = usize::from(self.timer_registrations.is_some())
         + usize::from(self.rate_timer_capacity(max_outstanding)?.is_some());
       bytes = bytes
@@ -714,7 +721,13 @@ impl ServiceOptions {
       );
     }
     if let Some(max_children) = self.process_children {
-      startup.process = Some(ProcessDriver::new(max_children).map_err(DriverBuildError::Process)?);
+      startup.process = Some(
+        match resources.tenant_domain() {
+          Some(tenant) => ProcessDriver::new_in_tenant(max_children, tenant),
+          None => ProcessDriver::new(max_children),
+        }
+        .map_err(DriverBuildError::Process)?,
+      );
     }
     let filesystem = if self.filesystem {
       let blocking = startup
@@ -3712,6 +3725,72 @@ mod tests {
       );
       std::thread::yield_now();
     }
+  }
+
+  #[test]
+  fn both_bound_facades_reap_selected_processes_and_release_provider_metadata() {
+    let ceilings = DomainResources::ZERO
+      .with(DomainResource::Cpu, 4)
+      .with(DomainResource::Memory, 1024)
+      .with(DomainResource::Tasks, 64)
+      .with(DomainResource::Control, 1 << 20);
+    let domain =
+      crate::runtime::resource_domain::ResourceDomain::with_waiters(ceilings, 1, 64).unwrap();
+    let tenant = domain.tenant(ceilings).unwrap();
+    let baseline = domain.snapshot().used.get(DomainResource::Control);
+    let child_command = || {
+      let mut command = std::process::Command::new("/bin/sh");
+      command.args(["-c", "exit 0"]);
+      command
+    };
+
+    let mut multi = MultiThreadBuilder::new(async_config())
+      .resource_domain(tenant.clone())
+      .resources(limits(0))
+      .processes(1)
+      .build()
+      .unwrap();
+    assert_eq!(
+      multi._control.bytes(),
+      std::mem::size_of::<MultiThreadDriver>()
+        - std::mem::size_of::<AsyncRuntime>()
+        - std::mem::size_of::<ProcessDriver>()
+    );
+    let mut child = multi.processes().unwrap().spawn(child_command()).unwrap();
+    let exit = multi.block_on(child.wait()).unwrap().unwrap();
+    assert!(exit.success());
+    shutdown_multi_driver(&mut multi);
+    drop(multi);
+    assert!(domain.snapshot().used.get(DomainResource::Control) > baseline);
+    drop(child);
+    assert_eq!(
+      domain.snapshot().used.get(DomainResource::Control),
+      baseline
+    );
+
+    let mut current = CurrentThreadBuilder::new(local_config())
+      .resource_domain(tenant)
+      .resources(limits(0))
+      .processes(1)
+      .build()
+      .unwrap();
+    assert_eq!(
+      current._control.bytes(),
+      std::mem::size_of::<CurrentThreadDriver>()
+        - std::mem::size_of::<LocalRuntime>()
+        - std::mem::size_of::<ProcessDriver>()
+    );
+    let mut child = current.processes().unwrap().spawn(child_command()).unwrap();
+    let exit = current.block_on(child.wait()).unwrap().unwrap();
+    assert!(exit.success());
+    shutdown_current_driver(&mut current);
+    drop(current);
+    assert!(domain.snapshot().used.get(DomainResource::Control) > baseline);
+    drop(child);
+    assert_eq!(
+      domain.snapshot().used.get(DomainResource::Control),
+      baseline
+    );
   }
 
   #[cfg(feature = "resource-feedback")]

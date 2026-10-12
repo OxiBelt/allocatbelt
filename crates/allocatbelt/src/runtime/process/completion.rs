@@ -10,6 +10,8 @@ use std::panic::{self, AssertUnwindSafe};
 use std::process::ExitStatus;
 use std::task::Waker;
 
+use crate::runtime::resource_domain::{ControlCharge, DomainError, TenantDomain};
+
 #[cfg(loom)]
 use loom::sync::atomic::AtomicBool;
 #[cfg(loom)]
@@ -51,6 +53,7 @@ impl std::error::Error for WaitError {}
 pub(super) struct Completion {
   ledger: Mutex<CompletionLedger>,
   pub(super) kill_requested: AtomicBool,
+  _control: ControlCharge,
 }
 
 struct CompletionLedger {
@@ -68,6 +71,17 @@ pub(super) enum Registration {
 
 impl Completion {
   pub(super) fn new() -> Self {
+    Self::with_control(ControlCharge::unbounded(std::mem::size_of::<Self>()))
+  }
+
+  /// Reserves the fixed completion payload before a process command can be
+  /// passed to the operating system.
+  pub(super) fn new_in_tenant(tenant: &TenantDomain) -> Result<Self, DomainError> {
+    let control = ControlCharge::try_new(Some(tenant), std::mem::size_of::<Self>())?;
+    Ok(Self::with_control(control))
+  }
+
+  fn with_control(control: ControlCharge) -> Self {
     Self {
       ledger: Mutex::new(CompletionLedger {
         outcome: None,
@@ -75,6 +89,7 @@ impl Completion {
         waiter: None,
       }),
       kill_requested: AtomicBool::new(false),
+      _control: control,
     }
   }
 

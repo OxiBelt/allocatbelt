@@ -274,6 +274,7 @@ impl std::error::Error for MonitorSpawnError {
 impl DeferredJoin {
   /// Retains the exact handle until a monitor starts successfully or a
   /// caller explicitly chooses the blocking join path.
+  #[cfg(test)]
   pub(crate) fn new(original: JoinHandle<()>) -> Self {
     let prepared = match PreparedJoin::new(None) {
       Ok(prepared) => prepared,

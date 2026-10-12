@@ -27,6 +27,17 @@
 //! releases the slot and publishes a tracking error. It cannot establish that
 //! a post-spawn pidfd refers to the original child after a foreign reaper has
 //! allowed the process identifier to be reused.
+//!
+//! [`ProcessDriver::new_in_tenant`] charges its declared owner, shared state,
+//! fixed slot and reaper scratch capacities, reaper capture, nested reactor,
+//! and thread-completion owner to the supplied tenant before starting service
+//! threads. Each child completion is charged before its command reaches
+//! `Command::spawn`, and its charge follows the stable completion record until
+//! the last handle drops. Arc allocator headers, standard-library and OS
+//! process/thread metadata, OS stacks, kernel resources, `Command` storage,
+//! arbitrary user-reachable heap allocations, and physical RSS are outside
+//! this logical Control accounting boundary. The process-owner fee excludes
+//! its inline `Reactor` payload because that reactor retains its own fee.
 
 #![forbid(unsafe_code)]
 #![cfg_attr(not(test), deny(clippy::expect_used, clippy::unwrap_used))]
@@ -48,8 +59,9 @@ use rustix::fd::OwnedFd;
 use rustix::process::{Pid, PidfdFlags, Signal, pidfd_open, pidfd_send_signal};
 
 use super::reactor::{AsyncFd, OwnedReadiness, Reactor, ReactorConfig, ReactorError};
+use super::resource_domain::{ControlCharge, DomainError, TenantDomain, payload_bytes};
 use super::task::drop_contained;
-use super::thread_completion::DeferredJoin;
+use super::thread_completion::{DeferredJoin, PreparedJoins};
 mod completion;
 pub mod output;
 pub mod pipe;
@@ -59,6 +71,7 @@ use completion::{Completion, Registration, wake_contained};
 const MAX_CHILDREN: usize = 1 << 24;
 const REAPER_INTERVAL: Duration = Duration::from_millis(25);
 const INTERRUPT_RETRIES: usize = 64;
+const REAPER_THREAD_NAME: &str = "allocatbelt-process-reaper";
 
 /// Creates a process driver with fixed capacity for `max_children` active
 /// children.
@@ -75,6 +88,9 @@ pub struct ProcessDriver {
   shutdown_requested: bool,
   shutdown_complete: bool,
   shutdown_error: Option<ProcessShutdownError>,
+  _control: ControlCharge,
+  #[cfg(test)]
+  service_storage_capacities: ServiceStorageCapacities,
 }
 
 /// Policy used when a process driver is explicitly shut down.
@@ -95,6 +111,8 @@ pub enum ProcessBuildError {
   CapacityTooLarge,
   /// A fixed process table could not be allocated.
   AllocationFailed,
+  /// The tenant refused a declared Control reservation.
+  ResourceDomain(DomainError),
   /// Reactor setup failed before the reaper started.
   Reactor(io::Error),
   /// The dedicated reaper thread could not be started.
@@ -107,6 +125,7 @@ impl fmt::Display for ProcessBuildError {
       Self::ZeroCapacity => "process child capacity must be nonzero",
       Self::CapacityTooLarge => "process child capacity exceeds the fixed table limit",
       Self::AllocationFailed => "process child table allocation failed",
+      Self::ResourceDomain(_) => "resource domain refused process metadata",
       Self::Reactor(_) => "process pidfd reactor setup failed",
       Self::Thread(_) => "process reaper thread startup failed",
     })
@@ -116,6 +135,7 @@ impl fmt::Display for ProcessBuildError {
 impl std::error::Error for ProcessBuildError {
   fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
     match self {
+      Self::ResourceDomain(error) => Some(error),
       Self::Reactor(error) | Self::Thread(error) => Some(error),
       _ => None,
     }
@@ -131,6 +151,8 @@ pub enum SpawnErrorKind {
   Closed,
   /// Every slot generation has been retired rather than wrapped.
   Exhausted,
+  /// The tenant refused the child's fixed completion record.
+  ResourceDomain(DomainError),
   /// The operating system rejected the spawn attempt.
   Spawn(io::Error),
 }
@@ -186,6 +208,7 @@ impl fmt::Display for SpawnError {
       SpawnErrorKind::Full => "process child table is full",
       SpawnErrorKind::Closed => "process driver is closed",
       SpawnErrorKind::Exhausted => "process child generations are exhausted",
+      SpawnErrorKind::ResourceDomain(_) => "resource domain refused child completion metadata",
       SpawnErrorKind::Spawn(_) => "operating system rejected child process",
     })
   }
@@ -195,6 +218,7 @@ impl std::error::Error for SpawnError {
   fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
     match &self.kind {
       SpawnErrorKind::Spawn(error) => Some(error),
+      SpawnErrorKind::ResourceDomain(error) => Some(error),
       _ => None,
     }
   }
@@ -233,6 +257,8 @@ struct Shared {
   signal: Arc<WakeSignal>,
   reactor: super::reactor::ReactorHandle,
   force_pidfd_fallback: bool,
+  tenant: Option<TenantDomain>,
+  _control: ControlCharge,
 }
 
 struct State {
@@ -294,15 +320,69 @@ impl ProcessDriver {
   /// Creates a fixed-capacity process driver and starts its independent
   /// reaper and pidfd reactor services.
   pub fn new(max_children: usize) -> Result<Self, ProcessBuildError> {
-    Self::new_inner(max_children, false)
+    Self::new_inner(max_children, false, None)
+  }
+
+  /// Creates a fixed-capacity process driver whose declared metadata is
+  /// reserved from `tenant` before service threads start.
+  ///
+  /// The reservation covers this owner, the shared process table and wake
+  /// signal, actual slot and reaper scratch capacities, the reaper capture,
+  /// the nested pidfd reactor, and the reaper's prepared completion owner.
+  /// Each child completion is charged before its command is passed to the
+  /// operating system. Standard-library and OS process/thread metadata,
+  /// stacks, Arc allocator headers, command storage, arbitrary reachable heap
+  /// allocations, kernel resources and physical RSS remain outside this
+  /// logical Control accounting boundary.
+  pub fn new_in_tenant(
+    max_children: usize,
+    tenant: &TenantDomain,
+  ) -> Result<Self, ProcessBuildError> {
+    Self::new_inner(max_children, false, Some(tenant))
   }
 
   #[cfg(test)]
   fn new_without_pidfd(max_children: usize) -> Result<Self, ProcessBuildError> {
-    Self::new_inner(max_children, true)
+    Self::new_inner(max_children, true, None)
   }
 
-  fn new_inner(max_children: usize, force_pidfd_fallback: bool) -> Result<Self, ProcessBuildError> {
+  fn inline_owner_control_payload_bytes(tenant_bound: bool) -> Result<usize, DomainError> {
+    let bytes = std::mem::size_of::<Self>();
+    if tenant_bound {
+      bytes
+        .checked_sub(std::mem::size_of::<Reactor>())
+        .ok_or(DomainError::Invalid)
+    } else {
+      Ok(bytes)
+    }
+  }
+
+  fn owner_control_payload_bytes(
+    name_capacity: usize,
+    tenant_bound: bool,
+  ) -> Result<usize, DomainError> {
+    let mut bytes = Self::inline_owner_control_payload_bytes(tenant_bound)?;
+    for payload in [
+      std::mem::size_of::<thread::Builder>(),
+      payload_bytes::<u8>(name_capacity)?,
+    ] {
+      bytes = bytes.checked_add(payload).ok_or(DomainError::Invalid)?;
+    }
+    Ok(bytes)
+  }
+
+  fn shared_control_payload_bytes(slot_capacity: usize) -> Result<usize, DomainError> {
+    std::mem::size_of::<Shared>()
+      .checked_add(std::mem::size_of::<WakeSignal>())
+      .and_then(|bytes| bytes.checked_add(payload_bytes::<Slot>(slot_capacity).ok()?))
+      .ok_or(DomainError::Invalid)
+  }
+
+  fn new_inner(
+    max_children: usize,
+    force_pidfd_fallback: bool,
+    tenant: Option<&TenantDomain>,
+  ) -> Result<Self, ProcessBuildError> {
     if max_children == 0 {
       return Err(ProcessBuildError::ZeroCapacity);
     }
@@ -310,26 +390,71 @@ impl ProcessDriver {
       return Err(ProcessBuildError::CapacityTooLarge);
     }
 
+    // Reserve every process-owned component before allocating its backing or
+    // invoking the nested reactor or either thread's startup path.
+    let owner_final_bytes = Self::inline_owner_control_payload_bytes(tenant.is_some())
+      .map_err(ProcessBuildError::ResourceDomain)?;
+    let mut owner_control = ControlCharge::try_new(
+      tenant,
+      Self::owner_control_payload_bytes(REAPER_THREAD_NAME.len(), tenant.is_some())
+        .map_err(ProcessBuildError::ResourceDomain)?,
+    )
+    .map_err(ProcessBuildError::ResourceDomain)?;
+    let mut shared_control = ControlCharge::try_new(
+      tenant,
+      Self::shared_control_payload_bytes(max_children)
+        .map_err(ProcessBuildError::ResourceDomain)?,
+    )
+    .map_err(ProcessBuildError::ResourceDomain)?;
+    let service_requested = ServiceStorage::control_payload_bytes(max_children, max_children)
+      .map_err(ProcessBuildError::ResourceDomain)?;
+    let service_control = ControlCharge::try_new(tenant, service_requested)
+      .map_err(ProcessBuildError::ResourceDomain)?;
+    let mut prepared = PreparedJoins::new(tenant, 1).map_err(ProcessBuildError::ResourceDomain)?;
+    let reaper_prepared = prepared.pop().ok_or(ProcessBuildError::AllocationFailed)?;
+    drop(prepared);
+
     let mut slots = Vec::new();
     slots
       .try_reserve_exact(max_children)
       .map_err(|_| ProcessBuildError::AllocationFailed)?;
     slots.resize_with(max_children, Slot::empty);
+    shared_control
+      .try_resize(
+        Self::shared_control_payload_bytes(slots.capacity())
+          .map_err(ProcessBuildError::ResourceDomain)?,
+      )
+      .map_err(ProcessBuildError::ResourceDomain)?;
 
     let signal = Arc::new(WakeSignal::new());
-    let mut reaped = Vec::new();
-    reaped
-      .try_reserve_exact(max_children)
+    let service_storage = ServiceStorage::allocate(max_children, service_control)?;
+    #[cfg(test)]
+    let service_storage_capacities = service_storage.capacities();
+
+    let mut reaper_name = String::new();
+    reaper_name
+      .try_reserve_exact(REAPER_THREAD_NAME.len())
       .map_err(|_| ProcessBuildError::AllocationFailed)?;
-    let mut wakes = Vec::new();
-    wakes
-      .try_reserve_exact(max_children)
-      .map_err(|_| ProcessBuildError::AllocationFailed)?;
-    let reactor = Reactor::new(ReactorConfig {
+    reaper_name.push_str(REAPER_THREAD_NAME);
+    owner_control
+      .try_resize(
+        Self::owner_control_payload_bytes(reaper_name.capacity(), tenant.is_some())
+          .map_err(ProcessBuildError::ResourceDomain)?,
+      )
+      .map_err(ProcessBuildError::ResourceDomain)?;
+
+    let reactor_config = ReactorConfig {
       max_registrations: max_children,
       max_waiters: max_children,
-    })
-    .map_err(ProcessBuildError::Reactor)?;
+    };
+    let reactor = match tenant {
+      Some(tenant) => Reactor::new_in_tenant(reactor_config, tenant),
+      None => Reactor::new(reactor_config),
+    }
+    .map_err(|error| match ReactorError::of(&error) {
+      Some(ReactorError::Domain(domain_error)) => ProcessBuildError::ResourceDomain(domain_error),
+      _ => ProcessBuildError::Reactor(error),
+    })?;
     let shared = Arc::new(Shared {
       state: Mutex::new(State {
         slots,
@@ -344,27 +469,37 @@ impl ProcessDriver {
       signal: Arc::clone(&signal),
       reactor: reactor.handle(),
       force_pidfd_fallback,
+      tenant: tenant.cloned(),
+      _control: shared_control,
     });
     let service = Arc::clone(&shared);
-    let reaper = match thread::Builder::new()
-      .name("allocatbelt-process-reaper".to_owned())
-      .spawn(move || run_service(service, reaped, wakes))
-    {
+    let thread_owner = reaper_prepared.thread_owner();
+    let reaper = match thread::Builder::new().name(reaper_name).spawn(move || {
+      thread_owner.retain_until_thread_exit();
+      run_service(service, service_storage);
+    }) {
       Ok(reaper) => reaper,
       Err(error) => {
         let _ = reactor.shutdown();
         return Err(ProcessBuildError::Thread(error));
       }
     };
+    // The builder and name backing have been consumed by thread startup. The
+    // owner fee now covers the process-owned inline payload; the nested
+    // Reactor's inline payload is covered by its own Control fee.
+    let _ = owner_control.try_resize(owner_final_bytes);
 
     Ok(Self {
       shared,
-      reaper: Some(DeferredJoin::new(reaper)),
+      reaper: Some(reaper_prepared.attach(reaper)),
       reactor: Some(reactor),
       reaper_panic: Mutex::new(None),
       shutdown_requested: false,
       shutdown_complete: false,
       shutdown_error: None,
+      _control: owner_control,
+      #[cfg(test)]
+      service_storage_capacities,
     })
   }
 
@@ -388,11 +523,31 @@ impl ProcessDriver {
   /// remains live through pidfd setup and the `Child` is installed before the
   /// worker can examine it, so setup failure cannot abandon a started process.
   pub fn spawn(&self, mut command: Command) -> Result<ProcessChild, SpawnError> {
-    let completion = Arc::new(Completion::new());
-    let key = match reserve(&self.shared, &completion) {
+    let key = match reserve(&self.shared) {
       Ok(key) => key,
       Err(kind) => return Err(SpawnError { kind, command }),
     };
+    let completion_result = match self.shared.tenant.as_ref() {
+      Some(tenant) => Completion::new_in_tenant(tenant),
+      None => Ok(Completion::new()),
+    };
+    let completion = match completion_result {
+      Ok(completion) => Arc::new(completion),
+      Err(error) => {
+        release_reservation(&self.shared, key);
+        return Err(SpawnError {
+          kind: SpawnErrorKind::ResourceDomain(error),
+          command,
+        });
+      }
+    };
+    if !attach_completion(&self.shared, key, Arc::clone(&completion)) {
+      release_reservation(&self.shared, key);
+      return Err(SpawnError {
+        kind: SpawnErrorKind::Closed,
+        command,
+      });
+    }
 
     let spawned = panic::catch_unwind(AssertUnwindSafe(|| command.spawn()));
     let mut child = match spawned {
@@ -437,7 +592,7 @@ impl ProcessDriver {
         }
       }
     };
-    install_child(&self.shared, key, completion.clone(), child, registered);
+    install_child(&self.shared, key, child, registered);
 
     self.shared.signal.notify();
     Ok(ProcessChild {
@@ -789,7 +944,7 @@ impl fmt::Debug for ChildWait<'_> {
   }
 }
 
-fn reserve(shared: &Shared, completion: &Arc<Completion>) -> Result<SlotKey, SpawnErrorKind> {
+fn reserve(shared: &Shared) -> Result<SlotKey, SpawnErrorKind> {
   let mut state = lock(&shared.state);
   if !state.admissions_open {
     return Err(SpawnErrorKind::Closed);
@@ -804,7 +959,6 @@ fn reserve(shared: &Shared, completion: &Arc<Completion>) -> Result<SlotKey, Spa
     };
     slot.generation = generation;
     slot.state = SlotState::Reserved;
-    slot.completion = Some(Arc::clone(completion));
     state.reserved += 1;
     return Ok(SlotKey { index, generation });
   }
@@ -817,6 +971,19 @@ fn reserve(shared: &Shared, completion: &Arc<Completion>) -> Result<SlotKey, Spa
   } else {
     Err(SpawnErrorKind::Full)
   }
+}
+
+fn attach_completion(shared: &Shared, key: SlotKey, completion: Arc<Completion>) -> bool {
+  let mut state = lock(&shared.state);
+  let Some(slot) = state.slots.get_mut(key.index) else {
+    return false;
+  };
+  if slot.generation != key.generation || slot.state != SlotState::Reserved {
+    return false;
+  }
+  debug_assert!(slot.completion.is_none());
+  slot.completion = Some(completion);
+  true
 }
 
 fn release_reservation(shared: &Shared, key: SlotKey) {
@@ -840,13 +1007,7 @@ fn release_reservation(shared: &Shared, key: SlotKey) {
   shared.signal.notify();
 }
 
-fn install_child(
-  shared: &Shared,
-  key: SlotKey,
-  completion: Arc<Completion>,
-  child: StdChild,
-  pidfd: Option<AsyncFd<OwnedFd>>,
-) {
+fn install_child(shared: &Shared, key: SlotKey, child: StdChild, pidfd: Option<AsyncFd<OwnedFd>>) {
   let installed = {
     let mut state = lock(&shared.state);
     let Some(slot) = state.slots.get_mut(key.index) else {
@@ -856,7 +1017,7 @@ fn install_child(
       return;
     }
     slot.child = Some(child);
-    slot.completion = Some(completion);
+    debug_assert!(slot.completion.is_some());
     if let Some(pidfd) = pidfd {
       slot.readiness = Some(pidfd.readable_owned());
       slot.pidfd = Some(pidfd);
@@ -895,19 +1056,87 @@ struct Reaped {
   waker: Option<Waker>,
 }
 
-fn run_service(shared: Arc<Shared>, mut reaped: Vec<Reaped>, mut wakes: Vec<Waker>) {
+/// Fixed service-thread scratch. The charge follows the vectors and the
+/// capture owner through actual reaper-thread exit.
+struct ServiceStorage {
+  reaped: Vec<Reaped>,
+  wakes: Vec<Waker>,
+  _control: ControlCharge,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy)]
+struct ServiceStorageCapacities {
+  reaped: usize,
+  wakes: usize,
+}
+
+impl ServiceStorage {
+  #[cfg(test)]
+  fn capacities(&self) -> ServiceStorageCapacities {
+    ServiceStorageCapacities {
+      reaped: self.reaped.capacity(),
+      wakes: self.wakes.capacity(),
+    }
+  }
+
+  fn control_payload_bytes(
+    reaped_capacity: usize,
+    wakes_capacity: usize,
+  ) -> Result<usize, DomainError> {
+    let mut bytes = std::mem::size_of::<Self>()
+      .checked_add(std::mem::size_of::<Arc<Shared>>())
+      .ok_or(DomainError::Invalid)?;
+    for payload in [
+      payload_bytes::<Reaped>(reaped_capacity)?,
+      payload_bytes::<Waker>(wakes_capacity)?,
+    ] {
+      bytes = bytes.checked_add(payload).ok_or(DomainError::Invalid)?;
+    }
+    Ok(bytes)
+  }
+
+  fn allocate(capacity: usize, mut control: ControlCharge) -> Result<Self, ProcessBuildError> {
+    let mut reaped = Vec::new();
+    reaped
+      .try_reserve_exact(capacity)
+      .map_err(|_| ProcessBuildError::AllocationFailed)?;
+    let mut wakes = Vec::new();
+    wakes
+      .try_reserve_exact(capacity)
+      .map_err(|_| ProcessBuildError::AllocationFailed)?;
+    control
+      .try_resize(
+        Self::control_payload_bytes(reaped.capacity(), wakes.capacity())
+          .map_err(ProcessBuildError::ResourceDomain)?,
+      )
+      .map_err(ProcessBuildError::ResourceDomain)?;
+    Ok(Self {
+      reaped,
+      wakes,
+      _control: control,
+    })
+  }
+}
+
+fn run_service(shared: Arc<Shared>, mut storage: ServiceStorage) {
   shared.signal.install_current_thread();
   let mut use_reactor = true;
   loop {
     let result = panic::catch_unwind(AssertUnwindSafe(|| {
-      service_loop(&shared, &mut reaped, &mut wakes, use_reactor)
+      service_loop(
+        &shared,
+        &mut storage.reaped,
+        &mut storage.wakes,
+        use_reactor,
+      )
     }));
     match result {
       Ok(()) => break,
       Err(payload) => {
         drop_contained(payload);
         lock(&shared.state).worker_panicked = true;
-        finish_reaped(&mut reaped, &mut wakes);
+        finish_reaped(&mut storage.reaped, &mut storage.wakes);
         use_reactor = false;
         shared.signal.park_timeout(REAPER_INTERVAL);
       }
@@ -1135,6 +1364,10 @@ mod tests {
     ProcessBuildError, ProcessDriver, ProcessShutdownMode, SpawnErrorKind, WaitError, WakeSignal,
   };
   use crate::runtime::asynchronous::{AsyncConfig, AsyncRuntime, AsyncShutdown};
+  use crate::runtime::reactor::{Reactor, ReactorConfig};
+  use crate::runtime::resource_domain::{
+    DomainError, DomainResource, DomainResources, ResourceDomain,
+  };
   use std::future::Future;
   use std::future::poll_fn;
   use std::io::{Read, Write};
@@ -1217,6 +1450,54 @@ mod tests {
     }
   }
 
+  fn tenant_with_control(
+    domain_control: usize,
+    tenant_control: usize,
+  ) -> (
+    ResourceDomain,
+    crate::runtime::resource_domain::TenantDomain,
+  ) {
+    let domain_ceiling = DomainResources::ZERO.with(DomainResource::Control, domain_control);
+    let tenant_ceiling = DomainResources::ZERO.with(DomainResource::Control, tenant_control);
+    let domain = ResourceDomain::new(domain_ceiling, 1).unwrap();
+    let tenant = domain.tenant(tenant_ceiling).unwrap();
+    (domain, tenant)
+  }
+
+  fn reactor_control_fee(
+    tenant: &crate::runtime::resource_domain::TenantDomain,
+    capacity: usize,
+  ) -> usize {
+    let before = tenant.snapshot().unwrap().used.get(DomainResource::Control);
+    let reactor = Reactor::new_in_tenant(
+      ReactorConfig {
+        max_registrations: capacity,
+        max_waiters: capacity,
+      },
+      tenant,
+    )
+    .unwrap();
+    let after_start = tenant.snapshot().unwrap().used.get(DomainResource::Control);
+    reactor.shutdown().unwrap();
+    wait_until(|| tenant.snapshot().unwrap().used.get(DomainResource::Control) == before);
+    after_start - before
+  }
+
+  fn allocatbelt_threads() -> Vec<(String, String)> {
+    let mut threads = std::fs::read_dir("/proc/self/task")
+      .unwrap()
+      .map(|entry| {
+        let entry = entry.unwrap();
+        let id = entry.file_name().to_string_lossy().into_owned();
+        let name = std::fs::read_to_string(entry.path().join("comm")).unwrap();
+        (id, name.trim().to_owned())
+      })
+      .filter(|(_, name)| name.starts_with("allocatbelt"))
+      .collect::<Vec<_>>();
+    threads.sort_unstable();
+    threads
+  }
+
   #[test]
   fn validates_capacity_bounds() {
     assert!(matches!(
@@ -1227,6 +1508,129 @@ mod tests {
       ProcessDriver::new((1 << 24) + 1),
       Err(ProcessBuildError::CapacityTooLarge)
     ));
+  }
+
+  #[test]
+  fn tenant_control_refusal_happens_before_process_service_threads_start() {
+    let (_domain, tenant) = tenant_with_control(1 << 20, 0);
+    let before_threads = allocatbelt_threads();
+    let before_control = tenant.snapshot().unwrap().used.get(DomainResource::Control);
+
+    let error = match ProcessDriver::new_in_tenant(1, &tenant) {
+      Ok(_) => panic!("zero-Control tenant admitted a process driver"),
+      Err(error) => error,
+    };
+
+    assert!(matches!(
+      error,
+      ProcessBuildError::ResourceDomain(DomainError::AboveCeiling(DomainResource::Control))
+    ));
+    assert_eq!(
+      tenant.snapshot().unwrap().used.get(DomainResource::Control),
+      before_control
+    );
+    assert_eq!(allocatbelt_threads(), before_threads);
+  }
+
+  #[test]
+  fn tenant_process_fee_equals_independent_nonoverlapping_owner_payloads() {
+    let (_domain, tenant) = tenant_with_control(1 << 20, 1 << 20);
+    let nested_reactor_fee = reactor_control_fee(&tenant, 2);
+    let baseline = tenant.snapshot().unwrap().used.get(DomainResource::Control);
+    let mut driver = ProcessDriver::new_in_tenant(2, &tenant).unwrap();
+    let actual = tenant.snapshot().unwrap().used.get(DomainResource::Control) - baseline;
+
+    let process_owner_payload =
+      std::mem::size_of::<ProcessDriver>() - std::mem::size_of::<Reactor>();
+    let slot_capacity = super::lock(&driver.shared.state).slots.capacity();
+    let shared_payload = std::mem::size_of::<super::Shared>()
+      + std::mem::size_of::<super::WakeSignal>()
+      + slot_capacity * std::mem::size_of::<super::Slot>();
+    let service_storage = driver.service_storage_capacities;
+    let service_payload = std::mem::size_of::<super::ServiceStorage>()
+      + std::mem::size_of::<Arc<super::Shared>>()
+      + service_storage.reaped * std::mem::size_of::<super::Reaped>()
+      + service_storage.wakes * std::mem::size_of::<Waker>();
+    let reaper_completion_fee = driver.reaper.as_ref().unwrap().control_bytes();
+    let independently_summed = process_owner_payload
+      + shared_payload
+      + service_payload
+      + reaper_completion_fee
+      + nested_reactor_fee;
+
+    assert_eq!(driver._control.bytes(), process_owner_payload);
+    assert_eq!(driver.shared._control.bytes(), shared_payload);
+    assert_eq!(actual, independently_summed);
+    driver.shutdown(ProcessShutdownMode::Wait).unwrap();
+    drop(driver);
+    wait_until(|| tenant.snapshot().unwrap().used.get(DomainResource::Control) == baseline);
+  }
+
+  #[test]
+  fn child_completion_refusal_returns_unspawned_command_and_marker_is_recoverable() {
+    let (_domain, tenant) = tenant_with_control(1 << 20, 1 << 20);
+    let mut driver = ProcessDriver::new_in_tenant(1, &tenant).unwrap();
+    let snapshot = tenant.snapshot().unwrap();
+    let used = snapshot.used.get(DomainResource::Control);
+    let path = std::env::temp_dir().join(format!(
+      "allocatbelt-process-control-marker-{}-{}",
+      std::process::id(),
+      NEXT_PATH.fetch_add(1, Ordering::Relaxed)
+    ));
+    let _ = std::fs::remove_file(&path);
+    let marker = path.to_string_lossy().into_owned();
+    let mut command = Command::new("/bin/sh");
+    command.args(["-c", "printf reached > \"$1\"", "sh", &marker]);
+    tenant
+      .set_limits(snapshot.limit.with(DomainResource::Control, used))
+      .unwrap();
+
+    let error = match driver.spawn(command) {
+      Ok(_) => panic!("child completion charge refusal still spawned the command"),
+      Err(error) => error,
+    };
+    assert!(matches!(
+      error.kind(),
+      SpawnErrorKind::ResourceDomain(DomainError::Exhausted(DomainResource::Control))
+    ));
+    assert!(!path.exists(), "refused command had a side effect");
+    assert_eq!(error.command().get_program(), "/bin/sh");
+    let recovered = error.into_command();
+
+    tenant.set_limits(snapshot.limit).unwrap();
+    let mut child = driver.spawn(recovered).unwrap();
+    assert!(block_on(child.wait()).unwrap().success());
+    assert_eq!(std::fs::read(&path).unwrap(), b"reached");
+    let _ = std::fs::remove_file(path);
+    driver.shutdown(ProcessShutdownMode::Wait).unwrap();
+  }
+
+  #[test]
+  fn tenant_charges_bound_reused_slots_and_follow_retained_completion_handles() {
+    let (_domain, tenant) = tenant_with_control(1 << 20, 1 << 20);
+    let baseline = tenant.snapshot().unwrap().used.get(DomainResource::Control);
+    let mut driver = ProcessDriver::new_in_tenant(1, &tenant).unwrap();
+    let startup = tenant.snapshot().unwrap().used.get(DomainResource::Control);
+    assert!(startup > baseline);
+
+    for _ in 0..4 {
+      let mut child = driver.spawn(helper("exit-23")).unwrap();
+      assert_eq!(block_on(child.wait()).unwrap().code(), Some(23));
+      drop(child);
+      wait_until(|| tenant.snapshot().unwrap().used.get(DomainResource::Control) == startup);
+    }
+
+    let mut retained = driver.spawn(helper("exit-23")).unwrap();
+    let status = block_on(retained.wait()).unwrap();
+    assert_eq!(status.code(), Some(23));
+    assert!(tenant.snapshot().unwrap().used.get(DomainResource::Control) > startup);
+    driver.shutdown(ProcessShutdownMode::Wait).unwrap();
+    drop(driver);
+
+    assert_eq!(retained.try_wait(), Ok(Some(status)));
+    assert!(tenant.snapshot().unwrap().used.get(DomainResource::Control) > baseline);
+    drop(retained);
+    wait_until(|| tenant.snapshot().unwrap().used.get(DomainResource::Control) == baseline);
   }
 
   #[test]
