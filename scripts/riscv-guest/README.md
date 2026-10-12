@@ -22,6 +22,13 @@ The absolute checkout location is part of the key because Buildroot's host
 toolchain must not be relocated. Per-commit tests are rebuilt and overlaid on
 the cached base initramfs, not cached as guest assets.
 
+The guest keeps local networking offline: PID 1 brings up loopback for the
+TCP/UDP fixtures, while QEMU remains `-nic none` and physical and virtual NIC
+drivers remain disabled. The kernel enables `NETDEVICES` for the socket's
+`SO_BINDTODEVICE` path. The static Buildroot Bash package supplies the
+fixtures that require Bash syntax; PID 1 itself continues to run under
+BusyBox `/bin/sh`.
+
 The no-V boot checks platform, region, runtime and baseline ISA dispatch.
 The V-enabled boot checks allowed dispatch, fresh-exec disabled dispatch,
 and real Linux thread-local vector control. A system-wide default changes

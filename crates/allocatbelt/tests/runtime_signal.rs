@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 use allocatbelt::runtime::signal::{Signal, SignalDriver, SignalError, SignalKind};
 
 const PROBE_ENV: &str = "ALLOCATBELT_RUNTIME_SIGNAL_PROBE";
+const CHILD_EXIT_ENV: &str = "ALLOCATBELT_RUNTIME_SIGNAL_CHILD_EXIT";
 const LIMIT: Duration = Duration::from_secs(10);
 
 struct ThreadWake(thread::Thread);
@@ -173,6 +174,9 @@ fn signal_driver_capacity_is_fixed_and_invalid_kinds_have_no_side_effects() {
 
 #[test]
 fn child_signal_subscription_coexists_with_owned_reaping() {
+  if std::env::var(CHILD_EXIT_ENV).as_deref() == Ok("exit-7") {
+    std::process::exit(7);
+  }
   isolated(
     "child_signal_subscription_coexists_with_owned_reaping",
     || {
@@ -181,8 +185,14 @@ fn child_signal_subscription_coexists_with_owned_reaping() {
       let signals = SignalDriver::new(1).unwrap();
       let mut signal = signals.subscribe(SignalKind::child()).unwrap();
       let mut processes = ProcessDriver::new(1).unwrap();
-      let mut command = Command::new("/bin/sh");
-      command.args(["-c", "exit 7"]);
+      let mut command = Command::new(std::env::current_exe().unwrap());
+      command
+        .args([
+          "--exact",
+          "child_signal_subscription_coexists_with_owned_reaping",
+          "--nocapture",
+        ])
+        .env(CHILD_EXIT_ENV, "exit-7");
       let mut child = processes.spawn(command).unwrap();
       await_signal(&mut signal);
       let deadline = Instant::now() + LIMIT;

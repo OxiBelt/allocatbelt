@@ -22,6 +22,11 @@ case " $(cat /proc/cmdline) " in
   *" allocatbelt_scenario=v-on "*) scenario=v-on ;;
   *) scenario=invalid; fail ;;
 esac
+test -x /bin/bash || fail
+/bin/bash -c 'exit 0' || fail
+ip link set dev lo up || fail
+lo_flags=$(cat /sys/class/net/lo/flags) || fail
+test "$((lo_flags & 1))" -eq 1 || fail
 run() {
   label=$1
   shift

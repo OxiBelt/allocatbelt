@@ -1033,7 +1033,9 @@ mod tests {
         &format!("{test_name}::child_helper_entrypoint"),
         "--quiet",
       ])
-      .env("ALLOCATBELT_PROCESS_HELPER", mode);
+      .env("ALLOCATBELT_PROCESS_HELPER", mode)
+      .stdout(Stdio::null())
+      .stderr(Stdio::inherit());
     command
   }
 
@@ -1292,7 +1294,12 @@ mod tests {
         "--quiet",
       ])
       .env("ALLOCATBELT_PROCESS_HELPER", "sigchld-ignore-test");
-    let status = command.status().unwrap();
-    assert!(status.success());
+    let output = command.output().unwrap();
+    assert!(
+      output.status.success(),
+      "isolated SIGCHLD subprocess failed:\nstdout:\n{}\nstderr:\n{}",
+      String::from_utf8_lossy(&output.stdout),
+      String::from_utf8_lossy(&output.stderr),
+    );
   }
 }

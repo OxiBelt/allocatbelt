@@ -14,7 +14,8 @@ CONFIG_SERIAL_8250=y
 CONFIG_SERIAL_8250_CONSOLE=y
 CONFIG_SERIAL_OF_PLATFORM=y
 CONFIG_RANDOM_TRUST_CPU=y
-# The offline initramfs needs no dynamically loaded or peripheral drivers.
+# NET already provides loopback; NETDEVICES gates SO_BINDTODEVICE. Enabling
+# it does not add a NIC; keep physical and virtual device families disabled.
 # Disable their parent families explicitly instead of promoting modules.
 # CONFIG_MODULES is not set
 # CONFIG_DRM is not set
@@ -33,4 +34,27 @@ CONFIG_RANDOM_TRUST_CPU=y
 # CONFIG_WIREGUARD is not set
 # CONFIG_CAN is not set
 # CONFIG_NFC is not set
-# CONFIG_NETDEVICES is not set
+CONFIG_NETDEVICES=y
+# CONFIG_NET_CORE is not set
+# CONFIG_ETHERNET is not set
+# PCS_XPCS selects PHYLINK, which selects PHYLIB; keep reverse selectors off.
+# CONFIG_PCS_XPCS is not set
+# CONFIG_PHYLINK is not set
+# CONFIG_PHYLIB is not set
+# CONFIG_PPP is not set
+# CONFIG_SLIP is not set
+# CONFIG_WAN is not set
+# CONFIG_VIRTIO_NET is not set
+# CONFIG_E1000 is not set
+# CONFIG_E1000E is not set
+# CONFIG_PCNET32 is not set
+# CONFIG_8139CP is not set
+# CONFIG_8139TOO is not set
+# CONFIG_DUMMY is not set
+# CONFIG_TUN is not set
+# CONFIG_VETH is not set
+# CONFIG_BRIDGE is not set
+# CONFIG_BONDING is not set
+# CONFIG_MACVLAN is not set
+# CONFIG_IPVLAN is not set
+# CONFIG_VXLAN is not set

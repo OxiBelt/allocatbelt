@@ -54,6 +54,7 @@ def check_config():
     "BR2_RISCV_64": "y", "BR2_RISCV_ISA_RVC": "y",
     "BR2_RISCV_ABI_LP64D": "y", "BR2_TOOLCHAIN_BUILDROOT_MUSL": "y",
     "BR2_STATIC_LIBS": "y", "BR2_LINUX_KERNEL_CUSTOM_VERSION_VALUE": '"7.0"',
+    "BR2_PACKAGE_BUSYBOX_SHOW_OTHERS": "y", "BR2_PACKAGE_BASH": "y",
     "BR2_PACKAGE_HOST_LINUX_HEADERS_CUSTOM_7_0": "y",
     "BR2_SYSTEM_DHCP": '""', "BR2_RISCV_ISA_EXTRA": '""',
     "BR2_TARGET_ROOTFS_CPIO": "y", "BR2_DOWNLOAD_FORCE_CHECK_HASHES": "y",
@@ -127,12 +128,17 @@ def build():
   kernel = configuration(OUTPUT / "build/linux-7.0/.config")
   for required in ("RISCV_ISA_V", "SMP", "BLK_DEV_INITRD", "DEVTMPFS", "PROC_FS",
                    "SYSFS", "SYSCTL", "FUTEX", "SECCOMP", "SECCOMP_FILTER", "TMPFS",
-                   "SERIAL_8250", "SERIAL_8250_CONSOLE", "SERIAL_OF_PLATFORM"):
+                   "SERIAL_8250", "SERIAL_8250_CONSOLE", "SERIAL_OF_PLATFORM",
+                   "NET", "INET", "NETDEVICES"):
     if kernel.get(f"CONFIG_{required}") != "y":
       raise ValueError(f"kernel lacks required guest support: {required}")
   for disabled in ("MODULES", "DRM", "SOUND", "WLAN", "BT", "USB_SUPPORT",
                    "MEDIA_SUPPORT", "STAGING", "SCSI", "ATA", "NVME_CORE",
-                   "INFINIBAND", "CAN", "NFC", "NETDEVICES"):
+                   "INFINIBAND", "CAN", "NFC", "NET_CORE", "ETHERNET", "PHYLIB",
+                   "PCS_XPCS", "PHYLINK",
+                   "PPP", "SLIP", "WAN", "VIRTIO_NET", "E1000", "E1000E",
+                   "PCNET32", "8139CP", "8139TOO", "DUMMY", "TUN", "VETH",
+                   "BRIDGE", "BONDING", "MACVLAN", "IPVLAN", "VXLAN"):
     if kernel.get(f"CONFIG_{disabled}") in ("y", "m"):
       raise ValueError(f"kernel retains unused peripheral family: {disabled}")
   if "m" in kernel.values():
