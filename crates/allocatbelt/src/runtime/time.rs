@@ -114,7 +114,7 @@ use std::panic::{self, AssertUnwindSafe};
 use std::pin::Pin;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, Weak};
 use std::task::{Context, Poll, Waker};
-use std::thread::{self, JoinHandle, Thread, ThreadId};
+use std::thread::{self, Thread, ThreadId};
 use std::time::{Duration, Instant};
 
 #[cfg(loom)]
@@ -122,6 +122,7 @@ use loom::sync::atomic::{AtomicBool, AtomicU64, Ordering as EpochOrdering};
 #[cfg(not(loom))]
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as EpochOrdering};
 
+use super::thread_completion::DeferredJoin;
 use crate::runtime::asynchronous::{poll_cooperative, poll_cooperative_composed};
 use crate::runtime::task::drop_contained;
 
@@ -353,6 +354,9 @@ pub enum TimerError {
   Closed,
   /// The service thread could not be started.
   Spawn,
+  /// A nonblocking shutdown join monitor could not be started. The original
+  /// thread handle remains owned, and a later shutdown poll may retry.
+  JoinMonitorSpawn,
   /// [`TimerDriver::shutdown`] ran on the service or close thread, which
   /// cannot join itself. The driver is closed nonetheless.
   WouldDeadlock,
@@ -370,6 +374,7 @@ impl fmt::Display for TimerError {
       Self::OutOfMemory => "timer registration storage could not be reserved",
       Self::Closed => "timer driver is closed",
       Self::Spawn => "timer service thread could not be started",
+      Self::JoinMonitorSpawn => "timer shutdown join monitor could not be started",
       Self::WouldDeadlock => "timer shutdown from one of its own threads would deadlock",
       Self::DriverPanicked => "timer service thread panicked",
     })
@@ -1249,8 +1254,8 @@ fn drive(shared: &Shared) {
 /// Owns the timer's service thread; see the module documentation.
 pub struct TimerDriver {
   shared: Arc<Shared>,
-  thread: Option<JoinHandle<()>>,
-  close_worker: Option<JoinHandle<()>>,
+  thread: Option<DeferredJoin>,
+  close_worker: Option<DeferredJoin>,
   panic_payloads: Mutex<Vec<Box<dyn Any + Send>>>,
   shutdown_panicked: bool,
 }
@@ -1376,7 +1381,7 @@ impl TimerDriver {
       .map_err(|_| TimerError::Spawn)?;
     Ok(Self {
       shared,
-      thread: Some(thread),
+      thread: Some(DeferredJoin::new(thread)),
       close_worker: None,
       panic_payloads: Mutex::new(panic_payloads),
       shutdown_panicked: false,
@@ -1402,34 +1407,43 @@ impl TimerDriver {
     let close_worker = thread::Builder::new()
       .name("allocatbelt-timer-close".into())
       .spawn(move || shared.close(false))?;
-    self.close_worker = Some(close_worker);
+    self.close_worker = Some(DeferredJoin::new(close_worker));
     Ok(())
   }
 
   /// Returns `Pending` until close callbacks and the service thread have
-  /// actually finished. It joins only threads already known to have exited.
-  /// Thread panic payloads remain owned by this driver; their destructors can
-  /// run and block when it is explicitly shut down or dropped.
+  /// actually finished, including thread-local destructors. Each original
+  /// handle is joined by one retained helper thread, never by this polling
+  /// caller. If a helper cannot start, this returns `JoinMonitorSpawn`, keeps
+  /// the original handle, and permits a later retry. Thread panic payloads
+  /// remain owned by this driver; their destructors can run and block when it
+  /// is explicitly shut down or dropped.
   pub(super) fn poll_shutdown(&mut self) -> Result<bool, TimerError> {
-    if self
-      .thread
-      .as_ref()
-      .is_some_and(|thread| thread.is_finished())
-      && let Some(thread) = self.thread.take()
-      && let Err(payload) = thread.join()
-    {
-      self.shutdown_panicked = true;
-      self.lock_panic_payloads().push(payload);
+    if let Some(thread) = self.thread.as_mut() {
+      match thread.try_join() {
+        Err(_) => return Err(TimerError::JoinMonitorSpawn),
+        Ok(None) => {}
+        Ok(Some(result)) => {
+          self.thread.take();
+          if let Err(payload) = result {
+            self.shutdown_panicked = true;
+            self.lock_panic_payloads().push(payload);
+          }
+        }
+      }
     }
-    if self
-      .close_worker
-      .as_ref()
-      .is_some_and(|thread| thread.is_finished())
-      && let Some(thread) = self.close_worker.take()
-      && let Err(payload) = thread.join()
-    {
-      self.shutdown_panicked = true;
-      self.lock_panic_payloads().push(payload);
+    if let Some(thread) = self.close_worker.as_mut() {
+      match thread.try_join() {
+        Err(_) => return Err(TimerError::JoinMonitorSpawn),
+        Ok(None) => {}
+        Ok(Some(result)) => {
+          self.close_worker.take();
+          if let Err(payload) = result {
+            self.shutdown_panicked = true;
+            self.lock_panic_payloads().push(payload);
+          }
+        }
+      }
     }
     if !self.shared.close_complete() || self.thread.is_some() || self.close_worker.is_some() {
       return Ok(false);
@@ -1455,28 +1469,30 @@ impl TimerDriver {
     let on_service_thread = self
       .thread
       .as_ref()
-      .is_some_and(|thread| thread.thread().id() == thread::current().id());
+      .is_some_and(DeferredJoin::is_current_thread);
     self.shared.close(on_service_thread);
     let on_close_thread = self
       .close_worker
       .as_ref()
-      .is_some_and(|thread| thread.thread().id() == thread::current().id());
+      .is_some_and(DeferredJoin::is_current_thread);
     if on_service_thread || on_close_thread {
       return Err(TimerError::WouldDeadlock);
     }
     let mut panicked = false;
-    if let Some(thread) = self.thread.take()
-      && let Err(payload) = thread.join()
+    if let Some(thread) = self.thread.as_mut()
+      && let Err(payload) = thread.join_blocking()
     {
       panicked = true;
       drop_contained(payload);
     }
-    if let Some(thread) = self.close_worker.take()
-      && let Err(payload) = thread.join()
+    self.thread.take();
+    if let Some(thread) = self.close_worker.as_mut()
+      && let Err(payload) = thread.join_blocking()
     {
       panicked = true;
       drop_contained(payload);
     }
+    self.close_worker.take();
     if panicked || self.shutdown_panicked {
       Err(TimerError::DriverPanicked)
     } else {
@@ -1548,10 +1564,10 @@ impl Drop for TimerDriver {
     let on_service_thread = self
       .thread
       .as_ref()
-      .is_some_and(|thread| thread.thread().id() == thread::current().id());
+      .is_some_and(DeferredJoin::is_current_thread);
     self.shared.close(on_service_thread);
-    // Dropping the `JoinHandle` detaches; the thread sees the close and
-    // exits. Dropping the driver never blocks on a waker it is running.
+    // Dropping never waits for a waker or a thread-local destructor. A started
+    // monitor keeps joining its exact original handle off-caller.
     self.thread = None;
     self.close_worker = None;
     self.drop_panic_payloads();
@@ -3225,7 +3241,7 @@ mod tests {
   fn close_owns_all_batches_and_waits_for_blocked_wakers() {
     const SLEEPS: usize = BATCH * 2 + 3;
     let (mut driver, handle) = driver(SLEEPS);
-    let timer_join = driver
+    let mut timer_join = driver
       .thread
       .take()
       .expect("the timer service thread is running");
@@ -3256,13 +3272,19 @@ mod tests {
     // Let the service thread take its exit path while the first close batch's
     // waker is gated. It must not steal later batches from the close owner.
     let limit = Instant::now() + WATCHDOG;
-    while !timer_join.is_finished() && Instant::now() < limit {
-      thread::sleep(MS);
+    let mut timer_joined = false;
+    while Instant::now() < limit {
+      match timer_join.try_join() {
+        Ok(Some(result)) => {
+          result.expect("timer service thread");
+          timer_joined = true;
+          break;
+        }
+        Ok(None) => thread::sleep(MS),
+        Err(error) => panic!("timer join monitor could not start: {error}"),
+      }
     }
-    assert!(
-      timer_join.is_finished(),
-      "timer service did not exit on close"
-    );
+    assert!(timer_joined, "timer service did not exit on close");
     let stolen_event = events_rx.try_recv().ok();
     let stolen = stolen_event.is_some();
 
@@ -3292,7 +3314,6 @@ mod tests {
         .iter_mut()
         .all(|sleep| { poll_with(sleep, Waker::noop()) == Poll::Ready(Err(TimerError::Closed)) })
     );
-    timer_join.join().unwrap();
   }
 
   /// Shuts down the driver it owns from its `wake`.

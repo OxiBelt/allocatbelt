@@ -167,13 +167,14 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::task::{Context, Poll, Waker};
-use std::thread::{self, JoinHandle};
+use std::thread;
 
 use rustix::event::epoll::{self, Event, EventData, EventFlags};
 use rustix::event::{EventfdFlags, eventfd};
 use rustix::fs::{self as rfs, OFlags};
 use rustix::io::Errno;
 
+use super::thread_completion::DeferredJoin;
 use crate::runtime::reactor_release::begin_if_no_waiters;
 use crate::runtime::task::drop_contained;
 
@@ -222,6 +223,9 @@ pub enum ReactorError {
   Closed,
   /// The service thread could not be started.
   Spawn,
+  /// A nonblocking shutdown join monitor could not be started. The original
+  /// thread handle remains owned, and a later shutdown poll may retry.
+  JoinMonitorSpawn,
   /// [`Reactor::shutdown`] ran on the service or close thread, which cannot
   /// join itself. The reactor is closed nonetheless.
   WouldDeadlock,
@@ -246,6 +250,7 @@ impl fmt::Display for ReactorError {
       Self::Exhausted => "reactor waiter ids exhausted",
       Self::Closed => "reactor is closed",
       Self::Spawn => "reactor service thread could not be started",
+      Self::JoinMonitorSpawn => "reactor shutdown join monitor could not be started",
       Self::WouldDeadlock => "reactor shutdown from one of its own threads would deadlock",
       Self::DriverPanicked => "reactor service thread panicked",
     })
@@ -1374,8 +1379,8 @@ fn drive(shared: &Shared, mut wakers: Vec<Waker>) {
 /// Owns the reactor's service thread; see the module documentation.
 pub struct Reactor {
   shared: Arc<Shared>,
-  thread: Option<JoinHandle<()>>,
-  close_worker: Option<JoinHandle<()>>,
+  thread: Option<DeferredJoin>,
+  close_worker: Option<DeferredJoin>,
   panic_payloads: Mutex<Vec<Box<dyn Any + Send>>>,
   shutdown_panicked: bool,
 }
@@ -1434,7 +1439,7 @@ impl Reactor {
       .map_err(|_| io::Error::from(ReactorError::Spawn))?;
     Ok(Self {
       shared,
-      thread: Some(thread),
+      thread: Some(DeferredJoin::new(thread)),
       close_worker: None,
       panic_payloads: Mutex::new(panic_payloads),
       shutdown_panicked: false,
@@ -1460,34 +1465,43 @@ impl Reactor {
     let close_worker = thread::Builder::new()
       .name("allocatbelt-reactor-close".into())
       .spawn(move || shared.close())?;
-    self.close_worker = Some(close_worker);
+    self.close_worker = Some(DeferredJoin::new(close_worker));
     Ok(())
   }
 
   /// Returns `Pending` until close callbacks and the service thread have
-  /// actually finished. It joins only threads already known to have exited.
-  /// Thread panic payloads remain owned by this reactor; their destructors
-  /// can run and block when it is explicitly shut down or dropped.
+  /// actually finished, including thread-local destructors. Each original
+  /// handle is joined by one retained helper thread, never by this polling
+  /// caller. If a helper cannot start, this returns `JoinMonitorSpawn`, keeps
+  /// the original handle, and permits a later retry. Thread panic payloads
+  /// remain owned by this reactor; their destructors can run and block when
+  /// it is explicitly shut down or dropped.
   pub(super) fn poll_shutdown(&mut self) -> Result<bool, ReactorError> {
-    if self
-      .thread
-      .as_ref()
-      .is_some_and(|thread| thread.is_finished())
-      && let Some(thread) = self.thread.take()
-      && let Err(payload) = thread.join()
-    {
-      self.shutdown_panicked = true;
-      self.lock_panic_payloads().push(payload);
+    if let Some(thread) = self.thread.as_mut() {
+      match thread.try_join() {
+        Err(_) => return Err(ReactorError::JoinMonitorSpawn),
+        Ok(None) => {}
+        Ok(Some(result)) => {
+          self.thread.take();
+          if let Err(payload) = result {
+            self.shutdown_panicked = true;
+            self.lock_panic_payloads().push(payload);
+          }
+        }
+      }
     }
-    if self
-      .close_worker
-      .as_ref()
-      .is_some_and(|thread| thread.is_finished())
-      && let Some(thread) = self.close_worker.take()
-      && let Err(payload) = thread.join()
-    {
-      self.shutdown_panicked = true;
-      self.lock_panic_payloads().push(payload);
+    if let Some(thread) = self.close_worker.as_mut() {
+      match thread.try_join() {
+        Err(_) => return Err(ReactorError::JoinMonitorSpawn),
+        Ok(None) => {}
+        Ok(Some(result)) => {
+          self.close_worker.take();
+          if let Err(payload) = result {
+            self.shutdown_panicked = true;
+            self.lock_panic_payloads().push(payload);
+          }
+        }
+      }
     }
     if !self.shared.close_complete() || self.thread.is_some() || self.close_worker.is_some() {
       return Ok(false);
@@ -1512,28 +1526,32 @@ impl Reactor {
     let on_service_thread = self
       .thread
       .as_ref()
-      .is_some_and(|thread| thread.thread().id() == thread::current().id());
+      .is_some_and(DeferredJoin::is_current_thread);
     let on_close_thread = self
       .close_worker
       .as_ref()
-      .is_some_and(|thread| thread.thread().id() == thread::current().id());
+      .is_some_and(DeferredJoin::is_current_thread);
     if on_service_thread || on_close_thread {
       return Err(ReactorError::WouldDeadlock);
     }
     let current_callback = in_callback(&self.shared);
     let mut panicked = false;
-    if let Some(thread) = self.thread.take()
-      && let Err(payload) = thread.join()
+    if let Some(thread) = self.thread.as_mut()
+      && let Err(payload) = thread.join_blocking()
     {
       panicked = true;
       drop_contained(payload);
     }
+    self.thread.take();
     if !current_callback
-      && let Some(thread) = self.close_worker.take()
-      && let Err(payload) = thread.join()
+      && let Some(thread) = self.close_worker.as_mut()
+      && let Err(payload) = thread.join_blocking()
     {
       panicked = true;
       drop_contained(payload);
+    }
+    if !current_callback {
+      self.close_worker.take();
     }
     if panicked || self.shutdown_panicked {
       Err(ReactorError::DriverPanicked)
@@ -1563,8 +1581,8 @@ impl Reactor {
 impl Drop for Reactor {
   fn drop(&mut self) {
     self.shared.close();
-    // Dropping the `JoinHandle` detaches; the thread sees the close and
-    // exits. Dropping the reactor never blocks on a waker it is running.
+    // Dropping never waits for a waker or thread-local destructor. A started
+    // monitor keeps joining its exact original handle off-caller.
     self.thread = None;
     self.close_worker = None;
     self.drop_panic_payloads();

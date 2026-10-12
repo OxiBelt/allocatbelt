@@ -148,6 +148,7 @@ pub mod task_local;
 mod tests;
 #[cfg(all(test, not(loom)))]
 mod tests_guard;
+mod thread_completion;
 pub mod time;
 #[cfg(not(loom))]
 pub mod unix_pipe;

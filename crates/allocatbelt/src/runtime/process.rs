@@ -41,14 +41,15 @@ use std::process::{Child as StdChild, ChildStderr, ChildStdin, ChildStdout, Comm
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::task::{Context, Poll, Wake, Waker};
-use std::thread::{self, JoinHandle, Thread};
+use std::thread::{self, Thread};
 use std::time::Duration;
 
 use rustix::fd::OwnedFd;
 use rustix::process::{Pid, PidfdFlags, Signal, pidfd_open, pidfd_send_signal};
 
-use super::reactor::{AsyncFd, OwnedReadiness, Reactor, ReactorConfig};
+use super::reactor::{AsyncFd, OwnedReadiness, Reactor, ReactorConfig, ReactorError};
 use super::task::drop_contained;
+use super::thread_completion::DeferredJoin;
 mod completion;
 pub mod output;
 pub mod pipe;
@@ -68,7 +69,7 @@ const INTERRUPT_RETRIES: usize = 64;
 /// reported before the driver is returned.
 pub struct ProcessDriver {
   shared: Arc<Shared>,
-  reaper: Option<JoinHandle<()>>,
+  reaper: Option<DeferredJoin>,
   reactor: Option<Reactor>,
   reaper_panic: Mutex<Option<Box<dyn Any + Send>>>,
   shutdown_requested: bool,
@@ -208,6 +209,9 @@ pub enum ProcessShutdownError {
   ReaperPanicked,
   /// The process reactor failed to stop cleanly.
   ReactorPanicked,
+  /// A nonblocking join monitor could not be started. The original reaper
+  /// handle remains owned, and a later shutdown poll may retry.
+  JoinMonitorSpawn,
 }
 
 impl fmt::Display for ProcessShutdownError {
@@ -216,6 +220,7 @@ impl fmt::Display for ProcessShutdownError {
       Self::WouldDeadlock => "process shutdown would join its reaper thread",
       Self::ReaperPanicked => "process reaper panicked before entering fallback mode",
       Self::ReactorPanicked => "process reactor thread panicked",
+      Self::JoinMonitorSpawn => "process shutdown join monitor could not be started",
     })
   }
 }
@@ -354,7 +359,7 @@ impl ProcessDriver {
 
     Ok(Self {
       shared,
-      reaper: Some(reaper),
+      reaper: Some(DeferredJoin::new(reaper)),
       reactor: Some(reactor),
       reaper_panic: Mutex::new(None),
       shutdown_requested: false,
@@ -475,9 +480,9 @@ impl ProcessDriver {
     let reaper_panicked = state.worker_panicked;
     drop(state);
 
-    if let Some(reaper) = self.reaper.take()
-      && let Err(payload) = reaper.join()
-    {
+    let reaper_result = self.reaper.as_mut().map(DeferredJoin::join_blocking);
+    self.reaper.take();
+    if let Some(Err(payload)) = reaper_result {
       drop_contained(payload);
       return Err(ProcessShutdownError::ReaperPanicked);
     }
@@ -510,7 +515,10 @@ impl ProcessDriver {
   }
 
   /// Checks whether all children were reaped and the private reactor thread
-  /// exited. It never waits for a child or joins a live service thread. A
+  /// exited. It never waits for a child or joins an original service thread
+  /// on this caller. One bounded helper joins each service thread and
+  /// publishes its result only after thread-local destructors finish. A helper
+  /// startup error leaves the original handle owned for a later retry. A
   /// reaper panic payload stays owned by this driver; dropping that payload
   /// can run user code and block when the driver is explicitly shut down or
   /// dropped.
@@ -528,19 +536,21 @@ impl ProcessDriver {
       let state = lock(&self.shared.state);
       (state.worker_exited, state.worker_panicked)
     };
-    if !worker_exited
-      || self
-        .reaper
-        .as_ref()
-        .is_some_and(|reaper| !reaper.is_finished())
-    {
+    if !worker_exited {
       return Ok(false);
     }
-    if let Some(reaper) = self.reaper.take()
-      && let Err(payload) = reaper.join()
-    {
-      *lock(&self.reaper_panic) = Some(payload);
-      self.shutdown_error = Some(ProcessShutdownError::ReaperPanicked);
+    if let Some(reaper) = self.reaper.as_mut() {
+      match reaper.try_join() {
+        Err(_) => return Err(ProcessShutdownError::JoinMonitorSpawn),
+        Ok(None) => return Ok(false),
+        Ok(Some(result)) => {
+          self.reaper.take();
+          if let Err(payload) = result {
+            *lock(&self.reaper_panic) = Some(payload);
+            self.shutdown_error = Some(ProcessShutdownError::ReaperPanicked);
+          }
+        }
+      }
     }
     if worker_panicked {
       self.shutdown_error = Some(ProcessShutdownError::ReaperPanicked);
@@ -549,6 +559,9 @@ impl ProcessDriver {
       match reactor.poll_shutdown() {
         Ok(false) => return Ok(false),
         Ok(true) => self.reactor = None,
+        Err(ReactorError::JoinMonitorSpawn) => {
+          return Err(ProcessShutdownError::JoinMonitorSpawn);
+        }
         Err(_) => {
           self.shutdown_error = Some(ProcessShutdownError::ReactorPanicked);
         }
@@ -579,8 +592,9 @@ impl ProcessDriver {
 impl Drop for ProcessDriver {
   fn drop(&mut self) {
     close_admission(&self.shared, ProcessShutdownMode::Wait);
-    // Dropping a JoinHandle detaches. The service owns `Shared` until it has
-    // reaped every started child, independent of this driver and executor.
+    // Dropping never waits for a service thread's TLS destructors. A started
+    // monitor retains and joins the exact reaper handle off-caller; otherwise
+    // dropping the original handle preserves the driver's detach contract.
     self.reaper.take();
     // Reactor::drop is itself nonblocking and switches registered pidfds to
     // the service's fixed-cadence try_wait fallback.
