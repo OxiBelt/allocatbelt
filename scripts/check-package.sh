@@ -42,9 +42,10 @@ fail() {
 cargo package -p allocatbelt --locked "${dirty[@]}"
 cargo publish -p allocatbelt --dry-run --locked "${dirty[@]}"
 
-version="$(cargo metadata --format-version 1 --no-deps --locked |
-  jq -r '.packages[] | select(.name == "allocatbelt") | .version')"
-crate="${root}/target/package/allocatbelt-${version}.crate"
+package_metadata="$(cargo metadata --format-version 1 --no-deps --locked)"
+version="$(jq -r '.packages[] | select(.name == "allocatbelt") | .version' <<<"${package_metadata}")"
+package_target_dir="$(jq -r '.target_directory' <<<"${package_metadata}")"
+crate="${package_target_dir}/package/allocatbelt-${version}.crate"
 [[ -f "${crate}" ]] || fail "no ${crate}"
 
 # Contents: required files present, nothing from other packages.
