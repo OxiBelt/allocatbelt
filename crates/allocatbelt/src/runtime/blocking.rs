@@ -1,15 +1,18 @@
 //! The runtime: its configuration, worker threads, submission handles and
 //! shutdown.
 
+use std::any::Any;
+use std::collections::VecDeque;
 use std::io;
-use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread::{self, JoinHandle};
 
 use crate::runtime::error::SubmitError;
 use crate::runtime::job::{CancellationToken, Job};
 use crate::runtime::resources::Resources;
-use crate::runtime::scheduler::{Shared, Snapshot};
+use crate::runtime::scheduler::{Entry, Shared, Snapshot};
+use crate::runtime::task::drop_contained;
 use crate::runtime::worker;
 
 /// A runtime's size and bounds.
@@ -48,11 +51,18 @@ pub enum ShutdownMode {
 /// queued jobs' closures unstarted, synchronously on the dropping thread,
 /// so a capture's `Drop` that blocks also blocks the drop. Then it
 /// detaches the worker threads, which exit after their current job.
+/// A panic payload retained by a prior nonblocking shutdown check is also
+/// dropped here; its destructor can block.
 /// Running jobs may outlive the runtime; call [`Runtime::shutdown`] to wait
 /// for them.
 pub struct Runtime {
   shared: Arc<Shared>,
   workers: Vec<JoinHandle<()>>,
+  panic_payloads: Mutex<Vec<Box<dyn Any + Send>>>,
+  shutdown_pending: Mutex<VecDeque<Entry>>,
+  shutdown_requested: bool,
+  shutdown_complete: bool,
+  shutdown_panicked: bool,
 }
 
 /// A cloneable, thread-safe submission handle. Submissions after the
@@ -102,6 +112,10 @@ impl Runtime {
     workers
       .try_reserve_exact(config.workers)
       .map_err(|_| io::Error::from(io::ErrorKind::OutOfMemory))?;
+    let mut panic_payloads = Vec::new();
+    panic_payloads
+      .try_reserve_exact(config.workers)
+      .map_err(|_| io::Error::from(io::ErrorKind::OutOfMemory))?;
     for index in 0..config.workers {
       let worker_shared = Arc::clone(&shared);
       let spawned = spawn(
@@ -120,7 +134,15 @@ impl Runtime {
         }
       }
     }
-    Ok(Self { shared, workers })
+    Ok(Self {
+      shared,
+      workers,
+      panic_payloads: Mutex::new(panic_payloads),
+      shutdown_pending: Mutex::new(VecDeque::new()),
+      shutdown_requested: false,
+      shutdown_complete: false,
+      shutdown_panicked: false,
+    })
   }
 
   /// A submission handle for other threads, workers included.
@@ -168,6 +190,16 @@ impl Runtime {
   /// finished all the same.
   pub fn shutdown(&mut self, mode: ShutdownMode) -> io::Result<()> {
     if self.workers.is_empty() {
+      if !self.lock_shutdown_pending().is_empty() {
+        worker::abandon_all(&self.shared, self.take_shutdown_pending());
+        self.shutdown_complete = true;
+      }
+      if !self.lock_panic_payloads().is_empty() {
+        self.shutdown_complete = true;
+        self.shutdown_panicked = true;
+        self.drop_panic_payloads();
+        return Err(io::Error::other("a runtime worker panicked"));
+      }
       return Ok(());
     }
     if worker::is_worker_of(self.shared.ident.id) {
@@ -180,14 +212,137 @@ impl Runtime {
       &self.shared,
       self.shared.close(mode == ShutdownMode::CancelPending),
     );
+    worker::abandon_all(&self.shared, self.take_shutdown_pending());
     let mut panicked = false;
-    for handle in self.workers.drain(..) {
-      panicked |= handle.join().is_err();
+    for handle in std::mem::take(&mut self.workers) {
+      if let Err(payload) = handle.join() {
+        panicked = true;
+        self.lock_panic_payloads().push(payload);
+      }
     }
-    if panicked {
+    self.shutdown_requested = true;
+    self.shutdown_complete = true;
+    self.shutdown_panicked |= panicked;
+    self.drop_panic_payloads();
+    if self.shutdown_panicked {
       return Err(io::Error::other("a runtime worker panicked"));
     }
     Ok(())
+  }
+
+  /// Closes admission and signals cancellation without running queued job
+  /// destructors on the caller. The returned queue remains owned by this
+  /// runtime until later [`Runtime::poll_shutdown`] calls abandon it.
+  pub(crate) fn request_shutdown(&mut self, mode: ShutdownMode) -> io::Result<()> {
+    if self.shutdown_complete || self.shutdown_requested {
+      return Ok(());
+    }
+    if worker::is_worker_of(self.shared.ident.id) {
+      return Err(io::Error::new(
+        io::ErrorKind::Deadlock,
+        "shutdown called from one of the runtime's own workers",
+      ));
+    }
+    let pending = self.shared.close(mode == ShutdownMode::CancelPending);
+    *self.lock_shutdown_pending() = pending;
+    self.shutdown_requested = true;
+    Ok(())
+  }
+
+  /// Drops at most one queued job, then checks whether all workers and
+  /// retained queue cleanup have actually completed. A job capture's
+  /// destructor may take unbounded time while one item is abandoned, so this
+  /// explicit cleanup step is separate from the facade's status check.
+  pub(crate) fn drive_shutdown_step(&mut self) -> io::Result<bool> {
+    if self.shutdown_complete {
+      return if self.shutdown_panicked {
+        Err(io::Error::other("a runtime worker panicked"))
+      } else {
+        Ok(true)
+      };
+    }
+    if !self.shutdown_requested {
+      return Err(io::Error::new(
+        io::ErrorKind::InvalidInput,
+        "shutdown has not been requested",
+      ));
+    }
+    let pending = { self.lock_shutdown_pending().pop_front() };
+    if let Some(entry) = pending {
+      let _cleaning = worker::Cleaning::enter(&self.shared.ident);
+      worker::abandon(&self.shared, entry);
+      return Ok(false);
+    }
+    self.poll_shutdown()
+  }
+
+  /// Checks completion without dropping queued job captures. It joins workers
+  /// only after every queued cancellation owner is cleaned and every worker
+  /// has actually exited. Worker panic payloads stay owned by this runtime;
+  /// their destructors may run when it is explicitly shut down or dropped.
+  pub(crate) fn poll_shutdown(&mut self) -> io::Result<bool> {
+    if self.shutdown_complete {
+      return if self.shutdown_panicked {
+        Err(io::Error::other("a runtime worker panicked"))
+      } else {
+        Ok(true)
+      };
+    }
+    if !self.shutdown_requested {
+      return Err(io::Error::new(
+        io::ErrorKind::InvalidInput,
+        "shutdown has not been requested",
+      ));
+    }
+    if !self.lock_shutdown_pending().is_empty()
+      || self.workers.iter().any(|worker| !worker.is_finished())
+    {
+      return Ok(false);
+    }
+    for worker in std::mem::take(&mut self.workers) {
+      if let Err(payload) = worker.join() {
+        self.shutdown_panicked = true;
+        self.lock_panic_payloads().push(payload);
+      }
+    }
+    self.shutdown_complete = true;
+    if self.shutdown_panicked {
+      Err(io::Error::other("a runtime worker panicked"))
+    } else {
+      Ok(true)
+    }
+  }
+
+  pub(crate) fn shutdown_complete(&self) -> bool {
+    self.shutdown_complete
+  }
+
+  fn lock_shutdown_pending(&self) -> MutexGuard<'_, VecDeque<Entry>> {
+    self
+      .shutdown_pending
+      .lock()
+      .unwrap_or_else(PoisonError::into_inner)
+  }
+
+  fn take_shutdown_pending(&self) -> VecDeque<Entry> {
+    std::mem::take(&mut *self.lock_shutdown_pending())
+  }
+
+  fn take_panic_payloads(&self) -> Vec<Box<dyn Any + Send>> {
+    std::mem::take(&mut *self.lock_panic_payloads())
+  }
+
+  fn drop_panic_payloads(&self) {
+    for payload in self.take_panic_payloads() {
+      drop_contained(payload);
+    }
+  }
+
+  fn lock_panic_payloads(&self) -> MutexGuard<'_, Vec<Box<dyn Any + Send>>> {
+    self
+      .panic_payloads
+      .lock()
+      .unwrap_or_else(PoisonError::into_inner)
   }
 }
 
@@ -222,6 +377,8 @@ impl Drop for Runtime {
       // Dropping the handles detaches the threads.
       self.workers.clear();
     }
+    worker::abandon_all(&self.shared, self.take_shutdown_pending());
+    self.drop_panic_payloads();
   }
 }
 
@@ -236,5 +393,81 @@ impl std::fmt::Debug for Runtime {
 impl std::fmt::Debug for Handle {
   fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
     f.debug_struct("Handle").finish_non_exhaustive()
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+  use std::sync::mpsc;
+  use std::time::{Duration, Instant};
+
+  struct PanicOnDrop;
+
+  impl Drop for PanicOnDrop {
+    fn drop(&mut self) {
+      panic!("retained worker panic payload destructor panicked");
+    }
+  }
+
+  struct DropSignal(mpsc::SyncSender<()>);
+
+  impl Drop for DropSignal {
+    fn drop(&mut self) {
+      let _ = self.0.send(());
+    }
+  }
+
+  #[test]
+  fn drop_contains_payload_destructor_panic_and_continues_cleanup() {
+    let (cleanup_tx, cleanup_rx) = mpsc::sync_channel(1);
+    let mut next_worker = 0;
+    let mut cleanup_tx = Some(cleanup_tx);
+    let mut runtime = Runtime::with_spawner(
+      Config {
+        workers: 2,
+        max_outstanding: 1,
+        capacity: Resources::ZERO,
+      },
+      move |builder, _worker| {
+        let index = next_worker;
+        next_worker += 1;
+        if index == 0 {
+          builder.spawn(|| std::panic::panic_any(PanicOnDrop))
+        } else {
+          let Some(cleanup_tx) = cleanup_tx.take() else {
+            return Err(io::Error::other("unexpected extra worker"));
+          };
+          builder.spawn(move || std::panic::panic_any(DropSignal(cleanup_tx)))
+        }
+      },
+      |_| {},
+    )
+    .unwrap_or_else(|error| panic!("blocking runtime build failed: {error}"));
+    runtime
+      .request_shutdown(ShutdownMode::Drain)
+      .unwrap_or_else(|error| panic!("shutdown request failed: {error}"));
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+      match runtime.poll_shutdown() {
+        Err(error) => {
+          assert_eq!(error.kind(), io::ErrorKind::Other);
+          break;
+        }
+        Ok(false) if Instant::now() < deadline => thread::yield_now(),
+        result => panic!("unexpected shutdown status: {result:?}"),
+      }
+    }
+    let repeated = runtime
+      .poll_shutdown()
+      .err()
+      .unwrap_or_else(|| panic!("worker panic error was not retained"));
+    assert_eq!(repeated.kind(), io::ErrorKind::Other);
+
+    drop(runtime);
+    cleanup_rx
+      .recv_timeout(Duration::from_secs(2))
+      .unwrap_or_else(|error| panic!("remaining payload cleanup did not run: {error}"));
   }
 }

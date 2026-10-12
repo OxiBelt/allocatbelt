@@ -224,36 +224,38 @@ impl Future for SignalRecv<'_> {
     if this.completed {
       return Poll::Ready(Err(SignalError::Completed));
     }
-    let waker = match panic::catch_unwind(AssertUnwindSafe(|| cx.waker().clone())) {
-      Ok(waker) => waker,
-      Err(payload) => {
-        this.signal.remove_waker();
-        this.completed = true;
-        drop_contained(payload);
-        return Poll::Ready(Err(SignalError::WakerPanicked));
-      }
-    };
-    let (result, old, unused) = {
-      let mut state = lock(&this.signal.shared.state);
-      let closed = state.closed;
-      match active_slot(&mut state.slots, this.signal.key) {
-        None => (Poll::Ready(Err(SignalError::Closed)), None, Some(waker)),
-        Some(slot) if slot.pending => {
-          slot.pending = false;
-          (Poll::Ready(Ok(())), slot.waker.take(), Some(waker))
+    crate::runtime::asynchronous::poll_cooperative(cx, |cx| {
+      let waker = match panic::catch_unwind(AssertUnwindSafe(|| cx.waker().clone())) {
+        Ok(waker) => waker,
+        Err(payload) => {
+          this.signal.remove_waker();
+          this.completed = true;
+          drop_contained(payload);
+          return Poll::Ready(Err(SignalError::WakerPanicked));
         }
-        Some(slot) if closed => (
-          Poll::Ready(Err(SignalError::Closed)),
-          slot.waker.take(),
-          Some(waker),
-        ),
-        Some(slot) => (Poll::Pending, slot.waker.replace(waker), None),
-      }
-    };
-    this.completed = result.is_ready();
-    drop_contained(old);
-    drop_contained(unused);
-    result
+      };
+      let (result, old, unused) = {
+        let mut state = lock(&this.signal.shared.state);
+        let closed = state.closed;
+        match active_slot(&mut state.slots, this.signal.key) {
+          None => (Poll::Ready(Err(SignalError::Closed)), None, Some(waker)),
+          Some(slot) if slot.pending => {
+            slot.pending = false;
+            (Poll::Ready(Ok(())), slot.waker.take(), Some(waker))
+          }
+          Some(slot) if closed => (
+            Poll::Ready(Err(SignalError::Closed)),
+            slot.waker.take(),
+            Some(waker),
+          ),
+          Some(slot) => (Poll::Pending, slot.waker.replace(waker), None),
+        }
+      };
+      this.completed = result.is_ready();
+      drop_contained(old);
+      drop_contained(unused);
+      result
+    })
   }
 }
 
@@ -304,6 +306,65 @@ mod generation_tests {
       Err(SignalError::Full)
     ));
     assert!(lock(&shared.state).slots[0].retired);
+  }
+}
+
+#[cfg(all(test, not(loom)))]
+mod cooperative_tests {
+  use super::*;
+  use crate::runtime::asynchronous::{AsyncConfig, AsyncRuntime, AsyncShutdown};
+  use std::future::poll_fn;
+
+  #[test]
+  fn signal_receive_gates_event_consumption_and_refunds_pending_polls() {
+    let runtime = AsyncRuntime::new(AsyncConfig {
+      workers: 1,
+      max_outstanding: 2,
+      max_scopes: 1,
+    })
+    .unwrap();
+    let shared = Shared::new(1).unwrap();
+    let mut signal = Shared::subscribe(&shared, SignalKind::interrupt()).unwrap();
+    let mut receive = Box::pin(signal.recv());
+
+    runtime
+      .block_on(poll_fn(|cx| {
+        assert!(receive.as_mut().poll(cx).is_pending());
+        assert!(crate::runtime::asynchronous::poll_cooperative(cx, |_| Poll::Ready(())).is_ready());
+        for _ in 0..63 {
+          assert!(
+            crate::runtime::asynchronous::poll_cooperative(cx, |_| Poll::Ready(())).is_ready()
+          );
+        }
+        let mut wakes = Vec::with_capacity(shared.capacity());
+        shared.deliver(SignalKind::interrupt().mask(), &mut wakes);
+        wake_all(&mut wakes);
+        assert!(lock(&shared.state).slots[0].pending);
+        assert!(receive.as_mut().poll(cx).is_pending());
+        assert!(lock(&shared.state).slots[0].pending);
+        Poll::Ready(())
+      }))
+      .unwrap();
+
+    runtime
+      .block_on(poll_fn(|cx| {
+        assert_eq!(receive.as_mut().poll(cx), Poll::Ready(Ok(())));
+        assert!(!lock(&shared.state).slots[0].pending);
+        for _ in 0..63 {
+          assert!(
+            crate::runtime::asynchronous::poll_cooperative(cx, |_| Poll::Ready(())).is_ready()
+          );
+        }
+        assert_eq!(
+          receive.as_mut().poll(cx),
+          Poll::Ready(Err(SignalError::Completed))
+        );
+        Poll::Ready(())
+      }))
+      .unwrap();
+    drop(receive);
+    drop(signal);
+    runtime.shutdown(AsyncShutdown::Drain).unwrap();
   }
 }
 

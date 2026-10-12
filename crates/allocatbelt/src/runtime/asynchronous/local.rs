@@ -697,14 +697,20 @@ impl LocalCore {
   }
 
   fn request_scope_close(&self, scope: &Rc<ScopeCell>) {
-    if scope.closed.replace(true) {
-      return;
+    self.begin_scope_close(scope);
+    self.finish_scope_close(scope);
+  }
+
+  fn begin_scope_close(&self, scope: &Rc<ScopeCell>) {
+    if !scope.closed.replace(true) {
+      self.control.abort_scope(scope.reference);
+      self.notifier.notify();
     }
-    self.control.abort_scope(scope.reference);
-    self.notifier.notify();
-    if scope.active.get() == 0 {
+  }
+
+  fn finish_scope_close(&self, scope: &Rc<ScopeCell>) {
+    if scope.closed.get() && scope.active.get() == 0 && !scope.reclaimed.replace(true) {
       self.control.close_scope(scope.reference);
-      scope.reclaimed.set(true);
       let waker = scope.completion.borrow_mut().take();
       if let Some(waker) = waker
         && let Err(payload) = panic::catch_unwind(AssertUnwindSafe(|| waker.wake()))
@@ -831,6 +837,7 @@ where
   abort: Arc<AtomicBool>,
   abort_target: Arc<Mutex<Option<TaskRef>>>,
   admission: AdmissionPermit,
+  resources: Option<ResourceScope>,
 }
 
 impl<F> ExternalRequest for SendRequest<F>
@@ -846,6 +853,7 @@ where
       abort,
       abort_target,
       admission,
+      resources: _,
     } = *self;
     let task = Task {
       future: Some(Box::pin(future)),
@@ -872,8 +880,9 @@ where
       abort: _,
       abort_target: _,
       admission,
+      resources,
     } = *self;
-    let _task_context = TaskContextGuard::enter(Some(id));
+    let _task_context = TaskContextGuard::enter_with_resource(Some(id), resources);
     let outcome = match panic::catch_unwind(AssertUnwindSafe(|| drop(future))) {
       Ok(()) => Err(AsyncJoinError::Cancelled),
       Err(payload) => Err(AsyncJoinError::Panicked(payload)),
@@ -892,6 +901,7 @@ where
       abort: _,
       abort_target: _,
       admission,
+      resources: _,
     } = *self;
     drop(admission);
     Box::new(future)
@@ -913,12 +923,27 @@ pub struct LocalRuntime {
   receiver: Receiver<Box<dyn ExternalRequest>>,
   root_scope: ScopeRef,
   closed: bool,
+  shutdown_complete: bool,
   _not_send: PhantomData<Rc<()>>,
 }
 
 impl LocalRuntime {
   /// Allocates all bounded task and scope tables before exposing handles.
   pub fn new(config: LocalConfig) -> Result<Self, LocalError> {
+    Self::build(config, None)
+  }
+
+  /// Creates a local runtime whose existing implicit root scope uses the
+  /// supplied resource ledger for root polls and root tasks. The root binding
+  /// does not consume an additional scope slot.
+  pub(in crate::runtime) fn with_resources(
+    config: LocalConfig,
+    resources: ResourceScope,
+  ) -> Result<Self, LocalError> {
+    Self::build(config, Some(resources))
+  }
+
+  fn build(config: LocalConfig, resources: Option<ResourceScope>) -> Result<Self, LocalError> {
     if config.max_outstanding == 0 || config.max_scopes == 0 {
       return Err(LocalError::InvalidConfig);
     }
@@ -935,7 +960,7 @@ impl LocalRuntime {
       .try_reserve_exact(config.max_scopes)
       .map_err(|_| LocalError::InvalidConfig)?;
     scopes.resize_with(config.max_scopes, || None);
-    let root = ScopeCell::new(root_scope, None);
+    let root = ScopeCell::new(root_scope, resources);
     scopes[0] = Some(Rc::clone(&root));
     let owner = thread::current();
     let notifier = Notifier::new(owner.clone());
@@ -953,6 +978,7 @@ impl LocalRuntime {
       receiver,
       root_scope,
       closed: false,
+      shutdown_complete: false,
       _not_send: PhantomData,
     })
   }
@@ -969,7 +995,8 @@ impl LocalRuntime {
 
   /// Returns a cross-thread handle that accepts only `Send` futures and
   /// outputs. Its admissions share `max_outstanding` with local tasks and use
-  /// the unbound implicit root scope; the submitting thread's resource context
+  /// the implicit root scope. Its futures use this runtime's explicitly bound
+  /// root ledger when imported or cleaned up; the submitting thread's context
   /// is never inherited.
   #[must_use]
   pub fn send_handle(&self) -> LocalSendHandle {
@@ -978,6 +1005,10 @@ impl LocalRuntime {
       gate: Arc::clone(&self.core.gate),
       notifier: Arc::clone(&self.core.notifier),
       control: Arc::clone(&self.core.control),
+      resources: self
+        .core
+        .scope_cell(self.root_scope)
+        .and_then(|scope| scope.resources.clone()),
     }
   }
 
@@ -1015,9 +1046,9 @@ impl LocalRuntime {
   /// Polls a caller-owned root future and runs ready local tasks one poll turn
   /// at a time until the root completes. The root may borrow data and need not
   /// be `Send`; spawned local futures must be `'static`. The borrowed runtime
-  /// root has no task ID or managed-resource binding, even when called while
-  /// another task's resource context is active; that context is restored on
-  /// return or unwind.
+  /// root has no task ID. If this runtime was created by the owning facade,
+  /// its configured resource ledger is bound for the duration of the root
+  /// poll and restored on return or unwind.
   pub fn block_on<F: Future>(&mut self, future: F) -> Result<F::Output, LocalError> {
     self.core.check_owner()?;
     if self.closed {
@@ -1025,7 +1056,14 @@ impl LocalRuntime {
     }
     let _block_on = BlockOnGuard::enter().map_err(|_| LocalError::BlockOnRejected)?;
     let _local_execution = LocalExecutionGuard::enter();
-    let _task_context = TaskContextGuard::enter(None);
+    let root_resources = self
+      .core
+      .scope_cell(self.root_scope)
+      .and_then(|scope| scope.resources.clone());
+    let _task_context = match root_resources {
+      Some(resources) => TaskContextGuard::enter_with_resource(None, Some(resources)),
+      None => TaskContextGuard::enter(None),
+    };
     let _context = LocalEnterGuard::enter(&self.handle());
     let root_waker = Waker::from(Arc::clone(&self.core.notifier));
     let mut context = Context::from_waker(&root_waker);
@@ -1147,18 +1185,29 @@ impl LocalRuntime {
   }
 
   fn close_and_cleanup(&mut self) {
-    if self.closed {
+    if self.shutdown_complete {
+      return;
+    }
+    let _local_execution = LocalExecutionGuard::enter();
+    self.request_shutdown();
+    while !self.shutdown_complete {
+      match self.drive_shutdown_step() {
+        Ok(true) | Err(_) => break,
+        Ok(false) => {}
+      }
+    }
+  }
+
+  /// Closes local admission and requests cancellation while keeping every
+  /// task and cleanup owner on this thread. This does not run future
+  /// destructors or stored completion wakers.
+  pub(in crate::runtime) fn request_shutdown(&mut self) {
+    if self.closed || self.shutdown_complete {
       return;
     }
     self.closed = true;
-    let _local_execution = LocalExecutionGuard::enter();
     self.core.gate.close();
     self.core.control.close_all();
-    while let Ok(request) = self.receiver.try_recv() {
-      let root_handle = self.handle();
-      let _root_context = LocalEnterGuard::enter(&root_handle);
-      request.cancel_on_owner();
-    }
     let scope_count = self.core.scopes.borrow().len();
     for index in 0..scope_count {
       let scope = self
@@ -1169,9 +1218,29 @@ impl LocalRuntime {
         .and_then(Option::as_ref)
         .cloned();
       if let Some(scope) = scope {
-        self.core.request_scope_close(&scope);
+        self.core.begin_scope_close(&scope);
       }
     }
+    self.core.notifier.notify();
+  }
+
+  /// Runs at most one local cleanup step, then reports whether every queued
+  /// external future, task and scope has actually been cleaned up. A future
+  /// destructor or completion waker may itself take unbounded time.
+  pub(in crate::runtime) fn drive_shutdown_step(&mut self) -> Result<bool, LocalError> {
+    self.core.check_owner()?;
+    if self.shutdown_complete {
+      return Ok(true);
+    }
+    self.request_shutdown();
+
+    if let Ok(request) = self.receiver.try_recv() {
+      let root_handle = self.handle();
+      let _root_context = LocalEnterGuard::enter(&root_handle);
+      request.cancel_on_owner();
+      return Ok(false);
+    }
+
     let task_count = self.core.tasks.borrow().len();
     for index in 0..task_count {
       let task_ref = self
@@ -1201,8 +1270,35 @@ impl LocalRuntime {
           task.publish();
           task.complete_scope(&self.core);
         }
+        return Ok(false);
       }
     }
+
+    let scope_count = self.core.scopes.borrow().len();
+    for index in 0..scope_count {
+      let scope = self
+        .core
+        .scopes
+        .borrow()
+        .get(index)
+        .and_then(Option::as_ref)
+        .cloned();
+      if let Some(scope) = scope
+        && scope.closed.get()
+        && !scope.reclaimed.get()
+        && scope.active.get() == 0
+      {
+        self.core.finish_scope_close(&scope);
+        return Ok(false);
+      }
+    }
+
+    self.shutdown_complete = true;
+    Ok(true)
+  }
+
+  pub(in crate::runtime) fn shutdown_complete(&self) -> bool {
+    self.shutdown_complete
   }
 }
 
@@ -1319,6 +1415,7 @@ pub struct LocalSendHandle {
   gate: Arc<AdmissionGate>,
   notifier: Arc<Notifier>,
   control: Arc<Control>,
+  resources: Option<ResourceScope>,
 }
 
 impl LocalSendHandle {
@@ -1348,6 +1445,7 @@ impl LocalSendHandle {
       abort: Arc::clone(&abort),
       abort_target: Arc::clone(&abort_target),
       admission,
+      resources: self.resources.clone(),
     };
     let job_abort = Arc::clone(&abort);
     let job_abort_target = Arc::clone(&abort_target);

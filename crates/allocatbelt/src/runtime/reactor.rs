@@ -155,6 +155,7 @@
 #![forbid(unsafe_code)]
 #![cfg_attr(not(test), deny(clippy::expect_used, clippy::unwrap_used))]
 
+use std::any::Any;
 use std::collections::{HashMap, TryReserveError};
 use std::fmt;
 use std::fs::File;
@@ -221,8 +222,8 @@ pub enum ReactorError {
   Closed,
   /// The service thread could not be started.
   Spawn,
-  /// [`Reactor::shutdown`] ran on the service thread, which cannot join
-  /// itself. The reactor is closed nonetheless.
+  /// [`Reactor::shutdown`] ran on the service or close thread, which cannot
+  /// join itself. The reactor is closed nonetheless.
   WouldDeadlock,
   /// The service thread panicked.
   DriverPanicked,
@@ -245,7 +246,7 @@ impl fmt::Display for ReactorError {
       Self::Exhausted => "reactor waiter ids exhausted",
       Self::Closed => "reactor is closed",
       Self::Spawn => "reactor service thread could not be started",
-      Self::WouldDeadlock => "reactor shutdown from its service thread would deadlock",
+      Self::WouldDeadlock => "reactor shutdown from one of its own threads would deadlock",
       Self::DriverPanicked => "reactor service thread panicked",
     })
   }
@@ -1303,6 +1304,11 @@ impl Shared {
   fn is_closed(&self) -> bool {
     lock(&self.state).closed
   }
+
+  fn close_complete(&self) -> bool {
+    let state = lock(&self.state);
+    state.closed && state.callbacks_pending == 0
+  }
 }
 
 /// Closes the reactor when the service thread exits, unwinding included,
@@ -1369,6 +1375,9 @@ fn drive(shared: &Shared, mut wakers: Vec<Waker>) {
 pub struct Reactor {
   shared: Arc<Shared>,
   thread: Option<JoinHandle<()>>,
+  close_worker: Option<JoinHandle<()>>,
+  panic_payloads: Mutex<Vec<Box<dyn Any + Send>>>,
+  shutdown_panicked: bool,
 }
 
 impl Reactor {
@@ -1414,6 +1423,10 @@ impl Reactor {
       max_waiters,
       fd_events: AtomicU64::new(0),
     });
+    let mut panic_payloads = Vec::new();
+    panic_payloads
+      .try_reserve_exact(2)
+      .map_err(|_| io::Error::from(io::ErrorKind::OutOfMemory))?;
     let worker = Arc::clone(&shared);
     let thread = thread::Builder::new()
       .name("allocatbelt-reactor".into())
@@ -1422,6 +1435,9 @@ impl Reactor {
     Ok(Self {
       shared,
       thread: Some(thread),
+      close_worker: None,
+      panic_payloads: Mutex::new(panic_payloads),
+      shutdown_panicked: false,
     })
   }
 
@@ -1433,25 +1449,114 @@ impl Reactor {
     }
   }
 
+  /// Starts close completion on a retained helper thread. Reactor waiters
+  /// carry arbitrary wakers, so the owning facade requests close away from
+  /// its caller and observes actual callback and thread completion later.
+  pub(super) fn request_shutdown(&mut self) -> io::Result<()> {
+    if self.close_worker.is_some() || self.shared.close_complete() {
+      return Ok(());
+    }
+    let shared = Arc::clone(&self.shared);
+    let close_worker = thread::Builder::new()
+      .name("allocatbelt-reactor-close".into())
+      .spawn(move || shared.close())?;
+    self.close_worker = Some(close_worker);
+    Ok(())
+  }
+
+  /// Returns `Pending` until close callbacks and the service thread have
+  /// actually finished. It joins only threads already known to have exited.
+  /// Thread panic payloads remain owned by this reactor; their destructors
+  /// can run and block when it is explicitly shut down or dropped.
+  pub(super) fn poll_shutdown(&mut self) -> Result<bool, ReactorError> {
+    if self
+      .thread
+      .as_ref()
+      .is_some_and(|thread| thread.is_finished())
+      && let Some(thread) = self.thread.take()
+      && let Err(payload) = thread.join()
+    {
+      self.shutdown_panicked = true;
+      self.lock_panic_payloads().push(payload);
+    }
+    if self
+      .close_worker
+      .as_ref()
+      .is_some_and(|thread| thread.is_finished())
+      && let Some(thread) = self.close_worker.take()
+      && let Err(payload) = thread.join()
+    {
+      self.shutdown_panicked = true;
+      self.lock_panic_payloads().push(payload);
+    }
+    if !self.shared.close_complete() || self.thread.is_some() || self.close_worker.is_some() {
+      return Ok(false);
+    }
+    if self.shutdown_panicked {
+      Err(ReactorError::DriverPanicked)
+    } else {
+      Ok(true)
+    }
+  }
+
   /// Closes the reactor, completing and waking every waiting future with
   /// `Closed` on this thread, then waits for the service thread to exit.
   ///
   /// # Errors
   ///
-  /// `WouldDeadlock` when called on the service thread, which is then left
-  /// to exit on its own; `DriverPanicked` when the service thread panicked.
+  /// `WouldDeadlock` when called on the service or close thread, which is
+  /// then left to exit on its own; `DriverPanicked` when either thread
+  /// panicked.
   pub fn shutdown(mut self) -> Result<(), ReactorError> {
     self.shared.close();
-    let Some(thread) = self.thread.take() else {
-      return Ok(());
-    };
-    if thread.thread().id() == thread::current().id() {
+    let on_service_thread = self
+      .thread
+      .as_ref()
+      .is_some_and(|thread| thread.thread().id() == thread::current().id());
+    let on_close_thread = self
+      .close_worker
+      .as_ref()
+      .is_some_and(|thread| thread.thread().id() == thread::current().id());
+    if on_service_thread || on_close_thread {
       return Err(ReactorError::WouldDeadlock);
     }
-    thread.join().map_err(|payload| {
+    let current_callback = in_callback(&self.shared);
+    let mut panicked = false;
+    if let Some(thread) = self.thread.take()
+      && let Err(payload) = thread.join()
+    {
+      panicked = true;
       drop_contained(payload);
-      ReactorError::DriverPanicked
-    })
+    }
+    if !current_callback
+      && let Some(thread) = self.close_worker.take()
+      && let Err(payload) = thread.join()
+    {
+      panicked = true;
+      drop_contained(payload);
+    }
+    if panicked || self.shutdown_panicked {
+      Err(ReactorError::DriverPanicked)
+    } else {
+      Ok(())
+    }
+  }
+
+  fn lock_panic_payloads(&self) -> MutexGuard<'_, Vec<Box<dyn Any + Send>>> {
+    self
+      .panic_payloads
+      .lock()
+      .unwrap_or_else(PoisonError::into_inner)
+  }
+
+  fn take_panic_payloads(&self) -> Vec<Box<dyn Any + Send>> {
+    std::mem::take(&mut *self.lock_panic_payloads())
+  }
+
+  fn drop_panic_payloads(&self) {
+    for payload in self.take_panic_payloads() {
+      drop_contained(payload);
+    }
   }
 }
 
@@ -1461,6 +1566,8 @@ impl Drop for Reactor {
     // Dropping the `JoinHandle` detaches; the thread sees the close and
     // exits. Dropping the reactor never blocks on a waker it is running.
     self.thread = None;
+    self.close_worker = None;
+    self.drop_panic_payloads();
   }
 }
 
@@ -1702,14 +1809,16 @@ impl<'a, T> Future for Readiness<'a, T> {
 
   fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
     let this = self.get_mut();
-    let inner = &this.fd.inner;
-    let shared = &inner.shared;
-    let polled = shared.poll_ready(inner.index, inner.generation, this.dir, &mut this.key, cx);
-    polled.map(|outcome| {
-      outcome.map_err(io::Error::from)?;
-      Ok(ReadinessGuard {
-        fd: this.fd,
-        dir: this.dir,
+    super::asynchronous::poll_cooperative(cx, |cx| {
+      let inner = &this.fd.inner;
+      let shared = &inner.shared;
+      let polled = shared.poll_ready(inner.index, inner.generation, this.dir, &mut this.key, cx);
+      polled.map(|outcome| {
+        outcome.map_err(io::Error::from)?;
+        Ok(ReadinessGuard {
+          fd: this.fd,
+          dir: this.dir,
+        })
       })
     })
   }
@@ -1748,14 +1857,16 @@ impl<T> Future for OwnedReadiness<T> {
 
   fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
     let this = self.get_mut();
-    let inner = &this.fd.inner;
-    let shared = &inner.shared;
-    let polled = shared.poll_ready(inner.index, inner.generation, this.dir, &mut this.key, cx);
-    polled.map(|outcome| {
-      outcome.map_err(io::Error::from)?;
-      Ok(OwnedReadinessGuard {
-        fd: this.fd.clone(),
-        dir: this.dir,
+    super::asynchronous::poll_cooperative(cx, |cx| {
+      let inner = &this.fd.inner;
+      let shared = &inner.shared;
+      let polled = shared.poll_ready(inner.index, inner.generation, this.dir, &mut this.key, cx);
+      polled.map(|outcome| {
+        outcome.map_err(io::Error::from)?;
+        Ok(OwnedReadinessGuard {
+          fd: this.fd.clone(),
+          dir: this.dir,
+        })
       })
     })
   }
@@ -1885,7 +1996,9 @@ mod tests {
   use std::thread::{self, Thread};
   use std::time::{Duration, Instant};
 
+  use crate::runtime::asynchronous::{AsyncConfig, AsyncJoinError, AsyncRuntime, AsyncShutdown};
   use rustix::fs::{OFlags, fcntl_getfl};
+  use std::future::poll_fn;
 
   use super::*;
 
@@ -1953,6 +2066,14 @@ mod tests {
       let now = Instant::now();
       assert!(now < limit, "lost wakeup: the waker never ran");
       thread::park_timeout(limit - now);
+    }
+  }
+
+  fn wait_until_polling(mut done: impl FnMut() -> bool) {
+    let limit = Instant::now() + WATCHDOG;
+    while !done() {
+      assert!(Instant::now() < limit, "condition timed out");
+      thread::sleep(Duration::from_millis(1));
     }
   }
 
@@ -2206,6 +2327,109 @@ mod tests {
     let read = guard.try_io(|stream| read_from(stream, &mut buf)).unwrap();
     assert_eq!(&buf[..read], b"pong");
     drop(readable);
+    reactor.shutdown().unwrap();
+  }
+
+  #[test]
+  fn public_readiness_gates_state_changes_and_yields_to_siblings() {
+    let (reactor, handle) = reactor(1, 2);
+    let (fd, mut peer) = registered(&handle);
+    let mut borrowed = fd.readable();
+    let runtime = AsyncRuntime::new(AsyncConfig {
+      workers: 1,
+      max_outstanding: 4,
+      max_scopes: 2,
+    })
+    .unwrap();
+
+    runtime
+      .block_on(poll_fn(|cx| {
+        assert!(Pin::new(&mut borrowed).poll(cx).is_pending());
+        assert_eq!(handle.waiters(), 1);
+        for _ in 0..64 {
+          assert!(super::super::asynchronous::poll_cooperative(cx, |_| Poll::Ready(())).is_ready());
+        }
+        assert!(super::super::asynchronous::poll_cooperative(cx, |_| Poll::Ready(())).is_pending());
+        Poll::Ready(())
+      }))
+      .unwrap();
+    peer.write_all(b"ready").unwrap();
+    wait_until_polling(|| match poll_with(&mut borrowed, Waker::noop()) {
+      Poll::Pending => false,
+      Poll::Ready(Ok(guard)) => {
+        guard.clear_ready();
+        true
+      }
+      Poll::Ready(Err(error)) => panic!("readiness wait failed: {error}"),
+    });
+    drop(borrowed);
+
+    peer.write_all(b"cached").unwrap();
+    let guard = block_on(fd.readable()).unwrap();
+    drop(guard);
+    let mut owned = fd.readable_owned();
+    runtime
+      .block_on(poll_fn(|cx| {
+        for _ in 0..64 {
+          assert!(super::super::asynchronous::poll_cooperative(cx, |_| Poll::Ready(())).is_ready());
+        }
+        assert!(Pin::new(&mut owned).poll(cx).is_pending());
+        assert_eq!(
+          handle.waiters(),
+          0,
+          "zero budget must not allocate a waiter"
+        );
+        Poll::Ready(())
+      }))
+      .unwrap();
+    runtime
+      .block_on(poll_fn(|cx| {
+        for _ in 0..63 {
+          assert!(super::super::asynchronous::poll_cooperative(cx, |_| Poll::Ready(())).is_ready());
+        }
+        assert!(
+          super::super::asynchronous::poll_cooperative(cx, |cx| { Pin::new(&mut owned).poll(cx) })
+            .is_ready()
+        );
+        assert!(super::super::asynchronous::poll_cooperative(cx, |_| Poll::Ready(())).is_pending());
+        Poll::Ready(())
+      }))
+      .unwrap();
+    drop(owned);
+
+    let progress = Arc::new(AtomicUsize::new(0));
+    let hot_progress = Arc::clone(&progress);
+    let hot_fd = fd.clone();
+    let hot = runtime
+      .handle()
+      .spawn(async move {
+        loop {
+          drop(hot_fd.readable().await.unwrap());
+          hot_progress.fetch_add(1, Ordering::SeqCst);
+        }
+      })
+      .unwrap();
+    wait_until_polling(|| progress.load(Ordering::SeqCst) > 0);
+    let sibling_ran = Arc::new(AtomicBool::new(false));
+    let sibling_flag = Arc::clone(&sibling_ran);
+    let sibling = runtime
+      .handle()
+      .spawn(async move {
+        sibling_flag.store(true, Ordering::SeqCst);
+      })
+      .unwrap();
+    wait_until_polling(|| sibling.is_finished());
+    assert!(sibling_ran.load(Ordering::SeqCst));
+    assert!(progress.load(Ordering::SeqCst) > 0);
+    hot.abort_handle().abort();
+    wait_until_polling(|| hot.is_finished());
+    assert!(matches!(
+      runtime.block_on(hot).unwrap(),
+      Err(AsyncJoinError::Cancelled)
+    ));
+    assert!(runtime.block_on(sibling).unwrap().is_ok());
+
+    runtime.shutdown(AsyncShutdown::Drain).unwrap();
     reactor.shutdown().unwrap();
   }
 

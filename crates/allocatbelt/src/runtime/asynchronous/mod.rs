@@ -39,11 +39,13 @@ mod handoff_tests;
 #[cfg(all(test, not(loom)))]
 mod tests;
 
+use std::any::Any;
 use std::fmt;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread::{self, JoinHandle};
 
 use crate::runtime::managed::ResourceScope;
+use crate::runtime::task::drop_contained;
 use scheduler::{ScopeRef, Shared};
 
 pub use entry::{
@@ -189,7 +191,10 @@ pub enum AsyncShutdown {
 pub struct AsyncRuntime {
   shared: Arc<Shared>,
   workers: Vec<JoinHandle<()>>,
+  panic_payloads: Mutex<Vec<Box<dyn Any + Send>>>,
   root: ScopeRef,
+  shutdown_complete: bool,
+  shutdown_panicked: bool,
 }
 
 impl AsyncRuntime {
@@ -198,7 +203,20 @@ impl AsyncRuntime {
   /// [`try_block_in_place`] on one of its turns returns
   /// [`BlockInPlaceErrorKind::Disabled`].
   pub fn new(config: AsyncConfig) -> Result<Self, AsyncError> {
-    Self::start(config, 0)
+    Self::start(config, 0, None)
+  }
+
+  /// Creates a runtime whose implicit root scope uses `resources` for every
+  /// root handle, worker context and task admitted through that root.
+  ///
+  /// This constructor is reserved for the owning runtime facade, which owns
+  /// the ledger alongside the executor. It binds the existing root scope and
+  /// therefore does not consume an additional scope slot.
+  pub(super) fn with_resources(
+    config: AsyncConfig,
+    resources: ResourceScope,
+  ) -> Result<Self, AsyncError> {
+    Self::start(config, 0, Some(resources))
   }
 
   /// Like [`AsyncRuntime::new`], and also prestarts
@@ -221,19 +239,39 @@ impl AsyncRuntime {
     if handoffs.max_handoffs == 0 {
       return Err(AsyncError::InvalidConfig);
     }
-    Self::start(config, handoffs.max_handoffs)
+    Self::start(config, handoffs.max_handoffs, None)
   }
 
-  fn start(config: AsyncConfig, max_handoffs: usize) -> Result<Self, AsyncError> {
+  /// Resource-bound counterpart used by the owning facade.
+  pub(super) fn with_resources_and_handoffs(
+    config: AsyncConfig,
+    handoffs: HandoffConfig,
+    resources: ResourceScope,
+  ) -> Result<Self, AsyncError> {
+    if handoffs.max_handoffs == 0 {
+      return Err(AsyncError::InvalidConfig);
+    }
+    Self::start(config, handoffs.max_handoffs, Some(resources))
+  }
+
+  fn start(
+    config: AsyncConfig,
+    max_handoffs: usize,
+    resources: Option<ResourceScope>,
+  ) -> Result<Self, AsyncError> {
     if config.workers == 0 || config.max_outstanding == 0 || config.max_scopes == 0 {
       return Err(AsyncError::InvalidConfig);
     }
     let Some(threads) = config.workers.checked_add(max_handoffs) else {
       return Err(AsyncError::InvalidConfig);
     };
-    let (shared, root) = Shared::new(config, max_handoffs)?;
+    let (shared, root) = Shared::new(config, max_handoffs, resources)?;
     let mut workers = Vec::new();
     workers
+      .try_reserve_exact(threads)
+      .map_err(|_| AsyncError::OutOfMemory)?;
+    let mut panic_payloads = Vec::new();
+    panic_payloads
       .try_reserve_exact(threads)
       .map_err(|_| AsyncError::OutOfMemory)?;
     for index in 0..threads {
@@ -265,7 +303,10 @@ impl AsyncRuntime {
     Ok(Self {
       shared,
       workers,
+      panic_payloads: Mutex::new(panic_payloads),
       root,
+      shutdown_complete: false,
+      shutdown_panicked: false,
     })
   }
 
@@ -275,7 +316,7 @@ impl AsyncRuntime {
     AsyncHandle {
       shared: Arc::clone(&self.shared),
       scope: self.root,
-      resources: None,
+      resources: self.shared.root_resources(),
     }
   }
 
@@ -283,8 +324,9 @@ impl AsyncRuntime {
   /// future need not be `Send` or `'static`; spawned tasks remain owned and
   /// `Send + 'static`. Calling this from an executor worker or from another
   /// `block_on` on the same thread returns an error. This runtime-root poll
-  /// has no task ID or managed-resource binding, and clears any enclosing
-  /// task's resource context until it returns.
+  /// has no task ID. A runtime created by the owning facade binds its root
+  /// ledger for this poll; otherwise it clears any enclosing task's resource
+  /// context until it returns.
   pub fn block_on<F: std::future::Future>(&self, future: F) -> Result<F::Output, AsyncError> {
     self.handle().block_on(future)
   }
@@ -340,13 +382,76 @@ impl AsyncRuntime {
     }
     self.shared.close(mode == AsyncShutdown::CancelPending);
     let mut panicked = false;
-    for worker in self.workers.drain(..) {
-      panicked |= worker.join().is_err();
+    for worker in std::mem::take(&mut self.workers) {
+      if let Err(payload) = worker.join() {
+        panicked = true;
+        self.lock_panic_payloads().push(payload);
+      }
     }
-    if panicked {
+    let result = if panicked || self.shutdown_panicked {
       Err(AsyncError::WorkerPanicked)
     } else {
       Ok(())
+    };
+    self.drop_panic_payloads();
+    result
+  }
+
+  /// Requests close without waiting for task polling or destructors. The
+  /// owner remains available for [`AsyncRuntime::poll_shutdown`] until every
+  /// worker and handoff helper has exited.
+  pub(super) fn request_shutdown(&mut self, mode: AsyncShutdown) {
+    self.shared.close(mode == AsyncShutdown::CancelPending);
+  }
+
+  /// Checks real worker completion without blocking. It joins workers only
+  /// after every worker has exited; `Pending` retains all remaining owners.
+  /// If a worker panicked, its panic payload remains owned by this runtime
+  /// until the runtime is explicitly shut down or dropped. Dropping that
+  /// payload may run user code and block.
+  pub(super) fn poll_shutdown(&mut self) -> Result<bool, AsyncError> {
+    if self.shutdown_complete {
+      return if self.shutdown_panicked {
+        Err(AsyncError::WorkerPanicked)
+      } else {
+        Ok(true)
+      };
+    }
+    if self.workers.iter().any(|worker| !worker.is_finished()) {
+      return Ok(false);
+    }
+    for worker in std::mem::take(&mut self.workers) {
+      if let Err(payload) = worker.join() {
+        self.shutdown_panicked = true;
+        self.lock_panic_payloads().push(payload);
+      }
+    }
+    self.shutdown_complete = true;
+    if self.shutdown_panicked {
+      Err(AsyncError::WorkerPanicked)
+    } else {
+      Ok(true)
+    }
+  }
+
+  pub(super) fn shutdown_complete(&self) -> bool {
+    self.shutdown_complete
+  }
+
+  fn lock_panic_payloads(&self) -> MutexGuard<'_, Vec<Box<dyn Any + Send>>> {
+    self
+      .panic_payloads
+      .lock()
+      .unwrap_or_else(PoisonError::into_inner)
+  }
+
+  fn take_panic_payloads(&self) -> Vec<Box<dyn Any + Send>> {
+    std::mem::take(&mut *self.lock_panic_payloads())
+  }
+
+  fn drop_panic_payloads(&self) {
+    for payload in self.take_panic_payloads() {
+      drop_contained(payload);
     }
   }
 }
@@ -356,6 +461,7 @@ impl Drop for AsyncRuntime {
     self.shared.close(true);
     // Dropping JoinHandles detaches. Runtime drop never blocks on user work.
     self.workers.clear();
+    self.drop_panic_payloads();
   }
 }
 

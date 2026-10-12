@@ -106,6 +106,7 @@
 #![forbid(unsafe_code)]
 #![cfg_attr(not(test), deny(clippy::expect_used, clippy::unwrap_used))]
 
+use std::any::Any;
 use std::fmt;
 use std::future::Future;
 use std::panic::{self, AssertUnwindSafe};
@@ -148,8 +149,8 @@ pub enum TimerError {
   Closed,
   /// The service thread could not be started.
   Spawn,
-  /// [`TimerDriver::shutdown`] ran on the service thread, which cannot join
-  /// itself. The driver is closed nonetheless.
+  /// [`TimerDriver::shutdown`] ran on the service or close thread, which
+  /// cannot join itself. The driver is closed nonetheless.
   WouldDeadlock,
   /// The service thread panicked.
   DriverPanicked,
@@ -163,7 +164,7 @@ impl fmt::Display for TimerError {
       Self::OutOfMemory => "timer registration storage could not be reserved",
       Self::Closed => "timer driver is closed",
       Self::Spawn => "timer service thread could not be started",
-      Self::WouldDeadlock => "timer shutdown from its service thread would deadlock",
+      Self::WouldDeadlock => "timer shutdown from one of its own threads would deadlock",
       Self::DriverPanicked => "timer service thread panicked",
     })
   }
@@ -702,6 +703,10 @@ impl Shared {
   fn is_closed(&self) -> bool {
     lock(&self.state).closed
   }
+
+  fn close_complete(&self) -> bool {
+    lock(&self.state).close_complete
+  }
 }
 
 /// Takes up to [`BATCH`] registrations off the front of the queue: those
@@ -790,6 +795,9 @@ fn drive(shared: &Shared) {
 pub struct TimerDriver {
   shared: Arc<Shared>,
   thread: Option<JoinHandle<()>>,
+  close_worker: Option<JoinHandle<()>>,
+  panic_payloads: Mutex<Vec<Box<dyn Any + Send>>>,
+  shutdown_panicked: bool,
 }
 
 impl TimerDriver {
@@ -833,6 +841,10 @@ impl TimerDriver {
       wakeup: Condvar::new(),
       max_registered,
     });
+    let mut panic_payloads = Vec::new();
+    panic_payloads
+      .try_reserve_exact(2)
+      .map_err(|_| TimerError::OutOfMemory)?;
     let worker = Arc::clone(&shared);
     let thread = thread::Builder::new()
       .name("allocatbelt-timer".into())
@@ -841,6 +853,9 @@ impl TimerDriver {
     Ok(Self {
       shared,
       thread: Some(thread),
+      close_worker: None,
+      panic_payloads: Mutex::new(panic_payloads),
+      shutdown_panicked: false,
     })
   }
 
@@ -852,6 +867,56 @@ impl TimerDriver {
     }
   }
 
+  /// Starts close completion on a retained helper thread. Registered wakers
+  /// are arbitrary caller code, so the owning facade uses this nonblocking
+  /// request before checking completion on later calls.
+  pub(super) fn request_shutdown(&mut self) -> std::io::Result<()> {
+    if self.close_worker.is_some() || self.shared.close_complete() {
+      return Ok(());
+    }
+    let shared = Arc::clone(&self.shared);
+    let close_worker = thread::Builder::new()
+      .name("allocatbelt-timer-close".into())
+      .spawn(move || shared.close(false))?;
+    self.close_worker = Some(close_worker);
+    Ok(())
+  }
+
+  /// Returns `Pending` until close callbacks and the service thread have
+  /// actually finished. It joins only threads already known to have exited.
+  /// Thread panic payloads remain owned by this driver; their destructors can
+  /// run and block when it is explicitly shut down or dropped.
+  pub(super) fn poll_shutdown(&mut self) -> Result<bool, TimerError> {
+    if self
+      .thread
+      .as_ref()
+      .is_some_and(|thread| thread.is_finished())
+      && let Some(thread) = self.thread.take()
+      && let Err(payload) = thread.join()
+    {
+      self.shutdown_panicked = true;
+      self.lock_panic_payloads().push(payload);
+    }
+    if self
+      .close_worker
+      .as_ref()
+      .is_some_and(|thread| thread.is_finished())
+      && let Some(thread) = self.close_worker.take()
+      && let Err(payload) = thread.join()
+    {
+      self.shutdown_panicked = true;
+      self.lock_panic_payloads().push(payload);
+    }
+    if !self.shared.close_complete() || self.thread.is_some() || self.close_worker.is_some() {
+      return Ok(false);
+    }
+    if self.shutdown_panicked {
+      Err(TimerError::DriverPanicked)
+    } else {
+      Ok(true)
+    }
+  }
+
   /// Closes the driver, resolving and waking every registered sleep with
   /// `Closed` before returning, then waits for the service thread to exit.
   /// The thread that first claims close runs the wakers; concurrent callers
@@ -859,24 +924,57 @@ impl TimerDriver {
   ///
   /// # Errors
   ///
-  /// `WouldDeadlock` when called on the service thread, which is then left
-  /// to exit on its own; `DriverPanicked` when the service thread panicked.
+  /// `WouldDeadlock` when called on the service or close thread, which is
+  /// then left to exit on its own; `DriverPanicked` when either thread
+  /// panicked.
   pub fn shutdown(mut self) -> Result<(), TimerError> {
     let on_service_thread = self
       .thread
       .as_ref()
       .is_some_and(|thread| thread.thread().id() == thread::current().id());
     self.shared.close(on_service_thread);
-    if on_service_thread {
+    let on_close_thread = self
+      .close_worker
+      .as_ref()
+      .is_some_and(|thread| thread.thread().id() == thread::current().id());
+    if on_service_thread || on_close_thread {
       return Err(TimerError::WouldDeadlock);
     }
-    let Some(thread) = self.thread.take() else {
-      return Ok(());
-    };
-    thread.join().map_err(|payload| {
+    let mut panicked = false;
+    if let Some(thread) = self.thread.take()
+      && let Err(payload) = thread.join()
+    {
+      panicked = true;
       drop_contained(payload);
-      TimerError::DriverPanicked
-    })
+    }
+    if let Some(thread) = self.close_worker.take()
+      && let Err(payload) = thread.join()
+    {
+      panicked = true;
+      drop_contained(payload);
+    }
+    if panicked || self.shutdown_panicked {
+      Err(TimerError::DriverPanicked)
+    } else {
+      Ok(())
+    }
+  }
+
+  fn lock_panic_payloads(&self) -> MutexGuard<'_, Vec<Box<dyn Any + Send>>> {
+    self
+      .panic_payloads
+      .lock()
+      .unwrap_or_else(PoisonError::into_inner)
+  }
+
+  fn take_panic_payloads(&self) -> Vec<Box<dyn Any + Send>> {
+    std::mem::take(&mut *self.lock_panic_payloads())
+  }
+
+  fn drop_panic_payloads(&self) {
+    for payload in self.take_panic_payloads() {
+      drop_contained(payload);
+    }
   }
 }
 
@@ -951,6 +1049,8 @@ impl Drop for TimerDriver {
     // Dropping the `JoinHandle` detaches; the thread sees the close and
     // exits. Dropping the driver never blocks on a waker it is running.
     self.thread = None;
+    self.close_worker = None;
+    self.drop_panic_payloads();
   }
 }
 

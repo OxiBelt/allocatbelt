@@ -88,6 +88,8 @@ pub mod channel;
 pub mod concurrency;
 pub mod concurrency_macros;
 pub mod concurrency_many;
+#[cfg(not(loom))]
+pub mod driver;
 mod error;
 pub mod fs;
 #[cfg(not(loom))]
@@ -138,6 +140,11 @@ pub mod watch;
 mod worker;
 
 pub use crate::runtime::blocking::{Config, Handle, Runtime, ShutdownMode};
+#[cfg(not(loom))]
+pub use crate::runtime::driver::{
+  CurrentShutdown, CurrentThreadBuilder, CurrentThreadDriver, DriverBuildError,
+  DriverShutdownError, MultiShutdown, MultiThreadBuilder, MultiThreadDriver, ShutdownProgress,
+};
 pub use crate::runtime::error::{JoinError, SubmitError, SubmitErrorKind};
 pub use crate::runtime::job::{CancellationToken, Job};
 pub use crate::runtime::resources::Resources;

@@ -126,6 +126,7 @@ impl Shared {
   pub(super) fn new(
     config: AsyncConfig,
     max_handoffs: usize,
+    resources: Option<ResourceScope>,
   ) -> Result<(Arc<Self>, ScopeRef), AsyncError> {
     let mut tasks = Vec::new();
     tasks
@@ -161,7 +162,7 @@ impl Shared {
     else {
       return Err(AsyncError::InvalidConfig);
     };
-    let root_scope = Arc::new(ScopeCell::new(None, None, config.workers, None));
+    let root_scope = Arc::new(ScopeCell::new(None, None, config.workers, resources));
     scopes[0] = ScopeSlot {
       generation: 1,
       scope: Some(root_scope),
@@ -261,6 +262,15 @@ impl Shared {
 
   pub(super) fn default_scope_poll_limit(&self) -> usize {
     self.lock().scopes[0].quota.maximum()
+  }
+
+  pub(super) fn root_resources(&self) -> Option<ResourceScope> {
+    self
+      .lock()
+      .scopes
+      .first()
+      .and_then(|slot| slot.scope.as_ref())
+      .and_then(|scope| scope.resources.clone())
   }
 
   fn scope_snapshot(&self, scope_ref: ScopeRef) -> Option<super::AsyncScopeSnapshot> {
@@ -975,7 +985,7 @@ fn executor_thread<R>(shared: &Arc<Shared>, shard: usize, run: impl FnOnce() -> 
       index: 0,
       generation: 1,
     },
-    resources: None,
+    resources: shared.root_resources(),
   };
   let _runtime_context = super::entry::EnterGuard::enter(&worker_handle);
   let _dispatcher = handoff::DispatcherGuard::install(shared);
@@ -1122,6 +1132,7 @@ mod tests {
         max_scopes: 2,
       },
       0,
+      None,
     )
     .unwrap_or_else(|error| panic!("shared construction failed: {error}"));
     let scope = shared

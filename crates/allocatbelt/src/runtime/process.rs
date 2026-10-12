@@ -31,6 +31,7 @@
 #![forbid(unsafe_code)]
 #![cfg_attr(not(test), deny(clippy::expect_used, clippy::unwrap_used))]
 
+use std::any::Any;
 use std::fmt;
 use std::future::Future;
 use std::io;
@@ -69,6 +70,10 @@ pub struct ProcessDriver {
   shared: Arc<Shared>,
   reaper: Option<JoinHandle<()>>,
   reactor: Option<Reactor>,
+  reaper_panic: Mutex<Option<Box<dyn Any + Send>>>,
+  shutdown_requested: bool,
+  shutdown_complete: bool,
+  shutdown_error: Option<ProcessShutdownError>,
 }
 
 /// Policy used when a process driver is explicitly shut down.
@@ -336,15 +341,25 @@ impl ProcessDriver {
       force_pidfd_fallback,
     });
     let service = Arc::clone(&shared);
-    let reaper = thread::Builder::new()
+    let reaper = match thread::Builder::new()
       .name("allocatbelt-process-reaper".to_owned())
       .spawn(move || run_service(service, reaped, wakes))
-      .map_err(ProcessBuildError::Thread)?;
+    {
+      Ok(reaper) => reaper,
+      Err(error) => {
+        let _ = reactor.shutdown();
+        return Err(ProcessBuildError::Thread(error));
+      }
+    };
 
     Ok(Self {
       shared,
       reaper: Some(reaper),
       reactor: Some(reactor),
+      reaper_panic: Mutex::new(None),
+      shutdown_requested: false,
+      shutdown_complete: false,
+      shutdown_error: None,
     })
   }
 
@@ -436,6 +451,14 @@ impl ProcessDriver {
   /// actually been reaped. `KillAndWait` also applies to a spawn already in
   /// its OS call when that process is committed to the table.
   pub fn shutdown(&mut self, mode: ProcessShutdownMode) -> Result<(), ProcessShutdownError> {
+    if self.shutdown_complete {
+      let result = match self.shutdown_error {
+        Some(error) => Err(error),
+        None => Ok(()),
+      };
+      self.drop_reaper_panic();
+      return result;
+    }
     close_admission(&self.shared, mode);
     if self.shared.signal.is_current_thread() {
       return Err(ProcessShutdownError::WouldDeadlock);
@@ -471,6 +494,86 @@ impl ProcessDriver {
       Ok(())
     }
   }
+
+  /// Closes admission and requests shutdown of the private pidfd reactor.
+  /// This does not wait for a child or run a process completion waker.
+  pub(crate) fn request_shutdown(&mut self, mode: ProcessShutdownMode) -> std::io::Result<()> {
+    if self.shutdown_complete {
+      return Ok(());
+    }
+    close_admission(&self.shared, mode);
+    if let Some(reactor) = self.reactor.as_mut() {
+      reactor.request_shutdown()?;
+    }
+    self.shutdown_requested = true;
+    Ok(())
+  }
+
+  /// Checks whether all children were reaped and the private reactor thread
+  /// exited. It never waits for a child or joins a live service thread. A
+  /// reaper panic payload stays owned by this driver; dropping that payload
+  /// can run user code and block when the driver is explicitly shut down or
+  /// dropped.
+  pub(crate) fn poll_shutdown(&mut self) -> Result<bool, ProcessShutdownError> {
+    if self.shutdown_complete {
+      return match self.shutdown_error {
+        Some(error) => Err(error),
+        None => Ok(true),
+      };
+    }
+    if !self.shutdown_requested {
+      return Ok(false);
+    }
+    let (worker_exited, worker_panicked) = {
+      let state = lock(&self.shared.state);
+      (state.worker_exited, state.worker_panicked)
+    };
+    if !worker_exited
+      || self
+        .reaper
+        .as_ref()
+        .is_some_and(|reaper| !reaper.is_finished())
+    {
+      return Ok(false);
+    }
+    if let Some(reaper) = self.reaper.take()
+      && let Err(payload) = reaper.join()
+    {
+      *lock(&self.reaper_panic) = Some(payload);
+      self.shutdown_error = Some(ProcessShutdownError::ReaperPanicked);
+    }
+    if worker_panicked {
+      self.shutdown_error = Some(ProcessShutdownError::ReaperPanicked);
+    }
+    if let Some(reactor) = self.reactor.as_mut() {
+      match reactor.poll_shutdown() {
+        Ok(false) => return Ok(false),
+        Ok(true) => self.reactor = None,
+        Err(_) => {
+          self.shutdown_error = Some(ProcessShutdownError::ReactorPanicked);
+        }
+      }
+    }
+    self.shutdown_complete = true;
+    match self.shutdown_error {
+      Some(error) => Err(error),
+      None => Ok(true),
+    }
+  }
+
+  pub(crate) fn shutdown_complete(&self) -> bool {
+    self.shutdown_complete
+  }
+
+  fn take_reaper_panic(&self) -> Option<Box<dyn Any + Send>> {
+    lock(&self.reaper_panic).take()
+  }
+
+  fn drop_reaper_panic(&self) {
+    if let Some(payload) = self.take_reaper_panic() {
+      drop_contained(payload);
+    }
+  }
 }
 
 impl Drop for ProcessDriver {
@@ -482,6 +585,8 @@ impl Drop for ProcessDriver {
     // Reactor::drop is itself nonblocking and switches registered pidfds to
     // the service's fixed-cadence try_wait fallback.
     self.reactor.take();
+    // A reaper panic payload is dropped only after releasing its mutex.
+    self.drop_reaper_panic();
   }
 }
 
@@ -610,21 +715,23 @@ impl Future for ChildWait<'_> {
     if this.completed {
       return Poll::Ready(Err(WaitError::AlreadyCompleted));
     }
-    match this
-      .child
-      .completion
-      .poll_register(&mut this.waiter, cx.waker())
-    {
-      Ok(Registration::Ready(outcome)) => {
-        this.completed = true;
-        Poll::Ready(outcome)
+    super::asynchronous::poll_cooperative(cx, |cx| {
+      match this
+        .child
+        .completion
+        .poll_register(&mut this.waiter, cx.waker())
+      {
+        Ok(Registration::Ready(outcome)) => {
+          this.completed = true;
+          Poll::Ready(outcome)
+        }
+        Ok(Registration::Pending) => Poll::Pending,
+        Err(error) => {
+          this.completed = true;
+          Poll::Ready(Err(error))
+        }
       }
-      Ok(Registration::Pending) => Poll::Pending,
-      Err(error) => {
-        this.completed = true;
-        Poll::Ready(Err(error))
-      }
-    }
+    })
   }
 }
 
@@ -1013,7 +1120,9 @@ mod tests {
   use super::{
     ProcessBuildError, ProcessDriver, ProcessShutdownMode, SpawnErrorKind, WaitError, WakeSignal,
   };
+  use crate::runtime::asynchronous::{AsyncConfig, AsyncRuntime, AsyncShutdown};
   use std::future::Future;
+  use std::future::poll_fn;
   use std::io::{Read, Write};
   use std::process::{Command, Stdio};
   use std::sync::Arc;
@@ -1234,6 +1343,62 @@ mod tests {
     let status = block_on(child.wait()).unwrap();
     assert!(status.success());
     assert_eq!(child.try_wait(), Ok(Some(status)));
+  }
+
+  #[test]
+  fn child_wait_gates_registration_and_refunds_pending_polls() {
+    let runtime = AsyncRuntime::new(AsyncConfig {
+      workers: 1,
+      max_outstanding: 2,
+      max_scopes: 1,
+    })
+    .unwrap();
+    let mut driver = ProcessDriver::new(1).unwrap();
+    let mut child = driver.spawn(helper("long-sleep")).unwrap();
+    let mut wait = Box::pin(child.wait());
+
+    runtime
+      .block_on(poll_fn(|cx| {
+        for _ in 0..64 {
+          assert!(super::super::asynchronous::poll_cooperative(cx, |_| Poll::Ready(())).is_ready());
+        }
+        assert!(wait.as_mut().poll(cx).is_pending());
+        assert!(
+          wait.waiter.is_none(),
+          "zero budget must not register a waiter"
+        );
+        Poll::Ready(())
+      }))
+      .unwrap();
+
+    runtime
+      .block_on(poll_fn(|cx| {
+        assert!(wait.as_mut().poll(cx).is_pending());
+        assert!(wait.waiter.is_some());
+        for _ in 0..64 {
+          assert!(super::super::asynchronous::poll_cooperative(cx, |_| Poll::Ready(())).is_ready());
+        }
+        assert!(super::super::asynchronous::poll_cooperative(cx, |_| Poll::Ready(())).is_pending());
+        Poll::Ready(())
+      }))
+      .unwrap();
+
+    driver.shutdown(ProcessShutdownMode::KillAndWait).unwrap();
+    runtime
+      .block_on(poll_fn(|cx| {
+        assert!(matches!(wait.as_mut().poll(cx), Poll::Ready(Ok(_))));
+        for _ in 0..63 {
+          assert!(super::super::asynchronous::poll_cooperative(cx, |_| Poll::Ready(())).is_ready());
+        }
+        assert_eq!(
+          wait.as_mut().poll(cx),
+          Poll::Ready(Err(WaitError::AlreadyCompleted))
+        );
+        Poll::Ready(())
+      }))
+      .unwrap();
+    drop(wait);
+    runtime.shutdown(AsyncShutdown::Drain).unwrap();
   }
 
   #[test]

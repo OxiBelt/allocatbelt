@@ -1696,3 +1696,32 @@ wire bandwidth or operation-slot permits. Owning-facade bucket getters permit
 explicit use; network and filesystem enforcement adapters require their own
 integration and acceptance. A bucket configured on a builder alone does not
 automatically intercept lower-level I/O.
+
+## Owning driver facades
+
+`runtime::driver::CurrentThreadBuilder` and `MultiThreadBuilder` construct typed
+local and worker-pool owners for explicitly selected timer, readiness, blocking,
+filesystem, process and signal services. Existing low-level constructors remain
+available. The facade binds the executor's existing implicit root, borrowed
+root polls, owned children and local cross-thread imports to the same managed
+resource ledger; a second scope is not needed when `max_scopes = 1`. Filesystem
+handles use the selected blocking pool and that ledger. Signal installation is
+last during startup because its process-global bridge remains permanent.
+
+`request_shutdown` closes executor admission. `try_shutdown` reports
+`ShutdownProgress::Pending` while task cleanup, blocking work, child reaping,
+callbacks or service threads remain owned. Async/local work finishes first,
+followed by blocking work and child reaping; timer and readiness services close
+last so admitted drains retain their dependencies. Status calls retain joined
+worker panic payloads and return sticky typed failures instead of running their
+destructors on the caller. Explicit cleanup and owner destruction contain
+payload destructor panics, but a blocking destructor can still delay them.
+
+Local future and queued-blocking capture cleanup is explicit through
+`drive_shutdown_step`; it can invoke arbitrary caller code and has no finite
+wall-time guarantee. Keep an unfinished facade owner alive until cleanup
+completes. Process-wide signal bridge lifetime is not included in
+`ShutdownProgress::Complete`. These ownership operations do not yet provide
+automatic CPU enforcement, runtime metrics, a sampling service or paused-clock
+automatic advancement. Their qualification remains separate from the full
+replacement and performance gates.
