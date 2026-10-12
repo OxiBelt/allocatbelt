@@ -46,8 +46,7 @@ use crate::runtime::job::{CancellationToken, Job};
 use crate::runtime::managed::{
   ManagedBuf, OperationPermit, OperationRequest, ResourceError, ResourceScope,
 };
-#[cfg(not(loom))]
-use crate::runtime::resource_domain::DomainError;
+use crate::runtime::resource_domain::{ControlCharge, DomainError};
 #[cfg(all(feature = "resource-feedback", not(loom)))]
 use crate::runtime::resource_feedback_meter::IoFeedbackMeter;
 use crate::runtime::resources::Resources;
@@ -98,6 +97,8 @@ pub enum FsSubmissionErrorKind {
   Resource(ResourceError),
   /// The blocking runtime rejected the job.
   Runtime(SubmitErrorKind),
+  /// The tenant could not retain the declared request metadata.
+  Domain(DomainError),
 }
 
 impl std::fmt::Display for FsSubmissionErrorKind {
@@ -106,6 +107,7 @@ impl std::fmt::Display for FsSubmissionErrorKind {
       Self::InvalidInput => f.write_str("filesystem operation rejected invalid input"),
       Self::Resource(error) => write!(f, "filesystem operation refused: {error}"),
       Self::Runtime(error) => write!(f, "filesystem operation refused: {error}"),
+      Self::Domain(error) => write!(f, "filesystem request metadata refused: {error}"),
     }
   }
 }
@@ -842,6 +844,18 @@ impl FsHandle {
     I: Send + 'static,
     T: Send + 'static,
   {
+    let control = match ControlCharge::try_new(
+      self.scope.tenant_domain(),
+      std::mem::size_of::<SharedRequest<I>>(),
+    ) {
+      Ok(control) => control,
+      Err(error) => {
+        return Err(FsSubmissionError {
+          kind: FsSubmissionErrorKind::Domain(error),
+          input,
+        });
+      }
+    };
     let permit = match self.scope.try_acquire(OperationRequest {
       disk: 1,
       network: 0,
@@ -854,7 +868,10 @@ impl FsHandle {
         });
       }
     };
-    let request = Arc::new(Mutex::new(Some(ReservedInput { input, permit })));
+    let request = Arc::new(SharedRequest {
+      input: Mutex::new(Some(ReservedInput { input, permit })),
+      _control: control,
+    });
     let worker_request = Arc::clone(&request);
     match self.blocking.try_spawn(Resources::ZERO, move |token| {
       let ReservedInput { input, permit } = take_request(&worker_request);
@@ -880,6 +897,13 @@ impl FsHandle {
   }
 }
 
+// The declared shared payload includes the owned input value and the mutex,
+// not caller-owned allocations reachable from that input or Arc headers.
+struct SharedRequest<I> {
+  input: Mutex<Option<ReservedInput<I>>>,
+  _control: ControlCharge,
+}
+
 struct ReservedInput<I> {
   // Field order keeps the permit alive through input destruction on queued
   // cancellation; Rust drops fields in declaration order.
@@ -891,8 +915,8 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
   mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-fn take_request<I>(request: &Mutex<Option<ReservedInput<I>>>) -> ReservedInput<I> {
-  match lock(request).take() {
+fn take_request<I>(request: &SharedRequest<I>) -> ReservedInput<I> {
+  match lock(&request.input).take() {
     Some(request) => request,
     None => panic!("filesystem request was consumed before its worker started"),
   }

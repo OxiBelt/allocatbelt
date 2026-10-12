@@ -754,3 +754,119 @@ fn shared_read_buffer_is_rejected_unchanged_before_disk_admission() {
   assert_eq!(scope.snapshot().managed_memory, 0);
   runtime.shutdown(ShutdownMode::Drain).unwrap();
 }
+
+fn controlled_scope() -> (
+  crate::runtime::resource_domain::ResourceDomain,
+  ResourceScope,
+) {
+  use crate::runtime::resource_domain::{DomainResource, DomainResources, ResourceDomain};
+  let limits = DomainResources::ZERO
+    .with(DomainResource::Control, 1 << 20)
+    .with(DomainResource::Disk, 1);
+  let domain = ResourceDomain::new(limits, 1).unwrap();
+  let tenant = domain.tenant(limits).unwrap();
+  let scope = ResourceScope::try_from_tenant(
+    ResourceLimits {
+      managed_memory: 0,
+      disk_concurrent_ops: 1,
+      network_concurrent_ops: 0,
+    },
+    tenant,
+  )
+  .unwrap();
+  (domain, scope)
+}
+
+#[test]
+fn metadata_refusal_recovers_input_before_disk_or_job_admission() {
+  use crate::runtime::resource_domain::{DomainError, DomainResource};
+  let (domain, scope) = controlled_scope();
+  let mut runtime = runtime(1, 1);
+  let handle = FsHandle::new(runtime.handle(), scope.clone());
+  let before = domain.snapshot();
+  domain
+    .set_limits(before.limit.with(
+      DomainResource::Control,
+      before.used.get(DomainResource::Control),
+    ))
+    .unwrap();
+  let before = domain.snapshot();
+  let called = Arc::new(AtomicBool::new(false));
+  let observed = called.clone();
+  let input = String::from("unchanged owned input");
+  let pointer = input.as_ptr();
+  let error = handle
+    .submit(input, move |_, _| observed.store(true, Ordering::SeqCst))
+    .unwrap_err();
+  assert_eq!(
+    error.kind,
+    FsSubmissionErrorKind::Domain(DomainError::Exhausted(DomainResource::Control))
+  );
+  assert_eq!(error.input.as_ptr(), pointer);
+  assert!(!called.load(Ordering::SeqCst));
+  assert_eq!(scope.snapshot().disk_ops, 0);
+  assert_eq!(domain.snapshot(), before);
+  runtime.shutdown(ShutdownMode::Drain).unwrap();
+}
+
+#[test]
+fn detached_active_request_keeps_declared_metadata_until_closure_finishes() {
+  use crate::runtime::resource_domain::DomainResource;
+  let (domain, scope) = controlled_scope();
+  let mut runtime = runtime(1, 1);
+  let handle = FsHandle::new(runtime.handle(), scope.clone());
+  let baseline = domain.snapshot().used.get(DomainResource::Control);
+  let (started_tx, started_rx) = mpsc::channel();
+  let (release_tx, release_rx) = mpsc::channel();
+  let job = handle
+    .submit(17_u64, move |input, _| {
+      started_tx.send(()).unwrap();
+      release_rx.recv_timeout(WATCHDOG).unwrap();
+      input
+    })
+    .unwrap();
+  started_rx.recv_timeout(WATCHDOG).unwrap();
+  let charged = domain.snapshot().used.get(DomainResource::Control);
+  assert_eq!(
+    charged - baseline,
+    std::mem::size_of::<super::SharedRequest<u64>>()
+  );
+  drop(job);
+  assert_eq!(domain.snapshot().used.get(DomainResource::Control), charged);
+  assert_eq!(scope.snapshot().disk_ops, 1);
+  release_tx.send(()).unwrap();
+  runtime.shutdown(ShutdownMode::Drain).unwrap();
+  assert_eq!(scope.snapshot().disk_ops, 0);
+  assert_eq!(
+    domain.snapshot().used.get(DomainResource::Control),
+    baseline
+  );
+}
+
+#[test]
+fn cancelled_queued_request_releases_metadata_and_operation_together() {
+  use crate::runtime::resource_domain::DomainResource;
+  let (domain, scope) = controlled_scope();
+  let mut runtime = runtime(1, 2);
+  let handle = FsHandle::new(runtime.handle(), scope.clone());
+  let baseline = domain.snapshot().used.get(DomainResource::Control);
+  let (blocker, started, release) = gated_job(&runtime);
+  started.recv_timeout(WATCHDOG).unwrap();
+  let called = Arc::new(AtomicBool::new(false));
+  let observed = called.clone();
+  let job = handle
+    .submit(9_u64, move |_, _| observed.store(true, Ordering::SeqCst))
+    .unwrap();
+  assert!(domain.snapshot().used.get(DomainResource::Control) > baseline);
+  job.cancel();
+  release.send(()).unwrap();
+  assert!(matches!(job.join(), Err(JoinError::Cancelled)));
+  blocker.join().unwrap();
+  runtime.shutdown(ShutdownMode::Drain).unwrap();
+  assert!(!called.load(Ordering::SeqCst));
+  assert_eq!(scope.snapshot().disk_ops, 0);
+  assert_eq!(
+    domain.snapshot().used.get(DomainResource::Control),
+    baseline
+  );
+}
