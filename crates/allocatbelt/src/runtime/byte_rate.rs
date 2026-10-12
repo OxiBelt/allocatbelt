@@ -67,10 +67,21 @@ impl std::error::Error for ByteRateError {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub struct ByteRateSnapshot {
+  /// Current replenishment rate in application bytes per second.
   pub bytes_per_second: u64,
+  /// Current burst capacity in application bytes.
   pub burst_bytes: usize,
+  /// Construction-time maximum replenishment rate.
+  pub ceiling_bytes_per_second: u64,
+  /// Construction-time maximum burst capacity.
+  pub ceiling_burst_bytes: usize,
+  /// Construction-time maximum number of simultaneous reservation owners.
+  pub max_reservations: usize,
+  /// Tokens currently available for admission.
   pub available_bytes: usize,
+  /// Bytes held by live reservation owners.
   pub reserved_bytes: usize,
+  /// Live reservation owners; distinct from the configured maximum.
   pub reservations: usize,
 }
 
@@ -326,6 +337,9 @@ impl ByteRateLimit {
     ByteRateSnapshot {
       bytes_per_second: state.rate,
       burst_bytes: state.burst,
+      ceiling_bytes_per_second: state.ceilings.bytes_per_second,
+      ceiling_burst_bytes: state.ceilings.burst_bytes,
+      max_reservations: state.ceilings.max_reservations,
       available_bytes: state.available,
       reserved_bytes: state.reserved,
       reservations: state.reservations,
@@ -531,6 +545,34 @@ mod tests {
     limit.set_limits_at(10, 100, start).unwrap();
     assert_eq!(limit.snapshot().available_bytes, 50);
     assert_eq!(limit.set_limits(11, 100), Err(ByteRateError::AboveCeiling));
+  }
+
+  #[test]
+  fn snapshot_keeps_construction_ceilings_and_reservation_cap_after_lowering() {
+    let limit = bucket(10, 100, 3);
+    let first = limit.try_reserve(10).unwrap();
+    limit.set_limits(5, 60).unwrap();
+
+    let lowered = limit.snapshot();
+    assert_eq!(lowered.bytes_per_second, 5);
+    assert_eq!(lowered.burst_bytes, 60);
+    assert_eq!(lowered.ceiling_bytes_per_second, 10);
+    assert_eq!(lowered.ceiling_burst_bytes, 100);
+    assert_eq!(lowered.max_reservations, 3);
+    assert_eq!(lowered.reservations, 1);
+
+    let second = limit.try_reserve(10).unwrap();
+    let third = limit.try_reserve(10).unwrap();
+    let full = limit.snapshot();
+    assert_eq!(full.max_reservations, 3);
+    assert_eq!(full.reservations, 3);
+    assert_eq!(
+      limit.try_reserve(1).unwrap_err(),
+      ByteRateError::ReservationsFull
+    );
+
+    drop((first, second, third));
+    assert_eq!(limit.snapshot().reservations, 0);
   }
 
   #[test]
