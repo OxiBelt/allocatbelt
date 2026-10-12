@@ -17,7 +17,7 @@ use super::identity::TaskId;
 use super::{AsyncError, AsyncHandle};
 use crate::runtime::cpu_execution::{CpuExecutionGuard, active_for_domain};
 use crate::runtime::managed::ResourceScope;
-use crate::runtime::resource_domain::DomainReservation;
+use crate::runtime::resource_domain::{ControlCharge, DomainReservation};
 
 const DEFAULT_BUDGET: u16 = 64;
 
@@ -541,7 +541,9 @@ fn block_on_caller_thread_with_domain<F: Future>(
   tenant: Option<&crate::runtime::resource_domain::TenantDomain>,
   waiter: Option<&crate::runtime::resource_domain::DomainWaiter>,
 ) -> Result<F::Output, AsyncError> {
-  let parker = Arc::new(Parker::new(thread::current()));
+  let control = ControlCharge::try_new(tenant, std::mem::size_of::<Parker>())
+    .map_err(AsyncError::ResourceDomain)?;
+  let parker = Arc::new(Parker::new(thread::current(), control));
   let waker = Waker::from(Arc::clone(&parker));
   let mut context = Context::from_waker(&waker);
   let mut future = Box::pin(future);
@@ -591,13 +593,16 @@ fn block_on_caller_thread_with_domain<F: Future>(
 struct Parker {
   thread: Thread,
   notified: AtomicBool,
+  // Exported Waker clones retain the charged Parker until the final drop.
+  _control: ControlCharge,
 }
 
 impl Parker {
-  fn new(thread: Thread) -> Self {
+  fn new(thread: Thread, control: ControlCharge) -> Self {
     Self {
       thread,
       notified: AtomicBool::new(false),
+      _control: control,
     }
   }
 
@@ -768,6 +773,160 @@ mod tests {
     }
 
     assert_eq!(block_on_caller_thread(WakeOnFirstPoll(false)), 2);
+  }
+
+  #[test]
+  fn caller_parker_control_charge_follows_exported_waker_and_denial_skips_poll() {
+    use crate::runtime::asynchronous::{AsyncConfig, AsyncRuntime};
+    use crate::runtime::managed::{ResourceLimits, ResourceScope};
+    use crate::runtime::resource_domain::{
+      DomainError, DomainResource, DomainResources, ResourceDomain,
+    };
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct CaptureWaker {
+      polls: Arc<AtomicUsize>,
+      captured: Arc<std::sync::Mutex<Option<Waker>>>,
+    }
+
+    impl Future for CaptureWaker {
+      type Output = ();
+
+      fn poll(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
+        self.polls.fetch_add(1, Ordering::SeqCst);
+        *self
+          .captured
+          .lock()
+          .unwrap_or_else(|error| error.into_inner()) = Some(context.waker().clone());
+        Poll::Ready(())
+      }
+    }
+
+    let ceiling = DomainResources::ZERO
+      .with(DomainResource::Cpu, 2)
+      .with(DomainResource::Tasks, 8)
+      .with(DomainResource::Control, 1 << 20);
+    let domain = ResourceDomain::with_waiters(ceiling, 1, 8)
+      .unwrap_or_else(|error| panic!("resource domain setup failed: {error}"));
+    let tenant = domain
+      .tenant(ceiling)
+      .unwrap_or_else(|error| panic!("tenant setup failed: {error}"));
+    let resources = ResourceScope::from_tenant(ResourceLimits::default(), tenant.clone());
+    let runtime = AsyncRuntime::with_resources(
+      AsyncConfig {
+        workers: 1,
+        max_outstanding: 2,
+        max_scopes: 2,
+      },
+      resources,
+    )
+    .unwrap_or_else(|error| panic!("async runtime setup failed: {error}"));
+    let handle = runtime.handle();
+
+    let baseline = domain.snapshot().used.get(DomainResource::Control);
+    let tenant_baseline = tenant
+      .snapshot()
+      .unwrap_or_else(|error| panic!("tenant snapshot failed: {error}"))
+      .used
+      .get(DomainResource::Control);
+    let polls = Arc::new(AtomicUsize::new(0));
+    let captured = Arc::new(std::sync::Mutex::new(None));
+    handle
+      .block_on(CaptureWaker {
+        polls: Arc::clone(&polls),
+        captured: Arc::clone(&captured),
+      })
+      .unwrap_or_else(|error| panic!("resource-bound root poll failed: {error}"));
+    assert_eq!(polls.load(Ordering::SeqCst), 1);
+
+    let first = captured
+      .lock()
+      .unwrap_or_else(|error| error.into_inner())
+      .take()
+      .unwrap_or_else(|| panic!("root future did not export its waker"));
+    let final_clone = first.clone();
+    let parker_bytes = std::mem::size_of::<Parker>();
+    assert_eq!(
+      domain.snapshot().used.get(DomainResource::Control),
+      baseline + parker_bytes
+    );
+    assert_eq!(
+      tenant
+        .snapshot()
+        .unwrap_or_else(|error| panic!("tenant snapshot failed: {error}"))
+        .used
+        .get(DomainResource::Control),
+      tenant_baseline + parker_bytes
+    );
+    drop(first);
+    assert_eq!(
+      domain.snapshot().used.get(DomainResource::Control),
+      baseline + parker_bytes
+    );
+    drop(final_clone);
+    assert_eq!(
+      domain.snapshot().used.get(DomainResource::Control),
+      baseline
+    );
+    assert_eq!(
+      tenant
+        .snapshot()
+        .unwrap_or_else(|error| panic!("tenant snapshot failed: {error}"))
+        .used
+        .get(DomainResource::Control),
+      tenant_baseline
+    );
+
+    let frame_bytes = std::mem::size_of::<CaptureWaker>()
+      + std::mem::size_of::<super::super::scheduler::RootAdmission>();
+    let ceiling_with_root_frame = baseline + frame_bytes;
+    let domain_before = domain.snapshot();
+    let tenant_before = tenant
+      .snapshot()
+      .unwrap_or_else(|error| panic!("tenant snapshot failed: {error}"));
+    domain
+      .set_limits(
+        domain_before
+          .limit
+          .with(DomainResource::Control, ceiling_with_root_frame),
+      )
+      .unwrap_or_else(|error| panic!("global Control clamp failed: {error}"));
+    tenant
+      .set_limits(
+        tenant_before
+          .limit
+          .with(DomainResource::Control, tenant_baseline + frame_bytes),
+      )
+      .unwrap_or_else(|error| panic!("tenant Control clamp failed: {error}"));
+
+    let denied_polls = Arc::new(AtomicUsize::new(0));
+    let denied_capture = Arc::new(std::sync::Mutex::new(None));
+    assert_eq!(
+      handle.block_on(CaptureWaker {
+        polls: Arc::clone(&denied_polls),
+        captured: denied_capture,
+      }),
+      Err(AsyncError::ResourceDomain(DomainError::Exhausted(
+        DomainResource::Control
+      )))
+    );
+    assert_eq!(denied_polls.load(Ordering::SeqCst), 0);
+    assert_eq!(
+      domain.snapshot().used.get(DomainResource::Control),
+      baseline
+    );
+    assert_eq!(
+      tenant
+        .snapshot()
+        .unwrap_or_else(|error| panic!("tenant snapshot failed: {error}"))
+        .used
+        .get(DomainResource::Control),
+      tenant_baseline
+    );
+
+    runtime
+      .shutdown(crate::runtime::asynchronous::AsyncShutdown::Drain)
+      .unwrap_or_else(|error| panic!("async shutdown failed: {error}"));
   }
 
   #[test]
