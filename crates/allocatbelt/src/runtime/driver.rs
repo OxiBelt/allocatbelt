@@ -517,6 +517,11 @@ impl ServiceOptions {
         ))?;
     }
     if tenant.is_some() {
+      if self.reactor.is_some() {
+        bytes = bytes.checked_sub(std::mem::size_of::<Reactor>()).ok_or(
+          DriverBuildError::InvalidConfiguration("reactor metadata exceeds its facade"),
+        )?;
+      }
       let timers = usize::from(self.timer_registrations.is_some())
         + usize::from(self.rate_timer_capacity(max_outstanding)?.is_some());
       bytes = bytes
@@ -700,7 +705,13 @@ impl ServiceOptions {
       );
     }
     if let Some(config) = self.reactor {
-      startup.reactor = Some(Reactor::new(config).map_err(DriverBuildError::Reactor)?);
+      startup.reactor = Some(
+        match resources.tenant_domain() {
+          Some(tenant) => Reactor::new_in_tenant(config, tenant),
+          None => Reactor::new(config),
+        }
+        .map_err(DriverBuildError::Reactor)?,
+      );
     }
     if let Some(max_children) = self.process_children {
       startup.process = Some(ProcessDriver::new(max_children).map_err(DriverBuildError::Process)?);

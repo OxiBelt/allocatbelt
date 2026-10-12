@@ -40,8 +40,11 @@
 //! acquired; `T` must keep the returned descriptor valid and stable for that
 //! call. Closing and installing the duplicate are serialized, so a close
 //! that wins before installation leaves the original descriptor flags alone.
-//! Releasing deletes the duplicate from epoll and closes it; only then is
-//! the registration's capacity returned.
+//! Releasing deletes the duplicate from epoll and closes it before returning
+//! the registration slot. Close/release normally claim a full waiter batch in
+//! one preallocated buffer before callbacks run; if that buffer is already
+//! leased by reentrant work, an allocation-free one-at-a-time drain keeps the
+//! releasing slot reserved until its callbacks finish.
 //!
 //! The duplicate is added first, so a descriptor epoll cannot watch is
 //! refused with the kernel's own error (`EPERM` for a regular file or a
@@ -129,6 +132,8 @@
 //! Close waits for callbacks already claimed by the service thread or another
 //! closer. A callback closing its own reactor skips that wait to avoid waiting
 //! for itself; an external closer still waits for the full claimed batch.
+//! Callback-owner metadata uses a tenant-charged fixed table and a fixed TLS
+//! reentrancy stack for overflow callbacks.
 //!
 //! # Shutdown
 //!
@@ -139,7 +144,8 @@
 //! registration through any handle is refused with `Closed`, and an eventfd
 //! interrupts the service thread's `epoll_wait`. `shutdown` then joins the
 //! service thread unless it runs on that thread (from a waker the reactor
-//! wakes), where it returns [`ReactorError::WouldDeadlock`]. Dropping never
+//! wakes), or inside one of its callback scopes; those calls return
+//! [`ReactorError::WouldDeadlock`]. Dropping never
 //! joins. Registrations and their `T` may outlive the reactor; their waits
 //! resolve `Closed`, `try_io` on a guard obtained earlier still runs, and
 //! dropping them still releases their registration.
@@ -150,13 +156,15 @@
 //! priority (`EPOLLPRI`) readiness, no edge-triggered mode and no I/O
 //! helpers. Readiness wakes every waiter of a direction, which favours
 //! simplicity over avoiding a thundering herd. The bounds count
-//! registrations and waiters, not memory or kernel resources.
+//! registrations and waiters. The tenant-aware constructor also charges
+//! declared Rust metadata payloads, but this is not a physical-memory or
+//! kernel-resource bound.
 
 #![forbid(unsafe_code)]
 #![cfg_attr(not(test), deny(clippy::expect_used, clippy::unwrap_used))]
 
 use std::any::Any;
-use std::collections::{HashMap, TryReserveError};
+use std::collections::TryReserveError;
 use std::fmt;
 use std::fs::File;
 use std::future::Future;
@@ -174,12 +182,97 @@ use rustix::event::{EventfdFlags, eventfd};
 use rustix::fs::{self as rfs, OFlags};
 use rustix::io::Errno;
 
-use super::thread_completion::DeferredJoin;
+use super::thread_completion::{DeferredJoin, PreparedJoin, PreparedJoins};
 use crate::runtime::reactor_release::begin_if_no_waiters;
+use crate::runtime::resource_domain::{ControlCharge, DomainError, TenantDomain, payload_bytes};
 use crate::runtime::task::drop_contained;
 
 /// Events taken per `epoll_wait`.
 const EVENTS: usize = 64;
+/// The callback-owner table is fixed at the smaller of this limit and the
+/// configured waiter bound. Additional concurrent callback threads use a
+/// fixed, heap-free per-thread reentrancy stack instead of growing metadata.
+const MAX_CALLBACK_OWNERS: usize = 32;
+const CALLBACK_FALLBACK_DEPTH: usize = 32;
+
+const REACTOR_THREAD_NAME: &str = "allocatbelt-reactor";
+const CLOSE_THREAD_NAME: &str = "allocatbelt-reactor-close";
+
+#[derive(Clone, Copy)]
+struct CallbackFallbackStack {
+  shared: [usize; CALLBACK_FALLBACK_DEPTH],
+  depth: usize,
+  overflow: usize,
+}
+
+impl CallbackFallbackStack {
+  const EMPTY: Self = Self {
+    shared: [0; CALLBACK_FALLBACK_DEPTH],
+    depth: 0,
+    overflow: 0,
+  };
+}
+
+thread_local! {
+  /// Overflow callback ownership uses fixed TLS storage rather than growing
+  /// a reactor-owned table while arbitrary callbacks are already running.
+  static CALLBACK_FALLBACK: std::cell::Cell<CallbackFallbackStack> = const {
+    std::cell::Cell::new(CallbackFallbackStack::EMPTY)
+  };
+}
+
+#[derive(Clone, Copy)]
+enum CallbackFallbackMarker {
+  Slot { identity: usize },
+  Overflow,
+}
+
+fn push_callback_fallback(shared: &Shared) -> CallbackFallbackMarker {
+  let identity = shared as *const Shared as usize;
+  CALLBACK_FALLBACK.with(|cell| {
+    let mut value = cell.get();
+    let marker = if value.depth < CALLBACK_FALLBACK_DEPTH {
+      let index = value.depth;
+      value.shared[index] = identity;
+      value.depth += 1;
+      CallbackFallbackMarker::Slot { identity }
+    } else {
+      value.overflow += 1;
+      CallbackFallbackMarker::Overflow
+    };
+    cell.set(value);
+    marker
+  })
+}
+
+fn pop_callback_fallback(marker: CallbackFallbackMarker) {
+  CALLBACK_FALLBACK.with(|cell| {
+    let mut value = cell.get();
+    match marker {
+      CallbackFallbackMarker::Slot { identity } => {
+        debug_assert!(value.depth > 0);
+        debug_assert_eq!(value.shared[value.depth - 1], identity);
+        value.depth = value.depth.saturating_sub(1);
+        if value.depth < CALLBACK_FALLBACK_DEPTH {
+          value.shared[value.depth] = 0;
+        }
+      }
+      CallbackFallbackMarker::Overflow => {
+        debug_assert!(value.overflow > 0);
+        value.overflow = value.overflow.saturating_sub(1);
+      }
+    }
+    cell.set(value);
+  });
+}
+
+fn in_callback_fallback(shared: &Shared) -> bool {
+  let identity = shared as *const Shared as usize;
+  CALLBACK_FALLBACK.with(|fallback| {
+    let fallback = fallback.get();
+    fallback.overflow != 0 || fallback.shared[..fallback.depth].contains(&identity)
+  })
+}
 
 /// Bits of an event token holding the table index.
 const INDEX_BITS: u32 = 24;
@@ -226,11 +319,13 @@ pub enum ReactorError {
   /// A nonblocking shutdown join monitor could not be started. The original
   /// thread handle remains owned, and a later shutdown poll may retry.
   JoinMonitorSpawn,
-  /// [`Reactor::shutdown`] ran on the service or close thread, which cannot
-  /// join itself. The reactor is closed nonetheless.
+  /// [`Reactor::shutdown`] ran on the service or close thread, or from a
+  /// callback that would need to wait for itself. The reactor is closed.
   WouldDeadlock,
   /// The service thread panicked.
   DriverPanicked,
+  /// The tenant's Control budget refused reactor metadata.
+  Domain(DomainError),
 }
 
 impl ReactorError {
@@ -251,8 +346,9 @@ impl fmt::Display for ReactorError {
       Self::Closed => "reactor is closed",
       Self::Spawn => "reactor service thread could not be started",
       Self::JoinMonitorSpawn => "reactor shutdown join monitor could not be started",
-      Self::WouldDeadlock => "reactor shutdown from one of its own threads would deadlock",
+      Self::WouldDeadlock => "reactor shutdown would wait for its current worker or callback",
       Self::DriverPanicked => "reactor service thread panicked",
+      Self::Domain(_) => "resource domain refused reactor metadata",
     })
   }
 }
@@ -488,6 +584,12 @@ impl Waiters {
     self.table.len() - self.free.len()
   }
 
+  fn control_payload_bytes(&self) -> Result<usize, DomainError> {
+    payload_bytes::<Waiter>(self.table.capacity())?
+      .checked_add(payload_bytes::<u32>(self.free.capacity())?)
+      .ok_or(DomainError::Invalid)
+  }
+
   fn get_mut(&mut self, key: WaiterKey) -> Option<&mut Waiter> {
     let waiter = self.table.get_mut(key.index as usize)?;
     (waiter.id == key.id).then_some(waiter)
@@ -562,7 +664,7 @@ impl Waiters {
 /// A live registration's state.
 struct Entry {
   /// The reactor's duplicate, the descriptor added to epoll.
-  fd: OwnedFd,
+  fd: Option<OwnedFd>,
   /// Cached readiness bits.
   ready: u8,
   /// The interest the kernel may still report (armed and not yet
@@ -577,7 +679,7 @@ struct Entry {
 impl Entry {
   const fn new(fd: OwnedFd) -> Self {
     Self {
-      fd,
+      fd: Some(fd),
       ready: 0,
       armed: 0,
       error: None,
@@ -602,8 +704,9 @@ enum SlotState {
   /// Taken by a registration still being set up.
   Reserved,
   Live(Entry),
-  /// Being deleted from epoll; still charged.
-  Releasing,
+  /// Being deleted from epoll; still charged and retaining its waiter lists
+  /// so callbacks can be drained one at a time without allocating a Vec.
+  Releasing(Entry),
   /// Out of generations; never used again.
   Retired,
 }
@@ -699,6 +802,14 @@ impl State {
     })
   }
 
+  fn control_payload_bytes(&self) -> Result<usize, DomainError> {
+    let waiters = self.waiters.control_payload_bytes()?;
+    payload_bytes::<Slot>(self.slots.capacity())?
+      .checked_add(payload_bytes::<u32>(self.free_slots.capacity())?)
+      .and_then(|bytes| bytes.checked_add(waiters))
+      .ok_or(DomainError::Invalid)
+  }
+
   fn entry(&self, index: u32, generation: u64) -> Option<&Entry> {
     let slot = self.slots.get(index as usize)?;
     match &slot.state {
@@ -781,36 +892,59 @@ impl State {
   /// once, all outstanding waiters are freed, and its descriptor is returned
   /// to be deleted from epoll and closed. The slot stays charged until
   /// [`State::finish_release`].
-  fn begin_release(
-    &mut self,
-    index: u32,
-    generation: u64,
-    wakers: &mut Vec<Waker>,
-  ) -> Option<OwnedFd> {
+  fn begin_release(&mut self, index: u32, generation: u64) -> Option<OwnedFd> {
     let Self { slots, .. } = self;
     let slot = slots.get_mut(index as usize)?;
     if slot.generation != generation || !matches!(slot.state, SlotState::Live(_)) {
       return None;
     }
-    let released = std::mem::replace(&mut slot.state, SlotState::Releasing);
+    let released = std::mem::replace(&mut slot.state, SlotState::Reserved);
     let SlotState::Live(mut entry) = released else {
       return None;
     };
-    for list in &mut entry.lists {
-      self.waiters.drain(list, wakers);
+    let Some(fd) = entry.fd.take() else {
+      slot.state = SlotState::Live(entry);
+      return None;
+    };
+    slot.state = SlotState::Releasing(entry);
+    Some(fd)
+  }
+
+  /// Pops one waiter from a registration whose descriptor is being released.
+  /// The caller wakes it after dropping the state lock.
+  fn pop_release_waker(&mut self, index: u32, generation: u64) -> Option<Waker> {
+    let Self { slots, waiters, .. } = self;
+    let slot = slots.get_mut(index as usize)?;
+    if slot.generation != generation {
+      return None;
     }
-    Some(entry.fd)
+    let SlotState::Releasing(entry) = &mut slot.state else {
+      return None;
+    };
+    for list in &mut entry.lists {
+      if !list.is_empty() {
+        return waiters.unlink(list, list.head);
+      }
+    }
+    None
   }
 
   /// Frees a released slot once its descriptor has left epoll.
-  fn finish_release(&mut self, index: u32) {
+  fn finish_release(&mut self, index: u32, generation: u64) {
     let Some(slot) = self.slots.get_mut(index as usize) else {
       return;
     };
-    if matches!(slot.state, SlotState::Releasing) {
-      slot.state = SlotState::Free;
-      self.free_slots.push(index);
-      self.live -= 1;
+    if slot.generation != generation {
+      return;
+    }
+    match std::mem::replace(&mut slot.state, SlotState::Free) {
+      SlotState::Releasing(entry) => {
+        debug_assert!(entry.lists.iter().all(|list| list.is_empty()));
+        debug_assert!(entry.fd.is_none());
+        self.free_slots.push(index);
+        self.live -= 1;
+      }
+      other => slot.state = other,
     }
   }
 
@@ -819,8 +953,9 @@ impl State {
     let waiter = self.waiters.get_mut(key)?;
     let (slot, dir) = (waiter.slot, waiter.dir);
     let Self { slots, waiters, .. } = self;
-    let SlotState::Live(entry) = &mut slots.get_mut(slot as usize)?.state else {
-      return None;
+    let entry = match &mut slots.get_mut(slot as usize)?.state {
+      SlotState::Live(entry) | SlotState::Releasing(entry) => entry,
+      SlotState::Free | SlotState::Reserved | SlotState::Retired => return None,
     };
     waiters.unlink(&mut entry.lists[dir.index()], key.index)
   }
@@ -994,14 +1129,24 @@ impl State {
     }
   }
 
-  /// Closes: refuses everything later and frees every waiter, collecting
-  /// their wakers. Returns whether this call closed it.
-  fn close(&mut self, wakers: &mut Vec<Waker>) -> bool {
+  /// Closes: refuses everything later. Callers pop and wake waiters one at a
+  /// time outside this lock. Returns whether this call closed it.
+  fn close(&mut self) -> bool {
+    let newly = !self.closed;
+    self.closed = true;
+    newly
+  }
+
+  fn close_and_drain(&mut self, wakers: &mut Vec<Waker>) -> bool {
     let newly = !self.closed;
     self.closed = true;
     let Self { slots, waiters, .. } = self;
     for slot in slots {
-      if let SlotState::Live(entry) = &mut slot.state {
+      let entry = match &mut slot.state {
+        SlotState::Live(entry) | SlotState::Releasing(entry) => Some(entry),
+        SlotState::Free | SlotState::Reserved | SlotState::Retired => None,
+      };
+      if let Some(entry) = entry {
         for list in &mut entry.lists {
           waiters.drain(list, wakers);
         }
@@ -1009,13 +1154,45 @@ impl State {
     }
     newly
   }
+
+  fn pop_closed_waker(&mut self) -> Option<Waker> {
+    if !self.closed {
+      return None;
+    }
+    let Self { slots, waiters, .. } = self;
+    for slot in slots {
+      let entry = match &mut slot.state {
+        SlotState::Live(entry) | SlotState::Releasing(entry) => Some(entry),
+        SlotState::Free | SlotState::Reserved | SlotState::Retired => None,
+      };
+      if let Some(entry) = entry {
+        for list in &mut entry.lists {
+          if !list.is_empty() {
+            return waiters.unlink(list, list.head);
+          }
+        }
+      }
+    }
+    None
+  }
+
+  fn has_releasing_slots(&self) -> bool {
+    self
+      .slots
+      .iter()
+      .any(|slot| matches!(slot.state, SlotState::Releasing(_)))
+  }
 }
 
 struct Shared {
   state: Mutex<State>,
-  /// Threads currently running a reactor-owned waker callback. This map is
-  /// transient callback metadata and is cleared when the last callback exits.
-  callback_owners: Mutex<HashMap<thread::ThreadId, usize>>,
+  /// Threads currently running a reactor-owned callback. The table has a
+  /// fixed capacity charged by `_control`; additional concurrent callback
+  /// threads use fixed TLS markers rather than growing it.
+  callback_owners: Mutex<Vec<CallbackOwner>>,
+  /// A single fixed waiter batch, leased only while wakers are invoked.
+  /// Reentrant work never waits for this scratch: it drains one at a time.
+  callback_scratch: Mutex<Option<Vec<Waker>>>,
   callbacks_drained: Condvar,
   service_thread: OnceLock<thread::ThreadId>,
   epoll: OwnedFd,
@@ -1023,8 +1200,95 @@ struct Shared {
   wake: File,
   max_registrations: usize,
   max_waiters: usize,
+  /// Actual retained capacity of the service thread's dispatch buffer.
+  dispatch_capacity: usize,
+  tenant: Option<TenantDomain>,
+  _control: ControlCharge,
   /// Registration events the service thread dispatched, stale included.
   fd_events: AtomicU64,
+}
+
+#[derive(Clone, Copy)]
+struct CallbackOwner {
+  thread: thread::ThreadId,
+  depth: usize,
+}
+
+impl Shared {
+  fn thread_capture_payload_bytes() -> Result<usize, DomainError> {
+    // The service closure moves both its Shared Arc and dispatch Vec value;
+    // the close closure moves a second Shared Arc. CompletionThreadOwner is
+    // charged separately by each prepared join owner. Keep these capture
+    // fees with Shared through the last worker or retained handle.
+    std::mem::size_of::<(Arc<Self>, Vec<Waker>)>()
+      .checked_add(std::mem::size_of::<Arc<Self>>())
+      .ok_or(DomainError::Invalid)
+  }
+
+  fn requested_control_payload_bytes(
+    max_registrations: usize,
+    max_waiters: usize,
+    callback_owners_capacity: usize,
+  ) -> Result<usize, DomainError> {
+    let mut bytes = std::mem::size_of::<Self>();
+    for payload in [
+      payload_bytes::<Slot>(max_registrations)?,
+      payload_bytes::<u32>(max_registrations)?,
+      payload_bytes::<Waiter>(max_waiters)?,
+      payload_bytes::<u32>(max_waiters)?,
+      payload_bytes::<CallbackOwner>(callback_owners_capacity)?,
+      payload_bytes::<Waker>(max_waiters)?,
+      payload_bytes::<Waker>(max_waiters)?,
+      Self::thread_capture_payload_bytes()?,
+    ] {
+      bytes = bytes.checked_add(payload).ok_or(DomainError::Invalid)?;
+    }
+    Ok(bytes)
+  }
+
+  fn control_payload_bytes(
+    state: &State,
+    callback_owners_capacity: usize,
+    wakers_capacity: usize,
+    scratch_capacity: usize,
+  ) -> Result<usize, DomainError> {
+    let callback_bytes = payload_bytes::<CallbackOwner>(callback_owners_capacity)?;
+    let waker_bytes = payload_bytes::<Waker>(wakers_capacity)?;
+    let scratch_bytes = payload_bytes::<Waker>(scratch_capacity)?;
+    let capture_bytes = Self::thread_capture_payload_bytes()?;
+    std::mem::size_of::<Self>()
+      .checked_add(state.control_payload_bytes()?)
+      .and_then(|bytes| bytes.checked_add(callback_bytes))
+      .and_then(|bytes| bytes.checked_add(waker_bytes))
+      .and_then(|bytes| bytes.checked_add(scratch_bytes))
+      .and_then(|bytes| bytes.checked_add(capture_bytes))
+      .ok_or(DomainError::Invalid)
+  }
+
+  #[cfg(all(test, not(loom)))]
+  fn control_bytes(&self) -> usize {
+    self._control.bytes()
+  }
+
+  fn take_callback_scratch(&self) -> Option<Vec<Waker>> {
+    lock(&self.callback_scratch).take()
+  }
+
+  fn return_callback_scratch(&self, wakers: Vec<Waker>) {
+    debug_assert!(wakers.is_empty());
+    let mut scratch = lock(&self.callback_scratch);
+    debug_assert!(scratch.is_none());
+    *scratch = Some(wakers);
+  }
+}
+
+fn try_thread_name(name: &str) -> io::Result<String> {
+  let mut result = String::new();
+  result
+    .try_reserve_exact(name.len())
+    .map_err(|_| io::Error::from(io::ErrorKind::OutOfMemory))?;
+  result.push_str(name);
+  Ok(result)
 }
 
 /// No user code runs, and nothing the reactor does panics, while the
@@ -1060,21 +1324,21 @@ fn wake_all(shared: &Shared, wakers: &mut Vec<Waker>) -> usize {
 struct CallbackScope<'a> {
   shared: &'a Shared,
   thread: thread::ThreadId,
+  fallback: Option<CallbackFallbackMarker>,
 }
 
 impl Drop for CallbackScope<'_> {
   fn drop(&mut self) {
+    if let Some(marker) = self.fallback {
+      pop_callback_fallback(marker);
+      return;
+    }
     let mut owners = lock(&self.shared.callback_owners);
-    if let Some(depth) = owners.get_mut(&self.thread) {
-      if *depth > 1 {
-        *depth -= 1;
+    if let Some(index) = owners.iter().position(|owner| owner.thread == self.thread) {
+      if owners[index].depth > 1 {
+        owners[index].depth -= 1;
       } else {
-        owners.remove(&self.thread);
-        if owners.is_empty() {
-          // Do not retain capacity based on a past peak in concurrent
-          // callbacks; this metadata is outside the reactor's resource bound.
-          *owners = HashMap::new();
-        }
+        owners.swap_remove(index);
       }
     }
   }
@@ -1082,16 +1346,37 @@ impl Drop for CallbackScope<'_> {
 
 fn callback_scope<R>(shared: &Shared, f: impl FnOnce() -> R) -> R {
   let current = thread::current().id();
-  *lock(&shared.callback_owners).entry(current).or_insert(0) += 1;
+  let tracked = {
+    let mut owners = lock(&shared.callback_owners);
+    if let Some(owner) = owners.iter_mut().find(|owner| owner.thread == current) {
+      owner.depth += 1;
+      true
+    } else if owners.len() < owners.capacity() {
+      // Capacity is pre-reserved and charged at construction; this push does
+      // not allocate while a callback is in progress.
+      owners.push(CallbackOwner {
+        thread: current,
+        depth: 1,
+      });
+      true
+    } else {
+      false
+    }
+  };
+  let fallback = (!tracked).then(|| push_callback_fallback(shared));
   let _scope = CallbackScope {
     shared,
     thread: current,
+    fallback,
   };
   f()
 }
 
 fn in_callback(shared: &Shared) -> bool {
-  lock(&shared.callback_owners).contains_key(&thread::current().id())
+  lock(&shared.callback_owners)
+    .iter()
+    .any(|owner| owner.thread == thread::current().id())
+    || in_callback_fallback(shared)
 }
 
 /// Sets `O_NONBLOCK` on the open file description, keeping other flags.
@@ -1110,9 +1395,10 @@ impl Shared {
   /// wakers going to `wakers`. Returns whether it failed.
   fn arm(&self, state: &mut State, arm: Arm) -> Option<ArmFailure> {
     let entry = state.entry(arm.index, arm.generation)?;
+    let fd = entry.fd.as_ref()?;
     let data = EventData::new_u64(token(arm.index, arm.generation));
     let flags = interest_flags(arm.interest);
-    match epoll::modify(&self.epoll, &entry.fd, data, flags) {
+    match epoll::modify(&self.epoll, fd, data, flags) {
       Ok(()) => None,
       Err(errno) => {
         let errno = errno.raw_os_error();
@@ -1162,48 +1448,78 @@ impl Shared {
   }
 
   /// Releases a registration: stale at once, deleted from epoll and closed
-  /// outside the lock, and only then uncharged.
+  /// outside the lock, then callback ownership is drained without growing a
+  /// waker vector.
   fn release(&self, index: u32, generation: u64) {
-    let without_waiters = {
+    if let Some(mut wakers) = self.take_callback_scratch() {
+      let (fd, callbacks) = {
+        let mut state = lock(&self.state);
+        let fd = state.begin_release(index, generation);
+        if fd.is_some() {
+          while let Some(waker) = state.pop_release_waker(index, generation) {
+            wakers.push(waker);
+          }
+          let callbacks = wakers.len();
+          state.callbacks_pending += callbacks;
+          (fd, callbacks)
+        } else {
+          (None, 0)
+        }
+      };
+      let Some(fd) = fd else {
+        self.return_callback_scratch(wakers);
+        return;
+      };
+      let _ = epoll::delete(&self.epoll, &fd);
+      drop(fd);
+      {
+        let mut state = lock(&self.state);
+        state.finish_release(index, generation);
+      }
+      self.callbacks_drained.notify_all();
+      let woken = wake_all(self, &mut wakers);
+      debug_assert_eq!(woken, callbacks);
+      self.finish_callbacks(woken);
+      self.return_callback_scratch(wakers);
+      return;
+    }
+
+    self.release_one_at_a_time(index, generation);
+  }
+
+  fn release_one_at_a_time(&self, index: u32, generation: u64) {
+    let fd = {
       let mut state = lock(&self.state);
       begin_if_no_waiters(
         &mut state,
         |state| state.has_waiters(index, generation),
-        |state| {
-          let mut wakers = Vec::new();
-          let fd = state.begin_release(index, generation, &mut wakers);
-          let callbacks = wakers.len();
-          state.callbacks_pending += callbacks;
-          (wakers, fd, callbacks)
-        },
+        |state| state.begin_release(index, generation),
       )
+      .unwrap_or_else(|| state.begin_release(index, generation))
     };
-    let (mut wakers, fd, expected_callbacks) = match without_waiters {
-      Some(released) => released,
-      None => {
-        // A waiter was present at the first locked inspection. Reserve the
-        // bounded storage outside the lock, then revalidate and release
-        // under the lock as before. Cancellation may empty the queues while
-        // this reservation is made; the unused capacity is harmless.
-        let mut wakers = Vec::with_capacity(self.max_waiters);
-        let (fd, callbacks) = {
-          let mut state = lock(&self.state);
-          let fd = state.begin_release(index, generation, &mut wakers);
-          let callbacks = wakers.len();
-          state.callbacks_pending += callbacks;
-          (fd, callbacks)
-        };
-        (wakers, fd, callbacks)
-      }
+    let Some(fd) = fd else {
+      return;
     };
-    if let Some(fd) = fd {
-      let _ = epoll::delete(&self.epoll, &fd);
-      drop(fd);
-      lock(&self.state).finish_release(index);
+    let _ = epoll::delete(&self.epoll, &fd);
+    drop(fd);
+    loop {
+      let waker = {
+        let mut state = lock(&self.state);
+        let waker = state.pop_release_waker(index, generation);
+        state.callbacks_pending += usize::from(waker.is_some());
+        waker
+      };
+      let Some(waker) = waker else {
+        break;
+      };
+      wake_contained(self, waker);
+      self.finish_callbacks(1);
     }
-    let callbacks = wake_all(self, &mut wakers);
-    debug_assert_eq!(callbacks, expected_callbacks);
-    self.finish_callbacks(callbacks);
+    {
+      let mut state = lock(&self.state);
+      state.finish_release(index, generation);
+    }
+    self.callbacks_drained.notify_all();
   }
 
   /// Polls a wait until it is ready, failed or registered with the task's
@@ -1266,27 +1582,51 @@ impl Shared {
   /// with `Closed` and wakes it on this thread, and interrupts the service
   /// thread. Idempotent.
   fn close(&self) {
-    let mut wakers = Vec::with_capacity(self.max_waiters);
-    let newly = {
+    let mut batch = self.take_callback_scratch();
+    let (newly, callbacks) = {
       let mut state = lock(&self.state);
-      let newly = state.close(&mut wakers);
-      state.callbacks_pending += wakers.len();
-      newly
+      let newly = if let Some(wakers) = &mut batch {
+        state.close_and_drain(wakers)
+      } else {
+        state.close()
+      };
+      let callbacks = batch.as_ref().map_or(0, Vec::len);
+      state.callbacks_pending += callbacks;
+      (newly, callbacks)
     };
     if newly {
       // Never fails in practice: the counter only overflows after 2^64 - 1
       // closes. The service thread also stops once it sees the close.
       let _ = (&self.wake).write(&1u64.to_ne_bytes());
     }
-    let callbacks = wake_all(self, &mut wakers);
-    self.finish_callbacks(callbacks);
+    if let Some(mut wakers) = batch {
+      let woken = wake_all(self, &mut wakers);
+      debug_assert_eq!(woken, callbacks);
+      self.finish_callbacks(woken);
+      self.return_callback_scratch(wakers);
+    } else {
+      loop {
+        let waker = {
+          let mut state = lock(&self.state);
+          let waker = state.pop_closed_waker();
+          state.callbacks_pending += usize::from(waker.is_some());
+          waker
+        };
+        let Some(waker) = waker else {
+          break;
+        };
+        wake_contained(self, waker);
+        self.finish_callbacks(1);
+      }
+    }
     let on_service_thread = self
       .service_thread
       .get()
       .is_some_and(|id| *id == thread::current().id());
     if !in_callback(self) && !on_service_thread {
       let mut state = lock(&self.state);
-      while state.callbacks_pending != 0 {
+      while state.callbacks_pending != 0 || state.waiters.live() != 0 || state.has_releasing_slots()
+      {
         state = self
           .callbacks_drained
           .wait(state)
@@ -1312,7 +1652,10 @@ impl Shared {
 
   fn close_complete(&self) -> bool {
     let state = lock(&self.state);
-    state.closed && state.callbacks_pending == 0
+    state.closed
+      && state.callbacks_pending == 0
+      && state.waiters.live() == 0
+      && !state.has_releasing_slots()
   }
 }
 
@@ -1331,6 +1674,7 @@ impl Drop for CloseOnExit<'_> {
 /// lock, until the reactor closes. `wakers` holds `max_waiters` wakers
 /// without growing: a waiter is freed when its waker is collected.
 fn drive(shared: &Shared, mut wakers: Vec<Waker>) {
+  debug_assert_eq!(wakers.capacity(), shared.dispatch_capacity);
   let _ = shared.service_thread.set(thread::current().id());
   let _close = CloseOnExit(shared);
   let empty = Event {
@@ -1381,21 +1725,82 @@ pub struct Reactor {
   shared: Arc<Shared>,
   thread: Option<DeferredJoin>,
   close_worker: Option<DeferredJoin>,
+  close_prepared: Option<PreparedJoin>,
   panic_payloads: Mutex<Vec<Box<dyn Any + Send>>>,
   shutdown_panicked: bool,
+  close_thread_name: String,
+  /// Reserved temporary thread-name capacity, retained as an accounting
+  /// witness after the startup name itself has been handed to `Builder`.
+  thread_name_scratch_capacity: usize,
+  _owner_control: ControlCharge,
 }
 
 impl Reactor {
-  /// Creates the epoll instance and the interrupting eventfd, reserves the
-  /// registration and waiter tables, and starts the service thread.
+  fn owner_control_payload_bytes(
+    panic_capacity: usize,
+    close_name_capacity: usize,
+    name_scratch_capacity: usize,
+  ) -> Result<usize, DomainError> {
+    let mut bytes = std::mem::size_of::<Self>()
+      .checked_add(payload_bytes::<Box<dyn Any + Send>>(panic_capacity)?)
+      .ok_or(DomainError::Invalid)?;
+    for payload in [
+      payload_bytes::<u8>(close_name_capacity)?,
+      payload_bytes::<u8>(name_scratch_capacity)?,
+      std::mem::size_of::<thread::Builder>(),
+    ] {
+      bytes = bytes.checked_add(payload).ok_or(DomainError::Invalid)?;
+    }
+    Ok(bytes)
+  }
+
+  /// Creates the epoll instance and interrupting eventfd, reserves the
+  /// registration and waiter tables, and starts the service thread without a
+  /// tenant Control reservation.
   ///
   /// # Errors
   ///
   /// [`ReactorError::Invalid`] for a bound of zero or above 2^24,
   /// [`ReactorError::Spawn`] when the thread cannot be started,
-  /// `OutOfMemory` when the tables cannot be reserved, or the kernel's
-  /// error from `epoll_create1` or `eventfd`.
+  /// `OutOfMemory` when the tables cannot be reserved, or the kernel's error
+  /// from `epoll_create1` or `eventfd`.
   pub fn new(config: ReactorConfig) -> io::Result<Self> {
+    Self::new_with_tenant(config, None)
+  }
+
+  /// Creates a reactor whose declared runtime metadata is charged to
+  /// `tenant` before tables, descriptors, or service threads are created.
+  /// Arc allocator headers, OS thread/provider metadata and stacks, fd
+  /// metadata, TLS backing, and caller-owned Waker allocations are outside
+  /// this logical Control accounting boundary.
+  ///
+  /// # Errors
+  ///
+  /// Returns the same errors as [`Self::new`], plus a typed
+  /// [`ReactorError::Domain`] inside `io::Error` when the tenant refuses a
+  /// declared Control charge.
+  pub fn new_in_tenant(config: ReactorConfig, tenant: &TenantDomain) -> io::Result<Self> {
+    Self::new_with_tenant(config, Some(tenant))
+  }
+
+  fn resize_owner_name_scratch(&mut self, capacity: usize) -> Result<(), ReactorError> {
+    let panic_capacity = self.lock_panic_payloads().capacity();
+    let scratch_capacity = self.thread_name_scratch_capacity.max(capacity);
+    let bytes = Self::owner_control_payload_bytes(
+      panic_capacity,
+      self.close_thread_name.capacity(),
+      scratch_capacity,
+    )
+    .map_err(ReactorError::Domain)?;
+    self
+      ._owner_control
+      .try_resize(bytes)
+      .map_err(ReactorError::Domain)?;
+    self.thread_name_scratch_capacity = scratch_capacity;
+    Ok(())
+  }
+
+  fn new_with_tenant(config: ReactorConfig, tenant: Option<&TenantDomain>) -> io::Result<Self> {
     let ReactorConfig {
       max_registrations,
       max_waiters,
@@ -1406,12 +1811,88 @@ impl Reactor {
         .filter(|&max| max != 0 && max as usize <= MAX_TABLE)
         .ok_or(ReactorError::Invalid)
     };
-    let state = State::new(bound(max_registrations)?, bound(max_waiters)?)
+    let max_registrations = bound(max_registrations)? as usize;
+    let max_waiters = bound(max_waiters)? as usize;
+
+    // Charge the owner and its startup-only thread-name scratch before any
+    // heap-backed owner fields are allocated.
+    let mut owner_control = ControlCharge::try_new(
+      tenant,
+      Self::owner_control_payload_bytes(
+        2,
+        CLOSE_THREAD_NAME.len(),
+        REACTOR_THREAD_NAME.len().max(CLOSE_THREAD_NAME.len()),
+      )
+      .map_err(ReactorError::Domain)?,
+    )
+    .map_err(ReactorError::Domain)?;
+    let close_thread_name = try_thread_name(CLOSE_THREAD_NAME)?;
+    let mut panic_payloads = Vec::new();
+    panic_payloads
+      .try_reserve_exact(2)
+      .map_err(|_| io::Error::from(io::ErrorKind::OutOfMemory))?;
+    let service_thread_name = try_thread_name(REACTOR_THREAD_NAME)?;
+    let thread_name_scratch_capacity = service_thread_name
+      .capacity()
+      .max(close_thread_name.capacity());
+    let actual_owner_bytes = Self::owner_control_payload_bytes(
+      panic_payloads.capacity(),
+      close_thread_name.capacity(),
+      thread_name_scratch_capacity,
+    )
+    .map_err(ReactorError::Domain)?;
+    owner_control
+      .try_resize(actual_owner_bytes)
+      .map_err(ReactorError::Domain)?;
+
+    let callback_owners_capacity = max_waiters.min(MAX_CALLBACK_OWNERS);
+    let mut shared_control = ControlCharge::try_new(
+      tenant,
+      Shared::requested_control_payload_bytes(
+        max_registrations,
+        max_waiters,
+        callback_owners_capacity,
+      )
+      .map_err(ReactorError::Domain)?,
+    )
+    .map_err(ReactorError::Domain)?;
+    let state = State::new(max_registrations as u32, max_waiters as u32)
       .map_err(|_| io::Error::from(io::ErrorKind::OutOfMemory))?;
     let mut wakers = Vec::new();
     wakers
       .try_reserve_exact(max_waiters)
       .map_err(|_| io::Error::from(io::ErrorKind::OutOfMemory))?;
+    let mut callback_scratch = Vec::new();
+    callback_scratch
+      .try_reserve_exact(max_waiters)
+      .map_err(|_| io::Error::from(io::ErrorKind::OutOfMemory))?;
+    let mut callback_owners = Vec::new();
+    callback_owners
+      .try_reserve_exact(callback_owners_capacity)
+      .map_err(|_| io::Error::from(io::ErrorKind::OutOfMemory))?;
+    let actual_shared_bytes = Shared::control_payload_bytes(
+      &state,
+      callback_owners.capacity(),
+      wakers.capacity(),
+      callback_scratch.capacity(),
+    )
+    .map_err(ReactorError::Domain)?;
+    shared_control
+      .try_resize(actual_shared_bytes)
+      .map_err(ReactorError::Domain)?;
+
+    // Both thread completion owners and their monitor names are prepared
+    // before the service worker can start. The vector allocation is startup
+    // scratch; each popped PreparedJoin keeps its own precharged Shared owner.
+    let mut prepared = PreparedJoins::new(tenant, 2).map_err(ReactorError::Domain)?;
+    let service_prepared = prepared
+      .pop()
+      .ok_or_else(|| io::Error::from(ReactorError::Spawn))?;
+    let close_prepared = prepared
+      .pop()
+      .ok_or_else(|| io::Error::from(ReactorError::Spawn))?;
+    drop(prepared);
+
     let epoll = epoll::create(epoll::CreateFlags::CLOEXEC).map_err(os_error)?;
     let wake = eventfd(0, EventfdFlags::CLOEXEC | EventfdFlags::NONBLOCK).map_err(os_error)?;
     let wake = File::from(wake);
@@ -1419,30 +1900,38 @@ impl Reactor {
     epoll::add(&epoll, &wake, data, EventFlags::IN).map_err(os_error)?;
     let shared = Arc::new(Shared {
       state: Mutex::new(state),
-      callback_owners: Mutex::new(HashMap::new()),
+      callback_owners: Mutex::new(callback_owners),
+      callback_scratch: Mutex::new(Some(callback_scratch)),
       callbacks_drained: Condvar::new(),
       service_thread: OnceLock::new(),
       epoll,
       wake,
       max_registrations,
       max_waiters,
+      dispatch_capacity: wakers.capacity(),
+      tenant: tenant.cloned(),
+      _control: shared_control,
       fd_events: AtomicU64::new(0),
     });
-    let mut panic_payloads = Vec::new();
-    panic_payloads
-      .try_reserve_exact(2)
-      .map_err(|_| io::Error::from(io::ErrorKind::OutOfMemory))?;
+    let thread_owner = service_prepared.thread_owner();
     let worker = Arc::clone(&shared);
     let thread = thread::Builder::new()
-      .name("allocatbelt-reactor".into())
-      .spawn(move || drive(&worker, wakers))
+      .name(service_thread_name)
+      .spawn(move || {
+        thread_owner.retain_until_thread_exit();
+        drive(&worker, wakers);
+      })
       .map_err(|_| io::Error::from(ReactorError::Spawn))?;
     Ok(Self {
       shared,
-      thread: Some(DeferredJoin::new(thread)),
+      thread: Some(service_prepared.attach(thread)),
       close_worker: None,
+      close_prepared: Some(close_prepared),
       panic_payloads: Mutex::new(panic_payloads),
       shutdown_panicked: false,
+      close_thread_name,
+      thread_name_scratch_capacity,
+      _owner_control: owner_control,
     })
   }
 
@@ -1461,11 +1950,27 @@ impl Reactor {
     if self.close_worker.is_some() || self.shared.close_complete() {
       return Ok(());
     }
+    let thread_name = try_thread_name(&self.close_thread_name)?;
+    self
+      .resize_owner_name_scratch(thread_name.capacity())
+      .map_err(io::Error::from)?;
+    let prepared = self
+      .close_prepared
+      .take()
+      .ok_or_else(|| io::Error::from(ReactorError::Spawn))?;
+    let thread_owner = prepared.thread_owner();
     let shared = Arc::clone(&self.shared);
-    let close_worker = thread::Builder::new()
-      .name("allocatbelt-reactor-close".into())
-      .spawn(move || shared.close())?;
-    self.close_worker = Some(DeferredJoin::new(close_worker));
+    let close_worker = thread::Builder::new().name(thread_name).spawn(move || {
+      thread_owner.retain_until_thread_exit();
+      shared.close();
+    });
+    match close_worker {
+      Ok(close_worker) => self.close_worker = Some(prepared.attach(close_worker)),
+      Err(error) => {
+        self.close_prepared = Some(prepared);
+        return Err(error);
+      }
+    }
     Ok(())
   }
 
@@ -1518,9 +2023,10 @@ impl Reactor {
   ///
   /// # Errors
   ///
-  /// `WouldDeadlock` when called on the service or close thread, which is
-  /// then left to exit on its own; `DriverPanicked` when either thread
-  /// panicked.
+  /// `WouldDeadlock` when called on the service or close thread or inside a
+  /// callback whose completion this shutdown would await; the reactor is
+  /// then left to finish after that call returns. `DriverPanicked` when a
+  /// worker thread panicked.
   pub fn shutdown(mut self) -> Result<(), ReactorError> {
     self.shared.close();
     let on_service_thread = self
@@ -1531,10 +2037,9 @@ impl Reactor {
       .close_worker
       .as_ref()
       .is_some_and(DeferredJoin::is_current_thread);
-    if on_service_thread || on_close_thread {
+    if on_service_thread || on_close_thread || in_callback(&self.shared) {
       return Err(ReactorError::WouldDeadlock);
     }
-    let current_callback = in_callback(&self.shared);
     let mut panicked = false;
     if let Some(thread) = self.thread.as_mut()
       && let Err(payload) = thread.join_blocking()
@@ -1543,16 +2048,13 @@ impl Reactor {
       drop_contained(payload);
     }
     self.thread.take();
-    if !current_callback
-      && let Some(thread) = self.close_worker.as_mut()
+    if let Some(thread) = self.close_worker.as_mut()
       && let Err(payload) = thread.join_blocking()
     {
       panicked = true;
       drop_contained(payload);
     }
-    if !current_callback {
-      self.close_worker.take();
-    }
+    self.close_worker.take();
     if panicked || self.shutdown_panicked {
       Err(ReactorError::DriverPanicked)
     } else {
@@ -1619,6 +2121,18 @@ impl ReactorHandle {
     T: AsFd + Send + Sync + 'static,
   {
     let shared = &self.shared;
+    let registration_control = match ControlCharge::try_new(
+      shared.tenant.as_ref(),
+      std::mem::size_of::<Registration<T>>(),
+    ) {
+      Ok(control) => control,
+      Err(error) => {
+        return Err(RegisterError {
+          io,
+          error: ReactorError::Domain(error).into(),
+        });
+      }
+    };
     let reserved = lock(&shared.state).reserve();
     let (index, generation) = match reserved {
       Ok(reserved) => reserved,
@@ -1643,6 +2157,7 @@ impl ReactorHandle {
       shared: Arc::clone(shared),
       index,
       generation,
+      _control: registration_control,
     });
     Ok(AsyncFd { inner })
   }
@@ -1719,6 +2234,7 @@ struct Registration<T> {
   shared: Arc<Shared>,
   index: u32,
   generation: u64,
+  _control: ControlCharge,
 }
 
 impl<T> Drop for Registration<T> {
@@ -3027,7 +3543,7 @@ mod tests {
   }
 
   #[test]
-  fn dropping_a_pending_waker_can_shutdown_and_join_its_reactor() {
+  fn dropping_a_pending_waker_gets_nonwaiting_shutdown_result() {
     let (done_tx, done_rx) = mpsc::channel();
     let worker = thread::spawn(move || {
       let (reactor, handle) = reactor(1, 1);
@@ -3042,8 +3558,10 @@ mod tests {
       drop(waker);
       drop(readable);
       let result = shutdown_rx.recv_timeout(WATCHDOG).unwrap();
-      assert_eq!(result, Ok(()));
-      done_tx.send(handle.is_closed()).unwrap();
+      assert_eq!(result, Err(ReactorError::WouldDeadlock));
+      done_tx
+        .send(handle.is_closed() && handle.shared.close_complete())
+        .unwrap();
     });
 
     assert_eq!(done_rx.recv_timeout(WATCHDOG), Ok(true));
@@ -3299,22 +3817,19 @@ mod tests {
   }
 
   #[test]
-  fn release_reserves_waker_storage_only_for_matching_live_waiters() {
+  fn release_keeps_waiters_attached_until_one_at_a_time_drain() {
     let (mut state, index, generation, _peer) = live_state(1);
     let empty_release = begin_if_no_waiters(
       &mut state,
       |state| state.has_waiters(index, generation),
-      |state| {
-        let mut wakers = Vec::new();
-        let fd = state.begin_release(index, generation, &mut wakers);
-        (wakers, fd)
-      },
+      |state| state.begin_release(index, generation),
     )
     .unwrap();
-    assert_eq!(empty_release.0.capacity(), 0);
-    assert!(empty_release.1.is_some());
-    drop(empty_release.1);
-    state.finish_release(index);
+    assert!(empty_release.is_some());
+    drop(empty_release);
+    assert!(state.has_releasing_slots());
+    state.finish_release(index, generation);
+    assert!(!state.has_releasing_slots());
 
     let (next_index, next_generation) = state.reserve().unwrap();
     let (stream, _peer) = UnixStream::pair().unwrap();
@@ -3342,13 +3857,17 @@ mod tests {
     assert!(not_released.is_none());
     assert!(state.has_waiters(next_index, next_generation));
 
-    let mut wakers = Vec::with_capacity(1);
-    let fd = state.begin_release(next_index, next_generation, &mut wakers);
+    let fd = state.begin_release(next_index, next_generation);
     assert!(fd.is_some());
-    assert_eq!(wakers.len(), 1);
     drop(fd);
-    drop(wakers);
-    state.finish_release(next_index);
+    assert_eq!(state.waiters.live(), 1);
+    assert!(
+      state
+        .pop_release_waker(next_index, next_generation)
+        .is_some()
+    );
+    assert_eq!(state.waiters.live(), 0);
+    state.finish_release(next_index, next_generation);
   }
 
   #[test]
@@ -3432,3 +3951,7 @@ mod tests {
     assert!(read_key.is_none());
   }
 }
+
+#[cfg(all(test, not(loom)))]
+#[path = "newreactor_control_tests.rs"]
+mod control_tests;
