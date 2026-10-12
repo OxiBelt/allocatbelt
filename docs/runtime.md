@@ -1789,7 +1789,10 @@ Local future and queued-blocking capture cleanup is explicit through
 `drive_shutdown_step`; it can invoke arbitrary caller code and has no finite
 wall-time guarantee. Keep an unfinished facade owner alive until cleanup
 completes. Process-wide signal bridge lifetime is not included in
-`ShutdownProgress::Complete`. When a tenant resource domain is bound, root
+`ShutdownProgress::Complete`. Its permanent tables and dispatcher metadata
+are outside tenant `Control`; subscriptions reuse fixed global slots. A bound
+facade includes its inline `SignalDriver` value in its own metadata charge.
+When a tenant resource domain is bound, root
 polls, owned tasks and blocking execution share its CPU and task admission.
 Declared scheduler payloads, owning facades, controlled scopes, queues, metrics,
 flags, waiter owners, byte buckets and feedback state retain Control charges
@@ -1797,8 +1800,11 @@ through their final handles. Bound filesystem requests reserve their shared
 input-and-mutex payload before disk or job admission; that charge survives
 queued cancellation and detached execution. Caller-owned allocations reachable
 from an input remain outside this declared-payload charge. This accounting excludes
-physical allocator overhead, arbitrary application allocations and OS stacks;
-provider metadata coverage remains a separate implementation requirement.
+physical allocator overhead, arbitrary application allocations and OS stacks.
+Separately constructed providers retain their documented metadata boundaries.
+In particular, the owning builders do not select `UringRuntime::start`; its
+standalone ring tables, issuer state and backend owner storage remain outside
+tenant `Control`, together with opaque kernel mappings and OS metadata.
 
 `runtime::cpu_gate::CpuGate` provides the same domain admission to external
 executors. A wrapped future holds a CPU ticket for each inner poll; `run` holds
