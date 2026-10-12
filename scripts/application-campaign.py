@@ -14,6 +14,7 @@ import argparse
 from contextlib import contextmanager
 import heapq
 import hashlib
+import io
 import json
 import math
 import os
@@ -21,20 +22,47 @@ import re
 import signal
 import shutil
 import statistics
+import stat
 import struct
 import subprocess
 import sys
 import tempfile
 import time
+import types
 from fractions import Fraction
 from pathlib import Path
 from typing import Any
 
 
 SPEC_SCHEMA = "allocatbelt.application-campaign-spec.v2"
-SOURCE_SCHEMA = "allocatbelt.application-source-manifest.v2"
-PLAN_SCHEMA = "allocatbelt.application-campaign-plan.v1"
+SOURCE_SCHEMA = "allocatbelt.application-source-manifest.v3"
+PLAN_SCHEMA = "allocatbelt.application-campaign-plan.v2"
 LEDGER_SCHEMA = "allocatbelt.application-campaign-ledger.v1"
+FIXED_POLICY_SCHEMA = "allocatbelt.application-fixed-policy-artifact.v1"
+CALIBRATION_SCHEMA = "allocatbelt.resource-domain-calibration.v1"
+RUNTIME_BINDINGS_SCHEMA = "allocatbelt.application-runtime-process-bindings.v1"
+RUNTIME_VALIDATOR_RELATIVE_PATH = "scripts/application-runtime-readback.py"
+RUNTIME_APPLICATION_CONTROL_CEILING = 67_108_864
+RUNTIME_APPLICATION_TASK_CEILING = 64
+RUNTIME_FIXED_CONTROL_MAX_TENANTS = 1
+RUNTIME_FIXED_CONTROL_MAX_WAITERS = 256
+MAX_READBACK_ARTIFACT_BYTES = 128 * 1024
+MAX_STDOUT_ARTIFACT_BYTES = 1024 * 1024
+MAX_TRACE_ARTIFACT_BYTES = 512 * 1024 * 1024
+MAX_SOURCE_MANIFEST_BYTES = 16 * 1024 * 1024
+# The complete frozen matrix contains 24,300 confirmation jobs and 24,300
+# pressure jobs, plus exploration/A-A jobs. The 25,398 fixed jobs carry two
+# inline process bindings (24,300 confirmation, 1,080 exploration, and 18 A/A);
+# a 256 MiB cap allows 3 KiB per binding, 1.5 KiB per job row, and more than
+# 4 MiB for the plan envelope while keeping reads finite.
+MAX_CAMPAIGN_PLAN_BYTES = 256 * 1024 * 1024
+PAIR_PROCESS_HEADER = (
+    "pair executor allocator exit_code row_validation p99_qualification argv stdout time_report ids_sha256 "
+    "shutdown_sha256 capacity_family_sha256 stdout_sha256 runtime_readback runtime_readback_sha256 "
+    "runtime_expectation runtime_expectation_sha256 runtime_validation runtime_validation_sha256 "
+    "runtime_recipe_sha256 resource_ceiling_sha256 policy_sha256 fixed_global_control_baseline "
+    "validator_sha256 source_manifest_sha256 calibration_binary_sha256 calibration_output_sha256"
+).split()
 ALLOCATORS = ("allocatbelt", "mimalloc-secure", "mimalloc-standard", "system")
 STANDALONE = ("cpu", "memory", "http", "disk")
 FAMILIES = (*STANDALONE, "mixed")
@@ -119,17 +147,130 @@ def no_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     return value
 
 
+def reject_json_constant(value: str) -> None:
+    raise CampaignError(f"non-finite JSON number is forbidden: {value}")
+
+
+def _same_file_snapshot(before: os.stat_result, after: os.stat_result, count: int, path: Path, label: str) -> None:
+    require(stat.S_ISREG(before.st_mode) and stat.S_ISREG(after.st_mode), f"{label} is not a regular file")
+    require(
+        (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns, before.st_ctime_ns)
+        == (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns)
+        and count == before.st_size,
+        f"{label} changed while taking its stable read",
+    )
+    try:
+        current = path.stat(follow_symlinks=False)
+    except OSError as error:
+        raise CampaignError(f"cannot restat {label}: {error}") from error
+    require(
+        stat.S_ISREG(current.st_mode)
+        and (current.st_dev, current.st_ino) == (before.st_dev, before.st_ino),
+        f"{label} path was replaced while taking its stable read",
+    )
+
+
+def read_stable_bytes(path: Path, label: str, maximum: int) -> tuple[bytes, str]:
+    """Read a bounded regular file once and hash the exact returned bytes."""
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as error:
+        raise CampaignError(f"cannot open {label}: {error}") from error
+    try:
+        before = os.fstat(descriptor)
+        require(stat.S_ISREG(before.st_mode), f"{label} is not a regular file")
+        if before.st_size > maximum:
+            raise CampaignError(f"{label} exceeds its finite size bound")
+        chunks: list[bytes] = []
+        count = 0
+        while True:
+            block = os.read(descriptor, min(64 * 1024, maximum + 1 - count))
+            if not block:
+                break
+            count += len(block)
+            require(count <= maximum, f"{label} exceeds its finite size bound")
+            chunks.append(block)
+        after = os.fstat(descriptor)
+        _same_file_snapshot(before, after, count, path, label)
+    finally:
+        os.close(descriptor)
+    raw = b"".join(chunks)
+    return raw, hashlib.sha256(raw).hexdigest()
+
+
+@contextmanager
+def stable_file_snapshot(path: Path, label: str, maximum: int | None = None):
+    """Stream one stable source-file read into a bounded-memory parse snapshot."""
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as error:
+        raise CampaignError(f"cannot open {label}: {error}") from error
+    snapshot = tempfile.SpooledTemporaryFile(max_size=2 * 1024 * 1024, mode="w+b")
+    try:
+        before = os.fstat(descriptor)
+        require(stat.S_ISREG(before.st_mode), f"{label} is not a regular file")
+        if maximum is not None:
+            require(before.st_size <= maximum, f"{label} exceeds its finite size bound")
+        digest = hashlib.sha256()
+        count = 0
+        while True:
+            block = os.read(descriptor, 1024 * 1024)
+            if not block:
+                break
+            count += len(block)
+            if maximum is not None:
+                require(count <= maximum, f"{label} exceeds its finite size bound")
+            digest.update(block)
+            snapshot.write(block)
+        after = os.fstat(descriptor)
+        _same_file_snapshot(before, after, count, path, label)
+        snapshot.seek(0)
+        yield snapshot, digest.hexdigest(), count
+    finally:
+        os.close(descriptor)
+        snapshot.close()
+
+
+def parse_json_object_bytes(raw: bytes, label: str, maximum: int) -> dict[str, Any]:
+    require(len(raw) <= maximum, f"{label} exceeds its finite size bound")
+    try:
+        value = json.loads(
+            raw.decode("utf-8"),
+            object_pairs_hook=no_duplicate_keys,
+            parse_constant=reject_json_constant,
+        )
+    except (UnicodeError, json.JSONDecodeError, CampaignError) as error:
+        raise CampaignError(f"cannot parse {label}: {error}") from error
+    require(type(value) is dict, f"{label} must contain a JSON object")
+    return value
+
+
+def read_bounded_text_line(stream: Any, label: str, maximum: int = 4096) -> str | None:
+    line = stream.readline(maximum + 1)
+    if line == "":
+        return None
+    require(len(line) <= maximum and line.endswith("\n") and "\r" not in line, f"{label} line is oversized or not canonically framed")
+    return line[:-1]
+
+
 def read_json(path: Path) -> dict[str, Any]:
     try:
-        value = json.loads(path.read_text(encoding="utf-8"), object_pairs_hook=no_duplicate_keys)
-    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raw, _digest = read_stable_bytes(path, f"JSON input {path}", MAX_SOURCE_MANIFEST_BYTES)
+        value = json.loads(raw.decode("utf-8"), object_pairs_hook=no_duplicate_keys, parse_constant=reject_json_constant)
+    except (OSError, UnicodeError, json.JSONDecodeError, CampaignError) as error:
         raise CampaignError(f"cannot read JSON input {path}: {error}") from error
     require(isinstance(value, dict), f"JSON input {path} must contain an object")
     return value
 
 
 def canonical_bytes(value: Any) -> bytes:
-    return (json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True) + "\n").encode()
+    try:
+        encoded = json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False)
+    except (TypeError, ValueError) as error:
+        raise CampaignError(f"value is not canonical JSON: {error}") from error
+    return (encoded + "\n").encode()
 
 
 def sha256_file(path: Path) -> str:
@@ -147,6 +288,195 @@ def digest_object(value: dict[str, Any], field: str = "manifest_sha256") -> str:
     payload = dict(value)
     payload.pop(field, None)
     return hashlib.sha256(canonical_bytes(payload)).hexdigest()
+
+
+_RUNTIME_READBACK_MODULE_CACHE: dict[str, Any] = {}
+
+
+def runtime_readback_module(expected_sha256: str | None = None) -> Any:
+    path = Path(__file__).with_name("application-runtime-readback.py")
+    try:
+        raw, source_sha256 = read_stable_bytes(path, "runtime readback validator source", MAX_SOURCE_MANIFEST_BYTES)
+    except CampaignError:
+        raise
+    require(expected_sha256 is None or source_sha256 == expected_sha256, "runtime readback validator source differs from its frozen SHA-256")
+    module = _RUNTIME_READBACK_MODULE_CACHE.get(source_sha256)
+    if module is not None:
+        return module
+    module_name = f"application_runtime_readback_{source_sha256}"
+    module = types.ModuleType(module_name)
+    module.__file__ = str(path)
+    module.__package__ = ""
+    try:
+        code = compile(raw, str(path), "exec", dont_inherit=True)
+        exec(code, module.__dict__)
+    except (SyntaxError, ValueError, TypeError) as error:
+        raise CampaignError(f"runtime readback validator source cannot be compiled: {error}") from error
+    if len(_RUNTIME_READBACK_MODULE_CACHE) >= 4:
+        _RUNTIME_READBACK_MODULE_CACHE.pop(next(iter(_RUNTIME_READBACK_MODULE_CACHE)))
+    _RUNTIME_READBACK_MODULE_CACHE[source_sha256] = module
+    return module
+
+
+def safe_relative_artifact(root: Path, value: Any, label: str, *, require_file: bool = True) -> tuple[Path, Path]:
+    require(isinstance(value, str) and value and "\\" not in value and "\x00" not in value, f"{label} path is malformed")
+    require(not any(ord(character) < 32 or ord(character) == 127 for character in value), f"{label} path contains a control character")
+    relative = Path(value)
+    require(not relative.is_absolute() and ".." not in relative.parts and relative.as_posix() == value, f"{label} path is not portable")
+    root = root.resolve(strict=True)
+    candidate = root / relative
+    cursor = root
+    for part in relative.parts:
+        cursor = cursor / part
+        require(not cursor.is_symlink(), f"{label} path traverses a symlink: {value}")
+    try:
+        resolved = candidate.resolve(strict=True)
+        resolved.relative_to(root)
+    except (OSError, ValueError) as error:
+        raise CampaignError(f"{label} path is missing or escaped its source root: {value}") from error
+    if require_file:
+        require(resolved.is_file(), f"{label} is not a regular file: {value}")
+    return relative, resolved
+
+
+def read_json_bounded(path: Path, label: str, maximum: int = MAX_READBACK_ARTIFACT_BYTES) -> dict[str, Any]:
+    try:
+        raw, _digest = read_stable_bytes(path, label, maximum)
+        value = parse_json_object_bytes(raw, label, maximum)
+    except (OSError, UnicodeError, json.JSONDecodeError, CampaignError) as error:
+        raise CampaignError(f"cannot read {label}: {error}") from error
+    return value
+
+
+def campaign_plan_bytes(plan: dict[str, Any]) -> bytes:
+    raw = canonical_bytes(plan)
+    require(len(raw) <= MAX_CAMPAIGN_PLAN_BYTES, "complete frozen campaign plan exceeds its finite matrix-sized bound")
+    return raw
+
+
+def read_campaign_plan(path: Path) -> dict[str, Any]:
+    return read_json_bounded(path, "frozen campaign plan", MAX_CAMPAIGN_PLAN_BYTES)
+
+
+def runtime_recipe_for_policy(
+    workload: str, profile: str = "steady", validator_sha256: str | None = None,
+) -> dict[str, Any]:
+    module = runtime_readback_module(validator_sha256)
+    return {
+        "schema": module.RECIPE_SCHEMA,
+        "identity": {
+            "report_nonce": "0" * 32,
+            "run_id": "policy-contract",
+            "allocator": "allocatbelt",
+            "executor": "allocatbelt",
+            "source_sha256": "0" * 64,
+            "binary_sha256": "0" * 64,
+            "comparison_family": "fixed_policy",
+            "resource_ceiling_sha256": "0" * 64,
+            "policy_sha256": "0" * 64,
+        },
+        "run": {
+            "workload": workload,
+            "profile": profile,
+            "mode": "open_loop",
+            "rate_per_second": 1,
+            "arrivals": 1,
+        },
+        "fixed_global_control_baseline": 1,
+    }
+
+
+def fixed_runtime_policy_artifact(validator_sha256: str | None = None) -> dict[str, Any]:
+    """Expose all numeric fixed-policy inputs in the immutable source manifest."""
+    module = runtime_readback_module(validator_sha256)
+    workloads: dict[str, Any] = {}
+    for workload in module.WORKLOADS:
+        profile = "mixed" if workload == "mixed" else "steady"
+        expected = module.build_fixed_expectation(runtime_recipe_for_policy(workload, profile, validator_sha256))
+        contract = expected["contract"]
+        workloads[workload] = {
+            "domain_ceiling": contract["ceilings"],
+            "scope_limits": contract["scope_limits"],
+        }
+    ordinary_workers = module.build_fixed_expectation(runtime_recipe_for_policy("cpu", validator_sha256=validator_sha256))
+    oversubscribed_workers = module.build_fixed_expectation(
+        runtime_recipe_for_policy("cpu", "oversubscribed", validator_sha256)
+    )
+    kernel = module.build_fixed_expectation(runtime_recipe_for_policy("cpu", validator_sha256=validator_sha256))["contract"]["kernel"]
+    byte_buckets = module.build_fixed_expectation(runtime_recipe_for_policy("cpu", validator_sha256=validator_sha256))["contract"]["byte_buckets"]
+    policy = {
+        "schema": FIXED_POLICY_SCHEMA,
+        "comparison_family": "fixed_policy",
+        "resource_policy": "fixed_primary_v1",
+        "logical_window": int(ordinary_workers["contract"]["configuration"]["logical_window"]),
+        "task_ceiling": int(ordinary_workers["contract"]["configuration"]["task_ceiling"]),
+        "workers_by_profile": {
+            "ordinary": int(ordinary_workers["contract"]["configuration"]["async_workers"]),
+            "oversubscribed": int(oversubscribed_workers["contract"]["configuration"]["async_workers"]),
+        },
+        "workloads": workloads,
+        "byte_buckets": byte_buckets,
+        "kernel": kernel,
+    }
+    return {
+        "schema": FIXED_POLICY_SCHEMA,
+        "policy": policy,
+        "policy_sha256": hashlib.sha256(canonical_bytes(policy)).hexdigest(),
+    }
+
+
+def validate_fixed_runtime_policy_artifact(
+    value: Any, validator_sha256: str | None = None,
+) -> dict[str, Any]:
+    expected = fixed_runtime_policy_artifact(validator_sha256)
+    try:
+        exact_numeric_bytes = canonical_bytes(value) == canonical_bytes(expected)
+    except (CampaignError, TypeError, ValueError):
+        exact_numeric_bytes = False
+    require(exact_numeric_bytes, "numeric fixed-policy artifact differs from the frozen application policy")
+    return expected
+
+
+def fixed_resource_limits_for_cell(
+    workload: str, profile: str, validator_sha256: str | None = None,
+) -> dict[str, int]:
+    module = runtime_readback_module(validator_sha256)
+    recipe = runtime_recipe_for_policy(workload, profile, validator_sha256)
+    contract = module.build_fixed_expectation(recipe)["contract"]
+    ceilings = contract["ceilings"]
+    return {
+        "managed_bytes": ceilings["memory"],
+        "disk_ops": ceilings["disk"],
+        "network_ops": ceilings["network"],
+        "tasks": ceilings["tasks"],
+        "cpu_charges": ceilings["cpu"],
+    }
+
+
+def validate_calibration_record(value: Any) -> dict[str, Any]:
+    expected_keys = {
+        "schema", "architecture", "max_tenants", "max_waiters", "control_ceiling",
+        "fixed_global_control_baseline", "tenant_owner_control_bytes", "final_live_tenants",
+        "final_global_control_bytes",
+    }
+    record = exact_keys(value, expected_keys, "resource-domain calibration output")
+    require(record["schema"] == CALIBRATION_SCHEMA, "unknown resource-domain calibration schema")
+    require(record["architecture"] == "x86_64", "resource-domain calibration is not for the frozen x86_64 target")
+    expected_numbers = {
+        "max_tenants": RUNTIME_FIXED_CONTROL_MAX_TENANTS,
+        "max_waiters": RUNTIME_FIXED_CONTROL_MAX_WAITERS,
+        "control_ceiling": RUNTIME_APPLICATION_CONTROL_CEILING,
+        "final_live_tenants": 0,
+    }
+    for key, expected in expected_numbers.items():
+        require(type(record[key]) is int and record[key] == expected, f"resource-domain calibration has an invalid {key}")
+    baseline = record["fixed_global_control_baseline"]
+    tenant_bytes = record["tenant_owner_control_bytes"]
+    final_control = record["final_global_control_bytes"]
+    require(type(baseline) is int and 0 < baseline < RUNTIME_APPLICATION_CONTROL_CEILING, "calibration baseline Control must be a positive bounded integer")
+    require(type(tenant_bytes) is int and 0 <= tenant_bytes <= RUNTIME_APPLICATION_CONTROL_CEILING, "calibration tenant Control is outside its finite bound")
+    require(type(final_control) is int and final_control == baseline, "calibration final Control does not return to its numeric baseline")
+    return record
 
 
 def is_sha256(value: Any) -> bool:
@@ -216,10 +546,7 @@ def source_manifest(args: argparse.Namespace) -> dict[str, Any]:
         label, separator, path = assignment.partition("=")
         require(separator and label in ALLOCATORS, f"invalid allocator binary binding: {assignment}")
         require(label not in artifacts, f"duplicate allocator binary binding: {label}")
-        artifact_rel = Path(path)
-        require(not artifact_rel.is_absolute() and ".." not in artifact_rel.parts, "binary path must be relative to source root")
-        artifact = root / artifact_rel
-        require(artifact.is_file() and not artifact.is_symlink(), f"binary artifact missing or symlinked: {artifact_rel}")
+        artifact_rel, artifact = safe_relative_artifact(root, path, f"{label} binary")
         artifacts[label] = {"path": artifact_rel.as_posix(), "sha256": hashlib.sha256(artifact.read_bytes()).hexdigest()}
     require(set(artifacts) == set(ALLOCATORS), f"all four allocator binaries required; got {sorted(artifacts)}")
     require(len({item["path"] for item in artifacts.values()}) == len(ALLOCATORS), "allocator binaries must have distinct frozen paths")
@@ -228,43 +555,80 @@ def source_manifest(args: argparse.Namespace) -> dict[str, Any]:
         label, separator, path = assignment.partition("=")
         require(separator and label in ALLOCATORS, f"invalid soak binary binding: {assignment}")
         require(label not in soak_artifacts, f"duplicate soak binary binding: {label}")
-        artifact_rel = Path(path)
-        require(not artifact_rel.is_absolute() and ".." not in artifact_rel.parts, "soak binary path must be relative to source root")
-        artifact = root / artifact_rel
-        require(artifact.is_file() and not artifact.is_symlink(), f"soak binary artifact missing or symlinked: {artifact_rel}")
+        artifact_rel, artifact = safe_relative_artifact(root, path, f"{label} soak binary")
         soak_artifacts[label] = {"path": artifact_rel.as_posix(), "sha256": hashlib.sha256(artifact.read_bytes()).hexdigest()}
     require(set(soak_artifacts) == set(ALLOCATORS), f"all four dedicated soak binaries required; got {sorted(soak_artifacts)}")
     require(len({item["path"] for item in soak_artifacts.values()}) == len(ALLOCATORS), "dedicated soak binaries must have distinct frozen paths")
-    analyzer_relative = Path(args.analysis_binary)
-    require(not analyzer_relative.is_absolute() and ".." not in analyzer_relative.parts, "analyzer binary path must be relative to source root")
+    analyzer_relative, analyzer_path = safe_relative_artifact(root, args.analysis_binary, "analysis binary")
     require(analyzer_relative.as_posix() not in {item["path"] for item in artifacts.values()} | {item["path"] for item in soak_artifacts.values()}, "analysis binary must be a distinct pinned build artifact")
-    analyzer_path = root / analyzer_relative
-    require(analyzer_path.is_file() and not analyzer_path.is_symlink(), "pinned analyzer binary is missing or symlinked")
-    manifest: dict[str, Any] = {
-        "schema": SOURCE_SCHEMA,
+    calibration_binary_relative, calibration_binary_path = safe_relative_artifact(
+        root, args.resource_domain_calibration_binary, "resource-domain calibration binary"
+    )
+    calibration_output_relative, calibration_output_path = safe_relative_artifact(
+        root, args.resource_domain_calibration_output, "resource-domain calibration output"
+    )
+    used_paths = {item["path"] for item in artifacts.values()} | {item["path"] for item in soak_artifacts.values()} | {analyzer_relative.as_posix()}
+    require(calibration_binary_relative.as_posix() not in used_paths, "calibration binary must be a distinct frozen artifact")
+    require(calibration_output_relative.as_posix() not in used_paths | {calibration_binary_relative.as_posix()}, "calibration output must be a distinct frozen artifact")
+    calibration_output_raw, calibration_output_sha256 = read_stable_bytes(
+        calibration_output_path, "resource-domain calibration output", MAX_READBACK_ARTIFACT_BYTES
+    )
+    calibration_record = validate_calibration_record(
+        parse_json_object_bytes(calibration_output_raw, "resource-domain calibration output", MAX_READBACK_ARTIFACT_BYTES)
+    )
+    calibration_binary_sha256 = hashlib.sha256(calibration_binary_path.read_bytes()).hexdigest()
+    validator_relative, validator_path = safe_relative_artifact(
+        root, RUNTIME_VALIDATOR_RELATIVE_PATH, "runtime readback validator"
+    )
+    _validator_raw, validator_sha256 = read_stable_bytes(
+        validator_path, "runtime readback validator source", MAX_SOURCE_MANIFEST_BYTES
+    )
+    fixed_policy = fixed_runtime_policy_artifact(validator_sha256)
+    source_identity = {
+        "git_commit": commit,
+        "source_tree_sha256": tree_sha,
+        "cargo_lock_sha256": hashlib.sha256(cargo_lock.read_bytes()).hexdigest(),
+        "files": source_files,
+    }
+    build_identity = {
+        "host_id": token(args.host_id, "host id"),
+        "rustc_release": rustc_release,
+        "rustc_verbose": rustc,
+        "cargo_version": cargo,
+        "target_triple": args.target_triple,
+        "target_cpu": args.target_cpu,
+        "profile": "release",
+        "features_sha256": args.features_sha256,
+        "build_inputs_sha256": args.build_inputs_sha256,
+    }
+    calibration = {
+        "binary": {"path": calibration_binary_relative.as_posix(), "sha256": calibration_binary_sha256},
+        "output": {"path": calibration_output_relative.as_posix(), "sha256": calibration_output_sha256},
+        "record": calibration_record,
         "source": {
             "git_commit": commit,
             "source_tree_sha256": tree_sha,
-            "cargo_lock_sha256": hashlib.sha256(cargo_lock.read_bytes()).hexdigest(),
-            "files": source_files,
+            "cargo_lock_sha256": source_identity["cargo_lock_sha256"],
         },
-        "build": {
-            "host_id": token(args.host_id, "host id"),
-            "rustc_release": rustc_release,
-            "rustc_verbose": rustc,
-            "cargo_version": cargo,
-            "target_triple": args.target_triple,
-            "target_cpu": args.target_cpu,
-            "profile": "release",
-            "features_sha256": args.features_sha256,
-            "build_inputs_sha256": args.build_inputs_sha256,
-        },
+        "build": build_identity,
+        "build_sha256": digest_object(build_identity),
+    }
+    manifest: dict[str, Any] = {
+        "schema": SOURCE_SCHEMA,
+        "source": source_identity,
+        "build": build_identity,
         "artifacts": artifacts,
         "soak_artifacts": soak_artifacts,
         "analysis_artifact": {
             "path": analyzer_relative.as_posix(),
             "sha256": hashlib.sha256(analyzer_path.read_bytes()).hexdigest(),
         },
+        "fixed_runtime_policy": fixed_policy,
+        "runtime_readback_validator": {
+            "path": validator_relative.as_posix(),
+            "sha256": validator_sha256,
+        },
+        "resource_domain_calibration": calibration,
     }
     require(is_sha256(args.features_sha256), "features manifest SHA-256 is required")
     require(is_sha256(args.build_inputs_sha256), "build inputs SHA-256 is required")
@@ -276,7 +640,11 @@ def verify_source_manifest(
     manifest: dict[str, Any], source_root: Path | None = None, verify_artifacts: bool = True,
     timeout_seconds: float = 120.0,
 ) -> None:
-    exact_keys(manifest, {"schema", "source", "build", "artifacts", "soak_artifacts", "analysis_artifact", "manifest_sha256"}, "source manifest")
+    exact_keys(manifest, {
+        "schema", "source", "build", "artifacts", "soak_artifacts", "analysis_artifact",
+        "fixed_runtime_policy", "runtime_readback_validator", "resource_domain_calibration",
+        "manifest_sha256",
+    }, "source manifest")
     require(manifest["schema"] == SOURCE_SCHEMA, "unsupported source-manifest schema")
     require(is_sha256(manifest["manifest_sha256"]) and digest_object(manifest) == manifest["manifest_sha256"], "source-manifest digest mismatch")
     source = exact_keys(manifest["source"], {"git_commit", "source_tree_sha256", "cargo_lock_sha256", "files"}, "source manifest source")
@@ -293,8 +661,36 @@ def verify_source_manifest(
     require(len({item.get("path") for item in manifest["soak_artifacts"].values()}) == len(ALLOCATORS), "source manifest aliases dedicated soak binary paths")
     require(manifest["analysis_artifact"].get("path") not in {item.get("path") for item in manifest["artifacts"].values()} | {item.get("path") for item in manifest["soak_artifacts"].values()}, "source manifest reuses a treatment binary for analysis")
     require(isinstance(source["files"], list) and source["files"], "source file inventory is missing")
+    file_paths: set[str] = set()
+    for index, entry_value in enumerate(source["files"]):
+        entry = exact_keys(entry_value, {"path", "sha256", "size"}, f"source file inventory[{index}]")
+        path = Path(entry["path"])
+        require(isinstance(entry["path"], str) and not path.is_absolute() and ".." not in path.parts and "\\" not in entry["path"], "source inventory path is not portable")
+        require(entry["path"] not in file_paths and is_sha256(entry["sha256"]) and type(entry["size"]) is int and entry["size"] >= 0, "source file inventory has a duplicate or invalid entry")
+        file_paths.add(entry["path"])
     inventory_hash = hashlib.sha256("".join(f"{entry['sha256']}  {entry['path']}\n" for entry in source["files"]).encode()).hexdigest()
     require(inventory_hash == source["source_tree_sha256"], "source file inventory digest is invalid")
+    validator = exact_keys(manifest["runtime_readback_validator"], {"path", "sha256"}, "runtime readback validator pin")
+    validator_path = Path(validator["path"])
+    require(validator["path"] == RUNTIME_VALIDATOR_RELATIVE_PATH and not validator_path.is_absolute() and ".." not in validator_path.parts and is_sha256(validator["sha256"]), "runtime readback validator path/digest is malformed")
+    validator_file = next((entry for entry in source["files"] if entry["path"] == validator["path"]), None)
+    require(validator_file is not None and validator_file["sha256"] == validator["sha256"], "runtime readback validator hash is not bound by the source inventory")
+    policy_artifact = validate_fixed_runtime_policy_artifact(manifest["fixed_runtime_policy"], validator["sha256"])
+    calibration = exact_keys(
+        manifest["resource_domain_calibration"],
+        {"binary", "output", "record", "source", "build", "build_sha256"},
+        "resource-domain calibration artifact",
+    )
+    calibration_binary = exact_keys(calibration["binary"], {"path", "sha256"}, "calibration binary")
+    calibration_output = exact_keys(calibration["output"], {"path", "sha256"}, "calibration output")
+    for label, artifact in (("calibration binary", calibration_binary), ("calibration output", calibration_output)):
+        relative = Path(artifact["path"])
+        require(isinstance(artifact["path"], str) and not relative.is_absolute() and ".." not in relative.parts and "\\" not in artifact["path"] and is_sha256(artifact["sha256"]), f"{label} path/digest is malformed")
+    artifact_paths = {item["path"] for item in manifest["artifacts"].values()} | {item["path"] for item in manifest["soak_artifacts"].values()} | {manifest["analysis_artifact"]["path"]}
+    require(calibration_binary["path"] not in artifact_paths and calibration_output["path"] not in artifact_paths | {calibration_binary["path"]}, "calibration binary/output must be distinct from all other artifacts")
+    require(calibration["source"] == {key: source[key] for key in ("git_commit", "source_tree_sha256", "cargo_lock_sha256")}, "calibration is not bound to the frozen source revision")
+    require(calibration["build"] == build and calibration["build_sha256"] == digest_object(build), "calibration is not bound to the frozen target/build features")
+    calibration_record = validate_calibration_record(calibration["record"])
     if source_root is not None:
         root = source_root.resolve(strict=True)
         tree_sha, files = source_inventory(root, timeout_seconds)
@@ -310,13 +706,31 @@ def verify_source_manifest(
             **manifest["artifacts"],
             **{f"soak-{name}": value for name, value in manifest["soak_artifacts"].items()},
             "analysis-engine": manifest["analysis_artifact"],
+            "resource-domain-calibration": calibration_binary,
+            "resource-domain-calibration-output": calibration_output,
+            "runtime-readback-validator": validator,
         }
+        live_calibration = None
         for label, artifact in all_artifacts.items():
             exact_keys(artifact, {"path", "sha256"}, f"artifact {label}")
-            rel = Path(artifact["path"])
-            require(not rel.is_absolute() and ".." not in rel.parts, f"artifact path for {label} is not portable")
-            binary = root / rel
-            require(binary.is_file() and not binary.is_symlink() and hashlib.sha256(binary.read_bytes()).hexdigest() == artifact["sha256"], f"frozen binary mismatch: {label}")
+            rel, artifact_path = safe_relative_artifact(root, artifact["path"], f"artifact {label}")
+            if label == "resource-domain-calibration-output":
+                raw, actual_sha256 = read_stable_bytes(
+                    artifact_path, label, MAX_READBACK_ARTIFACT_BYTES
+                )
+                require(actual_sha256 == artifact["sha256"], f"frozen artifact mismatch: {label}")
+                live_calibration = validate_calibration_record(
+                    parse_json_object_bytes(raw, label, MAX_READBACK_ARTIFACT_BYTES)
+                )
+            elif label == "runtime-readback-validator":
+                _raw, actual_sha256 = read_stable_bytes(
+                    artifact_path, label, MAX_SOURCE_MANIFEST_BYTES
+                )
+                require(actual_sha256 == artifact["sha256"], f"frozen artifact mismatch: {label}")
+            else:
+                require(sha256_file(artifact_path) == artifact["sha256"], f"frozen artifact mismatch: {label}")
+        require(live_calibration is not None, "resource-domain calibration output was not independently loaded")
+        require(live_calibration == calibration_record, "resource-domain calibration output changed after source-manifest freeze")
 
 
 def load_source_manifests(spec: dict[str, Any], spec_path: Path, source_root: Path | None, selected_host: str | None = None) -> dict[str, dict[str, Any]]:
@@ -324,14 +738,36 @@ def load_source_manifests(spec: dict[str, Any], spec_path: Path, source_root: Pa
     for ref in spec.get("source_manifests", []):
         exact_keys(ref, {"host_id", "relative_path", "sha256"}, "source manifest reference")
         host_id = ref["host_id"]
-        path = Path(ref["relative_path"])
-        require(not path.is_absolute() and ".." not in path.parts and is_sha256(ref["sha256"]), f"invalid host source manifest reference: {host_id}")
-        manifest_path = spec_path.resolve().parent / path
+        require(is_sha256(ref["sha256"]), f"invalid host source manifest digest: {host_id}")
+        _relative, manifest_path = safe_relative_artifact(
+            spec_path.resolve().parent, ref["relative_path"], f"{host_id} source manifest"
+        )
         source = read_json(manifest_path)
         require(source.get("manifest_sha256") == ref["sha256"], f"host source manifest digest mismatch: {host_id}")
         verify_source_manifest(source, source_root, selected_host == host_id)
         sources[host_id] = source
     return sources
+
+
+def source_manifest_file(spec: dict[str, Any], spec_path: Path, host_id: str) -> tuple[Path, str]:
+    refs = [item for item in spec["source_manifests"] if item["host_id"] == host_id]
+    require(len(refs) == 1, f"source manifest reference is missing or duplicated for {host_id}")
+    parent = spec_path.resolve(strict=True).parent
+    relative, path = safe_relative_artifact(parent, refs[0]["relative_path"], f"{host_id} source manifest")
+    require(path.is_file() and not path.is_symlink(), f"{host_id} source manifest is not a regular nonsymlink file")
+    return path, refs[0]["sha256"]
+
+
+def verify_source_manifest_file(
+    path: Path, expected_source: dict[str, Any], expected_manifest_sha256: str, expected_file_sha256: str | None = None,
+) -> str:
+    require(not path.is_symlink() and path.is_file(), "frozen source-manifest file is missing or symlinked")
+    raw, raw_sha = read_stable_bytes(path, "frozen source manifest", MAX_SOURCE_MANIFEST_BYTES)
+    require(expected_file_sha256 is None or raw_sha == expected_file_sha256, "source-manifest file changed during the phase")
+    current = parse_json_object_bytes(raw, "frozen source manifest", MAX_SOURCE_MANIFEST_BYTES)
+    verify_source_manifest(current, verify_artifacts=False)
+    require(current == expected_source and current["manifest_sha256"] == expected_manifest_sha256, "source-manifest content differs from the frozen host manifest")
+    return raw_sha
 
 
 def expected_profile_cells() -> set[tuple[str, str, str]]:
@@ -399,6 +835,20 @@ def validate_spec(spec: dict[str, Any], sources: dict[str, dict[str, Any]]) -> d
     for field in ("resource_policy_sha256", "feedback_policy_sha256"):
         require(is_sha256(binding[field]), f"runtime binding lacks frozen {field}")
     require(binding["feedback_match"] in ("fixed_same_policy", "external_same_policy"), "allocatbelt and Tokio feedback policy must be explicitly matched")
+    fixed_policies = {
+        source["fixed_runtime_policy"]["policy_sha256"]
+        for source in sources.values()
+    }
+    require(len(fixed_policies) == 1, "host source manifests do not share one numeric fixed-policy artifact")
+    validator_hashes = {source["runtime_readback_validator"]["sha256"] for source in sources.values()}
+    require(len(validator_hashes) == 1, "host source manifests do not pin one exact runtime readback validator source")
+    require(binding["resource_policy_sha256"] == next(iter(fixed_policies)), "runtime binding policy hash does not identify the numeric fixed-policy artifact")
+    require(
+        all(source["runtime_readback_validator"]["path"] == RUNTIME_VALIDATOR_RELATIVE_PATH for source in sources.values()),
+        "host manifests do not pin the canonical runtime readback validator path",
+    )
+    calibration_baselines = [source["resource_domain_calibration"]["record"]["fixed_global_control_baseline"] for source in sources.values()]
+    require(all(type(value) is int and 0 < value < RUNTIME_APPLICATION_CONTROL_CEILING for value in calibration_baselines), "per-host audited Control baseline is not a positive bounded number")
 
     phase_adapters = exact_keys(spec["phase_adapters"], {"same_executor_aa_sha256", "three_hour_soak_sha256", "simultaneous_analysis_sha256"}, "phase adapters")
     for name, value in phase_adapters.items():
@@ -415,17 +865,21 @@ def validate_spec(spec: dict[str, Any], sources: dict[str, dict[str, Any]]) -> d
         actual_cells.add(key)
         cell_map[key] = cell
         require(cell["family"] in FAMILIES and cell["workload"] in FAMILIES, f"unknown family/workload in {key}")
-        require(isinstance(cell["arrivals"], int) and 1 <= cell["arrivals"] <= MAX_ARRIVALS, f"arrival count outside finite bound in {key}")
+        require(type(cell["arrivals"]) is int and 1 <= cell["arrivals"] <= MAX_ARRIVALS, f"arrival count outside finite bound in {key}")
         minimum = 400_000 if cell["workload"] == "mixed" else 100_000
         require(cell["arrivals"] >= minimum, f"confirmation trace too small for {key}")
-        require(cell["async_workers"] == (2 if cell["profile"] == "oversubscribed" else 4), f"worker count mismatches profile: {key}")
+        require(type(cell["async_workers"]) is int and cell["async_workers"] == (2 if cell["profile"] == "oversubscribed" else 4), f"worker count mismatches profile: {key}")
         limits = exact_keys(cell["resource_limits"], {"managed_bytes", "disk_ops", "network_ops", "tasks", "cpu_charges"}, f"resource limits {key}")
         for field, value in limits.items():
             require(type(value) is int and 0 <= value <= (1 << 64) - 1, f"resource limit is not a finite u64: {key}/{field}")
         require(limits["tasks"] > 0 and limits["cpu_charges"] > 0, f"task/CPU ceilings must be positive: {key}")
+        expected_limits = fixed_resource_limits_for_cell(cell["workload"], cell["profile"], next(iter(validator_hashes)))
+        require(canonical_bytes(limits) == canonical_bytes(expected_limits), f"numeric resource limits differ from the fixed workload/profile recipe: {key}")
+        policy_ceiling = next(iter(sources.values()))["fixed_runtime_policy"]["policy"]["workloads"][cell["workload"]]["domain_ceiling"]
+        require(type(policy_ceiling["control"]) is int and policy_ceiling["control"] == RUNTIME_APPLICATION_CONTROL_CEILING, f"numeric fixed-policy Control ceiling differs for {key}")
         require(hashlib.sha256(canonical_bytes(limits)).hexdigest() == cell["resource_ceiling_sha256"], f"resource ceiling digest does not bind the numeric limits: {key}")
         require(is_sha256(cell["resource_ceiling_sha256"]), f"resource ceiling is not frozen for {key}")
-        require(cell["capacity_horizon_seconds"] == 30, f"capacity horizon must be 30s for {key}")
+        require(type(cell["capacity_horizon_seconds"]) is int and cell["capacity_horizon_seconds"] == 30, f"capacity horizon must be 30s for {key}")
     require(actual_cells == expected_profile_cells(), f"family/profile matrix differs from required set; missing={sorted(expected_profile_cells() - actual_cells)} extra={sorted(actual_cells - expected_profile_cells())}")
 
     protocol = exact_keys(spec["protocol"], {"exploration_pairs", "confirmation_pairs", "standalone_min_successes", "mixed_min_successes", "family_min_successes", "bootstrap_draws", "bootstrap_block_arrivals", "bootstrap_seed", "bootstrap_prng", "comparison_family_order", "external_pressure_predecessor", "confidence", "simultaneous_adjustment", "bootstrap_hierarchy", "weighting", "gate_scope", "safety_overload_gate_eligible", "soak_seconds", "soak_rss_growth_percent", "schedule_seed", "allocator_min_capacity_ratio", "allocator_max_p99_ratio", "executor_min_capacity_ratio", "executor_max_p99_ratio", "max_workload_throughput_ratio", "max_workload_cpu_ratio", "max_workload_p99_ratio", "max_retained_rss_ratio"}, "protocol")
@@ -870,7 +1324,7 @@ def validate_phase_ledger(records: list[dict[str, Any]], expected_jobs: list[dic
 
 
 def fixed_pressure_predecessor_receipt(
-    pressure_job: dict[str, Any], fixed_record: dict[str, Any], spec: dict[str, Any],
+    pressure_job: dict[str, Any], fixed_record: dict[str, Any], spec: dict[str, Any], source: dict[str, Any],
 ) -> dict[str, Any]:
     fixed_job = fixed_record.get("job")
     require(
@@ -894,34 +1348,96 @@ def fixed_pressure_predecessor_receipt(
     expected_cell = next(cell for cell in spec["cells"] if cell["family"] == fixed_job["family"] and cell["profile"] == fixed_job["profile"])
     metrics = fixed_record.get("process_metrics")
     require(isinstance(metrics, list) and len(metrics) == 2, "fixed predecessor receipt lacks its two validated process observations")
-    readback_receipts = []
+    scheduled = build_runtime_process_bindings(fixed_job, spec, source)
+    scheduled_by_identity = {(item["pair"], item["executor"], item["allocator"]): item for item in scheduled}
+    observed_metric_identities = []
+    for metric in metrics:
+        readback_value = metric.get("runtime_readback") if type(metric) is dict else None
+        observed_metric_identities.append(
+            (readback_value.get("pair"), readback_value.get("executor"), readback_value.get("allocator"))
+            if type(readback_value) is dict else (None, None, None)
+        )
+    require(
+        len(scheduled_by_identity) == 2
+        and len(observed_metric_identities) == 2
+        and len(set(observed_metric_identities)) == 2
+        and set(observed_metric_identities) == set(scheduled_by_identity),
+        "fixed predecessor metrics do not equal the exact unique scheduled process descriptors",
+    )
+    readback_snapshots = []
+    calibration = source["resource_domain_calibration"]
+    calibration_record = calibration["record"]
     for metric in metrics:
         readback = exact_keys(metric.get("runtime_readback"), {
-            "schema", "comparison_family", "resource_domain", "feedback_policy_sha256",
-            "resource_ceiling_sha256", "live_usage_sha256", "readback_sha256", "receipt_sha256",
-        }, "fixed predecessor runtime readback")
+            "schema", "pair", "executor", "allocator", "report_nonce", "comparison_family",
+            "resource_ceiling_sha256", "policy_sha256", "fixed_global_control_baseline",
+            "source_manifest_sha256", "calibration_binary_sha256", "calibration_output_sha256",
+            "validator_sha256", "runtime_readback_sha256", "output_sha256",
+            "runtime_expectation_sha256", "runtime_validation_sha256", "runtime_recipe_sha256",
+            "numeric_snapshot",
+        }, "fixed predecessor numeric runtime readback")
+        identity_key = (readback["pair"], readback["executor"], readback["allocator"])
+        binding = scheduled_by_identity.get(identity_key)
+        require(binding is not None, "fixed predecessor process has no controller-frozen runtime recipe")
+        expected = runtime_readback_module(source["runtime_readback_validator"]["sha256"]).build_fixed_expectation(binding["recipe"])
         require(
-            readback["schema"] == "allocatbelt.application-runtime-readback.v1"
+            readback["schema"] == "allocatbelt.application-runtime-readback-process.v1"
             and readback["comparison_family"] == "fixed_policy"
-            and readback["resource_domain"] == "owning_global_tenant"
-            and readback["feedback_policy_sha256"] == spec["runtime_binding"]["feedback_policy_sha256"]
+            and readback["report_nonce"] == binding["report_nonce"]
+            and readback["policy_sha256"] == source["fixed_runtime_policy"]["policy_sha256"]
             and readback["resource_ceiling_sha256"] == expected_cell["resource_ceiling_sha256"]
-            and is_sha256(readback["live_usage_sha256"])
-            and is_sha256(readback["readback_sha256"])
-            and is_sha256(readback["receipt_sha256"]),
+            and readback["runtime_recipe_sha256"] == binding["recipe_sha256"]
+            and readback["runtime_expectation_sha256"] == binding["expectation_sha256"]
+            and type(readback["fixed_global_control_baseline"]) is int
+            and readback["fixed_global_control_baseline"] == calibration_record["fixed_global_control_baseline"]
+            and readback["source_manifest_sha256"] == source["manifest_sha256"]
+            and readback["calibration_binary_sha256"] == calibration["binary"]["sha256"]
+            and readback["calibration_output_sha256"] == calibration["output"]["sha256"]
+            and readback["validator_sha256"] == source["runtime_readback_validator"]["sha256"]
+            and all(is_sha256(readback[name]) for name in ("runtime_readback_sha256", "output_sha256", "runtime_expectation_sha256", "runtime_validation_sha256", "runtime_recipe_sha256")),
             "fixed predecessor runtime readback differs from its source/policy/ceiling receipt",
         )
-        readback_receipts.append(readback["receipt_sha256"])
+        require(metric.get("executor") == binding["executor"] and metric.get("allocator") == binding["allocator"], "fixed predecessor process metric identity differs from its runtime recipe")
+        validate_numeric_runtime_snapshot(
+            readback["numeric_snapshot"], expected, calibration_record,
+            source["runtime_readback_validator"]["sha256"],
+        )
+        readback_snapshots.append({
+            "pair": binding["pair"],
+            "executor": binding["executor"],
+            "allocator": binding["allocator"],
+            "recipe_sha256": binding["recipe_sha256"],
+            "runtime_readback_sha256": readback["runtime_readback_sha256"],
+            "output_sha256": readback["output_sha256"],
+            "expectation_sha256": readback["runtime_expectation_sha256"],
+            "validation_sha256": readback["runtime_validation_sha256"],
+            "numeric_snapshot": readback["numeric_snapshot"],
+        })
+    require(len({(item["pair"], item["executor"], item["allocator"]) for item in readback_snapshots}) == 2, "fixed predecessor repeats or omits a process runtime snapshot")
+    readback_snapshots.sort(key=lambda item: (item["pair"], item["executor"], item["allocator"]))
     material = {
+        "schema": "allocatbelt.application-fixed-policy-predecessor.v2",
         "run_id": fixed_job["run_id"],
         "record_sha256": digest_object(fixed_record),
-        "readback_receipt_sha256s": readback_receipts,
+        "source_manifest_sha256": source["manifest_sha256"],
+        "policy_sha256": source["fixed_runtime_policy"]["policy_sha256"],
+        "resource_ceiling_sha256": expected_cell["resource_ceiling_sha256"],
+        "calibration": {
+            "max_tenants": calibration_record["max_tenants"],
+            "max_waiters": calibration_record["max_waiters"],
+            "control_ceiling": calibration_record["control_ceiling"],
+            "fixed_global_control_baseline": calibration_record["fixed_global_control_baseline"],
+            "tenant_owner_control_bytes": calibration_record["tenant_owner_control_bytes"],
+            "final_live_tenants": calibration_record["final_live_tenants"],
+            "final_global_control_bytes": calibration_record["final_global_control_bytes"],
+        },
+        "readback_snapshots": readback_snapshots,
     }
     return {**material, "receipt_sha256": digest_object(material)}
 
 
 def validate_pressure_predecessor_receipts(
-    pressure_records: list[dict[str, Any]], fixed_records: list[dict[str, Any]], spec: dict[str, Any],
+    pressure_records: list[dict[str, Any]], fixed_records: list[dict[str, Any]], spec: dict[str, Any], source: dict[str, Any],
 ) -> None:
     fixed_by_id = {record["job"]["run_id"]: record for record in fixed_records}
     require(len(fixed_by_id) == len(fixed_records), "fixed predecessor ledger repeats a run ID")
@@ -931,30 +1447,58 @@ def validate_pressure_predecessor_receipts(
         require(isinstance(predecessors, list) and len(predecessors) == 1, "pressure job must name exactly one fixed-policy predecessor ID")
         fixed = fixed_by_id.get(predecessors[0])
         require(fixed is not None, "pressure job references a missing fixed-policy predecessor receipt")
-        expected = fixed_pressure_predecessor_receipt(job, fixed, spec)
-        require(record.get("predecessor_receipts") == [expected], "pressure ledger does not bind the validated successful fixed-policy readback receipt")
+        expected = fixed_pressure_predecessor_receipt(job, fixed, spec, source)
+        try:
+            exact_receipt_bytes = canonical_bytes(record.get("predecessor_receipts")) == canonical_bytes([expected])
+        except (CampaignError, TypeError, ValueError):
+            exact_receipt_bytes = False
+        require(exact_receipt_bytes, "pressure ledger does not bind the validated successful fixed-policy readback receipt")
 
 
 def revalidate_pair_records(
     records: list[dict[str, Any]], phase: str, ledger_root: Path, source: dict[str, Any], spec: dict[str, Any], campaign_artifacts: Path,
+    source_manifest_file_sha256: str | None = None,
 ) -> None:
+    require(phase in ("exploration", "aa", "confirmation"), "external-pressure process readbacks remain unsupported pending approved policy support")
     for record in records:
         require(record.get("runner_sha256_before") == spec["runner_sha256"] and record.get("runner_sha256_after") == spec["runner_sha256"], "recorded pair runner is not bound to the frozen runner hash")
         job = record["job"]
+        scheduled_bindings = build_runtime_process_bindings(job, spec, source)
+        binding_relative = Path(record.get("runtime_binding_manifest", ""))
+        require(not binding_relative.is_absolute() and ".." not in binding_relative.parts, "runtime binding manifest path is unsafe")
+        binding_path = ledger_root / binding_relative
+        require(within(ledger_root, binding_path) and not binding_path.is_symlink() and binding_path.is_file(), "runtime binding manifest is missing or escaped its phase root")
+        binding_raw, binding_sha = read_stable_bytes(
+            binding_path, "runtime binding manifest", MAX_READBACK_ARTIFACT_BYTES
+        )
+        require(binding_sha == record.get("runtime_binding_manifest_sha256"), "runtime binding manifest hash differs from the process ledger")
+        expected_manifest = runtime_binding_manifest_value(scheduled_bindings, job, spec, source)
+        stored_manifest = parse_json_object_bytes(binding_raw, "runtime process binding manifest", MAX_READBACK_ARTIFACT_BYTES)
+        require(binding_raw == canonical_bytes(expected_manifest) and stored_manifest == expected_manifest, "runtime process binding manifest differs from current frozen source/spec recipes")
+        calibration = source["resource_domain_calibration"]
+        require(record.get("runtime_validator_sha256") == source["runtime_readback_validator"]["sha256"], "runtime validator hash changed between schedule and analysis")
+        require(record.get("runtime_policy_sha256") == source["fixed_runtime_policy"]["policy_sha256"], "numeric fixed-policy hash changed between schedule and analysis")
+        require(record.get("calibration_binary_sha256") == calibration["binary"]["sha256"] and record.get("calibration_output_sha256") == calibration["output"]["sha256"], "calibration artifact hash changed between schedule and analysis")
+        require(
+            type(record.get("fixed_global_control_baseline")) is int
+            and record["fixed_global_control_baseline"] == calibration["record"]["fixed_global_control_baseline"],
+            "numeric fixed global Control baseline changed between schedule and analysis",
+        )
+        if source_manifest_file_sha256 is not None:
+            require(record.get("source_manifest_file_sha256") == source_manifest_file_sha256, "source-manifest file hash differs from the phase run record")
         relative = Path(record.get("pair_directory", ""))
         require(not relative.is_absolute() and ".." not in relative.parts, "pair directory path is unsafe")
         pair_dir = ledger_root / relative
         require(within(ledger_root, pair_dir) and pair_dir.is_dir(), "pair directory is missing or escaped its phase root")
         header, process_rows = read_tsv(pair_dir / "processes.tsv", 2)
-        expected_header = ("pair executor allocator exit_code row_validation p99_qualification argv stdout time_report ids_sha256 shutdown_sha256 capacity_family_sha256").split()
-        require(header == expected_header and all(row["exit_code"] == "0" and row["row_validation"] == "valid" for row in process_rows), "raw process ledger is invalid during independent revalidation")
+        require(header == PAIR_PROCESS_HEADER and all(row["exit_code"] == "0" and row["row_validation"] == "valid" for row in process_rows), "raw process ledger is invalid during independent revalidation")
+        require_exact_pair_process_rows(process_rows, job)
         actual = [extract_process_metrics(pair_dir, row, job, source, spec, campaign_artifacts) for row in process_rows]
         require(record.get("process_metrics") == actual, "stored process metrics differ from independently revalidated raw evidence")
 
 
 def latency_blocks_by_family(pair_dir: Path, metric: dict[str, Any], families: tuple[str, ...], block_size: int) -> dict[str, list[list[tuple[int, int]]]]:
     ids_path = pair_dir / metric["ids_path"]
-    require(sha256_file(ids_path) == metric["ids_sha256"], "arrival sidecar changed before block analysis")
     result: dict[str, list[list[tuple[int, int]]]] = {family: [] for family in families}
 
     def finish_block(block: dict[str, list[int]]) -> None:
@@ -971,25 +1515,33 @@ def latency_blocks_by_family(pair_dir: Path, metric: dict[str, Any], families: t
             result[family].append(grouped)
             block[family].clear()
     try:
-        with ids_path.open("r", encoding="utf-8") as stream:
-            require(stream.readline().rstrip("\n") == "schema\tallocatbelt-app-arrivals-v3", "arrival sidecar schema changed before block analysis")
-            identity = stream.readline().rstrip("\n").split("\t")
-            require(len(identity) == 9, "arrival sidecar identity changed before block analysis")
-            require(stream.readline().rstrip("\n") == "id\tworkload\tscheduled_ns\tcompletion_ns\tterminal\tchecksum\texpected_checksum", "arrival sidecar header changed before block analysis")
-            block: dict[str, list[int]] = {family: [] for family in families}
-            in_block = 0
-            for expected_id, line in enumerate(stream):
-                fields = line.rstrip("\n").split("\t")
-                require(len(fields) == 7 and fields[0] == str(expected_id) and fields[1] in families and fields[4] == "completed", "arrival terminal is invalid during block analysis")
-                scheduled, completion = parse_uint(fields[2], "scheduled_ns"), parse_uint(fields[3], "completion_ns")
-                require(completion >= scheduled, "negative latency during block analysis")
-                block[fields[1]].append(completion - scheduled)
-                in_block += 1
-                if in_block == block_size:
+        with stable_file_snapshot(ids_path, "arrival sidecar", MAX_TRACE_ARTIFACT_BYTES) as (snapshot, digest, _size):
+            require(digest == metric["ids_sha256"], "arrival sidecar changed before block analysis")
+            with io.TextIOWrapper(snapshot, encoding="utf-8") as stream:
+                require(read_bounded_text_line(stream, "arrival sidecar schema") == "schema\tallocatbelt-app-arrivals-v3", "arrival sidecar schema changed before block analysis")
+                identity_line = read_bounded_text_line(stream, "arrival sidecar identity")
+                require(identity_line is not None, "arrival sidecar identity is missing")
+                identity = identity_line.split("\t")
+                require(len(identity) == 9, "arrival sidecar identity changed before block analysis")
+                require(read_bounded_text_line(stream, "arrival sidecar header") == "id\tworkload\tscheduled_ns\tcompletion_ns\tterminal\tchecksum\texpected_checksum", "arrival sidecar header changed before block analysis")
+                block: dict[str, list[int]] = {family: [] for family in families}
+                in_block = 0
+                for expected_id in range(MAX_ARRIVALS):
+                    line = read_bounded_text_line(stream, f"arrival sidecar row {expected_id}")
+                    if line is None:
+                        break
+                    fields = line.split("\t")
+                    require(len(fields) == 7 and fields[0] == str(expected_id) and fields[1] in families and fields[4] == "completed", "arrival terminal is invalid during block analysis")
+                    scheduled, completion = parse_uint(fields[2], "scheduled_ns"), parse_uint(fields[3], "completion_ns")
+                    require(completion >= scheduled, "negative latency during block analysis")
+                    block[fields[1]].append(completion - scheduled)
+                    in_block += 1
+                    if in_block == block_size:
+                        finish_block(block)
+                        in_block = 0
+                if in_block:
                     finish_block(block)
-                    in_block = 0
-            if in_block:
-                finish_block(block)
+                require(read_bounded_text_line(stream, "arrival sidecar trailing row") is None, "arrival sidecar exceeds its finite ID bound")
     except (OSError, UnicodeError) as error:
         raise CampaignError(f"cannot read arrival blocks for analysis: {error}") from error
     require(all(any(block for block in result[family]) for family in families), "one source family has no successful latency observations")
@@ -1045,7 +1597,7 @@ def _write_trace_frame_to_spools(
     block_size: int,
     scratch_directory: Path,
 ) -> dict[str, Any]:
-    require(is_sha256(expected_sha256) and sha256_file(ids_path) == expected_sha256, "trace source sidecar hash changed before analyzer serialization")
+    require(is_sha256(expected_sha256), "trace source sidecar digest is malformed")
     spools = {family: tempfile.TemporaryFile(mode="w+b", dir=scratch_directory) for family in families}
     for spool in spools.values():
         spool.write(b"\0\0\0\0")
@@ -1070,31 +1622,38 @@ def _write_trace_frame_to_spools(
             block_values[family].clear()
 
     try:
-        with ids_path.open("r", encoding="utf-8") as stream:
-            require(stream.readline().rstrip("\n") == "schema\tallocatbelt-app-arrivals-v3", "analyzer trace has an unsupported per-ID schema")
-            identity = stream.readline().rstrip("\n").split("\t")
-            require(len(identity) == 9 and identity[0] == "identity", "analyzer trace process identity is malformed")
-            require(stream.readline().rstrip("\n") == "id\tworkload\tscheduled_ns\tcompletion_ns\tterminal\tchecksum\texpected_checksum", "analyzer trace header is malformed")
-            in_block = 0
-            for expected_id, line in enumerate(stream):
-                require(expected_id < MAX_ARRIVALS, "analyzer trace exceeds the per-process arrival bound")
-                fields = line.rstrip("\n").split("\t")
-                require(len(fields) == 7 and fields[0] == str(expected_id), f"analyzer trace ID is malformed at {expected_id}")
-                family = fields[1]
-                require(family in block_values and fields[4] == "completed", f"analyzer trace has an invalid terminal/family at {expected_id}")
-                scheduled = parse_uint(fields[2], "analyzer trace schedule")
-                completion = parse_uint(fields[3], "analyzer trace completion")
-                checksum = parse_uint(fields[5], "analyzer trace checksum")
-                expected_checksum = parse_uint(fields[6], "analyzer trace expected checksum")
-                require(completion >= scheduled and checksum == expected_checksum, f"analyzer trace timestamp/checksum differs at {expected_id}")
-                block_values[family].append(completion - scheduled)
-                observed_ids += 1
-                in_block += 1
-                if in_block == block_size:
+        with stable_file_snapshot(ids_path, "analyzer trace sidecar", MAX_TRACE_ARTIFACT_BYTES) as (snapshot, digest, _size):
+            require(digest == expected_sha256, "trace source sidecar hash changed before analyzer serialization")
+            with io.TextIOWrapper(snapshot, encoding="utf-8") as stream:
+                require(read_bounded_text_line(stream, "analyzer trace schema") == "schema\tallocatbelt-app-arrivals-v3", "analyzer trace has an unsupported per-ID schema")
+                identity_line = read_bounded_text_line(stream, "analyzer trace identity")
+                require(identity_line is not None, "analyzer trace process identity is missing")
+                identity = identity_line.split("\t")
+                require(len(identity) == 9 and identity[0] == "identity", "analyzer trace process identity is malformed")
+                require(read_bounded_text_line(stream, "analyzer trace header") == "id\tworkload\tscheduled_ns\tcompletion_ns\tterminal\tchecksum\texpected_checksum", "analyzer trace header is malformed")
+                in_block = 0
+                for expected_id in range(MAX_ARRIVALS):
+                    line = read_bounded_text_line(stream, f"analyzer trace row {expected_id}")
+                    if line is None:
+                        break
+                    fields = line.split("\t")
+                    require(len(fields) == 7 and fields[0] == str(expected_id), f"analyzer trace ID is malformed at {expected_id}")
+                    family = fields[1]
+                    require(family in block_values and fields[4] == "completed", f"analyzer trace has an invalid terminal/family at {expected_id}")
+                    scheduled = parse_uint(fields[2], "analyzer trace schedule")
+                    completion = parse_uint(fields[3], "analyzer trace completion")
+                    checksum = parse_uint(fields[5], "analyzer trace checksum")
+                    expected_checksum = parse_uint(fields[6], "analyzer trace expected checksum")
+                    require(completion >= scheduled and checksum == expected_checksum, f"analyzer trace timestamp/checksum differs at {expected_id}")
+                    block_values[family].append(completion - scheduled)
+                    observed_ids += 1
+                    in_block += 1
+                    if in_block == block_size:
+                        finish_global_block()
+                        in_block = 0
+                if in_block:
                     finish_global_block()
-                    in_block = 0
-            if in_block:
-                finish_global_block()
+                require(read_bounded_text_line(stream, "analyzer trace trailing row") is None, "analyzer trace exceeds the per-process arrival bound")
     except (OSError, UnicodeError) as error:
         for spool in spools.values():
             spool.close()
@@ -1105,7 +1664,6 @@ def _write_trace_frame_to_spools(
         spool.seek(0)
         spool.write(struct.pack("<I", block_counts[families[0]]))
         spool.seek(0)
-    require(sha256_file(ids_path) == expected_sha256, "trace sidecar changed while serializing analyzer input")
     return {"spools": spools, "blocks": block_counts[families[0]], "observed_ids": observed_ids}
 
 
@@ -1761,11 +2319,40 @@ def read_tsv(path: Path, expected_rows: int | None = None) -> tuple[list[str], l
     return header, rows
 
 
+def read_tsv_bytes(raw: bytes, label: str, expected_rows: int | None = None) -> tuple[list[str], list[dict[str, str]]]:
+    try:
+        lines = raw.decode("utf-8").splitlines()
+    except UnicodeError as error:
+        raise CampaignError(f"cannot decode TSV {label}: {error}") from error
+    require(lines, f"TSV is empty: {label}")
+    header = lines[0].split("\t")
+    require(len(header) == len(set(header)), f"TSV header repeats columns: {label}")
+    rows = []
+    for index, line in enumerate(lines[1:], 2):
+        values = line.split("\t")
+        require(len(values) == len(header), f"TSV row {index} has wrong field count: {label}")
+        rows.append(dict(zip(header, values)))
+    if expected_rows is not None:
+        require(len(rows) == expected_rows, f"TSV row count differs: {label}")
+    return header, rows
+
+
 def parse_uint(value: str, field: str, maximum: int = (1 << 64) - 1) -> int:
     require(re.fullmatch(r"(?:0|[1-9][0-9]*)", value) is not None, f"invalid integer {field}")
     parsed = int(value)
     require(parsed <= maximum, f"{field} exceeds its finite bound")
     return parsed
+
+
+def _require_u64_leaves(value: Any, label: str, skip_keys: set[str] | None = None) -> None:
+    if isinstance(value, dict):
+        skip = skip_keys or set()
+        for key, child in value.items():
+            if key in skip:
+                continue
+            _require_u64_leaves(child, f"{label}.{key}")
+        return
+    require(type(value) is int and 0 <= value <= (1 << 64) - 1, f"{label} must be an exact nonnegative u64 integer")
 
 
 def parse_decimal(value: str, field: str) -> float:
@@ -1776,8 +2363,7 @@ def parse_decimal(value: str, field: str) -> float:
 
 
 def parse_oracle(path: Path, entry: dict[str, Any], source: dict[str, Any], cell: dict[str, Any], rate: int) -> tuple[int, list[tuple[int, str, int]]]:
-    require(hashlib.sha256(path.read_bytes()).hexdigest() == entry["sha256"], "trusted per-ID oracle hash mismatch")
-    lines = path.read_text(encoding="utf-8").splitlines()
+    require(is_sha256(entry.get("sha256")), "trusted per-ID oracle digest is malformed")
     workload = cell["workload"]
     profile = cell["profile"]
     count = cell["arrivals"]
@@ -1799,22 +2385,335 @@ def parse_oracle(path: Path, entry: dict[str, Any], source: dict[str, Any], cell
         f"kernel_config\t{oracle_kernel_config(workload)}",
         "id\tscheduled_ns\tworkload\texpected_checksum",
     ]
-    require(len(lines) == len(header) + count and lines[: len(header)] == header, "trusted oracle metadata or row count differs")
     families = ("cpu", "memory", "http", "disk")
     oracle_rows = []
-    for expected_id, line in enumerate(lines[len(header) :]):
-        fields = line.split("\t")
-        require(len(fields) == 4 and fields[0] == str(expected_id), f"trusted oracle ID malformed: {expected_id}")
-        if profile == "burst":
-            cycle, slot = divmod(expected_id, rate)
-            scheduled = cycle * 1_000_000_000 + slot * 250_000_000 // rate
-        else:
-            scheduled = expected_id * 1_000_000_000 // rate
-        family = families[expected_id % 4] if workload == "mixed" else workload
-        require(fields[1] == str(scheduled) and fields[2] == family, f"trusted oracle schedule/family mismatch at ID {expected_id}")
-        checksum = parse_uint(fields[3], "oracle checksum")
-        oracle_rows.append((scheduled, family, checksum))
+    with stable_file_snapshot(path, "trusted per-ID oracle", MAX_TRACE_ARTIFACT_BYTES) as (snapshot, actual_sha, _size):
+        require(actual_sha == entry["sha256"], "trusted per-ID oracle hash mismatch")
+        with io.TextIOWrapper(snapshot, encoding="utf-8") as stream:
+            for expected_line in header:
+                require(read_bounded_text_line(stream, "trusted oracle metadata") == expected_line, "trusted oracle metadata differs")
+            for expected_id in range(count):
+                line = read_bounded_text_line(stream, f"trusted oracle row {expected_id}")
+                require(line is not None, f"trusted oracle is missing ID {expected_id}")
+                fields = line.split("\t")
+                require(len(fields) == 4 and fields[0] == str(expected_id), f"trusted oracle ID malformed: {expected_id}")
+                if profile == "burst":
+                    cycle, slot = divmod(expected_id, rate)
+                    scheduled = cycle * 1_000_000_000 + slot * 250_000_000 // rate
+                else:
+                    scheduled = expected_id * 1_000_000_000 // rate
+                family = families[expected_id % 4] if workload == "mixed" else workload
+                require(fields[1] == str(scheduled) and fields[2] == family, f"trusted oracle schedule/family mismatch at ID {expected_id}")
+                checksum = parse_uint(fields[3], "oracle checksum")
+                oracle_rows.append((scheduled, family, checksum))
+            require(read_bounded_text_line(stream, "trusted oracle trailing row") is None, "trusted oracle has extra rows")
     return duration, oracle_rows
+
+
+def process_runtime_binding(
+    process_row: dict[str, str], job: dict[str, Any], source: dict[str, Any], spec: dict[str, Any],
+) -> dict[str, Any]:
+    candidates = build_runtime_process_bindings(job, spec, source)
+    matches = [
+        binding for binding in candidates
+        if binding["pair"] == process_row.get("pair")
+        and binding["executor"] == process_row.get("executor")
+        and binding["allocator"] == process_row.get("allocator")
+    ]
+    require(len(matches) == 1, "raw process row does not identify one scheduled fixed-policy runtime recipe")
+    return matches[0]
+
+
+def require_exact_pair_process_rows(process_rows: list[dict[str, str]], job: dict[str, Any]) -> None:
+    planned = {
+        (item["pair"], item["executor"], item["allocator"])
+        for item in process_descriptors(job)
+    }
+    observed = [
+        (row.get("pair"), row.get("executor"), row.get("allocator"))
+        for row in process_rows
+    ]
+    require(
+        len(planned) == 2
+        and len(observed) == 2
+        and all(all(type(value) is str and value for value in descriptor) for descriptor in observed)
+        and len(set(observed)) == len(observed)
+        and set(observed) == planned,
+        "raw pair process rows do not equal the exact unique scheduled (pair, executor, allocator) descriptors",
+    )
+
+
+def process_artifact_bytes(
+    pair_dir: Path, process_row: dict[str, str], path_field: str, sha_field: str,
+) -> tuple[Path, bytes, str]:
+    name = process_row.get(path_field, "")
+    require(name and Path(name).name == name and name not in (".", ".."), f"process ledger {path_field} is not a basename")
+    path = pair_dir / name
+    require(not path.is_symlink() and path.is_file(), f"process artifact is missing or symlinked: {path_field}")
+    maximum = MAX_STDOUT_ARTIFACT_BYTES if path_field == "stdout" else MAX_READBACK_ARTIFACT_BYTES
+    raw, actual = read_stable_bytes(path, f"process artifact {path_field}", maximum)
+    require(is_sha256(process_row.get(sha_field)) and actual == process_row[sha_field], f"process artifact hash mismatch: {path_field}")
+    return path, raw, actual
+
+
+class _BytesArtifactPath:
+    def __init__(self, raw: bytes) -> None:
+        self._raw = raw
+
+    def open(self, mode: str = "rb") -> io.BytesIO:
+        require(mode == "rb", "in-memory artifact supports read-only binary access")
+        return io.BytesIO(self._raw)
+
+
+def numeric_runtime_snapshot(
+    fields: dict[str, str], expected: dict[str, Any], validator_sha256: str | None = None,
+) -> dict[str, Any]:
+    module = runtime_readback_module(validator_sha256)
+    contract = expected["contract"]
+    identity = {
+        name: fields[f"identity.{name}"]
+        for name in (
+            "report_nonce", "run_id", "allocator", "executor", "comparison_family",
+            "resource_ceiling_sha256", "policy_sha256", "profile", "workload",
+        )
+    }
+    configuration = {
+        name: parse_uint(fields[f"configuration.{name}"], name)
+        for name in (
+            "rate_per_second", "arrivals", "async_workers", "logical_window",
+            "trace_duration_ns", "pulse_rate_per_second", "task_ceiling",
+            "fixed_global_control_baseline",
+        )
+    }
+    configuration["mode"] = fields["configuration.mode"]
+    configuration["domain_ceiling"] = {
+        name: parse_uint(fields[f"configuration.domain_ceiling.{name}"], f"domain ceiling {name}")
+        for name in module.DIMENSIONS
+    }
+    configuration["scope_limits"] = {
+        name: parse_uint(fields[f"setup.scope.{name}"], f"scope limit {name}")
+        for name in contract["scope_limits"]
+    }
+    configuration["setup_global_control"] = parse_uint(fields["configuration.setup_global_control"], "setup_global_control")
+    stages: dict[str, Any] = {}
+    for stage in module.STAGES:
+        stage_snapshot: dict[str, Any] = {}
+        for owner in module.OWNERS:
+            prefix = f"{stage}.{owner}."
+            stage_snapshot[owner] = {
+                "ceiling": {dimension: parse_uint(fields[prefix + "ceiling." + dimension], "ceiling") for dimension in module.DIMENSIONS},
+                "limit": {dimension: parse_uint(fields[prefix + "limit." + dimension], "limit") for dimension in module.DIMENSIONS},
+                "used": {dimension: parse_uint(fields[prefix + "used." + dimension], "used") for dimension in module.DIMENSIONS},
+                "live_tenants": parse_uint(fields[prefix + "live_tenants"], "live_tenants"),
+            }
+        stage_snapshot["scope"] = {
+            name: parse_uint(fields[f"{stage}.scope.{name}"], name)
+            for name in contract["scope_limits"]
+        }
+        stage_snapshot["scope_used"] = {
+            name: parse_uint(fields[f"{stage}.scope.{name}_used"], name)
+            for name in ("managed_memory", "disk_operations", "network_operations")
+        }
+        stage_snapshot["io"] = {}
+        for direction in module.DIRECTIONS:
+            prefix = f"{stage}.io.{direction}_"
+            stage_snapshot["io"][direction] = {
+                field: parse_uint(fields[prefix + field], field)
+                for field in (
+                    "bytes_per_second", "ceiling_bytes_per_second", "burst_bytes",
+                    "ceiling_burst_bytes", "available_bytes", "reserved_bytes",
+                    "reservations", "max_reservations",
+                )
+            }
+        stages[stage] = stage_snapshot
+    return {
+        "schema": "allocatbelt.application-runtime-numeric-snapshot.v1",
+        "identity": identity,
+        "configuration": configuration,
+        "stages": stages,
+        "after_release": {
+            "global_live_tenants": parse_uint(fields["after_release.global.live_tenants"], "global_live_tenants"),
+            "global_used_control": parse_uint(fields["after_release.global.used.control"], "global_used_control"),
+            "expected_global_control_baseline": parse_uint(fields["after_release.expected_global_control_baseline"], "expected_global_control_baseline"),
+        },
+    }
+
+
+def validate_numeric_runtime_snapshot(
+    snapshot: dict[str, Any], expected: dict[str, Any], calibration: dict[str, Any],
+    validator_sha256: str | None = None,
+) -> None:
+    module = runtime_readback_module(validator_sha256)
+    exact_keys(snapshot, {"schema", "identity", "configuration", "stages", "after_release"}, "fixed predecessor numeric snapshot")
+    require(snapshot.get("schema") == "allocatbelt.application-runtime-numeric-snapshot.v1", "fixed predecessor numeric snapshot has an unknown schema")
+    exact_keys(snapshot["identity"], {
+        "report_nonce", "run_id", "allocator", "executor", "comparison_family",
+        "resource_ceiling_sha256", "policy_sha256", "profile", "workload",
+    }, "fixed predecessor numeric snapshot identity")
+    exact_keys(snapshot["configuration"], {
+        "mode", "rate_per_second", "arrivals", "async_workers", "logical_window",
+        "trace_duration_ns", "pulse_rate_per_second", "task_ceiling",
+        "fixed_global_control_baseline", "domain_ceiling", "scope_limits", "setup_global_control",
+    }, "fixed predecessor numeric snapshot configuration")
+    exact_keys(snapshot["stages"], set(module.STAGES), "fixed predecessor numeric snapshot stages")
+    exact_keys(snapshot["after_release"], {"global_live_tenants", "global_used_control", "expected_global_control_baseline"}, "fixed predecessor final numeric snapshot")
+    _require_u64_leaves(snapshot["configuration"], "fixed predecessor configuration", {"mode"})
+    _require_u64_leaves(snapshot["stages"], "fixed predecessor stages")
+    _require_u64_leaves(snapshot["after_release"], "fixed predecessor after-release")
+    require(
+        all(type(value) is str for value in snapshot["identity"].values())
+        and type(snapshot["configuration"]["mode"]) is str,
+        "fixed predecessor identity and mode fields must be strings",
+    )
+    contract = expected["contract"]
+    baseline = calibration["fixed_global_control_baseline"]
+    identity = expected["recipe"]["identity"]
+    expected_snapshot_identity = {
+        "report_nonce": identity["report_nonce"],
+        "run_id": identity["run_id"],
+        "allocator": identity["allocator"],
+        "executor": identity["executor"],
+        "comparison_family": identity["comparison_family"],
+        "resource_ceiling_sha256": identity["resource_ceiling_sha256"],
+        "policy_sha256": identity["policy_sha256"],
+        "profile": expected["recipe"]["run"]["profile"],
+        "workload": expected["recipe"]["run"]["workload"],
+    }
+    require(snapshot["identity"] == expected_snapshot_identity, "fixed predecessor numeric snapshot identity differs from its frozen process recipe")
+    require(snapshot["configuration"]["fixed_global_control_baseline"] == baseline, "fixed predecessor snapshot changed its audited numeric baseline")
+    require(snapshot["configuration"]["setup_global_control"] == snapshot["stages"]["setup"]["global"]["used"]["control"], "fixed predecessor setup Control does not match its global snapshot")
+    expected_configuration = contract["configuration"]
+    require(snapshot["configuration"]["mode"] == expected_configuration["mode"], "fixed predecessor snapshot changed its mode")
+    for name in (
+        "rate_per_second", "arrivals", "async_workers", "logical_window", "trace_duration_ns",
+        "pulse_rate_per_second", "task_ceiling", "fixed_global_control_baseline",
+    ):
+        require(snapshot["configuration"][name] == int(expected_configuration[name]), f"fixed predecessor snapshot changed configuration.{name}")
+    require(snapshot["configuration"]["domain_ceiling"] == contract["ceilings"], "fixed predecessor snapshot domain ceilings differ from its recipe")
+    require(snapshot["configuration"]["scope_limits"] == contract["scope_limits"], "fixed predecessor snapshot scope limits differ from its recipe")
+    require(baseline <= snapshot["configuration"]["setup_global_control"] <= baseline + contract["ceilings"]["control"], "fixed predecessor setup global Control exceeds its independently bounded baseline")
+    require(snapshot["configuration"]["setup_global_control"] - baseline >= snapshot["stages"]["setup"]["tenant"]["used"]["control"], "fixed predecessor setup global Control does not cover tenant Control use")
+    require(snapshot["after_release"] == {
+        "global_live_tenants": 0,
+        "global_used_control": baseline,
+        "expected_global_control_baseline": baseline,
+    }, "fixed predecessor final numeric Control/live-tenant cleanup differs")
+    for stage in module.STAGES:
+        row = snapshot["stages"][stage]
+        exact_keys(row, {"global", "tenant", "scope", "scope_used", "io"}, f"fixed predecessor {stage} numeric snapshot")
+        for owner in module.OWNERS:
+            owner_snapshot = row[owner]
+            exact_keys(owner_snapshot, {"ceiling", "limit", "used", "live_tenants"}, f"fixed predecessor {stage}/{owner} numeric snapshot")
+            for field in ("ceiling", "limit", "used"):
+                exact_keys(owner_snapshot[field], set(module.DIMENSIONS), f"fixed predecessor {stage}/{owner}/{field} numeric snapshot")
+            require(owner_snapshot["live_tenants"] == 1, f"fixed predecessor lost its tenant at {stage}/{owner}")
+            for dimension in module.DIMENSIONS:
+                bound = contract["ceilings"][dimension]
+                require(owner_snapshot["ceiling"][dimension] == bound and owner_snapshot["limit"][dimension] == bound, f"fixed predecessor changed {stage}/{owner}/{dimension} capacity")
+                require(owner_snapshot["used"][dimension] <= bound, f"fixed predecessor exceeded {stage}/{owner}/{dimension} hard bound")
+                if stage != "setup" and dimension in module.APP_DIMENSIONS:
+                    require(owner_snapshot["used"][dimension] == 0, f"fixed predecessor retained {stage}/{owner}/{dimension} application usage")
+        global_control = row["global"]["used"]["control"]
+        require(global_control >= baseline, f"fixed predecessor {stage} global Control lost its fixed metadata baseline")
+        if stage == "after_shutdown":
+            require(
+                global_control >= baseline + row["tenant"]["used"]["control"],
+                "fixed predecessor joined global Control does not cover baseline and tenant metadata",
+            )
+        exact_keys(row["scope"], set(contract["scope_limits"]), f"fixed predecessor {stage} scope limits")
+        exact_keys(row["scope_used"], {"managed_memory", "disk_operations", "network_operations"}, f"fixed predecessor {stage} scope usage")
+        exact_keys(row["io"], set(module.DIRECTIONS), f"fixed predecessor {stage} I/O snapshots")
+        for name, bound in contract["scope_limits"].items():
+            require(row["scope"][name] == bound, f"fixed predecessor changed {stage}/{name} scope limit")
+        for name, bound in (
+            ("managed_memory", contract["scope_limits"]["managed_memory_limit"]),
+            ("disk_operations", contract["scope_limits"]["disk_operation_limit"]),
+            ("network_operations", contract["scope_limits"]["network_operation_limit"]),
+        ):
+            require(row["scope_used"][name] <= bound, f"fixed predecessor exceeded {stage}/{name} scope limit")
+            if stage != "setup":
+                require(row["scope_used"][name] == 0, f"fixed predecessor retained {stage}/{name} scope usage")
+        for direction in module.DIRECTIONS:
+            bucket = contract["byte_buckets"][direction]
+            observed = row["io"][direction]
+            exact_keys(observed, {
+                "bytes_per_second", "ceiling_bytes_per_second", "burst_bytes", "ceiling_burst_bytes",
+                "available_bytes", "reserved_bytes", "reservations", "max_reservations",
+            }, f"fixed predecessor {stage}/{direction} byte-bucket snapshot")
+            for name in ("bytes_per_second", "ceiling_bytes_per_second", "burst_bytes", "ceiling_burst_bytes", "max_reservations"):
+                require(observed[name] == bucket[name], f"fixed predecessor changed {stage}/{direction}/{name}")
+            require(observed["available_bytes"] + observed["reserved_bytes"] <= bucket["burst_bytes"], f"fixed predecessor minted {stage}/{direction} byte credits")
+            require(observed["reservations"] <= bucket["max_reservations"], f"fixed predecessor exceeded {stage}/{direction} reservation capacity")
+            if stage != "setup":
+                require(observed["reserved_bytes"] == observed["reservations"] == 0, f"fixed predecessor retained {stage}/{direction} offers")
+
+
+def validate_runtime_process_artifacts(
+    pair_dir: Path,
+    process_row: dict[str, str],
+    job: dict[str, Any],
+    source: dict[str, Any],
+    spec: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    validator_pin = source["runtime_readback_validator"]
+    module = runtime_readback_module(validator_pin["sha256"])
+    binding = process_runtime_binding(process_row, job, source, spec)
+    expected = module.build_fixed_expectation(binding["recipe"])
+    require(validator_pin["path"] == RUNTIME_VALIDATOR_RELATIVE_PATH, "runtime readback validator path differs from the frozen source artifact")
+    validator_sha = validator_pin["sha256"]
+    stdout_path, stdout_raw, stdout_sha = process_artifact_bytes(pair_dir, process_row, "stdout", "stdout_sha256")
+    receipt_path, receipt_raw, receipt_sha = process_artifact_bytes(pair_dir, process_row, "runtime_readback", "runtime_readback_sha256")
+    expectation_path, expectation_raw, expectation_sha = process_artifact_bytes(pair_dir, process_row, "runtime_expectation", "runtime_expectation_sha256")
+    validation_path, validation_raw, validation_sha = process_artifact_bytes(pair_dir, process_row, "runtime_validation", "runtime_validation_sha256")
+    require(receipt_path.suffix == ".tsv" and expectation_path.suffix == ".json" and validation_path.suffix == ".json", "runtime readback artifact suffix differs from the frozen layout")
+    require(expectation_sha == binding["expectation_sha256"], "runtime expectation hash differs from the controller's frozen recipe")
+    stored_expectation = parse_json_object_bytes(expectation_raw, "runtime expectation", MAX_READBACK_ARTIFACT_BYTES)
+    require(expectation_raw == module.canonical_bytes(expected) and canonical_bytes(stored_expectation) == module.canonical_bytes(expected), "runtime expectation differs from the current frozen recipe")
+    require(process_row.get("runtime_recipe_sha256") == binding["recipe_sha256"], "runtime recipe hash differs from the controller's frozen process binding")
+    require(process_row.get("resource_ceiling_sha256") == binding["resource_ceiling_sha256"], "process ledger resource-ceiling binding differs from the frozen process recipe")
+    require(process_row.get("policy_sha256") == binding["policy_sha256"], "process ledger policy binding differs from the numeric fixed-policy artifact")
+    require(process_row.get("validator_sha256") == validator_sha, "process ledger validator hash differs from the frozen validator source")
+    calibration = source["resource_domain_calibration"]
+    baseline = calibration["record"]["fixed_global_control_baseline"]
+    require(parse_uint(process_row.get("fixed_global_control_baseline"), "fixed_global_control_baseline") == baseline, "process ledger Control baseline differs from the independent calibration")
+    require(process_row.get("calibration_binary_sha256") == calibration["binary"]["sha256"], "process ledger calibration binary hash differs from its source manifest")
+    require(process_row.get("calibration_output_sha256") == calibration["output"]["sha256"], "process ledger calibration output hash differs from its source manifest")
+    require(process_row.get("source_manifest_sha256") == source["manifest_sha256"], "process ledger source-manifest hash differs from the frozen host input")
+    require(process_row.get("runtime_expectation_sha256") == binding["expectation_sha256"], "process ledger expectation hash differs from its controller recipe")
+    fields = module.read_receipt(_BytesArtifactPath(receipt_raw))
+    try:
+        validation = module.validate_runtime_readback(fields, expected)
+    except (TypeError, ValueError, KeyError) as error:
+        raise CampaignError(f"runtime readback validation failed for {job['run_id']}/{binding['pair']}: {error}") from error
+    stored_validation = parse_json_object_bytes(validation_raw, "runtime validation output", MAX_READBACK_ARTIFACT_BYTES)
+    exact_keys(stored_validation, {"schema", "validated", "expectation_sha256", "field_count"}, "runtime validation output")
+    require(canonical_bytes(stored_validation) == canonical_bytes(validation), "stored runtime validation output differs from independent numeric revalidation")
+    require(validation["validated"] is True, "runtime receipt was not independently validated")
+    require(validation["expectation_sha256"] == binding["expectation_sha256"], "runtime validator returned an unexpected expectation hash")
+    require(validation["field_count"] == len(fields), "runtime validation field count differs from the receipt")
+    numeric_snapshot = numeric_runtime_snapshot(fields, expected, validator_sha)
+    readback = {
+        "schema": "allocatbelt.application-runtime-readback-process.v1",
+        "pair": binding["pair"],
+        "executor": binding["executor"],
+        "allocator": binding["allocator"],
+        "report_nonce": binding["report_nonce"],
+        "comparison_family": "fixed_policy",
+        "resource_ceiling_sha256": binding["resource_ceiling_sha256"],
+        "policy_sha256": binding["policy_sha256"],
+        "fixed_global_control_baseline": baseline,
+        "source_manifest_sha256": source["manifest_sha256"],
+        "calibration_binary_sha256": calibration["binary"]["sha256"],
+        "calibration_output_sha256": calibration["output"]["sha256"],
+        "validator_sha256": validator_sha,
+        "runtime_readback_sha256": receipt_sha,
+        "output_sha256": stdout_sha,
+        "runtime_expectation_sha256": expectation_sha,
+        "runtime_validation_sha256": validation_sha,
+        "runtime_recipe_sha256": binding["recipe_sha256"],
+        "numeric_snapshot": numeric_snapshot,
+    }
+    return readback, {"stdout_sha256": stdout_sha, "runtime_readback_sha256": receipt_sha, "stdout_bytes": stdout_raw}
 
 
 def extract_process_metrics(
@@ -1834,7 +2733,10 @@ def extract_process_metrics(
     stdout_name = process_row["stdout"]
     require(Path(stdout_name).name == stdout_name and stdout_name.endswith(".stdout.tsv"), "runner stdout reference is not a basename")
     stdout_path = pair_dir / stdout_name
-    header, rows = read_tsv(stdout_path, 1)
+    runtime_readback, runtime_artifact_evidence = validate_runtime_process_artifacts(
+        pair_dir, process_row, job, source, spec
+    )
+    header, rows = read_tsv_bytes(runtime_artifact_evidence["stdout_bytes"], str(stdout_path), 1)
     expected_header = ("schema allocator executor workload mode async_workers blocking_workers topology logical_window global_task_limit retained_window arrival_rate_per_second requested_arrivals attempted admitted rejected_full rejected_resource completed_on_time completed_late errors cancellations unresolved lost result_digest expected_digest capacity_publications_per_second successful_throughput_through_drain_per_second setup_ns timer_pair_median_ns wall_through_drain_ns drain_tail_ns response_p50_ns response_p95_ns response_p99_ns producer_lateness_mean_ns producer_lateness_max_ns max_observed_managed_bytes retained_managed_bytes managed_limit_bytes disk_limit_ops network_limit_ops final_managed_bytes final_disk_ops final_network_ops rss_before_kib rss_after_drain_kib rss_after_shutdown_kib hwm_before_kib hwm_after_drain_kib hwm_after_shutdown_kib shutdown_ns rejected_logical_window rejected_backend_full").split()
     require(header == expected_header and len(header) == 53, "benchmark row schema changed")
     row = rows[0]
@@ -1848,8 +2750,11 @@ def extract_process_metrics(
         require(parse_uint(row["managed_limit_bytes"], "managed limit") > 0, "managed resource ceiling is missing for managed-memory workload")
     cpu_pair = f"{process_id}-{executor}.shutdown.tsv"
     shutdown_path = pair_dir / cpu_pair
-    shutdown_lines = shutdown_path.read_text(encoding="utf-8").splitlines()
-    shutdown_sha = hashlib.sha256(shutdown_path.read_bytes()).hexdigest()
+    shutdown_raw, shutdown_sha = read_stable_bytes(shutdown_path, "phase sidecar", MAX_READBACK_ARTIFACT_BYTES)
+    try:
+        shutdown_lines = shutdown_raw.decode("utf-8").splitlines()
+    except UnicodeError as error:
+        raise CampaignError(f"phase sidecar is not UTF-8: {error}") from error
     require(shutdown_sha == process_row["shutdown_sha256"], "phase sidecar hash differs from the process ledger")
     require(shutdown_lines and shutdown_lines[0] == "schema\tallocatbelt-app-phase-v1\t", "unsupported production phase sidecar schema")
     identity = {}
@@ -1866,6 +2771,10 @@ def extract_process_metrics(
     _, metadata_rows = read_tsv(pair_dir / "metadata.tsv")
     metadata_map = {item["key"]: item["value"] for item in metadata_rows}
     require(metadata_map.get("comparison_family") == job["comparison_family"], "runner metadata comparison family differs from the frozen fixed/pressure phase")
+    require(metadata_map.get(f"report_nonce_{process_id}_{executor}") == runtime_readback["report_nonce"], "runner nonce differs from the controller-frozen runtime process recipe")
+    require(metadata_map.get(f"policy_sha256_{process_id}_{executor}") == runtime_readback["policy_sha256"], "runner metadata policy hash differs from the fixed runtime recipe")
+    require(metadata_map.get(f"resource_ceiling_sha256_{process_id}_{executor}") == runtime_readback["resource_ceiling_sha256"], "runner metadata resource ceiling differs from the fixed runtime recipe")
+    require(parse_uint(metadata_map.get(f"fixed_global_control_baseline_{process_id}_{executor}"), "fixed global Control baseline") == runtime_readback["fixed_global_control_baseline"], "runner metadata numeric baseline differs from independent calibration")
     expected_identity = {
         "report_nonce": metadata_map.get(f"report_nonce_{process_id}_{executor}"),
         "run_id": job["run_id"],
@@ -1908,14 +2817,18 @@ def extract_process_metrics(
         "ids_path": None,
         "family_successes": {},
         "latency_p99_by_family_ns": {},
+        "runtime_readback": runtime_readback,
     }
     require(metrics["response_p50_ns"] <= metrics["response_p95_ns"] <= metrics["response_p99_ns"], "row quantiles are not monotone")
     if job["mode"] == "capacity" and job["workload"] == "mixed":
         family_name = stdout_name.removesuffix(".stdout.tsv") + ".capacity-families.tsv"
         family_path = pair_dir / family_name
-        family_sha = sha256_file(family_path)
+        family_raw, family_sha = read_stable_bytes(family_path, "capacity family sidecar", MAX_READBACK_ARTIFACT_BYTES)
         require(family_sha == process_row["capacity_family_sha256"], "capacity family sidecar hash differs from the process ledger")
-        family_lines = family_path.read_text(encoding="utf-8").splitlines()
+        try:
+            family_lines = family_raw.decode("utf-8").splitlines()
+        except UnicodeError as error:
+            raise CampaignError(f"capacity family sidecar is not UTF-8: {error}") from error
         require(family_lines and family_lines[0] == "schema\tallocatbelt-app-capacity-families-v1\t", "capacity family sidecar schema differs")
         family_identity = {}
         family_counts = {}
@@ -1949,16 +2862,13 @@ def extract_process_metrics(
     if job["mode"] == "open_loop":
         ids_name = stdout_name.removesuffix(".stdout.tsv") + ".ids.tsv"
         ids_path = pair_dir / ids_name
-        ids_sha = hashlib.sha256(ids_path.read_bytes()).hexdigest()
-        require(ids_sha == process_row["ids_sha256"], "per-ID sidecar hash differs from the process ledger")
+        require(not ids_path.is_symlink() and ids_path.is_file(), "per-ID sidecar is missing or symlinked")
         _, metadata = read_tsv(pair_dir / "metadata.tsv")
         metadata_map = {item["key"]: item["value"] for item in metadata}
         nonce = metadata_map.get(f"report_nonce_{process_id}_{executor}")
         expected_binary_sha = source["artifacts"][process_allocator]["sha256"]
         expected_identity = ["identity", nonce, job["run_id"], label, process_allocator, job["workload"], job["profile"], source["source"]["source_tree_sha256"], expected_binary_sha]
-        sidecar_lines = ids_path.read_text(encoding="utf-8").splitlines()
-        require(len(sidecar_lines) == job["arrivals"] + 3 and sidecar_lines[0] == "schema\tallocatbelt-app-arrivals-v3" and sidecar_lines[1].split("\t") == expected_identity, "per-ID identity or row count differs")
-        require(sidecar_lines[2] == "id\tworkload\tscheduled_ns\tcompletion_ns\tterminal\tchecksum\texpected_checksum", "per-ID schema differs")
+        require(is_sha256(process_row.get("ids_sha256")), "per-ID sidecar digest is malformed")
         oracle = job["oracles"][process_allocator] if job.get("comparison_kind") == "allocator" else job["oracle"]
         oracle_path = campaign_artifacts / oracle["relative_path"]
         oracle_duration, oracle_rows = parse_oracle(oracle_path, oracle, source, next(cell for cell in spec["cells"] if cell["family"] == job["family"] and cell["profile"] == job["profile"]), job["rate_per_second"])
@@ -1967,29 +2877,42 @@ def extract_process_metrics(
         digest = 0
         rejected = errors = complete_count = 0
         on_time = 0
-        for arrival_id, line in enumerate(sidecar_lines[3:]):
-            fields = line.split("\t")
-            require(len(fields) == 7 and fields[0] == str(arrival_id) and fields[1] == oracle_rows[arrival_id][1], f"per-ID family/ID mismatch at {arrival_id}")
-            scheduled, completion = parse_uint(fields[2], "scheduled_ns"), parse_uint(fields[3], "completion_ns")
-            checksum, expected_checksum = parse_uint(fields[5], "checksum"), parse_uint(fields[6], "expected_checksum")
-            canonical_scheduled, family, canonical_checksum = oracle_rows[arrival_id]
-            require(scheduled == canonical_scheduled and expected_checksum == canonical_checksum and completion >= scheduled, f"per-ID oracle/timestamp mismatch at {arrival_id}")
-            terminal = fields[4]
-            if terminal == "completed":
-                require(checksum == expected_checksum, f"per-ID checksum mismatch at {arrival_id}")
-                latency = completion - scheduled
-                latencies[family].append(latency)
-                all_latencies.append(latency)
-                complete_count += 1
-                on_time += completion <= oracle_duration
-                digest = (digest + (checksum if job["workload"] == "http" else checksum ^ arrival_id)) & ((1 << 64) - 1)
-            elif terminal == "rejected":
-                require(checksum == 0, f"rejected ID has checksum at {arrival_id}")
-                rejected += 1
-            elif terminal == "error":
-                errors += 1
-            else:
-                raise CampaignError(f"unknown terminal status at ID {arrival_id}")
+        with stable_file_snapshot(ids_path, "per-ID sidecar", MAX_TRACE_ARTIFACT_BYTES) as (snapshot, ids_sha, _size):
+            require(ids_sha == process_row["ids_sha256"], "per-ID sidecar hash differs from the process ledger")
+            with io.TextIOWrapper(snapshot, encoding="utf-8") as stream:
+                require(read_bounded_text_line(stream, "per-ID schema") == "schema\tallocatbelt-app-arrivals-v3", "per-ID schema differs")
+                require(read_bounded_text_line(stream, "per-ID identity").split("\t") == expected_identity, "per-ID identity differs")
+                require(read_bounded_text_line(stream, "per-ID header") == "id\tworkload\tscheduled_ns\tcompletion_ns\tterminal\tchecksum\texpected_checksum", "per-ID header differs")
+                observed_rows = 0
+                for arrival_id in range(MAX_ARRIVALS):
+                    line = read_bounded_text_line(stream, f"per-ID row {arrival_id}")
+                    if line is None:
+                        break
+                    require(arrival_id < job["arrivals"], "per-ID sidecar has more rows than the frozen arrival count")
+                    fields = line.split("\t")
+                    require(len(fields) == 7 and fields[0] == str(arrival_id) and fields[1] == oracle_rows[arrival_id][1], f"per-ID family/ID mismatch at {arrival_id}")
+                    scheduled, completion = parse_uint(fields[2], "scheduled_ns"), parse_uint(fields[3], "completion_ns")
+                    checksum, expected_checksum = parse_uint(fields[5], "checksum"), parse_uint(fields[6], "expected_checksum")
+                    canonical_scheduled, family, canonical_checksum = oracle_rows[arrival_id]
+                    require(scheduled == canonical_scheduled and expected_checksum == canonical_checksum and completion >= scheduled, f"per-ID oracle/timestamp mismatch at {arrival_id}")
+                    terminal = fields[4]
+                    if terminal == "completed":
+                        require(checksum == expected_checksum, f"per-ID checksum mismatch at {arrival_id}")
+                        latency = completion - scheduled
+                        latencies[family].append(latency)
+                        all_latencies.append(latency)
+                        complete_count += 1
+                        on_time += completion <= oracle_duration
+                        digest = (digest + (checksum if job["workload"] == "http" else checksum ^ arrival_id)) & ((1 << 64) - 1)
+                    elif terminal == "rejected":
+                        require(checksum == 0, f"rejected ID has checksum at {arrival_id}")
+                        rejected += 1
+                    elif terminal == "error":
+                        errors += 1
+                    else:
+                        raise CampaignError(f"unknown terminal status at ID {arrival_id}")
+                    observed_rows += 1
+                require(observed_rows == job["arrivals"] and read_bounded_text_line(stream, "per-ID trailing row") is None, "per-ID sidecar row count differs from the frozen arrival count")
         require(complete_count == completed and rejected == numeric_counts["rejected_full"] + numeric_counts["rejected_resource"] and errors == numeric_counts["errors"], "per-ID terminal counts do not reconcile")
         require(on_time == numeric_counts["completed_on_time"] and digest == numeric_counts["result_digest"], "per-ID on-time count/digest does not reconcile")
         require(not rejected and not errors, "confirmation per-ID trace contains loss")
@@ -2249,8 +3172,117 @@ def build_jobs(spec: dict[str, Any], phase: str, host_id: str | None = None) -> 
     return jobs
 
 
+def process_descriptors(job: dict[str, Any]) -> list[dict[str, str]]:
+    require(job.get("phase") in ("exploration", "aa", "confirmation"), "runtime recipes only support fixed-policy process phases")
+    if job["phase"] == "aa":
+        executor = job["executor"]
+        require(executor in ("bounded", "tokio"), "A/A runtime recipe has an unknown executor")
+        return [
+            {"pair": f"{executor}-a", "executor": executor, "allocator": job["allocator"]},
+            {"pair": f"{executor}-b", "executor": executor, "allocator": job["allocator"]},
+        ]
+    if job.get("comparison_kind") == "allocator":
+        return [
+            {"pair": "candidate", "executor": "bounded", "allocator": job["allocator"]},
+            {"pair": "baseline", "executor": "bounded", "allocator": job["baseline_allocator"]},
+        ]
+    return [
+        {"pair": "bounded", "executor": "bounded", "allocator": job["allocator"]},
+        {"pair": "tokio", "executor": "tokio", "allocator": job["allocator"]},
+    ]
+
+
+def build_runtime_process_bindings(
+    job: dict[str, Any], spec: dict[str, Any], source: dict[str, Any],
+) -> list[dict[str, Any]]:
+    require(job.get("comparison_family") == "fixed_policy", "external-pressure runtime recipes are unsupported pending approved policy support")
+    module = runtime_readback_module(source["runtime_readback_validator"]["sha256"])
+    calibration = source["resource_domain_calibration"]["record"]
+    policy_sha = source["fixed_runtime_policy"]["policy_sha256"]
+    cell = next(
+        item for item in spec["cells"]
+        if item["family"] == job["family"] and item["profile"] == job["profile"]
+    )
+    source_sha = source["source"]["source_tree_sha256"]
+    result: list[dict[str, Any]] = []
+    for descriptor in process_descriptors(job):
+        allocator = descriptor["allocator"]
+        executor = "allocatbelt" if descriptor["executor"] == "bounded" else "tokio-1.53.1"
+        binary_sha = source["artifacts"][allocator]["sha256"]
+        nonce_identity = {
+            "campaign_id": spec["campaign_id"],
+            "host_id": job["host_id"],
+            "run_id": job["run_id"],
+            "pair": descriptor["pair"],
+            "executor": executor,
+            "allocator": allocator,
+            "source_sha256": source_sha,
+            "binary_sha256": binary_sha,
+            "resource_ceiling_sha256": cell["resource_ceiling_sha256"],
+            "policy_sha256": policy_sha,
+            "workload": job["workload"],
+            "profile": job["profile"],
+            "mode": job["mode"],
+            "rate_per_second": job["rate_per_second"],
+            "arrivals": job["arrivals"] if job["mode"] == "open_loop" else 5000,
+        }
+        nonce = hashlib.sha256(
+            b"allocatbelt.application-runtime-report-nonce.v1\0" + canonical_bytes(nonce_identity)
+        ).hexdigest()[:32]
+        recipe_input = {
+            "schema": module.RECIPE_SCHEMA,
+            "identity": {
+                "report_nonce": nonce,
+                "run_id": job["run_id"],
+                "allocator": allocator,
+                "executor": executor,
+                "source_sha256": source_sha,
+                "binary_sha256": binary_sha,
+                "comparison_family": "fixed_policy",
+                "resource_ceiling_sha256": cell["resource_ceiling_sha256"],
+                "policy_sha256": policy_sha,
+            },
+            "run": {
+                "workload": job["workload"],
+                "profile": job["profile"],
+                "mode": job["mode"],
+                "rate_per_second": job["rate_per_second"],
+                "arrivals": job["arrivals"] if job["mode"] == "open_loop" else 5000,
+            },
+            "fixed_global_control_baseline": calibration["fixed_global_control_baseline"],
+        }
+        expected = module.build_fixed_expectation(recipe_input)
+        recipe = expected["recipe"]
+        result.append({
+            **descriptor,
+            "report_nonce": nonce,
+            "recipe": recipe,
+            "recipe_sha256": hashlib.sha256(canonical_bytes(recipe)).hexdigest(),
+            "expectation_sha256": hashlib.sha256(module.canonical_bytes(expected)).hexdigest(),
+            "resource_ceiling_sha256": cell["resource_ceiling_sha256"],
+            "policy_sha256": policy_sha,
+            "fixed_global_control_baseline": calibration["fixed_global_control_baseline"],
+        })
+    require(len(result) == 2 and len({item["pair"] for item in result}) == 2, "fixed pair must freeze exactly two process recipes")
+    return result
+
+
+def runtime_process_bindings_for_plan(
+    jobs: dict[str, list[dict[str, Any]]], spec: dict[str, Any], sources: dict[str, dict[str, Any]],
+) -> dict[str, list[dict[str, Any]]]:
+    result: dict[str, list[dict[str, Any]]] = {}
+    for phase in ("exploration", "aa", "confirmation"):
+        for job in jobs[phase]:
+            source = sources[job["host_id"]]
+            bindings = build_runtime_process_bindings(job, spec, source)
+            require(job["run_id"] not in result, "runtime process recipe schedule repeats a run ID")
+            result[job["run_id"]] = bindings
+    return result
+
+
 def freeze_plan(spec: dict[str, Any], sources: dict[str, dict[str, Any]]) -> dict[str, Any]:
     validation = validate_spec(spec, sources)
+    jobs = {phase: build_jobs(spec, phase) for phase in ("exploration", "aa", "confirmation", "pressure", "soak")}
     plan = {
         "schema": PLAN_SCHEMA,
         "campaign_id": spec["campaign_id"],
@@ -2263,18 +3295,54 @@ def freeze_plan(spec: dict[str, Any], sources: dict[str, dict[str, Any]]) -> dic
         "full_gate_gaps": validation["full_gate_gaps"],
         "host_ids": validation["host_ids"],
         "cell_count": validation["cell_count"],
-        "jobs": {phase: build_jobs(spec, phase) for phase in ("exploration", "aa", "confirmation", "pressure", "soak")},
+        "jobs": jobs,
+        "runtime_process_bindings": runtime_process_bindings_for_plan(jobs, spec, sources),
     }
     plan["plan_sha256"] = digest_object(plan, "plan_sha256")
+    campaign_plan_bytes(plan)
     return plan
 
 
-def verify_plan(plan: dict[str, Any]) -> None:
-    exact_keys(plan, {"schema", "campaign_id", "spec_sha256", "source_manifests", "protocol", "runtime_binding", "execution_ready", "full_gate_ready", "full_gate_gaps", "host_ids", "cell_count", "jobs", "plan_sha256"}, "campaign plan")
+def verify_plan(plan: dict[str, Any], validator_sha256: str | None = None) -> None:
+    exact_keys(plan, {"schema", "campaign_id", "spec_sha256", "source_manifests", "protocol", "runtime_binding", "execution_ready", "full_gate_ready", "full_gate_gaps", "host_ids", "cell_count", "jobs", "runtime_process_bindings", "plan_sha256"}, "campaign plan")
     require(plan["schema"] == PLAN_SCHEMA, "unsupported campaign-plan schema")
     require(is_sha256(plan["plan_sha256"]) and digest_object(plan, "plan_sha256") == plan["plan_sha256"], "campaign-plan digest mismatch")
     require(is_sha256(plan["spec_sha256"]) and isinstance(plan["source_manifests"], dict) and plan["source_manifests"], "campaign-plan source/spec digest missing")
     require(all(is_sha256(value) for value in plan["source_manifests"].values()), "campaign plan contains an invalid host source pin")
+    expected_run_ids = {
+        job["run_id"]
+        for phase in ("exploration", "aa", "confirmation")
+        for job in plan["jobs"].get(phase, [])
+    }
+    bindings = plan["runtime_process_bindings"]
+    require(type(bindings) is dict and set(bindings) == expected_run_ids, "campaign plan runtime recipes do not cover the exact fixed-policy job set")
+    module = runtime_readback_module(validator_sha256)
+    for run_id, process_bindings in bindings.items():
+        require(isinstance(process_bindings, list) and len(process_bindings) == 2, f"campaign plan lacks two process recipes for {run_id}")
+        pairs: set[str] = set()
+        for index, item_value in enumerate(process_bindings):
+            item = exact_keys(item_value, {
+                "pair", "executor", "allocator", "report_nonce", "recipe", "recipe_sha256",
+                "expectation_sha256", "resource_ceiling_sha256", "policy_sha256",
+                "fixed_global_control_baseline",
+            }, f"runtime process recipe {run_id}[{index}]")
+            require(isinstance(item["pair"], str) and re.fullmatch(r"[a-z][a-z0-9-]{0,31}", item["pair"]) is not None, f"runtime process label is malformed for {run_id}")
+            require(item["pair"] not in pairs, f"runtime recipe repeats a process label for {run_id}")
+            pairs.add(item["pair"])
+            require(item["executor"] in ("bounded", "tokio") and item["allocator"] in ALLOCATORS, f"runtime process identity is unknown for {run_id}")
+            require(isinstance(item["report_nonce"], str) and re.fullmatch(r"[a-f0-9]{32}", item["report_nonce"]) is not None, f"runtime process nonce is malformed for {run_id}")
+            require(is_sha256(item["recipe_sha256"]) and is_sha256(item["expectation_sha256"]) and is_sha256(item["resource_ceiling_sha256"]) and is_sha256(item["policy_sha256"]), f"runtime process recipe digest is malformed for {run_id}")
+            recipe = item["recipe"]
+            try:
+                expectation = module.build_fixed_expectation(recipe)
+            except (TypeError, ValueError) as error:
+                raise CampaignError(f"runtime process recipe is invalid for {run_id}: {error}") from error
+            require(recipe["identity"]["run_id"] == run_id and recipe["identity"]["report_nonce"] == item["report_nonce"], f"runtime process recipe identity differs for {run_id}")
+            require(recipe["identity"]["allocator"] == item["allocator"] and recipe["identity"]["executor"] == ("allocatbelt" if item["executor"] == "bounded" else "tokio-1.53.1"), f"runtime process recipe allocator/executor differs for {run_id}")
+            require(recipe["identity"]["comparison_family"] == "fixed_policy" and recipe["identity"]["resource_ceiling_sha256"] == item["resource_ceiling_sha256"] and recipe["identity"]["policy_sha256"] == item["policy_sha256"], f"runtime process recipe source bindings differ for {run_id}")
+            require(type(item["fixed_global_control_baseline"]) is int and item["fixed_global_control_baseline"] == recipe["fixed_global_control_baseline"], f"runtime process recipe baseline differs for {run_id}")
+            require(hashlib.sha256(canonical_bytes(recipe)).hexdigest() == item["recipe_sha256"], f"runtime process recipe hash mismatch for {run_id}")
+            require(hashlib.sha256(module.canonical_bytes(expectation)).hexdigest() == item["expectation_sha256"], f"runtime process expectation hash mismatch for {run_id}")
 
 
 def within(root: Path, path: Path) -> bool:
@@ -2344,6 +3412,9 @@ def build_pair_runner_argv(
     deadlines: dict[str, int], arrivals: int, candidate_oracle: tuple[Path, str] | None = None,
     baseline_binary: Path | None = None, baseline_allocator: str | None = None,
     baseline_oracle: tuple[Path, str] | None = None,
+    runtime_bindings: Path | None = None, runtime_bindings_sha256: str | None = None,
+    runtime_validator: Path | None = None, runtime_validator_sha256: str | None = None,
+    fixed_global_control_baseline: int | None = None,
 ) -> list[str]:
     rate_arg = "-" if job["mode"] == "capacity" else str(job["rate_per_second"])
     argv = [
@@ -2367,7 +3438,72 @@ def build_pair_runner_argv(
             argv.extend(["", ""])
     else:
         require(baseline_binary is None and baseline_allocator is None and baseline_oracle is None, "non-allocator pair command contains baseline-only arguments")
+    binding_args = (
+        runtime_bindings,
+        runtime_bindings_sha256,
+        runtime_validator,
+        runtime_validator_sha256,
+        fixed_global_control_baseline,
+    )
+    if any(value is not None for value in binding_args):
+        require(all(value is not None for value in binding_args), "runtime readback argv is missing a frozen binding input")
+        require(is_sha256(runtime_bindings_sha256) and is_sha256(runtime_validator_sha256), "runtime readback argv contains an invalid digest")
+        require(type(fixed_global_control_baseline) is int and 0 < fixed_global_control_baseline < RUNTIME_APPLICATION_CONTROL_CEILING, "runtime readback argv lacks a bounded numeric Control baseline")
+        while len(argv) < 22:
+            argv.append("")
+        argv.extend([
+            "--runtime-bindings", str(runtime_bindings),
+            "--runtime-bindings-sha256", runtime_bindings_sha256,
+            "--runtime-validator", str(runtime_validator),
+            "--runtime-validator-sha256", runtime_validator_sha256,
+            "--fixed-global-control-baseline", str(fixed_global_control_baseline),
+        ])
     return argv
+
+
+def runtime_binding_manifest_value(
+    bindings: list[dict[str, Any]], job: dict[str, Any], spec: dict[str, Any], source: dict[str, Any],
+) -> dict[str, Any]:
+    expected_bindings = build_runtime_process_bindings(job, spec, source)
+    require(bindings == expected_bindings, "scheduled process recipes differ from the current frozen spec/source inputs")
+    calibration = source["resource_domain_calibration"]
+    manifest: dict[str, Any] = {
+        "schema": RUNTIME_BINDINGS_SCHEMA,
+        "run_id": job["run_id"],
+        "comparison_family": "fixed_policy",
+        "source_manifest_sha256": source["manifest_sha256"],
+        "source_sha256": source["source"]["source_tree_sha256"],
+        "source": calibration["source"],
+        "build": calibration["build"],
+        "fixed_runtime_policy": source["fixed_runtime_policy"],
+        "resource_domain_calibration": {
+            "binary": calibration["binary"],
+            "output": calibration["output"],
+            "record": calibration["record"],
+            "source": calibration["source"],
+            "build": calibration["build"],
+            "build_sha256": calibration["build_sha256"],
+        },
+        "runtime_readback_validator": source["runtime_readback_validator"],
+        "fixed_global_control_baseline": calibration["record"]["fixed_global_control_baseline"],
+        "processes": bindings,
+    }
+    manifest["manifest_sha256"] = digest_object(manifest)
+    return manifest
+
+
+def write_runtime_binding_manifest(
+    output: Path, bindings: list[dict[str, Any]], job: dict[str, Any],
+    spec: dict[str, Any], source: dict[str, Any],
+) -> str:
+    manifest = runtime_binding_manifest_value(bindings, job, spec, source)
+    encoded = canonical_bytes(manifest)
+    require(len(encoded) <= MAX_READBACK_ARTIFACT_BYTES, "runtime process binding manifest exceeds its finite size bound")
+    require(not output.exists() and not output.is_symlink(), f"refusing to replace runtime binding manifest: {output}")
+    output.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    output.write_bytes(encoded)
+    output.chmod(0o600)
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def oracle_map_for_job(job: dict[str, Any]) -> dict[str, dict[str, Any]]:
@@ -2385,14 +3521,23 @@ def oracle_map_for_job(job: dict[str, Any]) -> dict[str, dict[str, Any]]:
 
 
 def run_jobs(plan: dict[str, Any], spec: dict[str, Any], sources: dict[str, dict[str, Any]], args: argparse.Namespace) -> int:
-    verify_plan(plan)
+    require(args.host_id in sources, "selected host has no verified source manifest")
+    source = sources[args.host_id]
+    verify_plan(plan, source["runtime_readback_validator"]["sha256"])
     if args.phase == "pressure":
         require(EXTERNAL_PRESSURE_DRIVER_SUPPORTED, "external-pressure phase is hard-disabled until the same-policy feedback driver and process readbacks are implemented")
     require(plan["execution_ready"], "qualification execution is hard-disabled until production binary runtime-domain/policy/ceiling readback is implemented and verified")
     require(args.phase in ("exploration", "aa", "confirmation", "pressure", "soak"), "unknown campaign phase")
     require(args.host_id in plan["host_ids"], "selected host is not in the frozen plan")
     source_root = Path(args.source_root).resolve(strict=True)
-    source = sources[args.host_id]
+    spec_path = Path(args.spec).resolve(strict=True)
+    frozen_spec_sha256 = sha256_file(spec_path)
+    require(digest_object(read_json(spec_path)) == digest_object(spec), "campaign spec file differs from the current frozen plan input")
+    source_manifest_path, source_manifest_pin = source_manifest_file(spec, spec_path, args.host_id)
+    require(source_manifest_pin == source["manifest_sha256"], "selected source manifest path differs from its frozen host reference")
+    source_manifest_file_sha256 = verify_source_manifest_file(
+        source_manifest_path, source, source_manifest_pin
+    )
     verify_source_manifest(source, source_root)
     raw_output_root = Path(args.output_root)
     require(not raw_output_root.is_symlink(), "raw output root may not be a symlink")
@@ -2430,7 +3575,7 @@ def run_jobs(plan: dict[str, Any], spec: dict[str, Any], sources: dict[str, dict
             require(len(ledger) == len(expected), f"{prerequisite} ledger is incomplete for this host")
             require(all(record.get("state") == "valid_pair" for record in ledger), f"{prerequisite} contains a failed, interrupted, or invalid pair")
             if args.phase in ("pressure", "soak") and prerequisite in ("confirmation", "pressure"):
-                revalidate_pair_records(ledger, prerequisite, campaign_dir / prerequisite / args.host_id, source, spec, Path(args.campaign_artifacts))
+                revalidate_pair_records(ledger, prerequisite, campaign_dir / prerequisite / args.host_id, source, spec, Path(args.campaign_artifacts), source_manifest_file_sha256)
             prerequisite_ledgers[prerequisite] = ledger
             if prerequisite == "aa":
                 validate_aa_records(ledger, expected, args.host_id, spec["protocol"]["bootstrap_draws"], spec["protocol"]["bootstrap_seed"])
@@ -2442,7 +3587,7 @@ def run_jobs(plan: dict[str, Any], spec: dict[str, Any], sources: dict[str, dict
                 require(isinstance(predecessor_ids, list) and len(predecessor_ids) == 1, "pressure schedule lacks its exact fixed predecessor ID")
                 fixed = fixed_by_id.get(predecessor_ids[0])
                 require(fixed is not None, "pressure schedule references an absent fixed predecessor pair")
-                receipt = fixed_pressure_predecessor_receipt(job, fixed, spec)
+                receipt = fixed_pressure_predecessor_receipt(job, fixed, spec, source)
                 pressure_predecessor_receipts[job["run_id"]] = [receipt]
         else:
             pressure_predecessor_receipts = {}
@@ -2451,6 +3596,7 @@ def run_jobs(plan: dict[str, Any], spec: dict[str, Any], sources: dict[str, dict
                 prerequisite_ledgers["pressure"],
                 prerequisite_ledgers["confirmation"],
                 spec,
+                source,
             )
         if args.phase == "soak":
             analysis_path = campaign_dir / "analysis" / args.host_id / "pre-soak.json"
@@ -2509,6 +3655,10 @@ def run_jobs(plan: dict[str, Any], spec: dict[str, Any], sources: dict[str, dict
                 write_record({"state": f"not_run_after_{stop_reason}", "job": job})
                 continue
             job_started = time.monotonic()
+            require(sha256_file(spec_path) == frozen_spec_sha256, "campaign spec file changed before a scheduled job")
+            source_manifest_file_sha256 = verify_source_manifest_file(
+                source_manifest_path, source, source_manifest_pin, source_manifest_file_sha256
+            )
             runner_hash_before = sha256_file(runner)
             require(runner_hash_before == runner_sha256, "pinned runner changed before a scheduled job")
             artifact_group = "soak_artifacts" if args.phase == "soak" else "artifacts"
@@ -2545,10 +3695,26 @@ def run_jobs(plan: dict[str, Any], spec: dict[str, Any], sources: dict[str, dict
                         baseline_oracle_path = Path(args.campaign_artifacts) / baseline_oracle["relative_path"]
                         require(baseline_oracle_path.is_file() and sha256_file(baseline_oracle_path) == baseline_oracle["sha256"], f"baseline oracle is missing or changed for {job['run_id']}")
                         baseline_oracle = (baseline_oracle_path, baseline_oracle["sha256"])
+                require(job["comparison_family"] == "fixed_policy", "external-pressure pair execution is unsupported pending approved policy support")
+                scheduled_bindings = plan["runtime_process_bindings"].get(job["run_id"])
+                current_bindings = build_runtime_process_bindings(job, spec, source)
+                require(scheduled_bindings == current_bindings, "runtime process recipes differ from the frozen plan")
+                runtime_binding_path = runner_output / ".runtime-bindings" / f"{job['run_id']}.json"
+                runtime_binding_sha256 = write_runtime_binding_manifest(
+                    runtime_binding_path, scheduled_bindings, job, spec, source
+                )
+                validator_pin = source["runtime_readback_validator"]
+                runtime_validator_path = source_root / validator_pin["path"]
+                runtime_validator_sha256 = sha256_file(runtime_validator_path)
+                require(runtime_validator_sha256 == validator_pin["sha256"], "runtime readback validator changed before pair launch")
+                control_baseline = source["resource_domain_calibration"]["record"]["fixed_global_control_baseline"]
                 argv = build_pair_runner_argv(
                     runner, binary, job, expected_host["controls"]["cpu_set"], runner_output,
                     spec["deadlines"], job["arrivals"] or 5000, candidate_oracle,
                     baseline_binary, baseline_allocator, baseline_oracle,
+                    runtime_binding_path, runtime_binding_sha256,
+                    runtime_validator_path, runtime_validator_sha256,
+                    control_baseline,
                 )
             stdout_path = ledger_dir / f"{position:06d}-{job['run_id']}.stdout.log"
             stderr_path = ledger_dir / f"{position:06d}-{job['run_id']}.stderr.log"
@@ -2566,7 +3732,12 @@ def run_jobs(plan: dict[str, Any], spec: dict[str, Any], sources: dict[str, dict
                     exit_code = 124
                 except OSError as error:
                     active = None
-                    write_record({"state": "halt_launch_error", "job": job, "error": str(error)})
+                    launch_record = {"state": "halt_launch_error", "job": job, "error": str(error)}
+                    if args.phase != "soak":
+                        launch_record["runtime_binding_manifest"] = runtime_binding_path.relative_to(ledger_dir).as_posix()
+                        launch_record["runtime_binding_manifest_sha256"] = runtime_binding_sha256
+                        launch_record["source_manifest_file_sha256"] = source_manifest_file_sha256
+                    write_record(launch_record)
                     stopped = True
                     stop_reason = "launch_error"
                     for remaining in jobs[position + 1 :]:
@@ -2584,15 +3755,35 @@ def run_jobs(plan: dict[str, Any], spec: dict[str, Any], sources: dict[str, dict
                 require(source_check_remaining > 0, "job outer deadline expired before post-run source verification")
                 with hard_wall_deadline(source_check_remaining, "post-run source verification exceeded the remaining outer job deadline"):
                     verify_source_manifest(source, source_root, timeout_seconds=source_check_remaining)
+                    require(sha256_file(spec_path) == frozen_spec_sha256, "campaign spec changed during the scheduled job")
+                    source_manifest_file_sha256 = verify_source_manifest_file(
+                        source_manifest_path, source, source_manifest_pin, source_manifest_file_sha256
+                    )
+                    if args.phase != "soak":
+                        require(sha256_file(runtime_binding_path) == runtime_binding_sha256, "runtime process binding manifest changed during the scheduled job")
             except CampaignError as error:
                 state = "integrity_failed_stop"
                 stopped = True
                 stop_reason = "integrity_failure"
-                write_record({"state": state, "exit_code": exit_code, "job": job, "error": str(error), "stdout": stdout_path.relative_to(ledger_dir).as_posix(), "stderr": stderr_path.relative_to(ledger_dir).as_posix()})
+                failed_record = {"state": state, "exit_code": exit_code, "job": job, "error": str(error), "stdout": stdout_path.relative_to(ledger_dir).as_posix(), "stderr": stderr_path.relative_to(ledger_dir).as_posix()}
+                if args.phase != "soak":
+                    failed_record["runtime_binding_manifest"] = runtime_binding_path.relative_to(ledger_dir).as_posix()
+                    failed_record["runtime_binding_manifest_sha256"] = runtime_binding_sha256
+                    failed_record["source_manifest_file_sha256"] = source_manifest_file_sha256
+                write_record(failed_record)
                 for remaining in jobs[position + 1 :]:
                     write_record({"state": f"not_run_after_{stop_reason}", "job": remaining})
                 break
             record = {"state": state, "exit_code": exit_code, "runner_sha256_before": runner_hash_before, "runner_sha256_after": runner_hash_after, "job": job, "stdout": stdout_path.relative_to(ledger_dir).as_posix(), "stderr": stderr_path.relative_to(ledger_dir).as_posix()}
+            if args.phase != "soak":
+                record["runtime_binding_manifest"] = runtime_binding_path.relative_to(ledger_dir).as_posix()
+                record["runtime_binding_manifest_sha256"] = runtime_binding_sha256
+                record["runtime_validator_sha256"] = runtime_validator_sha256
+                record["runtime_policy_sha256"] = source["fixed_runtime_policy"]["policy_sha256"]
+                record["calibration_binary_sha256"] = source["resource_domain_calibration"]["binary"]["sha256"]
+                record["calibration_output_sha256"] = source["resource_domain_calibration"]["output"]["sha256"]
+                record["fixed_global_control_baseline"] = source["resource_domain_calibration"]["record"]["fixed_global_control_baseline"]
+                record["source_manifest_file_sha256"] = source_manifest_file_sha256
             if args.phase == "pressure":
                 record["predecessor_receipts"] = pressure_predecessor_receipts[job["run_id"]]
             if exit_code == 0:
@@ -2620,20 +3811,9 @@ def run_jobs(plan: dict[str, Any], spec: dict[str, Any], sources: dict[str, dict
                     pair_dir = runner_output / job["run_id"]
                     record["pair_directory"] = pair_dir.relative_to(ledger_dir).as_posix()
                     process_header, process_rows = read_tsv(pair_dir / "processes.tsv", 2)
-                    expected_process_header = ("pair executor allocator exit_code row_validation p99_qualification argv stdout time_report ids_sha256 shutdown_sha256 capacity_family_sha256").split()
-                    require(process_header == expected_process_header, "pair process ledger schema changed")
+                    require(process_header == PAIR_PROCESS_HEADER, "pair process ledger schema changed")
                     require(all(item["exit_code"] == "0" and item["row_validation"] == "valid" for item in process_rows), "pair process ledger contains an invalid process")
-                    if job["phase"] == "aa":
-                        expected_executors = (job["executor"], job["executor"])
-                        expected_allocators = (job["allocator"], job["allocator"])
-                    elif job.get("comparison_kind") == "allocator":
-                        expected_executors = ("bounded", "bounded")
-                        expected_allocators = (job["allocator"], job["baseline_allocator"])
-                    else:
-                        expected_executors = ("bounded", "tokio")
-                        expected_allocators = (job["allocator"], job["allocator"])
-                    require(sorted(item["executor"] for item in process_rows) == sorted(expected_executors), "pair executors differ from the preregistered treatment")
-                    require(sorted(item["allocator"] for item in process_rows) == sorted(expected_allocators), "pair allocators differ from the preregistered treatment")
+                    require_exact_pair_process_rows(process_rows, job)
                     metrics = [extract_process_metrics(pair_dir, item, job, source, spec, Path(args.campaign_artifacts)) for item in process_rows]
                     require(time.monotonic() - validation_started <= spec["deadlines"]["pair_validation_seconds"], "pair artifact validation exceeded its finite phase deadline")
                     require(time.monotonic() - job_started <= outer_budget, "pair validation exceeded its finite outer job deadline")
@@ -2677,6 +3857,8 @@ def build_parser() -> argparse.ArgumentParser:
     source.add_argument("--allocator-binary", action="append", required=True, metavar="ALLOCATOR=RELATIVE_PATH")
     source.add_argument("--soak-binary", action="append", required=True, metavar="ALLOCATOR=RELATIVE_PATH")
     source.add_argument("--analysis-binary", required=True, metavar="RELATIVE_PATH")
+    source.add_argument("--resource-domain-calibration-binary", required=True, metavar="RELATIVE_PATH")
+    source.add_argument("--resource-domain-calibration-output", required=True, metavar="RELATIVE_PATH")
     source.add_argument("--output", required=True)
     for name in ("plan", "validate"):
         command = commands.add_parser(name, help="validate frozen inputs and build/check a deterministic campaign schedule")
@@ -2728,7 +3910,14 @@ def main(argv: list[str] | None = None) -> int:
             require(not output.exists(), f"refusing to replace source manifest: {output}")
             output.parent.mkdir(parents=True, exist_ok=True)
             output.write_bytes(canonical_bytes(manifest))
-            print(json.dumps({"manifest_sha256": manifest["manifest_sha256"], "source_tree_sha256": manifest["source"]["source_tree_sha256"]}, sort_keys=True))
+            print(json.dumps({
+                "manifest_sha256": manifest["manifest_sha256"],
+                "source_tree_sha256": manifest["source"]["source_tree_sha256"],
+                "fixed_policy_sha256": manifest["fixed_runtime_policy"]["policy_sha256"],
+                "calibration_output_sha256": manifest["resource_domain_calibration"]["output"]["sha256"],
+                "fixed_global_control_baseline": manifest["resource_domain_calibration"]["record"]["fixed_global_control_baseline"],
+                "runtime_readback_validator_sha256": manifest["runtime_readback_validator"]["sha256"],
+            }, sort_keys=True))
             return 0
         if args.command == "freeze-rates":
             spec = read_json(Path(args.spec))
@@ -2745,15 +3934,18 @@ def main(argv: list[str] | None = None) -> int:
             spec = read_json(Path(args.spec))
             source_root = Path(args.source_root).resolve(strict=True)
             sources = load_source_manifests(spec, Path(args.spec), source_root, args.host_id)
+            analysis_source_manifest_path, analysis_source_manifest_pin = source_manifest_file(spec, Path(args.spec), args.host_id)
+            analysis_source_manifest_file_sha256 = verify_source_manifest_file(
+                analysis_source_manifest_path, sources[args.host_id], analysis_source_manifest_pin
+            )
             manifest = prepare_oracles(spec, sources, args)
             print(json.dumps({"manifest_sha256": manifest["manifest_sha256"], "host_id": manifest["host_id"], "oracle_count": len(manifest["oracles"])}, sort_keys=True))
             return 0
         if args.command == "analyze":
             spec = read_json(Path(args.spec))
-            plan = read_json(Path(args.plan))
-            verify_plan(plan)
+            analysis_spec_file_sha256 = sha256_file(Path(args.spec))
+            plan = read_campaign_plan(Path(args.plan))
             require(digest_object(spec) == plan["spec_sha256"], "analysis spec differs from the frozen plan")
-            require(args.host_id in plan["host_ids"], "analysis host is absent from the frozen plan")
             script = Path(args.analysis_script).resolve(strict=True)
             phase_adapter = spec["phase_adapters"]["simultaneous_analysis_sha256"]
             require(is_sha256(phase_adapter) and hashlib.sha256(script.read_bytes()).hexdigest() == phase_adapter, "analysis adapter source hash differs from the preregistration")
@@ -2763,21 +3955,30 @@ def main(argv: list[str] | None = None) -> int:
             campaign_dir = root / spec["campaign_id"]
             source_root = Path(args.source_root).resolve(strict=True)
             sources = load_source_manifests(spec, Path(args.spec), source_root, args.host_id)
+            require(args.host_id in sources, "analysis host has no verified source manifest")
+            source = sources[args.host_id]
+            verify_plan(plan, source["runtime_readback_validator"]["sha256"])
+            require(args.host_id in plan["host_ids"], "analysis host is absent from the frozen plan")
+            analysis_source_manifest_path, analysis_source_manifest_pin = source_manifest_file(
+                spec, Path(args.spec), args.host_id
+            )
+            analysis_source_manifest_file_sha256 = verify_source_manifest_file(
+                analysis_source_manifest_path, source, analysis_source_manifest_pin
+            )
             require(plan == freeze_plan(spec, sources), "analysis plan schedule differs from the frozen specification and host source pins")
             campaign_artifacts = Path(args.campaign_artifacts).resolve(strict=True)
-            source = sources[args.host_id]
             qualification_scope = validate_spec(spec, sources)
             aa_expected = [job for job in plan["jobs"]["aa"] if job["host_id"] == args.host_id]
             aa_path = campaign_dir / "aa" / args.host_id / "controller-ledger.jsonl"
             aa_ledger = read_ledger(aa_path)
             validate_phase_ledger(aa_ledger, aa_expected, "aa", args.host_id)
-            revalidate_pair_records(aa_ledger, "aa", aa_path.parent, source, spec, campaign_artifacts)
+            revalidate_pair_records(aa_ledger, "aa", aa_path.parent, source, spec, campaign_artifacts, analysis_source_manifest_file_sha256)
             aa_result = validate_aa_records(aa_ledger, aa_expected, args.host_id, spec["protocol"]["bootstrap_draws"], spec["protocol"]["bootstrap_seed"])
             confirmation_ledger_path = campaign_dir / "confirmation" / args.host_id / "controller-ledger.jsonl"
             confirmation_ledger = read_ledger(confirmation_ledger_path)
             confirmation_expected = [job for job in plan["jobs"]["confirmation"] if job["host_id"] == args.host_id]
             validate_phase_ledger(confirmation_ledger, confirmation_expected, "confirmation", args.host_id)
-            revalidate_pair_records(confirmation_ledger, "confirmation", confirmation_ledger_path.parent, source, spec, campaign_artifacts)
+            revalidate_pair_records(confirmation_ledger, "confirmation", confirmation_ledger_path.parent, source, spec, campaign_artifacts, analysis_source_manifest_file_sha256)
             analysis_artifact = source["analysis_artifact"]
             analysis_binary = source_root / analysis_artifact["path"]
             require(sha256_file(analysis_binary) == analysis_artifact["sha256"], "Rust analyzer binary differs from the frozen host source manifest")
@@ -2796,7 +3997,7 @@ def main(argv: list[str] | None = None) -> int:
                 pressure_ledger = read_ledger(pressure_ledger_path)
                 pressure_expected = [job for job in plan["jobs"]["pressure"] if job["host_id"] == args.host_id]
                 validate_phase_ledger(pressure_ledger, pressure_expected, "pressure", args.host_id)
-                validate_pressure_predecessor_receipts(pressure_ledger, confirmation_ledger, spec)
+                validate_pressure_predecessor_receipts(pressure_ledger, confirmation_ledger, spec, source)
                 revalidate_pair_records(pressure_ledger, "pressure", pressure_ledger_path.parent, source, spec, campaign_artifacts)
                 pressure_analysis = analyze_confirmation_host_gated(
                     spec,
@@ -2842,6 +4043,10 @@ def main(argv: list[str] | None = None) -> int:
             require(sha256_file(analysis_binary) == analysis_artifact["sha256"], "Rust analyzer binary changed during independent reanalysis")
             require(hashlib.sha256(script.read_bytes()).hexdigest() == phase_adapter, "analysis adapter changed during independent reanalysis")
             verify_source_manifest(source, source_root)
+            require(sha256_file(Path(args.spec)) == analysis_spec_file_sha256, "campaign spec changed during independent reanalysis")
+            verify_source_manifest_file(
+                analysis_source_manifest_path, source, analysis_source_manifest_pin, analysis_source_manifest_file_sha256
+            )
             old_umask = os.umask(0o077)
             try:
                 output.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -2863,13 +4068,14 @@ def main(argv: list[str] | None = None) -> int:
             output = Path(args.output)
             require(not output.exists(), f"refusing to replace campaign plan: {output}")
             output.parent.mkdir(parents=True, exist_ok=True)
-            output.write_bytes(canonical_bytes(plan))
+            output.write_bytes(campaign_plan_bytes(plan))
             print(json.dumps({**summary, "plan_sha256": plan["plan_sha256"], "job_counts": {name: len(rows) for name, rows in plan["jobs"].items()}}, sort_keys=True))
             return 0
-        plan = read_json(Path(args.plan))
+        plan = read_campaign_plan(Path(args.plan))
         spec = read_json(Path(args.spec))
-        verify_plan(plan)
         sources = load_source_manifests(spec, Path(args.spec), Path(args.source_root).resolve(strict=True), args.host_id)
+        require(args.host_id in sources, "selected host has no verified source manifest")
+        verify_plan(plan, sources[args.host_id]["runtime_readback_validator"]["sha256"])
         require(digest_object(spec) == plan["spec_sha256"] and sources[args.host_id]["manifest_sha256"] == plan["source_manifests"].get(args.host_id), "run inputs differ from frozen plan")
         require(plan == freeze_plan(spec, sources), "run plan schedule differs from the frozen specification and host source pins")
         return run_jobs(plan, spec, sources, args)

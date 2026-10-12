@@ -7,11 +7,11 @@ qualification_runtime_readback_supported=0
 external_pressure_driver_supported=0
 
 usage() {
-  echo "usage: $0 BINARY ALLOCATOR WORKLOAD MODE RATE_OR_DASH CPU_SET RUN_ID OUTPUT_ROOT [ARRIVALS TRACE_S DRAIN_S SHUTDOWN_S PROCESS_S ORACLE_FILE ORACLE_SHA256 PROFILE PAIR_KIND [BASELINE_BINARY BASELINE_ALLOCATOR BASELINE_ORACLE BASELINE_ORACLE_SHA256]]" >&2
+  echo "usage: $0 BINARY ALLOCATOR WORKLOAD MODE RATE_OR_DASH CPU_SET RUN_ID OUTPUT_ROOT [ARRIVALS TRACE_S DRAIN_S SHUTDOWN_S PROCESS_S ORACLE_FILE ORACLE_SHA256 PROFILE PAIR_KIND [BASELINE_BINARY BASELINE_ALLOCATOR BASELINE_ORACLE BASELINE_ORACLE_SHA256] [--runtime-bindings FILE --runtime-bindings-sha256 SHA --runtime-validator FILE --runtime-validator-sha256 SHA --fixed-global-control-baseline BYTES]]" >&2
   echo "  open_loop requires a precomputed oracle file and its SHA-256 digest." >&2
 }
 
-if [[ $# -lt 8 || $# -gt 21 ]]; then usage; exit 2; fi
+if [[ $# -lt 8 || $# -gt 31 ]]; then usage; exit 2; fi
 binary_arg=$1
 allocator=$2
 workload=$3
@@ -33,6 +33,21 @@ baseline_binary_arg=${18:-}
 baseline_allocator=${19:-}
 baseline_oracle_arg=${20:-}
 baseline_oracle_digest_expected=${21:-}
+runtime_bindings_arg=
+runtime_bindings_sha_expected=
+runtime_validator_arg=
+runtime_validator_sha_expected=
+fixed_global_control_baseline_arg=
+if (( $# > 21 )); then
+  [[ $# -eq 31 && "${22}" == "--runtime-bindings" && "${24}" == "--runtime-bindings-sha256" && "${26}" == "--runtime-validator" && "${28}" == "--runtime-validator-sha256" && "${30}" == "--fixed-global-control-baseline" ]] || { usage; exit 2; }
+  runtime_bindings_arg=${23}
+  runtime_bindings_sha_expected=${25}
+  runtime_validator_arg=${27}
+  runtime_validator_sha_expected=${29}
+  fixed_global_control_baseline_arg=${31}
+  [[ "$runtime_bindings_sha_expected" =~ ^[0-9a-f]{64}$ && "$runtime_validator_sha_expected" =~ ^[0-9a-f]{64}$ ]] || { echo "runtime readback artifact hashes must be SHA-256 values" >&2; exit 2; }
+  [[ "$fixed_global_control_baseline_arg" =~ ^[1-9][0-9]*$ && ${#fixed_global_control_baseline_arg} -le 20 ]] || { echo "fixed global Control baseline must be a positive numeric input" >&2; exit 2; }
+fi
 
 for deadline in "$trace_deadline" "$drain_deadline" "$shutdown_deadline" "$process_deadline"; do
   [[ "$deadline" =~ ^[1-9][0-9]*$ && ${#deadline} -le 4 ]] || { echo "deadlines must be positive finite integer seconds" >&2; exit 2; }
@@ -120,7 +135,7 @@ pair_suffix=${run_id##*[!0-9]}
 pair_ordinal=$((10#$pair_suffix))
 (( pair_ordinal >= 1 && pair_ordinal <= 36 )) || { echo "pair ordinal must be from 1 through 36" >&2; exit 2; }
 
-for command in taskset timeout sha256sum awk rustc uname python3 od tr cmp; do
+for command in taskset timeout sha256sum awk rustc uname python3 cmp realpath; do
   command -v "$command" >/dev/null || { echo "missing required command: $command" >&2; exit 2; }
 done
 [[ -x /usr/bin/time ]] || { echo "GNU /usr/bin/time is required" >&2; exit 2; }
@@ -176,8 +191,191 @@ source_hash() {
     | awk '{print $1}'
 }
 
+verify_runtime_inputs() {
+  [[ -n "$runtime_bindings_arg" && -n "$runtime_validator_arg" ]] || { echo "controller-frozen runtime bindings are required" >&2; return 1; }
+  local bindings_file validator_file
+  bindings_file=$(realpath "$runtime_bindings_arg") || return 1
+  validator_file=$(realpath "$runtime_validator_arg") || return 1
+  [[ -f "$bindings_file" && ! -L "$runtime_bindings_arg" && -f "$validator_file" && ! -L "$runtime_validator_arg" ]] || { echo "runtime binding or validator artifact is missing or symlinked" >&2; return 1; }
+  [[ "$bindings_file" == "$output_root"/* && "$validator_file" == "$repo_root/scripts/application-runtime-readback.py" ]] || { echo "runtime binding or validator path escaped its frozen root" >&2; return 1; }
+  [[ $(sha256sum "$bindings_file" | awk '{print $1}') == "$runtime_bindings_sha_expected" ]] || { echo "runtime binding manifest hash changed" >&2; return 1; }
+  [[ $(sha256sum "$validator_file" | awk '{print $1}') == "$runtime_validator_sha_expected" ]] || { echo "runtime readback validator hash changed" >&2; return 1; }
+  python3 - "$bindings_file" "$runtime_bindings_sha_expected" "$validator_file" "$runtime_validator_sha_expected" "$fixed_global_control_baseline_arg" "$repo_root" "$source_digest" "$run_id" "$workload" "$profile" "$mode" "$rate" "$arrivals" <<'PY'
+import hashlib
+import json
+import re
+import sys
+from pathlib import Path
+
+manifest_path, raw_sha, validator_path, validator_sha, baseline_text, source_root, source_sha, run_id, workload, profile, mode, rate_text, arrivals_text = sys.argv[1:]
+def fail():
+    raise SystemExit(1)
+def unique(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            fail()
+        result[key] = value
+    return result
+def canonical(value):
+    return (json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False) + "\n").encode("ascii")
+def safe_file(root, relative, expected_sha):
+    if not isinstance(relative, str) or not relative or "\\" in relative:
+        fail()
+    rel = Path(relative)
+    if rel.is_absolute() or ".." in rel.parts:
+        fail()
+    cursor = Path(root).resolve(strict=True)
+    for part in rel.parts:
+        cursor = cursor / part
+        if cursor.is_symlink():
+            fail()
+    resolved = cursor.resolve(strict=True)
+    try:
+        resolved.relative_to(Path(root).resolve(strict=True))
+    except ValueError:
+        fail()
+    if not resolved.is_file() or hashlib.sha256(resolved.read_bytes()).hexdigest() != expected_sha:
+        fail()
+    return resolved
+try:
+    raw = Path(manifest_path).read_bytes()
+    if len(raw) > 131072 or hashlib.sha256(raw).hexdigest() != raw_sha:
+        fail()
+    manifest = json.loads(raw.decode("utf-8"), object_pairs_hook=unique)
+    required = {"schema", "run_id", "comparison_family", "source_manifest_sha256", "source_sha256", "source", "build", "fixed_runtime_policy", "resource_domain_calibration", "runtime_readback_validator", "fixed_global_control_baseline", "processes", "manifest_sha256"}
+    if type(manifest) is not dict or set(manifest) != required:
+        fail()
+    unsigned = dict(manifest)
+    digest = unsigned.pop("manifest_sha256")
+    if manifest["schema"] != "allocatbelt.application-runtime-process-bindings.v1" or hashlib.sha256(canonical(unsigned)).hexdigest() != digest:
+        fail()
+    if manifest["comparison_family"] != "fixed_policy" or manifest["run_id"] != run_id or manifest["source_sha256"] != source_sha:
+        fail()
+    if type(manifest["fixed_global_control_baseline"]) is not int or manifest["fixed_global_control_baseline"] != int(baseline_text):
+        fail()
+    policy = manifest["fixed_runtime_policy"]
+    if type(policy) is not dict or set(policy) != {"schema", "policy", "policy_sha256"}:
+        fail()
+    policy_body = policy["policy"]
+    if type(policy_body) is not dict or policy_body.get("schema") != "allocatbelt.application-fixed-policy-artifact.v1" or policy["policy_sha256"] != hashlib.sha256(canonical(policy_body)).hexdigest():
+        fail()
+    buckets = policy_body.get("byte_buckets", {})
+    if set(buckets) != {"disk", "upload", "download"} or any(
+        bucket.get("bytes_per_second") != 17179869184
+        or bucket.get("ceiling_bytes_per_second") != 17179869184
+        or bucket.get("burst_bytes") != 65536
+        or bucket.get("ceiling_burst_bytes") != 65536
+        or bucket.get("max_reservations") != 64
+        for bucket in buckets.values()
+    ):
+        fail()
+    calibration = manifest["resource_domain_calibration"]
+    if type(calibration) is not dict or set(calibration) != {"binary", "output", "record", "source", "build", "build_sha256"}:
+        fail()
+    expected_source_keys = {"git_commit", "source_tree_sha256", "cargo_lock_sha256"}
+    expected_build_keys = {"host_id", "rustc_release", "rustc_verbose", "cargo_version", "target_triple", "target_cpu", "profile", "features_sha256", "build_inputs_sha256"}
+    if type(manifest["source"]) is not dict or set(manifest["source"]) != expected_source_keys or manifest["source"]["source_tree_sha256"] != source_sha:
+        fail()
+    if type(manifest["build"]) is not dict or set(manifest["build"]) != expected_build_keys or manifest["build"]["target_triple"] != "x86_64-unknown-linux-gnu" or manifest["build"]["target_cpu"] != "x86-64-v3" or manifest["build"]["profile"] != "release":
+        fail()
+    if manifest["source"] != calibration["source"] or manifest["build"] != calibration["build"] or hashlib.sha256(canonical(manifest["build"])).hexdigest() != calibration["build_sha256"]:
+        fail()
+    record = calibration["record"]
+    if type(record) is not dict or record.get("schema") != "allocatbelt.resource-domain-calibration.v1":
+        fail()
+    if type(record.get("max_tenants")) is not int or record["max_tenants"] != 1 or type(record.get("max_waiters")) is not int or record["max_waiters"] != 256:
+        fail()
+    if type(record.get("control_ceiling")) is not int or record["control_ceiling"] != 67108864:
+        fail()
+    if type(record.get("fixed_global_control_baseline")) is not int or record["fixed_global_control_baseline"] <= 0 or type(record.get("final_live_tenants")) is not int or record["final_live_tenants"] != 0 or record.get("final_global_control_bytes") != record["fixed_global_control_baseline"]:
+        fail()
+    safe_file(source_root, calibration["binary"]["path"], calibration["binary"]["sha256"])
+    output_path = safe_file(source_root, calibration["output"]["path"], calibration["output"]["sha256"])
+    calibration_raw = output_path.read_bytes()
+    if len(calibration_raw) > 131072 or json.loads(calibration_raw.decode("utf-8"), object_pairs_hook=unique) != record:
+        fail()
+    validator = manifest["runtime_readback_validator"]
+    if type(validator) is not dict or set(validator) != {"path", "sha256"} or validator["path"] != "scripts/application-runtime-readback.py" or validator["sha256"] != validator_sha:
+        fail()
+    safe_file(source_root, validator["path"], validator["sha256"])
+except (OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError, KeyError):
+    fail()
+PY
+}
+
+runtime_binding_for_process() {
+  local pair=$1 executor=$2 allocator_name=$3 binary_hash=$4 recipe_path=$5
+  python3 - "$runtime_bindings_arg" "$runtime_bindings_sha_expected" "$pair" "$executor" "$allocator_name" "$binary_hash" "$run_id" "$workload" "$profile" "$mode" "$rate" "$arrivals" "$source_digest" "$fixed_global_control_baseline_arg" "$runtime_validator_sha_expected" "$recipe_path" <<'PY'
+import hashlib
+import json
+import re
+import sys
+from pathlib import Path
+
+manifest_path, manifest_sha, pair, executor, allocator, binary_sha, run_id, workload, profile, mode, rate_text, arrivals_text, source_sha, baseline_text, validator_sha, recipe_path = sys.argv[1:]
+def fail():
+    raise SystemExit(1)
+def unique(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            fail()
+        result[key] = value
+    return result
+def canonical(value):
+    return (json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False) + "\n").encode("ascii")
+try:
+    raw = Path(manifest_path).read_bytes()
+    if len(raw) > 131072 or hashlib.sha256(raw).hexdigest() != manifest_sha:
+        fail()
+    manifest = json.loads(raw.decode("utf-8"), object_pairs_hook=unique)
+    row = [item for item in manifest["processes"] if item.get("pair") == pair and item.get("executor") == executor and item.get("allocator") == allocator]
+    if len(row) != 1:
+        fail()
+    binding = row[0]
+    if set(binding) != {"pair", "executor", "allocator", "report_nonce", "recipe", "recipe_sha256", "expectation_sha256", "resource_ceiling_sha256", "policy_sha256", "fixed_global_control_baseline"}:
+        fail()
+    recipe = binding["recipe"]
+    expected_executor = "allocatbelt" if executor == "bounded" else "tokio-1.53.1"
+    run = recipe["run"]
+    expected_rate = None if mode == "capacity" else int(rate_text)
+    expected_arrivals = 5000 if mode == "capacity" else int(arrivals_text)
+    if (recipe["schema"] != "allocatbelt.application-runtime-recipe.v1"
+        or recipe["identity"]["report_nonce"] != binding["report_nonce"]
+        or recipe["identity"]["run_id"] != run_id
+        or recipe["identity"]["allocator"] != allocator
+        or recipe["identity"]["executor"] != expected_executor
+        or recipe["identity"]["source_sha256"] != source_sha
+        or recipe["identity"]["binary_sha256"] != binary_sha
+        or recipe["identity"]["comparison_family"] != "fixed_policy"
+        or recipe["identity"]["resource_ceiling_sha256"] != binding["resource_ceiling_sha256"]
+        or recipe["identity"]["policy_sha256"] != binding["policy_sha256"]
+        or binding["policy_sha256"] != manifest["fixed_runtime_policy"]["policy_sha256"]
+        or run["workload"] != workload or run["profile"] != profile or run["mode"] != mode
+        or run["rate_per_second"] != expected_rate or run["arrivals"] != expected_arrivals
+        or recipe["fixed_global_control_baseline"] != int(baseline_text)
+        or binding["fixed_global_control_baseline"] != int(baseline_text)
+        or not re.fullmatch(r"[a-f0-9]{32}", binding["report_nonce"])
+        or hashlib.sha256(canonical(recipe)).hexdigest() != binding["recipe_sha256"]):
+        fail()
+    path = Path(recipe_path)
+    if path.exists() or path.is_symlink():
+        fail()
+    with path.open("xb") as stream:
+        stream.write(canonical(recipe))
+    path.chmod(0o600)
+    sys.stdout.buffer.write((binding["report_nonce"] + "\0" + binding["recipe_sha256"] + "\0" + binding["expectation_sha256"] + "\0" + binding["resource_ceiling_sha256"] + "\0" + binding["policy_sha256"] + "\0" + str(binding["fixed_global_control_baseline"]) + "\0" + manifest["source_manifest_sha256"] + "\0" + manifest["resource_domain_calibration"]["binary"]["sha256"] + "\0" + manifest["resource_domain_calibration"]["output"]["sha256"] + "\0" + validator_sha + "\0").encode("utf-8"))
+except (OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError, KeyError):
+    fail()
+PY
+}
+
 source_digest=$(source_hash) || exit 2
 binary_digest=$(sha256sum "$binary" | awk '{print $1}') || exit 2
+if (( qualification_runtime_readback_supported == 1 )); then
+  verify_runtime_inputs || exit 2
+fi
 head_commit=$(git -C "$repo_root" rev-parse HEAD) || exit 2
 rust_version=$(rustc -Vv | tr '\n' ';') || exit 2
 kernel=$(uname -srmo) || exit 2
@@ -226,6 +424,9 @@ printf 'baseline_allocator\t%s\n' "$baseline_allocator"
   printf 'source_tree_sha256\t%s\n' "$source_digest"
 printf 'binary_path\t%s\n' "$binary"
 printf 'binary_sha256\t%s\n' "$binary_digest"
+  printf 'runtime_bindings_sha256_before\t%s\n' "$runtime_bindings_sha_expected"
+  printf 'runtime_validator_sha256_before\t%s\n' "$runtime_validator_sha_expected"
+  printf 'fixed_global_control_baseline\t%s\n' "$fixed_global_control_baseline_arg"
 printf 'baseline_binary_path\t%s\n' "$baseline_binary"
 printf 'baseline_binary_sha256\t%s\n' "$baseline_binary_digest"
   printf 'host\t%s\n' "$host"
@@ -238,7 +439,7 @@ printf 'baseline_binary_sha256\t%s\n' "$baseline_binary_digest"
   printf 'argv_policy\t%s\n' 'one fresh process; external timeout is hard whole-process watchdog; binary process budget starts at setup; taskset applied to each process'
 } > "$cell_dir/metadata.tsv"
 
-printf 'pair\texecutor\tallocator\texit_code\trow_validation\tp99_qualification\targv\tstdout\ttime_report\tids_sha256\tshutdown_sha256\tcapacity_family_sha256\n' > "$cell_dir/processes.tsv"
+printf 'pair\texecutor\tallocator\texit_code\trow_validation\tp99_qualification\targv\tstdout\ttime_report\tids_sha256\tshutdown_sha256\tcapacity_family_sha256\tstdout_sha256\truntime_readback\truntime_readback_sha256\truntime_expectation\truntime_expectation_sha256\truntime_validation\truntime_validation_sha256\truntime_recipe_sha256\tresource_ceiling_sha256\tpolicy_sha256\tfixed_global_control_baseline\tvalidator_sha256\tsource_manifest_sha256\tcalibration_binary_sha256\tcalibration_output_sha256\n' > "$cell_dir/processes.tsv"
 failed=0
 
 validate_output() {
@@ -772,20 +973,61 @@ run_one() {
   local ids_report="$cell_dir/${pair}-${executor}.ids.tsv"
   local family_report="$cell_dir/${pair}-${executor}.capacity-families.tsv"
   local timing="$cell_dir/${pair}-${executor}.time.txt" status validation p99_qualification=not_applicable ids_sha256=not_applicable
+  local stdout_sha256=unavailable runtime_readback_path="$cell_dir/${pair}-${executor}.runtime.tsv" runtime_readback_sha256=unavailable
+  local runtime_expectation_path="$cell_dir/${pair}-${executor}.expectation.json" runtime_expectation_sha256=unavailable
+  local runtime_validation_path="$cell_dir/${pair}-${executor}.validation.json" runtime_validation_sha256=unavailable
+  local runtime_recipe_sha256=unavailable resource_ceiling_sha256=unavailable policy_sha256=unavailable
+  local fixed_global_control_baseline=unavailable validator_sha256="$runtime_validator_sha_expected"
+  local source_manifest_sha256=unavailable calibration_binary_sha256=unavailable calibration_output_sha256=unavailable
   local -a args=(--executor "$executor" --workload "$workload" --profile "$profile" --mode "$mode" --trace-deadline-seconds "$trace_deadline" --drain-deadline-seconds "$drain_deadline" --shutdown-deadline-seconds "$shutdown_deadline" --process-deadline-seconds "$process_deadline")
-  local report_nonce
-  report_nonce=$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')
-  [[ "$report_nonce" =~ ^[0-9a-f]{32}$ ]] || { failed=1; return 1; }
+  local report_nonce recipe_path="$cell_dir/${pair}-${executor}.recipe.json" binding_values_path="$cell_dir/${pair}-${executor}.binding-values"
+  local -a runtime_binding_values=()
+  if (( qualification_runtime_readback_supported == 1 )); then
+    runtime_binding_for_process "$pair" "$executor" "$process_allocator" "$process_binary_sha" "$recipe_path" > "$binding_values_path" || { failed=1; return 1; }
+    mapfile -d '' -t runtime_binding_values < "$binding_values_path"
+    (( ${#runtime_binding_values[@]} == 10 )) || { failed=1; return 1; }
+    report_nonce=${runtime_binding_values[0]}
+    runtime_recipe_sha256=${runtime_binding_values[1]}
+    local planned_expectation_sha=${runtime_binding_values[2]}
+    resource_ceiling_sha256=${runtime_binding_values[3]}
+    policy_sha256=${runtime_binding_values[4]}
+    fixed_global_control_baseline=${runtime_binding_values[5]}
+    source_manifest_sha256=${runtime_binding_values[6]}
+    calibration_binary_sha256=${runtime_binding_values[7]}
+    calibration_output_sha256=${runtime_binding_values[8]}
+    validator_sha256=${runtime_binding_values[9]}
+    [[ "$report_nonce" =~ ^[0-9a-f]{32}$ ]] || { failed=1; return 1; }
+    python3 -B "$runtime_validator_arg" --build-expectation "$recipe_path" --output "$runtime_expectation_path" > "$cell_dir/${pair}-${executor}.expectation-build.json" || { failed=1; return 1; }
+    runtime_expectation_sha256=$(sha256sum "$runtime_expectation_path" | awk '{print $1}') || { failed=1; return 1; }
+    [[ "$runtime_expectation_sha256" == "$planned_expectation_sha" ]] || { failed=1; return 1; }
+  else
+    echo "a scheduled runtime process recipe is required before a fixed-policy process can run" >&2
+    failed=1
+    return 1
+  fi
   if [[ "$mode" == open_loop ]]; then args+=(--rate "$rate" --arrivals "$arrivals"); fi
-  local -a command=(taskset -c "$cpu_set" /usr/bin/time -v -o "$timing" timeout --foreground --signal=TERM --kill-after=3s "${process_deadline}s" env "ALLOCATBELT_APP_SHUTDOWN_REPORT=$shutdown_report" "ALLOCATBELT_APP_ID_REPORT=$ids_report" "ALLOCATBELT_APP_FAMILY_REPORT=$family_report" "ALLOCATBELT_APP_REPORT_NONCE=$report_nonce" "ALLOCATBELT_APP_RUN_ID=$run_id" "ALLOCATBELT_APP_EXECUTOR=$expected_executor" "ALLOCATBELT_APP_ALLOCATOR=$process_allocator" "ALLOCATBELT_APP_WORKLOAD=$workload" "ALLOCATBELT_APP_PROFILE=$profile" "ALLOCATBELT_APP_SOURCE_SHA256=$source_digest" "ALLOCATBELT_APP_BINARY_SHA256=$process_binary_sha" "ALLOCATBELT_APP_ORACLE_FILE=$process_oracle_file" "ALLOCATBELT_APP_ORACLE_SHA256=$process_oracle_digest" "$process_binary" "${args[@]}")
+  local -a command=(taskset -c "$cpu_set" /usr/bin/time -v -o "$timing" timeout --foreground --signal=TERM --kill-after=3s "${process_deadline}s" env "ALLOCATBELT_APP_SHUTDOWN_REPORT=$shutdown_report" "ALLOCATBELT_APP_ID_REPORT=$ids_report" "ALLOCATBELT_APP_FAMILY_REPORT=$family_report" "ALLOCATBELT_APP_RUNTIME_REPORT=$runtime_readback_path" "ALLOCATBELT_APP_COMPARISON_FAMILY=fixed_policy" "ALLOCATBELT_APP_RESOURCE_CEILING_SHA256=$resource_ceiling_sha256" "ALLOCATBELT_APP_POLICY_SHA256=$policy_sha256" "ALLOCATBELT_APP_REPORT_NONCE=$report_nonce" "ALLOCATBELT_APP_RUN_ID=$run_id" "ALLOCATBELT_APP_EXECUTOR=$expected_executor" "ALLOCATBELT_APP_ALLOCATOR=$process_allocator" "ALLOCATBELT_APP_WORKLOAD=$workload" "ALLOCATBELT_APP_PROFILE=$profile" "ALLOCATBELT_APP_SOURCE_SHA256=$source_digest" "ALLOCATBELT_APP_BINARY_SHA256=$process_binary_sha" "ALLOCATBELT_APP_ORACLE_FILE=$process_oracle_file" "ALLOCATBELT_APP_ORACLE_SHA256=$process_oracle_digest" "$process_binary" "${args[@]}")
   local argv
-  printf -v argv '%q ' "${command[@]}"
+  argv=$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1:], separators=(",", ":")))' "${command[@]}") || { failed=1; return 1; }
   set +e
   "${command[@]}" > "$stdout" 2> "$cell_dir/${pair}-${executor}.stderr.txt"
   status=$?
   set -e
   validation=invalid
-  if [[ $status -eq 0 && ! -s "$cell_dir/${pair}-${executor}.stderr.txt" ]] && \
+  local runtime_validation_status=1
+  if [[ -f "$runtime_readback_path" && -f "$runtime_expectation_path" ]]; then
+    if python3 -B "$runtime_validator_arg" --receipt "$runtime_readback_path" --expected "$runtime_expectation_path" > "$runtime_validation_path" 2> "$cell_dir/${pair}-${executor}.readback-validation.stderr.txt"; then
+      runtime_validation_status=0
+      runtime_validation_sha256=$(sha256sum "$runtime_validation_path" | awk '{print $1}') || { runtime_validation_status=1; failed=1; }
+    else
+      failed=1
+      [[ -f "$runtime_validation_path" ]] && runtime_validation_sha256=$(sha256sum "$runtime_validation_path" | awk '{print $1}') || runtime_validation_sha256=unavailable
+    fi
+  fi
+  [[ -f "$stdout" ]] && stdout_sha256=$(sha256sum "$stdout" | awk '{print $1}') || stdout_sha256=unavailable
+  [[ -f "$runtime_readback_path" ]] && runtime_readback_sha256=$(sha256sum "$runtime_readback_path" | awk '{print $1}') || runtime_readback_sha256=unavailable
+  [[ -f "$runtime_expectation_path" ]] && runtime_expectation_sha256=$(sha256sum "$runtime_expectation_path" | awk '{print $1}') || runtime_expectation_sha256=unavailable
+  if [[ $status -eq 0 && $runtime_validation_status -eq 0 && ! -s "$cell_dir/${pair}-${executor}.stderr.txt" ]] && \
     validate_output "$stdout" "$expected_executor" "$process_allocator" && \
     validate_shutdown_report "$shutdown_report" "$expected_executor" "$phase_trace_deadline" "$shutdown_deadline" "$process_deadline" "$stdout" "$report_nonce" "$run_id" "$process_allocator" "$profile" "$source_digest" "$process_binary_sha" && \
     { [[ "$mode:$workload" != capacity:mixed ]] || validate_capacity_family_report "$family_report" "$stdout" "$expected_executor" "$report_nonce" "$run_id" "$process_allocator" "$profile" "$source_digest" "$process_binary_sha"; } && \
@@ -828,10 +1070,16 @@ run_one() {
   if [[ -f "$family_report" ]]; then
     family_sha256=$(sha256sum "$family_report" | awk '{print $1}') || { failed=1; validation=invalid; family_sha256=invalid; }
   fi
-  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
     "$pair" "$executor" "$process_allocator" "$status" "$validation" "$p99_qualification" "$argv" "$(basename "$stdout")" "$(basename "$timing")" "$ids_sha256" "$shutdown_sha256" "$family_sha256" \
+    "$stdout_sha256" "$(basename "$runtime_readback_path")" "$runtime_readback_sha256" "$(basename "$runtime_expectation_path")" "$runtime_expectation_sha256" \
+    "$(basename "$runtime_validation_path")" "$runtime_validation_sha256" "$runtime_recipe_sha256" "$resource_ceiling_sha256" "$policy_sha256" "$fixed_global_control_baseline" \
+    "$validator_sha256" "$source_manifest_sha256" "$calibration_binary_sha256" "$calibration_output_sha256" \
     >> "$cell_dir/processes.tsv"
   printf 'report_nonce_%s_%s\t%s\n' "$pair" "$executor" "$report_nonce" >> "$cell_dir/metadata.tsv"
+  printf 'policy_sha256_%s_%s\t%s\n' "$pair" "$executor" "$policy_sha256" >> "$cell_dir/metadata.tsv"
+  printf 'resource_ceiling_sha256_%s_%s\t%s\n' "$pair" "$executor" "$resource_ceiling_sha256" >> "$cell_dir/metadata.tsv"
+  printf 'fixed_global_control_baseline_%s_%s\t%s\n' "$pair" "$executor" "$fixed_global_control_baseline" >> "$cell_dir/metadata.tsv"
   printf 'oracle_sha256_%s_%s\t%s\n' "$pair" "$executor" "$process_oracle_digest" >> "$cell_dir/metadata.tsv"
   printf 'shutdown_report_%s_%s\t%s\n' "$pair" "$executor" "$(basename "$shutdown_report")" >> "$cell_dir/metadata.tsv"
   if [[ -f "$ids_report" ]]; then
@@ -902,6 +1150,14 @@ else
   oracle_digest_after=
   baseline_oracle_digest_after=
 fi
+runtime_bindings_sha_after=
+runtime_validator_sha_after=
+if (( qualification_runtime_readback_supported == 1 )); then
+  runtime_bindings_sha_after=$(sha256sum "$runtime_bindings_arg" | awk '{print $1}') || { failed=1; runtime_bindings_sha_after=unavailable; }
+  runtime_validator_sha_after=$(sha256sum "$runtime_validator_arg" | awk '{print $1}') || { failed=1; runtime_validator_sha_after=unavailable; }
+  [[ "$runtime_bindings_sha_after" == "$runtime_bindings_sha_expected" && "$runtime_validator_sha_after" == "$runtime_validator_sha_expected" ]] || failed=1
+  verify_runtime_inputs || failed=1
+fi
 {
   printf 'source_tree_sha256_before\t%s\n' "$source_digest"
   printf 'source_tree_sha256_after\t%s\n' "$source_digest_after"
@@ -913,6 +1169,8 @@ fi
   printf 'oracle_sha256_after\t%s\n' "$oracle_digest_after"
   printf 'baseline_oracle_sha256_before\t%s\n' "$baseline_oracle_digest_actual"
   printf 'baseline_oracle_sha256_after\t%s\n' "$baseline_oracle_digest_after"
+  printf 'runtime_bindings_sha256_after\t%s\n' "$runtime_bindings_sha_after"
+  printf 'runtime_validator_sha256_after\t%s\n' "$runtime_validator_sha_after"
 } >> "$cell_dir/metadata.tsv"
 [[ $(awk -F '\t' '$1=="source_tree_sha256_before"{b=$2} $1=="source_tree_sha256_after"{a=$2} END{print (b==a)?"same":"changed"}' "$cell_dir/metadata.tsv") == same ]] || failed=1
 [[ "$binary_digest" == "$binary_digest_after" ]] || failed=1

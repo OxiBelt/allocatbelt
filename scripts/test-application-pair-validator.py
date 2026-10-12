@@ -39,6 +39,14 @@ def runner_header() -> list[str]:
     return match.group(1).split("\t")
 
 
+def runner_process_header() -> list[str]:
+    source = RUNNER.read_text(encoding="utf-8")
+    match = re.search(r"^printf 'pair\\t(.*?)\\n' > \"\$cell_dir/processes.tsv\"$", source, flags=re.MULTILINE)
+    if match is None:
+        raise AssertionError("could not extract the per-process readback ledger header")
+    return ["pair", *match.group(1).split(r"\t")]
+
+
 class ApplicationPairValidatorTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory(prefix="app-pair-validator-")
@@ -113,6 +121,29 @@ class ApplicationPairValidatorTests(unittest.TestCase):
         result = subprocess.run(arguments, check=False, capture_output=True, text=True)
         self.assertEqual(result.returncode, 2)
         self.assertIn("external-pressure timing is hard-disabled", result.stderr)
+
+    def test_environment_cannot_enable_qualification_and_process_ledger_pins_readback_artifacts(self) -> None:
+        arguments = [
+            str(RUNNER), "/missing/candidate", "allocatbelt", "cpu", "capacity", "-", "0",
+            "guard-pair-1", str(self.directory), "5000", "300", "300", "60", "1200", "", "",
+            "steady", "matched",
+        ]
+        environment = os.environ.copy()
+        environment["qualification_runtime_readback_supported"] = "1"
+        result = subprocess.run(arguments, check=False, capture_output=True, text=True, env=environment)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("qualification timing is hard-disabled", result.stderr)
+        self.assertEqual(
+            runner_process_header(),
+            [
+                "pair", "executor", "allocator", "exit_code", "row_validation", "p99_qualification", "argv",
+                "stdout", "time_report", "ids_sha256", "shutdown_sha256", "capacity_family_sha256", "stdout_sha256",
+                "runtime_readback", "runtime_readback_sha256", "runtime_expectation", "runtime_expectation_sha256",
+                "runtime_validation", "runtime_validation_sha256", "runtime_recipe_sha256", "resource_ceiling_sha256",
+                "policy_sha256", "fixed_global_control_baseline", "validator_sha256", "source_manifest_sha256",
+                "calibration_binary_sha256", "calibration_output_sha256",
+            ],
+        )
 
     def test_gnu_timeout_foreground_keeps_term_ignoring_binary_in_controller_group(self) -> None:
         with tempfile.TemporaryDirectory(prefix="application-timeout-group-") as temporary:

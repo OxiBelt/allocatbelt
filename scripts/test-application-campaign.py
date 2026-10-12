@@ -6,14 +6,18 @@ from __future__ import annotations
 import importlib.machinery
 import importlib.util
 import contextlib
+import copy
 import io
 import math
+import os
+import py_compile
 import random
 import subprocess
 import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 from pathlib import Path
 
 
@@ -28,11 +32,20 @@ LOADER.exec_module(campaign)
 def source_for(host_id: str) -> dict:
     file_sha = "1" * 64
     soak_sha = "b" * 64
+    validator_path = campaign.RUNTIME_VALIDATOR_RELATIVE_PATH
+    validator_sha = campaign.hashlib.sha256((SCRIPT.parent / "application-runtime-readback.py").read_bytes()).hexdigest()
+    files = [
+        {"path": "Cargo.lock", "sha256": file_sha, "size": 1},
+        {"path": "scripts/run-application-soak.sh", "sha256": soak_sha, "size": 1},
+        {"path": validator_path, "sha256": validator_sha, "size": (SCRIPT.parent / "application-runtime-readback.py").stat().st_size},
+    ]
     source = {
         "git_commit": "a" * 40,
-        "source_tree_sha256": campaign.hashlib.sha256(f"{file_sha}  Cargo.lock\n{soak_sha}  scripts/run-application-soak.sh\n".encode()).hexdigest(),
+        "source_tree_sha256": campaign.hashlib.sha256(
+            "".join(f"{item['sha256']}  {item['path']}\n" for item in sorted(files, key=lambda item: item["path"])).encode()
+        ).hexdigest(),
         "cargo_lock_sha256": file_sha,
-        "files": [{"path": "Cargo.lock", "sha256": file_sha, "size": 1}, {"path": "scripts/run-application-soak.sh", "sha256": soak_sha, "size": 1}],
+        "files": sorted(files, key=lambda item: item["path"]),
     }
     build = {
         "host_id": host_id,
@@ -47,13 +60,107 @@ def source_for(host_id: str) -> dict:
     }
     artifacts = {name: {"path": f"bin/{name}", "sha256": str(index + 1) * 64} for index, name in enumerate(campaign.ALLOCATORS)}
     soak_artifacts = {name: {"path": f"bin/soak-{name}", "sha256": str(index + 5) * 64} for index, name in enumerate(campaign.ALLOCATORS)}
+    build_sha = campaign.digest_object(build)
+    calibration_record = {
+        "schema": campaign.CALIBRATION_SCHEMA,
+        "architecture": "x86_64",
+        "max_tenants": 1,
+        "max_waiters": 256,
+        "control_ceiling": 67_108_864,
+        "fixed_global_control_baseline": 2048,
+        "tenant_owner_control_bytes": 0,
+        "final_live_tenants": 0,
+        "final_global_control_bytes": 2048,
+    }
+    calibration = {
+        "binary": {"path": "bin/bench-resource-domain-calibration", "sha256": "d" * 64},
+        "output": {"path": "calibration/resource-domain-calibration.json", "sha256": "e" * 64},
+        "record": calibration_record,
+        "source": {key: source[key] for key in ("git_commit", "source_tree_sha256", "cargo_lock_sha256")},
+        "build": build,
+        "build_sha256": build_sha,
+    }
     result = {
         "schema": campaign.SOURCE_SCHEMA, "source": source, "build": build,
         "artifacts": artifacts, "soak_artifacts": soak_artifacts,
         "analysis_artifact": {"path": "bin/application-analyze", "sha256": "c" * 64},
+        "fixed_runtime_policy": campaign.fixed_runtime_policy_artifact(),
+        "runtime_readback_validator": {"path": validator_path, "sha256": validator_sha},
+        "resource_domain_calibration": calibration,
     }
     result["manifest_sha256"] = campaign.digest_object(result)
     return result
+
+
+def runtime_fixture_for(binding: dict, source: dict, include_artifacts: bool = False) -> dict:
+    module = campaign.runtime_readback_module()
+    expected = module.build_fixed_expectation(binding["recipe"])
+    contract = expected["contract"]
+    fields = module._expectation_rows(expected)
+    baseline = source["resource_domain_calibration"]["record"]["fixed_global_control_baseline"]
+    setup_control = baseline + 4096
+    fields["configuration.setup_global_control"] = str(setup_control)
+    for stage in module.STAGES:
+        for owner in module.OWNERS:
+            for dimension, ceiling in contract["ceilings"].items():
+                fields[f"{stage}.{owner}.ceiling.{dimension}"] = str(ceiling)
+                fields[f"{stage}.{owner}.limit.{dimension}"] = str(ceiling)
+                used = (setup_control if owner == "global" else 1024) if dimension == "control" else 0
+                fields[f"{stage}.{owner}.used.{dimension}"] = str(used)
+            fields[f"{stage}.{owner}.live_tenants"] = "1"
+        for name, value in contract["scope_limits"].items():
+            fields[f"{stage}.scope.{name}"] = str(value)
+        for name in ("managed_memory", "disk_operations", "network_operations"):
+            fields[f"{stage}.scope.{name}_used"] = "0"
+        for direction, bucket in contract["byte_buckets"].items():
+            for name, value in (
+                ("bytes_per_second", bucket["bytes_per_second"]),
+                ("ceiling_bytes_per_second", bucket["ceiling_bytes_per_second"]),
+                ("burst_bytes", bucket["burst_bytes"]),
+                ("ceiling_burst_bytes", bucket["ceiling_burst_bytes"]),
+                ("available_bytes", bucket["burst_bytes"] if stage == "setup" else 0),
+                ("reserved_bytes", 0), ("reservations", 0),
+                ("max_reservations", bucket["max_reservations"]),
+            ):
+                fields[f"{stage}.io.{direction}_{name}"] = str(value)
+    fields.update({
+        "after_release.global.live_tenants": "0",
+        "after_release.global.used.control": str(baseline),
+        "after_release.expected_global_control_baseline": str(baseline),
+        "after_release.control_matches_fixed_baseline": "true",
+    })
+    validation = module.validate_runtime_readback(fields, expected)
+    receipt_text = f"schema\t{module.SCHEMA}\n" + "".join(
+        f"{key}\t{value}\n" for key, value in sorted(fields.items())
+    )
+    calibration = source["resource_domain_calibration"]
+    runtime_readback = {
+        "schema": "allocatbelt.application-runtime-readback-process.v1",
+        "pair": binding["pair"],
+        "executor": binding["executor"],
+        "allocator": binding["allocator"],
+        "report_nonce": binding["report_nonce"],
+        "comparison_family": "fixed_policy",
+        "resource_ceiling_sha256": binding["resource_ceiling_sha256"],
+        "policy_sha256": binding["policy_sha256"],
+        "fixed_global_control_baseline": baseline,
+        "source_manifest_sha256": source["manifest_sha256"],
+        "calibration_binary_sha256": calibration["binary"]["sha256"],
+        "calibration_output_sha256": calibration["output"]["sha256"],
+        "validator_sha256": source["runtime_readback_validator"]["sha256"],
+        "runtime_readback_sha256": campaign.hashlib.sha256(receipt_text.encode()).hexdigest(),
+        "output_sha256": "5" * 64,
+        "runtime_expectation_sha256": binding["expectation_sha256"],
+        "runtime_validation_sha256": campaign.hashlib.sha256(campaign.canonical_bytes(validation)).hexdigest(),
+        "runtime_recipe_sha256": binding["recipe_sha256"],
+        "numeric_snapshot": campaign.numeric_runtime_snapshot(fields, expected),
+    }
+    metric = {
+        "executor": binding["executor"],
+        "allocator": binding["allocator"],
+        "runtime_readback": runtime_readback,
+    }
+    return (metric, fields, expected, validation, receipt_text) if include_artifacts else metric
 
 
 def spec_fixture() -> tuple[dict, dict[str, dict]]:
@@ -85,13 +192,20 @@ def spec_fixture() -> tuple[dict, dict[str, dict]]:
         })
         sources[host_id] = source_for(host_id)
         source_refs.append({"host_id": host_id, "relative_path": f"source/{host_id}.json", "sha256": sources[host_id]["manifest_sha256"]})
-    resource_limits = {"managed_bytes": 1_000_000, "disk_ops": 16, "network_ops": 16, "tasks": 17, "cpu_charges": 17}
-    resource_ceiling_sha256 = campaign.hashlib.sha256(campaign.canonical_bytes(resource_limits)).hexdigest()
-    cells = [
-        {"family": family, "workload": workload, "profile": profile, "arrivals": 400_000 if workload == "mixed" else 100_000,
-         "async_workers": 2 if profile == "oversubscribed" else 4, "resource_limits": resource_limits, "resource_ceiling_sha256": resource_ceiling_sha256, "capacity_horizon_seconds": 30}
-        for family, workload, profile in sorted(campaign.expected_profile_cells())
-    ]
+    cells = []
+    validator_sha = sources["host-1"]["runtime_readback_validator"]["sha256"]
+    for family, workload, profile in sorted(campaign.expected_profile_cells()):
+        resource_limits = campaign.fixed_resource_limits_for_cell(workload, profile, validator_sha)
+        cells.append({
+            "family": family,
+            "workload": workload,
+            "profile": profile,
+            "arrivals": 400_000 if workload == "mixed" else 100_000,
+            "async_workers": 2 if profile == "oversubscribed" else 4,
+            "resource_limits": resource_limits,
+            "resource_ceiling_sha256": campaign.hashlib.sha256(campaign.canonical_bytes(resource_limits)).hexdigest(),
+            "capacity_horizon_seconds": 30,
+        })
     spec = {
         "schema": campaign.SPEC_SCHEMA,
         "campaign_id": "campaign-v1",
@@ -133,7 +247,7 @@ def spec_fixture() -> tuple[dict, dict[str, dict]]:
         },
         "runtime_binding": {
             "resource_domain": "pending",
-            "resource_policy_sha256": "9" * 64,
+            "resource_policy_sha256": sources["host-1"]["fixed_runtime_policy"]["policy_sha256"],
             "feedback_policy_sha256": "a" * 64,
             "feedback_match": "fixed_same_policy",
             "source_state": "pending",
@@ -161,6 +275,168 @@ def add_frozen_rates(spec: dict, include_oracles: bool) -> None:
 
 
 class ApplicationCampaignTests(unittest.TestCase):
+    def test_validator_loader_compiles_pinned_source_and_keys_cache_by_sha(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="application-validator-loader-") as temporary:
+            root = Path(temporary)
+            campaign_path = root / "application-campaign.py"
+            campaign_path.write_text("# test module anchor\n", encoding="utf-8")
+            validator_path = root / "application-runtime-readback.py"
+            base = (SCRIPT.parent / "application-runtime-readback.py").read_bytes()
+            stale_source = base + b"\nSOURCE_MARKER = 'stale'\n"
+            validator_path.write_bytes(stale_source)
+            py_compile.compile(
+                str(validator_path), doraise=True,
+                invalidation_mode=py_compile.PycInvalidationMode.TIMESTAMP,
+            )
+            compiled_stat = validator_path.stat()
+            first_source = base + b"\nSOURCE_MARKER = 'first'\n"
+            self.assertEqual(len(first_source), len(stale_source))
+            validator_path.write_bytes(first_source)
+            os.utime(validator_path, ns=(compiled_stat.st_atime_ns, compiled_stat.st_mtime_ns))
+            first_sha = campaign.hashlib.sha256(first_source).hexdigest()
+            second_source = base + b"\nSOURCE_MARKER = 'other'\n"
+            second_sha = campaign.hashlib.sha256(second_source).hexdigest()
+            original_file = campaign.__file__
+            original_cache = campaign._RUNTIME_READBACK_MODULE_CACHE.copy()
+            campaign.__file__ = str(campaign_path)
+            campaign._RUNTIME_READBACK_MODULE_CACHE.clear()
+            try:
+                first = campaign.runtime_readback_module(first_sha)
+                self.assertEqual(first.SOURCE_MARKER, "first")
+                validator_path.write_bytes(second_source)
+                second = campaign.runtime_readback_module(second_sha)
+                self.assertEqual(second.SOURCE_MARKER, "other")
+                self.assertIsNot(first, second)
+                self.assertIs(campaign._RUNTIME_READBACK_MODULE_CACHE[first_sha], first)
+                with self.assertRaisesRegex(campaign.CampaignError, "frozen SHA-256"):
+                    campaign.runtime_readback_module(first_sha)
+                with self.assertRaisesRegex(campaign.CampaignError, "frozen SHA-256"):
+                    campaign.runtime_readback_module("0" * 64)
+            finally:
+                campaign.__file__ = original_file
+                campaign._RUNTIME_READBACK_MODULE_CACHE.clear()
+                campaign._RUNTIME_READBACK_MODULE_CACHE.update(original_cache)
+
+    def test_source_v3_binds_numeric_policy_validator_and_independent_calibration(self) -> None:
+        source = source_for("host-1")
+        campaign.verify_source_manifest(source, verify_artifacts=False)
+        self.assertEqual(source["schema"], "allocatbelt.application-source-manifest.v3")
+        self.assertEqual(source["fixed_runtime_policy"]["policy"]["byte_buckets"]["disk"]["bytes_per_second"], 17_179_869_184)
+        self.assertEqual(source["fixed_runtime_policy"]["policy"]["byte_buckets"]["disk"]["burst_bytes"], 65_536)
+        self.assertEqual(source["fixed_runtime_policy"]["policy"]["byte_buckets"]["disk"]["max_reservations"], 64)
+        calibration = source["resource_domain_calibration"]
+        self.assertEqual(calibration["record"]["max_tenants"], 1)
+        self.assertEqual(calibration["record"]["max_waiters"], 256)
+        self.assertEqual(calibration["record"]["control_ceiling"], 67_108_864)
+        self.assertEqual(calibration["record"]["final_live_tenants"], 0)
+        self.assertGreater(calibration["record"]["fixed_global_control_baseline"], 0)
+
+        # Rebuild each tampered manifest digest so validation reaches the
+        # semantic numeric checks instead of stopping at the outer hash.
+        for mutation in (
+            lambda value: value["fixed_runtime_policy"]["policy"]["byte_buckets"]["disk"].update(burst_bytes=1),
+            lambda value: value["resource_domain_calibration"]["record"].update(max_waiters=257),
+            lambda value: value["resource_domain_calibration"]["record"].update(final_global_control_bytes=0),
+        ):
+            damaged = copy.deepcopy(source)
+            mutation(damaged)
+            damaged["manifest_sha256"] = campaign.digest_object(damaged)
+            with self.assertRaises(campaign.CampaignError):
+                campaign.verify_source_manifest(damaged, verify_artifacts=False)
+
+    def test_rehashed_numeric_policy_rejects_float_bool_and_negative_values(self) -> None:
+        mutations = (
+            lambda policy: policy["workloads"]["cpu"]["domain_ceiling"].update(memory=0.0),
+            lambda policy: policy["workloads"]["cpu"]["domain_ceiling"].update(memory=False),
+            lambda policy: policy.update(task_ceiling=-1),
+        )
+        for mutate in mutations:
+            damaged = source_for("host-1")
+            policy = damaged["fixed_runtime_policy"]["policy"]
+            mutate(policy)
+            damaged["fixed_runtime_policy"]["policy_sha256"] = campaign.hashlib.sha256(
+                campaign.canonical_bytes(policy)
+            ).hexdigest()
+            damaged["manifest_sha256"] = campaign.digest_object(damaged)
+            with self.subTest(policy=policy), self.assertRaises(campaign.CampaignError):
+                campaign.verify_source_manifest(damaged, verify_artifacts=False)
+
+    def test_rehashed_cell_limits_must_match_fixed_workload_profile_recipe(self) -> None:
+        spec, sources = spec_fixture()
+        campaign.validate_spec(spec, sources)
+        for field, bad_value in (("managed_bytes", 1_000_000), ("tasks", 17), ("cpu_charges", 17)):
+            forged = copy.deepcopy(spec)
+            cell = next(item for item in forged["cells"] if item["family"] == "cpu" and item["profile"] == "steady")
+            cell["resource_limits"][field] = bad_value
+            cell["resource_ceiling_sha256"] = campaign.hashlib.sha256(
+                campaign.canonical_bytes(cell["resource_limits"])
+            ).hexdigest()
+            with self.subTest(field=field), self.assertRaisesRegex(campaign.CampaignError, "numeric resource limits"):
+                campaign.validate_spec(forged, sources)
+
+    def test_frozen_plan_contains_independent_per_process_recipes_and_numeric_baseline(self) -> None:
+        spec, sources = spec_fixture()
+        plan = campaign.freeze_plan(spec, sources)
+        expected_ids = {
+            job["run_id"]
+            for phase in ("exploration", "aa", "confirmation")
+            for job in plan["jobs"][phase]
+        }
+        self.assertEqual(set(plan["runtime_process_bindings"]), expected_ids)
+        for run_id, bindings in plan["runtime_process_bindings"].items():
+            self.assertEqual(len(bindings), 2, run_id)
+            self.assertEqual(len({item["report_nonce"] for item in bindings}), 2, run_id)
+            self.assertTrue(all(item["recipe"]["identity"]["run_id"] == run_id for item in bindings))
+            self.assertTrue(all(item["fixed_global_control_baseline"] == 2048 for item in bindings))
+            self.assertTrue(all(item["policy_sha256"] == spec["runtime_binding"]["resource_policy_sha256"] for item in bindings))
+
+        allocator_job = {
+            "phase": "confirmation", "comparison_family": "fixed_policy", "host_id": "host-1",
+            "run_id": "scheduled-cpu-fixed-01", "family": "cpu", "workload": "cpu",
+            "profile": "steady", "mode": "capacity", "rate_per_second": None,
+            "arrivals": None, "pair_kind": "allocator-match", "comparison_kind": "allocator",
+            "allocator": "allocatbelt", "baseline_allocator": "mimalloc-secure",
+        }
+        pair_bindings = campaign.build_runtime_process_bindings(allocator_job, spec, sources["host-1"])
+        self.assertEqual({item["pair"] for item in pair_bindings}, {"candidate", "baseline"})
+        self.assertEqual({item["allocator"] for item in pair_bindings}, {"allocatbelt", "mimalloc-secure"})
+        self.assertTrue(all(item["recipe"]["fixed_global_control_baseline"] == 2048 for item in pair_bindings))
+
+    def test_complete_three_host_plan_round_trips_all_frozen_bindings(self) -> None:
+        spec, sources = spec_fixture()
+        add_frozen_rates(spec, include_oracles=True)
+        plan = campaign.freeze_plan(spec, sources)
+        self.assertEqual(len(spec["rates"]), 90)
+        self.assertEqual(len(spec["oracles"]), 360)
+        self.assertEqual(len(plan["jobs"]["confirmation"]), 24_300)
+        self.assertEqual(len(plan["jobs"]["pressure"]), 24_300)
+        self.assertEqual(len(plan["jobs"]["exploration"]), 1_080)
+        encoded = campaign.campaign_plan_bytes(plan)
+        print(f"complete_frozen_plan_bytes={len(encoded)}")
+        self.assertGreater(len(encoded), campaign.MAX_SOURCE_MANIFEST_BYTES)
+        with tempfile.TemporaryDirectory(prefix="application-full-plan-roundtrip-") as temporary:
+            plan_path = Path(temporary) / "complete-plan.json"
+            plan_path.write_bytes(encoded)
+            reopened = campaign.read_campaign_plan(plan_path)
+            campaign.verify_plan(reopened, sources["host-1"]["runtime_readback_validator"]["sha256"])
+            self.assertEqual(reopened, plan)
+            self.assertEqual(reopened["runtime_process_bindings"], plan["runtime_process_bindings"])
+
+    def test_pair_argv_carries_the_controller_recipe_manifest_and_numeric_baseline(self) -> None:
+        job = {"allocator": "allocatbelt", "workload": "cpu", "mode": "capacity", "rate_per_second": None, "run_id": "capacity-01", "profile": "steady", "pair_kind": "matched"}
+        argv = campaign.build_pair_runner_argv(
+            Path("runner"), Path("binary"), job, "0-3", Path("result"),
+            {"trace_seconds": 300, "drain_seconds": 300, "shutdown_seconds": 60, "process_seconds": 1200},
+            5000, runtime_bindings=Path("bindings.json"), runtime_bindings_sha256="a" * 64,
+            runtime_validator=Path("application-runtime-readback.py"), runtime_validator_sha256="b" * 64,
+            fixed_global_control_baseline=2048,
+        )
+        self.assertEqual(argv[-10:], [
+            "--runtime-bindings", "bindings.json", "--runtime-bindings-sha256", "a" * 64,
+            "--runtime-validator", "application-runtime-readback.py", "--runtime-validator-sha256", "b" * 64,
+            "--fixed-global-control-baseline", "2048",
+        ])
+
     def test_three_host_manifest_requires_amd64_v3_and_full_family_profile_matrix(self) -> None:
         spec, sources = spec_fixture()
         summary = campaign.validate_spec(spec, sources)
@@ -425,7 +701,9 @@ class ApplicationCampaignTests(unittest.TestCase):
             job = {
                 "run_id": "campaign-host1-cpu-steady-cap-01", "allocator": "allocatbelt",
                 "workload": "cpu", "mode": "capacity", "profile": "steady", "arrivals": None,
-                "rate_per_second": None, "comparison_family": "fixed_policy",
+                "rate_per_second": None, "comparison_family": "fixed_policy", "phase": "aa",
+                "host_id": "host-1", "family": "cpu", "executor": "bounded", "pair_kind": "aa-bounded",
+                "control_id": "bounded-cpu", "ordinal": 1,
             }
             row_header = ("schema allocator executor workload mode async_workers blocking_workers topology logical_window global_task_limit retained_window arrival_rate_per_second requested_arrivals attempted admitted rejected_full rejected_resource completed_on_time completed_late errors cancellations unresolved lost result_digest expected_digest capacity_publications_per_second successful_throughput_through_drain_per_second setup_ns timer_pair_median_ns wall_through_drain_ns drain_tail_ns response_p50_ns response_p95_ns response_p99_ns producer_lateness_mean_ns producer_lateness_max_ns max_observed_managed_bytes retained_managed_bytes managed_limit_bytes disk_limit_ops network_limit_ops final_managed_bytes final_disk_ops final_network_ops rss_before_kib rss_after_drain_kib rss_after_shutdown_kib hwm_before_kib hwm_after_drain_kib hwm_after_shutdown_kib shutdown_ns rejected_logical_window rejected_backend_full").split()
             self.assertEqual(len(row_header), 53)
@@ -437,16 +715,23 @@ class ApplicationCampaignTests(unittest.TestCase):
                 successful_throughput_through_drain_per_second="1",
                 rss_after_drain_kib="100", rss_after_shutdown_kib="100",
             )
-            stdout_path = pair_dir / "left-bounded.stdout.tsv"
+            stdout_path = pair_dir / "bounded-a-bounded.stdout.tsv"
             stdout_path.write_text(
                 "\t".join(row_header) + "\n" + "\t".join(row[name] for name in row_header) + "\n",
                 encoding="utf-8",
             )
-            nonce = "n" * 32
-            (pair_dir / "metadata.tsv").write_text(
-                f"key\tvalue\ncomparison_family\tfixed_policy\nreport_nonce_left_bounded\t{nonce}\n", encoding="utf-8"
-            )
             source = source_for("host-1")
+            spec, _sources = spec_fixture()
+            runtime_binding = campaign.build_runtime_process_bindings(job, spec, source)[0]
+            nonce = runtime_binding["report_nonce"]
+            (pair_dir / "metadata.tsv").write_text(
+                "key\tvalue\n"
+                + f"comparison_family\tfixed_policy\nreport_nonce_bounded-a_bounded\t{nonce}\n"
+                + f"policy_sha256_bounded-a_bounded\t{runtime_binding['policy_sha256']}\n"
+                + f"resource_ceiling_sha256_bounded-a_bounded\t{runtime_binding['resource_ceiling_sha256']}\n"
+                + f"fixed_global_control_baseline_bounded-a_bounded\t{runtime_binding['fixed_global_control_baseline']}\n",
+                encoding="utf-8",
+            )
             binary_sha = source["artifacts"]["allocatbelt"]["sha256"]
             phases = {
                 "production_trace": 30_000_000_000,
@@ -468,18 +753,68 @@ class ApplicationCampaignTests(unittest.TestCase):
                 )
             )
             report.extend(f"phase\t{name}\t{value}" for name, value in phases.items())
-            shutdown_path = pair_dir / "left-bounded.shutdown.tsv"
+            shutdown_path = pair_dir / "bounded-a-bounded.shutdown.tsv"
             shutdown_path.write_text("\n".join(report) + "\n", encoding="utf-8")
+            _metric, runtime_fields, expectation, validation, receipt_text = runtime_fixture_for(
+                runtime_binding, source, include_artifacts=True
+            )
+            runtime_path = pair_dir / "bounded-a-bounded.runtime.tsv"
+            runtime_path.write_text(receipt_text, encoding="utf-8")
+            expectation_path = pair_dir / "bounded-a-bounded.expectation.json"
+            expectation_path.write_bytes(campaign.runtime_readback_module().canonical_bytes(expectation))
+            validation_path = pair_dir / "bounded-a-bounded.validation.json"
+            cli_validation = subprocess.run(
+                [
+                    sys.executable, "-B", str(SCRIPT.parent / "application-runtime-readback.py"),
+                    "--receipt", str(runtime_path), "--expected", str(expectation_path),
+                ],
+                check=False,
+                capture_output=True,
+            )
+            self.assertEqual(cli_validation.returncode, 0, cli_validation.stderr.decode(errors="replace"))
+            self.assertNotEqual(cli_validation.stdout, campaign.canonical_bytes(validation))
+            self.assertIn(b", ", cli_validation.stdout)
+            validation_path.write_bytes(cli_validation.stdout)
             process_row = {
-                "pair": "left", "executor": "bounded", "allocator": "allocatbelt",
+                "pair": "bounded-a", "executor": "bounded", "allocator": "allocatbelt",
                 "stdout": stdout_path.name,
                 "shutdown_sha256": campaign.hashlib.sha256(shutdown_path.read_bytes()).hexdigest(),
                 "capacity_family_sha256": "not_applicable",
+                "stdout_sha256": campaign.sha256_file(stdout_path),
+                "runtime_readback": runtime_path.name,
+                "runtime_readback_sha256": campaign.sha256_file(runtime_path),
+                "runtime_expectation": expectation_path.name,
+                "runtime_expectation_sha256": campaign.sha256_file(expectation_path),
+                "runtime_validation": validation_path.name,
+                "runtime_validation_sha256": campaign.sha256_file(validation_path),
+                "runtime_recipe_sha256": runtime_binding["recipe_sha256"],
+                "resource_ceiling_sha256": runtime_binding["resource_ceiling_sha256"],
+                "policy_sha256": runtime_binding["policy_sha256"],
+                "fixed_global_control_baseline": str(runtime_binding["fixed_global_control_baseline"]),
+                "validator_sha256": source["runtime_readback_validator"]["sha256"],
+                "source_manifest_sha256": source["manifest_sha256"],
+                "calibration_binary_sha256": source["resource_domain_calibration"]["binary"]["sha256"],
+                "calibration_output_sha256": source["resource_domain_calibration"]["output"]["sha256"],
             }
-            metrics = campaign.extract_process_metrics(pair_dir, process_row, job, source, spec_fixture()[0], Path(temporary))
+            read_artifact = campaign.process_artifact_bytes
+            def mutate_stdout_after_snapshot(*arguments, **keywords):
+                result = read_artifact(*arguments, **keywords)
+                if arguments[2] == "stdout":
+                    path, _raw, _digest = result
+                    forged_row = dict(row)
+                    forged_row["capacity_publications_per_second"] = "999"
+                    path.write_text(
+                        "\t".join(row_header) + "\n" + "\t".join(forged_row[name] for name in row_header) + "\n",
+                        encoding="utf-8",
+                    )
+                return result
+            with mock.patch.object(campaign, "process_artifact_bytes", side_effect=mutate_stdout_after_snapshot):
+                metrics = campaign.extract_process_metrics(pair_dir, process_row, job, source, spec, Path(temporary))
             self.assertEqual(metrics["completed"], 1)
             self.assertEqual(metrics["cpu_ns_per_completion"], 200)
             self.assertAlmostEqual(metrics["capacity_per_second"], 1 / 30)
+            self.assertNotEqual(campaign.sha256_file(stdout_path), process_row["stdout_sha256"])
+            self.assertEqual(metrics["runtime_readback"]["numeric_snapshot"]["after_release"]["global_live_tenants"], 0)
 
     def test_public_analyzer_constructs_all_capacity_and_latency_suite_endpoints(self) -> None:
         spec, _sources = spec_fixture()
@@ -568,9 +903,15 @@ class ApplicationCampaignTests(unittest.TestCase):
             spec, sources = spec_fixture()
             spec["cells"] = [{
                 "family": "cpu", "workload": "cpu", "profile": "steady", "arrivals": 2,
-                "async_workers": 4, "resource_limits": {"managed_bytes": 0, "disk_ops": 8, "network_ops": 8, "tasks": 8, "cpu_charges": 8},
+                "async_workers": 4,
+                "resource_limits": campaign.fixed_resource_limits_for_cell(
+                    "cpu", "steady", sources["host-1"]["runtime_readback_validator"]["sha256"]
+                ),
                 "resource_ceiling_sha256": "0" * 64, "capacity_horizon_seconds": 30,
             }]
+            spec["cells"][0]["resource_ceiling_sha256"] = campaign.hashlib.sha256(
+                campaign.canonical_bytes(spec["cells"][0]["resource_limits"])
+            ).hexdigest()
             spec["rates"] = [{
                 "host_id": "host-1", "family": "cpu", "profile": "steady", "load_percent": 70,
                 "arrivals_per_second": 2, "pilot_manifest_sha256": "d" * 64,
@@ -700,35 +1041,181 @@ class ApplicationCampaignTests(unittest.TestCase):
             self.assertEqual(oracle_map["allocatbelt"], job["oracle"])
 
     def test_pressure_predecessor_requires_successful_fixed_readback_receipt(self) -> None:
-        spec, _sources = spec_fixture()
+        spec, sources = spec_fixture()
+        source = sources["host-1"]
         fixed_job = {
             "run_id": "fixed-01", "host_id": "host-1", "family": "cpu", "profile": "steady",
             "mode": "capacity", "load_percent": None, "comparison_kind": "allocator",
             "baseline_allocator": "mimalloc-secure", "allocator": "allocatbelt",
             "pair_kind": "allocator-match", "ordinal": 1, "comparison_family": "fixed_policy",
+            "phase": "confirmation", "workload": "cpu", "rate_per_second": None, "arrivals": None,
         }
         pressure_job = {**fixed_job, "run_id": "pressure-01", "phase": "pressure", "comparison_family": "external_pressure", "pair_kind": "pressure-allocator-match"}
         missing = {"state": "valid_pair", "job": fixed_job, "process_metrics": [{}, {}]}
-        with self.assertRaisesRegex(campaign.CampaignError, "runtime readback"):
-            campaign.fixed_pressure_predecessor_receipt(pressure_job, missing, spec)
-        runtime_readback = {
-            "schema": "allocatbelt.application-runtime-readback.v1",
-            "comparison_family": "fixed_policy", "resource_domain": "owning_global_tenant",
-            "feedback_policy_sha256": spec["runtime_binding"]["feedback_policy_sha256"],
-            "resource_ceiling_sha256": next(cell["resource_ceiling_sha256"] for cell in spec["cells"] if cell["family"] == "cpu" and cell["profile"] == "steady"),
-            "live_usage_sha256": "1" * 64, "readback_sha256": "2" * 64, "receipt_sha256": "3" * 64,
-        }
-        good = {**missing, "process_metrics": [{"runtime_readback": runtime_readback.copy()}, {"runtime_readback": runtime_readback.copy()}]}
-        receipt = campaign.fixed_pressure_predecessor_receipt(pressure_job, good, spec)
+        with self.assertRaisesRegex(campaign.CampaignError, "exact unique scheduled"):
+            campaign.fixed_pressure_predecessor_receipt(pressure_job, missing, spec, source)
+        bindings = campaign.build_runtime_process_bindings(fixed_job, spec, source)
+        good = {**missing, "process_metrics": [runtime_fixture_for(binding, source) for binding in bindings]}
+        receipt = campaign.fixed_pressure_predecessor_receipt(pressure_job, good, spec, source)
         self.assertEqual(receipt["run_id"], "fixed-01")
-        self.assertEqual(receipt["readback_receipt_sha256s"], ["3" * 64, "3" * 64])
+        self.assertEqual(receipt["schema"], "allocatbelt.application-fixed-policy-predecessor.v2")
+        self.assertEqual(len(receipt["readback_snapshots"]), 2)
+        self.assertTrue(all(isinstance(item["numeric_snapshot"]["stages"]["setup"]["global"]["used"]["control"], int) for item in receipt["readback_snapshots"]))
+        self.assertEqual(receipt["calibration"]["fixed_global_control_baseline"], 2048)
         self.assertTrue(campaign.is_sha256(receipt["receipt_sha256"]))
         pressure_job["predecessor_run_ids"] = ["fixed-01"]
         pressure_record = {"state": "valid_pair", "job": pressure_job, "predecessor_receipts": [receipt]}
-        campaign.validate_pressure_predecessor_receipts([pressure_record], [good], spec)
+        campaign.validate_pressure_predecessor_receipts([pressure_record], [good], spec, source)
         tampered = {**pressure_record, "predecessor_receipts": [{**receipt, "record_sha256": "f" * 64}]}
         with self.assertRaises(campaign.CampaignError):
-            campaign.validate_pressure_predecessor_receipts([tampered], [good], spec)
+            campaign.validate_pressure_predecessor_receipts([tampered], [good], spec, source)
+        for invalid in (False, 1.0, -1):
+            tampered_numeric = copy.deepcopy(pressure_record)
+            tampered_numeric["predecessor_receipts"][0]["readback_snapshots"][0]["numeric_snapshot"]["stages"]["setup"]["global"]["used"]["cpu"] = invalid
+            with self.subTest(predecessor_value=invalid), self.assertRaises(campaign.CampaignError):
+                campaign.validate_pressure_predecessor_receipts([tampered_numeric], [good], spec, source)
+        forged = copy.deepcopy(good)
+        forged["process_metrics"][0]["runtime_readback"]["numeric_snapshot"]["stages"]["setup"]["global"]["limit"]["cpu"] += 1
+        with self.assertRaises(campaign.CampaignError):
+            campaign.fixed_pressure_predecessor_receipt(pressure_job, forged, spec, source)
+        for invalid in (True, 1.0, -1):
+            malformed = copy.deepcopy(good)
+            malformed["process_metrics"][0]["runtime_readback"]["numeric_snapshot"]["stages"]["setup"]["global"]["used"]["cpu"] = invalid
+            with self.subTest(snapshot_value=invalid), self.assertRaises(campaign.CampaignError):
+                campaign.fixed_pressure_predecessor_receipt(pressure_job, malformed, spec, source)
+        lost_baseline = copy.deepcopy(good)
+        lost_baseline["process_metrics"][0]["runtime_readback"]["numeric_snapshot"]["stages"]["after_drain"]["global"]["used"]["control"] = 0
+        with self.assertRaisesRegex(campaign.CampaignError, "global Control lost"):
+            campaign.fixed_pressure_predecessor_receipt(pressure_job, lost_baseline, spec, source)
+        incomplete_join = copy.deepcopy(good)
+        incomplete_join["process_metrics"][0]["runtime_readback"]["numeric_snapshot"]["stages"]["after_shutdown"]["tenant"]["used"]["control"] = 8192
+        with self.assertRaisesRegex(campaign.CampaignError, "joined global Control"):
+            campaign.fixed_pressure_predecessor_receipt(pressure_job, incomplete_join, spec, source)
+
+    def test_exact_process_descriptor_set_rejects_replayed_and_missing_aa_rows(self) -> None:
+        spec, sources = spec_fixture()
+        source = sources["host-1"]
+        job = {
+            "phase": "aa", "comparison_family": "fixed_policy", "host_id": "host-1",
+            "run_id": "aa-descriptor-01", "family": "cpu", "workload": "cpu",
+            "profile": "steady", "mode": "capacity", "rate_per_second": None,
+            "arrivals": None, "executor": "bounded", "allocator": "allocatbelt",
+            "pair_kind": "aa-bounded", "control_id": "aa-bounded-cpu", "ordinal": 1,
+        }
+        planned = campaign.process_descriptors(job)
+        campaign.require_exact_pair_process_rows(planned, job)
+        with self.assertRaisesRegex(campaign.CampaignError, "exact unique scheduled"):
+            campaign.require_exact_pair_process_rows([planned[0], planned[0]], job)
+        with self.assertRaisesRegex(campaign.CampaignError, "exact unique scheduled"):
+            campaign.require_exact_pair_process_rows([planned[0]], job)
+
+        with tempfile.TemporaryDirectory(prefix="application-revalidate-process-set-") as temporary:
+            ledger_root = Path(temporary)
+            pair_dir = ledger_root / "pair"
+            pair_dir.mkdir()
+            bindings = campaign.build_runtime_process_bindings(job, spec, source)
+            binding_path = ledger_root / "runtime-bindings.json"
+            binding_sha = campaign.write_runtime_binding_manifest(binding_path, bindings, job, spec, source)
+            rows = []
+            for descriptor in (planned[0], planned[0]):
+                row = {name: "" for name in campaign.PAIR_PROCESS_HEADER}
+                row.update({**descriptor, "exit_code": "0", "row_validation": "valid"})
+                rows.append(row)
+            (pair_dir / "processes.tsv").write_text(
+                "\t".join(campaign.PAIR_PROCESS_HEADER) + "\n"
+                + "".join("\t".join(row[name] for name in campaign.PAIR_PROCESS_HEADER) + "\n" for row in rows),
+                encoding="utf-8",
+            )
+            record = {
+                "runner_sha256_before": spec["runner_sha256"],
+                "runner_sha256_after": spec["runner_sha256"],
+                "job": job,
+                "runtime_binding_manifest": binding_path.name,
+                "runtime_binding_manifest_sha256": binding_sha,
+                "runtime_validator_sha256": source["runtime_readback_validator"]["sha256"],
+                "runtime_policy_sha256": source["fixed_runtime_policy"]["policy_sha256"],
+                "calibration_binary_sha256": source["resource_domain_calibration"]["binary"]["sha256"],
+                "calibration_output_sha256": source["resource_domain_calibration"]["output"]["sha256"],
+                "fixed_global_control_baseline": source["resource_domain_calibration"]["record"]["fixed_global_control_baseline"],
+                "pair_directory": "pair",
+            }
+            with self.assertRaisesRegex(campaign.CampaignError, "exact unique scheduled"):
+                campaign.revalidate_pair_records([record], "aa", ledger_root, source, spec, ledger_root)
+
+    def test_analyze_cli_pins_source_manifest_before_independent_revalidation(self) -> None:
+        spec, sources = spec_fixture()
+        source = sources["host-1"]
+        with tempfile.TemporaryDirectory(prefix="application-analyze-cli-source-pin-") as temporary:
+            root = Path(temporary)
+            spec_directory = root / "spec"
+            source_manifest_path = spec_directory / "source" / "host-1.json"
+            source_manifest_path.parent.mkdir(parents=True)
+            source_manifest_path.write_bytes(campaign.canonical_bytes(source))
+            pair_runner = root / "run-application-pair.sh"
+            pair_runner.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            pair_runner.chmod(0o755)
+            spec["runner_sha256"] = campaign.sha256_file(pair_runner)
+            analysis_script = root / "analyze.py"
+            analysis_script.write_text("# pinned analysis adapter\n", encoding="utf-8")
+            spec["phase_adapters"]["simultaneous_analysis_sha256"] = campaign.hashlib.sha256(
+                analysis_script.read_bytes()
+            ).hexdigest()
+            spec_path = spec_directory / "campaign.json"
+            spec_path.write_bytes(campaign.canonical_bytes(spec))
+            plan = campaign.freeze_plan(spec, sources)
+            plan_path = root / "plan.json"
+            plan_path.write_bytes(campaign.canonical_bytes(plan))
+            output_root = root / "output"
+            output_root.mkdir()
+            artifacts_root = root / "campaign-artifacts"
+            artifacts_root.mkdir()
+            source_root = root / "source-checkout"
+            (source_root / "bin").mkdir(parents=True)
+            analysis_binary = source_root / source["analysis_artifact"]["path"]
+            analysis_binary.write_bytes(b"not used by the patched analyzer")
+            output_path = root / "analysis.json"
+            revalidated_source_hashes = []
+            original_revalidate = campaign.revalidate_pair_records
+            original_verify_source = campaign.verify_source_manifest
+            original_sha256 = campaign.sha256_file
+
+            def record_revalidation(*arguments, **keywords):
+                revalidated_source_hashes.append(arguments[6] if len(arguments) > 6 else keywords.get("source_manifest_file_sha256"))
+                return original_revalidate(*arguments, **keywords)
+
+            def verify_source(manifest, live_root=None, verify_artifacts=True, timeout_seconds=120.0):
+                if live_root is not None:
+                    return None
+                return original_verify_source(manifest, live_root, verify_artifacts, timeout_seconds)
+
+            def pinned_sha(path):
+                if Path(path) == analysis_binary:
+                    return source["analysis_artifact"]["sha256"]
+                return original_sha256(path)
+
+            arguments = [
+                "analyze", "--spec", str(spec_path), "--plan", str(plan_path),
+                "--host-id", "host-1", "--output-root", str(output_root),
+                "--source-root", str(source_root), "--campaign-artifacts", str(artifacts_root),
+                "--pair-runner", str(pair_runner), "--analysis-script", str(analysis_script),
+                "--stage", "fixed_pre_pressure", "--output", str(output_path),
+            ]
+            with (
+                mock.patch.object(campaign, "load_source_manifests", return_value=sources),
+                mock.patch.object(campaign, "read_ledger", return_value=[]),
+                mock.patch.object(campaign, "validate_phase_ledger"),
+                mock.patch.object(campaign, "validate_aa_records", return_value={"passed": False}),
+                mock.patch.object(campaign, "analyze_confirmation_host_gated", return_value={"passed": False, "comparison_family": "fixed_policy", "family_size": 0}),
+                mock.patch.object(campaign, "revalidate_pair_records", side_effect=record_revalidation),
+                mock.patch.object(campaign, "verify_source_manifest", side_effect=verify_source),
+                mock.patch.object(campaign, "sha256_file", side_effect=pinned_sha),
+            ):
+                result = campaign.main(arguments)
+            self.assertEqual(result, 1)
+            self.assertGreaterEqual(len(revalidated_source_hashes), 2)
+            expected_manifest_file_sha = campaign.hashlib.sha256(source_manifest_path.read_bytes()).hexdigest()
+            self.assertEqual(revalidated_source_hashes, [expected_manifest_file_sha, expected_manifest_file_sha])
+            self.assertTrue(output_path.is_file())
 
     def test_pair_failures_are_retained_but_refusals_and_interruptions_halt(self) -> None:
         self.assertEqual(campaign.pair_exit_disposition(0), ("valid_pair", False))
