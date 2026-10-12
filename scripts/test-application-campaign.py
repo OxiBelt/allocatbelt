@@ -275,6 +275,25 @@ def add_frozen_rates(spec: dict, include_oracles: bool) -> None:
 
 
 class ApplicationCampaignTests(unittest.TestCase):
+    def test_qualification_metadata_rejects_functional_missing_and_duplicate_scope(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="application-scope-") as temporary:
+            pair_dir = Path(temporary)
+            path = pair_dir / "metadata.tsv"
+            for content in (
+                "key\tvalue\nexecution_scope\tfunctional_only\n",
+                "key\tvalue\ncomparison_family\tfixed_policy\n",
+                "key\tvalue\nexecution_scope\tunknown\n",
+                "key\tvalue\nexecution_scope\tfunctional_only\nexecution_scope\tqualification\n",
+            ):
+                path.write_text(content, encoding="utf-8")
+                with self.subTest(content=content), self.assertRaises(campaign.CampaignError):
+                    campaign.qualification_pair_metadata(pair_dir)
+            raw = b"key\tvalue\nexecution_scope\tqualification\n"
+            path.write_bytes(raw)
+            metadata, digest = campaign.qualification_pair_metadata(pair_dir)
+            self.assertEqual(metadata["execution_scope"], "qualification")
+            self.assertEqual(digest, campaign.hashlib.sha256(raw).hexdigest())
+
     def test_validator_loader_compiles_pinned_source_and_keys_cache_by_sha(self) -> None:
         with tempfile.TemporaryDirectory(prefix="application-validator-loader-") as temporary:
             root = Path(temporary)
@@ -725,7 +744,7 @@ class ApplicationCampaignTests(unittest.TestCase):
             runtime_binding = campaign.build_runtime_process_bindings(job, spec, source)[0]
             nonce = runtime_binding["report_nonce"]
             (pair_dir / "metadata.tsv").write_text(
-                "key\tvalue\n"
+                "key\tvalue\nexecution_scope\tqualification\n"
                 + f"comparison_family\tfixed_policy\nreport_nonce_bounded-a_bounded\t{nonce}\n"
                 + f"policy_sha256_bounded-a_bounded\t{runtime_binding['policy_sha256']}\n"
                 + f"resource_ceiling_sha256_bounded-a_bounded\t{runtime_binding['resource_ceiling_sha256']}\n"

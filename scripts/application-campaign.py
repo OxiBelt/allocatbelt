@@ -2716,6 +2716,18 @@ def validate_runtime_process_artifacts(
     return readback, {"stdout_sha256": stdout_sha, "runtime_readback_sha256": receipt_sha, "stdout_bytes": stdout_raw}
 
 
+def qualification_pair_metadata(pair_dir: Path) -> tuple[dict[str, str], str]:
+    raw, digest = read_stable_bytes(pair_dir / "metadata.tsv", "runner metadata", MAX_READBACK_ARTIFACT_BYTES)
+    header, rows = read_tsv_bytes(raw, "runner metadata")
+    require(header == ["key", "value"], "runner metadata header differs")
+    metadata: dict[str, str] = {}
+    for row in rows:
+        require(row["key"] not in metadata, "runner metadata repeats a key")
+        metadata[row["key"]] = row["value"]
+    require(metadata.get("execution_scope") == "qualification", "runner execution scope is not qualification")
+    return metadata, digest
+
+
 def extract_process_metrics(
     pair_dir: Path,
     process_row: dict[str, str],
@@ -2724,6 +2736,7 @@ def extract_process_metrics(
     spec: dict[str, Any],
     campaign_artifacts: Path,
 ) -> dict[str, Any]:
+    metadata_map, metadata_sha = qualification_pair_metadata(pair_dir)
     process_id = process_row["pair"]
     executor = process_row["executor"]
     require(executor in ("bounded", "tokio"), f"unknown pair executor: {executor}")
@@ -2768,8 +2781,6 @@ def extract_process_metrics(
         elif fields[0] == "phase":
             require(fields[1] not in phases, "phase sidecar repeats phase")
             phases[fields[1]] = parse_uint(fields[2], fields[1])
-    _, metadata_rows = read_tsv(pair_dir / "metadata.tsv")
-    metadata_map = {item["key"]: item["value"] for item in metadata_rows}
     require(metadata_map.get("comparison_family") == job["comparison_family"], "runner metadata comparison family differs from the frozen fixed/pressure phase")
     require(metadata_map.get(f"report_nonce_{process_id}_{executor}") == runtime_readback["report_nonce"], "runner nonce differs from the controller-frozen runtime process recipe")
     require(metadata_map.get(f"policy_sha256_{process_id}_{executor}") == runtime_readback["policy_sha256"], "runner metadata policy hash differs from the fixed runtime recipe")
@@ -2809,6 +2820,8 @@ def extract_process_metrics(
         "production_cpu_ended_ns": cpu_ended,
         "production_cpu_ns": cpu_total,
         "phase_sha256": shutdown_sha,
+        "runner_metadata_sha256": metadata_sha,
+        "execution_scope": "qualification",
         "rss_after_drain_kib": numeric_counts["rss_after_drain_kib"],
         "retained_managed_bytes": parse_uint(row["retained_managed_bytes"], "retained managed bytes"),
         "max_observed_managed_bytes": parse_uint(row["max_observed_managed_bytes"], "maximum managed bytes"),
@@ -2863,8 +2876,6 @@ def extract_process_metrics(
         ids_name = stdout_name.removesuffix(".stdout.tsv") + ".ids.tsv"
         ids_path = pair_dir / ids_name
         require(not ids_path.is_symlink() and ids_path.is_file(), "per-ID sidecar is missing or symlinked")
-        _, metadata = read_tsv(pair_dir / "metadata.tsv")
-        metadata_map = {item["key"]: item["value"] for item in metadata}
         nonce = metadata_map.get(f"report_nonce_{process_id}_{executor}")
         expected_binary_sha = source["artifacts"][process_allocator]["sha256"]
         expected_identity = ["identity", nonce, job["run_id"], label, process_allocator, job["workload"], job["profile"], source["source"]["source_tree_sha256"], expected_binary_sha]
