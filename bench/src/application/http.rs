@@ -818,6 +818,9 @@ fn run_tokio(options: Options, settings: Settings, plan: ArrivalPlan) -> Result<
       .await
     })
     .map_err(|error| format!("Tokio accept CPU admission failed: {:?}", error.kind))?;
+  // The wrapper retains its own gate owner; the construction-only clone
+  // must not keep tenant metadata alive past the final cleanup checkpoint.
+  drop(accept_cpu_gate);
   let accept_task = handle.spawn(async move {
     let _accept_slot = accept_slot;
     let _accept_task_owner = accept_task_owner;

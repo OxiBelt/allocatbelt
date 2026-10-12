@@ -1783,15 +1783,21 @@ impl RuntimeBindingWriter {
       "configuration.fixed_global_control_baseline".to_owned(),
       bindings.fixed_global_control_baseline().to_string(),
     )?;
+    let setup_rows = bindings.runtime_rows("setup")?;
+    let setup_control = setup_rows
+      .iter()
+      .find(|(key, _)| key == "setup.global.used.control")
+      .map(|(_, value)| value.clone())
+      .ok_or_else(|| "runtime setup omitted its actual global Control usage".to_owned())?;
     writer.add(
       "configuration.setup_global_control".to_owned(),
-      bindings.setup_global_control_baseline().to_string(),
+      setup_control,
     )?;
     writer.add(
       "configuration.blocking_disk_adapter_constructed".to_owned(),
       bindings.io().has_blocking_disk_byte_io().to_string(),
     )?;
-    for (key, value) in bindings.runtime_rows("setup")? {
+    for (key, value) in setup_rows {
       writer.add(key, value)?;
     }
     Ok(Some(writer))

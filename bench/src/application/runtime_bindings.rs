@@ -131,7 +131,6 @@ impl ApplicationDomain {
       rate_timer_owner: None,
       domain_limits: self.domain_limits,
       fixed_global_control_baseline: self.fixed_global_control_baseline,
-      setup_global_control_baseline: self.domain.snapshot().used.get(DomainResource::Control),
     })
   }
 
@@ -176,7 +175,6 @@ impl ApplicationDomain {
       rate_timer_owner: Some(timer_owner),
       domain_limits: self.domain_limits,
       fixed_global_control_baseline: self.fixed_global_control_baseline,
-      setup_global_control_baseline: self.domain.snapshot().used.get(DomainResource::Control),
     })
   }
 }
@@ -207,7 +205,6 @@ pub(crate) struct ApplicationRunBindings {
   rate_timer_owner: Option<TimerDriver>,
   domain_limits: DomainResources,
   fixed_global_control_baseline: usize,
-  setup_global_control_baseline: usize,
 }
 
 impl ApplicationRunBindings {
@@ -257,10 +254,6 @@ impl ApplicationRunBindings {
 
   pub(crate) fn fixed_global_control_baseline(&self) -> usize {
     self.fixed_global_control_baseline
-  }
-
-  pub(crate) fn setup_global_control_baseline(&self) -> usize {
-    self.setup_global_control_baseline
   }
 
   pub(crate) fn runtime_rows(&self, stage: &str) -> Result<Vec<(String, String)>, String> {
@@ -403,6 +396,18 @@ impl ApplicationIoBindings {
       rows.push((
         format!("{direction}_burst_bytes"),
         snapshot.burst_bytes.to_string(),
+      ));
+      rows.push((
+        format!("{direction}_ceiling_bytes_per_second"),
+        snapshot.ceiling_bytes_per_second.to_string(),
+      ));
+      rows.push((
+        format!("{direction}_ceiling_burst_bytes"),
+        snapshot.ceiling_burst_bytes.to_string(),
+      ));
+      rows.push((
+        format!("{direction}_max_reservations"),
+        snapshot.max_reservations.to_string(),
       ));
       rows.push((
         format!("{direction}_available_bytes"),

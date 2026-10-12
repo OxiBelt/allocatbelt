@@ -254,9 +254,9 @@ validate_output() {
       expected_schema=http-nonblocking-connect-v1
       expected_blocking=1 expected_task_limit=17 expected_managed=141312 expected_network=16
       if [[ "$expected_executor" == allocatbelt ]]; then
-        expected_topology="$expected_async async + 1 reserved blocking worker (unused by HTTP connect) + dedicated reactor; NetHandle::connect_nonblocking"
+        expected_topology="$expected_async async + 1 owning blocking connector + owning reactor; NetHandle::connect_nonblocking"
       else
-        expected_topology="$expected_async async + 1 reserved blocking worker (unused by HTTP connect) + integrated I/O driver; Tokio TcpSocket::connect"
+        expected_topology="$expected_async async + 1 reserved blocking worker (Tokio TcpSocket::connect) + integrated I/O driver"
       fi
       ;;
     disk)
@@ -269,12 +269,12 @@ validate_output() {
       ;;
     mixed)
       expected_schema=mixed-application-v1
-      expected_blocking=$((expected_async + 1)) expected_task_limit=17
+      expected_blocking=$expected_async expected_task_limit=17
       expected_retained=8 expected_managed=1638536 expected_disk=8 expected_network=16
       if [[ "$expected_executor" == allocatbelt ]]; then
-        expected_topology="$expected_async async + 1 connector + $expected_async filesystem workers + dedicated reactor"
+        expected_topology="$expected_async async + $expected_async owning blocking workers (connector and filesystem) + owning reactor"
       else
-        expected_topology="$expected_async async + Tokio blocking pool max$((expected_async + 1)) (filesystem execution cap$expected_async) + integrated I/O driver"
+        expected_topology="$expected_async async + Tokio blocking pool max$expected_async (filesystem execution cap$expected_async) + integrated I/O driver"
       fi
       ;;
   esac
@@ -456,11 +456,9 @@ expected_identity = [
 if identity != expected_identity:
     raise SystemExit(1)
 if executor == "allocatbelt":
-    drivers = ["allocatbelt HTTP async runtime", "allocatbelt connector pool", "allocatbelt reactor"] if workload in ("http", "mixed") else ["allocatbelt async runtime"]
-    if workload in ("disk", "mixed"):
-        drivers.append("allocatbelt filesystem runtime")
+    drivers = ["allocatbelt owning HTTP runtime"] if workload in ("http", "mixed") else ["allocatbelt application driver"]
 else:
-    drivers = ["Tokio HTTP runtime"] if workload in ("http", "mixed") else ["Tokio runtime"]
+    drivers = ["Tokio HTTP runtime", "Tokio fixed rate timer"] if workload in ("http", "mixed") else ["Tokio runtime"]
 if len(lines) != len(drivers) + 15:
     raise SystemExit(1)
 phase_rows = [line.split("\t") for line in lines[9:15]]

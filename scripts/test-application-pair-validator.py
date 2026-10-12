@@ -473,7 +473,7 @@ class ApplicationPairValidatorTests(unittest.TestCase):
             "phase\tproduction_through_drain_cpu_ns\t200\n"
             "phase\tsuccessful_completions\t2\n"
             "phase\tcpu_ns_per_successful_completion\t100\n"
-            "driver\tallocatbelt async runtime\t500000000\n",
+            "driver\tallocatbelt application driver\t500000000\n",
             encoding="utf-8",
         )
         program = embedded_validator("validate_shutdown_report")
