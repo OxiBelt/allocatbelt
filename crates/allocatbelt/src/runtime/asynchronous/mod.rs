@@ -51,7 +51,7 @@ use std::thread;
 use crate::runtime::managed::ResourceScope;
 use crate::runtime::resource_domain::{ControlCharge, DomainError, payload_bytes};
 use crate::runtime::task::drop_contained;
-use crate::runtime::thread_completion::DeferredJoin;
+use crate::runtime::thread_completion::{DeferredJoin, PreparedJoins};
 use scheduler::{ScopeRef, Shared};
 
 pub use entry::{
@@ -382,16 +382,18 @@ impl AsyncRuntime {
       return Err(AsyncError::InvalidConfig);
     };
     let tenant = resources.as_ref().and_then(ResourceScope::tenant_domain);
+    let stack_size = options.stack_size();
+    if stack_size.is_some_and(|size| size == 0) {
+      return Err(AsyncError::InvalidConfig);
+    }
+    let mut prepared_joins =
+      PreparedJoins::new(tenant, threads).map_err(AsyncError::ResourceDomain)?;
     let option_control = ControlCharge::try_new(tenant, options.control_name_capacity())
       .map_err(AsyncError::ResourceDomain)?;
     let options = ControlledThreadOptions {
       options,
       _control: option_control,
     };
-    let stack_size = options.stack_size();
-    if stack_size.is_some_and(|size| size == 0) {
-      return Err(AsyncError::InvalidConfig);
-    }
     let tenant = resources.as_ref().and_then(ResourceScope::tenant_domain);
     let metrics = RuntimeMetrics::try_new(
       config.workers,
@@ -461,7 +463,7 @@ impl AsyncRuntime {
       None
     };
     let (shared, root) = Shared::new(config, max_handoffs, resources, options, metrics)?;
-    let mut workers = Vec::new();
+    let mut workers: Vec<DeferredJoin> = Vec::new();
     workers
       .try_reserve_exact(threads)
       .map_err(|_| AsyncError::OutOfMemory)?;
@@ -483,6 +485,16 @@ impl AsyncRuntime {
       .try_resize(actual_runtime_control)
       .map_err(AsyncError::ResourceDomain)?;
     for (index, name) in names.into_iter().enumerate() {
+      let Some(prepared_join) = prepared_joins.pop() else {
+        shared.close(true);
+        for mut worker in workers {
+          if let Err(payload) = worker.join_blocking() {
+            drop_contained(payload);
+          }
+        }
+        return Err(AsyncError::ResourceDomain(DomainError::Invalid));
+      };
+      let completion_owner = prepared_join.thread_owner();
       let thread_shared = Arc::clone(&shared);
       let thread_launch_control = launch_control.clone();
       let context = if index < config.workers {
@@ -506,19 +518,22 @@ impl AsyncRuntime {
       };
       let started = if context.role == thread_options::AsyncThreadRole::Worker {
         builder.spawn(move || {
+          completion_owner.retain_until_thread_exit();
           let _launch_control = thread_launch_control;
           scheduler::worker(thread_shared, context)
         })
       } else {
         builder.spawn(move || {
+          completion_owner.retain_until_thread_exit();
           let _launch_control = thread_launch_control;
           scheduler::helper(thread_shared, context)
         })
       };
       match started {
-        Ok(worker) => workers.push(DeferredJoin::new(worker)),
+        Ok(worker) => workers.push(prepared_join.attach(worker)),
         Err(_) => {
           shared.close(true);
+          drop(prepared_join);
           for mut worker in workers {
             if let Err(payload) = worker.join_blocking() {
               drop_contained(payload);
@@ -528,6 +543,7 @@ impl AsyncRuntime {
         }
       }
     }
+    drop(prepared_joins);
     drop(names_control);
     Ok(Self {
       shared,
@@ -798,10 +814,15 @@ impl fmt::Debug for AsyncRuntime {
 
 #[cfg(all(test, not(loom)))]
 mod completion_tests {
-  use super::{AsyncConfig, AsyncRuntime, AsyncShutdown, DeferredJoin};
+  use super::{AsyncConfig, AsyncRuntime, AsyncShutdown, AsyncThreadOptions, DeferredJoin};
+  use crate::runtime::managed::{ResourceLimits, ResourceScope};
   use crate::runtime::resource_domain::payload_bytes;
+  use crate::runtime::resource_domain::{
+    DomainError, DomainResource, DomainResources, ResourceDomain,
+  };
   use std::any::Any;
   use std::cell::RefCell;
+  use std::sync::Arc;
   use std::sync::mpsc::{self, Receiver, SyncSender};
   use std::task::Poll;
   use std::thread;
@@ -879,6 +900,74 @@ mod completion_tests {
     runtime
       .shutdown(AsyncShutdown::Drain)
       .unwrap_or_else(|error| panic!("async shutdown failed: {error}"));
+  }
+
+  #[test]
+  fn prepared_completion_control_exhaustion_precedes_name_and_start_callbacks() {
+    let ceiling = DomainResources::ZERO
+      .with(DomainResource::Cpu, 2)
+      .with(DomainResource::Tasks, 8)
+      .with(DomainResource::Control, 1 << 20);
+    let domain = ResourceDomain::with_waiters(ceiling, 1, 4)
+      .unwrap_or_else(|error| panic!("resource domain setup failed: {error}"));
+    let tenant = domain
+      .tenant(ceiling)
+      .unwrap_or_else(|error| panic!("tenant setup failed: {error}"));
+    let resources = ResourceScope::from_tenant(ResourceLimits::default(), tenant.clone());
+    let domain_before = domain.snapshot();
+    let tenant_before = tenant
+      .snapshot()
+      .unwrap_or_else(|error| panic!("tenant snapshot failed: {error}"));
+    domain
+      .set_limits(domain_before.limit.with(
+        DomainResource::Control,
+        domain_before.used.get(DomainResource::Control),
+      ))
+      .unwrap_or_else(|error| panic!("global Control clamp failed: {error}"));
+    tenant
+      .set_limits(tenant_before.limit.with(
+        DomainResource::Control,
+        tenant_before.used.get(DomainResource::Control),
+      ))
+      .unwrap_or_else(|error| panic!("tenant Control clamp failed: {error}"));
+
+    let name_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let start_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let name_count = Arc::clone(&name_calls);
+    let start_count = Arc::clone(&start_calls);
+    let options = AsyncThreadOptions::new()
+      .thread_name_fn(move |_| {
+        name_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        String::from("prepared-control-test")
+      })
+      .on_thread_start(move |_| {
+        start_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+      });
+    let error = AsyncRuntime::with_resources_and_thread_options(
+      AsyncConfig {
+        workers: 1,
+        max_outstanding: 2,
+        max_scopes: 2,
+      },
+      resources,
+      options,
+    )
+    .err()
+    .unwrap_or_else(|| panic!("prepared completion Control exhaustion was ignored"));
+    assert_eq!(
+      error,
+      super::AsyncError::ResourceDomain(DomainError::Exhausted(DomainResource::Control))
+    );
+    assert_eq!(name_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    assert_eq!(start_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    assert_eq!(domain.snapshot().used, domain_before.used);
+    assert_eq!(
+      tenant
+        .snapshot()
+        .unwrap_or_else(|error| panic!("tenant snapshot failed: {error}"))
+        .used,
+      tenant_before.used
+    );
   }
 
   #[test]

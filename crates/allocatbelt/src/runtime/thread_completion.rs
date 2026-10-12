@@ -4,6 +4,18 @@
 //! finish. `DeferredJoin` therefore transfers the exact original handle to a
 //! small, per-thread monitor and publishes the `join` result only after those
 //! destructors have run. Polling never joins either thread.
+//!
+//! Bound startup charges the declared `Shared` payload, its worker TLS owner,
+//! one possible monitor Arc capture, builder payload, and the fixed monitor
+//! name template plus one attempt's name capacity before spawning. Pool code
+//! separately charges its actual `Vec<DeferredJoin>` capacity. A Shared
+//! reservation stays alive through the original worker's TLS cleanup and any
+//! monitor's final exit. These declared payloads exclude Arc allocator
+//! headers, OS thread/provider metadata and stacks, operating-system name
+//! backing, and arbitrary application TLS, destructor or panic-payload heap
+//! allocations. The reserved monitor-name and Arc-capture capacity is one
+//! helper attempt per original worker, including when that attempt is lazy or
+//! must be retried.
 
 #![forbid(unsafe_code)]
 #![cfg_attr(not(test), deny(clippy::expect_used, clippy::unwrap_used))]
@@ -13,9 +25,12 @@ use std::io;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread::{self, JoinHandle, ThreadId};
 
+use crate::runtime::resource_domain::{payload_bytes, ControlCharge, DomainError, TenantDomain};
+
 use super::task::drop_contained;
 
 type JoinResult = thread::Result<()>;
+const MONITOR_THREAD_NAME: &str = "allocatbelt-join-monitor";
 
 #[cfg(all(test, not(loom)))]
 thread_local! {
@@ -35,15 +50,162 @@ pub(crate) struct DeferredJoin {
   thread_id: ThreadId,
 }
 
+/// Fixed startup storage for the completion owners belonging to a worker set.
+/// Its vector allocation is charged while the owners are prepared, then the
+/// charge is released when startup finishes; each Shared owner retains its
+/// own charge for as long as a worker, wrapper or monitor still references it.
+pub(crate) struct PreparedJoins {
+  entries: Vec<PreparedJoin>,
+  _control: ControlCharge,
+}
+
+/// A precharged worker completion owner that can be attached without failure
+/// after the original worker thread has started.
+pub(crate) struct PreparedJoin {
+  shared: Arc<Shared>,
+}
+
+/// The original worker's one Arc owner, moved into a TLS sentinel before any
+/// runtime callback or user task can initialize its own thread-local values.
+pub(crate) struct CompletionThreadOwner {
+  shared: Arc<Shared>,
+}
+
 struct Shared {
   state: Mutex<State>,
   changed: Condvar,
+  monitor_name: String,
+  _control: ControlCharge,
 }
 
 struct State {
   original: Option<JoinHandle<()>>,
   result: Option<JoinResult>,
   owner_attached: bool,
+}
+
+struct CompletionTlsOwner(std::cell::RefCell<Option<Arc<Shared>>>);
+
+thread_local! {
+  static COMPLETION_TLS_OWNER: CompletionTlsOwner = const {
+    CompletionTlsOwner(std::cell::RefCell::new(None))
+  };
+}
+
+impl Drop for CompletionTlsOwner {
+  fn drop(&mut self) {
+    let shared = self.0.get_mut().take();
+    drop(shared);
+  }
+}
+
+impl PreparedJoins {
+  /// Precharges the actual vector capacity and every per-worker Shared owner
+  /// before any worker or lifecycle callback can start.
+  pub(crate) fn new(tenant: Option<&TenantDomain>, count: usize) -> Result<Self, DomainError> {
+    if count == 0 {
+      return Err(DomainError::Invalid);
+    }
+    let requested = std::mem::size_of::<Self>()
+      .checked_add(payload_bytes::<PreparedJoin>(count)?)
+      .ok_or(DomainError::Invalid)?;
+    let mut control = ControlCharge::try_new(tenant, requested)?;
+    let mut entries = Vec::new();
+    entries
+      .try_reserve_exact(count)
+      .map_err(|_| DomainError::OutOfMemory)?;
+    let actual = std::mem::size_of::<Self>()
+      .checked_add(payload_bytes::<PreparedJoin>(entries.capacity())?)
+      .ok_or(DomainError::Invalid)?;
+    control.try_resize(actual)?;
+    for _ in 0..count {
+      entries.push(PreparedJoin::new(tenant)?);
+    }
+    Ok(Self {
+      entries,
+      _control: control,
+    })
+  }
+
+  /// Takes one precharged owner. The caller must attach it if the matching
+  /// original worker thread starts.
+  pub(crate) fn pop(&mut self) -> Option<PreparedJoin> {
+    self.entries.pop()
+  }
+}
+
+impl PreparedJoin {
+  fn shared_control_bytes(name_capacity: usize) -> Result<usize, DomainError> {
+    // One CompletionThreadOwner is moved from the worker closure into TLS,
+    // so this one payload fee follows it through the transfer rather than
+    // being charged again in the runtime's launch-capture aggregate. The two
+    // name capacities are the retained template and one lazy/retry attempt.
+    let owners = std::mem::size_of::<CompletionThreadOwner>()
+      .checked_add(std::mem::size_of::<Arc<Shared>>())
+      .and_then(|bytes| bytes.checked_add(std::mem::size_of::<thread::Builder>()))
+      .and_then(|bytes| name_capacity.checked_mul(2)?.checked_add(bytes))
+      .ok_or(DomainError::Invalid)?;
+    std::mem::size_of::<Shared>()
+      .checked_add(owners)
+      .ok_or(DomainError::Invalid)
+  }
+
+  fn new(tenant: Option<&TenantDomain>) -> Result<Self, DomainError> {
+    let requested_name_capacity = MONITOR_THREAD_NAME.len();
+    let mut control =
+      ControlCharge::try_new(tenant, Self::shared_control_bytes(requested_name_capacity)?)?;
+    let monitor_name = String::from(MONITOR_THREAD_NAME);
+    let actual_control = Self::shared_control_bytes(monitor_name.capacity())?;
+    control.try_resize(actual_control)?;
+    let shared = Arc::new(Shared {
+      state: Mutex::new(State {
+        original: None,
+        result: None,
+        owner_attached: false,
+      }),
+      changed: Condvar::new(),
+      monitor_name,
+      _control: control,
+    });
+    Ok(Self { shared })
+  }
+
+  /// Clones the owner to be moved into the original worker's TLS sentinel.
+  /// Its pointer payload is included in this Shared's pre-spawn Control fee.
+  pub(crate) fn thread_owner(&self) -> CompletionThreadOwner {
+    CompletionThreadOwner {
+      shared: Arc::clone(&self.shared),
+    }
+  }
+
+  /// Transfers the exact original handle into the already-prepared Shared
+  /// owner. This operation does not allocate or fail after a spawn succeeds.
+  pub(crate) fn attach(self, original: JoinHandle<()>) -> DeferredJoin {
+    let thread_id = original.thread().id();
+    {
+      let mut state = lock(&self.shared.state);
+      debug_assert!(state.original.is_none());
+      debug_assert!(!state.owner_attached);
+      state.original = Some(original);
+      state.owner_attached = true;
+    }
+    DeferredJoin {
+      shared: self.shared,
+      monitor: None,
+      thread_id,
+    }
+  }
+}
+
+impl CompletionThreadOwner {
+  /// Installs this owner before the worker invokes any user or runtime code.
+  /// Its Arc is released by the thread-local sentinel after later-registered
+  /// TLS destructors, including destructors registered during another Drop.
+  pub(crate) fn retain_until_thread_exit(self) {
+    let previous = COMPLETION_TLS_OWNER.with(|owner| owner.0.replace(Some(self.shared)));
+    debug_assert!(previous.is_none());
+    drop(previous);
+  }
 }
 
 /// Failure to create the helper. The original handle remains owned and a
@@ -67,19 +229,11 @@ impl DeferredJoin {
   /// Retains the exact handle until a monitor starts successfully or a
   /// caller explicitly chooses the blocking join path.
   pub(crate) fn new(original: JoinHandle<()>) -> Self {
-    let thread_id = original.thread().id();
-    Self {
-      shared: Arc::new(Shared {
-        state: Mutex::new(State {
-          original: Some(original),
-          result: None,
-          owner_attached: true,
-        }),
-        changed: Condvar::new(),
-      }),
-      monitor: None,
-      thread_id,
-    }
+    let prepared = match PreparedJoin::new(None) {
+      Ok(prepared) => prepared,
+      Err(error) => panic!("unbound completion owner preparation failed: {error}"),
+    };
+    prepared.attach(original)
   }
 
   /// Whether the original thread is the current thread.
@@ -93,23 +247,23 @@ impl DeferredJoin {
   pub(crate) fn try_join(&mut self) -> Result<Option<JoinResult>, MonitorSpawnError> {
     #[cfg(all(test, not(loom)))]
     if FAIL_NEXT_MONITOR.replace(false) {
-      return self.try_join_with(|_| {
+      return self.try_join_with(|_, _| {
         Err(io::Error::new(
           io::ErrorKind::WouldBlock,
           "injected monitor startup refusal",
         ))
       });
     }
-    self.try_join_with(|shared| {
+    self.try_join_with(|shared, name| {
       thread::Builder::new()
-        .name("allocatbelt-join-monitor".to_owned())
+        .name(name)
         .spawn(move || monitor_join(shared))
     })
   }
 
   fn try_join_with(
     &mut self,
-    spawn: impl FnOnce(Arc<Shared>) -> io::Result<JoinHandle<()>>,
+    spawn: impl FnOnce(Arc<Shared>, String) -> io::Result<JoinHandle<()>>,
   ) -> Result<Option<JoinResult>, MonitorSpawnError> {
     if let Some(result) = self.take_result() {
       self.monitor.take();
@@ -117,7 +271,8 @@ impl DeferredJoin {
     }
 
     if self.monitor.is_none() {
-      let monitor = spawn(Arc::clone(&self.shared)).map_err(MonitorSpawnError)?;
+      let monitor = spawn(Arc::clone(&self.shared), self.shared.monitor_name.clone())
+        .map_err(MonitorSpawnError)?;
       self.monitor = Some(monitor);
     }
 
@@ -238,7 +393,10 @@ fn lock(state: &Mutex<State>) -> MutexGuard<'_, State> {
 
 #[cfg(all(test, not(loom)))]
 mod tests {
-  use super::{DeferredJoin, JoinResult};
+  use super::{fail_next_monitor_for_test, DeferredJoin, JoinResult, PreparedJoin, PreparedJoins};
+  use crate::runtime::resource_domain::{
+    payload_bytes, DomainResource, DomainResources, ResourceDomain, TenantDomain,
+  };
   use std::cell::RefCell;
   use std::sync::mpsc::{self, Receiver, Sender};
   use std::thread;
@@ -337,6 +495,59 @@ mod tests {
     }
   }
 
+  fn bound_domain() -> (ResourceDomain, TenantDomain) {
+    let ceiling = DomainResources::ZERO
+      .with(DomainResource::Cpu, 2)
+      .with(DomainResource::Tasks, 8)
+      .with(DomainResource::Control, 1 << 20);
+    let domain = ResourceDomain::new(ceiling, 1)
+      .unwrap_or_else(|error| panic!("resource domain setup failed: {error}"));
+    let tenant = domain
+      .tenant(ceiling)
+      .unwrap_or_else(|error| panic!("tenant setup failed: {error}"));
+    (domain, tenant)
+  }
+
+  fn global_control(domain: &ResourceDomain) -> usize {
+    domain.snapshot().used.get(DomainResource::Control)
+  }
+
+  fn tenant_control(tenant: &TenantDomain) -> usize {
+    tenant
+      .snapshot()
+      .unwrap_or_else(|error| panic!("tenant snapshot failed: {error}"))
+      .used
+      .get(DomainResource::Control)
+  }
+
+  fn wait_for_global_control(domain: &ResourceDomain, expected: usize) {
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while global_control(domain) != expected {
+      assert!(
+        Instant::now() < deadline,
+        "completion Control owner did not drain"
+      );
+      thread::yield_now();
+    }
+  }
+
+  fn spawn_bound_tls_worker(prepared: PreparedJoin, gate: Gate, nested: bool) -> DeferredJoin {
+    let owner = prepared.thread_owner();
+    let handle = thread::spawn(move || {
+      owner.retain_until_thread_exit();
+      if nested {
+        OUTER_TLS.with(|slot| {
+          *slot.0.borrow_mut() = Some(gate);
+        });
+      } else {
+        BLOCKING_TLS.with(|slot| {
+          *slot.0.borrow_mut() = Some(gate);
+        });
+      }
+    });
+    prepared.attach(handle)
+  }
+
   #[test]
   fn waits_for_tls_destructor_after_worker_returns() {
     blocked_tls_destructor_case(false);
@@ -360,7 +571,7 @@ mod tests {
     await_signal(&entered_rx, Instant::now() + Duration::from_secs(3));
 
     let error = join
-      .try_join_with(|_| {
+      .try_join_with(|_, _| {
         Err(std::io::Error::new(
           std::io::ErrorKind::WouldBlock,
           "injected monitor spawn failure",
@@ -372,6 +583,121 @@ mod tests {
     assert!(join.try_join().expect("retry should start").is_none());
     release_tx.send(()).expect("release original thread");
     assert!(poll_until_joined(&mut join).is_ok());
+    let _ = cancel_watchdog.send(());
+    watchdog.join().expect("watchdog thread");
+  }
+
+  #[test]
+  fn prepared_shared_control_survives_failed_monitor_retry_and_detached_owner() {
+    let (domain, tenant) = bound_domain();
+    let global_baseline = global_control(&domain);
+    let tenant_baseline = tenant_control(&tenant);
+    let mut prepared = PreparedJoins::new(Some(&tenant), 1)
+      .unwrap_or_else(|error| panic!("completion preparation failed: {error}"));
+    let prepared_capacity = prepared.entries.capacity();
+    let shared_bytes = PreparedJoin::shared_control_bytes(
+      prepared
+        .entries
+        .last()
+        .unwrap_or_else(|| panic!("prepared completion slot is missing"))
+        .shared
+        .monitor_name
+        .capacity(),
+    )
+    .unwrap_or_else(|error| panic!("completion payload size failed: {error}"));
+    let prepared_vector_bytes = std::mem::size_of::<PreparedJoins>()
+      + payload_bytes::<PreparedJoin>(prepared_capacity)
+        .unwrap_or_else(|error| panic!("prepared vector size failed: {error}"));
+    assert_eq!(
+      global_control(&domain) - global_baseline,
+      prepared_vector_bytes + shared_bytes
+    );
+    assert_eq!(
+      tenant_control(&tenant) - tenant_baseline,
+      prepared_vector_bytes + shared_bytes
+    );
+    let prepared_join = prepared
+      .pop()
+      .unwrap_or_else(|| panic!("prepared completion slot could not be taken"));
+    drop(prepared);
+    assert_eq!(global_control(&domain) - global_baseline, shared_bytes);
+
+    let (entered_tx, entered_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let (cancel_watchdog, watchdog) = start_release_watchdog(release_tx.clone());
+    let mut join = spawn_bound_tls_worker(
+      prepared_join,
+      Gate {
+        entered: entered_tx,
+        release: release_rx,
+      },
+      true,
+    );
+    await_signal(&entered_rx, Instant::now() + Duration::from_secs(3));
+
+    fail_next_monitor_for_test();
+    let error = join
+      .try_join()
+      .expect_err("injected monitor spawn failure must be reported");
+    assert_eq!(error.0.kind(), std::io::ErrorKind::WouldBlock);
+    assert!(join.retains_pending_join());
+    assert_eq!(global_control(&domain) - global_baseline, shared_bytes);
+    assert_eq!(tenant_control(&tenant) - tenant_baseline, shared_bytes);
+
+    assert!(join
+      .try_join()
+      .expect("monitor retry should start")
+      .is_none());
+    drop(join);
+    assert_eq!(global_control(&domain) - global_baseline, shared_bytes);
+    release_tx.send(()).expect("release nested TLS destructor");
+    wait_for_global_control(&domain, global_baseline);
+    assert_eq!(tenant_control(&tenant), tenant_baseline);
+    let _ = cancel_watchdog.send(());
+    watchdog.join().expect("watchdog thread");
+  }
+
+  #[test]
+  fn detached_owner_without_monitor_keeps_control_through_nested_tls_cleanup() {
+    let (domain, tenant) = bound_domain();
+    let global_baseline = global_control(&domain);
+    let tenant_baseline = tenant_control(&tenant);
+    let mut prepared = PreparedJoins::new(Some(&tenant), 1)
+      .unwrap_or_else(|error| panic!("completion preparation failed: {error}"));
+    let shared_bytes = PreparedJoin::shared_control_bytes(
+      prepared
+        .entries
+        .last()
+        .unwrap_or_else(|| panic!("prepared completion slot is missing"))
+        .shared
+        .monitor_name
+        .capacity(),
+    )
+    .unwrap_or_else(|error| panic!("completion payload size failed: {error}"));
+    let prepared_join = prepared
+      .pop()
+      .unwrap_or_else(|| panic!("prepared completion slot could not be taken"));
+    drop(prepared);
+
+    let (entered_tx, entered_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let (cancel_watchdog, watchdog) = start_release_watchdog(release_tx.clone());
+    let join = spawn_bound_tls_worker(
+      prepared_join,
+      Gate {
+        entered: entered_tx,
+        release: release_rx,
+      },
+      true,
+    );
+    await_signal(&entered_rx, Instant::now() + Duration::from_secs(3));
+    drop(join);
+
+    assert_eq!(global_control(&domain) - global_baseline, shared_bytes);
+    assert_eq!(tenant_control(&tenant) - tenant_baseline, shared_bytes);
+    release_tx.send(()).expect("release nested TLS destructor");
+    wait_for_global_control(&domain, global_baseline);
+    assert_eq!(tenant_control(&tenant), tenant_baseline);
     let _ = cancel_watchdog.send(());
     watchdog.join().expect("watchdog thread");
   }

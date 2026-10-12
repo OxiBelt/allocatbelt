@@ -14,7 +14,7 @@ use crate::runtime::resource_domain::{ControlCharge, DomainError, payload_bytes}
 use crate::runtime::resources::Resources;
 use crate::runtime::scheduler::{ClosedQueue, Shared, Snapshot, domain_build_error};
 use crate::runtime::task::drop_contained;
-use crate::runtime::thread_completion::{DeferredJoin, MonitorSpawnError};
+use crate::runtime::thread_completion::{DeferredJoin, MonitorSpawnError, PreparedJoins};
 use crate::runtime::time::TimerHandle;
 use crate::runtime::worker;
 
@@ -239,7 +239,14 @@ impl Runtime {
           .ok_or_else(|| control_build_error(DomainError::Invalid, bound))?,
       )
       .map_err(|error| control_build_error(error, bound))?;
+    let mut prepared_joins = PreparedJoins::new(tenant.as_ref(), config.workers)
+      .map_err(|error| control_build_error(error, bound))?;
     for index in 0..config.workers {
+      let Some(prepared_join) = prepared_joins.pop() else {
+        stop_started_workers(&shared, &mut workers);
+        return Err(control_build_error(DomainError::Invalid, bound));
+      };
+      let completion_owner = prepared_join.thread_owner();
       let worker_shared = Arc::clone(&shared);
       let thread_launch_control = launch_control.clone();
       let name = format!("allocatbelt-runtime-{index}");
@@ -258,18 +265,21 @@ impl Runtime {
       let spawned = spawn(
         thread::Builder::new().name(name),
         Box::new(move || {
+          completion_owner.retain_until_thread_exit();
           let _launch_control = thread_launch_control;
           worker::run(&worker_shared, index);
         }),
       );
       match spawned {
-        Ok(handle) => workers.push(DeferredJoin::new(handle)),
+        Ok(handle) => workers.push(prepared_join.attach(handle)),
         Err(error) => {
+          drop(prepared_join);
           stop_started_workers(&shared, &mut workers);
           return Err(error);
         }
       }
     }
+    drop(prepared_joins);
     runtime_control
       .try_resize(actual_persistent_bytes)
       .map_err(|error| {
@@ -823,6 +833,89 @@ mod tests {
     assert_eq!(
       domain.snapshot().used.get(DomainResource::Control),
       control_before
+    );
+  }
+
+  #[test]
+  fn completion_control_exhaustion_precedes_every_worker_start() {
+    let ceiling = DomainResources::ZERO
+      .with(DomainResource::Cpu, 2)
+      .with(DomainResource::Tasks, 8)
+      .with(DomainResource::Control, 1 << 20);
+    let domain = ResourceDomain::with_waiters(ceiling, 1, 4)
+      .unwrap_or_else(|error| panic!("resource domain setup failed: {error}"));
+    let tenant = domain
+      .tenant(ceiling)
+      .unwrap_or_else(|error| panic!("tenant setup failed: {error}"));
+    let resources = ResourceScope::from_tenant(ResourceLimits::default(), tenant.clone());
+    let domain_before = domain.snapshot().used.get(DomainResource::Control);
+    let tenant_before = tenant
+      .snapshot()
+      .unwrap_or_else(|error| panic!("tenant snapshot failed: {error}"))
+      .used
+      .get(DomainResource::Control);
+    let starts = Arc::new(AtomicUsize::new(0));
+    let spawn_calls = Arc::new(AtomicUsize::new(0));
+    let starts_in_hook = Arc::clone(&starts);
+    let spawn_calls_in_hook = Arc::clone(&spawn_calls);
+    let domain_in_setup = domain.clone();
+    let tenant_in_setup = tenant.clone();
+    let error = Runtime::with_spawner_and_resources(
+      Config {
+        workers: 2,
+        max_outstanding: 2,
+        capacity: Resources::ZERO,
+      },
+      Some(resources),
+      move |builder, worker| {
+        spawn_calls_in_hook.fetch_add(1, Ordering::SeqCst);
+        let starts = Arc::clone(&starts_in_hook);
+        builder.spawn(move || {
+          starts.fetch_add(1, Ordering::SeqCst);
+          worker();
+        })
+      },
+      move |_| {
+        let global = domain_in_setup.snapshot();
+        domain_in_setup
+          .set_limits(global.limit.with(
+            DomainResource::Control,
+            global.used.get(DomainResource::Control),
+          ))
+          .unwrap_or_else(|error| panic!("global Control clamp failed: {error}"));
+        let tenant_snapshot = tenant_in_setup
+          .snapshot()
+          .unwrap_or_else(|error| panic!("tenant snapshot failed: {error}"));
+        tenant_in_setup
+          .set_limits(tenant_snapshot.limit.with(
+            DomainResource::Control,
+            tenant_snapshot.used.get(DomainResource::Control),
+          ))
+          .unwrap_or_else(|error| panic!("tenant Control clamp failed: {error}"));
+      },
+    )
+    .err()
+    .unwrap_or_else(|| panic!("completion metadata exhaustion was ignored"));
+    assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+    assert_eq!(
+      error
+        .get_ref()
+        .and_then(|cause| cause.downcast_ref::<DomainError>()),
+      Some(&DomainError::Exhausted(DomainResource::Control))
+    );
+    assert_eq!(spawn_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(starts.load(Ordering::SeqCst), 0);
+    assert_eq!(
+      domain.snapshot().used.get(DomainResource::Control),
+      domain_before
+    );
+    assert_eq!(
+      tenant
+        .snapshot()
+        .unwrap_or_else(|error| panic!("tenant snapshot failed: {error}"))
+        .used
+        .get(DomainResource::Control),
+      tenant_before
     );
   }
 
