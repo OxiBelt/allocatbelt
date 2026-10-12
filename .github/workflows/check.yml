@@ -55,9 +55,6 @@ jobs:
       - name: Cargo clippy
         run: cargo clippy --all-targets --all-features --locked -- -D warnings
 
-      - name: Cargo test
-        run: cargo test --release --all-features --locked
-
       - name: Verification runner regression checks
         run: |
           bash scripts/tests/check-miri-test.sh
@@ -91,6 +88,45 @@ jobs:
         run: |
           uname -r
           cargo test --release --locked -p allocatbelt --features io-uring --lib ring_benchmark -- --ignored --nocapture
+
+  # Release test results qualify correctness only; hosted runners do not
+  # establish allocator or runtime performance.
+  release-tests:
+    name: Release correctness tests (${{ matrix.runner }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        rust_version:
+          - 1.99.0
+        runner:
+          - ubuntu-26.04
+          - ubuntu-26.04-arm
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # 7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install ${{ matrix.rust_version }} --profile minimal --no-self-update
+          rustup default ${{ matrix.rust_version }}
+
+      - name: Configure short private temporary directory
+        run: |
+          umask 077
+          temp_dir="$(mktemp -d /tmp/abt.XXXXXX)"
+          echo "TMPDIR=$temp_dir" >> "$GITHUB_ENV"
+
+      - name: Fetch locked Cargo dependency graph
+        run: cargo fetch --locked
+
+      - name: Cargo release correctness tests
+        run: cargo test --release --all-features --locked
 
   scalar-isa-arm64:
     name: ARM64 scalar instruction probes
