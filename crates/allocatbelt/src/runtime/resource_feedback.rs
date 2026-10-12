@@ -7,9 +7,11 @@
 //! service is off until explicitly constructed; it does not alter any default
 //! runtime configuration. An opted-in service starts one sampler and one
 //! bounded join-monitor thread so shutdown polling never joins on the caller.
-//! Policy and metrics use fixed-size storage and the join handoff has capacity
-//! one, but this service does not currently charge those allocations or its
-//! thread stacks to `ResourceDomain::Control`.
+//! `start_in_tenant` charges the declared shared metrics, owner, inline worker
+//! capture, monitor payload, and one logical capacity-one handoff slot before
+//! initial actuator callbacks or threads start. Legacy `start` is uncharged.
+//! Callback-owned heap, allocator/Arc headers, std channel backing, and OS
+//! thread stacks are outside these declared payload charges.
 //!
 //! Sensor and actuator callbacks run outside the snapshot lock and are
 //! panic-contained. A ticket is applied only after a readback confirms its
@@ -30,6 +32,7 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use super::resource_domain::{ControlCharge, DomainError, TenantDomain};
 use super::resource_feedback_policy::{
   ActuationResult, DecisionStatus, FeedbackResource, FeedbackSample, NoChangeReason, PlanTicket,
   PolicyError, PolicyPlan, ResourceFeedbackPolicy, ResourceFeedbackPolicyConfig, SAMPLE_INTERVAL,
@@ -261,6 +264,7 @@ struct SharedState {
 struct Shared {
   state: Mutex<SharedState>,
   wakeup: Condvar,
+  _control: ControlCharge,
 }
 
 impl Drop for Shared {
@@ -280,6 +284,61 @@ impl Drop for Shared {
 enum JoinCommand {
   Worker(JoinHandle<()>),
   Stop,
+}
+
+struct WorkerPayload<S, A> {
+  policy: ResourceFeedbackPolicy,
+  sensor: S,
+  actuator: A,
+  shared: Option<Arc<Shared>>,
+  _control: ControlCharge,
+}
+
+struct JoinMonitorPayload {
+  shared: Arc<Shared>,
+  receiver: mpsc::Receiver<JoinCommand>,
+  _control: ControlCharge,
+}
+
+struct ServiceControlShares {
+  shared: ControlCharge,
+  worker: ControlCharge,
+  monitor: ControlCharge,
+  owner: ControlCharge,
+}
+
+fn service_control_shares<S, A>(
+  tenant: Option<&TenantDomain>,
+) -> Result<ServiceControlShares, DomainError> {
+  let shared_bytes = std::mem::size_of::<Shared>();
+  let worker_bytes = std::mem::size_of::<WorkerPayload<S, A>>();
+  // Charge the logical capacity-one command slot with the retained monitor
+  // payload. The standard library's private channel backing remains excluded.
+  let monitor_bytes = std::mem::size_of::<JoinMonitorPayload>()
+    .checked_add(std::mem::size_of::<JoinCommand>())
+    .ok_or(DomainError::Invalid)?;
+  let owner_bytes = ResourceFeedbackService::owner_payload_bytes();
+  let total_bytes = shared_bytes
+    .checked_add(worker_bytes)
+    .and_then(|bytes| bytes.checked_add(monitor_bytes))
+    .and_then(|bytes| bytes.checked_add(owner_bytes))
+    .ok_or(DomainError::Invalid)?;
+  let mut total = match tenant {
+    Some(tenant) => ControlCharge::try_new(Some(tenant), total_bytes)?,
+    None => ControlCharge::unbounded(total_bytes),
+  };
+  let shared = total.split_off(shared_bytes)?;
+  let worker = total.split_off(worker_bytes)?;
+  let monitor = total.split_off(monitor_bytes)?;
+  let owner = total.split_off(owner_bytes)?;
+  debug_assert_eq!(total.bytes(), 0);
+  drop(total);
+  Ok(ServiceControlShares {
+    shared,
+    worker,
+    monitor,
+    owner,
+  })
 }
 
 fn lock_state(shared: &Shared) -> MutexGuard<'_, SharedState> {
@@ -334,6 +393,8 @@ pub enum FeedbackStartError {
   },
   /// OS thread creation failed.
   ThreadSpawn(std::io::Error),
+  /// The tenant domain refused bounded feedback metadata.
+  Domain(DomainError),
 }
 
 impl fmt::Display for FeedbackStartError {
@@ -342,7 +403,18 @@ impl fmt::Display for FeedbackStartError {
   }
 }
 
-impl std::error::Error for FeedbackStartError {}
+impl std::error::Error for FeedbackStartError {
+  fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+    match self {
+      Self::Policy(error) => Some(error),
+      Self::ThreadSpawn(error) => Some(error),
+      Self::Domain(error) => Some(error),
+      Self::InitialReadback { .. }
+      | Self::InitialReadbackPanicked(_)
+      | Self::InitialLimitMismatch { .. } => None,
+    }
+  }
+}
 
 /// Why an explicit reconciliation request was refused.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -414,6 +486,9 @@ pub struct ResourceFeedbackService {
   shutdown_error: Option<FeedbackShutdownError>,
   /// At most one joined panic payload is retained until owner drop.
   panic_payload: Mutex<Option<Box<dyn Any + Send>>>,
+  // An owning facade can account the enclosing owner and subtract this inline
+  // service payload so the service wrapper is charged exactly once.
+  _owner_control: ControlCharge,
 }
 
 impl fmt::Debug for ResourceFeedbackService {
@@ -427,6 +502,13 @@ impl fmt::Debug for ResourceFeedbackService {
 }
 
 impl ResourceFeedbackService {
+  /// The inline owner payload a containing driver may exclude when it charges
+  /// its own retained metadata. The service's shared and thread payloads are
+  /// charged separately by [`Self::start_in_tenant`].
+  pub(crate) const fn owner_payload_bytes() -> usize {
+    std::mem::size_of::<Self>()
+  }
+
   /// Validates the policy and all actual limits before starting either thread.
   ///
   /// All three controls must be configured explicitly. The actuator is read
@@ -436,7 +518,36 @@ impl ResourceFeedbackService {
   pub fn start<S, A>(
     config: ResourceFeedbackPolicyConfig,
     sensor: S,
-    mut actuator: A,
+    actuator: A,
+  ) -> Result<Self, FeedbackStartError>
+  where
+    S: FeedbackSensor,
+    A: FeedbackActuator,
+  {
+    Self::start_with_tenant(config, sensor, actuator, None)
+  }
+
+  /// Starts the service after reserving its declared shared and thread
+  /// payloads from `tenant`'s Control limit. No initial actuator callback or
+  /// thread is started unless all fixed charges fit.
+  pub fn start_in_tenant<S, A>(
+    config: ResourceFeedbackPolicyConfig,
+    sensor: S,
+    actuator: A,
+    tenant: &TenantDomain,
+  ) -> Result<Self, FeedbackStartError>
+  where
+    S: FeedbackSensor,
+    A: FeedbackActuator,
+  {
+    Self::start_with_tenant(config, sensor, actuator, Some(tenant))
+  }
+
+  fn start_with_tenant<S, A>(
+    config: ResourceFeedbackPolicyConfig,
+    sensor: S,
+    actuator: A,
+    tenant: Option<&TenantDomain>,
   ) -> Result<Self, FeedbackStartError>
   where
     S: FeedbackSensor,
@@ -444,8 +555,23 @@ impl ResourceFeedbackService {
   {
     let policy = ResourceFeedbackPolicy::new(config).map_err(FeedbackStartError::Policy)?;
     let limits = policy.current_limits();
+    let ServiceControlShares {
+      shared: shared_control,
+      worker: worker_control,
+      monitor: monitor_control,
+      owner: owner_control,
+    } = service_control_shares::<S, A>(tenant).map_err(FeedbackStartError::Domain)?;
+    let mut worker_payload = WorkerPayload {
+      policy,
+      sensor,
+      actuator,
+      shared: None,
+      _control: worker_control,
+    };
     for resource in RESOURCES {
-      let result = panic::catch_unwind(AssertUnwindSafe(|| actuator.readback(resource)));
+      let result = panic::catch_unwind(AssertUnwindSafe(|| {
+        worker_payload.actuator.readback(resource)
+      }));
       let actual = match result {
         Ok(Ok(actual)) => actual,
         Ok(Err(error)) => {
@@ -480,41 +606,60 @@ impl ResourceFeedbackService {
         metrics,
       }),
       wakeup: Condvar::new(),
+      _control: shared_control,
     });
+    worker_payload.shared = Some(Arc::clone(&shared));
     let (join_sender, join_receiver) = mpsc::sync_channel(1);
-    let monitor_shared = Arc::clone(&shared);
+    let monitor_payload = JoinMonitorPayload {
+      shared: Arc::clone(&shared),
+      receiver: join_receiver,
+      _control: monitor_control,
+    };
     let join_monitor = thread::Builder::new()
-      .name("allocatbelt-feedback-join".to_owned())
       .spawn(move || {
-        if let Ok(JoinCommand::Worker(worker)) = join_receiver.recv() {
+        let JoinMonitorPayload {
+          shared: monitor_shared,
+          receiver,
+          _control: _monitor_control,
+        } = monitor_payload;
+        if let Ok(JoinCommand::Worker(worker)) = receiver.recv() {
           publish_worker_join(&monitor_shared, worker.join());
         }
       })
       .map_err(FeedbackStartError::ThreadSpawn)?;
-    let worker_shared = Arc::clone(&shared);
-    let worker = match thread::Builder::new()
-      .name("allocatbelt-resource-feedback".to_owned())
-      .spawn(move || {
-        let mut policy = policy;
-        let mut sensor = sensor;
-        let mut actuator = actuator;
-        let run = panic::catch_unwind(AssertUnwindSafe(|| {
-          run_worker(&worker_shared, &mut policy, &mut sensor, &mut actuator)
-        }));
-        if let Err(payload) = run {
-          discard_worker_payload(payload);
-          record_worker_failure(&worker_shared, FeedbackWorkerFailure::Panicked);
-        }
-        let policy_dropped = drop_worker_value(policy);
-        let sensor_dropped = drop_worker_value(sensor);
-        let actuator_dropped = drop_worker_value(actuator);
-        if !policy_dropped || !sensor_dropped || !actuator_dropped {
-          record_worker_failure(
-            &worker_shared,
-            FeedbackWorkerFailure::PayloadCleanupPanicked,
-          );
-        }
-      }) {
+    let worker = match thread::Builder::new().spawn(move || {
+      let WorkerPayload {
+        mut policy,
+        mut sensor,
+        mut actuator,
+        shared: worker_shared,
+        _control: worker_control,
+      } = worker_payload;
+      let Some(worker_shared) = worker_shared else {
+        drop_worker_value(policy);
+        drop_worker_value(sensor);
+        drop_worker_value(actuator);
+        drop(worker_control);
+        return;
+      };
+      let run = panic::catch_unwind(AssertUnwindSafe(|| {
+        run_worker(&worker_shared, &mut policy, &mut sensor, &mut actuator)
+      }));
+      if let Err(payload) = run {
+        discard_worker_payload(payload);
+        record_worker_failure(&worker_shared, FeedbackWorkerFailure::Panicked);
+      }
+      let policy_dropped = drop_worker_value(policy);
+      let sensor_dropped = drop_worker_value(sensor);
+      let actuator_dropped = drop_worker_value(actuator);
+      if !policy_dropped || !sensor_dropped || !actuator_dropped {
+        record_worker_failure(
+          &worker_shared,
+          FeedbackWorkerFailure::PayloadCleanupPanicked,
+        );
+      }
+      drop(worker_control);
+    }) {
       Ok(worker) => worker,
       Err(error) => {
         let _ = join_sender.send(JoinCommand::Stop);
@@ -553,6 +698,7 @@ impl ResourceFeedbackService {
       join_monitor: Some(join_monitor),
       shutdown_error: None,
       panic_payload: Mutex::new(None),
+      _owner_control: owner_control,
     })
   }
 
@@ -1242,6 +1388,7 @@ fn shutdown_error(failure: FeedbackWorkerFailure) -> FeedbackShutdownError {
 
 #[cfg(test)]
 mod tests {
+  use super::super::resource_domain::{DomainResource, DomainResources, ResourceDomain};
   use super::super::resource_feedback_policy::{ACTUATION_COOLDOWN, FeedbackControlConfig};
   use super::*;
   use std::cell::RefCell;
@@ -1664,6 +1811,92 @@ mod tests {
   fn feedback_service_remains_send_and_sync() {
     fn assert_send_sync<T: Send + Sync>() {}
     assert_send_sync::<ResourceFeedbackService>();
+  }
+
+  #[test]
+  fn tenant_service_precharges_before_readbacks_and_retains_shared_metrics_charge() {
+    let ceiling = DomainResources::ZERO.with(DomainResource::Control, 1 << 20);
+    let domain = ResourceDomain::with_waiters(ceiling, 1, 0).unwrap();
+    let tenant = domain.tenant(ceiling).unwrap();
+    let control_before = domain.snapshot().used.get(DomainResource::Control);
+    let shared_bytes = std::mem::size_of::<Shared>();
+    let worker_bytes = std::mem::size_of::<WorkerPayload<TestSensor, TestActuator>>();
+    let monitor_bytes =
+      std::mem::size_of::<JoinMonitorPayload>() + std::mem::size_of::<JoinCommand>();
+    let owner_bytes = ResourceFeedbackService::owner_payload_bytes();
+    let service_bytes = shared_bytes + worker_bytes + monitor_bytes + owner_bytes;
+
+    tenant
+      .set_limits(DomainResources::ZERO.with(DomainResource::Control, 0))
+      .unwrap();
+    let state = ActuatorState::new([100, 100, 100]);
+    let (sensor, sensor_calls) = TestSensor::new(Signal::Neutral);
+    assert!(matches!(
+      ResourceFeedbackService::start_in_tenant(
+        config(),
+        sensor,
+        TestActuator::new(Arc::clone(&state)),
+        &tenant,
+      ),
+      Err(FeedbackStartError::Domain(DomainError::Exhausted(
+        DomainResource::Control
+      )))
+    ));
+    assert_eq!(sensor_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(
+      state
+        .readbacks
+        .iter()
+        .map(|count| count.load(Ordering::SeqCst))
+        .sum::<usize>(),
+      0
+    );
+    assert_eq!(
+      domain.snapshot().used.get(DomainResource::Control),
+      control_before
+    );
+
+    tenant.set_limits(ceiling).unwrap();
+    let mismatch = ActuatorState::new([100, 99, 100]);
+    let (sensor, sensor_calls) = TestSensor::new(Signal::Neutral);
+    assert!(matches!(
+      ResourceFeedbackService::start_in_tenant(
+        config(),
+        sensor,
+        TestActuator::new(Arc::clone(&mismatch)),
+        &tenant,
+      ),
+      Err(FeedbackStartError::InitialLimitMismatch {
+        resource: FeedbackResource::DiskRate,
+        expected: 100,
+        actual: 99,
+      })
+    ));
+    assert_eq!(sensor_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(
+      domain.snapshot().used.get(DomainResource::Control),
+      control_before
+    );
+
+    let state = ActuatorState::new([100, 100, 100]);
+    let (sensor, _) = TestSensor::new(Signal::Neutral);
+    let mut service =
+      ResourceFeedbackService::start_in_tenant(config(), sensor, TestActuator::new(state), &tenant)
+        .unwrap();
+    assert_eq!(
+      domain.snapshot().used.get(DomainResource::Control),
+      control_before + service_bytes
+    );
+    let metrics = service.metrics_handle();
+    stop_and_join(&mut service);
+    drop(service);
+    assert!(wait_until(Duration::from_secs(2), || {
+      domain.snapshot().used.get(DomainResource::Control) == control_before + shared_bytes
+    }));
+    drop(metrics);
+    assert!(wait_until(Duration::from_secs(2), || {
+      domain.snapshot().used.get(DomainResource::Control) == control_before
+    }));
   }
 
   #[test]

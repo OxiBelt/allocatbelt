@@ -11,14 +11,17 @@
 //!
 //! # What is counted
 //!
-//! A buffer is charged the storage length requested from the allocator for
-//! its bytes, which is its retained vector capacity. Clones share that storage
-//! and its one charge, which is released after the storage is freed, when
-//! the last clone is dropped. The charge is not a measure of physical
-//! memory: allocator rounding and metadata, the shared header holding the
-//! storage and its clone count, page residency (RSS) and memory allocated any other way are not counted,
-//! and nothing stops code from allocating outside a scope. Growing a buffer
-//! reserves its entire replacement while the old storage remains charged.
+//! A buffer's Memory charge is its retained vector capacity. Clones share that
+//! storage and its one charge, which is released after the storage is freed,
+//! when the last clone is dropped. A scope from [`ResourceScope::try_from_tenant`]
+//! additionally charges the declared `Ledger` and `Backing` payload sizes to
+//! Control. Legacy [`ResourceScope::new`] and [`ResourceScope::from_tenant`]
+//! retain their previous uncharged metadata behavior. These charges do not
+//! cover allocator headers, Arc control blocks, page residency (RSS), or
+//! memory allocated outside the scope. Initial Backing admission couples its
+//! requested Memory and Control payloads. Growth keeps that one Backing charge
+//! and reserves the complete replacement Memory while the old storage remains
+//! charged.
 //!
 //! A permit holds disk and network operation slots: concurrency counts the
 //! caller declares, released exactly once when the permit is dropped. There
@@ -28,12 +31,13 @@
 //! # Allocation failure
 //!
 //! A buffer's storage is reserved in the ledger first and then allocated
-//! with `Vec::try_reserve_exact`. When the allocator refuses, the
-//! reservation is released and [`ResourceError::OutOfMemory`] returned. The
-//! small shared header of a new buffer is allocated afterwards by
-//! `Arc::new`, and the ledger by [`ResourceScope::new`]; those follow Rust's
-//! usual out-of-memory handling (`handle_alloc_error`, which aborts by
-//! default) instead of returning an error.
+//! with `Vec::try_reserve_exact`. When the allocator refuses, Memory and any
+//! coupled Control reservation are released and [`ResourceError::OutOfMemory`]
+//! is returned. For controlled scopes, the declared Backing payload charge is
+//! reserved before `Arc::new`; Arc allocator headers and allocator failure
+//! for the Arc or ledger follow Rust's usual out-of-memory handling
+//! (`handle_alloc_error`, which aborts by default) instead of returning an
+//! error.
 //!
 //! # Locks
 //!
@@ -49,7 +53,7 @@ use std::ops::Deref;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use super::resource_domain::{
-  DomainError, DomainReservation, DomainResource, DomainResources, TenantDomain,
+  ControlCharge, DomainError, DomainReservation, DomainResource, DomainResources, TenantDomain,
 };
 
 #[cfg(all(test, loom))]
@@ -60,7 +64,7 @@ mod model;
 mod domain_model {
   use loom::thread;
 
-  use super::{ResourceLimits, ResourceScope, domain_memory};
+  use super::{Backing, Ledger, ResourceError, ResourceLimits, ResourceScope, domain_memory};
   use crate::runtime::resource_domain::{DomainResource, DomainResources, ResourceDomain};
 
   #[test]
@@ -95,6 +99,57 @@ mod domain_model {
       drop(left);
       drop(right);
       assert_eq!(domain.snapshot().used.get(DomainResource::Memory), 0);
+    });
+  }
+
+  #[test]
+  fn loom_controlled_backings_admit_memory_and_control_as_one_vector() {
+    loom::model(|| {
+      let scope_bytes = std::mem::size_of::<Ledger>();
+      let backing_bytes = std::mem::size_of::<Backing>();
+      let ceiling = DomainResources::ZERO
+        .with(DomainResource::Memory, 16)
+        .with(DomainResource::Control, 1 << 16);
+      let domain = ResourceDomain::with_waiters(ceiling, 1, 0).unwrap();
+      let tenant_ceiling = ceiling
+        .with(DomainResource::Memory, 16)
+        .with(DomainResource::Control, scope_bytes + backing_bytes);
+      let tenant = domain.tenant(tenant_ceiling).unwrap();
+      tenant.set_limits(tenant_ceiling).unwrap();
+      let baseline_control = domain.snapshot().used.get(DomainResource::Control);
+      let scope = ResourceScope::try_from_tenant(
+        ResourceLimits {
+          managed_memory: 32,
+          ..ResourceLimits::default()
+        },
+        tenant,
+      )
+      .unwrap();
+
+      let first_scope = scope.clone();
+      let second_scope = scope.clone();
+      let first = thread::spawn(move || first_scope.try_alloc_zeroed(8));
+      let second = thread::spawn(move || second_scope.try_alloc_zeroed(8));
+      let first = first.join().unwrap();
+      let second = second.join().unwrap();
+      let (buffer, rejected) = match (first, second) {
+        (Ok(buffer), Err(error)) | (Err(error), Ok(buffer)) => (buffer, error),
+        (Ok(_), Ok(_)) => panic!("both controlled allocations were admitted"),
+        (Err(first), Err(_second)) => panic!("both controlled allocations failed: {first:?}"),
+      };
+      assert_eq!(rejected, ResourceError::DomainControlExhausted);
+      assert_eq!(domain.snapshot().used.get(DomainResource::Memory), 8);
+      assert_eq!(
+        domain.snapshot().used.get(DomainResource::Control),
+        baseline_control + scope_bytes + backing_bytes
+      );
+      drop(buffer);
+      drop(scope);
+      assert_eq!(domain.snapshot().used.get(DomainResource::Memory), 0);
+      assert_eq!(
+        domain.snapshot().used.get(DomainResource::Control),
+        baseline_control
+      );
     });
   }
 }
@@ -166,8 +221,8 @@ pub enum ResourceError {
   /// The attached tenant has closed admission. Existing charges remain live
   /// until their buffers and permits are dropped.
   Closed,
-  /// The attached domain could not track another live reservation because
-  /// its fixed control-reservation count was exhausted.
+  /// The domain could not admit charged metadata or another fixed control
+  /// reservation.
   DomainControlExhausted,
   /// The attached domain refused admission for a condition outside the
   /// managed memory, disk and network resource kinds.
@@ -229,6 +284,9 @@ struct Ledger {
   memory: usize,
   disk: usize,
   network: usize,
+  // A controlled tenant scope accounts for this shared ledger payload. The
+  // charge lives here so buffers and permits retain it through their Arc.
+  _control: Option<ControlCharge>,
 }
 
 /// `used + request` when it is at most `limit`, otherwise `Exhausted`.
@@ -246,11 +304,16 @@ fn add_within(
 
 impl Ledger {
   const fn new(limits: ResourceLimits) -> Self {
+    Self::new_with_control(limits, None)
+  }
+
+  const fn new_with_control(limits: ResourceLimits, control: Option<ControlCharge>) -> Self {
     Self {
       limits,
       memory: 0,
       disk: 0,
       network: 0,
+      _control: control,
     }
   }
 
@@ -342,6 +405,7 @@ fn lock(ledger: &Mutex<Ledger>) -> MutexGuard<'_, Ledger> {
 pub struct ResourceScope {
   ledger: Arc<Mutex<Ledger>>,
   tenant: Option<TenantDomain>,
+  control_metadata: bool,
 }
 
 impl ResourceScope {
@@ -352,6 +416,7 @@ impl ResourceScope {
     Self {
       ledger: Arc::new(Mutex::new(Ledger::new(limits))),
       tenant: None,
+      control_metadata: false,
     }
   }
 
@@ -365,13 +430,37 @@ impl ResourceScope {
   /// tenant generation cannot be recycled while any bounded handle remains.
   /// Closing the tenant rejects new positive memory reservations and operation
   /// permits while existing buffers and permits continue to hold their
-  /// reservations until their actual drop.
+  /// reservations until their actual drop. This legacy constructor does not
+  /// charge the scope or backing payloads to `Control`; use
+  /// [`ResourceScope::try_from_tenant`] for metadata accounting.
   #[must_use]
   pub fn from_tenant(limits: ResourceLimits, tenant: TenantDomain) -> Self {
     Self {
       ledger: Arc::new(Mutex::new(Ledger::new(limits))),
       tenant: Some(tenant),
+      control_metadata: false,
     }
+  }
+
+  /// Creates a tenant-bound scope that charges its shared ledger and each
+  /// live buffer backing to `Control` in addition to declared resource use.
+  ///
+  /// The ledger payload is reserved before its `Arc` allocation. Initial
+  /// Backing admission reserves requested Memory and known Backing Control
+  /// payloads together in the domain's atomic vector; growth retains that one
+  /// Backing charge while reserving complete replacement Memory. The charges
+  /// follow the last buffer clone, even if every scope handle is dropped. Arc
+  /// allocator headers and allocations outside this scope remain unmeasured.
+  pub fn try_from_tenant(
+    limits: ResourceLimits,
+    tenant: TenantDomain,
+  ) -> Result<Self, DomainError> {
+    let control = ControlCharge::try_new(Some(&tenant), std::mem::size_of::<Ledger>())?;
+    Ok(Self {
+      ledger: Arc::new(Mutex::new(Ledger::new_with_control(limits, Some(control)))),
+      tenant: Some(tenant),
+      control_metadata: true,
+    })
   }
 
   /// The shared tenant used for global admission, when this scope is bound.
@@ -379,6 +468,12 @@ impl ResourceScope {
   #[must_use]
   pub fn tenant_domain(&self) -> Option<&TenantDomain> {
     self.tenant.as_ref()
+  }
+
+  /// Whether this scope's shared ledger and Backing payloads consume Control.
+  #[must_use]
+  pub(crate) const fn is_control_accounted(&self) -> bool {
+    self.control_metadata
   }
 
   /// The limits the scope was created with.
@@ -414,7 +509,9 @@ impl ResourceScope {
       charged: 0,
       ledger: Arc::clone(&self.ledger),
       domain_charges: empty_domain_charges(),
+      backing_control: None,
       tenant: self.tenant.clone(),
+      control_metadata: self.is_control_accounted(),
     };
     backing.try_resize(len)?;
     Ok(ManagedBuf {
@@ -526,7 +623,11 @@ struct Backing {
   // capacity the allocator returned beyond that length. New tickets replace
   // this fixed array during growth; the list cannot grow with resize history.
   domain_charges: [Option<DomainReservation>; 2],
+  // The Backing payload is allocated once and reused by uniquely owned Vec
+  // growth, so its Control ticket is separate from replaceable Memory.
+  backing_control: Option<ControlCharge>,
   tenant: Option<TenantDomain>,
+  control_metadata: bool,
 }
 
 fn empty_domain_charges() -> [Option<DomainReservation>; 2] {
@@ -535,6 +636,12 @@ fn empty_domain_charges() -> [Option<DomainReservation>; 2] {
 
 fn domain_memory(bytes: usize) -> DomainResources {
   DomainResources::ZERO.with(DomainResource::Memory, bytes)
+}
+
+fn domain_backing(memory_bytes: usize, control_bytes: usize) -> DomainResources {
+  DomainResources::ZERO
+    .with(DomainResource::Memory, memory_bytes)
+    .with(DomainResource::Control, control_bytes)
 }
 
 fn domain_ops(request: OperationRequest) -> DomainResources {
@@ -560,9 +667,9 @@ fn map_domain_error(error: DomainError) -> ResourceError {
     DomainError::Exhausted(DomainResource::Network) => {
       ResourceError::Exhausted(ResourceKind::Network)
     }
-    DomainError::Exhausted(DomainResource::Control) | DomainError::WaitersFull => {
-      ResourceError::DomainControlExhausted
-    }
+    DomainError::AboveCeiling(DomainResource::Control)
+    | DomainError::Exhausted(DomainResource::Control)
+    | DomainError::WaitersFull => ResourceError::DomainControlExhausted,
     // Managed scopes never request CPU, tasks or control. Keep every
     // unexpected domain refusal visible as a typed error rather than
     // bypassing domain admission.
@@ -570,9 +677,7 @@ fn map_domain_error(error: DomainError) -> ResourceError {
     | DomainError::OutOfMemory
     | DomainError::TenantsFull
     | DomainError::GenerationExhausted
-    | DomainError::AboveCeiling(
-      DomainResource::Cpu | DomainResource::Tasks | DomainResource::Control,
-    )
+    | DomainError::AboveCeiling(DomainResource::Cpu | DomainResource::Tasks)
     | DomainError::Exhausted(DomainResource::Cpu | DomainResource::Tasks) => {
       ResourceError::DomainAdmission
     }
@@ -584,6 +689,20 @@ impl Backing {
   /// [`ManagedBuf::try_resize`]. On an error nothing has changed.
   fn try_resize(&mut self, new_len: usize) -> Result<(), ResourceError> {
     if new_len <= self.charged {
+      if self.control_metadata && self.backing_control.is_none() {
+        let Some(tenant) = &self.tenant else {
+          return Err(ResourceError::DomainAdmission);
+        };
+        let control_bytes = std::mem::size_of::<Backing>();
+        let ticket = tenant
+          .try_acquire(domain_backing(0, control_bytes))
+          .map_err(map_domain_error)?;
+        self.backing_control = Some(ControlCharge::from_ticket(
+          Some(tenant),
+          ticket,
+          control_bytes,
+        ));
+      }
       // Capacity is already charged, so this neither reserves nor reallocates.
       self.storage.resize(new_len, 0);
       return Ok(());
@@ -595,9 +714,39 @@ impl Backing {
     // only a size delta would undercount the moving allocation's peak.
     lock(&self.ledger).reserve_memory(new_len, new_len)?;
     let mut domain_charges = empty_domain_charges();
+    let mut backing_control = None;
     if let Some(tenant) = &self.tenant {
-      match tenant.try_acquire(domain_memory(new_len)) {
-        Ok(reservation) => domain_charges[0] = Some(reservation),
+      let control_bytes = if self.control_metadata && self.backing_control.is_none() {
+        std::mem::size_of::<Backing>()
+      } else {
+        0
+      };
+      match tenant.try_acquire(domain_backing(new_len, control_bytes)) {
+        Ok(mut reservation) => {
+          if control_bytes != 0 {
+            match reservation
+              .split_off(DomainResources::ZERO.with(DomainResource::Control, control_bytes))
+            {
+              Ok(ticket) => {
+                backing_control = Some(ControlCharge::from_ticket(
+                  Some(tenant),
+                  ticket,
+                  control_bytes,
+                ));
+              }
+              Err(error) => {
+                drop(reservation);
+                self.release(new_len);
+                return Err(map_domain_error(error));
+              }
+            }
+          }
+          if new_len != 0 {
+            domain_charges[0] = Some(reservation);
+          } else {
+            drop(reservation);
+          }
+        }
         Err(error) => {
           self.release(new_len);
           return Err(map_domain_error(error));
@@ -639,6 +788,10 @@ impl Backing {
     let old_storage = std::mem::replace(&mut self.storage, replacement);
     let old_domain_charges = std::mem::replace(&mut self.domain_charges, domain_charges);
     self.charged = capacity;
+    if let Some(control) = backing_control {
+      debug_assert!(self.backing_control.is_none());
+      self.backing_control = Some(control);
+    }
     drop(old_storage);
     self.release(old_charge);
     // Ticket drops take the domain mutex, so keep them outside the local
@@ -760,6 +913,9 @@ mod tests {
 
   use super::{Ledger, MAX_STORAGE, ManagedBuf, OperationPermit, OperationRequest};
   use super::{ResourceError, ResourceKind, ResourceLimits, ResourceScope};
+  use crate::runtime::resource_domain::{
+    DomainError, DomainResource, DomainResources, ResourceDomain,
+  };
 
   const MEMORY: ResourceKind = ResourceKind::Memory;
   const DISK: ResourceKind = ResourceKind::Disk;
@@ -789,6 +945,152 @@ mod tests {
     check::<ResourceScope>();
     check::<ManagedBuf>();
     check::<OperationPermit>();
+  }
+
+  #[test]
+  fn controlled_scope_and_zero_length_backing_charge_until_last_clone() {
+    let ceiling = DomainResources::ZERO
+      .with(DomainResource::Memory, 256)
+      .with(DomainResource::Control, 1 << 20);
+    let domain = ResourceDomain::with_waiters(ceiling, 1, 0).unwrap();
+    let tenant = domain.tenant(ceiling).unwrap();
+    let control_before = domain.snapshot().used.get(DomainResource::Control);
+    let scope_control = std::mem::size_of::<Ledger>();
+    let backing_control = std::mem::size_of::<super::Backing>();
+    tenant
+      .set_limits(DomainResources::ZERO.with(DomainResource::Control, 0))
+      .unwrap();
+    assert_eq!(
+      ResourceScope::try_from_tenant(limits(128, 0, 0), tenant.clone()).map(drop),
+      Err(DomainError::Exhausted(DomainResource::Control))
+    );
+    assert_eq!(
+      domain.snapshot().used.get(DomainResource::Control),
+      control_before
+    );
+    tenant.set_limits(ceiling).unwrap();
+    let scope = ResourceScope::try_from_tenant(limits(128, 0, 0), tenant).unwrap();
+    assert!(scope.is_control_accounted());
+    assert_eq!(
+      domain.snapshot().used.get(DomainResource::Control),
+      control_before + scope_control
+    );
+
+    let empty = scope.try_alloc_zeroed(0).unwrap();
+    assert_eq!(empty.charged_bytes(), 0);
+    assert_eq!(domain.snapshot().used.get(DomainResource::Memory), 0);
+    assert_eq!(
+      domain.snapshot().used.get(DomainResource::Control),
+      control_before + scope_control + backing_control
+    );
+    let last = empty.clone();
+    drop(scope);
+    drop(empty);
+    assert_eq!(
+      domain.snapshot().used.get(DomainResource::Control),
+      control_before + scope_control + backing_control
+    );
+    drop(last);
+    assert_eq!(domain.snapshot().used.get(DomainResource::Memory), 0);
+    assert_eq!(
+      domain.snapshot().used.get(DomainResource::Control),
+      control_before
+    );
+
+    let legacy_tenant = domain.tenant(ceiling).unwrap();
+    let legacy = ResourceScope::from_tenant(limits(128, 0, 0), legacy_tenant);
+    let legacy_empty = legacy.try_alloc_zeroed(0).unwrap();
+    assert!(!legacy.is_control_accounted());
+    assert_eq!(
+      domain.snapshot().used.get(DomainResource::Control),
+      control_before
+    );
+    drop(legacy_empty);
+    drop(legacy);
+  }
+
+  #[test]
+  fn controlled_control_admission_is_coupled_once_and_growth_reuses_backing_metadata() {
+    let ceiling = DomainResources::ZERO
+      .with(DomainResource::Memory, 1 << 20)
+      .with(DomainResource::Control, 1 << 20);
+    let domain = ResourceDomain::with_waiters(ceiling, 1, 0).unwrap();
+    let tenant = domain.tenant(ceiling).unwrap();
+    let baseline_control = domain.snapshot().used.get(DomainResource::Control);
+    let scope_control = std::mem::size_of::<Ledger>();
+    let backing_control = std::mem::size_of::<super::Backing>();
+    tenant
+      .set_limits(ceiling.with(DomainResource::Control, scope_control))
+      .unwrap();
+    let scope = ResourceScope::try_from_tenant(limits(512, 0, 0), tenant.clone()).unwrap();
+    let scope_charge = domain.snapshot().used.get(DomainResource::Control);
+    assert_eq!(scope_charge, baseline_control + scope_control);
+    assert_eq!(
+      scope.try_alloc_zeroed(32).map(drop),
+      Err(ResourceError::DomainControlExhausted)
+    );
+    assert_eq!(scope.snapshot().managed_memory, 0);
+    assert_eq!(domain.snapshot().used.get(DomainResource::Memory), 0);
+    assert_eq!(
+      domain.snapshot().used.get(DomainResource::Control),
+      scope_charge
+    );
+
+    tenant
+      .set_limits(ceiling.with(DomainResource::Control, scope_control + backing_control))
+      .unwrap();
+    let mut buffer = scope.try_alloc_zeroed(32).unwrap();
+    let old_capacity = buffer.charged_bytes();
+    let memory_before = domain.snapshot().used.get(DomainResource::Memory);
+    let control_before = domain.snapshot().used.get(DomainResource::Control);
+    let local_before = scope.snapshot().managed_memory;
+    let next_len = old_capacity + 1;
+    assert_eq!(
+      control_before,
+      baseline_control + scope_control + backing_control
+    );
+
+    tenant
+      .set_limits(
+        ceiling
+          .with(DomainResource::Memory, old_capacity)
+          .with(DomainResource::Control, scope_control + backing_control),
+      )
+      .unwrap();
+    assert_eq!(
+      buffer.try_resize(next_len),
+      Err(ResourceError::Exhausted(ResourceKind::Memory))
+    );
+    assert_eq!(buffer.len(), 32);
+    assert_eq!(buffer.charged_bytes(), old_capacity);
+    assert_eq!(scope.snapshot().managed_memory, local_before);
+    assert_eq!(
+      domain.snapshot().used.get(DomainResource::Memory),
+      memory_before
+    );
+    assert_eq!(
+      domain.snapshot().used.get(DomainResource::Control),
+      control_before
+    );
+
+    tenant.set_limits(ceiling).unwrap();
+    buffer.try_resize(next_len).unwrap();
+    assert_eq!(buffer.len(), next_len);
+    assert_eq!(
+      domain.snapshot().used.get(DomainResource::Memory),
+      buffer.charged_bytes()
+    );
+    assert_eq!(
+      domain.snapshot().used.get(DomainResource::Control),
+      control_before
+    );
+    drop(buffer);
+    drop(scope);
+    assert_eq!(domain.snapshot().used.get(DomainResource::Memory), 0);
+    assert_eq!(
+      domain.snapshot().used.get(DomainResource::Control),
+      baseline_control
+    );
   }
 
   #[test]

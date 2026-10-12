@@ -179,12 +179,135 @@ where
   A: FeedbackActuator,
 {
   let invalid_policy = ResourceFeedbackPolicy::new(policy).err();
-  let build = Arc::new(move |context| {
+  let build = Arc::new(move |context: FeedbackContext| {
+    let tenant = context.resources.tenant_domain().cloned();
     let (sensor, actuator) = sources(context).map_err(FeedbackFactoryError::Sources)?;
-    ResourceFeedbackService::start(policy, sensor, actuator).map_err(FeedbackFactoryError::Service)
+    match tenant {
+      Some(tenant) => ResourceFeedbackService::start_in_tenant(policy, sensor, actuator, &tenant),
+      None => ResourceFeedbackService::start(policy, sensor, actuator),
+    }
+    .map_err(FeedbackFactoryError::Service)
   });
   FeedbackFactory {
     build,
     invalid_policy,
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+  use std::sync::atomic::{AtomicU64, Ordering};
+  use std::time::{Duration, Instant};
+
+  use crate::runtime::managed::ResourceLimits;
+  use crate::runtime::resource_domain::{DomainResource, DomainResources, ResourceDomain};
+  use crate::runtime::resource_feedback::{
+    FeedbackActuatorError, FeedbackSensorError, FeedbackShutdownProgress,
+  };
+  use crate::runtime::resource_feedback_policy::{
+    FeedbackControlConfig, FeedbackResource, FeedbackSample, PlanTicket,
+  };
+
+  struct QuietSensor;
+
+  impl FeedbackSensor for QuietSensor {
+    fn sample(&mut self) -> Result<FeedbackSample, FeedbackSensorError> {
+      Ok(FeedbackSample::new(Instant::now(), None, None, None))
+    }
+  }
+
+  struct FixedActuator([AtomicU64; 3]);
+
+  impl FixedActuator {
+    fn new() -> Self {
+      Self([
+        AtomicU64::new(16),
+        AtomicU64::new(1000),
+        AtomicU64::new(1000),
+      ])
+    }
+  }
+
+  impl FeedbackActuator for FixedActuator {
+    fn readback(&mut self, resource: FeedbackResource) -> Result<u64, FeedbackActuatorError> {
+      Ok(self.0[resource as usize].load(Ordering::SeqCst))
+    }
+
+    fn apply(&mut self, _ticket: PlanTicket) -> Result<(), FeedbackActuatorError> {
+      Ok(())
+    }
+  }
+
+  fn policy() -> ResourceFeedbackPolicyConfig {
+    ResourceFeedbackPolicyConfig {
+      cpu_concurrency: FeedbackControlConfig::new(4, 16, 64, 3000, 8000),
+      disk_rate: FeedbackControlConfig::new(100, 1000, 2000, 3000, 8000),
+      network_rate: FeedbackControlConfig::new(100, 1000, 2000, 3000, 8000),
+    }
+  }
+
+  fn stable_control_usage(domain: &ResourceDomain, timeout: Duration) -> usize {
+    let deadline = Instant::now() + timeout;
+    let mut previous = None;
+    let mut stable_reads = 0;
+    loop {
+      let current = domain.snapshot().used.get(DomainResource::Control);
+      if previous == Some(current) {
+        stable_reads += 1;
+        if stable_reads == 5 {
+          return current;
+        }
+      } else {
+        previous = Some(current);
+        stable_reads = 0;
+      }
+      assert!(Instant::now() < deadline, "Control usage did not settle");
+      std::thread::sleep(Duration::from_millis(1));
+    }
+  }
+
+  #[test]
+  fn tenant_bound_feedback_factory_uses_charged_service_startup() {
+    let ceiling = DomainResources::ZERO.with(DomainResource::Control, 1 << 20);
+    let domain = ResourceDomain::with_waiters(ceiling, 1, 0).unwrap();
+    let tenant = domain.tenant(ceiling).unwrap();
+    let before = domain.snapshot().used.get(DomainResource::Control);
+    let resources = ResourceScope::from_tenant(ResourceLimits::default(), tenant);
+    let context = FeedbackContext {
+      resources,
+      disk_rate: None,
+      upload_rate: None,
+      download_rate: None,
+      disk_meter: IoFeedbackMeter::new(),
+      upload_meter: IoFeedbackMeter::new(),
+      download_meter: IoFeedbackMeter::new(),
+      runtime_metrics: None,
+    };
+    let factory = feedback_sources(policy(), |_| Ok((QuietSensor, FixedActuator::new())));
+    let mut service = factory.build(context).unwrap();
+    assert!(domain.snapshot().used.get(DomainResource::Control) > before);
+
+    service.request_stop();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+      match service.try_shutdown() {
+        Ok(FeedbackShutdownProgress::Complete) => break,
+        Ok(FeedbackShutdownProgress::Pending) => {
+          assert!(Instant::now() < deadline, "factory service did not stop");
+          std::thread::yield_now();
+        }
+        Err(error) => panic!("factory service failed to stop: {error}"),
+      }
+    }
+    let metrics = service.metrics_handle();
+    drop(service);
+    let retained = stable_control_usage(&domain, Duration::from_secs(2));
+    assert!(retained > before);
+    drop(metrics);
+    assert_eq!(
+      stable_control_usage(&domain, Duration::from_secs(2)),
+      before
+    );
   }
 }

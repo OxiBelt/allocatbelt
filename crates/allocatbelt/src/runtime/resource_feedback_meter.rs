@@ -12,6 +12,8 @@ use std::fmt;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Instant;
 
+use super::resource_domain::{ControlCharge, DomainError, TenantDomain};
+
 /// Latched meter diagnostics. Any set field makes a snapshot unusable for
 /// feedback until the unattached meter is explicitly reset.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -74,6 +76,7 @@ struct State {
 
 struct Shared {
   state: Mutex<State>,
+  _control: ControlCharge,
 }
 
 fn lock_state(shared: &Shared) -> MutexGuard<'_, State> {
@@ -94,9 +97,22 @@ impl IoFeedbackMeter {
   /// Creates an empty meter with no attached endpoint sources.
   #[must_use]
   pub fn new() -> Self {
+    Self::with_control(ControlCharge::unbounded(std::mem::size_of::<Shared>()))
+  }
+
+  /// Creates an empty meter whose shared counter payload is charged to the
+  /// tenant's Control limit until its final clone or endpoint registration
+  /// drops.
+  pub fn new_in_tenant(tenant: &TenantDomain) -> Result<Self, DomainError> {
+    let control = ControlCharge::try_new(Some(tenant), std::mem::size_of::<Shared>())?;
+    Ok(Self::with_control(control))
+  }
+
+  fn with_control(control: ControlCharge) -> Self {
     Self {
       shared: Arc::new(Shared {
         state: Mutex::new(State::default()),
+        _control: control,
       }),
     }
   }
@@ -253,6 +269,48 @@ impl Drop for IoFeedbackRegistration {
 #[cfg(test)]
 mod tests {
   use super::*;
+  use crate::runtime::resource_domain::{DomainResource, DomainResources, ResourceDomain};
+
+  #[test]
+  fn tenant_charge_lives_through_meter_clones_and_final_registration() {
+    let limits = DomainResources::ZERO.with(DomainResource::Control, 1 << 20);
+    let domain = ResourceDomain::with_waiters(limits, 1, 0).unwrap();
+    let tenant = domain.tenant(limits).unwrap();
+    let before = domain.snapshot().used.get(DomainResource::Control);
+    let shared_bytes = std::mem::size_of::<Shared>();
+    let meter = IoFeedbackMeter::new_in_tenant(&tenant).unwrap();
+    assert_eq!(
+      domain.snapshot().used.get(DomainResource::Control),
+      before + shared_bytes
+    );
+
+    let clone = meter.clone();
+    let registration = meter.register_source();
+    drop(meter);
+    drop(clone);
+    assert_eq!(
+      domain.snapshot().used.get(DomainResource::Control),
+      before + shared_bytes
+    );
+    drop(registration);
+    assert_eq!(domain.snapshot().used.get(DomainResource::Control), before);
+  }
+
+  #[test]
+  fn tenant_control_rejection_leaves_meter_unallocated() {
+    let limits = DomainResources::ZERO.with(DomainResource::Control, 1 << 20);
+    let domain = ResourceDomain::with_waiters(limits, 1, 0).unwrap();
+    let tenant = domain.tenant(limits).unwrap();
+    tenant
+      .set_limits(DomainResources::ZERO.with(DomainResource::Control, 0))
+      .unwrap();
+    let before = domain.snapshot().used.get(DomainResource::Control);
+    assert_eq!(
+      IoFeedbackMeter::new_in_tenant(&tenant).map(drop),
+      Err(DomainError::Exhausted(DomainResource::Control))
+    );
+    assert_eq!(domain.snapshot().used.get(DomainResource::Control), before);
+  }
 
   #[test]
   fn shared_sources_count_until_each_registration_drops() {

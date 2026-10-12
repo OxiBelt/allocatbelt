@@ -3,6 +3,8 @@
 //! Reserve before starting I/O. A reservation owns its bucket and refunds
 //! unused bytes on cancellation or partial completion. Bytes committed by a
 //! syscall remain spent. This limits application bytes, not physical traffic.
+//! [`ByteRateLimit::new_in_tenant`] charges the declared shared State payload
+//! to the tenant's Control limit; legacy [`ByteRateLimit::new`] is uncharged.
 
 #![forbid(unsafe_code)]
 #![cfg_attr(not(test), deny(clippy::expect_used, clippy::unwrap_used))]
@@ -10,6 +12,8 @@
 use std::fmt;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+
+use super::resource_domain::{ControlCharge, DomainError, TenantDomain};
 
 const NANOS: u128 = 1_000_000_000;
 
@@ -40,6 +44,8 @@ pub enum ByteRateError {
   AboveCeiling,
   /// A claimed completion exceeds the original reservation.
   Overcommitted,
+  /// The tenant domain could not admit this bucket's bounded metadata.
+  Domain(DomainError),
 }
 
 impl fmt::Display for ByteRateError {
@@ -48,7 +54,14 @@ impl fmt::Display for ByteRateError {
   }
 }
 
-impl std::error::Error for ByteRateError {}
+impl std::error::Error for ByteRateError {
+  fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+    match self {
+      Self::Domain(error) => Some(error),
+      _ => None,
+    }
+  }
+}
 
 /// A coherent snapshot taken under the bucket lock.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -70,6 +83,7 @@ struct State {
   reserved: usize,
   reservations: usize,
   last: Instant,
+  _control: ControlCharge,
 }
 
 impl State {
@@ -112,6 +126,21 @@ impl State {
   }
 }
 
+fn validate_config(config: ByteRateConfig) -> Result<(), ByteRateError> {
+  if config.bytes_per_second == 0
+    || config.burst_bytes == 0
+    || config.max_reservations == 0
+    || config
+      .burst_bytes
+      .checked_mul(config.max_reservations)
+      .is_none()
+  {
+    Err(ByteRateError::InvalidConfig)
+  } else {
+    Ok(())
+  }
+}
+
 /// A clonable bucket with no unbounded waiter queue.
 #[derive(Clone)]
 pub struct ByteRateLimit {
@@ -129,17 +158,25 @@ impl fmt::Debug for ByteRateLimit {
 impl ByteRateLimit {
   /// Creates a full bucket and fixes its hard ceilings.
   pub fn new(config: ByteRateConfig) -> Result<Self, ByteRateError> {
-    if config.bytes_per_second == 0
-      || config.burst_bytes == 0
-      || config.max_reservations == 0
-      || config
-        .burst_bytes
-        .checked_mul(config.max_reservations)
-        .is_none()
-    {
-      return Err(ByteRateError::InvalidConfig);
-    }
-    Ok(Self {
+    validate_config(config)?;
+    let control = ControlCharge::unbounded(std::mem::size_of::<State>());
+    Ok(Self::with_control(config, control))
+  }
+
+  /// Creates a full bucket charged to `tenant`'s Control limit until the
+  /// bucket and every outstanding reservation release its shared state.
+  pub fn new_in_tenant(
+    config: ByteRateConfig,
+    tenant: &TenantDomain,
+  ) -> Result<Self, ByteRateError> {
+    validate_config(config)?;
+    let control = ControlCharge::try_new(Some(tenant), std::mem::size_of::<State>())
+      .map_err(ByteRateError::Domain)?;
+    Ok(Self::with_control(config, control))
+  }
+
+  fn with_control(config: ByteRateConfig, control: ControlCharge) -> Self {
+    Self {
       shared: Arc::new(Mutex::new(State {
         ceilings: config,
         rate: config.bytes_per_second,
@@ -149,8 +186,9 @@ impl ByteRateLimit {
         reserved: 0,
         reservations: 0,
         last: Instant::now(),
+        _control: control,
       })),
-    })
+    }
   }
 
   /// Reserves exactly `bytes` before an operation. A zero-length request
@@ -343,6 +381,7 @@ impl Drop for ByteReservation {
 #[cfg(test)]
 mod tests {
   use super::*;
+  use crate::runtime::resource_domain::{DomainResource, DomainResources, ResourceDomain};
 
   fn bucket(rate: u64, burst: usize, entries: usize) -> ByteRateLimit {
     ByteRateLimit::new(ByteRateConfig {
@@ -351,6 +390,73 @@ mod tests {
       max_reservations: entries,
     })
     .unwrap()
+  }
+
+  #[test]
+  fn tenant_bucket_charge_survives_clones_and_final_reservation() {
+    let limits = DomainResources::ZERO.with(DomainResource::Control, 1 << 20);
+    let domain = ResourceDomain::with_waiters(limits, 1, 0).unwrap();
+    let tenant = domain.tenant(limits).unwrap();
+    let before = domain.snapshot().used.get(DomainResource::Control);
+    let state_bytes = std::mem::size_of::<State>();
+    let limit = ByteRateLimit::new_in_tenant(
+      ByteRateConfig {
+        bytes_per_second: 10,
+        burst_bytes: 32,
+        max_reservations: 2,
+      },
+      &tenant,
+    )
+    .unwrap();
+    assert_eq!(
+      domain.snapshot().used.get(DomainResource::Control),
+      before + state_bytes
+    );
+
+    let clone = limit.clone();
+    let reservation = clone.try_reserve(8).unwrap();
+    drop(limit);
+    drop(clone);
+    assert_eq!(
+      domain.snapshot().used.get(DomainResource::Control),
+      before + state_bytes
+    );
+    drop(reservation);
+    assert_eq!(domain.snapshot().used.get(DomainResource::Control), before);
+  }
+
+  #[test]
+  fn tenant_bucket_control_rejection_precedes_shared_allocation() {
+    let limits = DomainResources::ZERO.with(DomainResource::Control, 1 << 20);
+    let domain = ResourceDomain::with_waiters(limits, 1, 0).unwrap();
+    let tenant = domain.tenant(limits).unwrap();
+    let before = domain.snapshot().used.get(DomainResource::Control);
+    let invalid = ByteRateConfig {
+      bytes_per_second: 0,
+      burst_bytes: 32,
+      max_reservations: 2,
+    };
+    assert_eq!(
+      ByteRateLimit::new_in_tenant(invalid, &tenant).map(drop),
+      Err(ByteRateError::InvalidConfig)
+    );
+    tenant
+      .set_limits(DomainResources::ZERO.with(DomainResource::Control, 0))
+      .unwrap();
+    assert!(matches!(
+      ByteRateLimit::new_in_tenant(
+        ByteRateConfig {
+          bytes_per_second: 10,
+          burst_bytes: 32,
+          max_reservations: 2,
+        },
+        &tenant
+      ),
+      Err(ByteRateError::Domain(DomainError::Exhausted(
+        DomainResource::Control
+      )))
+    ));
+    assert_eq!(domain.snapshot().used.get(DomainResource::Control), before);
   }
 
   #[test]
