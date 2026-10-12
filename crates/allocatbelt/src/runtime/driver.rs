@@ -10,9 +10,23 @@
 //! The signal driver is a process-wide permanent bridge. A facade can expose
 //! subscriptions through it, but its shutdown status does not claim that the
 //! global bridge has stopped.
+//!
+//! Bucket reservation tables and rate-timer wait registrations use configured
+//! bounds, while caller-created endpoint objects remain caller-controlled.
+//! The facade does not currently charge its feedback state, meters, buckets,
+//! or private rate-timer metadata to `ResourceDomain::Control`.
 
 #![forbid(unsafe_code)]
 #![cfg_attr(not(test), deny(clippy::expect_used, clippy::unwrap_used))]
+
+#[cfg(feature = "resource-feedback")]
+#[path = "driver_feedback.rs"]
+mod feedback;
+
+#[cfg(feature = "resource-feedback")]
+use feedback::FeedbackMeters;
+#[cfg(feature = "resource-feedback")]
+pub use feedback::{FeedbackContext, FeedbackFactory, FeedbackFactoryError, feedback_sources};
 
 use std::fmt;
 use std::future::Future;
@@ -27,10 +41,20 @@ use super::asynchronous::{
 };
 use super::byte_rate::{ByteRateConfig, ByteRateError, ByteRateLimit};
 use super::fs::FsHandle;
+#[cfg(not(loom))]
+use super::io::{AsyncRead, AsyncWrite};
 use super::managed::{ResourceLimits, ResourceScope};
 use super::process::{ProcessBuildError, ProcessDriver, ProcessShutdownError, ProcessShutdownMode};
+#[cfg(not(loom))]
+use super::rate_io::{RateIoFailure, RateLimitedIo};
 use super::reactor::{Reactor, ReactorConfig, ReactorError, ReactorHandle};
 use super::resource_domain::TenantDomain;
+#[cfg(feature = "resource-feedback")]
+use super::resource_feedback::{
+  FeedbackMetricsHandle, FeedbackShutdownError, FeedbackShutdownProgress, ResourceFeedbackService,
+};
+#[cfg(feature = "resource-feedback")]
+use super::resource_feedback_meter::IoFeedbackMeter;
 use super::signal::{SignalDriver, SignalError};
 use super::time::{ClockMode, IdleCoordinator, TimerDriver, TimerError, TimerHandle};
 use super::{Config as BlockingConfig, Handle as BlockingHandle, Runtime as BlockingRuntime};
@@ -69,6 +93,9 @@ pub enum DriverShutdownError {
   Timer(TimerError),
   /// Reactor service or close worker failed.
   Reactor(ReactorError),
+  /// Autonomous feedback service failed while stopping.
+  #[cfg(feature = "resource-feedback")]
+  Feedback(FeedbackShutdownError),
 }
 
 impl fmt::Display for DriverShutdownError {
@@ -83,6 +110,8 @@ impl fmt::Display for DriverShutdownError {
       Self::Process(error) => error.fmt(f),
       Self::Timer(error) => error.fmt(f),
       Self::Reactor(error) => error.fmt(f),
+      #[cfg(feature = "resource-feedback")]
+      Self::Feedback(error) => error.fmt(f),
     }
   }
 }
@@ -113,6 +142,9 @@ pub enum DriverBuildError {
   Signal(SignalError),
   /// A directional application-byte bucket has invalid bounds.
   ByteRate(ByteRateError),
+  /// An opt-in feedback factory or its service failed during startup.
+  #[cfg(feature = "resource-feedback")]
+  Feedback(FeedbackFactoryError),
 }
 
 impl fmt::Display for DriverBuildError {
@@ -130,6 +162,8 @@ impl fmt::Display for DriverBuildError {
       Self::Process(error) => error.fmt(f),
       Self::Signal(error) => error.fmt(f),
       Self::ByteRate(error) => error.fmt(f),
+      #[cfg(feature = "resource-feedback")]
+      Self::Feedback(error) => error.fmt(f),
     }
   }
 }
@@ -144,9 +178,181 @@ impl std::error::Error for DriverBuildError {
       Self::Signal(error) => Some(error),
       Self::Timer(error) => Some(error),
       Self::ByteRate(error) => Some(error),
+      #[cfg(feature = "resource-feedback")]
+      Self::Feedback(error) => Some(error),
       Self::InvalidConfiguration(_) | Self::FilesystemNeedsBlocking => None,
     }
   }
+}
+
+/// Why a facade could not construct a rate-limited stream.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum DriverRateIoFailure {
+  /// Neither upload nor download admission was configured.
+  MissingUploadAndDownloadRates,
+  /// Download/read admission was not configured.
+  MissingDownloadRate,
+  /// Upload/write admission was not configured.
+  MissingUploadRate,
+  /// Disk application-byte admission was not configured.
+  MissingDiskRate,
+  /// The builder did not create its private fixed real-clock timer.
+  MissingRateTimer,
+  /// The underlying rate adapter rejected its construction inputs.
+  Adapter(RateIoFailure),
+}
+
+/// Recoverable original endpoint from a facade rate-I/O construction failure.
+pub struct DriverRateIoError<T> {
+  inner: T,
+  failure: DriverRateIoFailure,
+}
+
+impl<T> DriverRateIoError<T> {
+  /// Why rate-limited I/O could not be constructed.
+  #[must_use]
+  pub const fn failure(&self) -> DriverRateIoFailure {
+    self.failure
+  }
+
+  /// Returns the original endpoint unchanged.
+  #[must_use]
+  pub fn into_inner(self) -> T {
+    self.inner
+  }
+}
+
+impl<T: fmt::Debug> fmt::Debug for DriverRateIoError<T> {
+  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    f.debug_struct("DriverRateIoError")
+      .field("failure", &self.failure)
+      .field("inner", &self.inner)
+      .finish()
+  }
+}
+
+impl<T: fmt::Debug> fmt::Display for DriverRateIoError<T> {
+  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    write!(f, "could not construct driver rate I/O: {:?}", self.failure)
+  }
+}
+
+impl<T: fmt::Debug> std::error::Error for DriverRateIoError<T> {}
+
+#[cfg(feature = "resource-feedback")]
+fn poll_feedback_service(
+  service: Option<&mut ResourceFeedbackService>,
+  failure: &mut Option<DriverShutdownError>,
+) -> bool {
+  let Some(service) = service else {
+    return true;
+  };
+  match service.try_shutdown() {
+    Ok(FeedbackShutdownProgress::Complete) => true,
+    Ok(FeedbackShutdownProgress::Pending) => false,
+    Err(error) => {
+      failure.get_or_insert(DriverShutdownError::Feedback(error));
+      service.is_shutdown_complete()
+    }
+  }
+}
+
+#[cfg(not(loom))]
+fn build_rate_io<T: AsyncRead + AsyncWrite + Unpin>(
+  inner: T,
+  download_rate: Option<ByteRateLimit>,
+  upload_rate: Option<ByteRateLimit>,
+  timer: Option<TimerHandle>,
+  #[cfg(feature = "resource-feedback")] feedback_meters: Option<&FeedbackMeters>,
+) -> Result<RateLimitedIo<T>, DriverRateIoError<T>> {
+  let (read_rate, write_rate) = match (download_rate, upload_rate) {
+    (Some(read_rate), Some(write_rate)) => (read_rate, write_rate),
+    (None, None) => {
+      return Err(DriverRateIoError {
+        inner,
+        failure: DriverRateIoFailure::MissingUploadAndDownloadRates,
+      });
+    }
+    (None, Some(_)) => {
+      return Err(DriverRateIoError {
+        inner,
+        failure: DriverRateIoFailure::MissingDownloadRate,
+      });
+    }
+    (Some(_), None) => {
+      return Err(DriverRateIoError {
+        inner,
+        failure: DriverRateIoFailure::MissingUploadRate,
+      });
+    }
+  };
+  let Some(timer) = timer else {
+    return Err(DriverRateIoError {
+      inner,
+      failure: DriverRateIoFailure::MissingRateTimer,
+    });
+  };
+  finish_rate_io(
+    inner,
+    read_rate,
+    write_rate,
+    timer,
+    #[cfg(feature = "resource-feedback")]
+    feedback_meters.map(|meters| (meters.download.clone(), meters.upload.clone())),
+  )
+}
+
+#[cfg(not(loom))]
+fn build_disk_io<T: AsyncRead + AsyncWrite + Unpin>(
+  inner: T,
+  disk_rate: Option<ByteRateLimit>,
+  timer: Option<TimerHandle>,
+  #[cfg(feature = "resource-feedback")] feedback_meters: Option<&FeedbackMeters>,
+) -> Result<RateLimitedIo<T>, DriverRateIoError<T>> {
+  let Some(disk_rate) = disk_rate else {
+    return Err(DriverRateIoError {
+      inner,
+      failure: DriverRateIoFailure::MissingDiskRate,
+    });
+  };
+  let Some(timer) = timer else {
+    return Err(DriverRateIoError {
+      inner,
+      failure: DriverRateIoFailure::MissingRateTimer,
+    });
+  };
+  finish_rate_io(
+    inner,
+    disk_rate.clone(),
+    disk_rate,
+    timer,
+    #[cfg(feature = "resource-feedback")]
+    feedback_meters.map(|meters| (meters.disk.clone(), meters.disk.clone())),
+  )
+}
+
+#[cfg(not(loom))]
+fn finish_rate_io<T: AsyncRead + AsyncWrite + Unpin>(
+  inner: T,
+  read_rate: ByteRateLimit,
+  write_rate: ByteRateLimit,
+  timer: TimerHandle,
+  #[cfg(feature = "resource-feedback")] meters: Option<(IoFeedbackMeter, IoFeedbackMeter)>,
+) -> Result<RateLimitedIo<T>, DriverRateIoError<T>> {
+  let adapter = match RateLimitedIo::new(inner, read_rate, write_rate, timer) {
+    Ok(adapter) => adapter,
+    Err(error) => {
+      let failure = DriverRateIoFailure::Adapter(error.failure());
+      let (inner, _, _, _) = error.into_inputs();
+      return Err(DriverRateIoError { inner, failure });
+    }
+  };
+  #[cfg(feature = "resource-feedback")]
+  if let Some((read, write)) = meters {
+    return Ok(adapter.with_feedback_meters(read, write));
+  }
+  Ok(adapter)
 }
 
 /// Shutdown choices for an owner-thread runtime.
@@ -188,25 +394,61 @@ impl Default for MultiShutdown {
   }
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Debug, Default)]
 struct ServiceOptions {
   timer_registrations: Option<usize>,
   timer_mode: ClockMode,
+  rate_timer_registrations: Option<usize>,
   reactor: Option<ReactorConfig>,
   blocking: Option<BlockingConfig>,
   filesystem: bool,
   process_children: Option<usize>,
   signal_listeners: Option<usize>,
+  disk_rate: Option<ByteRateConfig>,
   upload_rate: Option<ByteRateConfig>,
   download_rate: Option<ByteRateConfig>,
+  #[cfg(feature = "resource-feedback")]
+  feedback: Option<FeedbackFactory>,
+}
+
+struct ByteRateLimits {
+  disk: Option<ByteRateLimit>,
+  upload: Option<ByteRateLimit>,
+  download: Option<ByteRateLimit>,
+}
+
+#[cfg(feature = "resource-feedback")]
+struct FeedbackStartupInputs {
+  resources: ResourceScope,
+  disk_rate: Option<ByteRateLimit>,
+  upload_rate: Option<ByteRateLimit>,
+  download_rate: Option<ByteRateLimit>,
+  runtime_metrics: Option<RuntimeMetrics>,
+  meters: FeedbackMeters,
 }
 
 impl ServiceOptions {
-  fn validate(&self) -> Result<(), DriverBuildError> {
+  fn validate(&self, max_outstanding: usize) -> Result<(), DriverBuildError> {
     if self.timer_registrations == Some(0) {
       return Err(DriverBuildError::InvalidConfiguration(
         "timer registrations must be nonzero",
       ));
+    }
+    if self.rate_timer_registrations == Some(0) {
+      return Err(DriverBuildError::InvalidConfiguration(
+        "rate timer registrations must be nonzero",
+      ));
+    }
+    if self.rate_timer_registrations.is_some()
+      && self.disk_rate.is_none()
+      && (self.upload_rate.is_none() || self.download_rate.is_none())
+    {
+      return Err(DriverBuildError::InvalidConfiguration(
+        "a rate timer requires a disk bucket or both network buckets",
+      ));
+    }
+    if self.disk_rate.is_some() || (self.upload_rate.is_some() && self.download_rate.is_some()) {
+      self.rate_timer_capacity(max_outstanding)?;
     }
     if self.timer_mode != ClockMode::Real && self.timer_registrations.is_none() {
       return Err(DriverBuildError::InvalidConfiguration(
@@ -249,12 +491,19 @@ impl ServiceOptions {
         "signal listener capacity must be between 1 and 64",
       ));
     }
+    #[cfg(feature = "resource-feedback")]
+    if let Some(factory) = &self.feedback {
+      factory.validate().map_err(DriverBuildError::Feedback)?;
+    }
     Ok(())
   }
 
-  fn build_rates(
-    &self,
-  ) -> Result<(Option<ByteRateLimit>, Option<ByteRateLimit>), DriverBuildError> {
+  fn build_rate_limits(&self) -> Result<ByteRateLimits, DriverBuildError> {
+    let disk = self
+      .disk_rate
+      .map(ByteRateLimit::new)
+      .transpose()
+      .map_err(DriverBuildError::ByteRate)?;
     let upload = self
       .upload_rate
       .map(ByteRateLimit::new)
@@ -265,7 +514,39 @@ impl ServiceOptions {
       .map(ByteRateLimit::new)
       .transpose()
       .map_err(DriverBuildError::ByteRate)?;
-    Ok((upload, download))
+    Ok(ByteRateLimits {
+      disk,
+      upload,
+      download,
+    })
+  }
+
+  fn rate_timer_capacity(&self, max_outstanding: usize) -> Result<Option<usize>, DriverBuildError> {
+    if self.disk_rate.is_none() && (self.upload_rate.is_none() || self.download_rate.is_none()) {
+      return Ok(None);
+    }
+    let directions_per_outstanding = match (
+      self.disk_rate.is_some(),
+      self.upload_rate.is_some() && self.download_rate.is_some(),
+    ) {
+      (true, true) => 4,
+      (true, false) | (false, true) => 2,
+      (false, false) => return Ok(None),
+    };
+    let capacity = match self.rate_timer_registrations {
+      Some(capacity) => capacity,
+      None => max_outstanding
+        .checked_mul(directions_per_outstanding)
+        .ok_or(DriverBuildError::InvalidConfiguration(
+          "default rate timer capacity overflows",
+        ))?,
+    };
+    if capacity == 0 {
+      return Err(DriverBuildError::InvalidConfiguration(
+        "rate timer capacity must be nonzero",
+      ));
+    }
+    Ok(Some(capacity))
   }
 
   fn build_services(
@@ -274,6 +555,7 @@ impl ServiceOptions {
     startup: &mut StartupGuard,
     coordinator: Arc<IdleCoordinator>,
     current_thread: bool,
+    max_outstanding: usize,
   ) -> Result<Option<FsHandle>, DriverBuildError> {
     if let Some(config) = self.blocking {
       startup.blocking = Some(
@@ -286,6 +568,10 @@ impl ServiceOptions {
         TimerDriver::new_for_runtime(max_registered, self.timer_mode, current_thread, coordinator)
           .map_err(DriverBuildError::Timer)?,
       );
+    }
+    if let Some(max_registered) = self.rate_timer_capacity(max_outstanding)? {
+      startup.rate_timer =
+        Some(TimerDriver::new_realtime(max_registered).map_err(DriverBuildError::Timer)?);
     }
     if let Some(config) = self.reactor {
       startup.reactor = Some(Reactor::new(config).map_err(DriverBuildError::Reactor)?);
@@ -302,12 +588,40 @@ impl ServiceOptions {
     } else {
       None
     };
+    Ok(filesystem)
+  }
+
+  #[cfg(feature = "resource-feedback")]
+  fn start_feedback(
+    &self,
+    inputs: FeedbackStartupInputs,
+    startup: &mut StartupGuard,
+  ) -> Result<(), DriverBuildError> {
+    if let Some(factory) = &self.feedback {
+      startup.feedback = Some(
+        factory
+          .build(FeedbackContext {
+            resources: inputs.resources,
+            disk_rate: inputs.disk_rate,
+            upload_rate: inputs.upload_rate,
+            download_rate: inputs.download_rate,
+            disk_meter: inputs.meters.disk,
+            upload_meter: inputs.meters.upload,
+            download_meter: inputs.meters.download,
+            runtime_metrics: inputs.runtime_metrics,
+          })
+          .map_err(DriverBuildError::Feedback)?,
+      );
+    }
+    Ok(())
+  }
+
+  fn start_signal(&self, startup: &mut StartupGuard) -> Result<(), DriverBuildError> {
     if let Some(max_listeners) = self.signal_listeners {
-      // The permanent process signal bridge is created after every other
-      // fallible service so earlier owners can still be rolled back on error.
+      // The permanent process signal bridge remains the final startup action.
       startup.signal = Some(SignalDriver::new(max_listeners).map_err(DriverBuildError::Signal)?);
     }
-    Ok(filesystem)
+    Ok(())
   }
 }
 
@@ -332,6 +646,16 @@ macro_rules! service_builder_methods {
       /// Selects the initial mode for a timer configured with [`Self::timer`].
       pub fn timer_mode(mut self, mode: ClockMode) -> Self {
         self.services.timer_mode = mode;
+        self
+      }
+
+      /// Selects the fixed real-clock timer capacity used by rate-limited I/O.
+      /// Both upload and download buckets must also be configured.
+      /// The default is two wait registrations per maximum outstanding task
+      /// for each selected network or explicit disk adapter class. It bounds
+      /// timer waiters, not the number of endpoints a caller may construct.
+      pub fn rate_timer_registrations(mut self, max_registered: usize) -> Self {
+        self.services.rate_timer_registrations = Some(max_registered);
         self
       }
 
@@ -366,6 +690,14 @@ macro_rules! service_builder_methods {
         self
       }
 
+      /// Selects one disk application-byte bucket. This exposes a shared
+      /// bucket for explicit disk adapters; it does not intercept filesystem
+      /// operations by itself.
+      pub fn disk_rate(mut self, config: ByteRateConfig) -> Self {
+        self.services.disk_rate = Some(config);
+        self
+      }
+
       /// Selects the upload application-byte bucket.
       pub fn upload_rate(mut self, config: ByteRateConfig) -> Self {
         self.services.upload_rate = Some(config);
@@ -375,6 +707,13 @@ macro_rules! service_builder_methods {
       /// Selects the download application-byte bucket.
       pub fn download_rate(mut self, config: ByteRateConfig) -> Self {
         self.services.download_rate = Some(config);
+        self
+      }
+
+      /// Selects an opt-in, per-driver autonomous feedback factory.
+      #[cfg(feature = "resource-feedback")]
+      pub fn feedback_sources(mut self, factory: FeedbackFactory) -> Self {
+        self.services.feedback = Some(factory);
         self
       }
     }
@@ -406,13 +745,17 @@ impl CurrentThreadBuilder {
       services: ServiceOptions {
         timer_registrations: None,
         timer_mode: ClockMode::Real,
+        rate_timer_registrations: None,
         reactor: None,
         blocking: None,
         filesystem: false,
         process_children: None,
         signal_listeners: None,
+        disk_rate: None,
         upload_rate: None,
         download_rate: None,
+        #[cfg(feature = "resource-feedback")]
+        feedback: None,
       },
     }
   }
@@ -440,8 +783,18 @@ impl CurrentThreadBuilder {
         "local task and scope bounds must be nonzero",
       ));
     }
-    self.services.validate()?;
-    let (upload_rate, download_rate) = self.services.build_rates()?;
+    self.services.validate(self.config.max_outstanding)?;
+    let ByteRateLimits {
+      disk: disk_rate,
+      upload: upload_rate,
+      download: download_rate,
+    } = self.services.build_rate_limits()?;
+    #[cfg(feature = "resource-feedback")]
+    let feedback_meters = self
+      .services
+      .feedback
+      .as_ref()
+      .map(|_| FeedbackMeters::new());
     let resources = match self.tenant {
       Some(tenant) => ResourceScope::from_tenant(self.resources, tenant),
       None => ResourceScope::new(self.resources),
@@ -456,10 +809,33 @@ impl CurrentThreadBuilder {
       .as_ref()
       .map(LocalRuntime::idle_coordinator)
       .unwrap_or_else(|| IdleCoordinator::new(None));
-    let filesystem =
-      self
-        .services
-        .build_services(&resources, &mut startup, Arc::clone(&coordinator), true)?;
+    let filesystem = self.services.build_services(
+      &resources,
+      &mut startup,
+      Arc::clone(&coordinator),
+      true,
+      self.config.max_outstanding,
+    )?;
+    #[cfg(feature = "resource-feedback")]
+    if self.services.feedback.is_some() {
+      let Some(meters) = feedback_meters.clone() else {
+        return Err(DriverBuildError::InvalidConfiguration(
+          "feedback meters were not prepared for the selected service",
+        ));
+      };
+      self.services.start_feedback(
+        FeedbackStartupInputs {
+          resources: resources.clone(),
+          disk_rate: disk_rate.clone(),
+          upload_rate: upload_rate.clone(),
+          download_rate: download_rate.clone(),
+          runtime_metrics: None,
+          meters,
+        },
+        &mut startup,
+      )?;
+    }
+    self.services.start_signal(&mut startup)?;
     if let Some(timer) = startup.timer.as_ref().map(TimerDriver::handle) {
       let blocking_handle = startup.blocking.as_ref().map(BlockingRuntime::handle);
       if let Some(blocking) = startup.blocking.as_mut() {
@@ -473,11 +849,17 @@ impl CurrentThreadBuilder {
       local: startup.local.take().unwrap_or_else(|| unreachable!()),
       resources,
       timer: startup.timer.take(),
+      rate_timer: startup.rate_timer.take(),
       reactor: startup.reactor.take(),
       blocking: startup.blocking.take(),
       filesystem,
       process: startup.process.take(),
       signal: startup.signal.take(),
+      #[cfg(feature = "resource-feedback")]
+      feedback: startup.feedback.take(),
+      #[cfg(feature = "resource-feedback")]
+      feedback_meters,
+      disk_rate,
       upload_rate,
       download_rate,
       shutdown: None,
@@ -519,13 +901,17 @@ impl MultiThreadBuilder {
       services: ServiceOptions {
         timer_registrations: None,
         timer_mode: ClockMode::Real,
+        rate_timer_registrations: None,
         reactor: None,
         blocking: None,
         filesystem: false,
         process_children: None,
         signal_listeners: None,
+        disk_rate: None,
         upload_rate: None,
         download_rate: None,
+        #[cfg(feature = "resource-feedback")]
+        feedback: None,
       },
     }
   }
@@ -582,8 +968,18 @@ impl MultiThreadBuilder {
         "paused automatic time requires the current-thread executor",
       ));
     }
-    self.services.validate()?;
-    let (upload_rate, download_rate) = self.services.build_rates()?;
+    self.services.validate(self.config.max_outstanding)?;
+    let ByteRateLimits {
+      disk: disk_rate,
+      upload: upload_rate,
+      download: download_rate,
+    } = self.services.build_rate_limits()?;
+    #[cfg(feature = "resource-feedback")]
+    let feedback_meters = self
+      .services
+      .feedback
+      .as_ref()
+      .map(|_| FeedbackMeters::new());
     let resources = match self.tenant {
       Some(tenant) => ResourceScope::from_tenant(self.resources, tenant),
       None => ResourceScope::new(self.resources),
@@ -606,10 +1002,35 @@ impl MultiThreadBuilder {
     }
     .map_err(DriverBuildError::Async)?;
     startup.asynchronous = Some(asynchronous);
-    let filesystem =
-      self
-        .services
-        .build_services(&resources, &mut startup, IdleCoordinator::new(None), false)?;
+    let filesystem = self.services.build_services(
+      &resources,
+      &mut startup,
+      IdleCoordinator::new(None),
+      false,
+      self.config.max_outstanding,
+    )?;
+    #[cfg(feature = "resource-feedback")]
+    let runtime_metrics = startup.asynchronous.as_ref().map(AsyncRuntime::metrics);
+    #[cfg(feature = "resource-feedback")]
+    if self.services.feedback.is_some() {
+      let Some(meters) = feedback_meters.clone() else {
+        return Err(DriverBuildError::InvalidConfiguration(
+          "feedback meters were not prepared for the selected service",
+        ));
+      };
+      self.services.start_feedback(
+        FeedbackStartupInputs {
+          resources: resources.clone(),
+          disk_rate: disk_rate.clone(),
+          upload_rate: upload_rate.clone(),
+          download_rate: download_rate.clone(),
+          runtime_metrics,
+          meters,
+        },
+        &mut startup,
+      )?;
+    }
+    self.services.start_signal(&mut startup)?;
     if let Some(timer) = startup.timer.as_ref().map(TimerDriver::handle)
       && let Some(blocking) = startup.blocking.as_mut()
     {
@@ -622,11 +1043,17 @@ impl MultiThreadBuilder {
         .unwrap_or_else(|| unreachable!()),
       resources,
       timer: startup.timer.take(),
+      rate_timer: startup.rate_timer.take(),
       reactor: startup.reactor.take(),
       blocking: startup.blocking.take(),
       filesystem,
       process: startup.process.take(),
       signal: startup.signal.take(),
+      #[cfg(feature = "resource-feedback")]
+      feedback: startup.feedback.take(),
+      #[cfg(feature = "resource-feedback")]
+      feedback_meters,
+      disk_rate,
       upload_rate,
       download_rate,
       shutdown: None,
@@ -646,13 +1073,28 @@ struct StartupGuard {
   asynchronous: Option<AsyncRuntime>,
   blocking: Option<BlockingRuntime>,
   timer: Option<TimerDriver>,
+  rate_timer: Option<TimerDriver>,
   reactor: Option<Reactor>,
   process: Option<ProcessDriver>,
   signal: Option<SignalDriver>,
+  #[cfg(feature = "resource-feedback")]
+  feedback: Option<ResourceFeedbackService>,
 }
 
 impl Drop for StartupGuard {
   fn drop(&mut self) {
+    #[cfg(feature = "resource-feedback")]
+    if let Some(feedback) = self.feedback.as_mut() {
+      feedback.request_stop();
+      while !feedback.is_shutdown_complete() {
+        let _ = feedback.try_shutdown();
+        if !feedback.is_shutdown_complete() {
+          std::thread::yield_now();
+        }
+      }
+    }
+    #[cfg(feature = "resource-feedback")]
+    self.feedback.take();
     if let Some(process) = self.process.as_mut() {
       let _ = process.shutdown(ProcessShutdownMode::Wait);
     }
@@ -660,6 +1102,9 @@ impl Drop for StartupGuard {
       let _ = reactor.shutdown();
     }
     if let Some(timer) = self.timer.take() {
+      let _ = timer.shutdown();
+    }
+    if let Some(timer) = self.rate_timer.take() {
       let _ = timer.shutdown();
     }
     if let Some(blocking) = self.blocking.as_mut() {
@@ -679,11 +1124,17 @@ pub struct CurrentThreadDriver {
   local: LocalRuntime,
   resources: ResourceScope,
   timer: Option<TimerDriver>,
+  rate_timer: Option<TimerDriver>,
   reactor: Option<Reactor>,
   blocking: Option<BlockingRuntime>,
   filesystem: Option<FsHandle>,
   process: Option<ProcessDriver>,
   signal: Option<SignalDriver>,
+  #[cfg(feature = "resource-feedback")]
+  feedback: Option<ResourceFeedbackService>,
+  #[cfg(feature = "resource-feedback")]
+  feedback_meters: Option<FeedbackMeters>,
+  disk_rate: Option<ByteRateLimit>,
   upload_rate: Option<ByteRateLimit>,
   download_rate: Option<ByteRateLimit>,
   shutdown: Option<CurrentShutdown>,
@@ -770,6 +1221,12 @@ impl CurrentThreadDriver {
     self.signal.as_ref()
   }
 
+  /// A clone of the configured disk application-byte bucket.
+  #[must_use]
+  pub fn disk_rate(&self) -> Option<ByteRateLimit> {
+    self.disk_rate.clone()
+  }
+
   /// Clones of the selected directional byte buckets.
   #[must_use]
   pub fn upload_rate(&self) -> Option<ByteRateLimit> {
@@ -782,6 +1239,54 @@ impl CurrentThreadDriver {
     self.download_rate.clone()
   }
 
+  /// Wraps an application stream with download/read and upload/write buckets.
+  ///
+  /// The adapter uses a private fixed real-clock timer, independently of this
+  /// runtime's virtual application clock. Missing rates return the original
+  /// endpoint unchanged. This does not intercept filesystem calls or raw I/O
+  /// that bypasses the returned adapter.
+  #[cfg(not(loom))]
+  pub fn rate_io<T: AsyncRead + AsyncWrite + Unpin>(
+    &self,
+    inner: T,
+  ) -> Result<RateLimitedIo<T>, DriverRateIoError<T>> {
+    build_rate_io(
+      inner,
+      self.download_rate.clone(),
+      self.upload_rate.clone(),
+      self.rate_timer.as_ref().map(TimerDriver::handle),
+      #[cfg(feature = "resource-feedback")]
+      self.feedback_meters.as_ref(),
+    )
+  }
+
+  /// Wraps an application stream with the selected disk bucket on both
+  /// reads and writes. This adapter is explicit; it does not intercept the
+  /// filesystem front end or raw file I/O that bypasses the returned stream.
+  #[cfg(not(loom))]
+  pub fn disk_io<T: AsyncRead + AsyncWrite + Unpin>(
+    &self,
+    inner: T,
+  ) -> Result<RateLimitedIo<T>, DriverRateIoError<T>> {
+    build_disk_io(
+      inner,
+      self.disk_rate.clone(),
+      self.rate_timer.as_ref().map(TimerDriver::handle),
+      #[cfg(feature = "resource-feedback")]
+      self.feedback_meters.as_ref(),
+    )
+  }
+
+  /// A cloneable metrics handle for this driver's feedback service, if selected.
+  #[cfg(feature = "resource-feedback")]
+  #[must_use]
+  pub fn feedback_metrics(&self) -> Option<FeedbackMetricsHandle> {
+    self
+      .feedback
+      .as_ref()
+      .map(ResourceFeedbackService::metrics_handle)
+  }
+
   /// Closes local admission and requests cancellation according to `policy`.
   /// Supporting services remain open while owner-thread future cleanup,
   /// blocking work and child reaping finish. Repeating the same request is
@@ -791,6 +1296,10 @@ impl CurrentThreadDriver {
       return Err(DriverShutdownError::PolicyAlreadyFixed);
     }
     self.shutdown = Some(policy);
+    #[cfg(feature = "resource-feedback")]
+    if let Some(feedback) = self.feedback.as_ref() {
+      feedback.request_stop();
+    }
     self.local.request_shutdown();
     Ok(())
   }
@@ -836,6 +1345,11 @@ impl CurrentThreadDriver {
         .request_shutdown()
         .map_err(|error| DriverShutdownError::CloseThread(error.kind()))?;
     }
+    if let Some(timer) = self.rate_timer.as_mut() {
+      timer
+        .request_shutdown()
+        .map_err(|error| DriverShutdownError::CloseThread(error.kind()))?;
+    }
     if let Some(reactor) = self.reactor.as_mut() {
       reactor
         .request_shutdown()
@@ -852,8 +1366,12 @@ impl CurrentThreadDriver {
     if self.shutdown.is_none() {
       return Err(DriverShutdownError::NotRequested);
     }
-    let local_complete = self.local.shutdown_complete();
     let mut failure = None;
+    #[cfg(feature = "resource-feedback")]
+    let feedback_complete = poll_feedback_service(self.feedback.as_mut(), &mut failure);
+    #[cfg(not(feature = "resource-feedback"))]
+    let feedback_complete = true;
+    let local_complete = self.local.shutdown_complete();
     let mut blocking_complete = false;
     if local_complete {
       if let Some(policy) = self.shutdown {
@@ -902,6 +1420,14 @@ impl CurrentThreadDriver {
           }
         }
       }
+      if let Some(timer) = self.rate_timer.as_mut() {
+        match timer.poll_shutdown() {
+          Ok(done) => io_complete &= done,
+          Err(error) => {
+            failure.get_or_insert(DriverShutdownError::Timer(error));
+          }
+        }
+      }
       if let Some(reactor) = self.reactor.as_mut() {
         match reactor.poll_shutdown() {
           Ok(done) => io_complete &= done,
@@ -917,7 +1443,8 @@ impl CurrentThreadDriver {
     if let Some(error) = self.shutdown_failure {
       return Err(error);
     }
-    let complete = local_complete && blocking_complete && process_complete && io_complete;
+    let complete =
+      local_complete && blocking_complete && process_complete && io_complete && feedback_complete;
     Ok(if complete {
       ShutdownProgress::Complete
     } else {
@@ -959,11 +1486,17 @@ pub struct MultiThreadDriver {
   asynchronous: AsyncRuntime,
   resources: ResourceScope,
   timer: Option<TimerDriver>,
+  rate_timer: Option<TimerDriver>,
   reactor: Option<Reactor>,
   blocking: Option<BlockingRuntime>,
   filesystem: Option<FsHandle>,
   process: Option<ProcessDriver>,
   signal: Option<SignalDriver>,
+  #[cfg(feature = "resource-feedback")]
+  feedback: Option<ResourceFeedbackService>,
+  #[cfg(feature = "resource-feedback")]
+  feedback_meters: Option<FeedbackMeters>,
+  disk_rate: Option<ByteRateLimit>,
   upload_rate: Option<ByteRateLimit>,
   download_rate: Option<ByteRateLimit>,
   shutdown: Option<MultiShutdown>,
@@ -1038,6 +1571,12 @@ impl MultiThreadDriver {
     self.signal.as_ref()
   }
 
+  /// A clone of the configured disk application-byte bucket.
+  #[must_use]
+  pub fn disk_rate(&self) -> Option<ByteRateLimit> {
+    self.disk_rate.clone()
+  }
+
   /// Clones of the selected directional byte bucket.
   #[must_use]
   pub fn upload_rate(&self) -> Option<ByteRateLimit> {
@@ -1050,6 +1589,54 @@ impl MultiThreadDriver {
     self.download_rate.clone()
   }
 
+  /// Wraps an application stream with download/read and upload/write buckets.
+  ///
+  /// The adapter uses a private fixed real-clock timer, independently of any
+  /// application clock. Missing rates return the original endpoint unchanged.
+  /// This does not intercept filesystem calls or raw I/O that bypasses the
+  /// returned adapter.
+  #[cfg(not(loom))]
+  pub fn rate_io<T: AsyncRead + AsyncWrite + Unpin>(
+    &self,
+    inner: T,
+  ) -> Result<RateLimitedIo<T>, DriverRateIoError<T>> {
+    build_rate_io(
+      inner,
+      self.download_rate.clone(),
+      self.upload_rate.clone(),
+      self.rate_timer.as_ref().map(TimerDriver::handle),
+      #[cfg(feature = "resource-feedback")]
+      self.feedback_meters.as_ref(),
+    )
+  }
+
+  /// Wraps an application stream with the selected disk bucket on both
+  /// reads and writes. This adapter is explicit; it does not intercept the
+  /// filesystem front end or raw file I/O that bypasses the returned stream.
+  #[cfg(not(loom))]
+  pub fn disk_io<T: AsyncRead + AsyncWrite + Unpin>(
+    &self,
+    inner: T,
+  ) -> Result<RateLimitedIo<T>, DriverRateIoError<T>> {
+    build_disk_io(
+      inner,
+      self.disk_rate.clone(),
+      self.rate_timer.as_ref().map(TimerDriver::handle),
+      #[cfg(feature = "resource-feedback")]
+      self.feedback_meters.as_ref(),
+    )
+  }
+
+  /// A cloneable metrics handle for this driver's feedback service, if selected.
+  #[cfg(feature = "resource-feedback")]
+  #[must_use]
+  pub fn feedback_metrics(&self) -> Option<FeedbackMetricsHandle> {
+    self
+      .feedback
+      .as_ref()
+      .map(ResourceFeedbackService::metrics_handle)
+  }
+
   /// Closes executor admission. Blocking jobs continue first, then managed
   /// children are reaped, and timer/reactor services close only after both
   /// stages finish. This keeps dependencies available to already-admitted
@@ -1059,6 +1646,10 @@ impl MultiThreadDriver {
       return Err(DriverShutdownError::PolicyAlreadyFixed);
     }
     self.shutdown = Some(policy);
+    #[cfg(feature = "resource-feedback")]
+    if let Some(feedback) = self.feedback.as_ref() {
+      feedback.request_stop();
+    }
     self.asynchronous.request_shutdown(policy.tasks);
     Ok(())
   }
@@ -1101,6 +1692,11 @@ impl MultiThreadDriver {
         .request_shutdown()
         .map_err(|error| DriverShutdownError::CloseThread(error.kind()))?;
     }
+    if let Some(timer) = self.rate_timer.as_mut() {
+      timer
+        .request_shutdown()
+        .map_err(|error| DriverShutdownError::CloseThread(error.kind()))?;
+    }
     if let Some(reactor) = self.reactor.as_mut() {
       reactor
         .request_shutdown()
@@ -1117,6 +1713,10 @@ impl MultiThreadDriver {
       return Err(DriverShutdownError::NotRequested);
     }
     let mut failure = None;
+    #[cfg(feature = "resource-feedback")]
+    let feedback_complete = poll_feedback_service(self.feedback.as_mut(), &mut failure);
+    #[cfg(not(feature = "resource-feedback"))]
+    let feedback_complete = true;
     if let Err(error) = self.asynchronous.poll_shutdown() {
       failure.get_or_insert(DriverShutdownError::Async(error));
     }
@@ -1169,6 +1769,14 @@ impl MultiThreadDriver {
           }
         }
       }
+      if let Some(timer) = self.rate_timer.as_mut() {
+        match timer.poll_shutdown() {
+          Ok(done) => io_complete &= done,
+          Err(error) => {
+            failure.get_or_insert(DriverShutdownError::Timer(error));
+          }
+        }
+      }
       if let Some(reactor) = self.reactor.as_mut() {
         match reactor.poll_shutdown() {
           Ok(done) => io_complete &= done,
@@ -1184,7 +1792,8 @@ impl MultiThreadDriver {
     if let Some(error) = self.shutdown_failure {
       return Err(error);
     }
-    let complete = async_complete && blocking_complete && process_complete && io_complete;
+    let complete =
+      async_complete && blocking_complete && process_complete && io_complete && feedback_complete;
     Ok(if complete {
       ShutdownProgress::Complete
     } else {
@@ -1216,13 +1825,45 @@ mod tests {
   use super::*;
   use crate::runtime::Resources;
   use std::pin::Pin;
+  #[cfg(feature = "resource-feedback")]
+  use std::sync::Condvar;
   use std::sync::Mutex;
   use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
   use std::sync::mpsc::{self, Receiver, SyncSender};
   use std::task::{Context, Wake, Waker};
   use std::time::{Duration, Instant};
 
+  #[cfg(feature = "resource-feedback")]
+  use crate::runtime::byte_rate::ByteRateConfig;
+  #[cfg(all(not(loom), feature = "resource-feedback"))]
+  use crate::runtime::io::AsyncWriteExt as RuntimeAsyncWriteExt;
+  #[cfg(not(loom))]
+  use crate::runtime::io::{
+    AsyncRead as RuntimeAsyncRead, AsyncReadExt as RuntimeAsyncReadExt,
+    AsyncWrite as RuntimeAsyncWrite,
+  };
+  #[cfg(feature = "resource-feedback")]
+  use crate::runtime::resource_domain::{DomainResource, DomainResources, ResourceDomain};
+  #[cfg(feature = "resource-feedback")]
+  use crate::runtime::resource_feedback::{
+    FeedbackActuator, FeedbackActuatorError, FeedbackSensor, FeedbackSensorError,
+  };
+  #[cfg(feature = "resource-feedback")]
+  use crate::runtime::resource_feedback_actuator::{CpuFeedbackTarget, RuntimeFeedbackActuator};
+  #[cfg(feature = "resource-feedback")]
+  use crate::runtime::resource_feedback_policy::{
+    FeedbackControlConfig, FeedbackResource, FeedbackSample, PlanTicket,
+    ResourceFeedbackPolicyConfig,
+  };
+
   static NEXT_FILE: AtomicUsize = AtomicUsize::new(1);
+
+  fn assert_send_sync<T: Send + Sync>() {}
+
+  #[test]
+  fn multithread_driver_remains_send_and_sync() {
+    assert_send_sync::<MultiThreadDriver>();
+  }
 
   fn local_config() -> LocalConfig {
     LocalConfig {
@@ -1244,6 +1885,214 @@ mod tests {
       managed_memory: memory,
       disk_concurrent_ops: 2,
       network_concurrent_ops: 3,
+    }
+  }
+
+  #[cfg(feature = "resource-feedback")]
+  fn feedback_policy() -> ResourceFeedbackPolicyConfig {
+    ResourceFeedbackPolicyConfig {
+      cpu_concurrency: FeedbackControlConfig::new(4, 16, 64, 3000, 8000),
+      disk_rate: FeedbackControlConfig::new(100, 1000, 2000, 3000, 8000),
+      network_rate: FeedbackControlConfig::new(100, 1000, 2000, 3000, 8000),
+    }
+  }
+
+  #[cfg(feature = "resource-feedback")]
+  fn feedback_domain() -> (
+    ResourceDomain,
+    crate::runtime::resource_domain::TenantDomain,
+  ) {
+    let ceiling = DomainResources::ZERO
+      .with(DomainResource::Cpu, 64)
+      .with(DomainResource::Tasks, 64)
+      .with(DomainResource::Memory, 1 << 20)
+      .with(DomainResource::Disk, 8)
+      .with(DomainResource::Network, 8)
+      .with(DomainResource::Control, 1 << 20);
+    let domain = ResourceDomain::with_waiters(ceiling, 2, 32).unwrap();
+    let tenant = domain.tenant(ceiling).unwrap();
+    tenant
+      .set_limits(ceiling.with(DomainResource::Cpu, 16))
+      .unwrap();
+    (domain, tenant)
+  }
+
+  #[cfg(feature = "resource-feedback")]
+  fn feedback_rate_config() -> ByteRateConfig {
+    ByteRateConfig {
+      bytes_per_second: 1000,
+      burst_bytes: 1024,
+      max_reservations: 8,
+    }
+  }
+
+  #[cfg(feature = "resource-feedback")]
+  struct MissingFeedbackSensor;
+
+  #[cfg(feature = "resource-feedback")]
+  impl FeedbackSensor for MissingFeedbackSensor {
+    fn sample(&mut self) -> Result<FeedbackSample, FeedbackSensorError> {
+      Ok(FeedbackSample::new(Instant::now(), None, None, None))
+    }
+  }
+
+  #[cfg(feature = "resource-feedback")]
+  struct BusyFeedbackSensor;
+
+  #[cfg(feature = "resource-feedback")]
+  impl FeedbackSensor for BusyFeedbackSensor {
+    fn sample(&mut self) -> Result<FeedbackSample, FeedbackSensorError> {
+      Ok(FeedbackSample::new(
+        Instant::now(),
+        Some(9000),
+        Some(9000),
+        Some(9000),
+      ))
+    }
+  }
+
+  #[cfg(feature = "resource-feedback")]
+  struct TestFeedbackActuator {
+    limits: [u64; 3],
+  }
+
+  #[cfg(feature = "resource-feedback")]
+  impl FeedbackActuator for TestFeedbackActuator {
+    fn readback(&mut self, resource: FeedbackResource) -> Result<u64, FeedbackActuatorError> {
+      Ok(self.limits[resource as usize])
+    }
+
+    fn apply(&mut self, ticket: PlanTicket) -> Result<(), FeedbackActuatorError> {
+      self.limits[ticket.resource() as usize] = ticket.to_limit();
+      Ok(())
+    }
+  }
+
+  #[cfg(feature = "resource-feedback")]
+  #[derive(Default)]
+  struct SampleGate {
+    state: Mutex<(bool, bool)>,
+    changed: Condvar,
+  }
+
+  #[cfg(feature = "resource-feedback")]
+  impl SampleGate {
+    fn enter_and_wait(&self) {
+      let mut state = self.state.lock().unwrap();
+      state.0 = true;
+      self.changed.notify_all();
+      while !state.1 {
+        state = self.changed.wait(state).unwrap();
+      }
+    }
+
+    fn wait_until_entered(&self, timeout: Duration) -> bool {
+      let state = self.state.lock().unwrap();
+      let (state, _) = self
+        .changed
+        .wait_timeout_while(state, timeout, |state| !state.0)
+        .unwrap();
+      state.0
+    }
+
+    fn release(&self) {
+      self.state.lock().unwrap().1 = true;
+      self.changed.notify_all();
+    }
+  }
+
+  #[cfg(feature = "resource-feedback")]
+  struct GatedFeedbackSensor(Arc<SampleGate>);
+
+  #[cfg(feature = "resource-feedback")]
+  impl FeedbackSensor for GatedFeedbackSensor {
+    fn sample(&mut self) -> Result<FeedbackSample, FeedbackSensorError> {
+      self.0.enter_and_wait();
+      Ok(FeedbackSample::new(Instant::now(), None, None, None))
+    }
+  }
+
+  #[cfg(not(loom))]
+  #[derive(Debug, PartialEq)]
+  struct DriverTestIo {
+    marker: u8,
+    read_count: u8,
+  }
+
+  #[cfg(not(loom))]
+  impl DriverTestIo {
+    fn new(marker: u8) -> Self {
+      Self {
+        marker,
+        read_count: 0,
+      }
+    }
+  }
+
+  #[cfg(not(loom))]
+  impl RuntimeAsyncRead for DriverTestIo {
+    fn poll_read(
+      mut self: Pin<&mut Self>,
+      _cx: &mut Context<'_>,
+      buf: &mut [u8],
+    ) -> std::task::Poll<io::Result<usize>> {
+      if buf.is_empty() {
+        return std::task::Poll::Ready(Ok(0));
+      }
+      buf[0] = self.marker.wrapping_add(self.read_count);
+      self.read_count = self.read_count.wrapping_add(1);
+      std::task::Poll::Ready(Ok(1))
+    }
+  }
+
+  #[cfg(not(loom))]
+  impl RuntimeAsyncWrite for DriverTestIo {
+    fn poll_write(
+      self: Pin<&mut Self>,
+      _cx: &mut Context<'_>,
+      buf: &[u8],
+    ) -> std::task::Poll<io::Result<usize>> {
+      std::task::Poll::Ready(Ok(buf.len()))
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> std::task::Poll<io::Result<()>> {
+      std::task::Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(
+      self: Pin<&mut Self>,
+      _cx: &mut Context<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+      std::task::Poll::Ready(Ok(()))
+    }
+  }
+
+  fn shutdown_current_driver(driver: &mut CurrentThreadDriver) {
+    driver.request_shutdown(CurrentShutdown::default()).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+      match driver.drive_shutdown_step().unwrap() {
+        ShutdownProgress::Complete => break,
+        ShutdownProgress::Pending => {
+          assert!(Instant::now() < deadline, "current driver did not stop");
+          std::thread::yield_now();
+        }
+      }
+    }
+  }
+
+  #[cfg(feature = "resource-feedback")]
+  fn shutdown_multi_driver(driver: &mut MultiThreadDriver) {
+    driver.request_shutdown(MultiShutdown::default()).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+      match driver.try_shutdown().unwrap() {
+        ShutdownProgress::Complete => break,
+        ShutdownProgress::Pending => {
+          assert!(Instant::now() < deadline, "multithread driver did not stop");
+          std::thread::yield_now();
+        }
+      }
     }
   }
 
@@ -1810,11 +2659,17 @@ mod tests {
       timer: Some(
         TimerDriver::new(1).unwrap_or_else(|error| panic!("timer driver build failed: {error}")),
       ),
+      rate_timer: None,
       reactor: None,
       blocking: Some(blocking),
       filesystem: None,
       process: None,
       signal: None,
+      #[cfg(feature = "resource-feedback")]
+      feedback: None,
+      #[cfg(feature = "resource-feedback")]
+      feedback_meters: None,
+      disk_rate: None,
       upload_rate: None,
       download_rate: None,
       shutdown: None,
@@ -2126,6 +2981,323 @@ mod tests {
       Pin::new(&mut sleep)
         .poll(&mut Context::from_waker(Waker::noop()))
         .is_ready()
+    );
+  }
+
+  #[cfg(not(loom))]
+  #[test]
+  fn rate_io_waits_on_its_real_timer_and_returns_unconfigured_endpoints() {
+    let mut driver = CurrentThreadBuilder::new(local_config())
+      .clock(ClockMode::PausedManual, 4)
+      .download_rate(ByteRateConfig {
+        bytes_per_second: 100,
+        burst_bytes: 1,
+        max_reservations: 4,
+      })
+      .upload_rate(ByteRateConfig {
+        bytes_per_second: 100,
+        burst_bytes: 1,
+        max_reservations: 4,
+      })
+      .build()
+      .unwrap_or_else(|error| panic!("current-thread build failed: {error}"));
+    #[cfg(feature = "resource-feedback")]
+    assert!(driver.feedback_metrics().is_none());
+
+    let application_clock = driver.clock().unwrap();
+    assert_eq!(application_clock.mode(), ClockMode::PausedManual);
+    let application_time = application_clock.now();
+    let mut stream = driver
+      .rate_io(DriverTestIo::new(20))
+      .unwrap_or_else(|error| panic!("network rate adapter failed: {error}"));
+    let started_at = Instant::now();
+    driver
+      .block_on(async {
+        let mut first = [0];
+        assert_eq!(stream.read(&mut first).await?, 1);
+        let mut second = [0];
+        assert_eq!(stream.read(&mut second).await?, 1);
+        Ok::<(), io::Error>(())
+      })
+      .unwrap_or_else(|error| panic!("paused-clock rate wait failed: {error}"))
+      .unwrap_or_else(|error| panic!("rate-limited read failed: {error}"));
+    assert!(started_at.elapsed() >= Duration::from_millis(5));
+    assert_eq!(application_clock.now(), application_time);
+    drop(stream);
+
+    let mut unconfigured = CurrentThreadBuilder::new(local_config())
+      .build()
+      .unwrap_or_else(|error| panic!("default driver build failed: {error}"));
+    let error = match unconfigured.rate_io(DriverTestIo::new(31)) {
+      Ok(_) => panic!("unconfigured network rates unexpectedly built"),
+      Err(error) => error,
+    };
+    assert_eq!(
+      error.failure(),
+      DriverRateIoFailure::MissingUploadAndDownloadRates
+    );
+    assert_eq!(error.into_inner().marker, 31);
+    let error = match unconfigured.disk_io(DriverTestIo::new(32)) {
+      Ok(_) => panic!("unconfigured disk rate unexpectedly built"),
+      Err(error) => error,
+    };
+    assert_eq!(error.failure(), DriverRateIoFailure::MissingDiskRate);
+    assert_eq!(error.into_inner().marker, 32);
+
+    shutdown_current_driver(&mut driver);
+    shutdown_current_driver(&mut unconfigured);
+  }
+
+  #[cfg(feature = "resource-feedback")]
+  #[test]
+  fn cloned_builder_creates_fresh_contexts_and_directional_feedback_meters() {
+    let (_domain, tenant) = feedback_domain();
+    let contexts = Arc::new(Mutex::new(Vec::new()));
+    let observed = Arc::clone(&contexts);
+    let factory = feedback_sources(feedback_policy(), move |context| {
+      assert!(context.resources.tenant_domain().is_some());
+      assert!(context.runtime_metrics.is_none());
+      assert_eq!(context.disk_meter.snapshot().attached_sources, 0);
+      assert_eq!(context.upload_meter.snapshot().attached_sources, 0);
+      assert_eq!(context.download_meter.snapshot().attached_sources, 0);
+      let tenant = context
+        .resources
+        .tenant_domain()
+        .cloned()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "tenant missing"))?;
+      let disk = context
+        .disk_rate
+        .clone()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "disk rate missing"))?;
+      let network = context
+        .download_rate
+        .clone()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "download rate missing"))?;
+      observed.lock().unwrap().push((
+        context.disk_meter.clone(),
+        context.upload_meter.clone(),
+        context.download_meter.clone(),
+      ));
+      Ok((
+        MissingFeedbackSensor,
+        RuntimeFeedbackActuator::new(CpuFeedbackTarget::Tenant(tenant), disk, network),
+      ))
+    });
+    let builder = CurrentThreadBuilder::new(local_config())
+      .resources(limits(64))
+      .resource_domain(tenant)
+      .disk_rate(feedback_rate_config())
+      .upload_rate(feedback_rate_config())
+      .download_rate(feedback_rate_config())
+      .feedback_sources(factory);
+    assert!(format!("{builder:?}").contains("CurrentThreadBuilder"));
+    let mut first = builder
+      .clone()
+      .build()
+      .unwrap_or_else(|error| panic!("first cloned build failed: {error}"));
+    let mut second = builder
+      .build()
+      .unwrap_or_else(|error| panic!("second cloned build failed: {error}"));
+    assert_eq!(contexts.lock().unwrap().len(), 2);
+    assert!(first.feedback_metrics().is_some());
+    assert!(second.feedback_metrics().is_some());
+
+    let first_network = first
+      .rate_io(DriverTestIo::new(1))
+      .unwrap_or_else(|error| panic!("first network adapter failed: {error}"));
+    let first_disk = first
+      .disk_io(DriverTestIo::new(2))
+      .unwrap_or_else(|error| panic!("first disk adapter failed: {error}"));
+    let second_network = second
+      .rate_io(DriverTestIo::new(3))
+      .unwrap_or_else(|error| panic!("second network adapter failed: {error}"));
+    let second_disk = second
+      .disk_io(DriverTestIo::new(4))
+      .unwrap_or_else(|error| panic!("second disk adapter failed: {error}"));
+    let contexts = contexts.lock().unwrap();
+    assert_eq!(contexts[0].0.snapshot().attached_sources, 2);
+    assert_eq!(contexts[0].1.snapshot().attached_sources, 1);
+    assert_eq!(contexts[0].2.snapshot().attached_sources, 1);
+    assert_eq!(contexts[1].0.snapshot().attached_sources, 2);
+    assert_eq!(contexts[1].1.snapshot().attached_sources, 1);
+    assert_eq!(contexts[1].2.snapshot().attached_sources, 1);
+    drop(contexts);
+
+    drop(first_network);
+    drop(first_disk);
+    drop(second_network);
+    drop(second_disk);
+    shutdown_current_driver(&mut first);
+    shutdown_current_driver(&mut second);
+  }
+
+  #[cfg(feature = "resource-feedback")]
+  #[test]
+  fn feedback_factory_actuates_the_bound_domain_and_selected_byte_buckets() {
+    let (_domain, tenant) = feedback_domain();
+    let contexts_seen = Arc::new(AtomicUsize::new(0));
+    let observed = Arc::clone(&contexts_seen);
+    let factory = feedback_sources(feedback_policy(), move |context| {
+      assert!(context.runtime_metrics.is_some());
+      observed.fetch_add(1, Ordering::SeqCst);
+      let tenant = context
+        .resources
+        .tenant_domain()
+        .cloned()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "tenant missing"))?;
+      let disk = context
+        .disk_rate
+        .clone()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "disk rate missing"))?;
+      let network = context
+        .download_rate
+        .clone()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "download rate missing"))?;
+      Ok((
+        BusyFeedbackSensor,
+        RuntimeFeedbackActuator::new(CpuFeedbackTarget::Tenant(tenant), disk, network),
+      ))
+    });
+    let mut driver = MultiThreadBuilder::new(async_config())
+      .resources(limits(64))
+      .resource_domain(tenant.clone())
+      .disk_rate(feedback_rate_config())
+      .upload_rate(feedback_rate_config())
+      .download_rate(feedback_rate_config())
+      .feedback_sources(factory)
+      .build()
+      .unwrap_or_else(|error| panic!("feedback driver build failed: {error}"));
+    assert_eq!(contexts_seen.load(Ordering::SeqCst), 1);
+
+    let mut network = driver
+      .rate_io(DriverTestIo::new(9))
+      .unwrap_or_else(|error| panic!("network rate adapter failed: {error}"));
+    let meter = driver
+      .feedback_meters
+      .as_ref()
+      .map(|meters| meters.download.clone())
+      .unwrap_or_else(|| panic!("feedback download meter was not retained"));
+    driver
+      .block_on(async {
+        let mut byte = [0];
+        assert_eq!(network.read(&mut byte).await?, 1);
+        assert_eq!(network.write(&byte).await?, 1);
+        Ok::<(), io::Error>(())
+      })
+      .unwrap_or_else(|error| panic!("network progress failed: {error}"))
+      .unwrap_or_else(|error| panic!("network I/O failed: {error}"));
+    assert_eq!(meter.snapshot().committed_bytes, 1);
+
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+      let cpu_limit = tenant.snapshot().unwrap().limit.get(DomainResource::Cpu);
+      let disk_limit = driver.disk_rate().unwrap().snapshot().bytes_per_second;
+      let network_limit = driver.download_rate().unwrap().snapshot().bytes_per_second;
+      if cpu_limit < 16 && disk_limit < 1000 && network_limit < 1000 {
+        let metrics = driver.feedback_metrics().unwrap().snapshot();
+        assert_eq!(
+          metrics
+            .control(FeedbackResource::CpuConcurrency)
+            .current_limit,
+          cpu_limit as u64
+        );
+        assert_eq!(
+          metrics.control(FeedbackResource::DiskRate).current_limit,
+          disk_limit
+        );
+        assert_eq!(
+          metrics.control(FeedbackResource::NetworkRate).current_limit,
+          network_limit
+        );
+        break;
+      }
+      assert!(
+        Instant::now() < deadline,
+        "feedback did not actuate all controls"
+      );
+      std::thread::yield_now();
+    }
+    drop(network);
+    shutdown_multi_driver(&mut driver);
+  }
+
+  #[cfg(feature = "resource-feedback")]
+  #[test]
+  fn blocked_feedback_sensor_keeps_the_driver_pending_until_owner_cleanup() {
+    let gate = Arc::new(SampleGate::default());
+    let sensor_gate = Arc::clone(&gate);
+    let factory = feedback_sources(feedback_policy(), move |_| {
+      Ok((
+        GatedFeedbackSensor(Arc::clone(&sensor_gate)),
+        TestFeedbackActuator {
+          limits: [16, 1000, 1000],
+        },
+      ))
+    });
+    let mut driver = CurrentThreadBuilder::new(local_config())
+      .feedback_sources(factory)
+      .build()
+      .unwrap_or_else(|error| panic!("feedback driver build failed: {error}"));
+    assert!(gate.wait_until_entered(Duration::from_secs(2)));
+    driver
+      .request_shutdown(CurrentShutdown::default())
+      .unwrap_or_else(|error| panic!("shutdown request failed: {error}"));
+    assert_eq!(driver.try_shutdown(), Ok(ShutdownProgress::Pending));
+    assert!(driver.feedback.is_some());
+    assert!(driver.feedback_meters.is_some());
+    assert!(
+      !driver
+        .feedback_metrics()
+        .unwrap()
+        .snapshot()
+        .shutdown_complete
+    );
+
+    gate.release();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+      match driver.drive_shutdown_step() {
+        Ok(ShutdownProgress::Complete) => break,
+        Ok(ShutdownProgress::Pending) => {
+          assert!(Instant::now() < deadline, "feedback owner did not finish");
+          std::thread::yield_now();
+        }
+        Err(error) => panic!("feedback owner shutdown failed: {error}"),
+      }
+    }
+    assert!(
+      driver
+        .feedback_metrics()
+        .unwrap()
+        .snapshot()
+        .shutdown_complete
+    );
+  }
+
+  #[cfg(feature = "resource-feedback")]
+  #[test]
+  fn failed_feedback_factory_rolls_back_started_async_services() {
+    let (domain, tenant) = feedback_domain();
+    let control_before = domain.snapshot().used.get(DomainResource::Control);
+    let factory = feedback_sources(feedback_policy(), |_| {
+      Err::<(MissingFeedbackSensor, TestFeedbackActuator), io::Error>(io::Error::other(
+        "intentional source failure",
+      ))
+    });
+    let error = MultiThreadBuilder::new(async_config())
+      .resource_domain(tenant)
+      .timer(4)
+      .feedback_sources(factory)
+      .build()
+      .err()
+      .unwrap_or_else(|| panic!("failing feedback factory unexpectedly built"));
+    assert!(matches!(
+      error,
+      DriverBuildError::Feedback(FeedbackFactoryError::Sources(_))
+    ));
+    assert_eq!(
+      domain.snapshot().used.get(DomainResource::Control),
+      control_before
     );
   }
 }

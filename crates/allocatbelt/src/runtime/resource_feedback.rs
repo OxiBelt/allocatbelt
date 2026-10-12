@@ -5,16 +5,20 @@
 //! 100 ms deadlines and uses the fixed-storage [`super::resource_feedback_policy`]
 //! engine to plan CPU concurrency, disk-rate, and network-rate changes. This
 //! service is off until explicitly constructed; it does not alter any default
-//! runtime configuration.
+//! runtime configuration. An opted-in service starts one sampler and one
+//! bounded join-monitor thread so shutdown polling never joins on the caller.
+//! Policy and metrics use fixed-size storage and the join handoff has capacity
+//! one, but this service does not currently charge those allocations or its
+//! thread stacks to `ResourceDomain::Control`.
 //!
 //! Sensor and actuator callbacks run outside the snapshot lock and are
 //! panic-contained. A ticket is applied only after a readback confirms its
 //! expected old limit. Every attempted write is followed by a readback, even
 //! when stop was requested during the callback. A failed or ambiguous result
 //! latches that control until the owner explicitly requests reconciliation.
-//! Dropping the owner requests stop and detaches a live worker; the worker keeps
-//! its policy, sensor, actuator, and shared state until callbacks and payload
-//! cleanup finish.
+//! Dropping the owner requests stop and detaches a live join monitor; the
+//! monitor retains the sampler handle, and the sampler retains its policy,
+//! sensor, actuator, and shared state until callbacks and cleanup finish.
 
 #![forbid(unsafe_code)]
 #![cfg_attr(not(test), deny(clippy::expect_used, clippy::unwrap_used))]
@@ -22,7 +26,7 @@
 use std::any::Any;
 use std::fmt;
 use std::panic::{self, AssertUnwindSafe};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -201,7 +205,8 @@ pub struct FeedbackMetricsSnapshot {
   pub sample_count: u64,
   /// Whether stop has been requested.
   pub stop_requested: bool,
-  /// Whether worker callbacks, owner cleanup, and shared-state publication ended.
+  /// Whether the sampler thread, including thread-local destructors, was joined.
+  /// The service owner may still need to collect a typed shutdown failure.
   pub shutdown_complete: bool,
   /// One queued explicit reconciliation request, if any.
   pub reconciliation_pending: Option<FeedbackResource>,
@@ -246,12 +251,35 @@ struct SharedState {
   stop_requested: bool,
   reconciliation_pending: Option<FeedbackResource>,
   reconciliation_in_flight: Option<FeedbackResource>,
+  worker_joined: bool,
+  worker_join_panicked: bool,
+  worker_panic_payload: Option<Box<dyn Any + Send>>,
+  owner_attached: bool,
   metrics: FeedbackMetricsSnapshot,
 }
 
 struct Shared {
   state: Mutex<SharedState>,
   wakeup: Condvar,
+}
+
+impl Drop for Shared {
+  fn drop(&mut self) {
+    let payload = self
+      .state
+      .get_mut()
+      .unwrap_or_else(PoisonError::into_inner)
+      .worker_panic_payload
+      .take();
+    if let Some(payload) = payload {
+      discard_worker_payload(payload);
+    }
+  }
+}
+
+enum JoinCommand {
+  Worker(JoinHandle<()>),
+  Stop,
 }
 
 fn lock_state(shared: &Shared) -> MutexGuard<'_, SharedState> {
@@ -373,29 +401,33 @@ impl std::error::Error for FeedbackShutdownError {}
 
 /// Off-by-default autonomous resource sampling and actuation owner.
 ///
+/// An opted-in instance owns a sampler worker and a small join-monitor thread.
+/// The monitor joins the sampler away from callers and publishes completion
+/// only after that thread has finished its thread-local destructors.
+///
 /// Startup actuator readbacks are synchronous and may block; this constructor
 /// has no startup timeout. Use [`Self::try_shutdown`] to poll actual worker
 /// completion without waiting on a live sensor, actuator, or payload cleanup.
 pub struct ResourceFeedbackService {
   shared: Arc<Shared>,
-  worker: Option<JoinHandle<()>>,
+  join_monitor: Option<JoinHandle<()>>,
   shutdown_error: Option<FeedbackShutdownError>,
   /// At most one joined panic payload is retained until owner drop.
-  panic_payload: Option<Box<dyn Any + Send>>,
+  panic_payload: Mutex<Option<Box<dyn Any + Send>>>,
 }
 
 impl fmt::Debug for ResourceFeedbackService {
   fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
     f.debug_struct("ResourceFeedbackService")
       .field("metrics", &self.metrics())
-      .field("worker_joinable", &self.worker.is_some())
+      .field("join_monitor_owned", &self.join_monitor.is_some())
       .field("shutdown_error", &self.shutdown_error)
       .finish()
   }
 }
 
 impl ResourceFeedbackService {
-  /// Validates the policy and all actual limits before starting the worker.
+  /// Validates the policy and all actual limits before starting either thread.
   ///
   /// All three controls must be configured explicitly. The actuator is read
   /// once for each control and every value must match its configured initial
@@ -441,13 +473,27 @@ impl ResourceFeedbackService {
         stop_requested: false,
         reconciliation_pending: None,
         reconciliation_in_flight: None,
+        worker_joined: false,
+        worker_join_panicked: false,
+        worker_panic_payload: None,
+        owner_attached: true,
         metrics,
       }),
       wakeup: Condvar::new(),
     });
+    let (join_sender, join_receiver) = mpsc::sync_channel(1);
+    let monitor_shared = Arc::clone(&shared);
+    let join_monitor = thread::Builder::new()
+      .name("allocatbelt-feedback-join".to_owned())
+      .spawn(move || {
+        if let Ok(JoinCommand::Worker(worker)) = join_receiver.recv() {
+          publish_worker_join(&monitor_shared, worker.join());
+        }
+      })
+      .map_err(FeedbackStartError::ThreadSpawn)?;
     let worker_shared = Arc::clone(&shared);
-    let completion_shared = Arc::clone(&shared);
-    let worker = thread::Builder::new()
+    let worker = match thread::Builder::new()
+      .name("allocatbelt-resource-feedback".to_owned())
       .spawn(move || {
         let mut policy = policy;
         let mut sensor = sensor;
@@ -457,25 +503,56 @@ impl ResourceFeedbackService {
         }));
         if let Err(payload) = run {
           discard_worker_payload(payload);
-          record_worker_failure(&completion_shared, FeedbackWorkerFailure::Panicked);
+          record_worker_failure(&worker_shared, FeedbackWorkerFailure::Panicked);
         }
         let policy_dropped = drop_worker_value(policy);
         let sensor_dropped = drop_worker_value(sensor);
         let actuator_dropped = drop_worker_value(actuator);
         if !policy_dropped || !sensor_dropped || !actuator_dropped {
           record_worker_failure(
-            &completion_shared,
+            &worker_shared,
             FeedbackWorkerFailure::PayloadCleanupPanicked,
           );
         }
-        mark_worker_finished(&completion_shared);
-      })
-      .map_err(FeedbackStartError::ThreadSpawn)?;
+      }) {
+      Ok(worker) => worker,
+      Err(error) => {
+        let _ = join_sender.send(JoinCommand::Stop);
+        if let Err(payload) = join_monitor.join() {
+          discard_worker_payload(payload);
+        }
+        return Err(FeedbackStartError::ThreadSpawn(error));
+      }
+    };
+    if let Err(error) = join_sender.send(JoinCommand::Worker(worker)) {
+      let worker = match error.0 {
+        JoinCommand::Worker(worker) => worker,
+        JoinCommand::Stop => {
+          drop(join_monitor);
+          return Err(FeedbackStartError::ThreadSpawn(std::io::Error::new(
+            std::io::ErrorKind::BrokenPipe,
+            "feedback join monitor exited before taking worker ownership",
+          )));
+        }
+      };
+      {
+        let mut state = lock_state(&shared);
+        state.stop_requested = true;
+        state.metrics.stop_requested = true;
+      }
+      shared.wakeup.notify_all();
+      drop(worker);
+      drop(join_monitor);
+      return Err(FeedbackStartError::ThreadSpawn(std::io::Error::new(
+        std::io::ErrorKind::BrokenPipe,
+        "feedback join monitor exited before taking worker ownership",
+      )));
+    }
     Ok(Self {
       shared,
-      worker: Some(worker),
+      join_monitor: Some(join_monitor),
       shutdown_error: None,
-      panic_payload: None,
+      panic_payload: Mutex::new(None),
     })
   }
 
@@ -525,57 +602,132 @@ impl ResourceFeedbackService {
     Ok(())
   }
 
-  /// Requests stop and joins only when worker-owned callbacks and cleanup ended.
+  /// Requests stop and polls a dedicated join monitor until the sampler and
+  /// its thread-local destructors have fully exited.
   ///
-  /// A `Pending` return retains the exact `JoinHandle` and every owner. If a
-  /// join reports panic, its payload stays in this owner and the typed failure
-  /// remains sticky on subsequent calls; payload destruction happens only when
-  /// the owner is dropped.
+  /// A `Pending` return retains the join-monitor handle while that monitor owns
+  /// the exact sampler `JoinHandle` and every callback owner. If the sampler
+  /// panics, its payload stays in this owner after publication and the typed
+  /// failure remains sticky; payload destruction happens only when this owner
+  /// is dropped.
   pub fn try_shutdown(&mut self) -> Result<FeedbackShutdownProgress, FeedbackShutdownError> {
     self.request_stop();
+    let (worker_joined, worker_panicked, panic_payload) = {
+      let mut state = lock_state(&self.shared);
+      if !state.worker_joined {
+        (false, false, None)
+      } else {
+        (
+          true,
+          state.worker_join_panicked,
+          state.worker_panic_payload.take(),
+        )
+      }
+    };
+    if !worker_joined {
+      return Ok(FeedbackShutdownProgress::Pending);
+    }
+    self.join_monitor.take();
+    if worker_panicked {
+      let unretained_payload = {
+        let mut retained = self
+          .panic_payload
+          .lock()
+          .unwrap_or_else(PoisonError::into_inner);
+        match (retained.is_none(), panic_payload) {
+          (true, Some(payload)) => {
+            *retained = Some(payload);
+            None
+          }
+          (_, payload) => payload,
+        }
+      };
+      if let Some(payload) = unretained_payload {
+        discard_worker_payload(payload);
+      }
+      self.shutdown_error = Some(FeedbackShutdownError::WorkerPanicked);
+    }
     if let Some(error) = self.shutdown_error {
       return Err(error);
-    }
-    if self
-      .worker
-      .as_ref()
-      .is_some_and(|worker| worker.is_finished())
-      && let Some(worker) = self.worker.take()
-      && let Err(payload) = worker.join()
-    {
-      self.panic_payload = Some(payload);
-      self.shutdown_error = Some(FeedbackShutdownError::WorkerPanicked);
-      let mut state = lock_state(&self.shared);
-      state.metrics.shutdown_complete = true;
-      state.metrics.worker_failure = Some(FeedbackWorkerFailure::Panicked);
-      state.metrics.last_diagnostic = Some(FeedbackDiagnostic::WorkerPanicked);
-      return Err(FeedbackShutdownError::WorkerPanicked);
     }
     if let Some(failure) = self.metrics().worker_failure {
       let error = shutdown_error(failure);
       self.shutdown_error = Some(error);
       return Err(error);
     }
-    if self.worker.is_some() || !self.metrics().shutdown_complete {
+    if !self.metrics().shutdown_complete {
       Ok(FeedbackShutdownProgress::Pending)
     } else {
       Ok(FeedbackShutdownProgress::Complete)
     }
+  }
+
+  /// Whether the sampler thread was joined and its result was collected.
+  #[must_use]
+  pub fn is_shutdown_complete(&self) -> bool {
+    self.join_monitor.is_none() && lock_state(&self.shared).worker_joined
   }
 }
 
 impl Drop for ResourceFeedbackService {
   fn drop(&mut self) {
     self.request_stop();
-    // Dropping a live JoinHandle detaches. The worker closure retains the
-    // sensor, actuator, policy, and shared state until its own cleanup ends.
-    drop(self.worker.take());
+    {
+      let mut state = lock_state(&self.shared);
+      state.owner_attached = false;
+      let payload = state.worker_panic_payload.take();
+      drop(state);
+      if let Some(payload) = payload {
+        discard_worker_payload(payload);
+      }
+    }
+    // The join monitor owns the sampler handle, and that worker owns the
+    // sensor, actuator, and policy until callbacks and cleanup end.
+    drop(self.join_monitor.take());
     // A joined panic payload is bounded to one object. Its destructor may
     // block; contain a destructor panic so it cannot escape this owner Drop.
-    if let Some(payload) = self.panic_payload.take() {
+    let payload = self
+      .panic_payload
+      .get_mut()
+      .unwrap_or_else(PoisonError::into_inner)
+      .take();
+    if let Some(payload) = payload {
       discard_worker_payload(payload);
     }
   }
+}
+
+fn publish_worker_join(shared: &Shared, result: thread::Result<()>) {
+  let mut cleanup_payload = None;
+  {
+    let mut state = lock_state(shared);
+    if let Err(payload) = result {
+      state.worker_join_panicked = true;
+      state.metrics.worker_failure = Some(FeedbackWorkerFailure::Panicked);
+      state.metrics.last_diagnostic = Some(FeedbackDiagnostic::WorkerPanicked);
+      for control in &mut state.metrics.controls {
+        control.last_diagnostic = Some(FeedbackDiagnostic::WorkerPanicked);
+      }
+      if state.owner_attached {
+        state.worker_panic_payload = Some(payload);
+      } else {
+        cleanup_payload = Some(payload);
+      }
+    }
+    if cleanup_payload.is_none() {
+      state.worker_joined = true;
+      state.metrics.shutdown_complete = true;
+    }
+  }
+  if let Some(payload) = cleanup_payload {
+    // When the service owner has already been dropped, contain arbitrary
+    // payload cleanup here before publishing worker completion.
+    discard_worker_payload(payload);
+    let mut state = lock_state(shared);
+    state.worker_joined = true;
+    state.metrics.shutdown_complete = true;
+  }
+  shared.wakeup.notify_all();
 }
 
 #[derive(Clone, Copy)]
@@ -1016,14 +1168,6 @@ fn record_worker_failure(shared: &Shared, failure: FeedbackWorkerFailure) {
   }
 }
 
-fn mark_worker_finished(shared: &Shared) {
-  {
-    let mut state = lock_state(shared);
-    state.metrics.shutdown_complete = true;
-  }
-  shared.wakeup.notify_all();
-}
-
 fn stop_requested(shared: &Shared) -> bool {
   lock_state(shared).stop_requested
 }
@@ -1100,7 +1244,9 @@ fn shutdown_error(failure: FeedbackWorkerFailure) -> FeedbackShutdownError {
 mod tests {
   use super::super::resource_feedback_policy::{ACTUATION_COOLDOWN, FeedbackControlConfig};
   use super::*;
+  use std::cell::RefCell;
   use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+  use std::sync::mpsc;
 
   #[derive(Clone, Copy)]
   enum Signal {
@@ -1113,6 +1259,102 @@ mod tests {
   }
 
   type Flag = Arc<(Mutex<bool>, Condvar)>;
+
+  struct ThreadExitGate {
+    entered: Flag,
+    release: Flag,
+  }
+
+  impl Drop for ThreadExitGate {
+    fn drop(&mut self) {
+      set_flag(&self.entered);
+      let _ = wait_flag(&self.release, Duration::from_secs(10));
+    }
+  }
+
+  struct NestedThreadExitGate {
+    entered: Flag,
+    release: Flag,
+  }
+
+  impl Drop for NestedThreadExitGate {
+    fn drop(&mut self) {
+      set_flag(&self.entered);
+      let _ = wait_flag(&self.release, Duration::from_secs(10));
+    }
+  }
+
+  struct InitializeNestedThreadExitGate {
+    entered: Flag,
+    release: Flag,
+  }
+
+  impl Drop for InitializeNestedThreadExitGate {
+    fn drop(&mut self) {
+      let entered = Arc::clone(&self.entered);
+      let release = Arc::clone(&self.release);
+      NESTED_THREAD_EXIT_GATE.with(|slot| {
+        *slot.borrow_mut() = Some(NestedThreadExitGate { entered, release });
+      });
+    }
+  }
+
+  thread_local! {
+    static THREAD_EXIT_GATE: RefCell<Option<ThreadExitGate>> = const { RefCell::new(None) };
+    static NESTED_THREAD_EXIT_GATE: RefCell<Option<NestedThreadExitGate>> = const { RefCell::new(None) };
+    static INITIALIZE_NESTED_THREAD_EXIT_GATE: RefCell<Option<InitializeNestedThreadExitGate>> = const { RefCell::new(None) };
+  }
+
+  struct CleanupPanickingSensor {
+    entered: Flag,
+    release: Flag,
+    installed: bool,
+  }
+
+  impl FeedbackSensor for CleanupPanickingSensor {
+    fn sample(&mut self) -> Result<FeedbackSample, FeedbackSensorError> {
+      if !self.installed {
+        let entered = Arc::clone(&self.entered);
+        let release = Arc::clone(&self.release);
+        THREAD_EXIT_GATE.with(|slot| {
+          *slot.borrow_mut() = Some(ThreadExitGate { entered, release });
+        });
+        self.installed = true;
+      }
+      Ok(FeedbackSample::new(
+        Instant::now(),
+        Some(7_000),
+        Some(7_000),
+        Some(7_000),
+      ))
+    }
+  }
+
+  impl Drop for CleanupPanickingSensor {
+    fn drop(&mut self) {
+      panic!("mock sensor destructor panic");
+    }
+  }
+
+  struct NestedTlsSensor {
+    entered: Flag,
+    release: Flag,
+    installed: bool,
+  }
+
+  impl FeedbackSensor for NestedTlsSensor {
+    fn sample(&mut self) -> Result<FeedbackSample, FeedbackSensorError> {
+      if !self.installed {
+        let entered = Arc::clone(&self.entered);
+        let release = Arc::clone(&self.release);
+        INITIALIZE_NESTED_THREAD_EXIT_GATE.with(|slot| {
+          *slot.borrow_mut() = Some(InitializeNestedThreadExitGate { entered, release });
+        });
+        self.installed = true;
+      }
+      Ok(FeedbackSample::new(Instant::now(), None, None, None))
+    }
+  }
 
   struct TestSensor {
     signal: Signal,
@@ -1419,6 +1661,12 @@ mod tests {
   }
 
   #[test]
+  fn feedback_service_remains_send_and_sync() {
+    fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<ResourceFeedbackService>();
+  }
+
+  #[test]
   fn startup_rejects_actual_limit_mismatch_before_spawning_sensor() {
     let state = ActuatorState::new([100, 99, 100]);
     let (sensor, calls) = TestSensor::new(Signal::Neutral);
@@ -1548,7 +1796,7 @@ mod tests {
       service.try_shutdown(),
       Ok(FeedbackShutdownProgress::Pending)
     );
-    assert!(service.worker.is_some());
+    assert!(service.join_monitor.is_some());
     drop(service);
     assert!(!dropped.load(Ordering::SeqCst));
     assert!(!metrics.snapshot().shutdown_complete);
@@ -1556,6 +1804,99 @@ mod tests {
     set_flag(&release);
     assert!(wait_until(Duration::from_secs(2), || {
       dropped.load(Ordering::SeqCst) && metrics.snapshot().shutdown_complete
+    }));
+  }
+
+  #[test]
+  fn worker_failure_does_not_report_complete_before_tls_cleanup_finishes() {
+    let state = ActuatorState::new([100, 100, 100]);
+    let entered = new_flag();
+    let release = new_flag();
+    let mut service = ResourceFeedbackService::start(
+      config(),
+      CleanupPanickingSensor {
+        entered: Arc::clone(&entered),
+        release: Arc::clone(&release),
+        installed: false,
+      },
+      TestActuator::new(state),
+    )
+    .unwrap();
+    assert!(wait_until(Duration::from_secs(2), || {
+      service.metrics().sample_count > 0
+    }));
+    service.request_stop();
+    assert!(wait_flag(&entered, Duration::from_secs(2)));
+    let snapshot = service.metrics();
+    assert_eq!(
+      snapshot.worker_failure,
+      Some(FeedbackWorkerFailure::PayloadCleanupPanicked)
+    );
+    assert!(!snapshot.shutdown_complete);
+    assert!(!service.is_shutdown_complete());
+    assert_eq!(
+      service.try_shutdown(),
+      Ok(FeedbackShutdownProgress::Pending)
+    );
+    assert!(service.join_monitor.is_some());
+
+    set_flag(&release);
+    assert!(wait_until(Duration::from_secs(2), || {
+      service.try_shutdown() == Err(FeedbackShutdownError::PayloadCleanupPanicked)
+        && service.is_shutdown_complete()
+    }));
+  }
+
+  #[test]
+  fn joined_status_waits_for_tls_destructors_initialized_by_another_destructor() {
+    let entered = new_flag();
+    let release = new_flag();
+    let mut service = ResourceFeedbackService::start(
+      config(),
+      NestedTlsSensor {
+        entered: Arc::clone(&entered),
+        release: Arc::clone(&release),
+        installed: false,
+      },
+      TestActuator::new(ActuatorState::new([100, 100, 100])),
+    )
+    .unwrap();
+    assert!(wait_until(Duration::from_secs(2), || {
+      service.metrics().sample_count > 0
+    }));
+    service.request_stop();
+    assert!(wait_flag(&entered, Duration::from_secs(2)));
+    assert!(!service.is_shutdown_complete());
+    let (status_sender, status_receiver) = mpsc::sync_channel(1);
+    let status_thread = thread::spawn(move || {
+      let status = service.try_shutdown();
+      let _ = status_sender.send((service, status));
+    });
+    let first_status = status_receiver.recv_timeout(Duration::from_secs(1));
+    let returned_before_release = first_status.is_ok();
+    set_flag(&release);
+    let (mut service, status) = match first_status {
+      Ok(value) => value,
+      Err(mpsc::RecvTimeoutError::Timeout) => status_receiver
+        .recv_timeout(Duration::from_secs(2))
+        .unwrap_or_else(|error| {
+          panic!("shutdown poll remained blocked after TLS release: {error}")
+        }),
+      Err(error) => panic!("shutdown poll channel failed: {error}"),
+    };
+    status_thread
+      .join()
+      .unwrap_or_else(|_| panic!("bounded shutdown poll thread panicked"));
+    assert!(
+      returned_before_release,
+      "shutdown poll blocked during TLS teardown"
+    );
+    assert_eq!(status, Ok(FeedbackShutdownProgress::Pending));
+    assert!(service.join_monitor.is_some());
+
+    assert!(wait_until(Duration::from_secs(2), || {
+      service.try_shutdown() == Ok(FeedbackShutdownProgress::Complete)
+        && service.is_shutdown_complete()
     }));
   }
 
@@ -1688,7 +2029,7 @@ mod tests {
       service.try_shutdown(),
       Ok(FeedbackShutdownProgress::Pending)
     );
-    assert!(service.worker.is_some());
+    assert!(service.join_monitor.is_some());
     assert!(!sensor_dropped.load(Ordering::SeqCst));
     assert!(!actuator_dropped.load(Ordering::SeqCst));
 
