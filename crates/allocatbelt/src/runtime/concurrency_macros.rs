@@ -25,6 +25,7 @@ pub use std::pin::pin;
 
 #[doc(hidden)]
 pub type PanicPayload = Box<dyn Any + Send + 'static>;
+type BranchPoll<T> = Poll<Result<Option<(usize, T)>, PanicPayload>>;
 
 /// The nested winner representation used internally by [`select!`].
 #[doc(hidden)]
@@ -33,13 +34,21 @@ pub enum Either<L, R> {
   Right(R),
 }
 
+/// The initial priority mode for the heterogeneous `select!` macro.
+#[doc(hidden)]
+pub enum SelectionStart {
+  Biased,
+  RoundRobin,
+  Randomized(super::concurrency::SelectionRng),
+}
+
 /// Empty tail for the internal heterogeneous branch list.
 #[doc(hidden)]
 pub struct Nil;
 
 /// One future owned by a selection branch.
 #[doc(hidden)]
-pub struct Branch<F> {
+pub struct Branch<F: Future> {
   future: Option<Pin<Box<F>>>,
   enabled: bool,
 }
@@ -62,7 +71,19 @@ impl<F: Future> Branch<F> {
     let Some(future) = self.future.as_mut() else {
       return Ok(Poll::Pending);
     };
-    panic::catch_unwind(AssertUnwindSafe(|| future.as_mut().poll(cx)))
+    match panic::catch_unwind(AssertUnwindSafe(|| future.as_mut().poll(cx))) {
+      Ok(Poll::Pending) => Ok(Poll::Pending),
+      Ok(Poll::Ready(output)) => {
+        self.enabled = false;
+        if let Some(payload) = drop_capturing(self.future.take()) {
+          drop_contained(output);
+          Err(payload)
+        } else {
+          Ok(Poll::Ready(output))
+        }
+      }
+      Err(payload) => Err(payload),
+    }
   }
 
   fn dispose_capturing(&mut self, primary: &mut Option<PanicPayload>) {
@@ -94,11 +115,8 @@ pub trait BranchList {
   const LEN: usize;
 
   fn enabled_at(&self, index: usize) -> bool;
-  fn poll_at(
-    &mut self,
-    index: usize,
-    cx: &mut Context<'_>,
-  ) -> Poll<Result<Option<Self::Winner>, PanicPayload>>;
+  fn poll_at(&mut self, index: usize, cx: &mut Context<'_>) -> BranchPoll<Self::Winner>;
+  fn disable_at(&mut self, index: usize);
   fn dispose_capturing(&mut self, primary: &mut Option<PanicPayload>);
 
   fn branch_count(&self) -> usize {
@@ -114,6 +132,19 @@ pub trait BranchList {
       .map(|offset| (current + offset) % Self::LEN)
       .find(|index| self.enabled_at(*index))
       .unwrap_or(current)
+  }
+
+  fn enabled_count(&self) -> usize {
+    (0..Self::LEN)
+      .filter(|index| self.enabled_at(*index))
+      .count()
+  }
+
+  fn enabled_index(&self, rank: usize) -> usize {
+    (0..Self::LEN)
+      .filter(|index| self.enabled_at(*index))
+      .nth(rank)
+      .unwrap_or(0)
   }
 
   fn first_enabled_from(&self, start: usize) -> usize {
@@ -140,25 +171,30 @@ where
     }
   }
 
-  fn poll_at(
-    &mut self,
-    index: usize,
-    cx: &mut Context<'_>,
-  ) -> Poll<Result<Option<Self::Winner>, PanicPayload>> {
+  fn poll_at(&mut self, index: usize, cx: &mut Context<'_>) -> BranchPoll<Self::Winner> {
     if index == 0 {
       if !self.head.enabled() {
         return Poll::Ready(Ok(None));
       }
       return match self.head.poll(cx) {
-        Ok(Poll::Pending) => Poll::Ready(Ok(None)),
-        Ok(Poll::Ready(output)) => Poll::Ready(Ok(Some(Either::Left(output)))),
+        Ok(Poll::Pending) => Poll::Pending,
+        Ok(Poll::Ready(output)) => Poll::Ready(Ok(Some((0, Either::Left(output))))),
         Err(payload) => Poll::Ready(Err(payload)),
       };
     }
-    self
-      .tail
-      .poll_at(index - 1, cx)
-      .map(|result| result.map(|winner| winner.map(Either::Right)))
+    self.tail.poll_at(index - 1, cx).map(|result| {
+      result.map(|winner| {
+        winner.map(|(winner_index, output)| (winner_index + 1, Either::Right(output)))
+      })
+    })
+  }
+
+  fn disable_at(&mut self, index: usize) {
+    if index == 0 {
+      self.head.enabled = false;
+    } else {
+      self.tail.disable_at(index - 1);
+    }
   }
 
   fn dispose_capturing(&mut self, primary: &mut Option<PanicPayload>) {
@@ -175,13 +211,11 @@ impl BranchList for Nil {
     false
   }
 
-  fn poll_at(
-    &mut self,
-    _index: usize,
-    _cx: &mut Context<'_>,
-  ) -> Poll<Result<Option<Self::Winner>, PanicPayload>> {
+  fn poll_at(&mut self, _index: usize, _cx: &mut Context<'_>) -> BranchPoll<Self::Winner> {
     Poll::Ready(Ok(None))
   }
+
+  fn disable_at(&mut self, _index: usize) {}
 
   fn dispose_capturing(&mut self, _primary: &mut Option<PanicPayload>) {}
 }
@@ -223,6 +257,15 @@ impl<L: MultiBranchList> BranchSet<L> {
       .is_some_and(|branches| branches.any_enabled())
   }
 
+  /// Returns whether one original source branch remains enabled.
+  #[doc(hidden)]
+  pub fn any_enabled_at(&self, index: usize) -> bool {
+    self
+      .branches
+      .as_ref()
+      .is_some_and(|branches| branches.enabled_at(index))
+  }
+
   /// Number of original source branches.
   #[doc(hidden)]
   pub fn branch_count(&self) -> usize {
@@ -234,11 +277,7 @@ impl<L: MultiBranchList> BranchSet<L> {
 
   /// Polls one original branch index.
   #[doc(hidden)]
-  pub fn poll_at(
-    &mut self,
-    index: usize,
-    cx: &mut Context<'_>,
-  ) -> Poll<Result<Option<L::Winner>, PanicPayload>> {
+  pub fn poll_at(&mut self, index: usize, cx: &mut Context<'_>) -> BranchPoll<L::Winner> {
     match self.branches.as_mut() {
       Some(branches) => branches.poll_at(index, cx),
       None => Poll::Ready(Ok(None)),
@@ -263,6 +302,30 @@ impl<L: MultiBranchList> BranchSet<L> {
       .map_or(start, |branches| branches.first_enabled_from(start))
   }
 
+  /// Chooses one enabled source branch using `rng`.
+  #[doc(hidden)]
+  pub fn random_start(&self, rng: &mut super::concurrency::SelectionRng) -> usize {
+    let Some(branches) = self.branches.as_ref() else {
+      return 0;
+    };
+    let count = branches.enabled_count();
+    if count == 0 {
+      return 0;
+    }
+    branches.enabled_index(rng.index(count))
+  }
+
+  /// Resolves the first enabled branch and whether subsequent pending polls
+  /// should rotate priority.
+  #[doc(hidden)]
+  pub fn initial_start(&self, policy: &mut SelectionStart) -> (bool, usize) {
+    match policy {
+      SelectionStart::Biased => (false, self.first_enabled_from(0)),
+      SelectionStart::RoundRobin => (true, self.first_enabled_from(0)),
+      SelectionStart::Randomized(rng) => (true, self.random_start(rng)),
+    }
+  }
+
   /// Disposes all branch futures, then resumes the first
   /// destructor panic if there was one.
   #[doc(hidden)]
@@ -275,7 +338,7 @@ impl<L: MultiBranchList> BranchSet<L> {
   /// Disposes all branches before publishing a winner. The winner is safely
   /// disposed if cleanup itself panics.
   #[doc(hidden)]
-  pub fn dispose_before_winner(&mut self, winner: L::Winner) -> L::Winner {
+  pub fn dispose_before_winner<T>(&mut self, winner: T) -> T {
     let mut primary = None;
     self.dispose_capturing(&mut primary);
     if let Some(payload) = primary {
@@ -283,6 +346,56 @@ impl<L: MultiBranchList> BranchSet<L> {
       panic::resume_unwind(payload);
     }
     winner
+  }
+
+  /// Disposes all branch futures without resuming a cleanup panic until the
+  /// caller has finished leaving the pattern-match scope.
+  #[doc(hidden)]
+  pub fn dispose_before_winner_capturing<T>(&mut self, winner: T) -> Result<T, PanicPayload> {
+    let mut primary = None;
+    self.dispose_capturing(&mut primary);
+    if let Some(payload) = primary {
+      drop_contained(winner);
+      Err(payload)
+    } else {
+      Ok(winner)
+    }
+  }
+
+  /// Preserves the first selection failure while containing dispatch-state
+  /// and branch destructor panics.
+  #[doc(hidden)]
+  pub fn resolve_dispatch_failures(
+    &mut self,
+    primary: Option<PanicPayload>,
+    poll_panic: Option<PanicPayload>,
+    dispatcher_drop_panic: Option<PanicPayload>,
+  ) -> Option<PanicPayload> {
+    let mut primary = primary;
+    if primary.is_none() {
+      primary = poll_panic;
+    } else {
+      drop_contained(poll_panic);
+    }
+    if primary.is_none() {
+      primary = dispatcher_drop_panic;
+    } else {
+      drop_contained(dispatcher_drop_panic);
+    }
+    if primary.is_some() {
+      let mut ignored = None;
+      self.dispose_capturing(&mut ignored);
+      drop_contained(ignored);
+    }
+    primary
+  }
+
+  /// Disables a completed branch whose output did not match its pattern.
+  #[doc(hidden)]
+  pub fn disable_at(&mut self, index: usize) {
+    if let Some(branches) = self.branches.as_mut() {
+      branches.disable_at(index);
+    }
   }
 
   /// Disposes all branches while preserving a polling panic as primary.
@@ -398,6 +511,16 @@ pub struct JoinNode<H, T> {
   tail: T,
 }
 
+/// Poll-order policy for [`join!`] and [`try_join!`].
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum JoinPolicy {
+  /// Poll inputs in source order on every call.
+  Biased,
+  /// Rotate the first polled input after each pending call.
+  RoundRobin,
+}
+
 impl<H, T> JoinNode<H, T> {
   /// Prepends an input slot.
   #[doc(hidden)]
@@ -412,7 +535,7 @@ pub trait JoinBranches {
   /// Nested shape used internally before the macro flattens the final tuple.
   type Outputs;
   const LEN: usize;
-  fn poll_join(&mut self, cx: &mut Context<'_>) -> Result<(), PanicPayload>;
+  fn poll_join_at(&mut self, index: usize, cx: &mut Context<'_>) -> Result<(), PanicPayload>;
   fn complete(&self) -> bool;
   fn take_outputs(&mut self) -> Self::Outputs;
   fn dispose_capturing(&mut self, primary: &mut Option<PanicPayload>);
@@ -426,9 +549,12 @@ where
   type Outputs = (O, T::Outputs);
   const LEN: usize = 1 + T::LEN;
 
-  fn poll_join(&mut self, cx: &mut Context<'_>) -> Result<(), PanicPayload> {
-    self.head.poll(cx)?;
-    self.tail.poll_join(cx)
+  fn poll_join_at(&mut self, index: usize, cx: &mut Context<'_>) -> Result<(), PanicPayload> {
+    if index == 0 {
+      self.head.poll(cx)
+    } else {
+      self.tail.poll_join_at(index - 1, cx)
+    }
   }
 
   fn complete(&self) -> bool {
@@ -452,7 +578,7 @@ where
 impl JoinBranches for Nil {
   type Outputs = ();
   const LEN: usize = 0;
-  fn poll_join(&mut self, _cx: &mut Context<'_>) -> Result<(), PanicPayload> {
+  fn poll_join_at(&mut self, _index: usize, _cx: &mut Context<'_>) -> Result<(), PanicPayload> {
     Ok(())
   }
   fn complete(&self) -> bool {
@@ -468,6 +594,8 @@ impl JoinBranches for Nil {
 #[doc(hidden)]
 pub struct JoinFuture<L: JoinBranches> {
   branches: Option<L>,
+  policy: JoinPolicy,
+  next_start: usize,
   done: bool,
 }
 
@@ -475,10 +603,26 @@ impl<L: JoinBranches> JoinFuture<L> {
   /// Owns the prepared heterogeneous input list.
   #[doc(hidden)]
   pub fn new(branches: L) -> Self {
+    Self::with_policy(branches, JoinPolicy::RoundRobin)
+  }
+
+  /// Owns a prepared input list and its poll-order policy.
+  #[doc(hidden)]
+  pub fn with_policy(branches: L, policy: JoinPolicy) -> Self {
     Self {
       branches: Some(branches),
+      policy,
+      next_start: 0,
       done: false,
     }
+  }
+
+  /// Changes the poll-order policy before the first poll.
+  #[doc(hidden)]
+  pub fn configured(mut self, policy: JoinPolicy) -> Self {
+    self.policy = policy;
+    self.next_start = 0;
+    self
   }
 
   fn abort_with_primary(&mut self, primary: PanicPayload) -> ! {
@@ -505,15 +649,25 @@ impl<L: JoinBranches> Future for JoinFuture<L> {
   fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
     let this = self.get_mut();
     assert!(!this.done, "JoinFuture polled after completion");
-    let poll_result = match this.branches.as_mut() {
-      Some(branches) => branches.poll_join(cx),
-      None => Ok(()),
+    let start = match this.policy {
+      JoinPolicy::Biased => 0,
+      JoinPolicy::RoundRobin => this.next_start,
     };
-    if let Err(payload) = poll_result {
-      this.abort_with_primary(payload);
+    for offset in 0..L::LEN {
+      let index = (start + offset) % L::LEN;
+      let poll_result = match this.branches.as_mut() {
+        Some(branches) => branches.poll_join_at(index, cx),
+        None => Ok(()),
+      };
+      if let Err(payload) = poll_result {
+        this.abort_with_primary(payload);
+      }
     }
     let complete = this.branches.as_ref().is_some_and(JoinBranches::complete);
     if !complete {
+      if this.policy == JoinPolicy::RoundRobin {
+        this.next_start = (start + 1) % L::LEN;
+      }
       return Poll::Pending;
     }
     let outputs = match this.branches.as_mut() {
@@ -610,7 +764,11 @@ pub trait TryJoinBranches<E> {
   /// Nested shape used internally before the macro flattens the final tuple.
   type Outputs;
   const LEN: usize;
-  fn poll_try_join(&mut self, cx: &mut Context<'_>) -> Result<Option<E>, PanicPayload>;
+  fn poll_try_join_at(
+    &mut self,
+    index: usize,
+    cx: &mut Context<'_>,
+  ) -> Result<Option<E>, PanicPayload>;
   fn complete(&self) -> bool;
   fn take_outputs(&mut self) -> Self::Outputs;
   fn dispose_capturing(&mut self, primary: &mut Option<PanicPayload>);
@@ -624,11 +782,16 @@ where
   type Outputs = (T, Tail::Outputs);
   const LEN: usize = 1 + Tail::LEN;
 
-  fn poll_try_join(&mut self, cx: &mut Context<'_>) -> Result<Option<E>, PanicPayload> {
-    if let Some(error) = self.head.poll(cx)? {
-      return Ok(Some(error));
+  fn poll_try_join_at(
+    &mut self,
+    index: usize,
+    cx: &mut Context<'_>,
+  ) -> Result<Option<E>, PanicPayload> {
+    if index == 0 {
+      self.head.poll(cx)
+    } else {
+      self.tail.poll_try_join_at(index - 1, cx)
     }
-    self.tail.poll_try_join(cx)
   }
 
   fn complete(&self) -> bool {
@@ -652,7 +815,11 @@ where
 impl<E> TryJoinBranches<E> for Nil {
   type Outputs = ();
   const LEN: usize = 0;
-  fn poll_try_join(&mut self, _cx: &mut Context<'_>) -> Result<Option<E>, PanicPayload> {
+  fn poll_try_join_at(
+    &mut self,
+    _index: usize,
+    _cx: &mut Context<'_>,
+  ) -> Result<Option<E>, PanicPayload> {
     Ok(None)
   }
   fn complete(&self) -> bool {
@@ -668,6 +835,8 @@ impl<E> TryJoinBranches<E> for Nil {
 #[doc(hidden)]
 pub struct TryJoinFuture<L: TryJoinBranches<E>, E> {
   branches: Option<L>,
+  policy: JoinPolicy,
+  next_start: usize,
   done: bool,
   _error: PhantomData<fn(E)>,
 }
@@ -676,11 +845,27 @@ impl<L: TryJoinBranches<E>, E> TryJoinFuture<L, E> {
   /// Owns the prepared heterogeneous input list.
   #[doc(hidden)]
   pub fn new(branches: L) -> Self {
+    Self::with_policy(branches, JoinPolicy::RoundRobin)
+  }
+
+  /// Owns a prepared input list and its poll-order policy.
+  #[doc(hidden)]
+  pub fn with_policy(branches: L, policy: JoinPolicy) -> Self {
     Self {
       branches: Some(branches),
+      policy,
+      next_start: 0,
       done: false,
       _error: PhantomData,
     }
+  }
+
+  /// Changes the poll-order policy before the first poll.
+  #[doc(hidden)]
+  pub fn configured(mut self, policy: JoinPolicy) -> Self {
+    self.policy = policy;
+    self.next_start = 0;
+    self
   }
 
   fn dispose_capturing(&mut self, primary: &mut Option<PanicPayload>) {
@@ -707,10 +892,22 @@ impl<L: TryJoinBranches<E>, E> Future for TryJoinFuture<L, E> {
   fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
     let this = self.get_mut();
     assert!(!this.done, "TryJoinFuture polled after completion");
-    let poll_result = match this.branches.as_mut() {
-      Some(branches) => branches.poll_try_join(cx),
-      None => Ok(None),
+    let start = match this.policy {
+      JoinPolicy::Biased => 0,
+      JoinPolicy::RoundRobin => this.next_start,
     };
+    let mut poll_result = Ok(None);
+    for offset in 0..L::LEN {
+      let index = (start + offset) % L::LEN;
+      poll_result = match this.branches.as_mut() {
+        Some(branches) => branches.poll_try_join_at(index, cx),
+        None => Ok(None),
+      };
+      match &poll_result {
+        Err(_) | Ok(Some(_)) => break,
+        Ok(None) => {}
+      }
+    }
     match poll_result {
       Err(payload) => this.abort_with_primary(payload),
       Ok(Some(error)) => {
@@ -729,6 +926,9 @@ impl<L: TryJoinBranches<E>, E> Future for TryJoinFuture<L, E> {
           .as_ref()
           .is_some_and(TryJoinBranches::complete);
         if !complete {
+          if this.policy == JoinPolicy::RoundRobin {
+            this.next_start = (start + 1) % L::LEN;
+          }
           return Poll::Pending;
         }
         let outputs = match this.branches.as_mut() {
@@ -752,6 +952,12 @@ impl<L: TryJoinBranches<E>, E> Drop for TryJoinFuture<L, E> {
 
 fn drop_capturing<T>(value: T) -> Option<PanicPayload> {
   panic::catch_unwind(AssertUnwindSafe(|| drop(value))).err()
+}
+
+/// Drops one dispatch future while capturing its destructor panic.
+#[doc(hidden)]
+pub fn drop_dispatch_capturing<T>(dispatcher: T) -> Option<PanicPayload> {
+  drop_capturing(dispatcher)
 }
 
 #[doc(hidden)]
@@ -788,50 +994,184 @@ macro_rules! __allocatbelt_try_join_branches {
 
 #[doc(hidden)]
 #[macro_export]
-macro_rules! __allocatbelt_select_branches {
-  ([];) => { $crate::runtime::concurrency_macros::Nil };
+macro_rules! __allocatbelt_select_enabled {
+  ([];) => { () };
   ([]; $($branches:tt)+) => {
     compile_error!("select! supports at most sixteen branches")
   };
-  ([$($fuel:tt)*];) => { $crate::runtime::concurrency_macros::Nil };
+  ([$($fuel:tt)*];) => { () };
   ([$fuel:tt $($remaining:tt)*]; ($pattern:pat = $future:expr $(, if $enabled:expr)? => $handler:expr) $(, $rest:tt)*) => {
-    $crate::runtime::concurrency_macros::Cons::new(
-      $crate::runtime::concurrency_macros::Branch::new(
-        $future,
-        true $(&& $enabled)?,
-      ),
-      $crate::__allocatbelt_select_branches!([$($remaining)*]; $($rest),*),
-    )
+    (true $(&& $enabled)?, $crate::__allocatbelt_select_enabled!([$($remaining)*]; $($rest),*))
   };
 }
 
 #[doc(hidden)]
 #[macro_export]
-macro_rules! __allocatbelt_select_dispatch {
-  ($winner:expr; ($pattern:pat = $future:expr $(, if $enabled:expr)? => $handler:expr)) => {
-    match $winner {
-      $crate::runtime::concurrency_macros::Either::Left(__output) => {
-        match __output {
-          $pattern => $handler,
-        }
-      }
-      $crate::runtime::concurrency_macros::Either::Right(__unreachable) => {
-        match __unreachable {}
-      }
-    }
+macro_rules! __allocatbelt_select_branch {
+  ($enabled:expr; ($($branch:tt)*)) => {
+    $crate::__allocatbelt_select_branch!(@parse $enabled; $($branch)*)
   };
-  ($winner:expr; ($pattern:pat = $future:expr $(, if $enabled:expr)? => $handler:expr), $($rest:tt)+) => {
+  (@parse $enabled:expr; $pattern:pat = $future:expr $(, if $condition:expr)? => $handler:expr) => {{
+    let __future = $future;
+    #[allow(unused_variables)]
+    let __branch = $crate::runtime::concurrency_macros::Branch::new(
+      __future,
+      $enabled,
+    );
+    __branch
+  }};
+}
+
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __allocatbelt_select_branches {
+  ([]; $enabled:expr;) => { $crate::runtime::concurrency_macros::Nil };
+  ([]; $enabled:expr; $($branches:tt)+) => {
+    compile_error!("select! supports at most sixteen branches")
+  };
+  ([$($fuel:tt)*]; $enabled:expr;) => { $crate::runtime::concurrency_macros::Nil };
+  ([$fuel:tt $($remaining:tt)*]; $enabled_list:expr; $branch:tt $(, $rest:tt)*) => {{
+    let (__enabled_head, __enabled_tail) = $enabled_list;
+    $crate::runtime::concurrency_macros::Cons::new(
+      $crate::__allocatbelt_select_branch!(__enabled_head; $branch),
+      $crate::__allocatbelt_select_branches!([$($remaining)*]; __enabled_tail; $($rest),*),
+    )
+  }};
+}
+
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __allocatbelt_select_dispatch {
+  ($branches:ident, $index:ident, $winner:expr, $cleanup:ident; ) => {
+    match $winner {}
+  };
+  ($branches:ident, $index:ident, $winner:expr, $cleanup:ident; ($pattern:pat = $future:expr $(, if $enabled:expr)? => $handler:expr) $(, $rest:tt)*) => {
     match $winner {
-      $crate::runtime::concurrency_macros::Either::Left(__output) => {
+      $crate::runtime::concurrency_macros::Either::Left(mut __output) => {
+        #[allow(unreachable_patterns)]
         match __output {
-          $pattern => $handler,
+          $pattern => {
+            let __handler = async { $handler };
+            match $branches.dispose_before_winner_capturing(__handler) {
+              Ok(__handler) => Some(__handler.await),
+              Err(__payload) => {
+                $cleanup = Some(__payload);
+                None
+              }
+            }
+          }
+          _ => {
+            $branches.disable_at($index);
+            None
+          }
         }
       }
       $crate::runtime::concurrency_macros::Either::Right(__tail) => {
-        $crate::__allocatbelt_select_dispatch!(__tail; $($rest)+)
+        $crate::__allocatbelt_select_dispatch!($branches, $index, __tail, $cleanup; $($rest),*)
       }
     }
   };
+}
+
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __allocatbelt_select_future {
+  ($policy:expr; [ $( $branch:tt, )+ ]; else => $else:expr) => {{
+    async move {
+      let mut __policy = $policy;
+      let __enabled = $crate::__allocatbelt_select_enabled!(
+        [1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16];
+        $( $branch ),+
+      );
+      let mut __branches = $crate::runtime::concurrency_macros::BranchSet::new(
+        $crate::__allocatbelt_select_branches!(
+          [1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16];
+          __enabled;
+          $( $branch ),+
+        ),
+      );
+      let (__rotate, mut __start) = __branches.initial_start(&mut __policy);
+      let mut __visited = 0_u16;
+      loop {
+        let __candidate = ::std::future::poll_fn(|__cx| {
+          let __count = __branches.branch_count();
+          for __offset in 0..__count {
+            let __index = (__start + __offset) % __count;
+            let __mask = 1_u16 << __index;
+            if (__visited & __mask) != 0 || !__branches.any_enabled_at(__index) {
+              continue;
+            }
+            __visited |= __mask;
+            match __branches.poll_at(__index, __cx) {
+              ::std::task::Poll::Ready(Err(__payload)) => {
+                __branches.dispose_after_poll_panic(__payload);
+              }
+              ::std::task::Poll::Ready(Ok(Some((__source_index, __winner)))) => {
+                return ::std::task::Poll::Ready(Some((__source_index, __winner)));
+              }
+              ::std::task::Poll::Ready(Ok(None)) | ::std::task::Poll::Pending => {}
+            }
+          }
+          if !__branches.any_enabled() {
+            return ::std::task::Poll::Ready(None);
+          }
+          __visited = 0;
+          if __rotate {
+            __start = __branches.next_enabled(__start);
+          }
+          ::std::task::Poll::Pending
+        }).await;
+        match __candidate {
+          Some((__index, __winner)) => {
+            let mut __cleanup_primary = None;
+            let mut __dispatcher = ::std::boxed::Box::pin(async {
+              $crate::__allocatbelt_select_dispatch!(
+                __branches,
+                __index,
+                __winner,
+                __cleanup_primary;
+                $( $branch ),+
+              )
+            });
+            let __dispatch_result = ::std::future::poll_fn(|__cx| {
+              match ::std::panic::catch_unwind(::std::panic::AssertUnwindSafe(|| {
+                __dispatcher.as_mut().poll(__cx)
+              })) {
+                Ok(::std::task::Poll::Pending) => ::std::task::Poll::Pending,
+                Ok(::std::task::Poll::Ready(__output)) => {
+                  ::std::task::Poll::Ready(Ok(__output))
+                }
+                Err(__payload) => ::std::task::Poll::Ready(Err(__payload)),
+              }
+            })
+            .await;
+            let __dispatcher_drop =
+              $crate::runtime::concurrency_macros::drop_dispatch_capturing(__dispatcher);
+            let (__dispatch_output, __poll_panic) = match __dispatch_result {
+              Ok(__output) => (Some(__output), None),
+              Err(__payload) => (None, Some(__payload)),
+            };
+            if let Some(__payload) = __branches.resolve_dispatch_failures(
+              __cleanup_primary,
+              __poll_panic,
+              __dispatcher_drop,
+            ) {
+              ::std::panic::resume_unwind(__payload);
+            }
+            match __dispatch_output {
+              Some(Some(__output)) => break __output,
+              Some(None) => {}
+              None => unreachable!("dispatch poll panic was resumed above"),
+            }
+          }
+          None => {
+            __branches.dispose();
+            break $else;
+          }
+        }
+      }
+    }
+  }};
 }
 
 /// Joins two to sixteen heterogeneous futures and returns their outputs as a
@@ -852,130 +1192,157 @@ macro_rules! __allocatbelt_select_dispatch {
 /// assert_eq!(text, "ready");
 /// # }
 /// ```
+///
+/// By default `join!` rotates its first polled input after each pending poll.
+/// Use `join!(biased; ...)` to keep source order. `try_join!` has the same
+/// policies and still returns the first error observed in the chosen poll
+/// order.
+#[doc(hidden)]
 #[macro_export]
-macro_rules! join {
-  ($f0:expr, $f1:expr $(,)?) => {{
+macro_rules! __allocatbelt_join_impl {
+  ($policy:ident; $f0:expr, $f1:expr $(,)?) => {{
     async move {
       let (__o0, (__o1, ())) = $crate::runtime::concurrency_macros::JoinFuture::new(
         $crate::__allocatbelt_join_branches!([1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16]; $f0, $f1),
-      ).await;
+      ).configured($crate::runtime::concurrency_macros::JoinPolicy::$policy).await;
       (__o0, __o1)
     }
   }};
-  ($f0:expr, $f1:expr, $f2:expr $(,)?) => {{
+  ($policy:ident; $f0:expr, $f1:expr, $f2:expr $(,)?) => {{
     async move {
       let (__o0, (__o1, (__o2, ()))) = $crate::runtime::concurrency_macros::JoinFuture::new(
         $crate::__allocatbelt_join_branches!([1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16]; $f0, $f1, $f2),
-      ).await;
+      ).configured($crate::runtime::concurrency_macros::JoinPolicy::$policy).await;
       (__o0, __o1, __o2)
     }
   }};
-  ($f0:expr, $f1:expr, $f2:expr, $f3:expr $(,)?) => {{
+  ($policy:ident; $f0:expr, $f1:expr, $f2:expr, $f3:expr $(,)?) => {{
     async move {
       let (__o0, (__o1, (__o2, (__o3, ())))) = $crate::runtime::concurrency_macros::JoinFuture::new(
         $crate::__allocatbelt_join_branches!([1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16]; $f0, $f1, $f2, $f3),
-      ).await;
+      ).configured($crate::runtime::concurrency_macros::JoinPolicy::$policy).await;
       (__o0, __o1, __o2, __o3)
     }
   }};
-  ($f0:expr, $f1:expr, $f2:expr, $f3:expr, $f4:expr $(,)?) => {{
+  ($policy:ident; $f0:expr, $f1:expr, $f2:expr, $f3:expr, $f4:expr $(,)?) => {{
     async move {
       let (__o0, (__o1, (__o2, (__o3, (__o4, ()))))) = $crate::runtime::concurrency_macros::JoinFuture::new(
         $crate::__allocatbelt_join_branches!([1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16]; $f0, $f1, $f2, $f3, $f4),
-      ).await;
+      ).configured($crate::runtime::concurrency_macros::JoinPolicy::$policy).await;
       (__o0, __o1, __o2, __o3, __o4)
     }
   }};
-  ($f0:expr, $f1:expr, $f2:expr, $f3:expr, $f4:expr, $f5:expr $(,)?) => {{
+  ($policy:ident; $f0:expr, $f1:expr, $f2:expr, $f3:expr, $f4:expr, $f5:expr $(,)?) => {{
     async move {
       let (__o0, (__o1, (__o2, (__o3, (__o4, (__o5, ())))))) = $crate::runtime::concurrency_macros::JoinFuture::new(
         $crate::__allocatbelt_join_branches!([1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16]; $f0, $f1, $f2, $f3, $f4, $f5),
-      ).await;
+      ).configured($crate::runtime::concurrency_macros::JoinPolicy::$policy).await;
       (__o0, __o1, __o2, __o3, __o4, __o5)
     }
   }};
-  ($f0:expr, $f1:expr, $f2:expr, $f3:expr, $f4:expr, $f5:expr, $f6:expr $(,)?) => {{
+  ($policy:ident; $f0:expr, $f1:expr, $f2:expr, $f3:expr, $f4:expr, $f5:expr, $f6:expr $(,)?) => {{
     async move {
       let (__o0, (__o1, (__o2, (__o3, (__o4, (__o5, (__o6, ()))))))) = $crate::runtime::concurrency_macros::JoinFuture::new(
         $crate::__allocatbelt_join_branches!([1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16]; $f0, $f1, $f2, $f3, $f4, $f5, $f6),
-      ).await;
+      ).configured($crate::runtime::concurrency_macros::JoinPolicy::$policy).await;
       (__o0, __o1, __o2, __o3, __o4, __o5, __o6)
     }
   }};
-  ($f0:expr, $f1:expr, $f2:expr, $f3:expr, $f4:expr, $f5:expr, $f6:expr, $f7:expr $(,)?) => {{
+  ($policy:ident; $f0:expr, $f1:expr, $f2:expr, $f3:expr, $f4:expr, $f5:expr, $f6:expr, $f7:expr $(,)?) => {{
     async move {
       let (__o0, (__o1, (__o2, (__o3, (__o4, (__o5, (__o6, (__o7, ())))))))) = $crate::runtime::concurrency_macros::JoinFuture::new(
         $crate::__allocatbelt_join_branches!([1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16]; $f0, $f1, $f2, $f3, $f4, $f5, $f6, $f7),
-      ).await;
+      ).configured($crate::runtime::concurrency_macros::JoinPolicy::$policy).await;
       (__o0, __o1, __o2, __o3, __o4, __o5, __o6, __o7)
     }
   }};
-  ($f0:expr, $f1:expr, $f2:expr, $f3:expr, $f4:expr, $f5:expr, $f6:expr, $f7:expr, $f8:expr $(,)?) => {{
+  ($policy:ident; $f0:expr, $f1:expr, $f2:expr, $f3:expr, $f4:expr, $f5:expr, $f6:expr, $f7:expr, $f8:expr $(,)?) => {{
     async move {
       let (__o0, (__o1, (__o2, (__o3, (__o4, (__o5, (__o6, (__o7, (__o8, ()))))))))) = $crate::runtime::concurrency_macros::JoinFuture::new(
         $crate::__allocatbelt_join_branches!([1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16]; $f0, $f1, $f2, $f3, $f4, $f5, $f6, $f7, $f8),
-      ).await;
+      ).configured($crate::runtime::concurrency_macros::JoinPolicy::$policy).await;
       (__o0, __o1, __o2, __o3, __o4, __o5, __o6, __o7, __o8)
     }
   }};
-  ($f0:expr, $f1:expr, $f2:expr, $f3:expr, $f4:expr, $f5:expr, $f6:expr, $f7:expr, $f8:expr, $f9:expr $(,)?) => {{
+  ($policy:ident; $f0:expr, $f1:expr, $f2:expr, $f3:expr, $f4:expr, $f5:expr, $f6:expr, $f7:expr, $f8:expr, $f9:expr $(,)?) => {{
     async move {
       let (__o0, (__o1, (__o2, (__o3, (__o4, (__o5, (__o6, (__o7, (__o8, (__o9, ())))))))))) = $crate::runtime::concurrency_macros::JoinFuture::new(
         $crate::__allocatbelt_join_branches!([1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16]; $f0, $f1, $f2, $f3, $f4, $f5, $f6, $f7, $f8, $f9),
-      ).await;
+      ).configured($crate::runtime::concurrency_macros::JoinPolicy::$policy).await;
       (__o0, __o1, __o2, __o3, __o4, __o5, __o6, __o7, __o8, __o9)
     }
   }};
-  ($f0:expr, $f1:expr, $f2:expr, $f3:expr, $f4:expr, $f5:expr, $f6:expr, $f7:expr, $f8:expr, $f9:expr, $f10:expr $(,)?) => {{
+  ($policy:ident; $f0:expr, $f1:expr, $f2:expr, $f3:expr, $f4:expr, $f5:expr, $f6:expr, $f7:expr, $f8:expr, $f9:expr, $f10:expr $(,)?) => {{
     async move {
       let (__o0, (__o1, (__o2, (__o3, (__o4, (__o5, (__o6, (__o7, (__o8, (__o9, (__o10, ()))))))))))) = $crate::runtime::concurrency_macros::JoinFuture::new(
         $crate::__allocatbelt_join_branches!([1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16]; $f0, $f1, $f2, $f3, $f4, $f5, $f6, $f7, $f8, $f9, $f10),
-      ).await;
+      ).configured($crate::runtime::concurrency_macros::JoinPolicy::$policy).await;
       (__o0, __o1, __o2, __o3, __o4, __o5, __o6, __o7, __o8, __o9, __o10)
     }
   }};
-  ($f0:expr, $f1:expr, $f2:expr, $f3:expr, $f4:expr, $f5:expr, $f6:expr, $f7:expr, $f8:expr, $f9:expr, $f10:expr, $f11:expr $(,)?) => {{
+  ($policy:ident; $f0:expr, $f1:expr, $f2:expr, $f3:expr, $f4:expr, $f5:expr, $f6:expr, $f7:expr, $f8:expr, $f9:expr, $f10:expr, $f11:expr $(,)?) => {{
     async move {
       let (__o0, (__o1, (__o2, (__o3, (__o4, (__o5, (__o6, (__o7, (__o8, (__o9, (__o10, (__o11, ())))))))))))) = $crate::runtime::concurrency_macros::JoinFuture::new(
         $crate::__allocatbelt_join_branches!([1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16]; $f0, $f1, $f2, $f3, $f4, $f5, $f6, $f7, $f8, $f9, $f10, $f11),
-      ).await;
+      ).configured($crate::runtime::concurrency_macros::JoinPolicy::$policy).await;
       (__o0, __o1, __o2, __o3, __o4, __o5, __o6, __o7, __o8, __o9, __o10, __o11)
     }
   }};
-  ($f0:expr, $f1:expr, $f2:expr, $f3:expr, $f4:expr, $f5:expr, $f6:expr, $f7:expr, $f8:expr, $f9:expr, $f10:expr, $f11:expr, $f12:expr $(,)?) => {{
+  ($policy:ident; $f0:expr, $f1:expr, $f2:expr, $f3:expr, $f4:expr, $f5:expr, $f6:expr, $f7:expr, $f8:expr, $f9:expr, $f10:expr, $f11:expr, $f12:expr $(,)?) => {{
     async move {
       let (__o0, (__o1, (__o2, (__o3, (__o4, (__o5, (__o6, (__o7, (__o8, (__o9, (__o10, (__o11, (__o12, ()))))))))))))) = $crate::runtime::concurrency_macros::JoinFuture::new(
         $crate::__allocatbelt_join_branches!([1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16]; $f0, $f1, $f2, $f3, $f4, $f5, $f6, $f7, $f8, $f9, $f10, $f11, $f12),
-      ).await;
+      ).configured($crate::runtime::concurrency_macros::JoinPolicy::$policy).await;
       (__o0, __o1, __o2, __o3, __o4, __o5, __o6, __o7, __o8, __o9, __o10, __o11, __o12)
     }
   }};
-  ($f0:expr, $f1:expr, $f2:expr, $f3:expr, $f4:expr, $f5:expr, $f6:expr, $f7:expr, $f8:expr, $f9:expr, $f10:expr, $f11:expr, $f12:expr, $f13:expr $(,)?) => {{
+  ($policy:ident; $f0:expr, $f1:expr, $f2:expr, $f3:expr, $f4:expr, $f5:expr, $f6:expr, $f7:expr, $f8:expr, $f9:expr, $f10:expr, $f11:expr, $f12:expr, $f13:expr $(,)?) => {{
     async move {
       let (__o0, (__o1, (__o2, (__o3, (__o4, (__o5, (__o6, (__o7, (__o8, (__o9, (__o10, (__o11, (__o12, (__o13, ())))))))))))))) = $crate::runtime::concurrency_macros::JoinFuture::new(
         $crate::__allocatbelt_join_branches!([1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16]; $f0, $f1, $f2, $f3, $f4, $f5, $f6, $f7, $f8, $f9, $f10, $f11, $f12, $f13),
-      ).await;
+      ).configured($crate::runtime::concurrency_macros::JoinPolicy::$policy).await;
       (__o0, __o1, __o2, __o3, __o4, __o5, __o6, __o7, __o8, __o9, __o10, __o11, __o12, __o13)
     }
   }};
-  ($f0:expr, $f1:expr, $f2:expr, $f3:expr, $f4:expr, $f5:expr, $f6:expr, $f7:expr, $f8:expr, $f9:expr, $f10:expr, $f11:expr, $f12:expr, $f13:expr, $f14:expr $(,)?) => {{
+  ($policy:ident; $f0:expr, $f1:expr, $f2:expr, $f3:expr, $f4:expr, $f5:expr, $f6:expr, $f7:expr, $f8:expr, $f9:expr, $f10:expr, $f11:expr, $f12:expr, $f13:expr, $f14:expr $(,)?) => {{
     async move {
       let (__o0, (__o1, (__o2, (__o3, (__o4, (__o5, (__o6, (__o7, (__o8, (__o9, (__o10, (__o11, (__o12, (__o13, (__o14, ()))))))))))))))) = $crate::runtime::concurrency_macros::JoinFuture::new(
         $crate::__allocatbelt_join_branches!([1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16]; $f0, $f1, $f2, $f3, $f4, $f5, $f6, $f7, $f8, $f9, $f10, $f11, $f12, $f13, $f14),
-      ).await;
+      ).configured($crate::runtime::concurrency_macros::JoinPolicy::$policy).await;
       (__o0, __o1, __o2, __o3, __o4, __o5, __o6, __o7, __o8, __o9, __o10, __o11, __o12, __o13, __o14)
     }
   }};
-  ($f0:expr, $f1:expr, $f2:expr, $f3:expr, $f4:expr, $f5:expr, $f6:expr, $f7:expr, $f8:expr, $f9:expr, $f10:expr, $f11:expr, $f12:expr, $f13:expr, $f14:expr, $f15:expr $(,)?) => {{
+  ($policy:ident; $f0:expr, $f1:expr, $f2:expr, $f3:expr, $f4:expr, $f5:expr, $f6:expr, $f7:expr, $f8:expr, $f9:expr, $f10:expr, $f11:expr, $f12:expr, $f13:expr, $f14:expr, $f15:expr $(,)?) => {{
     async move {
       let (__o0, (__o1, (__o2, (__o3, (__o4, (__o5, (__o6, (__o7, (__o8, (__o9, (__o10, (__o11, (__o12, (__o13, (__o14, (__o15, ())))))))))))))))) = $crate::runtime::concurrency_macros::JoinFuture::new(
         $crate::__allocatbelt_join_branches!([1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16]; $f0, $f1, $f2, $f3, $f4, $f5, $f6, $f7, $f8, $f9, $f10, $f11, $f12, $f13, $f14, $f15),
-      ).await;
+      ).configured($crate::runtime::concurrency_macros::JoinPolicy::$policy).await;
       (__o0, __o1, __o2, __o3, __o4, __o5, __o6, __o7, __o8, __o9, __o10, __o11, __o12, __o13, __o14, __o15)
     }
   }};
-  ($($branches:expr),+ $(,)?) => {
+  ($policy:ident; $($branches:expr),+ $(,)?) => {
     compile_error!("join! requires between two and sixteen branches")
+  };
+}
+
+/// Joins two to sixteen heterogeneous futures and returns a flat tuple in
+/// source order. It rotates the first polled input after each pending poll;
+/// add `biased;` to poll in source order on every call. Completed futures are
+/// not polled again, and a polling or cleanup panic follows the helper's
+/// contained-cleanup behavior.
+#[macro_export]
+macro_rules! join {
+  (biased; $($branches:expr),+ $(,)?) => {
+    $crate::__allocatbelt_join_impl!(Biased; $($branches),+)
+  };
+  (round_robin; $($branches:expr),+ $(,)?) => {
+    $crate::__allocatbelt_join_impl!(RoundRobin; $($branches),+)
+  };
+  ($($branches:expr),+ $(,)?) => {
+    $crate::__allocatbelt_join_impl!(RoundRobin; $($branches),+)
+  };
+  ($($tokens:tt)*) => {
+    compile_error!("join! requires two to sixteen branches and an optional biased or round_robin policy")
   };
 }
 
@@ -984,115 +1351,136 @@ macro_rules! join {
 /// branches share one error type. Branches are evaluated when the returned
 /// future is first polled, and each partial value is retained and disposed
 /// independently before an error is returned.
+#[doc(hidden)]
 #[macro_export]
-macro_rules! try_join {
-  ($f0:expr, $f1:expr $(,)?) => {{
+macro_rules! __allocatbelt_try_join_impl {
+  ($policy:ident; $f0:expr, $f1:expr $(,)?) => {{
     async move {
       $crate::runtime::concurrency_macros::TryJoinFuture::new(
         $crate::__allocatbelt_try_join_branches!([1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16]; $f0, $f1),
-      ).await.map(|(__o0, (__o1, ()))| (__o0, __o1))
+      ).configured($crate::runtime::concurrency_macros::JoinPolicy::$policy).await.map(|(__o0, (__o1, ()))| (__o0, __o1))
     }
   }};
-  ($f0:expr, $f1:expr, $f2:expr $(,)?) => {{
+  ($policy:ident; $f0:expr, $f1:expr, $f2:expr $(,)?) => {{
     async move {
       $crate::runtime::concurrency_macros::TryJoinFuture::new(
         $crate::__allocatbelt_try_join_branches!([1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16]; $f0, $f1, $f2),
-      ).await.map(|(__o0, (__o1, (__o2, ())))| (__o0, __o1, __o2))
+      ).configured($crate::runtime::concurrency_macros::JoinPolicy::$policy).await.map(|(__o0, (__o1, (__o2, ())))| (__o0, __o1, __o2))
     }
   }};
-  ($f0:expr, $f1:expr, $f2:expr, $f3:expr $(,)?) => {{
+  ($policy:ident; $f0:expr, $f1:expr, $f2:expr, $f3:expr $(,)?) => {{
     async move {
       $crate::runtime::concurrency_macros::TryJoinFuture::new(
         $crate::__allocatbelt_try_join_branches!([1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16]; $f0, $f1, $f2, $f3),
-      ).await.map(|(__o0, (__o1, (__o2, (__o3, ()))))| (__o0, __o1, __o2, __o3))
+      ).configured($crate::runtime::concurrency_macros::JoinPolicy::$policy).await.map(|(__o0, (__o1, (__o2, (__o3, ()))))| (__o0, __o1, __o2, __o3))
     }
   }};
-  ($f0:expr, $f1:expr, $f2:expr, $f3:expr, $f4:expr $(,)?) => {{
+  ($policy:ident; $f0:expr, $f1:expr, $f2:expr, $f3:expr, $f4:expr $(,)?) => {{
     async move {
       $crate::runtime::concurrency_macros::TryJoinFuture::new(
         $crate::__allocatbelt_try_join_branches!([1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16]; $f0, $f1, $f2, $f3, $f4),
-      ).await.map(|(__o0, (__o1, (__o2, (__o3, (__o4, ())))))| (__o0, __o1, __o2, __o3, __o4))
+      ).configured($crate::runtime::concurrency_macros::JoinPolicy::$policy).await.map(|(__o0, (__o1, (__o2, (__o3, (__o4, ())))))| (__o0, __o1, __o2, __o3, __o4))
     }
   }};
-  ($f0:expr, $f1:expr, $f2:expr, $f3:expr, $f4:expr, $f5:expr $(,)?) => {{
+  ($policy:ident; $f0:expr, $f1:expr, $f2:expr, $f3:expr, $f4:expr, $f5:expr $(,)?) => {{
     async move {
       $crate::runtime::concurrency_macros::TryJoinFuture::new(
         $crate::__allocatbelt_try_join_branches!([1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16]; $f0, $f1, $f2, $f3, $f4, $f5),
-      ).await.map(|(__o0, (__o1, (__o2, (__o3, (__o4, (__o5, ()))))))| (__o0, __o1, __o2, __o3, __o4, __o5))
+      ).configured($crate::runtime::concurrency_macros::JoinPolicy::$policy).await.map(|(__o0, (__o1, (__o2, (__o3, (__o4, (__o5, ()))))))| (__o0, __o1, __o2, __o3, __o4, __o5))
     }
   }};
-  ($f0:expr, $f1:expr, $f2:expr, $f3:expr, $f4:expr, $f5:expr, $f6:expr $(,)?) => {{
+  ($policy:ident; $f0:expr, $f1:expr, $f2:expr, $f3:expr, $f4:expr, $f5:expr, $f6:expr $(,)?) => {{
     async move {
       $crate::runtime::concurrency_macros::TryJoinFuture::new(
         $crate::__allocatbelt_try_join_branches!([1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16]; $f0, $f1, $f2, $f3, $f4, $f5, $f6),
-      ).await.map(|(__o0, (__o1, (__o2, (__o3, (__o4, (__o5, (__o6, ())))))))| (__o0, __o1, __o2, __o3, __o4, __o5, __o6))
+      ).configured($crate::runtime::concurrency_macros::JoinPolicy::$policy).await.map(|(__o0, (__o1, (__o2, (__o3, (__o4, (__o5, (__o6, ())))))))| (__o0, __o1, __o2, __o3, __o4, __o5, __o6))
     }
   }};
-  ($f0:expr, $f1:expr, $f2:expr, $f3:expr, $f4:expr, $f5:expr, $f6:expr, $f7:expr $(,)?) => {{
+  ($policy:ident; $f0:expr, $f1:expr, $f2:expr, $f3:expr, $f4:expr, $f5:expr, $f6:expr, $f7:expr $(,)?) => {{
     async move {
       $crate::runtime::concurrency_macros::TryJoinFuture::new(
         $crate::__allocatbelt_try_join_branches!([1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16]; $f0, $f1, $f2, $f3, $f4, $f5, $f6, $f7),
-      ).await.map(|(__o0, (__o1, (__o2, (__o3, (__o4, (__o5, (__o6, (__o7, ()))))))))| (__o0, __o1, __o2, __o3, __o4, __o5, __o6, __o7))
+      ).configured($crate::runtime::concurrency_macros::JoinPolicy::$policy).await.map(|(__o0, (__o1, (__o2, (__o3, (__o4, (__o5, (__o6, (__o7, ()))))))))| (__o0, __o1, __o2, __o3, __o4, __o5, __o6, __o7))
     }
   }};
-  ($f0:expr, $f1:expr, $f2:expr, $f3:expr, $f4:expr, $f5:expr, $f6:expr, $f7:expr, $f8:expr $(,)?) => {{
+  ($policy:ident; $f0:expr, $f1:expr, $f2:expr, $f3:expr, $f4:expr, $f5:expr, $f6:expr, $f7:expr, $f8:expr $(,)?) => {{
     async move {
       $crate::runtime::concurrency_macros::TryJoinFuture::new(
         $crate::__allocatbelt_try_join_branches!([1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16]; $f0, $f1, $f2, $f3, $f4, $f5, $f6, $f7, $f8),
-      ).await.map(|(__o0, (__o1, (__o2, (__o3, (__o4, (__o5, (__o6, (__o7, (__o8, ())))))))))| (__o0, __o1, __o2, __o3, __o4, __o5, __o6, __o7, __o8))
+      ).configured($crate::runtime::concurrency_macros::JoinPolicy::$policy).await.map(|(__o0, (__o1, (__o2, (__o3, (__o4, (__o5, (__o6, (__o7, (__o8, ())))))))))| (__o0, __o1, __o2, __o3, __o4, __o5, __o6, __o7, __o8))
     }
   }};
-  ($f0:expr, $f1:expr, $f2:expr, $f3:expr, $f4:expr, $f5:expr, $f6:expr, $f7:expr, $f8:expr, $f9:expr $(,)?) => {{
+  ($policy:ident; $f0:expr, $f1:expr, $f2:expr, $f3:expr, $f4:expr, $f5:expr, $f6:expr, $f7:expr, $f8:expr, $f9:expr $(,)?) => {{
     async move {
       $crate::runtime::concurrency_macros::TryJoinFuture::new(
         $crate::__allocatbelt_try_join_branches!([1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16]; $f0, $f1, $f2, $f3, $f4, $f5, $f6, $f7, $f8, $f9),
-      ).await.map(|(__o0, (__o1, (__o2, (__o3, (__o4, (__o5, (__o6, (__o7, (__o8, (__o9, ()))))))))))| (__o0, __o1, __o2, __o3, __o4, __o5, __o6, __o7, __o8, __o9))
+      ).configured($crate::runtime::concurrency_macros::JoinPolicy::$policy).await.map(|(__o0, (__o1, (__o2, (__o3, (__o4, (__o5, (__o6, (__o7, (__o8, (__o9, ()))))))))))| (__o0, __o1, __o2, __o3, __o4, __o5, __o6, __o7, __o8, __o9))
     }
   }};
-  ($f0:expr, $f1:expr, $f2:expr, $f3:expr, $f4:expr, $f5:expr, $f6:expr, $f7:expr, $f8:expr, $f9:expr, $f10:expr $(,)?) => {{
+  ($policy:ident; $f0:expr, $f1:expr, $f2:expr, $f3:expr, $f4:expr, $f5:expr, $f6:expr, $f7:expr, $f8:expr, $f9:expr, $f10:expr $(,)?) => {{
     async move {
       $crate::runtime::concurrency_macros::TryJoinFuture::new(
         $crate::__allocatbelt_try_join_branches!([1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16]; $f0, $f1, $f2, $f3, $f4, $f5, $f6, $f7, $f8, $f9, $f10),
-      ).await.map(|(__o0, (__o1, (__o2, (__o3, (__o4, (__o5, (__o6, (__o7, (__o8, (__o9, (__o10, ())))))))))))| (__o0, __o1, __o2, __o3, __o4, __o5, __o6, __o7, __o8, __o9, __o10))
+      ).configured($crate::runtime::concurrency_macros::JoinPolicy::$policy).await.map(|(__o0, (__o1, (__o2, (__o3, (__o4, (__o5, (__o6, (__o7, (__o8, (__o9, (__o10, ())))))))))))| (__o0, __o1, __o2, __o3, __o4, __o5, __o6, __o7, __o8, __o9, __o10))
     }
   }};
-  ($f0:expr, $f1:expr, $f2:expr, $f3:expr, $f4:expr, $f5:expr, $f6:expr, $f7:expr, $f8:expr, $f9:expr, $f10:expr, $f11:expr $(,)?) => {{
+  ($policy:ident; $f0:expr, $f1:expr, $f2:expr, $f3:expr, $f4:expr, $f5:expr, $f6:expr, $f7:expr, $f8:expr, $f9:expr, $f10:expr, $f11:expr $(,)?) => {{
     async move {
       $crate::runtime::concurrency_macros::TryJoinFuture::new(
         $crate::__allocatbelt_try_join_branches!([1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16]; $f0, $f1, $f2, $f3, $f4, $f5, $f6, $f7, $f8, $f9, $f10, $f11),
-      ).await.map(|(__o0, (__o1, (__o2, (__o3, (__o4, (__o5, (__o6, (__o7, (__o8, (__o9, (__o10, (__o11, ()))))))))))))| (__o0, __o1, __o2, __o3, __o4, __o5, __o6, __o7, __o8, __o9, __o10, __o11))
+      ).configured($crate::runtime::concurrency_macros::JoinPolicy::$policy).await.map(|(__o0, (__o1, (__o2, (__o3, (__o4, (__o5, (__o6, (__o7, (__o8, (__o9, (__o10, (__o11, ()))))))))))))| (__o0, __o1, __o2, __o3, __o4, __o5, __o6, __o7, __o8, __o9, __o10, __o11))
     }
   }};
-  ($f0:expr, $f1:expr, $f2:expr, $f3:expr, $f4:expr, $f5:expr, $f6:expr, $f7:expr, $f8:expr, $f9:expr, $f10:expr, $f11:expr, $f12:expr $(,)?) => {{
+  ($policy:ident; $f0:expr, $f1:expr, $f2:expr, $f3:expr, $f4:expr, $f5:expr, $f6:expr, $f7:expr, $f8:expr, $f9:expr, $f10:expr, $f11:expr, $f12:expr $(,)?) => {{
     async move {
       $crate::runtime::concurrency_macros::TryJoinFuture::new(
         $crate::__allocatbelt_try_join_branches!([1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16]; $f0, $f1, $f2, $f3, $f4, $f5, $f6, $f7, $f8, $f9, $f10, $f11, $f12),
-      ).await.map(|(__o0, (__o1, (__o2, (__o3, (__o4, (__o5, (__o6, (__o7, (__o8, (__o9, (__o10, (__o11, (__o12, ())))))))))))))| (__o0, __o1, __o2, __o3, __o4, __o5, __o6, __o7, __o8, __o9, __o10, __o11, __o12))
+      ).configured($crate::runtime::concurrency_macros::JoinPolicy::$policy).await.map(|(__o0, (__o1, (__o2, (__o3, (__o4, (__o5, (__o6, (__o7, (__o8, (__o9, (__o10, (__o11, (__o12, ())))))))))))))| (__o0, __o1, __o2, __o3, __o4, __o5, __o6, __o7, __o8, __o9, __o10, __o11, __o12))
     }
   }};
-  ($f0:expr, $f1:expr, $f2:expr, $f3:expr, $f4:expr, $f5:expr, $f6:expr, $f7:expr, $f8:expr, $f9:expr, $f10:expr, $f11:expr, $f12:expr, $f13:expr $(,)?) => {{
+  ($policy:ident; $f0:expr, $f1:expr, $f2:expr, $f3:expr, $f4:expr, $f5:expr, $f6:expr, $f7:expr, $f8:expr, $f9:expr, $f10:expr, $f11:expr, $f12:expr, $f13:expr $(,)?) => {{
     async move {
       $crate::runtime::concurrency_macros::TryJoinFuture::new(
         $crate::__allocatbelt_try_join_branches!([1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16]; $f0, $f1, $f2, $f3, $f4, $f5, $f6, $f7, $f8, $f9, $f10, $f11, $f12, $f13),
-      ).await.map(|(__o0, (__o1, (__o2, (__o3, (__o4, (__o5, (__o6, (__o7, (__o8, (__o9, (__o10, (__o11, (__o12, (__o13, ()))))))))))))))| (__o0, __o1, __o2, __o3, __o4, __o5, __o6, __o7, __o8, __o9, __o10, __o11, __o12, __o13))
+      ).configured($crate::runtime::concurrency_macros::JoinPolicy::$policy).await.map(|(__o0, (__o1, (__o2, (__o3, (__o4, (__o5, (__o6, (__o7, (__o8, (__o9, (__o10, (__o11, (__o12, (__o13, ()))))))))))))))| (__o0, __o1, __o2, __o3, __o4, __o5, __o6, __o7, __o8, __o9, __o10, __o11, __o12, __o13))
     }
   }};
-  ($f0:expr, $f1:expr, $f2:expr, $f3:expr, $f4:expr, $f5:expr, $f6:expr, $f7:expr, $f8:expr, $f9:expr, $f10:expr, $f11:expr, $f12:expr, $f13:expr, $f14:expr $(,)?) => {{
+  ($policy:ident; $f0:expr, $f1:expr, $f2:expr, $f3:expr, $f4:expr, $f5:expr, $f6:expr, $f7:expr, $f8:expr, $f9:expr, $f10:expr, $f11:expr, $f12:expr, $f13:expr, $f14:expr $(,)?) => {{
     async move {
       $crate::runtime::concurrency_macros::TryJoinFuture::new(
         $crate::__allocatbelt_try_join_branches!([1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16]; $f0, $f1, $f2, $f3, $f4, $f5, $f6, $f7, $f8, $f9, $f10, $f11, $f12, $f13, $f14),
-      ).await.map(|(__o0, (__o1, (__o2, (__o3, (__o4, (__o5, (__o6, (__o7, (__o8, (__o9, (__o10, (__o11, (__o12, (__o13, (__o14, ())))))))))))))))| (__o0, __o1, __o2, __o3, __o4, __o5, __o6, __o7, __o8, __o9, __o10, __o11, __o12, __o13, __o14))
+      ).configured($crate::runtime::concurrency_macros::JoinPolicy::$policy).await.map(|(__o0, (__o1, (__o2, (__o3, (__o4, (__o5, (__o6, (__o7, (__o8, (__o9, (__o10, (__o11, (__o12, (__o13, (__o14, ())))))))))))))))| (__o0, __o1, __o2, __o3, __o4, __o5, __o6, __o7, __o8, __o9, __o10, __o11, __o12, __o13, __o14))
     }
   }};
-  ($f0:expr, $f1:expr, $f2:expr, $f3:expr, $f4:expr, $f5:expr, $f6:expr, $f7:expr, $f8:expr, $f9:expr, $f10:expr, $f11:expr, $f12:expr, $f13:expr, $f14:expr, $f15:expr $(,)?) => {{
+  ($policy:ident; $f0:expr, $f1:expr, $f2:expr, $f3:expr, $f4:expr, $f5:expr, $f6:expr, $f7:expr, $f8:expr, $f9:expr, $f10:expr, $f11:expr, $f12:expr, $f13:expr, $f14:expr, $f15:expr $(,)?) => {{
     async move {
       $crate::runtime::concurrency_macros::TryJoinFuture::new(
         $crate::__allocatbelt_try_join_branches!([1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16]; $f0, $f1, $f2, $f3, $f4, $f5, $f6, $f7, $f8, $f9, $f10, $f11, $f12, $f13, $f14, $f15),
-      ).await.map(|(__o0, (__o1, (__o2, (__o3, (__o4, (__o5, (__o6, (__o7, (__o8, (__o9, (__o10, (__o11, (__o12, (__o13, (__o14, (__o15, ()))))))))))))))))| (__o0, __o1, __o2, __o3, __o4, __o5, __o6, __o7, __o8, __o9, __o10, __o11, __o12, __o13, __o14, __o15))
+      ).configured($crate::runtime::concurrency_macros::JoinPolicy::$policy).await.map(|(__o0, (__o1, (__o2, (__o3, (__o4, (__o5, (__o6, (__o7, (__o8, (__o9, (__o10, (__o11, (__o12, (__o13, (__o14, (__o15, ()))))))))))))))))| (__o0, __o1, __o2, __o3, __o4, __o5, __o6, __o7, __o8, __o9, __o10, __o11, __o12, __o13, __o14, __o15))
     }
   }};
-  ($($branches:expr),+ $(,)?) => {
+  ($policy:ident; $($branches:expr),+ $(,)?) => {
     compile_error!("try_join! requires between two and sixteen branches")
+  };
+}
+
+/// Joins two to sixteen heterogeneous `Result` futures and returns the first
+/// observed error. Successful values are returned in source order; branch
+/// polling rotates after pending polls by default. Add `biased;` to keep
+/// source-order polling.
+#[macro_export]
+macro_rules! try_join {
+  (biased; $($branches:expr),+ $(,)?) => {
+    $crate::__allocatbelt_try_join_impl!(Biased; $($branches),+)
+  };
+  (round_robin; $($branches:expr),+ $(,)?) => {
+    $crate::__allocatbelt_try_join_impl!(RoundRobin; $($branches),+)
+  };
+  ($($branches:expr),+ $(,)?) => {
+    $crate::__allocatbelt_try_join_impl!(RoundRobin; $($branches),+)
+  };
+  ($($tokens:tt)*) => {
+    compile_error!("try_join! requires two to sixteen branches and an optional biased or round_robin policy")
   };
 }
 
@@ -1105,7 +1493,6 @@ macro_rules! try_join {
 /// # async fn example() {
 /// use allocatbelt::runtime::concurrency_macros::select;
 /// let selected = select! {
-///   biased;
 ///   [
 ///     (value = async { 4 }, if true => value),
 ///     (text = async { String::from("ready") } => text.len()),
@@ -1116,19 +1503,19 @@ macro_rules! try_join {
 /// # }
 /// ```
 ///
-/// Branch futures and enabled flags are evaluated once when the returned
-/// future is first polled. Disabled futures are owned and never polled; they
-/// are disposed when selection completes or is canceled. On a winner, every
-/// branch future is disposed before the selected handler runs.
-/// `round_robin;` rotates priority among enabled branches by their original
-/// source indices after each pending poll. The mandatory `else` arm runs
-/// after cleanup when every branch is disabled. Handler expressions are match
-/// arms in the enclosing async future; captures they use follow that future's
-/// lifetime and are not separately dropped at selection time. Patterns must
-/// be irrefutable, and all handlers must produce one common type. For each
-/// branch, the future expression is evaluated before its enabled guard; branch
-/// expressions and guards run in source order. A panic during this construction
-/// phase follows ordinary Rust cleanup until the complete branch set is owned.
+/// Branch preconditions are evaluated first, followed by every future
+/// expression in source order; disabled futures are constructed and owned but
+/// never polled. The default policy seeds a selection-only generator when the
+/// macro is invoked, using nonblocking kernel entropy and a `RandomState`
+/// fallback, then rotates the first branch after pending polls. `biased;`
+/// always starts with the first enabled branch, `round_robin;` starts there
+/// and rotates, and `randomized(rng);` uses a caller-supplied
+/// [`SelectionRng`](super::concurrency::SelectionRng). A refutable pattern
+/// mismatch disables that completed branch for this selection and continues
+/// with the others; if none remain, `else` runs after cleanup. Every branch
+/// future is disposed before the selected handler runs. Handlers must produce
+/// one common type. Handler captures follow the enclosing async future's
+/// lifetime and are not separately dropped at selection time.
 #[macro_export]
 macro_rules! select {
   (
@@ -1136,81 +1523,66 @@ macro_rules! select {
     [ $( $branch:tt, )+ ];
     else => $else:expr $(,)?
   ) => {{
-    async move {
-      let mut __branches = $crate::runtime::concurrency_macros::BranchSet::new(
-        $crate::__allocatbelt_select_branches!(
-          [1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16];
-          $( $branch ),+
-        ),
-      );
-      if !__branches.any_enabled() {
-        __branches.dispose();
-        return $else;
-      }
-      let __rotate = false;
-      let mut __start = 0usize;
-      let __winner = ::std::future::poll_fn(|__cx| {
-        for __offset in 0..__branches.branch_count() {
-          let __index = (__start + __offset) % __branches.branch_count();
-          match __branches.poll_at(__index, __cx) {
-            ::std::task::Poll::Ready(Err(__payload)) => {
-              __branches.dispose_after_poll_panic(__payload);
-            }
-            ::std::task::Poll::Ready(Ok(Some(__winner))) => {
-              return ::std::task::Poll::Ready(__branches.dispose_before_winner(__winner));
-            }
-            ::std::task::Poll::Ready(Ok(None)) | ::std::task::Poll::Pending => {}
-          }
-        }
-        if __rotate {
-          __start = __branches.next_enabled(__start);
-        }
-        ::std::task::Poll::Pending
-      }).await;
-      $crate::__allocatbelt_select_dispatch!(__winner; $( $branch ),+)
-    }
+    let __policy = $crate::runtime::concurrency_macros::SelectionStart::Biased;
+    $crate::__allocatbelt_select_future!(
+      __policy;
+      [ $( $branch, )+ ];
+      else => $else
+    )
   }};
   (
     round_robin;
     [ $( $branch:tt, )+ ];
     else => $else:expr $(,)?
   ) => {{
-    async move {
-      let mut __branches = $crate::runtime::concurrency_macros::BranchSet::new(
-        $crate::__allocatbelt_select_branches!(
-          [1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16];
-          $( $branch ),+
-        ),
-      );
-      if !__branches.any_enabled() {
-        __branches.dispose();
-        return $else;
-      }
-      let __rotate = true;
-      let mut __start = __branches.first_enabled_from(0);
-      let __winner = ::std::future::poll_fn(|__cx| {
-        for __offset in 0..__branches.branch_count() {
-          let __index = (__start + __offset) % __branches.branch_count();
-          match __branches.poll_at(__index, __cx) {
-            ::std::task::Poll::Ready(Err(__payload)) => {
-              __branches.dispose_after_poll_panic(__payload);
-            }
-            ::std::task::Poll::Ready(Ok(Some(__winner))) => {
-              return ::std::task::Poll::Ready(__branches.dispose_before_winner(__winner));
-            }
-            ::std::task::Poll::Ready(Ok(None)) | ::std::task::Poll::Pending => {}
-          }
-        }
-        if __rotate {
-          __start = __branches.next_enabled(__start);
-        }
-        ::std::task::Poll::Pending
-      }).await;
-      $crate::__allocatbelt_select_dispatch!(__winner; $( $branch ),+)
-    }
+    let __policy = $crate::runtime::concurrency_macros::SelectionStart::RoundRobin;
+    $crate::__allocatbelt_select_future!(
+      __policy;
+      [ $( $branch, )+ ];
+      else => $else
+    )
+  }};
+  (
+    randomized($rng:expr);
+    [ $( $branch:tt, )+ ];
+    else => $else:expr $(,)?
+  ) => {{
+    let __policy = $crate::runtime::concurrency_macros::SelectionStart::Randomized($rng);
+    $crate::__allocatbelt_select_future!(
+      __policy;
+      [ $( $branch, )+ ];
+      else => $else
+    )
+  }};
+  (
+    randomized;
+    [ $( $branch:tt, )+ ];
+    else => $else:expr $(,)?
+  ) => {{
+    let __policy = $crate::runtime::concurrency_macros::SelectionStart::Randomized(
+      $crate::runtime::concurrency::SelectionRng::from_entropy_or_random_state(),
+    );
+    $crate::__allocatbelt_select_future!(
+      __policy;
+      [ $( $branch, )+ ];
+      else => $else
+    )
+  }};
+  (
+    [ $( $branch:tt, )+ ];
+    else => $else:expr $(,)?
+  ) => {{
+    let __policy = $crate::runtime::concurrency_macros::SelectionStart::Randomized(
+      $crate::runtime::concurrency::SelectionRng::from_entropy_or_random_state(),
+    );
+    $crate::__allocatbelt_select_future!(
+      __policy;
+      [ $( $branch, )+ ];
+      else => $else
+    )
   }};
   ($($tokens:tt)*) => {
-    compile_error!("select! requires biased or round_robin, two to sixteen branches, and an else arm")
+    compile_error!("select! accepts two to sixteen branches, an else arm, and an optional biased, round_robin, randomized, or randomized(RNG) policy")
   };
 }
 
@@ -1307,6 +1679,259 @@ mod tests {
     };
     let mut joined = std::pin::pin!(joined);
     assert!(poll(joined.as_mut(), &noop_waker()).is_ready());
+  }
+
+  #[test]
+  fn join_and_try_join_rotate_by_default_and_keep_explicit_bias() {
+    fn join_probe(
+      order: Rc<std::cell::RefCell<Vec<usize>>>,
+      id: usize,
+    ) -> impl Future<Output = usize> {
+      let polls = Cell::new(0);
+      poll_fn(move |_| {
+        order.borrow_mut().push(id);
+        let poll = polls.get();
+        polls.set(poll + 1);
+        if poll == 0 {
+          Poll::Pending
+        } else {
+          Poll::Ready(id)
+        }
+      })
+    }
+
+    let order = Rc::new(std::cell::RefCell::new(Vec::new()));
+    let first_order = Rc::clone(&order);
+    let second_order = Rc::clone(&order);
+    let mut joined = std::pin::pin!(crate::join!(
+      join_probe(first_order, 0),
+      join_probe(second_order, 1),
+    ));
+    let waker = noop_waker();
+    assert!(poll(joined.as_mut(), &waker).is_pending());
+    assert_eq!(*order.borrow(), [0, 1]);
+    assert_eq!(poll(joined.as_mut(), &waker), Poll::Ready((0, 1)));
+    assert_eq!(*order.borrow(), [0, 1, 1, 0]);
+
+    let order = Rc::new(std::cell::RefCell::new(Vec::new()));
+    let first_order = Rc::clone(&order);
+    let second_order = Rc::clone(&order);
+    let mut biased = std::pin::pin!(crate::join!(
+      biased;
+      join_probe(first_order, 0),
+      join_probe(second_order, 1),
+    ));
+    assert!(poll(biased.as_mut(), &waker).is_pending());
+    assert!(poll(biased.as_mut(), &waker).is_ready());
+    assert_eq!(*order.borrow(), [0, 1, 0, 1]);
+
+    fn try_join_probe(
+      order: Rc<std::cell::RefCell<Vec<usize>>>,
+      id: usize,
+    ) -> impl Future<Output = Result<usize, &'static str>> {
+      let polls = Cell::new(0);
+      poll_fn(move |_| {
+        order.borrow_mut().push(id);
+        let poll = polls.get();
+        polls.set(poll + 1);
+        if poll == 0 {
+          Poll::Pending
+        } else {
+          Poll::Ready(Ok(id))
+        }
+      })
+    }
+
+    let order = Rc::new(std::cell::RefCell::new(Vec::new()));
+    let first_order = Rc::clone(&order);
+    let second_order = Rc::clone(&order);
+    let mut tried = std::pin::pin!(crate::try_join!(
+      try_join_probe(first_order, 0),
+      try_join_probe(second_order, 1),
+    ));
+    assert!(poll(tried.as_mut(), &waker).is_pending());
+    assert_eq!(poll(tried.as_mut(), &waker), Poll::Ready(Ok((0, 1))));
+    assert_eq!(*order.borrow(), [0, 1, 1, 0]);
+
+    let order = Rc::new(std::cell::RefCell::new(Vec::new()));
+    let first_order = Rc::clone(&order);
+    let second_order = Rc::clone(&order);
+    let mut tried_biased = std::pin::pin!(crate::try_join!(
+      biased;
+      try_join_probe(first_order, 0),
+      try_join_probe(second_order, 1),
+    ));
+    assert!(poll(tried_biased.as_mut(), &waker).is_pending());
+    assert_eq!(poll(tried_biased.as_mut(), &waker), Poll::Ready(Ok((0, 1))));
+    assert_eq!(*order.borrow(), [0, 1, 0, 1]);
+  }
+
+  #[test]
+  #[allow(
+    clippy::needless_borrow,
+    clippy::needless_borrowed_reference,
+    reason = "regresses explicit double-reference pattern behavior"
+  )]
+  fn refutable_patterns_preserve_binding_modes_and_handler_bindings() {
+    let owned = String::from("mutable owned binding");
+    let owned_result = crate::select! {
+      [
+      (mut value = std::future::ready(owned) => {
+        value.push('!');
+        value
+      }),
+      (_waiting = std::future::pending::<()>() => String::new()),
+      ];
+      else => String::new(),
+    };
+    let mut owned_result = std::pin::pin!(owned_result);
+    assert_eq!(
+      poll(owned_result.as_mut(), &noop_waker()),
+      Poll::Ready("mutable owned binding!".to_owned())
+    );
+
+    let pair = (String::from("borrowed"), String::from("mutable"));
+    let pair_result = crate::select! {
+      [
+      (Some((ref name, ref mut text)) = std::future::ready(Some(pair)) => {
+        text.push('!');
+        format!("{name}: {text}")
+      }),
+      (_waiting = std::future::pending::<()>() => String::from("waiting")),
+      ];
+      else => String::from("mismatch"),
+    };
+    let mut pair_result = std::pin::pin!(pair_result);
+    assert_eq!(
+      poll(pair_result.as_mut(), &noop_waker()),
+      Poll::Ready("borrowed: mutable!".to_owned())
+    );
+
+    let text = String::from("double reference");
+    let first = &text;
+    let second = &first;
+    let ref_result = crate::select! {
+      [
+      (&&ref value = std::future::ready(second) => value.len()),
+      (_waiting = std::future::pending::<()>() => 0),
+      ];
+      else => 0,
+    };
+    let mut ref_result = std::pin::pin!(ref_result);
+    assert_eq!(
+      poll(ref_result.as_mut(), &noop_waker()),
+      Poll::Ready(text.len())
+    );
+
+    struct Record {
+      name: String,
+      body: String,
+    }
+    let record_result = crate::select! {
+      [
+      (Record { ref name, ref mut body } = std::future::ready(Record {
+        name: String::from("record"),
+        body: String::from("text"),
+      }) => {
+        body.push('!');
+        format!("{name}: {body}")
+      }),
+      (_waiting = std::future::pending::<()>() => String::new()),
+      ];
+      else => String::from("mismatch"),
+    };
+    let mut record_result = std::pin::pin!(record_result);
+    assert_eq!(
+      poll(record_result.as_mut(), &noop_waker()),
+      Poll::Ready(String::from("record: text!"))
+    );
+
+    let slice_result = crate::select! {
+      [
+      ([.., ref mut last] = std::future::ready([String::from("one"), String::from("two")]) => {
+        last.push('!');
+        last.clone()
+      }),
+      (_waiting = std::future::pending::<()>() => String::new()),
+      ];
+      else => String::from("mismatch"),
+    };
+    let mut slice_result = std::pin::pin!(slice_result);
+    assert_eq!(
+      poll(slice_result.as_mut(), &noop_waker()),
+      Poll::Ready(String::from("two!"))
+    );
+
+    enum Message {
+      Text(String),
+      Other(String),
+    }
+    let _unused_variant = Message::Text(String::new());
+    let or_result = crate::select! {
+      [
+      (Message::Text(ref value) | Message::Other(ref value) = std::future::ready(Message::Other(
+        String::from("or-pattern"),
+      )) => value.len()),
+      (_waiting = std::future::pending::<()>() => 0),
+      ];
+      else => 0,
+    };
+    let mut or_result = std::pin::pin!(or_result);
+    assert_eq!(
+      poll(or_result.as_mut(), &noop_waker()),
+      Poll::Ready(String::from("or-pattern").len())
+    );
+
+    let absolute_result = crate::select! {
+      [
+      (::std::option::Option::Some(ref mut value) = std::future::ready(Some(String::from("absolute"))) => {
+        value.push('!');
+        value.len()
+      }),
+      (_waiting = std::future::pending::<()>() => 0),
+      ];
+      else => 0,
+    };
+    let mut absolute_result = std::pin::pin!(absolute_result);
+    assert_eq!(
+      poll(absolute_result.as_mut(), &noop_waker()),
+      Poll::Ready("absolute!".len())
+    );
+
+    let mut mutable_option = Some(17_u8);
+    let mutable_reference = &mut mutable_option;
+    let mutable_reference_result = crate::select! {
+      [
+      (&mut _ = std::future::ready(mutable_reference) => true),
+      (_waiting = std::future::pending::<()>() => false),
+      ];
+      else => false,
+    };
+    let mut mutable_reference_result = std::pin::pin!(mutable_reference_result);
+    assert_eq!(
+      poll(mutable_reference_result.as_mut(), &noop_waker()),
+      Poll::Ready(true)
+    );
+
+    enum ReferenceAlternative {
+      First(u8),
+      Second(u8),
+    }
+    let _unused_variant = ReferenceAlternative::First(0);
+    let alternative = ReferenceAlternative::Second(23);
+    let borrowed_alternative = &alternative;
+    let alternative_result = crate::select! {
+      [
+      (&ReferenceAlternative::First(value) | &ReferenceAlternative::Second(value) = std::future::ready(borrowed_alternative) => value),
+      (_waiting = std::future::pending::<()>() => 0),
+      ];
+      else => 0,
+    };
+    let mut alternative_result = std::pin::pin!(alternative_result);
+    assert_eq!(
+      poll(alternative_result.as_mut(), &noop_waker()),
+      Poll::Ready(23)
+    );
   }
 
   #[test]
@@ -1524,6 +2149,265 @@ mod tests {
   }
 
   #[test]
+  fn preconditions_run_before_all_future_expressions() {
+    let events = Rc::new(std::cell::RefCell::new(Vec::new()));
+    let guard_events = Rc::clone(&events);
+    let second_guard_events = Rc::clone(&events);
+    let future_events = Rc::clone(&events);
+    let second_future_events = Rc::clone(&events);
+    let future = select! {
+      biased;
+      [
+      (_a = {
+        future_events.borrow_mut().push("future-a");
+        std::future::pending::<usize>()
+      }, if {
+        guard_events.borrow_mut().push("guard-a");
+        true
+      } => 1),
+      (_b = {
+        second_future_events.borrow_mut().push("future-b");
+        std::future::pending::<usize>()
+      }, if {
+        second_guard_events.borrow_mut().push("guard-b");
+        false
+      } => 2),
+      ];
+      else => 3,
+    };
+    assert!(events.borrow().is_empty());
+    let mut future = std::pin::pin!(future);
+    assert!(poll(future.as_mut(), &noop_waker()).is_pending());
+    assert_eq!(
+      &*events.borrow(),
+      &["guard-a", "guard-b", "future-a", "future-b"]
+    );
+  }
+
+  #[test]
+  fn refutable_mismatch_disables_completed_branch_and_continues() {
+    let first_polls = Rc::new(Cell::new(0));
+    let second_polls = Rc::new(Cell::new(0));
+    let first_count = Rc::clone(&first_polls);
+    let first = poll_fn(move |_| {
+      let count = first_count.get();
+      first_count.set(count + 1);
+      if count == 0 {
+        Poll::Ready(None::<usize>)
+      } else {
+        panic!("a pattern-mismatched completed branch was polled again")
+      }
+    });
+    let second_count = Rc::clone(&second_polls);
+    let second = poll_fn(move |_| {
+      let count = second_count.get();
+      second_count.set(count + 1);
+      if count == 0 {
+        Poll::Pending
+      } else {
+        Poll::Ready(Some(17_usize))
+      }
+    });
+    let future = select! {
+      biased;
+      [
+      (Some(_first) = first => 1),
+      (Some(value) = second => value),
+      ];
+      else => 3,
+    };
+    let mut future = std::pin::pin!(future);
+    assert!(poll(future.as_mut(), &noop_waker()).is_pending());
+    assert_eq!(first_polls.get(), 1);
+    assert_eq!(second_polls.get(), 1);
+    assert_eq!(poll(future.as_mut(), &noop_waker()), Poll::Ready(17));
+    assert_eq!(first_polls.get(), 1);
+    assert_eq!(second_polls.get(), 2);
+  }
+
+  #[test]
+  fn mismatch_resume_does_not_repoll_a_pending_sibling_in_one_outer_poll() {
+    let first_polls = Rc::new(Cell::new(0));
+    let pending_polls = Rc::new(Cell::new(0));
+    let winner_polls = Rc::new(Cell::new(0));
+    let first_count = Rc::clone(&first_polls);
+    let pending_count = Rc::clone(&pending_polls);
+    let winner_count = Rc::clone(&winner_polls);
+    let future = select! {
+      biased;
+      [
+      (Some(_) = poll_fn(move |_| {
+        first_count.set(first_count.get() + 1);
+        Poll::Ready(None::<usize>)
+      }) => 1),
+      (_ = poll_fn(move |_| {
+        pending_count.set(pending_count.get() + 1);
+        Poll::<usize>::Pending
+      }) => 2),
+      (value = poll_fn(move |_| {
+        winner_count.set(winner_count.get() + 1);
+        Poll::Ready(17_usize)
+      }) => value),
+      ];
+      else => 0,
+    };
+    let mut future = std::pin::pin!(future);
+    assert_eq!(poll(future.as_mut(), &noop_waker()), Poll::Ready(17));
+    assert_eq!(first_polls.get(), 1);
+    assert_eq!(pending_polls.get(), 1);
+    assert_eq!(winner_polls.get(), 1);
+  }
+
+  #[test]
+  fn all_pattern_mismatches_run_else_after_branch_cleanup() {
+    struct DropProbe(Rc<Cell<usize>>);
+    impl Drop for DropProbe {
+      fn drop(&mut self) {
+        self.0.set(self.0.get() + 1);
+      }
+    }
+
+    let drops = Rc::new(Cell::new(0));
+    let first_drop = Rc::clone(&drops);
+    let second_drop = Rc::clone(&drops);
+    let third_drop = Rc::clone(&drops);
+    let else_drops = Rc::clone(&drops);
+    let future = select! {
+      biased;
+      [
+      (2 = {
+        let probe = DropProbe(first_drop);
+        poll_fn(move |_| {
+          let _probe = &probe;
+          Poll::Ready(1_usize)
+        })
+      } => 10),
+      (Some("match") = {
+        let probe = DropProbe(second_drop);
+        poll_fn(move |_| {
+          let _probe = &probe;
+          Poll::Ready(Some("miss"))
+        })
+      } => 20),
+      (_never = {
+        let probe = DropProbe(third_drop);
+        poll_fn(move |_| {
+          let _probe = &probe;
+          Poll::<usize>::Pending
+        })
+      }, if false => 30),
+      ];
+      else => else_drops.get(),
+    };
+    let mut future = std::pin::pin!(future);
+    assert_eq!(poll(future.as_mut(), &noop_waker()), Poll::Ready(3));
+    assert_eq!(drops.get(), 3);
+  }
+
+  #[test]
+  fn select_dispatch_accepts_generic_absolute_and_mutable_reference_patterns() {
+    let first = select! {
+      biased;
+      [
+      (::std::option::Option::Some::<String>(ref mut value) = std::future::ready(Some("first".to_owned())) => {
+        value.push('!');
+        value.len()
+      }),
+      (_ = std::future::pending::<usize>() => 0),
+      ];
+      else => 0,
+    };
+    let mut first = std::pin::pin!(first);
+    assert_eq!(poll(first.as_mut(), &noop_waker()), Poll::Ready(6));
+
+    let nested = select! {
+      biased;
+      [
+      ((Some::<Result<String, String>>(ref mut value), _) = std::future::ready((Some(Ok("nested".to_owned())), 1_u8)) => {
+        *value = Ok("updated".to_owned());
+        value.as_ref().unwrap().len()
+      }),
+      (_ = std::future::pending::<usize>() => 0),
+      ];
+      else => 0,
+    };
+    let mut nested = std::pin::pin!(nested);
+    assert_eq!(poll(nested.as_mut(), &noop_waker()), Poll::Ready(7));
+
+    let mut owned = String::from("borrowed");
+    let mutable_reference = select! {
+      biased;
+      [
+      (&mut _ = std::future::ready(&mut owned) => 9),
+      (_ = std::future::pending::<usize>() => 0),
+      ];
+      else => 0,
+    };
+    let mut mutable_reference = std::pin::pin!(mutable_reference);
+    assert_eq!(
+      poll(mutable_reference.as_mut(), &noop_waker()),
+      Poll::Ready(9)
+    );
+  }
+
+  #[test]
+  fn select_dispatch_accepts_reference_prefixed_top_level_alternatives() {
+    #[allow(dead_code)]
+    enum Alternative {
+      First(usize),
+      Second(usize),
+    }
+
+    let first = Alternative::First(23);
+    let future = select! {
+      biased;
+      [
+      (&Alternative::First(value) | &Alternative::Second(value) = std::future::ready(&first) => value),
+      (_ = std::future::pending::<usize>() => 0),
+      ];
+      else => 0,
+    };
+    let mut future = std::pin::pin!(future);
+    assert_eq!(poll(future.as_mut(), &noop_waker()), Poll::Ready(23));
+  }
+
+  #[test]
+  fn randomized_macro_policy_evaluates_rng_before_poll_and_skips_disabled_starts() {
+    let seed = 101;
+    let first_rank = super::super::concurrency::SelectionRng::from_seed(seed).index(2);
+    let enabled = [1_usize, 3];
+    let order = Rc::new(std::cell::RefCell::new(Vec::new()));
+    let polls = [
+      Rc::clone(&order),
+      Rc::clone(&order),
+      Rc::clone(&order),
+      Rc::clone(&order),
+    ];
+    let evaluated = Rc::new(Cell::new(false));
+    let evaluated_before_poll = Rc::clone(&evaluated);
+    let future = select! {
+      randomized({
+        evaluated.set(true);
+        super::super::concurrency::SelectionRng::from_seed(seed)
+      });
+      [
+      (_zero = std::future::ready(()), if false => 0),
+      (_one = poll_fn({ let log = Rc::clone(&polls[1]); move |_| { log.borrow_mut().push(1); Poll::<usize>::Pending } }) => 1),
+      (_two = std::future::ready(()), if false => 2),
+      (_three = poll_fn({ let log = Rc::clone(&polls[3]); move |_| { log.borrow_mut().push(3); Poll::<usize>::Pending } }) => 3),
+      ];
+      else => 4,
+    };
+    assert!(evaluated_before_poll.get());
+    let mut future = std::pin::pin!(future);
+    assert!(poll(future.as_mut(), &noop_waker()).is_pending());
+    assert_eq!(
+      &*order.borrow(),
+      &[enabled[first_rank], enabled[1 - first_rank]]
+    );
+  }
+
+  #[test]
   fn all_disabled_runs_else_after_cleanup() {
     let drops = Rc::new(Cell::new(0));
     let future = select! {
@@ -1672,7 +2556,56 @@ mod tests {
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
       let _ = poll(future.as_mut(), &noop_waker());
     }));
-    assert!(result.is_err());
+    let payload = match result {
+      Err(payload) => payload,
+      Ok(()) => panic!("loser cleanup should panic"),
+    };
+    assert_eq!(payload.downcast_ref::<&str>(), Some(&"drop panic"));
+  }
+
+  #[test]
+  fn loser_cleanup_panic_stays_primary_when_handler_borrows_winner_output() {
+    let future = select! {
+      biased;
+      [
+      (value = std::future::ready(PanicValue) => {
+        let _ = &value;
+        0
+      }),
+      (_value = PanicOnDrop => 1),
+      ];
+      else => 2,
+    };
+    let mut future = std::pin::pin!(future);
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+      let _ = poll(future.as_mut(), &noop_waker());
+    }));
+    let payload = match result {
+      Err(payload) => payload,
+      Ok(()) => panic!("loser cleanup should panic"),
+    };
+    assert_eq!(payload.downcast_ref::<&str>(), Some(&"drop panic"));
+  }
+
+  #[test]
+  fn loser_cleanup_panic_stays_primary_when_winner_binding_is_unused() {
+    let future = select! {
+      biased;
+      [
+      (_value = std::future::ready(PanicValue) => 0),
+      (_value = PanicOnDrop => 1),
+      ];
+      else => 2,
+    };
+    let mut future = std::pin::pin!(future);
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+      let _ = poll(future.as_mut(), &noop_waker());
+    }));
+    let payload = match result {
+      Err(payload) => payload,
+      Ok(()) => panic!("loser cleanup should panic"),
+    };
+    assert_eq!(payload.downcast_ref::<&str>(), Some(&"drop panic"));
   }
 
   #[test]

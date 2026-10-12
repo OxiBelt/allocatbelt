@@ -64,6 +64,7 @@ use std::panic::{self, AssertUnwindSafe};
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
+pub use super::concurrency::SelectionRng;
 use super::task::drop_contained;
 
 type PanicPayload = Box<dyn Any + Send + 'static>;
@@ -408,6 +409,9 @@ pub enum SelectionPolicy {
   /// Start each poll one enabled branch later than the previous poll when
   /// that poll returned `Pending`, wrapping around.
   RoundRobin,
+  /// Choose a pseudorandom enabled branch first, then rotate after pending
+  /// polls.
+  Randomized(SelectionRng),
 }
 
 /// Creates a future that returns the first ready enabled branch and cancels
@@ -416,7 +420,9 @@ pub enum SelectionPolicy {
 /// Every branch's future is constructed by the caller and owned by the
 /// returned helper, enabled or not. Enabled branches are polled at most
 /// once per call to `poll`, in the order chosen by `policy`; disabled
-/// branches are never polled. `RoundRobin` uses no random source. The first
+/// branches are never polled. `Randomized` consumes its supplied generator
+/// when this constructor is called, choosing among enabled branches only;
+/// subsequent pending polls rotate through enabled branches. The first
 /// enabled branch to return `Ready` wins; the result is its original index
 /// in `branches` and its output. The winning future, every losing future and
 /// every disabled future are dropped before that result is returned.
@@ -457,11 +463,16 @@ pub fn select_many<F: Future>(
       inputs: branches,
     });
   }
+  let (round_robin, next_start) = match policy {
+    SelectionPolicy::Biased => (false, 0),
+    SelectionPolicy::RoundRobin => (true, 0),
+    SelectionPolicy::Randomized(mut rng) => (true, rng.index(enabled)),
+  };
   let mut selection = SelectMany {
     active,
     disabled,
-    policy,
-    next_start: 0,
+    round_robin,
+    next_start,
     done: false,
   };
   // The entries are reserved; only boxing a nonzero-sized future allocates.
@@ -488,7 +499,7 @@ struct Active<F> {
 pub struct SelectMany<F: Future> {
   active: Vec<Option<Active<F>>>,
   disabled: Vec<Option<F>>,
-  policy: SelectionPolicy,
+  round_robin: bool,
   next_start: usize,
   done: bool,
 }
@@ -503,15 +514,12 @@ impl<F: Future> Future for SelectMany<F> {
   fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
     let this = self.get_mut();
     assert!(!this.done, "SelectMany polled after completion");
-    let start = match this.policy {
-      SelectionPolicy::Biased => 0,
-      SelectionPolicy::RoundRobin => this.next_start,
-    };
+    let start = if this.round_robin { this.next_start } else { 0 };
     match poll_from(&mut this.active, start, cx) {
       Some(Ok((winner, output))) => this.finish(winner, output),
       Some(Err(payload)) => this.abort_with_primary(payload),
       None => {
-        if this.policy == SelectionPolicy::RoundRobin {
+        if this.round_robin {
           this.next_start = (start + 1) % this.active.len();
         }
         Poll::Pending
@@ -645,8 +653,8 @@ mod tests {
   use std::task::{Context, Poll, Wake, Waker};
 
   use super::{
-    Branch, MAX_BRANCHES, SelectionPolicy, StartError, StartErrorKind, join_all, select_many,
-    try_join_all,
+    Branch, MAX_BRANCHES, SelectionPolicy, SelectionRng, StartError, StartErrorKind, join_all,
+    select_many, try_join_all,
   };
 
   #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -942,6 +950,35 @@ mod tests {
         Dropped(0),
         Dropped(2)
       ]
+    );
+  }
+
+  #[test]
+  fn randomized_selection_starts_at_a_seeded_enabled_rank_then_rotates() {
+    let seed = 29;
+    let first_rank = SelectionRng::from_seed(seed).index(2);
+    let enabled = [0_usize, 2];
+    let log = new_log();
+    let branches = vec![
+      Branch::new(true, Probe::<u8>::never(&log, 0)),
+      Branch::new(false, Probe::never(&log, 1)),
+      Branch::new(true, Probe::never(&log, 2)),
+    ];
+    let mut selected = select_many(
+      branches,
+      3,
+      SelectionPolicy::Randomized(SelectionRng::from_seed(seed)),
+    )
+    .expect("enabled branches");
+    assert!(poll_once(&mut selected).is_pending());
+    assert_eq!(
+      take_events(&log),
+      [Polled(enabled[first_rank]), Polled(enabled[1 - first_rank])]
+    );
+    assert!(poll_once(&mut selected).is_pending());
+    assert_eq!(
+      take_events(&log),
+      [Polled(enabled[1 - first_rank]), Polled(enabled[first_rank])]
     );
   }
 

@@ -906,15 +906,17 @@ and owned immediately.
 the original input vector before consuming any element. Empty joins complete
 immediately; an empty or wholly disabled selection is rejected. Disabled
 futures are owned but never polled, and are destroyed before result
-publication. Selection returns the original branch index and uses biased
-order or deterministic round-robin starting priority after pending polls.
+publication. Selection returns the original branch index and supports biased,
+round-robin or seeded randomized starting priority.
 
 These helpers reserve ordinary bookkeeping and result-vector storage before
 consuming inputs, then pin each active future in an ordinary box. Bookkeeping
 reservation failure is recoverable; box allocation follows ordinary Rust
 allocation-failure behavior. Managed storage is not implicitly charged.
-Twenty native tests cover ownership, ordering, pinning, rejection and panic
-cleanup. Randomized selection is outside these deterministic ports.
+Native tests cover ownership, ordering, pinning, rejection, randomized starting
+priority and panic cleanup. `SelectionRng` supports reproducible seeds and a
+fallible kernel-entropy constructor. The default fairness seed is independent
+of allocator hardening and is not a cryptographic randomness contract.
 
 A completed input is destroyed before its output is retained. Failure or
 selection destroys unfinished inputs and unused partial outputs before
@@ -928,11 +930,14 @@ borrowed and pinned inputs, retained terminal helpers and adversarial cleanup.
 `runtime::concurrency_macros` exports `join!`, `try_join!`, `select!` and the
 standard stack `pin!` macro. The composition macros also appear at the crate
 root and accept two to sixteen heterogeneous branches. Joins return flat
-tuples in source order; error joins require one error type. Each branch is
+tuples in source order; error joins require one error type. Their default
+polling order rotates after pending polls; `biased;` keeps source-order
+priority. Each branch is
 pinned in one ordinary box and partial join outputs are retained independently
 until final tuple publication. No managed storage is implicitly reserved.
 
-Selection uses an explicit policy and bracketed branch groups:
+Selection uses bracketed branch groups and randomized priority by default.
+An explicit policy can override it:
 
 ```rust,ignore
 let result = allocatbelt::select! {
@@ -945,9 +950,14 @@ let result = allocatbelt::select! {
 }.await;
 ```
 
-Patterns must be irrefutable and handlers must produce one common result type.
+Patterns use Rust's normal pattern syntax, including refutable patterns. A
+ready value that fails its branch pattern disables that branch for this
+selection; pending siblings are polled at most once during that outer poll.
+Handlers must produce one common result type.
 `biased;` starts in source order; `round_robin;` rotates priority among enabled
-original branch indices after pending polls. All branch futures, including
+original branch indices after pending polls. `randomized;` uses the default
+fairness seed, and `randomized(seed);` accepts a `SelectionRng` for repeatable
+priority. All branch futures, including
 disabled ones, are constructed and owned; disabled futures are never polled.
 Every branch future is disposed before the winning handler or mandatory
 all-disabled `else` runs. Handlers can borrow shared state and await. Captures

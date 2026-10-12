@@ -30,6 +30,10 @@ use std::task::{Context, Poll};
 
 use super::task::drop_contained;
 
+#[path = "selection_rng.rs"]
+pub mod selection_rng;
+pub use selection_rng::SelectionRng;
+
 type PanicPayload = Box<dyn Any + Send + 'static>;
 
 /// Creates a future that polls both inputs until each completes.
@@ -333,6 +337,9 @@ pub enum SelectPolicy {
   Biased,
   /// Alternate which future is polled first after each poll where both pend.
   RoundRobin,
+  /// Choose a pseudorandom first branch, then rotate after polls where both
+  /// futures return `Pending`.
+  Randomized(SelectionRng),
 }
 
 /// Creates a future that returns the first ready branch and cancels the other.
@@ -340,19 +347,26 @@ pub enum SelectPolicy {
 /// Both futures are eagerly constructed by the caller and owned by the
 /// returned helper. `Biased` always polls the first input before the second.
 /// `RoundRobin` begins with the first input, then alternates the first polled
-/// input after each call where both inputs return `Pending`; no random source
-/// is used. A winning input's output is moved into [`Either`], while both
+/// input after each call where both inputs return `Pending`. `Randomized`
+/// chooses its initial branch from the supplied generator when this function
+/// is called, then rotates after each pending poll. A winning input's output
+/// is moved into [`Either`], while both
 /// completed and losing future objects are dropped before the result appears.
 pub fn select2<A, B>(first: A, second: B, policy: SelectPolicy) -> Select2<A, B>
 where
   A: Future,
   B: Future,
 {
+  let (round_robin, next_first) = match policy {
+    SelectPolicy::Biased => (false, true),
+    SelectPolicy::RoundRobin => (true, true),
+    SelectPolicy::Randomized(mut rng) => (true, rng.index(2) == 0),
+  };
   Select2 {
     first: Some(Box::pin(first)),
     second: Some(Box::pin(second)),
-    policy,
-    next_first: true,
+    round_robin,
+    next_first,
     done: false,
   }
 }
@@ -361,7 +375,7 @@ where
 pub struct Select2<A: Future, B: Future> {
   first: Option<Pin<Box<A>>>,
   second: Option<Pin<Box<B>>>,
-  policy: SelectPolicy,
+  round_robin: bool,
   next_first: bool,
   done: bool,
 }
@@ -374,10 +388,7 @@ impl<A: Future, B: Future> Future for Select2<A, B> {
   fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
     let this = self.get_mut();
     assert!(!this.done, "Select2 polled after completion");
-    let first_is_left = match this.policy {
-      SelectPolicy::Biased => true,
-      SelectPolicy::RoundRobin => this.next_first,
-    };
+    let first_is_left = !this.round_robin || this.next_first;
 
     if first_is_left {
       if let Some(result) = poll_input(&mut this.first, cx) {
@@ -411,7 +422,7 @@ impl<A: Future, B: Future> Future for Select2<A, B> {
       }
     }
 
-    if this.policy == SelectPolicy::RoundRobin {
+    if this.round_robin {
       this.next_first = !first_is_left;
     }
     Poll::Pending
@@ -520,7 +531,7 @@ mod tests {
   use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
   use std::task::{Context, Poll, Waker};
 
-  use super::{Either, SelectPolicy, join2, select2, try_join2};
+  use super::{Either, SelectPolicy, SelectionRng, join2, select2, try_join2};
 
   fn noop_waker() -> Waker {
     (*Waker::noop()).clone()
@@ -870,6 +881,44 @@ mod tests {
     assert!(poll(select.as_mut(), &waker).is_pending());
     assert!(poll(select.as_mut(), &waker).is_pending());
     assert_eq!(&*order.borrow(), &[0, 1, 1, 0]);
+  }
+
+  #[test]
+  fn randomized_selection_uses_the_seeded_first_branch_then_rotates() {
+    let seed = 13;
+    let expected_first = SelectionRng::from_seed(seed).index(2);
+    let order = Rc::new(RefCell::new(Vec::new()));
+    let first = {
+      let order = Rc::clone(&order);
+      poll_fn(move |_| {
+        order.borrow_mut().push(0);
+        Poll::<u8>::Pending
+      })
+    };
+    let second = {
+      let order = Rc::clone(&order);
+      poll_fn(move |_| {
+        order.borrow_mut().push(1);
+        Poll::<u8>::Pending
+      })
+    };
+    let mut selected = Box::pin(select2(
+      first,
+      second,
+      SelectPolicy::Randomized(SelectionRng::from_seed(seed)),
+    ));
+    let waker = noop_waker();
+    assert!(poll(selected.as_mut(), &waker).is_pending());
+    assert!(poll(selected.as_mut(), &waker).is_pending());
+    assert_eq!(
+      &*order.borrow(),
+      &[
+        expected_first,
+        1 - expected_first,
+        1 - expected_first,
+        expected_first
+      ]
+    );
   }
 
   #[test]
