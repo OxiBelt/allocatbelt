@@ -30,11 +30,11 @@ use allocatbelt_app_ports::disk::{self, DiskConfig, DiskReport};
 use allocatbelt_app_ports::memory::{self, MemoryConfig, MemoryOutput};
 
 #[path = "application/disk_lane.rs"]
-mod disk_lane;
+pub(crate) mod disk_lane;
 #[path = "application/http.rs"]
 mod http;
 #[path = "application/runtime_bindings.rs"]
-mod runtime_bindings;
+pub(crate) mod runtime_bindings;
 pub(super) use runtime_bindings::{
   APPLICATION_TASK_CEILING, ApplicationDomain, ApplicationIoBindings, ApplicationRunBindings,
   ApplicationTaskAdmission,
@@ -785,9 +785,9 @@ pub(crate) struct Counts {
 }
 
 #[derive(Clone, Copy, Debug)]
-pub(super) struct ProcessMemory {
-  rss_kib: u64,
-  hwm_kib: u64,
+pub(crate) struct ProcessMemory {
+  pub(crate) rss_kib: u64,
+  pub(crate) hwm_kib: u64,
 }
 
 pub(super) struct ProcessCheckpoints {
@@ -798,7 +798,7 @@ pub(super) struct ProcessCheckpoints {
   pub(super) rss_after_shutdown: ProcessMemory,
 }
 
-pub(super) fn sample_process_memory() -> Result<ProcessMemory, String> {
+pub(crate) fn sample_process_memory() -> Result<ProcessMemory, String> {
   let status = std::fs::read_to_string("/proc/self/status")
     .map_err(|error| format!("could not read process RSS from /proc: {error}"))?;
   let mut rss_kib = None;
@@ -2108,7 +2108,7 @@ impl WarmGate {
   }
 }
 
-fn warm_bounded_for(handle: &AsyncHandle, workers: usize) -> Result<(), String> {
+pub(crate) fn warm_bounded_for(handle: &AsyncHandle, workers: usize) -> Result<(), String> {
   let gate = WarmGate::new(workers, WARMUP_TIMEOUT);
   let mut jobs = Vec::new();
   jobs
@@ -2601,6 +2601,44 @@ fn observe_with_plan(
 
 fn record_managed_sample(resources: &ResourceScope, maximum: &mut usize) {
   *maximum = (*maximum).max(resources.snapshot().managed_memory);
+}
+
+/// Canonical work inputs for a separately frozen mixed soak reference ring.
+/// The observation ID remains separate from this reference work ID.
+#[derive(Clone, Copy, Debug)]
+pub struct CanonicalSoakInputs {
+  pub family: Workload,
+  pub cpu_seed: u64,
+  pub cpu_rounds: u32,
+  pub memory: MemoryConfig,
+  pub disk: DiskConfig,
+  pub http_seed: u64,
+  pub http_body_bytes: usize,
+}
+
+pub fn canonical_soak_inputs(reference_work_id: u64) -> CanonicalSoakInputs {
+  let config = LaneConfig::default();
+  let seed = job_seed(reference_work_id);
+  CanonicalSoakInputs {
+    family: [
+      Workload::Cpu,
+      Workload::Memory,
+      Workload::Http,
+      Workload::Disk,
+    ][(reference_work_id % 4) as usize],
+    cpu_seed: seed,
+    cpu_rounds: config.rounds,
+    memory: MemoryConfig {
+      seed,
+      ..config.memory
+    },
+    disk: DiskConfig {
+      seed,
+      ..config.disk
+    },
+    http_seed: http::request_seed(reference_work_id),
+    http_body_bytes: http::ORACLE_BODY_BYTES,
+  }
 }
 
 fn job_seed(id: u64) -> u64 {

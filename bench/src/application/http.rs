@@ -2319,7 +2319,7 @@ fn build_open_loop_checksum_oracle(
   Ok(Some(Arc::new(oracle)))
 }
 
-fn request_seed(id: u64) -> u64 {
+pub(super) fn request_seed(id: u64) -> u64 {
   0xbb67_ae85_84ca_a73b ^ id.wrapping_mul(0x9e37_79b9_7f4a_7c15)
 }
 

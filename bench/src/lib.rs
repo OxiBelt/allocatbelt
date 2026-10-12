@@ -23,6 +23,7 @@ use allocatbelt_profile::Usage;
 pub mod adaptive_feedback;
 pub mod application;
 pub mod runtime;
+pub mod soak;
 
 /// Deterministic xorshift so every allocator sees the same request stream.
 struct Rng(u64);
