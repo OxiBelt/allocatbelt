@@ -1,10 +1,16 @@
 # Global and tenant resource admission
 
-`runtime::resource_domain` provides a fixed-storage domain for declared CPU,
-managed-memory, disk, network, task and control charges. `ResourceDomain::new`
-reserves its tenant-slot table before exposing the domain. The retained table
-capacity is charged to `Control`; allocator rounding and shared headers are
-not measured physical memory.
+`runtime::resource_domain` provides a fixed-storage domain for declared active
+CPU, managed-memory, disk, network, task and control charges.
+`ResourceDomain::new` reserves its tenant-slot table before exposing the
+domain. `ResourceDomain::with_waiters(ceiling, max_tenants, max_waiters)` also
+reserves a fixed CPU-waiter table. Actual retained slot capacities are charged
+to `Control`; allocator rounding, `Arc` headers and waker payload allocations
+are not measured physical memory. The existing `new` constructor keeps a
+zero-waiter table for callers that only need synchronous reservations.
+This charges the domain's tenant and waiter tables; runtime-owned queue,
+scope and task tables, per-task frames, and handoff helper infrastructure are
+not yet charged to `Control`.
 
 A tenant has immutable hard ceilings and independently adjustable soft limits.
 `TenantDomain::try_acquire` takes a complete `DomainResources` vector against
@@ -20,16 +26,53 @@ every clone. Its slot remains occupied until the final handle and reservation
 drop, bounding retained tenant-owner metadata and preventing stale handles
 from reopening a reused generation. Generation exhaustion never wraps.
 
+Runtime builders reserve disjoint shares of the waiter table before starting
+workers. Each admitted task, blocking job or borrowed root call leases one
+generation-stamped waiter slot. The share remains reserved while its pool or
+any live waiter retains it. CPU release and CPU soft-limit increases wake
+eligible waiters outside the domain lock. A waiter keeps its FIFO place across
+wakeups; cancellation clears its generation before slot reuse. A zero CPU soft
+limit can leave work waiting indefinitely until the limit rises.
+
 `DomainReservation` is an owned, non-clonable ticket. Retain it through actual
-execution, detached completion and cleanup. A shared returned object can hold
-one ticket until its final clone drops. This primitive accounts declared
-ownership: using it alone does not intercept allocations, polls or I/O, impose
-an OS CPU quota, or measure RSS, physical disk traffic or wire bandwidth.
+execution and cleanup. A shared returned object can hold one ticket until its
+final clone drops. Bound async and local runtimes reserve `Tasks` before
+publishing a future; blocking runtimes reserve it before publishing a closure.
+The task charge remains through future or closure destruction and is released
+before completion publication. A returned managed buffer or retained I/O
+permit keeps its own memory or operation charge for its full ownership
+lifetime; a task charge does not follow an arbitrary result after cleanup.
+
+Bound runtimes use one CPU unit for each active `Future::poll` or blocking
+closure call. A CPU ticket is acquired just before that call and released when
+it returns. A pending future releases its ticket before it waits for its next
+wake. Queued and cancelled unstarted closures take no CPU ticket. Borrowed
+`block_on` roots use the same CPU and task ledgers, with a fixed root-call
+bound. A blocking worker parked for CPU capacity remains task-admitted but
+does not hold a CPU unit. In `block_in_place`, the original poll keeps its CPU
+ticket for the borrowed closure; helpers acquire their own tickets and cannot
+exceed the same global or tenant CPU limits.
+If `Job::join` would wait for a job in the same bounded domain while the
+calling thread holds one of that domain's CPU tickets, it returns
+`JoinError::WouldDeadlock` and leaves the handle available for a later join.
+The runtime also rejects nested async or local roots when they cannot obtain a
+ticket held by the same thread. These checks cover direct CPU-admission cycles;
+they do not promise progress when user code waits on arbitrary locks or
+channels.
+
+These CPU units bound simultaneous calls, not CPU time. They do not preempt
+user code, impose an operating-system CPU quota, or measure RSS, physical disk
+traffic or wire bandwidth. This primitive alone does not intercept arbitrary
+allocations, polls or I/O.
 `ResourceScope::from_tenant` binds existing managed buffers and disk/network
 operation permits to that same domain. Its fixed `ResourceLimits` remain an
-additional local bound. Domain reservations update the global and tenant
-ledgers atomically; the local ledger and domain have separate locks, so their
-snapshots may describe adjacent stages of an admission or rollback.
+additional local bound. A bound runtime's omitted child-scope resource binding
+inherits its root `ResourceScope`; an explicit child binding must name a
+tenant in the same `ResourceDomain`. This prevents a new scope from dropping
+the global domain or switching to an unrelated domain. Domain reservations
+update the global and tenant ledgers atomically; the local ledger and domain
+have separate locks, so their snapshots may describe adjacent stages of an
+admission or rollback.
 
 Bound buffers charge retained vector capacity until the final clone drops.
 Growth reserves the complete replacement while retaining the old charge, and
@@ -44,9 +87,13 @@ already charged buffer capacity remains usable. A shared buffer still reports
 original local accounting behavior.
 
 Native fixtures cover multi-resource rollback, retained result clones, closed
-handle bounds, zero reservations and soft-limit draining. The same-source Loom
-fixture exercises concurrent global/tenant CPU admission and release. It does
-not model scheduler dispatch, syscall completion or kernel quotas. Native
-managed fixtures cover buffer clones, replacement peaks, allocation failure,
-closed admission and permit lifetimes; another same-source Loom model covers
-global contention by distinct tenant-bound operation scopes.
+handle bounds, zero reservations and soft-limit draining. Same-source Loom
+fixtures exercise global/tenant admission, CPU waiter enrollment racing with
+release, and waiter cancellation racing with slot reuse. They do not model
+executor dispatch, syscall completion or kernel quotas. Native runtime
+fixtures cover task admission, root and local polls, blocking closure waits,
+same-domain joins across pools and `block_in_place`, scope domain identity and
+cancellation before execution. Native managed
+fixtures cover buffer clones, replacement peaks, allocation failure, closed
+admission and permit lifetimes; another same-source Loom model covers global
+contention by distinct tenant-bound operation scopes.

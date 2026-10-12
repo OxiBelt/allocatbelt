@@ -30,6 +30,7 @@ use super::fs::FsHandle;
 use super::managed::{ResourceLimits, ResourceScope};
 use super::process::{ProcessBuildError, ProcessDriver, ProcessShutdownError, ProcessShutdownMode};
 use super::reactor::{Reactor, ReactorConfig, ReactorError, ReactorHandle};
+use super::resource_domain::TenantDomain;
 use super::signal::{SignalDriver, SignalError};
 use super::time::{ClockMode, IdleCoordinator, TimerDriver, TimerError, TimerHandle};
 use super::{Config as BlockingConfig, Handle as BlockingHandle, Runtime as BlockingRuntime};
@@ -275,7 +276,10 @@ impl ServiceOptions {
     current_thread: bool,
   ) -> Result<Option<FsHandle>, DriverBuildError> {
     if let Some(config) = self.blocking {
-      startup.blocking = Some(BlockingRuntime::new(config).map_err(DriverBuildError::Blocking)?);
+      startup.blocking = Some(
+        BlockingRuntime::with_resources(config, resources.clone())
+          .map_err(DriverBuildError::Blocking)?,
+      );
     }
     if let Some(max_registered) = self.timer_registrations {
       startup.timer = Some(
@@ -379,10 +383,11 @@ macro_rules! service_builder_methods {
 
 /// Builder for an owner-thread runtime. Its local tasks, handles and shutdown
 /// cleanup stay on the thread that calls [`CurrentThreadBuilder::build`].
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct CurrentThreadBuilder {
   config: LocalConfig,
   resources: ResourceLimits,
+  tenant: Option<TenantDomain>,
   services: ServiceOptions,
 }
 
@@ -392,6 +397,7 @@ impl CurrentThreadBuilder {
   pub const fn new(config: LocalConfig) -> Self {
     Self {
       config,
+      tenant: None,
       resources: ResourceLimits {
         managed_memory: 0,
         disk_concurrent_ops: 0,
@@ -417,6 +423,13 @@ impl CurrentThreadBuilder {
     self
   }
 
+  /// Binds managed storage and operation permits to a shared global/tenant
+  /// domain in addition to this builder's local resource limits.
+  pub fn resource_domain(mut self, tenant: TenantDomain) -> Self {
+    self.tenant = Some(tenant);
+    self
+  }
+
   /// Builds the local runtime and selected services after validating every
   /// configured bound. Failed startup joins any service threads already
   /// started; process signals are initialized last because their bridge is
@@ -429,7 +442,10 @@ impl CurrentThreadBuilder {
     }
     self.services.validate()?;
     let (upload_rate, download_rate) = self.services.build_rates()?;
-    let resources = ResourceScope::new(self.resources);
+    let resources = match self.tenant {
+      Some(tenant) => ResourceScope::from_tenant(self.resources, tenant),
+      None => ResourceScope::new(self.resources),
+    };
     let mut startup = StartupGuard::default();
     startup.local = Some(
       LocalRuntime::with_resources(self.config, resources.clone())
@@ -482,6 +498,7 @@ pub struct MultiThreadBuilder {
   handoffs: Option<HandoffConfig>,
   thread_options: Option<AsyncThreadOptions>,
   resources: ResourceLimits,
+  tenant: Option<TenantDomain>,
   services: ServiceOptions,
 }
 
@@ -492,6 +509,7 @@ impl MultiThreadBuilder {
     Self {
       config,
       handoffs: None,
+      tenant: None,
       thread_options: None,
       resources: ResourceLimits {
         managed_memory: 0,
@@ -530,6 +548,13 @@ impl MultiThreadBuilder {
     self
   }
 
+  /// Binds managed storage and operation permits to a shared global/tenant
+  /// domain in addition to this builder's local resource limits.
+  pub fn resource_domain(mut self, tenant: TenantDomain) -> Self {
+    self.tenant = Some(tenant);
+    self
+  }
+
   /// Builds the async runtime and selected services after validating every
   /// configured bound. Failed startup joins any service threads already
   /// started; process signals are initialized last because their bridge is
@@ -559,7 +584,10 @@ impl MultiThreadBuilder {
     }
     self.services.validate()?;
     let (upload_rate, download_rate) = self.services.build_rates()?;
-    let resources = ResourceScope::new(self.resources);
+    let resources = match self.tenant {
+      Some(tenant) => ResourceScope::from_tenant(self.resources, tenant),
+      None => ResourceScope::new(self.resources),
+    };
     let mut startup = StartupGuard::default();
     let asynchronous = match (self.handoffs, self.thread_options) {
       (Some(handoffs), Some(options)) => AsyncRuntime::with_resources_handoffs_and_thread_options(
@@ -1217,6 +1245,68 @@ mod tests {
       disk_concurrent_ops: 2,
       network_concurrent_ops: 3,
     }
+  }
+
+  #[test]
+  fn distinct_owning_facades_share_global_managed_limits_and_retained_results() {
+    use crate::runtime::asynchronous::current_resource_scope;
+    use crate::runtime::managed::{ResourceError, ResourceKind};
+    use crate::runtime::resource_domain::{DomainResource, DomainResources, ResourceDomain};
+
+    let ceiling = DomainResources::ZERO
+      .with(DomainResource::Cpu, 64)
+      .with(DomainResource::Tasks, 64)
+      .with(DomainResource::Memory, 8)
+      .with(DomainResource::Disk, 2)
+      .with(DomainResource::Network, 3)
+      .with(DomainResource::Control, 1 << 16);
+    let domain = ResourceDomain::with_waiters(ceiling, 2, 32).unwrap();
+    let mut local = CurrentThreadBuilder::new(local_config())
+      .resources(limits(8))
+      .resource_domain(domain.tenant(ceiling).unwrap())
+      .build()
+      .unwrap();
+    let mut threaded = MultiThreadBuilder::new(async_config())
+      .resources(limits(8))
+      .resource_domain(domain.tenant(ceiling).unwrap())
+      .build()
+      .unwrap();
+    let held = local
+      .block_on(async { current_resource_scope().try_alloc_zeroed(6) })
+      .unwrap()
+      .unwrap();
+    let rejected = threaded
+      .handle()
+      .spawn(async { current_resource_scope().try_alloc_zeroed(4) })
+      .unwrap();
+    assert_eq!(
+      threaded.block_on(rejected).unwrap().unwrap().map(drop),
+      Err(ResourceError::Exhausted(ResourceKind::Memory))
+    );
+    assert_eq!(domain.snapshot().used.get(DomainResource::Memory), 6);
+    assert_eq!(threaded.resources().snapshot().managed_memory, 0);
+    drop(held);
+    let completed = threaded
+      .handle()
+      .spawn(async { current_resource_scope().try_alloc_zeroed(4) })
+      .unwrap();
+    let result = threaded.block_on(completed).unwrap().unwrap().unwrap();
+    let retained = result.clone();
+    drop(result);
+    local.request_shutdown(CurrentShutdown::default()).unwrap();
+    threaded.request_shutdown(MultiShutdown::default()).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while local.drive_shutdown_step().unwrap() != ShutdownProgress::Complete
+      || threaded.drive_shutdown_step().unwrap() != ShutdownProgress::Complete
+    {
+      assert!(Instant::now() < deadline, "facades did not finish shutdown");
+      std::thread::yield_now();
+    }
+    drop(local);
+    drop(threaded);
+    assert_eq!(domain.snapshot().used.get(DomainResource::Memory), 4);
+    drop(retained);
+    assert_eq!(domain.snapshot().used.get(DomainResource::Memory), 0);
   }
 
   #[test]

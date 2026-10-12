@@ -17,7 +17,7 @@ impl Wake for Counter {
 }
 
 fn job(packet: Arc<Packet<u64>>) -> Job<u64> {
-  Job::new(Control::new(Ident::new(u64::MAX)), packet)
+  Job::new(Control::new(Ident::new(u64::MAX), None), packet)
 }
 
 #[test]
@@ -35,6 +35,15 @@ fn awaited_job_wakes_once_and_yields_the_published_result() {
     Pin::new(&mut job).poll(&mut context),
     Poll::Ready(Ok(42))
   ));
+}
+
+#[test]
+fn a_joined_outcome_is_one_shot_but_would_deadlock_keeps_the_handle() {
+  let packet = Packet::new();
+  let job = job(Arc::clone(&packet));
+  assert!(packet.publish(Ok(42)).is_none());
+  assert_eq!(job.join().unwrap(), 42);
+  assert!(matches!(job.join(), Err(super::JoinError::OutcomeTaken)));
 }
 
 #[test]

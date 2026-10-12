@@ -62,10 +62,13 @@
 //! [`Runtime::shutdown`] closes the runtime and waits ([`ShutdownMode`]).
 //! Called from one of the runtime's workers, it fails with `Deadlock`
 //! instead of joining. A [`Job::join`] that would block on a worker of the
-//! job's runtime (thread-local destructors as it exits included), or on
-//! the thread dropping its queued jobs (through any nested cleanup of other
-//! runtimes), returns [`JoinError::WouldDeadlock`] instead. Dropping a [`Runtime`] does not
-//! join its workers (see [`Runtime`]).
+//! job's runtime (thread-local destructors as it exits included), on the
+//! thread dropping its queued jobs, or on a CPU ticket held by the caller in
+//! the same bounded resource domain returns [`JoinError::WouldDeadlock`].
+//! That leaves the job handle available for a later join. These checks cover
+//! runtime-controlled waits; they do not promise progress for arbitrary user
+//! locks or channels. Dropping a [`Runtime`] does not join its workers (see
+//! [`Runtime`]).
 
 #![forbid(unsafe_code)]
 #![cfg_attr(not(test), deny(clippy::expect_used, clippy::unwrap_used))]
@@ -88,6 +91,7 @@ pub mod channel;
 pub mod concurrency;
 pub mod concurrency_macros;
 pub mod concurrency_many;
+mod cpu_execution;
 #[cfg(not(loom))]
 pub mod driver;
 mod error;
@@ -116,6 +120,8 @@ mod reactor_release;
 #[cfg(not(loom))]
 mod readiness_io;
 pub mod resource_domain;
+#[cfg(all(test, not(loom)))]
+mod resource_domain_runtime_tests;
 #[cfg(not(loom))]
 pub mod resource_feedback_policy;
 mod resources;

@@ -10,6 +10,7 @@ use std::thread::{self, JoinHandle};
 
 use crate::runtime::error::SubmitError;
 use crate::runtime::job::{CancellationToken, Job};
+use crate::runtime::managed::ResourceScope;
 use crate::runtime::resources::Resources;
 use crate::runtime::scheduler::{Entry, Shared, Snapshot};
 use crate::runtime::task::drop_contained;
@@ -89,7 +90,19 @@ impl Runtime {
   /// were stopped and joined. `Other` once the process created
   /// `u64::MAX - 2` runtimes, rather than reuse an id.
   pub fn new(config: Config) -> io::Result<Self> {
-    Self::with_spawner(config, |builder, f| builder.spawn(f), |_| {})
+    Self::with_spawner_and_resources(config, None, |builder, f| builder.spawn(f), |_| {})
+  }
+
+  /// Starts a pool whose admitted closures take Tasks and active CPU charges
+  /// from the tenant bound to resources. Its waiter share is reserved before
+  /// worker startup; failure returns before any worker is exposed.
+  pub(crate) fn with_resources(config: Config, resources: ResourceScope) -> io::Result<Self> {
+    Self::with_spawner_and_resources(
+      config,
+      Some(resources),
+      |builder, f| builder.spawn(f),
+      |_| {},
+    )
   }
 
   /// Associates facade-owned blocking admissions with a paused-auto clock.
@@ -101,8 +114,18 @@ impl Runtime {
 
   /// [`Runtime::new`] with the thread spawn replaceable and the shared
   /// state adjustable before any worker starts, for the tests.
+  #[cfg(test)]
   pub(crate) fn with_spawner(
     config: Config,
+    spawn: impl FnMut(thread::Builder, Box<dyn FnOnce() + Send>) -> io::Result<JoinHandle<()>>,
+    setup: impl FnOnce(&mut Shared),
+  ) -> io::Result<Self> {
+    Self::with_spawner_and_resources(config, None, spawn, setup)
+  }
+
+  fn with_spawner_and_resources(
+    config: Config,
+    resources: Option<ResourceScope>,
     mut spawn: impl FnMut(thread::Builder, Box<dyn FnOnce() + Send>) -> io::Result<JoinHandle<()>>,
     setup: impl FnOnce(&mut Shared),
   ) -> io::Result<Self> {
@@ -113,7 +136,13 @@ impl Runtime {
       ));
     }
     let id = worker::next_id(&NEXT_ID).ok_or_else(|| io::Error::other("runtime ids exhausted"))?;
-    let mut shared = Shared::new(id, config.workers, config.max_outstanding, config.capacity)?;
+    let mut shared = Shared::new(
+      id,
+      config.workers,
+      config.max_outstanding,
+      config.capacity,
+      resources,
+    )?;
     setup(&mut shared);
     let shared = Arc::new(shared);
     let mut workers = Vec::new();

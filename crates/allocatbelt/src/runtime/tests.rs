@@ -379,7 +379,7 @@ fn a_cancel_that_wins_the_start_transition_prevents_the_run() {
   }
   gate.send(()).unwrap();
   blocker.join().unwrap();
-  for (i, r) in jobs.into_iter().map(Job::join).enumerate() {
+  for (i, r) in jobs.into_iter().map(|job| job.join()).enumerate() {
     assert_eq!(i % 2 == 0, matches!(r, Err(JoinError::Cancelled)), "{i}");
   }
   rt.shutdown(ShutdownMode::Drain).unwrap();
@@ -413,6 +413,7 @@ fn cancel_racing_start_resolves_exactly_once() {
     match canceller.join().unwrap() {
       Ok(_) => finished += 1,
       Err(JoinError::Cancelled) => cancelled += 1,
+      Err(JoinError::OutcomeTaken) => panic!("job outcome was taken more than once"),
       Err(e) => panic!("{e}"),
     }
   }

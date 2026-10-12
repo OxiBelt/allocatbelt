@@ -17,6 +17,7 @@ use std::sync::{Mutex, MutexGuard};
 use std::task::{Context, Poll, Waker};
 
 use super::identity::TaskId;
+use crate::runtime::resource_domain::DomainError;
 
 /// Why an async task did not produce its output.
 pub enum AsyncJoinError {
@@ -24,6 +25,8 @@ pub enum AsyncJoinError {
   Cancelled,
   /// Polling or cleanup panicked; the original panic payload is retained.
   Panicked(Box<dyn Any + Send + 'static>),
+  /// A bounded runtime resource could not be acquired before polling.
+  ResourceDomain(DomainError),
 }
 
 impl fmt::Debug for AsyncJoinError {
@@ -31,6 +34,7 @@ impl fmt::Debug for AsyncJoinError {
     match self {
       Self::Cancelled => f.write_str("Cancelled"),
       Self::Panicked(_) => f.write_str("Panicked(..)"),
+      Self::ResourceDomain(error) => f.debug_tuple("ResourceDomain").field(error).finish(),
     }
   }
 }
@@ -40,6 +44,7 @@ impl fmt::Display for AsyncJoinError {
     f.write_str(match self {
       Self::Cancelled => "async task was cancelled",
       Self::Panicked(_) => "async task panicked",
+      Self::ResourceDomain(_) => "async task resource-domain admission failed",
     })
   }
 }

@@ -1,5 +1,6 @@
 //! Submission and join errors.
 
+use crate::runtime::resource_domain::DomainError;
 use std::any::Any;
 use std::fmt;
 
@@ -80,12 +81,17 @@ pub enum JoinError {
   Cancelled,
   /// The closure panicked; the payload is the panic's.
   Panicked(Box<dyn Any + Send + 'static>),
+  /// This handle's one-shot outcome was already taken by an earlier join or
+  /// future poll.
+  OutcomeTaken,
   /// The outcome was not ready, and the join was called from one of the
-  /// job's runtime's workers or from the thread dropping its queued jobs.
+  /// job's runtime's workers, from the thread dropping its queued jobs, or
+  /// while holding a CPU ticket from the same bounded resource domain.
   /// Waiting there could deadlock (see [`Job::join`](crate::runtime::Job::join)).
-  /// The job is unaffected; its result is lost because the handle was
-  /// consumed.
+  /// The job and its outcome remain available through the same handle.
   WouldDeadlock,
+  /// A bound runtime could not acquire CPU admission before execution.
+  ResourceDomain(DomainError),
 }
 
 impl fmt::Debug for JoinError {
@@ -93,7 +99,9 @@ impl fmt::Debug for JoinError {
     match self {
       Self::Cancelled => f.write_str("Cancelled"),
       Self::Panicked(_) => f.write_str("Panicked(..)"),
+      Self::OutcomeTaken => f.write_str("OutcomeTaken"),
       Self::WouldDeadlock => f.write_str("WouldDeadlock"),
+      Self::ResourceDomain(error) => f.debug_tuple("ResourceDomain").field(error).finish(),
     }
   }
 }
@@ -103,7 +111,9 @@ impl fmt::Display for JoinError {
     f.write_str(match self {
       Self::Cancelled => "job was cancelled before it started",
       Self::Panicked(_) => "job panicked",
-      Self::WouldDeadlock => "join from the job's own runtime would deadlock",
+      Self::OutcomeTaken => "job outcome was already taken",
+      Self::WouldDeadlock => "join would block work that only the calling thread can advance",
+      Self::ResourceDomain(_) => "job resource-domain admission failed",
     })
   }
 }

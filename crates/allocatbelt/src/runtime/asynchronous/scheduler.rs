@@ -15,11 +15,15 @@ use super::identity;
 use super::join::AsyncJob;
 use super::metrics::RuntimeMetrics;
 use super::protocol::{PollFinish, PollProtocol, PollQuota, ScopeProtocol};
-use super::task::{ErasedTask, PollResult, Task};
+use super::task::{DomainCpuAdmission, ErasedTask, PollResult, Task, TaskDomainAdmission};
 use super::thread_options::{AsyncThreadContext, AsyncThreadOptions};
 use super::{AsyncConfig, AsyncError, AsyncSpawnError};
 use crate::runtime::cache;
 use crate::runtime::managed::ResourceScope;
+use crate::runtime::resource_domain::{
+  DomainError, DomainIdentity, DomainReservation, DomainResource, DomainResources, DomainWaitPool,
+  DomainWaiter, TenantDomain,
+};
 
 thread_local! {
   static WORKER_RUNTIME: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
@@ -67,6 +71,7 @@ struct State {
 pub(super) struct Shared {
   id: u64,
   max_handoffs: usize,
+  workers: usize,
   pub(super) metrics: RuntimeMetrics,
   thread_options: AsyncThreadOptions,
   state: Mutex<State>,
@@ -81,6 +86,9 @@ struct ScopeCell {
   shared: Option<Weak<Shared>>,
   max_active_polls: usize,
   resources: Option<ResourceScope>,
+  tenant: Option<TenantDomain>,
+  task_waiters: Option<DomainWaitPool>,
+  root_waiters: Option<DomainWaitPool>,
   protocol: ScopeProtocol,
   completion: Mutex<Option<Waker>>,
 }
@@ -91,12 +99,21 @@ impl ScopeCell {
     shared: Option<Weak<Shared>>,
     max_active_polls: usize,
     resources: Option<ResourceScope>,
+    task_waiters: Option<DomainWaitPool>,
+    root_waiters: Option<DomainWaitPool>,
   ) -> Self {
+    let tenant = resources
+      .as_ref()
+      .and_then(ResourceScope::tenant_domain)
+      .cloned();
     Self {
       reference,
       shared,
       max_active_polls,
       resources,
+      tenant,
+      task_waiters,
+      root_waiters,
       protocol: ScopeProtocol::new(reference.is_none()),
       completion: Mutex::new(None),
     }
@@ -168,7 +185,29 @@ impl Shared {
     else {
       return Err(AsyncError::InvalidConfig);
     };
-    let root_scope = Arc::new(ScopeCell::new(None, None, config.workers, resources));
+    let (task_waiters, root_waiters) =
+      if let Some(tenant) = resources.as_ref().and_then(ResourceScope::tenant_domain) {
+        tenant
+          .validate_cpu_execution()
+          .map_err(AsyncError::ResourceDomain)?;
+        let task_waiters = tenant
+          .reserve_waiters(config.max_outstanding)
+          .map_err(AsyncError::ResourceDomain)?;
+        let root_waiters = tenant
+          .reserve_waiters(config.workers)
+          .map_err(AsyncError::ResourceDomain)?;
+        (Some(task_waiters), Some(root_waiters))
+      } else {
+        (None, None)
+      };
+    let root_scope = Arc::new(ScopeCell::new(
+      None,
+      None,
+      config.workers,
+      resources,
+      task_waiters,
+      root_waiters,
+    ));
     scopes[0] = ScopeSlot {
       generation: 1,
       scope: Some(root_scope),
@@ -184,6 +223,7 @@ impl Shared {
       Arc::new(Self {
         id,
         max_handoffs,
+        workers: config.workers,
         metrics,
         thread_options,
         state: Mutex::new(State {
@@ -302,12 +342,66 @@ impl Shared {
     let Some(generation) = state.scopes[index].generation.checked_add(1) else {
       return Err(AsyncError::TooManyScopes);
     };
+    let Some(root_cell) = state
+      .scopes
+      .first()
+      .and_then(|slot| slot.scope.as_ref())
+      .cloned()
+    else {
+      return Err(AsyncError::Closed);
+    };
+    let root_resources = root_cell.resources.clone();
+    let root_tenant = root_cell.tenant.clone();
+    let (resources, task_waiters, root_waiters) = match root_tenant {
+      Some(root_tenant) => {
+        let resources = match resources {
+          Some(resources) => {
+            let Some(tenant) = resources.tenant_domain() else {
+              return Err(AsyncError::ResourceDomain(DomainError::Invalid));
+            };
+            if !root_tenant.same_domain(tenant) {
+              return Err(AsyncError::ResourceDomain(DomainError::Invalid));
+            }
+            tenant
+              .validate_cpu_execution()
+              .map_err(AsyncError::ResourceDomain)?;
+            Some(resources)
+          }
+          None => root_resources,
+        };
+        (
+          resources,
+          root_cell.task_waiters.clone(),
+          root_cell.root_waiters.clone(),
+        )
+      }
+      None => {
+        let (task_waiters, root_waiters) =
+          if let Some(tenant) = resources.as_ref().and_then(ResourceScope::tenant_domain) {
+            tenant
+              .validate_cpu_execution()
+              .map_err(AsyncError::ResourceDomain)?;
+            let task_waiters = tenant
+              .reserve_waiters(state.tasks.len())
+              .map_err(AsyncError::ResourceDomain)?;
+            let root_waiters = tenant
+              .reserve_waiters(self.workers)
+              .map_err(AsyncError::ResourceDomain)?;
+            (Some(task_waiters), Some(root_waiters))
+          } else {
+            (None, None)
+          };
+        (resources, task_waiters, root_waiters)
+      }
+    };
     let scope_ref = ScopeRef { index, generation };
     let cell = Arc::new(ScopeCell::new(
       Some(scope_ref),
       Some(Arc::downgrade(self)),
       max_active_polls,
       resources,
+      task_waiters,
+      root_waiters,
     ));
     state.scopes[index].generation = generation;
     state.scopes[index].scope = Some(Arc::clone(&cell));
@@ -333,6 +427,46 @@ impl Shared {
       .first()
       .and_then(|slot| slot.scope.as_ref())
       .and_then(|scope| scope.resources.clone())
+  }
+
+  pub(super) fn root_admission(
+    &self,
+    scope_ref: ScopeRef,
+    resources: Option<&ResourceScope>,
+  ) -> Result<RootAdmission, AsyncError> {
+    let (default_tenant, root_waiters) = {
+      let state = self.lock();
+      let Some(scope) = get_scope(&state, scope_ref) else {
+        return Err(AsyncError::Closed);
+      };
+      (scope.tenant.clone(), scope.root_waiters.clone())
+    };
+    let tenant = resources
+      .and_then(ResourceScope::tenant_domain)
+      .cloned()
+      .or(default_tenant);
+    let Some(tenant) = tenant else {
+      return Ok(RootAdmission {
+        tenant: None,
+        waiter: None,
+        _task_admission: None,
+      });
+    };
+    tenant
+      .validate_cpu_execution()
+      .map_err(AsyncError::ResourceDomain)?;
+    let waiter = root_waiters
+      .ok_or(DomainError::WaitersFull)
+      .and_then(|pool| pool.try_lease())
+      .map_err(AsyncError::ResourceDomain)?;
+    let task_admission = tenant
+      .try_acquire(DomainResources::ZERO.with(DomainResource::Tasks, 1))
+      .map_err(AsyncError::ResourceDomain)?;
+    Ok(RootAdmission {
+      tenant: Some(tenant),
+      waiter: Some(waiter),
+      _task_admission: Some(task_admission),
+    })
   }
 
   fn scope_snapshot(&self, scope_ref: ScopeRef) -> Option<super::AsyncScopeSnapshot> {
@@ -409,11 +543,57 @@ impl Shared {
       drop(state);
       return Err(AsyncSpawnError::new(AsyncError::TaskIdExhausted, future));
     };
+    let tenant = scope_cell.tenant.clone();
+    let (task_admission, waiter) = if let Some(tenant) = &tenant {
+      if let Err(error) = tenant.validate_cpu_execution() {
+        drop(state);
+        return Err(AsyncSpawnError::new(
+          AsyncError::ResourceDomain(error),
+          future,
+        ));
+      }
+      let request = DomainResources::ZERO.with(DomainResource::Tasks, 1);
+      let task_admission = match tenant.try_acquire(request) {
+        Ok(admission) => admission,
+        Err(error) => {
+          drop(state);
+          return Err(AsyncSpawnError::new(
+            AsyncError::ResourceDomain(error),
+            future,
+          ));
+        }
+      };
+      let waiter = match scope_cell
+        .task_waiters
+        .as_ref()
+        .ok_or(DomainError::WaitersFull)
+        .and_then(DomainWaitPool::try_lease)
+      {
+        Ok(waiter) => waiter,
+        Err(error) => {
+          drop(state);
+          drop(task_admission);
+          return Err(AsyncSpawnError::new(
+            AsyncError::ResourceDomain(error),
+            future,
+          ));
+        }
+      };
+      (Some(task_admission), Some(waiter))
+    } else {
+      (None, None)
+    };
+    let domain = TaskDomainAdmission {
+      tenant,
+      waiter,
+      task: task_admission,
+    };
     let task_ref = TaskRef { index, generation };
     let (task, job) = Task::create(
       future,
       task_id,
       scope_cell.resources.clone(),
+      domain,
       Arc::downgrade(self),
       task_ref,
     );
@@ -867,6 +1047,27 @@ impl Selected {
 pub(super) struct PollPermit {
   shared: Weak<Shared>,
   scope: ScopeRef,
+  cpu_ticket: Option<DomainReservation>,
+}
+
+impl PollPermit {
+  pub(super) fn cpu_domain_identity(&self) -> Option<DomainIdentity> {
+    self
+      .cpu_ticket
+      .as_ref()
+      .map(DomainReservation::domain_identity)
+  }
+
+  fn set_cpu_ticket(&mut self, ticket: DomainReservation) {
+    debug_assert!(self.cpu_ticket.is_none());
+    self.cpu_ticket = Some(ticket);
+  }
+}
+
+pub(super) struct RootAdmission {
+  pub(super) tenant: Option<TenantDomain>,
+  pub(super) waiter: Option<DomainWaiter>,
+  _task_admission: Option<DomainReservation>,
 }
 
 impl Drop for PollPermit {
@@ -938,6 +1139,7 @@ fn dequeue(shared: &Arc<Shared>, state: &mut State) -> Option<Selected> {
           Some(PollPermit {
             shared: Arc::downgrade(shared),
             scope: scope_ref,
+            cpu_ticket: None,
           })
         };
         refresh_scope_schedule(state, scope_ref);
@@ -1063,8 +1265,27 @@ fn run_turns(
         super::entry::reset_budget();
         let waker = task_waker(shared, task_ref);
         let mut context = Context::from_waker(&waker);
-        let result = task.poll(&mut context, permit);
-        finish_poll(shared, task_ref, result);
+        match task.acquire_cpu(&waker) {
+          DomainCpuAdmission::Unbounded => {
+            let result = task.poll(&mut context, permit);
+            finish_poll(shared, task_ref, result);
+          }
+          DomainCpuAdmission::Acquired(ticket) => {
+            let mut permit = permit;
+            permit.set_cpu_ticket(ticket);
+            let result = task.poll(&mut context, permit);
+            finish_poll(shared, task_ref, result);
+          }
+          DomainCpuAdmission::Waiting => {
+            finish_poll(shared, task_ref, PollResult::Pending);
+            drop(permit);
+          }
+          DomainCpuAdmission::Rejected(error) => {
+            task.fail_resource(error);
+            finish_poll(shared, task_ref, PollResult::Ready);
+            drop(permit);
+          }
+        }
         drop(task);
         drop(waker);
         finished = handoff::leave_turn();

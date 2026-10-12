@@ -10,6 +10,10 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use crate::runtime::admission::Admission;
 use crate::runtime::error::{SubmitError, SubmitErrorKind};
 use crate::runtime::job::{CancellationToken, Control, Job, Packet};
+use crate::runtime::managed::ResourceScope;
+use crate::runtime::resource_domain::{
+  DomainError, DomainResource, DomainResources, DomainWaitPool, TenantDomain,
+};
 use crate::runtime::resources::Resources;
 use crate::runtime::task::{Runnable, Task};
 use crate::runtime::time::TimerHandle;
@@ -44,6 +48,8 @@ pub(crate) struct Shared {
   pub(crate) ident: Arc<Ident>,
   state: Mutex<State>,
   clock: Mutex<Option<TimerHandle>>,
+  tenant: Option<TenantDomain>,
+  domain_waiters: Option<DomainWaitPool>,
   pub(crate) work: Condvar,
   #[cfg(test)]
   pub(crate) park_hook: Option<ParkHook>,
@@ -78,6 +84,7 @@ impl Shared {
     workers: usize,
     max_outstanding: usize,
     capacity: Resources,
+    resources: Option<ResourceScope>,
   ) -> io::Result<Self> {
     let mut queue = VecDeque::new();
     queue
@@ -88,6 +95,18 @@ impl Shared {
       .try_reserve_exact(workers)
       .map_err(reservation_error)?;
     running.resize_with(workers, || None);
+    let (tenant, domain_waiters) =
+      if let Some(tenant) = resources.as_ref().and_then(ResourceScope::tenant_domain) {
+        tenant
+          .validate_cpu_execution()
+          .map_err(domain_build_error)?;
+        let waiters = tenant
+          .reserve_waiters(max_outstanding)
+          .map_err(domain_build_error)?;
+        (Some(tenant.clone()), Some(waiters))
+      } else {
+        (None, None)
+      };
     Ok(Self {
       ident: Ident::new(id),
       state: Mutex::new(State {
@@ -100,6 +119,8 @@ impl Shared {
         closed: false,
       }),
       clock: Mutex::new(None),
+      tenant,
+      domain_waiters,
       work: Condvar::new(),
       #[cfg(test)]
       park_hook: None,
@@ -123,19 +144,59 @@ impl Shared {
     F: FnOnce(CancellationToken) -> T + Send + 'static,
     T: Send + 'static,
   {
+    let (tenant, task_admission, waiter) = if let Some(tenant) = &self.tenant {
+      if let Err(error) = tenant.validate_cpu_execution() {
+        return Err(SubmitError {
+          kind: domain_submit_kind(error),
+          job: f,
+        });
+      }
+      let task_admission =
+        match tenant.try_acquire(DomainResources::ZERO.with(DomainResource::Tasks, 1)) {
+          Ok(admission) => admission,
+          Err(error) => {
+            return Err(SubmitError {
+              kind: domain_submit_kind(error),
+              job: f,
+            });
+          }
+        };
+      let waiter = match self
+        .domain_waiters
+        .as_ref()
+        .ok_or(DomainError::WaitersFull)
+        .and_then(DomainWaitPool::try_lease)
+      {
+        Ok(waiter) => waiter,
+        Err(error) => {
+          drop(task_admission);
+          return Err(SubmitError {
+            kind: domain_submit_kind(error),
+            job: f,
+          });
+        }
+      };
+      (Some(tenant.clone()), Some(task_admission), Some(waiter))
+    } else {
+      (None, None, None)
+    };
     let clock = self
       .clock
       .lock()
       .unwrap_or_else(PoisonError::into_inner)
       .clone();
     let auto_advance_inhibit = clock.map(|timer| timer.inhibit_auto_advance());
-    let control = Control::new(Arc::clone(&self.ident));
+    let domain_identity = tenant.as_ref().map(TenantDomain::domain_identity);
+    let control = Control::new(Arc::clone(&self.ident), domain_identity);
     let packet = Packet::new();
     let task = Box::new(Task::new(
       f,
       Arc::clone(&control),
       Arc::clone(&packet),
       auto_advance_inhibit,
+      tenant,
+      waiter,
+      task_admission,
     ));
     let mut state = self.lock();
     let admitted = if state.closed {
@@ -196,6 +257,34 @@ impl Shared {
   }
 }
 
+fn domain_build_error(error: DomainError) -> io::Error {
+  let kind = match error {
+    DomainError::OutOfMemory => io::ErrorKind::OutOfMemory,
+    DomainError::Invalid | DomainError::AboveCeiling(_) | DomainError::Closed => {
+      io::ErrorKind::InvalidInput
+    }
+    DomainError::Exhausted(_)
+    | DomainError::TenantsFull
+    | DomainError::WaitersFull
+    | DomainError::GenerationExhausted => io::ErrorKind::WouldBlock,
+  };
+  io::Error::new(kind, error)
+}
+
+fn domain_submit_kind(error: DomainError) -> SubmitErrorKind {
+  match error {
+    DomainError::Closed => SubmitErrorKind::Closed,
+    DomainError::AboveCeiling(DomainResource::Tasks | DomainResource::Cpu)
+    | DomainError::Invalid => SubmitErrorKind::InvalidRequest,
+    DomainError::WaitersFull => SubmitErrorKind::Full,
+    DomainError::OutOfMemory
+    | DomainError::TenantsFull
+    | DomainError::GenerationExhausted
+    | DomainError::AboveCeiling(_)
+    | DomainError::Exhausted(_) => SubmitErrorKind::InsufficientResources,
+  }
+}
+
 fn reservation_error(_: std::collections::TryReserveError) -> io::Error {
   io::ErrorKind::OutOfMemory.into()
 }
@@ -227,6 +316,7 @@ mod tests {
         memory: 6,
         ..Resources::ZERO
       },
+      None,
     )
     .unwrap();
     let capacity = shared.lock().queue.capacity();

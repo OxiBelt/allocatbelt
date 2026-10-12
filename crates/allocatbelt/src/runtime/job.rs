@@ -8,8 +8,10 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::task::{Context, Poll, Waker};
+use std::thread::Thread;
 
 use crate::runtime::error::JoinError;
+use crate::runtime::resource_domain::DomainIdentity;
 use crate::runtime::state::StartState;
 use crate::runtime::worker::{self, Ident};
 
@@ -22,24 +24,60 @@ mod future_tests;
 pub(crate) struct Control {
   pub(crate) start: StartState,
   cancelled: AtomicBool,
+  waiting_thread: Mutex<Option<Thread>>,
   runtime: Arc<Ident>,
+  pub(crate) domain_identity: Option<DomainIdentity>,
 }
 
 impl Control {
-  pub(crate) fn new(runtime: Arc<Ident>) -> Arc<Self> {
+  pub(crate) fn new(runtime: Arc<Ident>, domain_identity: Option<DomainIdentity>) -> Arc<Self> {
     Arc::new(Self {
       start: StartState::new(),
       cancelled: AtomicBool::new(false),
+      waiting_thread: Mutex::new(None),
       runtime,
+      domain_identity,
     })
   }
 
   /// Sets the token's flag; it never clears.
   pub(crate) fn mark_cancelled(&self) {
     self.cancelled.store(true, Ordering::Release);
+    let waiting = self
+      .waiting_thread
+      .lock()
+      .unwrap_or_else(PoisonError::into_inner)
+      .take();
+    if let Some(thread) = waiting {
+      thread.unpark();
+    }
   }
 
-  fn is_cancelled(&self) -> bool {
+  /// Enrolls the worker parked before user closure execution. Cancellation
+  /// races with enrollment through the flag recheck and the park token.
+  pub(crate) fn register_waiting_thread(&self, thread: &Thread) {
+    let mut waiting = self
+      .waiting_thread
+      .lock()
+      .unwrap_or_else(PoisonError::into_inner);
+    *waiting = Some(thread.clone());
+    let cancelled = self.cancelled.load(Ordering::Acquire);
+    drop(waiting);
+    if cancelled {
+      thread.unpark();
+    }
+  }
+
+  pub(crate) fn clear_waiting_thread(&self) {
+    let waiting = self
+      .waiting_thread
+      .lock()
+      .unwrap_or_else(PoisonError::into_inner)
+      .take();
+    drop(waiting);
+  }
+
+  pub(crate) fn is_cancelled(&self) -> bool {
     self.cancelled.load(Ordering::Acquire)
   }
 }
@@ -162,21 +200,27 @@ impl<T> Job<T> {
   /// # Errors
   ///
   /// [`JoinError::Cancelled`] if it was cancelled before it started,
-  /// [`JoinError::Panicked`] if its closure panicked.
+  /// [`JoinError::Panicked`] if its closure panicked, or
+  /// [`JoinError::OutcomeTaken`] if this handle's one-shot result was already
+  /// taken by a previous join or future poll.
   ///
   /// [`JoinError::WouldDeadlock`] at once, without waiting, if the outcome
   /// is not ready and the calling thread is one of the job's runtime's
-  /// workers, or is dropping the runtime's queued jobs (a cancelling
-  /// shutdown or the runtime's drop), even while it cleans up other
-  /// runtimes nested inside that. That covers a job joining itself or
-  /// any other job of its runtime, and a closure, result, capture or
-  /// worker thread-local `Drop` doing so. Such a join could wait on work only that thread can finish.
-  /// The job itself is unaffected, but this handle is consumed, so its
-  /// result is lost; check [`Job::is_finished`] first to keep it. A join
-  /// that is ready returns the outcome from any thread.
-  pub fn join(self) -> Result<T, JoinError> {
+  /// workers, is dropping the runtime's queued jobs (a cancelling shutdown
+  /// or the runtime's drop), or holds a CPU ticket from the same bounded
+  /// resource domain. That covers jobs submitted to a different pool that
+  /// cannot start until the caller releases its ticket. Such a join leaves
+  /// this handle and the job outcome available for a later call. A join that
+  /// is ready returns the outcome from any thread.
+  pub fn join(&self) -> Result<T, JoinError> {
     let mut slot = self.packet.lock();
-    if matches!(*slot, Slot::Pending(_)) && worker::would_deadlock(&self.control.runtime) {
+    let pending = matches!(*slot, Slot::Pending(_));
+    let same_domain_active = self
+      .control
+      .domain_identity
+      .as_ref()
+      .is_some_and(crate::runtime::cpu_execution::active_for_domain);
+    if pending && (worker::would_deadlock(&self.control.runtime) || same_domain_active) {
       return Err(JoinError::WouldDeadlock);
     }
     while matches!(*slot, Slot::Pending(_)) {
@@ -190,8 +234,8 @@ impl<T> Job<T> {
     drop(slot);
     match taken {
       Slot::Ready(outcome) => outcome,
-      // `join` consumes the only handle, so nothing took it before.
-      Slot::Pending(_) | Slot::Taken => Err(JoinError::Cancelled),
+      Slot::Taken => Err(JoinError::OutcomeTaken),
+      Slot::Pending(_) => Err(JoinError::Cancelled),
     }
   }
 }
@@ -215,7 +259,8 @@ impl<T> Future for Job<T> {
       drop(slot);
       match taken {
         Slot::Ready(outcome) => Poll::Ready(outcome),
-        Slot::Pending(_) | Slot::Taken => Poll::Ready(Err(JoinError::Cancelled)),
+        Slot::Taken => Poll::Ready(Err(JoinError::OutcomeTaken)),
+        Slot::Pending(_) => Poll::Ready(Err(JoinError::Cancelled)),
       }
     })
   }

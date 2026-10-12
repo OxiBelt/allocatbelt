@@ -686,6 +686,7 @@ enum ServiceFailure {
   Cancelled,
   Panicked,
   WouldDeadlock,
+  ResourceDomain,
 }
 
 impl std::fmt::Display for ServiceFailure {
@@ -694,6 +695,7 @@ impl std::fmt::Display for ServiceFailure {
       Self::Cancelled => "blocking filesystem operation was cancelled before it started",
       Self::Panicked => "blocking filesystem operation panicked",
       Self::WouldDeadlock => "blocking filesystem job could not be joined from its worker",
+      Self::ResourceDomain => "blocking filesystem job could not acquire CPU admission",
     })
   }
 }
@@ -701,12 +703,14 @@ impl std::fmt::Display for ServiceFailure {
 impl std::error::Error for ServiceFailure {}
 
 fn service_failure(error: JoinError) -> io::Error {
-  let failure = match error {
-    JoinError::Cancelled => ServiceFailure::Cancelled,
-    JoinError::Panicked(_) => ServiceFailure::Panicked,
-    JoinError::WouldDeadlock => ServiceFailure::WouldDeadlock,
+  let (kind, failure) = match error {
+    JoinError::Cancelled => (io::ErrorKind::BrokenPipe, ServiceFailure::Cancelled),
+    JoinError::OutcomeTaken => (io::ErrorKind::BrokenPipe, ServiceFailure::Cancelled),
+    JoinError::Panicked(_) => (io::ErrorKind::BrokenPipe, ServiceFailure::Panicked),
+    JoinError::WouldDeadlock => (io::ErrorKind::BrokenPipe, ServiceFailure::WouldDeadlock),
+    JoinError::ResourceDomain(_) => (io::ErrorKind::WouldBlock, ServiceFailure::ResourceDomain),
   };
-  io::Error::new(io::ErrorKind::BrokenPipe, failure)
+  io::Error::new(kind, failure)
 }
 
 fn submission_error(error: FsSubmissionErrorKind) -> io::Error {

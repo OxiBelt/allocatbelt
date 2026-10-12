@@ -838,11 +838,15 @@ fn submission_error(kind: SubmitErrorKind) -> io::Error {
 fn job_error(error: JoinError) -> io::Error {
   let kind = match error {
     JoinError::Cancelled => BlockingIoErrorKind::Cancelled,
+    JoinError::OutcomeTaken => BlockingIoErrorKind::Cancelled,
     JoinError::Panicked(payload) => {
       crate::runtime::task::drop_contained(payload);
       BlockingIoErrorKind::Panicked
     }
     JoinError::WouldDeadlock => BlockingIoErrorKind::WouldDeadlock,
+    JoinError::ResourceDomain(_) => {
+      BlockingIoErrorKind::Submission(SubmitErrorKind::InsufficientResources)
+    }
   };
   io::Error::new(ErrorKind::BrokenPipe, BlockingIoError { kind })
 }

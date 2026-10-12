@@ -374,6 +374,13 @@ impl ResourceScope {
     }
   }
 
+  /// The shared tenant used for global admission, when this scope is bound.
+  /// Cloning this handle retains the same tenant generation.
+  #[must_use]
+  pub fn tenant_domain(&self) -> Option<&TenantDomain> {
+    self.tenant.as_ref()
+  }
+
   /// The limits the scope was created with.
   #[must_use]
   pub fn limits(&self) -> ResourceLimits {
@@ -553,7 +560,9 @@ fn map_domain_error(error: DomainError) -> ResourceError {
     DomainError::Exhausted(DomainResource::Network) => {
       ResourceError::Exhausted(ResourceKind::Network)
     }
-    DomainError::Exhausted(DomainResource::Control) => ResourceError::DomainControlExhausted,
+    DomainError::Exhausted(DomainResource::Control) | DomainError::WaitersFull => {
+      ResourceError::DomainControlExhausted
+    }
     // Managed scopes never request CPU, tasks or control. Keep every
     // unexpected domain refusal visible as a typed error rather than
     // bypassing domain admission.

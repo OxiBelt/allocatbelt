@@ -49,6 +49,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread::{self, JoinHandle};
 
 use crate::runtime::managed::ResourceScope;
+use crate::runtime::resource_domain::DomainError;
 use crate::runtime::task::drop_contained;
 use scheduler::{ScopeRef, Shared};
 
@@ -147,6 +148,8 @@ pub enum AsyncError {
   WorkerPanicked,
   /// The process-wide task identifier space is exhausted.
   TaskIdExhausted,
+  /// A bound global/tenant resource could not be admitted.
+  ResourceDomain(DomainError),
 }
 
 impl fmt::Display for AsyncError {
@@ -162,6 +165,7 @@ impl fmt::Display for AsyncError {
       Self::NestedBlockOn => "nested block_on on one thread is not allowed",
       Self::WorkerPanicked => "an async worker exited unexpectedly",
       Self::TaskIdExhausted => "process-wide async task identifiers are exhausted",
+      Self::ResourceDomain(_) => "async resource-domain admission failed",
     })
   }
 }

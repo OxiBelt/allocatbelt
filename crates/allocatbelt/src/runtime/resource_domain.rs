@@ -9,13 +9,25 @@
 #![cfg_attr(not(test), deny(clippy::expect_used, clippy::unwrap_used))]
 
 use std::fmt;
+use std::task::Waker;
 
 #[cfg(loom)]
 use loom::sync::{Arc, Mutex, MutexGuard};
+use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(not(loom))]
 use std::sync::{Arc, Mutex, MutexGuard};
 
 const KINDS: usize = 6;
+static NEXT_DOMAIN_ID: AtomicU64 = AtomicU64::new(1);
+
+fn next_domain_identity() -> Result<DomainIdentity, DomainError> {
+  NEXT_DOMAIN_ID
+    .try_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+      next.checked_add(1)
+    })
+    .map(DomainIdentity)
+    .map_err(|_| DomainError::GenerationExhausted)
+}
 
 /// Independently admitted resources in a managed domain.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -68,6 +80,7 @@ pub enum DomainError {
   Invalid,
   OutOfMemory,
   TenantsFull,
+  WaitersFull,
   GenerationExhausted,
   Closed,
   AboveCeiling(DomainResource),
@@ -119,6 +132,33 @@ struct State {
   limit: DomainResources,
   used: DomainResources,
   tenants: Vec<TenantSlot>,
+  waiters: Vec<WaiterSlot>,
+  next_waiter_pool: u64,
+  next_wait_sequence: u64,
+}
+
+struct WaiterSlot {
+  pool: Option<u64>,
+  generation: u64,
+  leased: bool,
+  waiting: bool,
+  tenant: Option<Key>,
+  sequence: u64,
+  waker: Option<Waker>,
+}
+
+impl WaiterSlot {
+  fn empty() -> Self {
+    Self {
+      pool: None,
+      generation: 0,
+      leased: false,
+      waiting: false,
+      tenant: None,
+      sequence: 0,
+      waker: None,
+    }
+  }
 }
 
 fn lock(state: &Mutex<State>) -> MutexGuard<'_, State> {
@@ -164,6 +204,7 @@ fn subtract(used: &mut DomainResources, request: DomainResources) {
 #[derive(Clone)]
 pub struct ResourceDomain {
   state: Arc<Mutex<State>>,
+  identity: DomainIdentity,
 }
 
 impl fmt::Debug for ResourceDomain {
@@ -190,13 +231,25 @@ impl ResourceDomain {
   /// payload bytes are charged to `Control`; allocation/header overhead is
   /// not represented as measured physical memory.
   pub fn new(ceiling: DomainResources, max_tenants: usize) -> Result<Self, DomainError> {
+    Self::with_waiters(ceiling, max_tenants, 0)
+  }
+
+  /// Creates a domain with a fixed CPU-waiter table. The table is allocated
+  /// before the domain is exposed, and its actual retained slot capacity is
+  /// charged to `Control`. Runtime builders must lease disjoint waiter shares
+  /// before starting their workers.
+  pub fn with_waiters(
+    ceiling: DomainResources,
+    max_tenants: usize,
+    max_waiters: usize,
+  ) -> Result<Self, DomainError> {
     if max_tenants == 0 {
       return Err(DomainError::Invalid);
     }
-    let bytes = max_tenants
+    let tenant_bytes = max_tenants
       .checked_mul(std::mem::size_of::<TenantSlot>())
       .ok_or(DomainError::Invalid)?;
-    if bytes > ceiling.get(DomainResource::Control) {
+    if tenant_bytes > ceiling.get(DomainResource::Control) {
       return Err(DomainError::Exhausted(DomainResource::Control));
     }
     let mut tenants = Vec::new();
@@ -211,14 +264,34 @@ impl ResourceDomain {
       return Err(DomainError::Exhausted(DomainResource::Control));
     }
     tenants.resize_with(max_tenants, TenantSlot::empty);
-    let used = DomainResources::ZERO.with(DomainResource::Control, actual_bytes);
+    let mut waiters = Vec::new();
+    waiters
+      .try_reserve_exact(max_waiters)
+      .map_err(|_| DomainError::OutOfMemory)?;
+    let waiter_bytes = waiters
+      .capacity()
+      .checked_mul(std::mem::size_of::<WaiterSlot>())
+      .ok_or(DomainError::Invalid)?;
+    let control_bytes = actual_bytes
+      .checked_add(waiter_bytes)
+      .ok_or(DomainError::Invalid)?;
+    if control_bytes > ceiling.get(DomainResource::Control) {
+      return Err(DomainError::Exhausted(DomainResource::Control));
+    }
+    waiters.resize_with(max_waiters, WaiterSlot::empty);
+    let used = DomainResources::ZERO.with(DomainResource::Control, control_bytes);
+    let identity = next_domain_identity()?;
     Ok(Self {
       state: Arc::new(Mutex::new(State {
         ceiling,
         limit: ceiling,
         used,
         tenants,
+        waiters,
+        next_waiter_pool: 1,
+        next_wait_sequence: 1,
       })),
+      identity,
     })
   }
 
@@ -263,8 +336,37 @@ impl ResourceDomain {
   pub fn set_limits(&self, limit: DomainResources) -> Result<(), DomainError> {
     let mut state = lock(&self.state);
     check_ceiling(limit, state.ceiling)?;
+    let cpu_increased = limit.get(DomainResource::Cpu) > state.limit.get(DomainResource::Cpu);
     state.limit = limit;
+    drop(state);
+    if cpu_increased {
+      self.wake_waiters();
+    }
     Ok(())
+  }
+
+  /// Changes one soft-limit component only if its current value still equals
+  /// `expected`. Other components keep concurrent updates. Returns `false`
+  /// without mutation when another controller changed the component first.
+  pub fn compare_exchange_limit(
+    &self,
+    resource: DomainResource,
+    expected: usize,
+    desired: usize,
+  ) -> Result<bool, DomainError> {
+    let mut state = lock(&self.state);
+    if state.limit.get(resource) != expected {
+      return Ok(false);
+    }
+    let next = state.limit.with(resource, desired);
+    check_ceiling(next, state.ceiling)?;
+    state.limit = next;
+    let cpu_increased = resource == DomainResource::Cpu && desired > expected;
+    drop(state);
+    if cpu_increased {
+      self.wake_waiters();
+    }
+    Ok(true)
   }
 
   pub fn snapshot(&self) -> DomainSnapshot {
@@ -274,6 +376,39 @@ impl ResourceDomain {
       limit: state.limit,
       used: state.used,
       live_tenants: state.tenants.iter().filter(|slot| slot.occupied).count(),
+    }
+  }
+
+  fn wake_waiters(&self) {
+    loop {
+      let waker = {
+        let mut state = lock(&self.state);
+        if state.used.get(DomainResource::Cpu) >= state.limit.get(DomainResource::Cpu) {
+          return;
+        }
+        let mut selected = None;
+        let mut sequence = u64::MAX;
+        for (index, waiter) in state.waiters.iter().enumerate() {
+          if !waiter.leased
+            || !waiter.waiting
+            || waiter.waker.is_none()
+            || waiter.sequence >= sequence
+            || !waiter.tenant.is_some_and(|key| can_admit_cpu(&state, key))
+          {
+            continue;
+          }
+          sequence = waiter.sequence;
+          selected = Some(index);
+        }
+        selected.and_then(|index| state.waiters[index].waker.take())
+      };
+      let Some(waker) = waker else {
+        return;
+      };
+      if let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| waker.wake()))
+      {
+        drop_contained(payload);
+      }
     }
   }
 }
@@ -314,6 +449,11 @@ pub struct TenantDomain {
   owner: Arc<TenantOwner>,
 }
 
+/// Process-unique, non-wrapping domain identity. It retains no domain table;
+/// exhausted identity space refuses construction instead of reusing a value.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct DomainIdentity(u64);
+
 impl fmt::Debug for TenantDomain {
   fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
     f.debug_struct("TenantDomain")
@@ -323,6 +463,10 @@ impl fmt::Debug for TenantDomain {
 }
 
 impl TenantDomain {
+  pub(crate) fn domain_identity(&self) -> DomainIdentity {
+    self.owner.domain.identity
+  }
+
   /// Takes the complete vector under one lock or changes neither ledger.
   pub fn try_acquire(&self, request: DomainResources) -> Result<DomainReservation, DomainError> {
     let mut state = lock(&self.owner.domain.state);
@@ -355,8 +499,117 @@ impl TenantDomain {
       return Err(DomainError::Closed);
     }
     check_ceiling(limit, slot.ceiling)?;
+    let cpu_increased = limit.get(DomainResource::Cpu) > slot.limit.get(DomainResource::Cpu);
     slot.limit = limit;
+    drop(state);
+    if cpu_increased {
+      self.owner.domain.wake_waiters();
+    }
     Ok(())
+  }
+
+  /// Changes one tenant soft-limit component only if it still equals
+  /// `expected`, preserving concurrent changes to every other component.
+  pub fn compare_exchange_limit(
+    &self,
+    resource: DomainResource,
+    expected: usize,
+    desired: usize,
+  ) -> Result<bool, DomainError> {
+    let mut state = lock(&self.owner.domain.state);
+    let slot = &mut state.tenants[self.owner.key.index];
+    if !slot.occupied || slot.generation != self.owner.key.generation || slot.closed {
+      return Err(DomainError::Closed);
+    }
+    if slot.limit.get(resource) != expected {
+      return Ok(false);
+    }
+    let next = slot.limit.with(resource, desired);
+    check_ceiling(next, slot.ceiling)?;
+    slot.limit = next;
+    let cpu_increased = resource == DomainResource::Cpu && desired > expected;
+    drop(state);
+    if cpu_increased {
+      self.owner.domain.wake_waiters();
+    }
+    Ok(true)
+  }
+
+  /// Reserves a disjoint share of the domain's fixed CPU-waiter table for a
+  /// runtime. A task, blocking job or borrowed root call must lease one slot
+  /// from this share before it is admitted. The share remains reserved while
+  /// any pool or waiter handle is alive.
+  pub(crate) fn reserve_waiters(&self, count: usize) -> Result<DomainWaitPool, DomainError> {
+    if count == 0 {
+      return Err(DomainError::Invalid);
+    }
+    let mut state = lock(&self.owner.domain.state);
+    let key = self.owner.key;
+    let Some(tenant) = state.tenants.get(key.index) else {
+      return Err(DomainError::Closed);
+    };
+    if !tenant.occupied || tenant.generation != key.generation || tenant.closed {
+      return Err(DomainError::Closed);
+    }
+    if state.ceiling.get(DomainResource::Cpu) == 0 || tenant.ceiling.get(DomainResource::Cpu) == 0 {
+      return Err(DomainError::AboveCeiling(DomainResource::Cpu));
+    }
+    if state.ceiling.get(DomainResource::Tasks) == 0
+      || tenant.ceiling.get(DomainResource::Tasks) == 0
+    {
+      return Err(DomainError::AboveCeiling(DomainResource::Tasks));
+    }
+    let available = state
+      .waiters
+      .iter()
+      .filter(|slot| slot.pool.is_none() && slot.generation < u64::MAX)
+      .count();
+    if available < count {
+      return Err(DomainError::WaitersFull);
+    }
+    let pool_id = state.next_waiter_pool;
+    let Some(next_pool) = pool_id.checked_add(1) else {
+      return Err(DomainError::GenerationExhausted);
+    };
+    state.next_waiter_pool = next_pool;
+    let mut remaining = count;
+    for slot in &mut state.waiters {
+      if slot.pool.is_none() && slot.generation < u64::MAX {
+        slot.pool = Some(pool_id);
+        remaining -= 1;
+        if remaining == 0 {
+          break;
+        }
+      }
+    }
+    drop(state);
+    Ok(DomainWaitPool {
+      inner: Arc::new(DomainWaitPoolInner {
+        domain: self.owner.domain.clone(),
+        id: pool_id,
+      }),
+    })
+  }
+
+  /// Whether this tenant can ever issue one active CPU ticket under its hard
+  /// ceilings. Soft limits may be zero and can be raised later.
+  pub(crate) fn validate_cpu_execution(&self) -> Result<(), DomainError> {
+    let state = lock(&self.owner.domain.state);
+    let key = self.owner.key;
+    let Some(slot) = state.tenants.get(key.index) else {
+      return Err(DomainError::Closed);
+    };
+    if !slot.occupied || slot.generation != key.generation || slot.closed {
+      return Err(DomainError::Closed);
+    }
+    if state.ceiling.get(DomainResource::Cpu) == 0 || slot.ceiling.get(DomainResource::Cpu) == 0 {
+      return Err(DomainError::AboveCeiling(DomainResource::Cpu));
+    }
+    Ok(())
+  }
+
+  pub(crate) fn same_domain(&self, other: &TenantDomain) -> bool {
+    Arc::ptr_eq(&self.owner.domain.state, &other.owner.domain.state)
   }
 
   /// Closes all clones' admission without dropping user reservations.
@@ -376,6 +629,279 @@ impl TenantDomain {
       used: slot.used,
       live_tenants: 1,
     })
+  }
+}
+
+/// A pre-reserved share of a domain's waiter table. Clones share one share;
+/// they cannot reserve the same slots again.
+#[derive(Clone, Debug)]
+pub(crate) struct DomainWaitPool {
+  inner: Arc<DomainWaitPoolInner>,
+}
+
+#[derive(Debug)]
+struct DomainWaitPoolInner {
+  domain: ResourceDomain,
+  id: u64,
+}
+
+impl DomainWaitPool {
+  pub(crate) fn try_lease(&self) -> Result<DomainWaiter, DomainError> {
+    let mut state = lock(&self.inner.domain.state);
+    let Some(index) = state.waiters.iter().position(|slot| {
+      slot.pool == Some(self.inner.id) && !slot.leased && slot.generation < u64::MAX
+    }) else {
+      return Err(
+        if state
+          .waiters
+          .iter()
+          .any(|slot| slot.pool == Some(self.inner.id) && !slot.leased)
+        {
+          DomainError::GenerationExhausted
+        } else {
+          DomainError::WaitersFull
+        },
+      );
+    };
+    let slot = &mut state.waiters[index];
+    slot.generation += 1;
+    slot.leased = true;
+    slot.waiting = false;
+    slot.tenant = None;
+    slot.sequence = 0;
+    debug_assert!(slot.waker.is_none());
+    let generation = slot.generation;
+    drop(state);
+    Ok(DomainWaiter {
+      pool: Arc::clone(&self.inner),
+      index,
+      generation,
+    })
+  }
+}
+
+impl Drop for DomainWaitPoolInner {
+  fn drop(&mut self) {
+    loop {
+      let waker = {
+        let mut state = lock(&self.domain.state);
+        let Some(index) = state
+          .waiters
+          .iter()
+          .position(|slot| slot.pool == Some(self.id))
+        else {
+          return;
+        };
+        let slot = &mut state.waiters[index];
+        debug_assert!(!slot.leased);
+        slot.pool = None;
+        slot.waiting = false;
+        slot.tenant = None;
+        slot.sequence = 0;
+        slot.waker.take()
+      };
+      drop_contained(waker);
+    }
+  }
+}
+
+/// One generation-stamped, bounded CPU admission waiter.
+pub(crate) struct DomainWaiter {
+  pool: Arc<DomainWaitPoolInner>,
+  index: usize,
+  generation: u64,
+}
+
+impl DomainWaiter {
+  /// Admits one CPU unit, or atomically enrolls `waker` until capacity is
+  /// released or a soft limit rises. Waker operations always occur outside
+  /// the domain lock.
+  pub(crate) fn try_acquire_or_register(
+    &self,
+    tenant: &TenantDomain,
+    waker: &Waker,
+  ) -> Result<Option<DomainReservation>, DomainError> {
+    if !Arc::ptr_eq(&self.pool.domain.state, &tenant.owner.domain.state) {
+      return Err(DomainError::Invalid);
+    }
+    let mut replacement = Some(waker.clone());
+    let request = DomainResources::ZERO.with(DomainResource::Cpu, 1);
+    let key = tenant.owner.key;
+    let mut state = lock(&self.pool.domain.state);
+    let Some(tenant_slot) = state.tenants.get(key.index) else {
+      drop(state);
+      drop_contained(replacement);
+      return Err(DomainError::Closed);
+    };
+    let tenant_valid = tenant_slot.occupied && tenant_slot.generation == key.generation;
+    let tenant_cpu_ceiling = tenant_slot.ceiling.get(DomainResource::Cpu);
+    if !tenant_valid {
+      drop(state);
+      drop_contained(replacement);
+      return Err(DomainError::Closed);
+    }
+    if state.ceiling.get(DomainResource::Cpu) == 0 || tenant_cpu_ceiling == 0 {
+      drop(state);
+      drop_contained(replacement);
+      return Err(DomainError::AboveCeiling(DomainResource::Cpu));
+    }
+    let Some(waiter) = state.waiters.get(self.index) else {
+      drop(state);
+      drop_contained(replacement);
+      return Err(DomainError::GenerationExhausted);
+    };
+    if waiter.pool != Some(self.pool.id) || !waiter.leased || waiter.generation != self.generation {
+      drop(state);
+      drop_contained(replacement);
+      return Err(DomainError::GenerationExhausted);
+    }
+    if !waiter.waiting {
+      let Some(next) = state.next_wait_sequence.checked_add(1) else {
+        drop(state);
+        drop_contained(replacement);
+        return Err(DomainError::GenerationExhausted);
+      };
+      let sequence = state.next_wait_sequence;
+      state.next_wait_sequence = next;
+      let waiter = &mut state.waiters[self.index];
+      waiter.waiting = true;
+      waiter.tenant = Some(key);
+      waiter.sequence = sequence;
+    }
+    let sequence = state.waiters[self.index].sequence;
+    let has_earlier_eligible = state.waiters.iter().any(|waiter| {
+      waiter.leased
+        && waiter.waiting
+        && waiter.sequence < sequence
+        && waiter
+          .tenant
+          .is_some_and(|waiter_tenant| can_admit_cpu(&state, waiter_tenant))
+    });
+    let can_acquire = !has_earlier_eligible && can_admit_cpu(&state, key);
+    let mut old_waker = None;
+    if can_acquire {
+      let global = admitted(state.used, request, state.limit)?;
+      let tenant_next = admitted(
+        state.tenants[key.index].used,
+        request,
+        state.tenants[key.index].limit,
+      )?;
+      let reservations = state.tenants[key.index]
+        .reservations
+        .checked_add(1)
+        .ok_or(DomainError::Exhausted(DomainResource::Control))?;
+      state.used = global;
+      let tenant_slot = &mut state.tenants[key.index];
+      tenant_slot.used = tenant_next;
+      tenant_slot.reservations = reservations;
+      let waiter = &mut state.waiters[self.index];
+      waiter.waiting = false;
+      waiter.tenant = None;
+      waiter.sequence = 0;
+      old_waker = waiter.waker.take();
+    } else {
+      let waiter = &mut state.waiters[self.index];
+      if let Some(replacement) = replacement.take() {
+        old_waker = waiter.waker.replace(replacement);
+      }
+    }
+    let ticket = can_acquire.then(|| DomainReservation {
+      domain: self.pool.domain.clone(),
+      key,
+      request,
+    });
+    drop(state);
+    drop_contained(old_waker);
+    drop_contained(replacement);
+    Ok(ticket)
+  }
+
+  /// Removes a pending notification without returning this slot to the pool.
+  pub(crate) fn cancel_wait(&self) {
+    let waker = {
+      let mut state = lock(&self.pool.domain.state);
+      let Some(waiter) = state.waiters.get_mut(self.index) else {
+        return;
+      };
+      if waiter.pool != Some(self.pool.id) || !waiter.leased || waiter.generation != self.generation
+      {
+        return;
+      }
+      waiter.waiting = false;
+      waiter.tenant = None;
+      waiter.sequence = 0;
+      waiter.waker.take()
+    };
+    drop_contained(waker);
+    self.pool.domain.wake_waiters();
+  }
+}
+
+impl Drop for DomainWaiter {
+  fn drop(&mut self) {
+    let waker = {
+      let mut state = lock(&self.pool.domain.state);
+      let Some(waiter) = state.waiters.get_mut(self.index) else {
+        return;
+      };
+      if waiter.pool != Some(self.pool.id) || !waiter.leased || waiter.generation != self.generation
+      {
+        return;
+      }
+      waiter.leased = false;
+      waiter.waiting = false;
+      waiter.tenant = None;
+      waiter.sequence = 0;
+      waiter.waker.take()
+    };
+    drop_contained(waker);
+    self.pool.domain.wake_waiters();
+  }
+}
+
+impl Drop for DomainReservation {
+  fn drop(&mut self) {
+    let cpu_released = self.request.get(DomainResource::Cpu) != 0;
+    {
+      let mut state = lock(&self.domain.state);
+      let slot = &mut state.tenants[self.key.index];
+      debug_assert!(slot.occupied && slot.generation == self.key.generation);
+      subtract(&mut slot.used, self.request);
+      slot.reservations -= 1;
+      if slot.closed && !slot.owner_live && slot.used.empty() && slot.reservations == 0 {
+        slot.occupied = false;
+      }
+      subtract(&mut state.used, self.request);
+    }
+    if cpu_released {
+      self.domain.wake_waiters();
+    }
+  }
+}
+
+fn can_admit_cpu(state: &State, key: Key) -> bool {
+  let Some(tenant) = state.tenants.get(key.index) else {
+    return false;
+  };
+  tenant.occupied
+    && tenant.generation == key.generation
+    && state
+      .used
+      .get(DomainResource::Cpu)
+      .checked_add(1)
+      .is_some_and(|next| next <= state.limit.get(DomainResource::Cpu))
+    && tenant
+      .used
+      .get(DomainResource::Cpu)
+      .checked_add(1)
+      .is_some_and(|next| next <= tenant.limit.get(DomainResource::Cpu))
+}
+
+fn drop_contained<T>(value: T) {
+  if let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(value)))
+    && let Err(second) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(payload)))
+  {
+    std::mem::forget(second);
   }
 }
 
@@ -400,25 +926,18 @@ impl DomainReservation {
   pub fn resources(&self) -> DomainResources {
     self.request
   }
-}
 
-impl Drop for DomainReservation {
-  fn drop(&mut self) {
-    let mut state = lock(&self.domain.state);
-    let slot = &mut state.tenants[self.key.index];
-    debug_assert!(slot.occupied && slot.generation == self.key.generation);
-    subtract(&mut slot.used, self.request);
-    slot.reservations -= 1;
-    if slot.closed && !slot.owner_live && slot.used.empty() && slot.reservations == 0 {
-      slot.occupied = false;
-    }
-    subtract(&mut state.used, self.request);
+  pub(crate) fn domain_identity(&self) -> DomainIdentity {
+    self.domain.identity
   }
 }
 
 #[cfg(all(test, not(loom)))]
 mod tests {
   use super::*;
+  use std::sync::atomic::{AtomicUsize, Ordering};
+  use std::task::Wake;
+
   fn limits(cpu: usize, memory: usize) -> DomainResources {
     DomainResources::ZERO
       .with(DomainResource::Cpu, cpu)
@@ -504,6 +1023,64 @@ mod tests {
   }
 
   #[test]
+  fn component_compare_exchange_preserves_other_limits_and_resumes_waiters() {
+    let ceiling = limits(2, 20);
+    let domain = ResourceDomain::with_waiters(ceiling, 1, 1).unwrap();
+    let tenant = domain.tenant(ceiling).unwrap();
+    let tenant_limits = ceiling
+      .with(DomainResource::Cpu, 0)
+      .with(DomainResource::Disk, 1);
+    tenant.set_limits(tenant_limits).unwrap();
+    let pool = tenant.reserve_waiters(1).unwrap();
+    let waiter = pool.try_lease().unwrap();
+    let wakes = Arc::new(AtomicUsize::new(0));
+    let waker = Waker::from(Arc::new(CountWake(Arc::clone(&wakes))));
+    assert!(
+      waiter
+        .try_acquire_or_register(&tenant, &waker)
+        .unwrap()
+        .is_none()
+    );
+
+    assert!(
+      !tenant
+        .compare_exchange_limit(DomainResource::Disk, 2, 0)
+        .unwrap()
+    );
+    assert!(
+      tenant
+        .compare_exchange_limit(DomainResource::Cpu, 0, 1)
+        .unwrap()
+    );
+    let snapshot = tenant.snapshot().unwrap();
+    assert_eq!(snapshot.limit.get(DomainResource::Cpu), 1);
+    assert_eq!(snapshot.limit.get(DomainResource::Disk), 1);
+    assert_eq!(wakes.load(Ordering::SeqCst), 1);
+    let cpu = waiter
+      .try_acquire_or_register(&tenant, &waker)
+      .unwrap()
+      .unwrap();
+    drop(cpu);
+
+    let before = domain.snapshot().limit;
+    assert!(
+      domain
+        .compare_exchange_limit(DomainResource::Cpu, 2, 1)
+        .unwrap()
+    );
+    assert_eq!(domain.snapshot().limit, before.with(DomainResource::Cpu, 1));
+    assert!(
+      !domain
+        .compare_exchange_limit(DomainResource::Cpu, 2, 0)
+        .unwrap()
+    );
+    assert_eq!(
+      domain.compare_exchange_limit(DomainResource::Cpu, 1, 3),
+      Err(DomainError::AboveCeiling(DomainResource::Cpu))
+    );
+  }
+
+  #[test]
   fn closed_handles_retain_bounded_owner_slots_until_last_clone_drops() {
     let domain = ResourceDomain::new(limits(1, 20), 1).unwrap();
     let old = domain.tenant(limits(1, 20)).unwrap();
@@ -554,11 +1131,321 @@ mod tests {
     drop(zero);
     domain.tenant(limits(2, 20)).unwrap();
   }
+
+  struct CountWake(Arc<AtomicUsize>);
+
+  impl Wake for CountWake {
+    fn wake(self: Arc<Self>) {
+      self.wake_by_ref();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+      self.0.fetch_add(1, Ordering::SeqCst);
+    }
+  }
+
+  struct SnapshotWake {
+    tenant: TenantDomain,
+    wakes: Arc<AtomicUsize>,
+  }
+
+  impl Wake for SnapshotWake {
+    fn wake(self: Arc<Self>) {
+      self.wake_by_ref();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+      assert!(self.tenant.snapshot().is_ok());
+      self.wakes.fetch_add(1, Ordering::SeqCst);
+    }
+  }
+
+  struct PanicDropWake(TenantDomain);
+
+  impl Wake for PanicDropWake {
+    fn wake(self: Arc<Self>) {
+      assert!(self.0.snapshot().is_ok());
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+      assert!(self.0.snapshot().is_ok());
+    }
+  }
+
+  impl Drop for PanicDropWake {
+    fn drop(&mut self) {
+      assert!(self.0.snapshot().is_ok());
+      panic!("injected waker destructor panic");
+    }
+  }
+
+  #[test]
+  fn fixed_waiter_capacity_is_control_charged_and_leased_disjointly() {
+    let ceiling = limits(1, 20).with(DomainResource::Control, 4096);
+    let domain = ResourceDomain::with_waiters(ceiling, 2, 4).unwrap();
+    let tenant = domain.tenant(ceiling).unwrap();
+    let first = tenant.reserve_waiters(3).unwrap();
+    let _waiter = first.try_lease().unwrap();
+    assert_eq!(
+      tenant.reserve_waiters(2).unwrap_err(),
+      DomainError::WaitersFull
+    );
+    let state = lock(&domain.state);
+    let expected = state.tenants.capacity() * std::mem::size_of::<TenantSlot>()
+      + state.waiters.capacity() * std::mem::size_of::<WaiterSlot>();
+    drop(state);
+    assert_eq!(
+      domain.snapshot().used.get(DomainResource::Control),
+      expected
+    );
+
+    let too_small = ceiling.with(DomainResource::Control, expected - 1);
+    assert_eq!(
+      ResourceDomain::with_waiters(too_small, 2, 4).unwrap_err(),
+      DomainError::Exhausted(DomainResource::Control)
+    );
+  }
+
+  #[test]
+  fn cpu_waiters_wake_in_order_and_resume_after_soft_limit_increase() {
+    let ceiling = limits(1, 20);
+    let domain = ResourceDomain::with_waiters(ceiling, 1, 2).unwrap();
+    let tenant = domain.tenant(ceiling).unwrap();
+    let pool = tenant.reserve_waiters(2).unwrap();
+    let first = pool.try_lease().unwrap();
+    let second = pool.try_lease().unwrap();
+    let held = tenant
+      .try_acquire(DomainResources::ZERO.with(DomainResource::Cpu, 1))
+      .unwrap();
+    let first_wakes = Arc::new(AtomicUsize::new(0));
+    let second_wakes = Arc::new(AtomicUsize::new(0));
+    let first_waker = Waker::from(Arc::new(CountWake(Arc::clone(&first_wakes))));
+    let second_waker = Waker::from(Arc::new(CountWake(Arc::clone(&second_wakes))));
+
+    assert!(
+      first
+        .try_acquire_or_register(&tenant, &first_waker)
+        .unwrap()
+        .is_none()
+    );
+    assert!(
+      second
+        .try_acquire_or_register(&tenant, &second_waker)
+        .unwrap()
+        .is_none()
+    );
+    drop(held);
+    assert_eq!(first_wakes.load(Ordering::SeqCst), 1);
+    assert_eq!(second_wakes.load(Ordering::SeqCst), 1);
+
+    let first_cpu = first
+      .try_acquire_or_register(&tenant, &first_waker)
+      .unwrap()
+      .unwrap();
+    assert!(
+      second
+        .try_acquire_or_register(&tenant, &second_waker)
+        .unwrap()
+        .is_none()
+    );
+    drop(first_cpu);
+    assert_eq!(second_wakes.load(Ordering::SeqCst), 2);
+    let second_cpu = second
+      .try_acquire_or_register(&tenant, &second_waker)
+      .unwrap()
+      .unwrap();
+    drop(second_cpu);
+
+    tenant
+      .set_limits(ceiling.with(DomainResource::Cpu, 0))
+      .unwrap();
+    assert!(
+      first
+        .try_acquire_or_register(&tenant, &first_waker)
+        .unwrap()
+        .is_none()
+    );
+    let before = first_wakes.load(Ordering::SeqCst);
+    tenant.set_limits(ceiling).unwrap();
+    assert_eq!(first_wakes.load(Ordering::SeqCst), before + 1);
+    let final_cpu = first
+      .try_acquire_or_register(&tenant, &first_waker)
+      .unwrap()
+      .unwrap();
+    drop(final_cpu);
+  }
+
+  #[test]
+  fn panicking_waker_drop_cannot_leak_cpu_or_strand_the_next_waiter() {
+    let ceiling = limits(1, 20);
+    let domain = ResourceDomain::with_waiters(ceiling, 1, 2).unwrap();
+    let tenant = domain.tenant(ceiling).unwrap();
+    let pool = tenant.reserve_waiters(2).unwrap();
+    let first = pool.try_lease().unwrap();
+    let second = pool.try_lease().unwrap();
+    tenant
+      .set_limits(ceiling.with(DomainResource::Cpu, 0))
+      .unwrap();
+
+    let panic_waker = Waker::from(Arc::new(PanicDropWake(tenant.clone())));
+    let wakes = Arc::new(AtomicUsize::new(0));
+    let next_waker = Waker::from(Arc::new(SnapshotWake {
+      tenant: tenant.clone(),
+      wakes: Arc::clone(&wakes),
+    }));
+    assert!(
+      first
+        .try_acquire_or_register(&tenant, &panic_waker)
+        .unwrap()
+        .is_none()
+    );
+    assert!(
+      second
+        .try_acquire_or_register(&tenant, &next_waker)
+        .unwrap()
+        .is_none()
+    );
+    drop_contained(panic_waker);
+
+    // Stage the soft-limit increase without notifying: the first waiter must
+    // acquire and dispose its retained waker before the next release wakes
+    // the FIFO successor.
+    {
+      let mut state = lock(&domain.state);
+      state.tenants[tenant.owner.key.index].limit = ceiling;
+    }
+    let ticket = first
+      .try_acquire_or_register(&tenant, Waker::noop())
+      .unwrap()
+      .unwrap();
+    assert_eq!(domain.snapshot().used.get(DomainResource::Cpu), 1);
+    drop(ticket);
+    assert_eq!(wakes.load(Ordering::SeqCst), 1);
+    let next = second
+      .try_acquire_or_register(&tenant, &next_waker)
+      .unwrap()
+      .unwrap();
+    drop(next);
+    assert_eq!(domain.snapshot().used.get(DomainResource::Cpu), 0);
+  }
+
+  #[test]
+  fn cancelling_a_waiter_with_a_panicking_waker_still_notifies_the_fifo_successor() {
+    let ceiling = limits(1, 20);
+    let domain = ResourceDomain::with_waiters(ceiling, 1, 2).unwrap();
+    let tenant = domain.tenant(ceiling).unwrap();
+    let pool = tenant.reserve_waiters(2).unwrap();
+    let first = pool.try_lease().unwrap();
+    let second = pool.try_lease().unwrap();
+    tenant
+      .set_limits(ceiling.with(DomainResource::Cpu, 0))
+      .unwrap();
+    let panic_waker = Waker::from(Arc::new(PanicDropWake(tenant.clone())));
+    let wakes = Arc::new(AtomicUsize::new(0));
+    let next_waker = Waker::from(Arc::new(SnapshotWake {
+      tenant: tenant.clone(),
+      wakes: Arc::clone(&wakes),
+    }));
+    assert!(
+      first
+        .try_acquire_or_register(&tenant, &panic_waker)
+        .unwrap()
+        .is_none()
+    );
+    assert!(
+      second
+        .try_acquire_or_register(&tenant, &next_waker)
+        .unwrap()
+        .is_none()
+    );
+    drop_contained(panic_waker);
+    {
+      let mut state = lock(&domain.state);
+      state.tenants[tenant.owner.key.index].limit = ceiling;
+    }
+
+    first.cancel_wait();
+    assert_eq!(wakes.load(Ordering::SeqCst), 1);
+    let ticket = second
+      .try_acquire_or_register(&tenant, &next_waker)
+      .unwrap()
+      .unwrap();
+    drop(ticket);
+    assert_eq!(domain.snapshot().used.get(DomainResource::Cpu), 0);
+  }
+
+  struct ThreadWake(std::thread::Thread);
+
+  impl Wake for ThreadWake {
+    fn wake(self: Arc<Self>) {
+      self.wake_by_ref();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+      self.0.unpark();
+    }
+  }
+
+  #[test]
+  fn native_cpu_admission_races_never_exceed_global_or_tenant_limit() {
+    const THREADS: usize = 6;
+    const ROUNDS: usize = 200;
+    let ceiling = limits(2, 20);
+    let domain = ResourceDomain::with_waiters(ceiling, 1, THREADS).unwrap();
+    let tenant = domain.tenant(ceiling).unwrap();
+    let pool = tenant.reserve_waiters(THREADS).unwrap();
+    let waiters: Vec<_> = (0..THREADS).map(|_| pool.try_lease().unwrap()).collect();
+    let active = Arc::new(AtomicUsize::new(0));
+    std::thread::scope(|scope| {
+      for waiter in waiters {
+        let tenant = tenant.clone();
+        let active = Arc::clone(&active);
+        scope.spawn(move || {
+          let waker = Waker::from(Arc::new(ThreadWake(std::thread::current())));
+          for _ in 0..ROUNDS {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            let cpu = loop {
+              if let Some(cpu) = waiter.try_acquire_or_register(&tenant, &waker).unwrap() {
+                break cpu;
+              }
+              assert!(
+                std::time::Instant::now() < deadline,
+                "CPU waiter was not resumed"
+              );
+              std::thread::park_timeout(std::time::Duration::from_millis(100));
+            };
+            let now = active.fetch_add(1, Ordering::SeqCst) + 1;
+            assert!(now <= 2, "domain over-admitted {now} active CPU tickets");
+            std::thread::yield_now();
+            active.fetch_sub(1, Ordering::SeqCst);
+            drop(cpu);
+          }
+        });
+      }
+    });
+    assert_eq!(domain.snapshot().used.get(DomainResource::Cpu), 0);
+  }
 }
 
 #[cfg(all(test, loom))]
 mod model {
   use super::*;
+  use loom::sync::Arc as LoomArc;
+  use loom::sync::atomic::{AtomicUsize, Ordering};
+  use std::sync::Arc as StdArc;
+  use std::task::Wake;
+
+  struct CountWake(LoomArc<AtomicUsize>);
+
+  impl Wake for CountWake {
+    fn wake(self: StdArc<Self>) {
+      self.wake_by_ref();
+    }
+
+    fn wake_by_ref(self: &StdArc<Self>) {
+      self.0.fetch_add(1, Ordering::SeqCst);
+    }
+  }
   #[test]
   fn loom_global_and_tenant_reservations_never_overadmit() {
     loom::model(|| {
@@ -575,6 +1462,89 @@ mod model {
       assert!(domain.snapshot().used.get(DomainResource::Cpu) <= 1);
       drop(held);
       worker.join().unwrap();
+      assert_eq!(domain.snapshot().used.get(DomainResource::Cpu), 0);
+    });
+  }
+
+  #[test]
+  fn loom_waiter_enrollment_racing_release_is_not_lost() {
+    loom::model(|| {
+      let ceiling = DomainResources::ZERO
+        .with(DomainResource::Cpu, 1)
+        .with(DomainResource::Tasks, 2)
+        .with(DomainResource::Control, 4096);
+      let domain = ResourceDomain::with_waiters(ceiling, 1, 1).unwrap();
+      let tenant = domain.tenant(ceiling).unwrap();
+      let pool = tenant.reserve_waiters(1).unwrap();
+      let waiter = pool.try_lease().unwrap();
+      let held = tenant
+        .try_acquire(DomainResources::ZERO.with(DomainResource::Cpu, 1))
+        .unwrap();
+      let wakes = LoomArc::new(AtomicUsize::new(0));
+      let waker = Waker::from(StdArc::new(CountWake(LoomArc::clone(&wakes))));
+      let register = loom::thread::spawn(move || {
+        let result = waiter.try_acquire_or_register(&tenant, &waker).unwrap();
+        (waiter, tenant, waker, result)
+      });
+      let release = loom::thread::spawn(move || drop(held));
+      release.join().unwrap();
+      let (waiter, tenant, waker, result) = register.join().unwrap();
+      let was_admitted = result.is_some();
+      assert!(was_admitted || wakes.load(Ordering::SeqCst) > 0);
+      drop(result);
+      if !was_admitted {
+        let admitted = waiter
+          .try_acquire_or_register(&tenant, &waker)
+          .unwrap()
+          .unwrap();
+        drop(admitted);
+      }
+      assert_eq!(domain.snapshot().used.get(DomainResource::Cpu), 0);
+    });
+  }
+
+  #[test]
+  fn loom_waiter_cancellation_cannot_wake_a_reused_generation() {
+    loom::model(|| {
+      let ceiling = DomainResources::ZERO
+        .with(DomainResource::Cpu, 1)
+        .with(DomainResource::Tasks, 2)
+        .with(DomainResource::Control, 4096);
+      let domain = ResourceDomain::with_waiters(ceiling, 1, 1).unwrap();
+      let tenant = domain.tenant(ceiling).unwrap();
+      let pool = tenant.reserve_waiters(1).unwrap();
+      let old_waiter = pool.try_lease().unwrap();
+      let held = tenant
+        .try_acquire(DomainResources::ZERO.with(DomainResource::Cpu, 1))
+        .unwrap();
+      let old_wakes = LoomArc::new(AtomicUsize::new(0));
+      let old_waker = Waker::from(StdArc::new(CountWake(LoomArc::clone(&old_wakes))));
+      assert!(
+        old_waiter
+          .try_acquire_or_register(&tenant, &old_waker)
+          .unwrap()
+          .is_none()
+      );
+
+      let cancel = loom::thread::spawn(move || {
+        old_waiter.cancel_wait();
+        old_waiter
+      });
+      let release = loom::thread::spawn(move || drop(held));
+      release.join().unwrap();
+      drop(cancel.join().unwrap());
+      let old_wake_count = old_wakes.load(Ordering::SeqCst);
+      assert!(old_wake_count <= 1);
+
+      let new_waiter = pool.try_lease().unwrap();
+      let new_wakes = LoomArc::new(AtomicUsize::new(0));
+      let new_waker = Waker::from(StdArc::new(CountWake(LoomArc::clone(&new_wakes))));
+      let admitted = new_waiter
+        .try_acquire_or_register(&tenant, &new_waker)
+        .unwrap()
+        .unwrap();
+      drop(admitted);
+      assert_eq!(new_wakes.load(Ordering::SeqCst), 0);
       assert_eq!(domain.snapshot().used.get(DomainResource::Cpu), 0);
     });
   }

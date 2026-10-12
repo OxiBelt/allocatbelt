@@ -15,7 +15,9 @@ use std::thread::{self, Thread};
 
 use super::identity::TaskId;
 use super::{AsyncError, AsyncHandle};
+use crate::runtime::cpu_execution::{CpuExecutionGuard, active_for_domain};
 use crate::runtime::managed::ResourceScope;
+use crate::runtime::resource_domain::DomainReservation;
 
 const DEFAULT_BUDGET: u16 = 64;
 
@@ -493,9 +495,16 @@ pub(super) fn block_on<F: Future>(
   future: F,
 ) -> Result<F::Output, AsyncError> {
   let _block = BlockOnGuard::enter()?;
+  let root_admission = handle
+    .shared
+    .root_admission(handle.scope, handle.resources.as_ref())?;
   let _task_context = TaskContextGuard::enter_with_resource(None, handle.resources.clone());
   let _context = EnterGuard::enter(handle);
-  Ok(block_on_caller_thread(future))
+  block_on_caller_thread_with_domain(
+    future,
+    root_admission.tenant.as_ref(),
+    root_admission.waiter.as_ref(),
+  )
 }
 
 pub(super) struct BlockOnGuard;
@@ -521,19 +530,59 @@ impl Drop for BlockOnGuard {
   }
 }
 
+#[cfg(test)]
 fn block_on_caller_thread<F: Future>(future: F) -> F::Output {
+  block_on_caller_thread_with_domain(future, None, None)
+    .unwrap_or_else(|error| panic!("unbounded block_on failed: {error}"))
+}
+
+fn block_on_caller_thread_with_domain<F: Future>(
+  future: F,
+  tenant: Option<&crate::runtime::resource_domain::TenantDomain>,
+  waiter: Option<&crate::runtime::resource_domain::DomainWaiter>,
+) -> Result<F::Output, AsyncError> {
   let parker = Arc::new(Parker::new(thread::current()));
   let waker = Waker::from(Arc::clone(&parker));
   let mut context = Context::from_waker(&waker);
   let mut future = Box::pin(future);
   loop {
+    let cpu_ticket = match (tenant, waiter) {
+      (Some(tenant), Some(waiter)) => match waiter.try_acquire_or_register(tenant, &waker) {
+        Ok(Some(ticket)) => Some(ticket),
+        Ok(None) => {
+          if active_for_domain(&tenant.domain_identity()) {
+            waiter.cancel_wait();
+            return Err(AsyncError::ResourceDomain(
+              crate::runtime::resource_domain::DomainError::Exhausted(
+                crate::runtime::resource_domain::DomainResource::Cpu,
+              ),
+            ));
+          }
+          parker.park();
+          continue;
+        }
+        Err(error) => return Err(AsyncError::ResourceDomain(error)),
+      },
+      (None, None) => None,
+      _ => {
+        return Err(AsyncError::ResourceDomain(
+          crate::runtime::resource_domain::DomainError::WaitersFull,
+        ));
+      }
+    };
     reset_budget();
     let poll = {
+      let _cpu_execution =
+        CpuExecutionGuard::enter(cpu_ticket.as_ref().map(DomainReservation::domain_identity));
       let _cooperative_poll = CooperativePollGuard::enter();
-      future.as_mut().poll(&mut context)
+      let poll = future.as_mut().poll(&mut context);
+      drop(_cooperative_poll);
+      drop(_cpu_execution);
+      poll
     };
+    drop(cpu_ticket);
     if let Poll::Ready(output) = poll {
-      return output;
+      return Ok(output);
     }
     parker.park();
   }

@@ -23,9 +23,14 @@ use super::entry::{BlockOnGuard, LocalExecutionGuard, TaskContextGuard};
 use super::identity::{self, TaskId};
 use super::join::{AsyncJob, AsyncJoinError, JoinState};
 use super::protocol::{PollFinish, PollProtocol};
-use super::task::drop_contained;
+use super::task::{DomainCpuAdmission, drop_contained};
 use crate::runtime::blocking::Handle as BlockingHandle;
+use crate::runtime::cpu_execution::{CpuExecutionGuard, active_for_domain};
 use crate::runtime::managed::ResourceScope;
+use crate::runtime::resource_domain::{
+  DomainError, DomainReservation, DomainResource, DomainResources, DomainWaitPool, DomainWaiter,
+  TenantDomain,
+};
 use crate::runtime::time::{AutoAdvance, IdleCoordinator, IdleSignal, TimerHandle};
 
 #[cfg(all(test, not(loom)))]
@@ -60,6 +65,8 @@ pub enum LocalError {
   BlockOnRejected,
   /// The process-wide task identifier space is exhausted.
   TaskIdExhausted,
+  /// A bound global/tenant resource could not be admitted.
+  ResourceDomain(DomainError),
 }
 
 impl fmt::Display for LocalError {
@@ -72,6 +79,7 @@ impl fmt::Display for LocalError {
       Self::TooManyScopes => "local scope bound reached",
       Self::BlockOnRejected => "local block_on is nested or called from a worker",
       Self::TaskIdExhausted => "process-wide async task identifiers are exhausted",
+      Self::ResourceDomain(_) => "local resource-domain admission failed",
     })
   }
 }
@@ -564,6 +572,9 @@ impl Wake for LocalTaskWake {
 struct ScopeCell {
   reference: ScopeRef,
   resources: Option<ResourceScope>,
+  tenant: Option<TenantDomain>,
+  task_waiters: Option<DomainWaitPool>,
+  root_waiters: Option<DomainWaitPool>,
   active: Cell<usize>,
   closed: Cell<bool>,
   reclaimed: Cell<bool>,
@@ -571,10 +582,22 @@ struct ScopeCell {
 }
 
 impl ScopeCell {
-  fn new(reference: ScopeRef, resources: Option<ResourceScope>) -> Rc<Self> {
+  fn new(
+    reference: ScopeRef,
+    resources: Option<ResourceScope>,
+    task_waiters: Option<DomainWaitPool>,
+    root_waiters: Option<DomainWaitPool>,
+  ) -> Rc<Self> {
+    let tenant = resources
+      .as_ref()
+      .and_then(ResourceScope::tenant_domain)
+      .cloned();
     Rc::new(Self {
       reference,
       resources,
+      tenant,
+      task_waiters,
+      root_waiters,
       active: Cell::new(0),
       closed: Cell::new(false),
       reclaimed: Cell::new(reference.index == 0),
@@ -627,6 +650,34 @@ struct LocalCore {
 }
 
 impl LocalCore {
+  fn root_admission(&self, scope_ref: ScopeRef) -> Result<LocalRootAdmission, LocalError> {
+    let scope = self.scope_cell(scope_ref).ok_or(LocalError::Closed)?;
+    let Some(tenant) = scope.tenant.clone() else {
+      return Ok(LocalRootAdmission {
+        tenant: None,
+        waiter: None,
+        _task_admission: None,
+      });
+    };
+    tenant
+      .validate_cpu_execution()
+      .map_err(LocalError::ResourceDomain)?;
+    let waiter = scope
+      .root_waiters
+      .as_ref()
+      .ok_or(DomainError::WaitersFull)
+      .and_then(DomainWaitPool::try_lease)
+      .map_err(LocalError::ResourceDomain)?;
+    let task_admission = tenant
+      .try_acquire(DomainResources::ZERO.with(DomainResource::Tasks, 1))
+      .map_err(LocalError::ResourceDomain)?;
+    Ok(LocalRootAdmission {
+      tenant: Some(tenant),
+      waiter: Some(waiter),
+      _task_admission: Some(task_admission),
+    })
+  }
+
   fn check_owner(&self) -> Result<(), LocalError> {
     if thread::current().id() == self.owner {
       Ok(())
@@ -745,9 +796,17 @@ impl LocalCore {
   }
 }
 
+struct LocalRootAdmission {
+  tenant: Option<TenantDomain>,
+  waiter: Option<DomainWaiter>,
+  _task_admission: Option<DomainReservation>,
+}
+
 trait LocalTask {
-  fn poll(&mut self, context: &mut Context<'_>) -> Poll<()>;
+  fn poll(&mut self, context: &mut Context<'_>, cpu_ticket: Option<DomainReservation>) -> Poll<()>;
   fn cancel(&mut self);
+  fn acquire_cpu(&mut self, waker: &Waker) -> DomainCpuAdmission;
+  fn fail_resource(&mut self, error: DomainError);
   fn release_admission(&mut self);
   fn complete_scope(&mut self, core: &LocalCore);
   fn publish(&mut self);
@@ -759,6 +818,9 @@ struct Task<F: Future + 'static> {
   join: Arc<JoinState<F::Output>>,
   id: TaskId,
   admission: Option<AdmissionPermit>,
+  tenant: Option<TenantDomain>,
+  waiter: Option<DomainWaiter>,
+  task_admission: Option<DomainReservation>,
   scope: Rc<ScopeCell>,
   resources: Option<ResourceScope>,
 }
@@ -771,16 +833,20 @@ impl<F: Future + 'static> Task<F> {
 }
 
 impl<F: Future + 'static> LocalTask for Task<F> {
-  fn poll(&mut self, context: &mut Context<'_>) -> Poll<()> {
+  fn poll(&mut self, context: &mut Context<'_>, cpu_ticket: Option<DomainReservation>) -> Poll<()> {
     let _task_context =
       TaskContextGuard::enter_with_resource(Some(self.id), self.resources.clone());
     let Some(mut future) = self.future.take() else {
       return Poll::Ready(());
     };
+    let _cpu_execution =
+      CpuExecutionGuard::enter(cpu_ticket.as_ref().map(DomainReservation::domain_identity));
     let result = {
       let _cooperative_poll = super::entry::CooperativePollGuard::enter();
       panic::catch_unwind(AssertUnwindSafe(|| future.as_mut().poll(context)))
     };
+    drop(_cpu_execution);
+    drop(cpu_ticket);
     match result {
       Ok(Poll::Pending) => {
         self.future = Some(future);
@@ -813,9 +879,43 @@ impl<F: Future + 'static> LocalTask for Task<F> {
       None => Err(AsyncJoinError::Cancelled),
     };
     self.staged = Some(outcome);
+    if let Some(waiter) = &self.waiter {
+      waiter.cancel_wait();
+    }
+  }
+
+  fn acquire_cpu(&mut self, waker: &Waker) -> DomainCpuAdmission {
+    let Some(tenant) = &self.tenant else {
+      return DomainCpuAdmission::Unbounded;
+    };
+    let Some(waiter) = &self.waiter else {
+      return DomainCpuAdmission::Rejected(DomainError::WaitersFull);
+    };
+    match waiter.try_acquire_or_register(tenant, waker) {
+      Ok(Some(ticket)) => DomainCpuAdmission::Acquired(ticket),
+      Ok(None) => DomainCpuAdmission::Waiting,
+      Err(error) => DomainCpuAdmission::Rejected(error),
+    }
+  }
+
+  fn fail_resource(&mut self, error: DomainError) {
+    let _task_context =
+      TaskContextGuard::enter_with_resource(Some(self.id), self.resources.clone());
+    let outcome = match self.drop_future() {
+      Some(payload) => Err(AsyncJoinError::Panicked(payload)),
+      None => Err(AsyncJoinError::ResourceDomain(error)),
+    };
+    self.staged = Some(outcome);
+    if let Some(waiter) = &self.waiter {
+      waiter.cancel_wait();
+    }
   }
 
   fn release_admission(&mut self) {
+    if let Some(waiter) = self.waiter.take() {
+      drop(waiter);
+    }
+    drop(self.task_admission.take());
     drop(self.admission.take());
   }
 
@@ -853,6 +953,9 @@ where
   abort_target: Arc<Mutex<Option<TaskRef>>>,
   admission: AdmissionPermit,
   resources: Option<ResourceScope>,
+  tenant: Option<TenantDomain>,
+  waiter: Option<DomainWaiter>,
+  task_admission: Option<DomainReservation>,
 }
 
 impl<F> ExternalRequest for SendRequest<F>
@@ -869,6 +972,9 @@ where
       abort_target,
       admission,
       resources: _,
+      tenant,
+      waiter,
+      task_admission,
     } = *self;
     let task = Task {
       future: Some(Box::pin(future)),
@@ -876,6 +982,9 @@ where
       join,
       id,
       admission: Some(admission),
+      tenant,
+      waiter,
+      task_admission,
       resources: scope.resources.clone(),
       scope: Rc::clone(&scope),
     };
@@ -896,12 +1005,17 @@ where
       abort_target: _,
       admission,
       resources,
+      tenant: _,
+      waiter,
+      task_admission,
     } = *self;
     let _task_context = TaskContextGuard::enter_with_resource(Some(id), resources);
     let outcome = match panic::catch_unwind(AssertUnwindSafe(|| drop(future))) {
       Ok(()) => Err(AsyncJoinError::Cancelled),
       Err(payload) => Err(AsyncJoinError::Panicked(payload)),
     };
+    drop(waiter);
+    drop(task_admission);
     drop(admission);
     if let Some(unclaimed) = join.publish(outcome) {
       drop_contained(unclaimed);
@@ -917,7 +1031,12 @@ where
       abort_target: _,
       admission,
       resources: _,
+      tenant: _,
+      waiter,
+      task_admission,
     } = *self;
+    drop(waiter);
+    drop(task_admission);
     drop(admission);
     Box::new(future)
   }
@@ -974,6 +1093,21 @@ impl LocalRuntime {
     if config.max_outstanding == 0 || config.max_scopes == 0 {
       return Err(LocalError::InvalidConfig);
     }
+    let (task_waiters, root_waiters) =
+      if let Some(tenant) = resources.as_ref().and_then(ResourceScope::tenant_domain) {
+        tenant
+          .validate_cpu_execution()
+          .map_err(LocalError::ResourceDomain)?;
+        let task_waiters = tenant
+          .reserve_waiters(config.max_outstanding)
+          .map_err(LocalError::ResourceDomain)?;
+        let root_waiters = tenant
+          .reserve_waiters(1)
+          .map_err(LocalError::ResourceDomain)?;
+        (Some(task_waiters), Some(root_waiters))
+      } else {
+        (None, None)
+      };
     let (control, root_scope) = Control::new(config.max_outstanding, config.max_scopes)?;
     let gate = AdmissionGate::new(config.max_outstanding);
     let (sender, receiver) = mpsc::sync_channel(config.max_outstanding);
@@ -987,7 +1121,7 @@ impl LocalRuntime {
       .try_reserve_exact(config.max_scopes)
       .map_err(|_| LocalError::InvalidConfig)?;
     scopes.resize_with(config.max_scopes, || None);
-    let root = ScopeCell::new(root_scope, resources);
+    let root = ScopeCell::new(root_scope, resources, task_waiters, root_waiters);
     scopes[0] = Some(Rc::clone(&root));
     let owner = thread::current();
     let signal = IdleSignal::new(owner.clone());
@@ -1040,15 +1174,15 @@ impl LocalRuntime {
   /// is never inherited.
   #[must_use]
   pub fn send_handle(&self) -> LocalSendHandle {
+    let root = self.core.scope_cell(self.root_scope);
     LocalSendHandle {
       sender: self.sender.clone(),
       gate: Arc::clone(&self.core.gate),
       notifier: Arc::clone(&self.core.notifier),
       control: Arc::clone(&self.core.control),
-      resources: self
-        .core
-        .scope_cell(self.root_scope)
-        .and_then(|scope| scope.resources.clone()),
+      resources: root.as_ref().and_then(|scope| scope.resources.clone()),
+      tenant: root.as_ref().and_then(|scope| scope.tenant.clone()),
+      task_waiters: root.and_then(|scope| scope.task_waiters.clone()),
     }
   }
 
@@ -1069,8 +1203,54 @@ impl LocalRuntime {
 
   fn create_scope(&self, resources: Option<ResourceScope>) -> Result<LocalTaskScope, LocalError> {
     self.core.check_owner()?;
+    let root = self
+      .core
+      .scope_cell(self.root_scope)
+      .ok_or(LocalError::Closed)?;
+    let (resources, task_waiters, root_waiters) = match root.tenant.as_ref() {
+      Some(root_tenant) => {
+        let resources = match resources {
+          Some(resources) => {
+            let Some(tenant) = resources.tenant_domain() else {
+              return Err(LocalError::ResourceDomain(DomainError::Invalid));
+            };
+            if !root_tenant.same_domain(tenant) {
+              return Err(LocalError::ResourceDomain(DomainError::Invalid));
+            }
+            tenant
+              .validate_cpu_execution()
+              .map_err(LocalError::ResourceDomain)?;
+            Some(resources)
+          }
+          None => root.resources.clone(),
+        };
+        (
+          resources,
+          root.task_waiters.clone(),
+          root.root_waiters.clone(),
+        )
+      }
+      None => {
+        let (task_waiters, root_waiters) =
+          if let Some(tenant) = resources.as_ref().and_then(ResourceScope::tenant_domain) {
+            tenant
+              .validate_cpu_execution()
+              .map_err(LocalError::ResourceDomain)?;
+            let task_waiters = tenant
+              .reserve_waiters(self.core.tasks.borrow().len())
+              .map_err(LocalError::ResourceDomain)?;
+            let root_waiters = tenant
+              .reserve_waiters(1)
+              .map_err(LocalError::ResourceDomain)?;
+            (Some(task_waiters), Some(root_waiters))
+          } else {
+            (None, None)
+          };
+        (resources, task_waiters, root_waiters)
+      }
+    };
     let reference = self.core.control.admit_scope()?;
-    let cell = ScopeCell::new(reference, resources);
+    let cell = ScopeCell::new(reference, resources, task_waiters, root_waiters);
     self.core.scopes.borrow_mut()[reference.index] = Some(Rc::clone(&cell));
     Ok(LocalTaskScope {
       handle: LocalHandle {
@@ -1095,6 +1275,7 @@ impl LocalRuntime {
       return Err(LocalError::Closed);
     }
     let _block_on = BlockOnGuard::enter().map_err(|_| LocalError::BlockOnRejected)?;
+    let root_admission = self.core.root_admission(self.root_scope)?;
     let _local_execution = LocalExecutionGuard::enter();
     let root_resources = self
       .core
@@ -1110,13 +1291,41 @@ impl LocalRuntime {
     let mut future = Box::pin(future);
     loop {
       let poll_epoch = self.core.coordinator.epoch();
-      super::entry::reset_budget();
-      let poll = {
-        let _cooperative_poll = super::entry::CooperativePollGuard::enter();
-        future.as_mut().poll(&mut context)
+      let cpu_ticket = match (&root_admission.tenant, &root_admission.waiter) {
+        (Some(tenant), Some(waiter)) => {
+          match waiter
+            .try_acquire_or_register(tenant, &root_waker)
+            .map_err(LocalError::ResourceDomain)?
+          {
+            Some(ticket) => Some(ticket),
+            None if active_for_domain(&tenant.domain_identity()) => {
+              waiter.cancel_wait();
+              return Err(LocalError::ResourceDomain(DomainError::Exhausted(
+                DomainResource::Cpu,
+              )));
+            }
+            None => None,
+          }
+        }
+        (None, None) => None,
+        _ => return Err(LocalError::ResourceDomain(DomainError::WaitersFull)),
       };
-      if let Poll::Ready(output) = poll {
-        return Ok(output);
+      let root_unbounded = root_admission.tenant.is_none();
+      if root_unbounded || cpu_ticket.is_some() {
+        super::entry::reset_budget();
+        let poll = {
+          let _cpu_execution =
+            CpuExecutionGuard::enter(cpu_ticket.as_ref().map(DomainReservation::domain_identity));
+          let _cooperative_poll = super::entry::CooperativePollGuard::enter();
+          let poll = future.as_mut().poll(&mut context);
+          drop(_cooperative_poll);
+          drop(_cpu_execution);
+          poll
+        };
+        drop(cpu_ticket);
+        if let Poll::Ready(output) = poll {
+          return Ok(output);
+        }
       }
       self.import_external();
       if let Some((task_ref, aborting)) = self.core.control.take_ready() {
@@ -1212,7 +1421,15 @@ impl LocalRuntime {
       let mut context = Context::from_waker(&waker);
       super::entry::reset_budget();
       if let Some(task) = task {
-        task.poll(&mut context)
+        match task.acquire_cpu(&waker) {
+          DomainCpuAdmission::Unbounded => task.poll(&mut context, None),
+          DomainCpuAdmission::Acquired(ticket) => task.poll(&mut context, Some(ticket)),
+          DomainCpuAdmission::Waiting => Poll::Pending,
+          DomainCpuAdmission::Rejected(error) => {
+            task.fail_resource(error);
+            Poll::Ready(())
+          }
+        }
       } else {
         Poll::Ready(())
       }
@@ -1427,6 +1644,42 @@ impl LocalHandle {
     let Some(id) = identity::allocate() else {
       return Err(LocalSpawnError::new(LocalError::TaskIdExhausted, future));
     };
+    let (task_admission, waiter) = if let Some(tenant) = &scope.tenant {
+      if let Err(error) = tenant.validate_cpu_execution() {
+        return Err(LocalSpawnError::new(
+          LocalError::ResourceDomain(error),
+          future,
+        ));
+      }
+      let task_admission =
+        match tenant.try_acquire(DomainResources::ZERO.with(DomainResource::Tasks, 1)) {
+          Ok(admission) => admission,
+          Err(error) => {
+            return Err(LocalSpawnError::new(
+              LocalError::ResourceDomain(error),
+              future,
+            ));
+          }
+        };
+      let waiter = match scope
+        .task_waiters
+        .as_ref()
+        .ok_or(DomainError::WaitersFull)
+        .and_then(DomainWaitPool::try_lease)
+      {
+        Ok(waiter) => waiter,
+        Err(error) => {
+          drop(task_admission);
+          return Err(LocalSpawnError::new(
+            LocalError::ResourceDomain(error),
+            future,
+          ));
+        }
+      };
+      (Some(task_admission), Some(waiter))
+    } else {
+      (None, None)
+    };
     let task_ref = match self.core.control.admit(self.scope) {
       Ok(task_ref) => task_ref,
       Err(error) => return Err(LocalSpawnError::new(error, future)),
@@ -1439,6 +1692,9 @@ impl LocalHandle {
       join: Arc::clone(&join),
       id,
       admission: Some(permit),
+      tenant: scope.tenant.clone(),
+      waiter,
+      task_admission,
       resources: scope.resources.clone(),
       scope: Rc::clone(&scope),
     };
@@ -1496,6 +1752,8 @@ pub struct LocalSendHandle {
   notifier: Arc<Notifier>,
   control: Arc<Control>,
   resources: Option<ResourceScope>,
+  tenant: Option<TenantDomain>,
+  task_waiters: Option<DomainWaitPool>,
 }
 
 impl LocalSendHandle {
@@ -1516,6 +1774,48 @@ impl LocalSendHandle {
       drop(admission);
       return Err(LocalSpawnError::new(LocalError::TaskIdExhausted, future));
     };
+    let (task_admission, waiter) = if let Some(tenant) = &self.tenant {
+      if let Err(error) = tenant.validate_cpu_execution() {
+        drop(gate);
+        drop(changed);
+        return Err(LocalSpawnError::new(
+          LocalError::ResourceDomain(error),
+          future,
+        ));
+      }
+      let task_admission =
+        match tenant.try_acquire(DomainResources::ZERO.with(DomainResource::Tasks, 1)) {
+          Ok(admission) => admission,
+          Err(error) => {
+            drop(gate);
+            drop(changed);
+            return Err(LocalSpawnError::new(
+              LocalError::ResourceDomain(error),
+              future,
+            ));
+          }
+        };
+      let waiter = match self
+        .task_waiters
+        .as_ref()
+        .ok_or(DomainError::WaitersFull)
+        .and_then(DomainWaitPool::try_lease)
+      {
+        Ok(waiter) => waiter,
+        Err(error) => {
+          drop(gate);
+          drop(changed);
+          drop(task_admission);
+          return Err(LocalSpawnError::new(
+            LocalError::ResourceDomain(error),
+            future,
+          ));
+        }
+      };
+      (Some(task_admission), Some(waiter))
+    } else {
+      (None, None)
+    };
     let join = JoinState::with_id(id);
     let abort = Arc::new(AtomicBool::new(false));
     let abort_target = Arc::new(Mutex::new(None));
@@ -1527,6 +1827,9 @@ impl LocalSendHandle {
       abort_target: Arc::clone(&abort_target),
       admission,
       resources: self.resources.clone(),
+      tenant: self.tenant.clone(),
+      waiter,
+      task_admission,
     };
     let job_abort = Arc::clone(&abort);
     let job_abort_target = Arc::clone(&abort_target);

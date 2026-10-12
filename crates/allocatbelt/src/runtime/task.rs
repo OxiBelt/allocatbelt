@@ -2,9 +2,13 @@
 
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::Arc;
+use std::task::{Wake, Waker};
+use std::thread::{self, Thread};
 
+use crate::runtime::cpu_execution::CpuExecutionGuard;
 use crate::runtime::error::JoinError;
 use crate::runtime::job::{CancellationToken, Control, Packet};
+use crate::runtime::resource_domain::{DomainError, DomainReservation, DomainWaiter, TenantDomain};
 use crate::runtime::time::AutoAdvanceInhibitGuard;
 
 /// Returns a job's admission. The worker calls it again after the job if
@@ -28,6 +32,10 @@ pub(crate) trait Runnable: Send {
   /// `Drop` contained), then releases the admission, then publishes
   /// `Cancelled`. Called without any scheduler lock.
   fn abandon(self: Box<Self>, release: &mut dyn Release);
+
+  /// Drops a closure that could not acquire resources, then publishes the
+  /// typed admission failure. Called without any scheduler lock.
+  fn fail_resource(self: Box<Self>, release: &mut dyn Release, error: DomainError);
 }
 
 pub(crate) struct Task<F, T> {
@@ -35,6 +43,9 @@ pub(crate) struct Task<F, T> {
   control: Arc<Control>,
   packet: Arc<Packet<T>>,
   auto_advance_inhibit: Option<AutoAdvanceInhibitGuard>,
+  tenant: Option<TenantDomain>,
+  waiter: Option<DomainWaiter>,
+  task_admission: Option<DomainReservation>,
 }
 
 impl<F, T> Task<F, T> {
@@ -43,13 +54,74 @@ impl<F, T> Task<F, T> {
     control: Arc<Control>,
     packet: Arc<Packet<T>>,
     auto_advance_inhibit: Option<AutoAdvanceInhibitGuard>,
+    tenant: Option<TenantDomain>,
+    waiter: Option<DomainWaiter>,
+    task_admission: Option<DomainReservation>,
   ) -> Self {
     Self {
       f,
       control,
       packet,
       auto_advance_inhibit,
+      tenant,
+      waiter,
+      task_admission,
     }
+  }
+
+  fn wait_for_cpu(&self) -> CpuAdmission {
+    let Some(tenant) = &self.tenant else {
+      return CpuAdmission::Unbounded;
+    };
+    let Some(waiter) = &self.waiter else {
+      return CpuAdmission::Rejected(DomainError::WaitersFull);
+    };
+    let current = thread::current();
+    let waker = Waker::from(Arc::new(BlockingThreadWake(current.clone())));
+    loop {
+      if self.control.is_cancelled() {
+        self.control.clear_waiting_thread();
+        waiter.cancel_wait();
+        return CpuAdmission::Cancelled;
+      }
+      self.control.register_waiting_thread(&current);
+      if self.control.is_cancelled() {
+        self.control.clear_waiting_thread();
+        waiter.cancel_wait();
+        return CpuAdmission::Cancelled;
+      }
+      match waiter.try_acquire_or_register(tenant, &waker) {
+        Ok(Some(ticket)) => {
+          self.control.clear_waiting_thread();
+          return CpuAdmission::Acquired(ticket);
+        }
+        Ok(None) => thread::park(),
+        Err(error) => {
+          self.control.clear_waiting_thread();
+          waiter.cancel_wait();
+          return CpuAdmission::Rejected(error);
+        }
+      }
+    }
+  }
+}
+
+enum CpuAdmission {
+  Unbounded,
+  Acquired(DomainReservation),
+  Cancelled,
+  Rejected(DomainError),
+}
+
+struct BlockingThreadWake(Thread);
+
+impl Wake for BlockingThreadWake {
+  fn wake(self: Arc<Self>) {
+    self.0.unpark();
+  }
+
+  fn wake_by_ref(self: &Arc<Self>) {
+    self.0.unpark();
   }
 }
 
@@ -73,16 +145,40 @@ where
   }
 
   fn run(self: Box<Self>, release: &mut dyn Release) {
+    let cpu_ticket = match self.wait_for_cpu() {
+      CpuAdmission::Unbounded => None,
+      CpuAdmission::Acquired(ticket) => Some(ticket),
+      CpuAdmission::Cancelled => {
+        self.abandon(release);
+        return;
+      }
+      CpuAdmission::Rejected(error) => {
+        self.fail_resource(release, error);
+        return;
+      }
+    };
     let Self {
       f,
       control,
       packet,
       auto_advance_inhibit,
+      tenant: _,
+      waiter,
+      task_admission,
     } = *self;
     let _auto_advance_inhibit = auto_advance_inhibit;
     let token = CancellationToken::new(control);
+    let cpu_execution =
+      CpuExecutionGuard::enter(cpu_ticket.as_ref().map(DomainReservation::domain_identity));
     let outcome =
       panic::catch_unwind(AssertUnwindSafe(move || f(token))).map_err(JoinError::Panicked);
+    drop(cpu_execution);
+    drop(cpu_ticket);
+    if let Some(waiter) = waiter {
+      waiter.cancel_wait();
+      drop(waiter);
+    }
+    drop(task_admission);
     release.release();
     if let Some(unclaimed) = packet.publish(outcome) {
       drop_contained(unclaimed);
@@ -95,13 +191,47 @@ where
       control,
       packet,
       auto_advance_inhibit,
+      tenant: _,
+      waiter,
+      task_admission,
     } = *self;
     let _auto_advance_inhibit = auto_advance_inhibit;
     // A shutdown's take: the job may never start, whatever won before.
     let _ = control.start.try_cancel();
     drop_contained(f);
+    if let Some(waiter) = waiter {
+      waiter.cancel_wait();
+      drop(waiter);
+    }
+    drop(task_admission);
     release.release();
     // `Cancelled` holds nothing of the user's, so this drops nothing.
     let _ = packet.publish(Err(JoinError::Cancelled));
+  }
+
+  fn fail_resource(self: Box<Self>, release: &mut dyn Release, error: DomainError) {
+    let Self {
+      f,
+      control: _,
+      packet,
+      auto_advance_inhibit,
+      tenant: _,
+      waiter,
+      task_admission,
+    } = *self;
+    let _auto_advance_inhibit = auto_advance_inhibit;
+    let outcome = match panic::catch_unwind(AssertUnwindSafe(|| drop(f))) {
+      Ok(()) => Err(JoinError::ResourceDomain(error)),
+      Err(payload) => Err(JoinError::Panicked(payload)),
+    };
+    if let Some(waiter) = waiter {
+      waiter.cancel_wait();
+      drop(waiter);
+    }
+    drop(task_admission);
+    release.release();
+    if let Some(unclaimed) = packet.publish(outcome) {
+      drop_contained(unclaimed);
+    }
   }
 }
