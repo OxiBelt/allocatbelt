@@ -25,7 +25,35 @@ use std::time::Duration;
 use super::asynchronous::poll_cooperative_composed;
 use super::byte_rate::{ByteRateError, ByteRateLimit, ByteReservation};
 use super::io::{AsyncRead, AsyncWrite};
+#[cfg(feature = "resource-feedback")]
+use super::resource_feedback_meter::{IoFeedbackMeter, IoFeedbackRegistration};
 use super::time::{ClockMode, Sleep, TimerError, TimerHandle};
+
+#[cfg(feature = "resource-feedback")]
+struct FeedbackMeters {
+  read: IoFeedbackMeter,
+  write: IoFeedbackMeter,
+  _read_registration: IoFeedbackRegistration,
+  _write_registration: IoFeedbackRegistration,
+}
+
+#[cfg(feature = "resource-feedback")]
+impl FeedbackMeters {
+  fn new(read: IoFeedbackMeter, write: IoFeedbackMeter) -> Self {
+    let read_registration = read.register_source();
+    let write_registration = write.register_source();
+    Self {
+      read,
+      write,
+      _read_registration: read_registration,
+      _write_registration: write_registration,
+    }
+  }
+
+  fn meter(&self, is_read: bool) -> &IoFeedbackMeter {
+    if is_read { &self.read } else { &self.write }
+  }
+}
 
 /// A terminal or transient failure specific to a rate-limited stream.
 ///
@@ -153,8 +181,9 @@ impl<T: fmt::Debug> Error for RateIoBuildError<T> {}
 /// Recoverable components from a rate-limited stream.
 ///
 /// `into_adapter` resumes any rate-wait timer exactly where it was. Taking
-/// only the components with `into_inputs` cancels those adapter-owned sleeps;
-/// it does not alter endpoint state or any endpoint-owned I/O waiter.
+/// only the components with `into_inputs` cancels adapter-owned sleeps and
+/// releases optional feedback-meter source registrations; it does not alter
+/// endpoint state or any endpoint-owned I/O waiter.
 pub struct RateIoParts<T> {
   inner: T,
   read_limit: ByteRateLimit,
@@ -163,6 +192,8 @@ pub struct RateIoParts<T> {
   read_wait: Option<Sleep>,
   write_wait: Option<Sleep>,
   failure: Option<RateIoFailure>,
+  #[cfg(feature = "resource-feedback")]
+  feedback: Option<FeedbackMeters>,
 }
 
 impl<T> RateIoParts<T> {
@@ -207,18 +238,21 @@ impl<T> RateIoParts<T> {
       read_wait: self.read_wait,
       write_wait: self.write_wait,
       failure: self.failure,
+      #[cfg(feature = "resource-feedback")]
+      feedback: self.feedback,
     }
   }
 
-  /// Returns the original endpoint, buckets and timer, cancelling only the
-  /// adapter's rate waits.
+  /// Returns the original endpoint, buckets and timer, cancelling adapter
+  /// rate waits and releasing optional feedback-meter registrations.
   #[must_use]
   pub fn into_inputs(self) -> (T, ByteRateLimit, ByteRateLimit, TimerHandle) {
     (self.inner, self.read_limit, self.write_limit, self.timer)
   }
 
   /// Returns only the original endpoint. Endpoint-owned waiters and progress
-  /// remain on it; adapter-owned rate timers are cancelled.
+  /// remain on it; adapter-owned rate timers and meter registrations are
+  /// released.
   #[must_use]
   pub fn into_inner(self) -> T {
     self.inner
@@ -227,12 +261,15 @@ impl<T> RateIoParts<T> {
 
 impl<T: fmt::Debug> fmt::Debug for RateIoParts<T> {
   fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-    f.debug_struct("RateIoParts")
+    let mut debug = f.debug_struct("RateIoParts");
+    debug
       .field("inner", &self.inner)
       .field("read_waiting", &self.read_wait.is_some())
       .field("write_waiting", &self.write_wait.is_some())
-      .field("failure", &self.failure)
-      .finish_non_exhaustive()
+      .field("failure", &self.failure);
+    #[cfg(feature = "resource-feedback")]
+    debug.field("feedback_enabled", &self.feedback.is_some());
+    debug.finish_non_exhaustive()
   }
 }
 
@@ -251,6 +288,8 @@ pub struct RateLimitedIo<T> {
   read_wait: Option<Sleep>,
   write_wait: Option<Sleep>,
   failure: Option<RateIoFailure>,
+  #[cfg(feature = "resource-feedback")]
+  feedback: Option<FeedbackMeters>,
 }
 
 impl<T> RateLimitedIo<T> {
@@ -282,6 +321,8 @@ impl<T> RateLimitedIo<T> {
       read_wait: None,
       write_wait: None,
       failure: None,
+      #[cfg(feature = "resource-feedback")]
+      feedback: None,
     })
   }
 
@@ -309,7 +350,30 @@ impl<T> RateLimitedIo<T> {
     self.failure
   }
 
-  /// Recovers all components and keeps any registered rate-wait timers alive.
+  /// Attaches separate read- and write-direction application-byte meters.
+  /// Meter snapshots are usable while this adapter owns each direction's
+  /// bounded source registration. Cloned meters may be shared by adapters.
+  /// Updates count only validated successful completions after reservation
+  /// commit.
+  #[cfg(feature = "resource-feedback")]
+  #[must_use]
+  pub fn with_feedback_meters(mut self, read: IoFeedbackMeter, write: IoFeedbackMeter) -> Self {
+    let feedback = FeedbackMeters::new(read, write);
+    match self.failure {
+      Some(RateIoFailure::InvalidReadCount { .. }) => feedback.read.mark_invalid_io(),
+      Some(RateIoFailure::InvalidWriteCount { .. }) => feedback.write.mark_invalid_io(),
+      Some(RateIoFailure::ReservationCommit) => {
+        feedback.read.mark_invalid_io();
+        feedback.write.mark_invalid_io();
+      }
+      _ => {}
+    }
+    self.feedback = Some(feedback);
+    self
+  }
+
+  /// Recovers all components and keeps rate waits and optional meter
+  /// registrations alive.
   #[must_use]
   pub fn into_parts(self) -> RateIoParts<T> {
     RateIoParts {
@@ -320,11 +384,13 @@ impl<T> RateLimitedIo<T> {
       read_wait: self.read_wait,
       write_wait: self.write_wait,
       failure: self.failure,
+      #[cfg(feature = "resource-feedback")]
+      feedback: self.feedback,
     }
   }
 
   /// Recovers only the endpoint. Its state and endpoint-owned I/O waiter are
-  /// untouched; adapter-owned rate waits are cancelled.
+  /// untouched; adapter-owned rate waits and meter registrations are released.
   #[must_use]
   pub fn into_inner(self) -> T {
     self.inner
@@ -394,7 +460,10 @@ impl<T> RateLimitedIo<T> {
     reservation: ByteReservation,
     used: usize,
     offered: usize,
+    is_read: bool,
   ) -> Option<io::Error> {
+    #[cfg(not(feature = "resource-feedback"))]
+    let _ = is_read;
     match reservation.commit(used) {
       Ok(()) => None,
       Err((_failure, reservation)) => {
@@ -406,8 +475,30 @@ impl<T> RateLimitedIo<T> {
           Err((_failure, reservation)) => drop(reservation),
         }
         self.latch(RateIoFailure::ReservationCommit);
+        #[cfg(feature = "resource-feedback")]
+        self.invalidate_feedback(is_read);
         Some(RateIoFailure::ReservationCommit.into_io_error())
       }
+    }
+  }
+
+  #[cfg(feature = "resource-feedback")]
+  fn record_feedback(&self, is_read: bool, bytes: usize) {
+    if bytes == 0 {
+      return;
+    }
+    if let Some(feedback) = &self.feedback {
+      match u64::try_from(bytes) {
+        Ok(bytes) => feedback.meter(is_read).record_completion(bytes),
+        Err(_) => feedback.meter(is_read).mark_invalid_io(),
+      }
+    }
+  }
+
+  #[cfg(feature = "resource-feedback")]
+  fn invalidate_feedback(&self, is_read: bool) {
+    if let Some(feedback) = &self.feedback {
+      feedback.meter(is_read).mark_invalid_io();
     }
   }
 }
@@ -454,13 +545,21 @@ impl<T: AsyncRead + Unpin> AsyncRead for RateLimitedIo<T> {
             Err((_failure, reservation)) => drop(reservation),
           }
           let failure = RateIoFailure::InvalidReadCount { reported, offered };
+          #[cfg(feature = "resource-feedback")]
+          this.invalidate_feedback(true);
           this.latch(failure);
           Poll::Ready(Err(failure.into_io_error()))
         }
-        Poll::Ready(Ok(reported)) => match this.commit_or_fault(reservation, reported, offered) {
-          Some(error) => Poll::Ready(Err(error)),
-          None => Poll::Ready(Ok(reported)),
-        },
+        Poll::Ready(Ok(reported)) => {
+          match this.commit_or_fault(reservation, reported, offered, true) {
+            Some(error) => Poll::Ready(Err(error)),
+            None => {
+              #[cfg(feature = "resource-feedback")]
+              this.record_feedback(true, reported);
+              Poll::Ready(Ok(reported))
+            }
+          }
+        }
       }
     })
   }
@@ -520,13 +619,21 @@ impl<T: AsyncWrite + Unpin> AsyncWrite for RateLimitedIo<T> {
             Err((_failure, reservation)) => drop(reservation),
           }
           let failure = RateIoFailure::InvalidWriteCount { reported, offered };
+          #[cfg(feature = "resource-feedback")]
+          this.invalidate_feedback(false);
           this.latch(failure);
           Poll::Ready(Err(failure.into_io_error()))
         }
-        Poll::Ready(Ok(reported)) => match this.commit_or_fault(reservation, reported, offered) {
-          Some(error) => Poll::Ready(Err(error)),
-          None => Poll::Ready(Ok(reported)),
-        },
+        Poll::Ready(Ok(reported)) => {
+          match this.commit_or_fault(reservation, reported, offered, false) {
+            Some(error) => Poll::Ready(Err(error)),
+            None => {
+              #[cfg(feature = "resource-feedback")]
+              this.record_feedback(false, reported);
+              Poll::Ready(Ok(reported))
+            }
+          }
+        }
       }
     })
   }

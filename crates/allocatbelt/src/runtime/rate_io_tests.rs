@@ -568,3 +568,120 @@ fn rate_limited_tcp_stream_transfers_a_real_loopback_exchange() {
   drop(address_listener);
   reactor.shutdown().expect("reactor shutdown");
 }
+
+#[cfg(feature = "resource-feedback")]
+#[test]
+fn meters_count_only_committed_nonempty_successes_and_follow_component_recovery() {
+  use crate::runtime::resource_feedback_meter::IoFeedbackMeter;
+
+  let (_driver, timer) = timer(4);
+  let read_meter = IoFeedbackMeter::new();
+  let write_meter = IoFeedbackMeter::new();
+  let inner = ScriptIo::new(
+    [Action::Count(2), Action::Pending],
+    [
+      Action::Count(2),
+      Action::Pending,
+      Action::Error(ErrorKind::PermissionDenied),
+    ],
+  );
+  let mut stream = RateLimitedIo::new(inner, bucket(1, 8, 1), bucket(1, 8, 1), timer)
+    .expect("real-clock adapter")
+    .with_feedback_meters(read_meter.clone(), write_meter.clone());
+  let mut cx = context();
+
+  assert_eq!(read_meter.snapshot().attached_sources, 1);
+  assert_eq!(write_meter.snapshot().attached_sources, 1);
+  let mut output = [0; 4];
+  assert!(matches!(
+    Pin::new(&mut stream).poll_read(&mut cx, &mut output),
+    Poll::Ready(Ok(2))
+  ));
+  assert!(
+    Pin::new(&mut stream)
+      .poll_read(&mut cx, &mut output)
+      .is_pending()
+  );
+  assert_eq!(read_meter.snapshot().committed_bytes, 2);
+  assert_eq!(read_meter.snapshot().completions, 1);
+
+  {
+    let mut write_all = stream.write_all(b"data");
+    assert!(Pin::new(&mut write_all).poll(&mut cx).is_pending());
+  }
+  assert_eq!(write_meter.snapshot().committed_bytes, 2);
+  assert_eq!(write_meter.snapshot().completions, 1);
+  let error = match Pin::new(&mut stream).poll_write(&mut cx, b"data") {
+    Poll::Ready(Err(error)) => error,
+    other => panic!("expected endpoint error, got {other:?}"),
+  };
+  assert_eq!(error.kind(), ErrorKind::PermissionDenied);
+  assert_eq!(write_meter.snapshot().committed_bytes, 2);
+  assert_eq!(write_meter.snapshot().completions, 1);
+
+  let parts = stream.into_parts();
+  assert_eq!(read_meter.snapshot().attached_sources, 1);
+  assert_eq!(write_meter.snapshot().attached_sources, 1);
+  let recovered = parts.into_adapter();
+  drop(recovered.into_inner());
+  assert_eq!(read_meter.snapshot().attached_sources, 0);
+  assert_eq!(write_meter.snapshot().attached_sources, 0);
+}
+
+#[cfg(feature = "resource-feedback")]
+#[test]
+fn meters_share_counts_across_wrappers_and_invalidate_on_bad_counts() {
+  use crate::runtime::resource_feedback_meter::IoFeedbackMeter;
+
+  let (_driver, timer) = timer(4);
+  let shared = IoFeedbackMeter::new();
+  let read_first = IoFeedbackMeter::new();
+  let read_second = IoFeedbackMeter::new();
+  let mut first = RateLimitedIo::new(
+    ScriptIo::new([], [Action::Count(1)]),
+    bucket(1, 2, 1),
+    bucket(1, 2, 1),
+    timer.clone(),
+  )
+  .expect("real-clock adapter")
+  .with_feedback_meters(read_first, shared.clone());
+  let mut second = RateLimitedIo::new(
+    ScriptIo::new([], [Action::Count(1)]),
+    bucket(1, 2, 1),
+    bucket(1, 2, 1),
+    timer.clone(),
+  )
+  .expect("real-clock adapter")
+  .with_feedback_meters(read_second, shared.clone());
+  assert_eq!(shared.snapshot().attached_sources, 2);
+  let mut cx = context();
+  assert!(matches!(
+    Pin::new(&mut first).poll_write(&mut cx, b"a"),
+    Poll::Ready(Ok(1))
+  ));
+  assert!(matches!(
+    Pin::new(&mut second).poll_write(&mut cx, b"b"),
+    Poll::Ready(Ok(1))
+  ));
+  assert_eq!(shared.snapshot().committed_bytes, 2);
+  assert_eq!(shared.snapshot().completions, 2);
+
+  let bad_write_meter = IoFeedbackMeter::new();
+  let mut bad = RateLimitedIo::new(
+    ScriptIo::new([], [Action::Count(4)]),
+    bucket(1, 1, 1),
+    bucket(1, 3, 1),
+    timer.clone(),
+  )
+  .expect("real-clock adapter")
+  .with_feedback_meters(IoFeedbackMeter::new(), bad_write_meter.clone());
+  let error = match Pin::new(&mut bad).poll_write(&mut cx, b"large") {
+    Poll::Ready(Err(error)) => error,
+    other => panic!("expected invalid endpoint count, got {other:?}"),
+  };
+  assert_eq!(error.kind(), ErrorKind::InvalidData);
+  let invalid = bad_write_meter.snapshot();
+  assert_eq!(invalid.committed_bytes, 0);
+  assert_eq!(invalid.completions, 0);
+  assert!(invalid.diagnostics.invalid_io);
+}

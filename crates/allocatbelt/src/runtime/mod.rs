@@ -128,6 +128,8 @@ mod resource_domain_runtime_tests;
 pub mod resource_feedback;
 #[cfg(all(feature = "resource-feedback", not(loom)))]
 pub mod resource_feedback_actuator;
+#[cfg(all(feature = "resource-feedback", not(loom)))]
+pub mod resource_feedback_meter;
 #[cfg(not(loom))]
 pub mod resource_feedback_policy;
 #[cfg(all(feature = "resource-feedback", not(loom)))]
