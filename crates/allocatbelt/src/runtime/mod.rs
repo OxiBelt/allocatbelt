@@ -115,6 +115,8 @@ pub mod process;
 #[path = "process/completion.rs"]
 mod process_completion;
 #[cfg(not(loom))]
+pub mod rate_datagram;
+#[cfg(not(loom))]
 pub mod rate_io;
 #[cfg(not(loom))]
 pub mod reactor;
