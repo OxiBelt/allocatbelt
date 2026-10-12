@@ -1671,3 +1671,28 @@ Linux System scope and good-standing conditions for 2.0 coverage (sections
 1.1–1.2.1). This project makes no membership or coverage claim. Counsel should
 verify the agreement and [Linux System definition](https://openinventionnetwork.com/linux-system/)
 before relying on it. Sources consulted 2026-10-04; no agreement was submitted.
+
+## Application-byte admission
+
+`runtime::byte_rate::ByteRateLimit` provides a finite real-clock bucket for
+application-byte admission. Construct it with a nonzero replenishment rate,
+burst and maximum retained reservations. `try_reserve` removes tokens before
+I/O; a retained `ByteReservation` owns the bucket until `commit` settles actual
+progress. Committing refunds the unused suffix; dropping before I/O refunds
+the whole reservation. After a successful syscall, commit its byte count before
+dropping the owner or returning to a cancellation point. Detached operations
+must retain this owner until their actual completion. The bucket cannot infer
+I/O that its caller performed.
+
+Oversized datagrams are refused rather than split. Zero-byte reservations consume
+no reservation entry. Reconfiguration stays within construction-time ceilings,
+accounts elapsed time at the old rate and never creates tokens merely because
+a burst ceiling rises. Fractional replenishment survives short real intervals;
+full-bucket clamping discards accumulated surplus. Shared clones observe the
+same reservation count and byte balance.
+
+These buckets account application-byte admission, not physical disk traffic,
+wire bandwidth or operation-slot permits. Owning-facade bucket getters permit
+explicit use; network and filesystem enforcement adapters require their own
+integration and acceptance. A bucket configured on a builder alone does not
+automatically intercept lower-level I/O.
