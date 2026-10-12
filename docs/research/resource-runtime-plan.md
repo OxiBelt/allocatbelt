@@ -3,11 +3,15 @@
 Implementation target: one published `allocatbelt` package, allocator-only
 defaults preserved, optional runtime modules, and no Tokio dependency anywhere
 in the published normal/build dependency graph. Development comparators may
-depend on Tokio. Work takes place on `feat/resource-runtime-foundation`.
+depend on Tokio. Implementation remains on `feat/resource-runtime-foundation` until qualification
+passes. Integrate its complete history (including `research/rust-allocator`)
+into `main` with a signed normal merge commit; release publication is separate.
 
 The compatibility baseline is Tokio 1.53.1's stable Linux capabilities. This
 requires explicit application ports rather than claiming binary or exact API
-compatibility. Declarative macros and functions replace procedural entry
+compatibility. Stable behavior includes current-thread paused-clock automatic
+advance, pause/resume, randomized selection with refutable patterns, rotating
+joins, stable runtime metrics and thread lifecycle configuration. Declarative macros and functions replace procedural entry
 macros. Bounded submission and channel capacities require applications to
 handle rejection and retain ownership. Owned task scopes accept `'static`
 futures; scoped borrowing is outside this contract.
@@ -163,3 +167,67 @@ The [runtime contract](../runtime.md) documents accepted implementation. The
 [foundation report](runtime-foundation.md) contains earlier measurements, whose
 limitations remain in force. This roadmap records acceptance requirements,
 not completed qualification results.
+
+## Restored full-goal implementation (2026-10-12)
+
+The earlier CI-only goal is complete. The owner has restored the full goal and
+selected broader stable Linux behavior, a unified owning runtime builder and
+opt-in autonomous CPU, disk and network feedback. These additions are planned
+requirements, not qualified implementation claims.
+
+The additive `runtime::driver` facade must preserve the existing blocking
+`runtime::Runtime` and lower-level constructors. Its typed current-thread and
+multithread builders own selected drivers, bind roots and children to a shared
+global/tenant resource domain, roll back failed startup, and retain unfinished
+work through finite shutdown. Current-thread cleanup remains thread-affine.
+
+Paused automatic time advances only under a race-safe current-thread idle
+transition; associated blocking work inhibits it. Feedback, bandwidth refill
+and shutdown deadlines use real monotonic time. Public readiness, child-wait
+and signal-receive operations share the cooperative budget without double
+charging their concrete I/O adapters.
+
+Resource controls include active polls and blocking execution, managed memory,
+completion-held operation permits and directional application-byte buckets.
+Reserve before I/O, refund unused bytes, retain committed-byte charges through
+cancellation, and recover oversized datagrams without splitting them. These
+controls do not turn arbitrary application allocations into managed storage or
+application bytes into measured physical traffic.
+
+Autonomous feedback is off by default and separate from caller-driven cgroup
+quota adaptation. Sample every 100 ms, require three sustained breaches, reduce
+affected concurrency/rates by at most 10% with a one-second cooldown, and recover
+concurrency by at most one slot per second and rates by at most 1% of their
+configured ceiling per second. Floors, ceilings and hysteresis are explicit;
+missing, sparse or stale required telemetry freezes that control.
+
+Qualification must rebuild and record the new amd64-v3 package/library baseline
+on bare metal and both KVM guests. Analyze venues independently. All realistic
+profiles (steady, mixed, burst and oversubscribed) bear the original numeric
+gates; deliberate overload is safety-only. Fixed-policy allocator/executor
+comparisons precede pressure comparisons with the same external feedback policy
+for allocatbelt and Tokio.
+
+Measure throughput in separate backlogged capacity lanes and p99 in independent
+70%/90% scheduled-arrival lanes. Standalone gate runs need at least 100,000
+successful observations; evenly mixed CPU/memory/HTTP/disk runs need 400,000.
+Record per-ID timestamps, terminal states and checksums; report production CPU
+per completion separately from whole-process costs. Use the fixed post-drain
+100 ms RSS observation for the retained-memory guard. Burst arrivals use one-
+second cycles with a 250 ms pulse and 750 ms idle interval, calibrated through
+burst-specific pilots. Oversubscribed cells use matched two-worker execution.
+
+Preregister the complete family before independent 36-pair confirmation, after
+six exploratory pairs and A/A controls. Use equal weights by workload family
+and profile and 95% simultaneous paired hierarchical-bootstrap intervals, with
+contiguous 1,000-arrival blocks, 50,000 draws and a frozen seed. Preserve failed
+and interrupted processes without replacement. Source or environment changes
+require new controls and a fresh confirmation campaign.
+
+The final mixed-load soak is **three hours on each of the three hosts**,
+superseding the earlier 24-hour requirement. Require valid outputs, bounded
+usage, no unexplained process failures, zero final managed charges and no
+sustained RSS growth; final-hour median RSS must remain within 5% of the first
+post-warmup hour. A failed performance gate keeps the full goal unfinished and
+prevents integration. Actual tagging, releases and crates.io upload are outside
+this task.
