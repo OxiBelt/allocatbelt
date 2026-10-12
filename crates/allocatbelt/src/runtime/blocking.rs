@@ -14,6 +14,7 @@ use crate::runtime::resource_domain::{ControlCharge, DomainError, payload_bytes}
 use crate::runtime::resources::Resources;
 use crate::runtime::scheduler::{ClosedQueue, Shared, Snapshot, domain_build_error};
 use crate::runtime::task::drop_contained;
+use crate::runtime::thread_completion::{DeferredJoin, MonitorSpawnError};
 use crate::runtime::time::TimerHandle;
 use crate::runtime::worker;
 
@@ -59,7 +60,7 @@ pub enum ShutdownMode {
 /// for them.
 pub struct Runtime {
   shared: Arc<Shared>,
-  workers: Vec<JoinHandle<()>>,
+  workers: Vec<DeferredJoin>,
   panic_payloads: Mutex<Vec<Box<dyn Any + Send>>>,
   shutdown_pending: Mutex<ClosedQueue>,
   shutdown_requested: bool,
@@ -93,10 +94,12 @@ fn abandon_closed_queue(shared: &Shared, pending: ClosedQueue) {
   drop(control);
 }
 
-fn stop_started_workers(shared: &Shared, workers: &mut Vec<JoinHandle<()>>) {
+fn stop_started_workers(shared: &Shared, workers: &mut Vec<DeferredJoin>) {
   abandon_closed_queue(shared, shared.close(true));
-  while let Some(worker) = workers.pop() {
-    let _ = worker.join();
+  while let Some(mut worker) = workers.pop() {
+    if let Err(payload) = worker.join_blocking() {
+      drop_contained(payload);
+    }
   }
 }
 
@@ -168,7 +171,7 @@ impl Runtime {
       .len()
       .checked_add(std::mem::size_of::<usize>() * 3)
       .ok_or_else(|| control_build_error(DomainError::Invalid, bound))?;
-    let worker_bytes = payload_bytes::<JoinHandle<()>>(config.workers)
+    let worker_bytes = payload_bytes::<DeferredJoin>(config.workers)
       .map_err(|error| control_build_error(error, bound))?;
     let panic_bytes = payload_bytes::<Box<dyn Any + Send>>(config.workers)
       .map_err(|error| control_build_error(error, bound))?;
@@ -217,7 +220,7 @@ impl Runtime {
       .map_err(|_| io::Error::from(io::ErrorKind::OutOfMemory))?;
     let actual_persistent_bytes = std::mem::size_of::<Runtime>()
       .checked_add(
-        payload_bytes::<JoinHandle<()>>(workers.capacity())
+        payload_bytes::<DeferredJoin>(workers.capacity())
           .map_err(|error| control_build_error(error, bound))?,
       )
       .and_then(|bytes| {
@@ -260,7 +263,7 @@ impl Runtime {
         }),
       );
       match spawned {
-        Ok(handle) => workers.push(handle),
+        Ok(handle) => workers.push(DeferredJoin::new(handle)),
         Err(error) => {
           stop_started_workers(&shared, &mut workers);
           return Err(error);
@@ -345,7 +348,9 @@ impl Runtime {
       }
       return Ok(());
     }
-    if worker::is_worker_of(self.shared.ident.id) {
+    if worker::is_worker_of(self.shared.ident.id)
+      || self.workers.iter().any(DeferredJoin::is_current_thread)
+    {
       return Err(io::Error::new(
         io::ErrorKind::Deadlock,
         "shutdown called from one of the runtime's own workers",
@@ -357,8 +362,8 @@ impl Runtime {
     );
     abandon_closed_queue(&self.shared, self.take_shutdown_pending());
     let mut panicked = false;
-    while let Some(handle) = self.workers.pop() {
-      if let Err(payload) = handle.join() {
+    while let Some(mut handle) = self.workers.pop() {
+      if let Err(payload) = handle.join_blocking() {
         panicked = true;
         self.lock_panic_payloads().push(payload);
       }
@@ -442,16 +447,30 @@ impl Runtime {
         "shutdown has not been requested",
       ));
     }
-    if !self.lock_shutdown_pending().is_empty()
-      || self.workers.iter().any(|worker| !worker.is_finished())
-    {
+    if !self.lock_shutdown_pending().is_empty() {
       return Ok(false);
     }
-    while let Some(worker) = self.workers.pop() {
-      if let Err(payload) = worker.join() {
+
+    let mut index = 0;
+    while index < self.workers.len() {
+      let result = self.workers[index]
+        .try_join()
+        .map_err(monitor_spawn_io_error)?;
+      let Some(result) = result else {
+        index += 1;
+        continue;
+      };
+
+      // DeferredJoin is one-shot. Remove completed owners before returning so
+      // a later poll cannot start a monitor after its result was consumed.
+      drop(self.workers.swap_remove(index));
+      if let Err(payload) = result {
         self.shutdown_panicked = true;
         self.lock_panic_payloads().push(payload);
       }
+    }
+    if !self.workers.is_empty() {
+      return Ok(false);
     }
     drop(self.launch_control.take());
     drop(self.take_shutdown_pending());
@@ -494,6 +513,10 @@ impl Runtime {
       .lock()
       .unwrap_or_else(PoisonError::into_inner)
   }
+}
+
+fn monitor_spawn_io_error(error: MonitorSpawnError) -> io::Error {
+  io::Error::new(io::ErrorKind::WouldBlock, error)
 }
 
 impl Handle {
@@ -574,6 +597,45 @@ mod tests {
     }
   }
 
+  struct TlsGate {
+    entered: mpsc::SyncSender<()>,
+    release: mpsc::Receiver<()>,
+  }
+
+  impl TlsGate {
+    fn wait(self) {
+      let _ = self.entered.send(());
+      let _ = self.release.recv_timeout(Duration::from_secs(4));
+    }
+  }
+
+  struct WaitOnDrop(std::cell::RefCell<Option<TlsGate>>);
+
+  impl Drop for WaitOnDrop {
+    fn drop(&mut self) {
+      if let Some(gate) = self.0.get_mut().take() {
+        gate.wait();
+      }
+    }
+  }
+
+  thread_local! {
+    static NESTED_TLS: WaitOnDrop = const { WaitOnDrop(std::cell::RefCell::new(None)) };
+    static OUTER_TLS: OuterTls = const { OuterTls(std::cell::RefCell::new(None)) };
+  }
+
+  struct OuterTls(std::cell::RefCell<Option<TlsGate>>);
+
+  impl Drop for OuterTls {
+    fn drop(&mut self) {
+      if let Some(gate) = self.0.get_mut().take() {
+        NESTED_TLS.with(|slot| {
+          *slot.0.borrow_mut() = Some(gate);
+        });
+      }
+    }
+  }
+
   #[test]
   fn drop_contains_payload_destructor_panic_and_continues_cleanup() {
     let (cleanup_tx, cleanup_rx) = mpsc::sync_channel(1);
@@ -625,6 +687,86 @@ mod tests {
     cleanup_rx
       .recv_timeout(Duration::from_secs(2))
       .unwrap_or_else(|error| panic!("remaining payload cleanup did not run: {error}"));
+  }
+
+  #[test]
+  fn runtime_control_fee_uses_deferred_join_capacity() {
+    let mut runtime = Runtime::new(Config {
+      workers: 2,
+      max_outstanding: 2,
+      capacity: Resources::ZERO,
+    })
+    .unwrap_or_else(|error| panic!("blocking runtime setup failed: {error}"));
+    let panic_capacity = runtime
+      .panic_payloads
+      .lock()
+      .unwrap_or_else(PoisonError::into_inner)
+      .capacity();
+    let expected = std::mem::size_of::<Runtime>()
+      + payload_bytes::<DeferredJoin>(runtime.workers.capacity())
+        .unwrap_or_else(|error| panic!("worker payload size failed: {error}"))
+      + payload_bytes::<Box<dyn Any + Send>>(panic_capacity)
+        .unwrap_or_else(|error| panic!("panic payload size failed: {error}"));
+    assert_eq!(runtime._control.bytes(), expected);
+    runtime
+      .shutdown(ShutdownMode::Drain)
+      .unwrap_or_else(|error| panic!("blocking shutdown failed: {error}"));
+  }
+
+  #[test]
+  fn polling_waits_for_nested_tls_worker_completion_and_removes_slot_once() {
+    let mut runtime = Runtime::new(Config {
+      workers: 1,
+      max_outstanding: 2,
+      capacity: Resources::ZERO,
+    })
+    .unwrap_or_else(|error| panic!("blocking runtime setup failed: {error}"));
+    let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+    let (release_tx, release_rx) = mpsc::channel();
+    let job = runtime
+      .try_spawn(Resources::ZERO, move |_| {
+        OUTER_TLS.with(|slot| {
+          *slot.0.borrow_mut() = Some(TlsGate {
+            entered: entered_tx,
+            release: release_rx,
+          });
+        });
+      })
+      .unwrap_or_else(|error| panic!("blocking task admission failed: {}", error.kind));
+    job
+      .join()
+      .unwrap_or_else(|error| panic!("blocking task join failed: {error}"));
+
+    runtime
+      .request_shutdown(ShutdownMode::Drain)
+      .unwrap_or_else(|error| panic!("blocking shutdown request failed: {error}"));
+    entered_rx
+      .recv_timeout(Duration::from_secs(3))
+      .unwrap_or_else(|error| panic!("nested TLS destructor did not start: {error}"));
+    assert!(
+      !runtime
+        .poll_shutdown()
+        .unwrap_or_else(|error| panic!("blocking shutdown poll failed: {error}"))
+    );
+    assert_eq!(runtime.workers.len(), 1);
+
+    release_tx
+      .send(())
+      .unwrap_or_else(|error| panic!("nested TLS destructor release failed: {error}"));
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+      match runtime.poll_shutdown() {
+        Ok(true) => break,
+        Ok(false) if Instant::now() < deadline => thread::yield_now(),
+        result => panic!("blocking worker completion did not finish: {result:?}"),
+      }
+    }
+    assert!(runtime.workers.is_empty());
+    assert!(
+      runtime
+        .poll_shutdown()
+        .unwrap_or_else(|error| panic!("repeated blocking shutdown poll failed: {error}"))
+    );
   }
 
   #[test]

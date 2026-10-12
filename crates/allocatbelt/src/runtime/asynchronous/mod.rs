@@ -46,11 +46,12 @@ mod tests;
 use std::any::Any;
 use std::fmt;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
-use std::thread::{self, JoinHandle};
+use std::thread;
 
 use crate::runtime::managed::ResourceScope;
 use crate::runtime::resource_domain::{ControlCharge, DomainError, payload_bytes};
 use crate::runtime::task::drop_contained;
+use crate::runtime::thread_completion::DeferredJoin;
 use scheduler::{ScopeRef, Shared};
 
 pub use entry::{
@@ -170,6 +171,9 @@ pub enum AsyncError {
   NestedBlockOn,
   /// A worker exited unexpectedly.
   WorkerPanicked,
+  /// A finite shutdown poll could not start a worker completion monitor.
+  /// Retry shutdown polling; the original worker handle remains owned.
+  JoinMonitorSpawnFailed,
   /// The process-wide task identifier space is exhausted.
   TaskIdExhausted,
   /// A bound global/tenant resource could not be admitted.
@@ -188,6 +192,9 @@ impl fmt::Display for AsyncError {
       Self::BlockOnFromWorker => "block_on from an async executor worker is not allowed",
       Self::NestedBlockOn => "nested block_on on one thread is not allowed",
       Self::WorkerPanicked => "an async worker exited unexpectedly",
+      Self::JoinMonitorSpawnFailed => {
+        "async shutdown could not start a join monitor; retry shutdown polling"
+      }
       Self::TaskIdExhausted => "process-wide async task identifiers are exhausted",
       Self::ResourceDomain(_) => "async resource-domain admission failed",
     })
@@ -243,7 +250,7 @@ pub enum AsyncShutdown {
 /// A fixed worker pool for bounded, owned `Send + 'static` futures.
 pub struct AsyncRuntime {
   shared: Arc<Shared>,
-  workers: Vec<JoinHandle<()>>,
+  workers: Vec<DeferredJoin>,
   panic_payloads: Mutex<Vec<Box<dyn Any + Send>>>,
   root: ScopeRef,
   shutdown_complete: bool,
@@ -431,7 +438,7 @@ impl AsyncRuntime {
       }
     }
     let runtime_control_bytes = std::mem::size_of::<AsyncRuntime>()
-      .checked_add(payload_bytes::<JoinHandle<()>>(threads).map_err(AsyncError::ResourceDomain)?)
+      .checked_add(payload_bytes::<DeferredJoin>(threads).map_err(AsyncError::ResourceDomain)?)
       .and_then(|bytes| {
         payload_bytes::<Box<dyn Any + Send>>(threads)
           .ok()
@@ -464,7 +471,7 @@ impl AsyncRuntime {
       .map_err(|_| AsyncError::OutOfMemory)?;
     let actual_runtime_control = std::mem::size_of::<AsyncRuntime>()
       .checked_add(
-        payload_bytes::<JoinHandle<()>>(workers.capacity()).map_err(AsyncError::ResourceDomain)?,
+        payload_bytes::<DeferredJoin>(workers.capacity()).map_err(AsyncError::ResourceDomain)?,
       )
       .and_then(|bytes| {
         payload_bytes::<Box<dyn Any + Send>>(panic_payloads.capacity())
@@ -509,11 +516,13 @@ impl AsyncRuntime {
         })
       };
       match started {
-        Ok(worker) => workers.push(worker),
+        Ok(worker) => workers.push(DeferredJoin::new(worker)),
         Err(_) => {
           shared.close(true);
-          for worker in workers {
-            let _ = worker.join();
+          for mut worker in workers {
+            if let Err(payload) = worker.join_blocking() {
+              drop_contained(payload);
+            }
           }
           return Err(AsyncError::OutOfMemory);
         }
@@ -605,14 +614,16 @@ impl AsyncRuntime {
   /// runtime's threads, handed-off closures included, it closes admission
   /// with cancellation and returns [`AsyncError::WouldDeadlock`] instead.
   pub fn shutdown(mut self, mode: AsyncShutdown) -> Result<(), AsyncError> {
-    if scheduler::is_worker(&self.shared) {
+    if scheduler::is_worker(&self.shared)
+      || self.workers.iter().any(DeferredJoin::is_current_thread)
+    {
       self.shared.close(true);
       return Err(AsyncError::WouldDeadlock);
     }
     self.shared.close(mode == AsyncShutdown::CancelPending);
     let mut panicked = false;
-    while let Some(worker) = self.workers.pop() {
-      if let Err(payload) = worker.join() {
+    while let Some(mut worker) = self.workers.pop() {
+      if let Err(payload) = worker.join_blocking() {
         panicked = true;
         self.lock_panic_payloads().push(payload);
       }
@@ -634,8 +645,9 @@ impl AsyncRuntime {
     self.shared.close(mode == AsyncShutdown::CancelPending);
   }
 
-  /// Checks real worker completion without blocking. It joins workers only
-  /// after every worker has exited; `Pending` retains all remaining owners.
+  /// Checks real worker completion without blocking. A small monitor joins
+  /// each original worker so its thread-local destructors have finished
+  /// before completion is published. `Pending` retains all remaining owners.
   /// If a worker panicked, its panic payload remains owned by this runtime
   /// until the runtime is explicitly shut down or dropped. Dropping that
   /// payload may run user code and block.
@@ -647,14 +659,26 @@ impl AsyncRuntime {
         Ok(true)
       };
     }
-    if self.workers.iter().any(|worker| !worker.is_finished()) {
-      return Ok(false);
-    }
-    while let Some(worker) = self.workers.pop() {
-      if let Err(payload) = worker.join() {
+    let mut index = 0;
+    while index < self.workers.len() {
+      let result = self.workers[index]
+        .try_join()
+        .map_err(|_| AsyncError::JoinMonitorSpawnFailed)?;
+      let Some(result) = result else {
+        index += 1;
+        continue;
+      };
+
+      // A DeferredJoin is one-shot: once its result is taken, remove it so a
+      // later poll cannot start a second monitor for an already-consumed join.
+      drop(self.workers.swap_remove(index));
+      if let Err(payload) = result {
         self.shutdown_panicked = true;
         self.lock_panic_payloads().push(payload);
       }
+    }
+    if !self.workers.is_empty() {
+      return Ok(false);
     }
     drop(self.launch_control.take());
     self.shutdown_complete = true;
@@ -769,5 +793,144 @@ impl fmt::Debug for AsyncRuntime {
     f.debug_struct("AsyncRuntime")
       .field("workers", &self.workers.len())
       .finish_non_exhaustive()
+  }
+}
+
+#[cfg(all(test, not(loom)))]
+mod completion_tests {
+  use super::{AsyncConfig, AsyncRuntime, AsyncShutdown, DeferredJoin};
+  use crate::runtime::resource_domain::payload_bytes;
+  use std::any::Any;
+  use std::cell::RefCell;
+  use std::sync::mpsc::{self, Receiver, SyncSender};
+  use std::task::Poll;
+  use std::thread;
+  use std::time::{Duration, Instant};
+
+  struct Gate {
+    entered: SyncSender<()>,
+    release: Receiver<()>,
+  }
+
+  impl Gate {
+    fn wait(self) {
+      let _ = self.entered.send(());
+      let _ = self.release.recv_timeout(Duration::from_secs(4));
+    }
+  }
+
+  struct WaitOnDrop(RefCell<Option<Gate>>);
+
+  impl Drop for WaitOnDrop {
+    fn drop(&mut self) {
+      if let Some(gate) = self.0.get_mut().take() {
+        gate.wait();
+      }
+    }
+  }
+
+  thread_local! {
+    static NESTED_TLS: WaitOnDrop = const { WaitOnDrop(RefCell::new(None)) };
+    static OUTER_TLS: OuterTls = const { OuterTls(RefCell::new(None)) };
+  }
+
+  struct OuterTls(RefCell<Option<Gate>>);
+
+  impl Drop for OuterTls {
+    fn drop(&mut self) {
+      if let Some(gate) = self.0.get_mut().take() {
+        NESTED_TLS.with(|slot| {
+          *slot.0.borrow_mut() = Some(gate);
+        });
+      }
+    }
+  }
+
+  fn wait_for_completion(runtime: &mut AsyncRuntime) {
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+      match runtime.poll_shutdown() {
+        Ok(true) => return,
+        Ok(false) if Instant::now() < deadline => thread::yield_now(),
+        result => panic!("async worker completion did not finish: {result:?}"),
+      }
+    }
+  }
+
+  #[test]
+  fn runtime_control_fee_uses_deferred_join_capacity() {
+    let runtime = AsyncRuntime::new(AsyncConfig {
+      workers: 2,
+      max_outstanding: 2,
+      max_scopes: 2,
+    })
+    .unwrap_or_else(|error| panic!("async runtime setup failed: {error}"));
+    let panic_capacity = runtime
+      .panic_payloads
+      .lock()
+      .unwrap_or_else(std::sync::PoisonError::into_inner)
+      .capacity();
+    let expected = std::mem::size_of::<AsyncRuntime>()
+      + payload_bytes::<DeferredJoin>(runtime.workers.capacity())
+        .unwrap_or_else(|error| panic!("worker payload size failed: {error}"))
+      + payload_bytes::<Box<dyn Any + Send>>(panic_capacity)
+        .unwrap_or_else(|error| panic!("panic payload size failed: {error}"));
+    assert_eq!(runtime._control.bytes(), expected);
+    runtime
+      .shutdown(AsyncShutdown::Drain)
+      .unwrap_or_else(|error| panic!("async shutdown failed: {error}"));
+  }
+
+  #[test]
+  fn polling_removes_a_completed_nested_tls_worker_slot_once() {
+    let mut runtime = AsyncRuntime::new(AsyncConfig {
+      workers: 1,
+      max_outstanding: 2,
+      max_scopes: 2,
+    })
+    .unwrap_or_else(|error| panic!("async runtime setup failed: {error}"));
+    let handle = runtime.handle();
+    let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+    let (release_tx, release_rx) = mpsc::channel();
+    let mut gate = Some(Gate {
+      entered: entered_tx,
+      release: release_rx,
+    });
+    let job = handle
+      .spawn(std::future::poll_fn(move |_| {
+        if let Some(gate) = gate.take() {
+          OUTER_TLS.with(|slot| {
+            *slot.0.borrow_mut() = Some(gate);
+          });
+        }
+        Poll::Ready(())
+      }))
+      .unwrap_or_else(|error| panic!("async task admission failed: {error}"));
+    handle
+      .block_on(job)
+      .unwrap_or_else(|error| panic!("async task wait failed: {error}"))
+      .unwrap_or_else(|error| panic!("async task failed: {error}"));
+
+    runtime.request_shutdown(AsyncShutdown::Drain);
+    entered_rx
+      .recv_timeout(Duration::from_secs(3))
+      .unwrap_or_else(|error| panic!("nested TLS destructor did not start: {error}"));
+    assert!(
+      !runtime
+        .poll_shutdown()
+        .unwrap_or_else(|error| panic!("async shutdown poll failed: {error}"))
+    );
+    assert_eq!(runtime.workers.len(), 1);
+
+    release_tx
+      .send(())
+      .unwrap_or_else(|error| panic!("nested TLS destructor release failed: {error}"));
+    wait_for_completion(&mut runtime);
+    assert!(runtime.workers.is_empty());
+    assert!(
+      runtime
+        .poll_shutdown()
+        .unwrap_or_else(|error| panic!("repeated async shutdown poll failed: {error}"))
+    );
   }
 }
