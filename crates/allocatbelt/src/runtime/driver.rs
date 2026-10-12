@@ -13,8 +13,10 @@
 //!
 //! Bucket reservation tables and rate-timer wait registrations use configured
 //! bounds, while caller-created endpoint objects remain caller-controlled.
-//! The facade does not currently charge its feedback state, meters, buckets,
-//! or private rate-timer metadata to `ResourceDomain::Control`.
+//! Tenant-bound facades charge their declared owner, feedback, meter, bucket,
+//! and resource-ledger payloads to `ResourceDomain::Control`. Private timer
+//! and provider metadata have separate accounting requirements; the control
+//! budget is not a bound on process RSS or standard-library allocations.
 
 #![forbid(unsafe_code)]
 #![cfg_attr(not(test), deny(clippy::expect_used, clippy::unwrap_used))]
@@ -48,7 +50,7 @@ use super::process::{ProcessBuildError, ProcessDriver, ProcessShutdownError, Pro
 #[cfg(not(loom))]
 use super::rate_io::{RateIoFailure, RateLimitedIo};
 use super::reactor::{Reactor, ReactorConfig, ReactorError, ReactorHandle};
-use super::resource_domain::{DomainError, TenantDomain};
+use super::resource_domain::{ControlCharge, DomainError, TenantDomain};
 #[cfg(feature = "resource-feedback")]
 use super::resource_feedback::{
   FeedbackMetricsHandle, FeedbackShutdownError, FeedbackShutdownProgress, ResourceFeedbackService,
@@ -485,6 +487,39 @@ struct FeedbackStartupInputs {
 }
 
 impl ServiceOptions {
+  fn owner_control(
+    &self,
+    tenant: Option<&TenantDomain>,
+    owner_bytes: usize,
+    executor_bytes: usize,
+  ) -> Result<ControlCharge, DriverBuildError> {
+    // Executor and active blocking/service values already own their exact
+    // inline charges. The containing facade accounts their surrounding fields
+    // and padding without reserving those value payloads a second time.
+    let mut bytes =
+      owner_bytes
+        .checked_sub(executor_bytes)
+        .ok_or(DriverBuildError::InvalidConfiguration(
+          "executor metadata exceeds its facade",
+        ))?;
+    if self.blocking.is_some() {
+      bytes = bytes
+        .checked_sub(std::mem::size_of::<BlockingRuntime>())
+        .ok_or(DriverBuildError::InvalidConfiguration(
+          "blocking metadata exceeds its facade",
+        ))?;
+    }
+    #[cfg(feature = "resource-feedback")]
+    if tenant.is_some() && self.feedback.is_some() {
+      bytes = bytes
+        .checked_sub(ResourceFeedbackService::owner_payload_bytes())
+        .ok_or(DriverBuildError::InvalidConfiguration(
+          "feedback metadata exceeds its facade",
+        ))?;
+    }
+    ControlCharge::try_new(tenant, bytes).map_err(DriverBuildError::ResourceDomain)
+  }
+
   fn validate(&self, max_outstanding: usize) -> Result<(), DriverBuildError> {
     if self.timer_registrations == Some(0) {
       return Err(DriverBuildError::InvalidConfiguration(
@@ -555,20 +590,27 @@ impl ServiceOptions {
     Ok(())
   }
 
-  fn build_rate_limits(&self) -> Result<ByteRateLimits, DriverBuildError> {
+  fn build_rate_limits(
+    &self,
+    tenant: Option<&TenantDomain>,
+  ) -> Result<ByteRateLimits, DriverBuildError> {
+    let create = |config| match tenant {
+      Some(tenant) => ByteRateLimit::new_in_tenant(config, tenant),
+      None => ByteRateLimit::new(config),
+    };
     let disk = self
       .disk_rate
-      .map(ByteRateLimit::new)
+      .map(create)
       .transpose()
       .map_err(DriverBuildError::ByteRate)?;
     let upload = self
       .upload_rate
-      .map(ByteRateLimit::new)
+      .map(create)
       .transpose()
       .map_err(DriverBuildError::ByteRate)?;
     let download = self
       .download_rate
-      .map(ByteRateLimit::new)
+      .map(create)
       .transpose()
       .map_err(DriverBuildError::ByteRate)?;
     Ok(ByteRateLimits {
@@ -842,21 +884,32 @@ impl CurrentThreadBuilder {
       ));
     }
     self.services.validate(self.config.max_outstanding)?;
+    let resources = match self.tenant {
+      Some(tenant) => ResourceScope::try_from_tenant(self.resources, tenant)
+        .map_err(DriverBuildError::ResourceDomain)?,
+      None => ResourceScope::new(self.resources),
+    };
+    let owner_control = self.services.owner_control(
+      resources.tenant_domain(),
+      std::mem::size_of::<CurrentThreadDriver>(),
+      std::mem::size_of::<LocalRuntime>(),
+    )?;
     let ByteRateLimits {
       disk: disk_rate,
       upload: upload_rate,
       download: download_rate,
-    } = self.services.build_rate_limits()?;
+    } = self.services.build_rate_limits(resources.tenant_domain())?;
     #[cfg(feature = "resource-feedback")]
     let feedback_meters = self
       .services
       .feedback
       .as_ref()
-      .map(|_| FeedbackMeters::new());
-    let resources = match self.tenant {
-      Some(tenant) => ResourceScope::from_tenant(self.resources, tenant),
-      None => ResourceScope::new(self.resources),
-    };
+      .map(|_| match resources.tenant_domain() {
+        Some(tenant) => FeedbackMeters::new_in_tenant(tenant),
+        None => Ok(FeedbackMeters::new()),
+      })
+      .transpose()
+      .map_err(DriverBuildError::ResourceDomain)?;
     let mut startup = StartupGuard::default();
     startup.local = Some(
       LocalRuntime::with_resources(self.config, resources.clone())
@@ -931,6 +984,7 @@ impl CurrentThreadBuilder {
       blocking_shutdown_requested: false,
       process_shutdown_requested: false,
       io_shutdown_requested: false,
+      _control: owner_control,
     })
   }
 }
@@ -1033,21 +1087,32 @@ impl MultiThreadBuilder {
       ));
     }
     self.services.validate(self.config.max_outstanding)?;
+    let resources = match self.tenant {
+      Some(tenant) => ResourceScope::try_from_tenant(self.resources, tenant)
+        .map_err(DriverBuildError::ResourceDomain)?,
+      None => ResourceScope::new(self.resources),
+    };
+    let owner_control = self.services.owner_control(
+      resources.tenant_domain(),
+      std::mem::size_of::<MultiThreadDriver>(),
+      std::mem::size_of::<AsyncRuntime>(),
+    )?;
     let ByteRateLimits {
       disk: disk_rate,
       upload: upload_rate,
       download: download_rate,
-    } = self.services.build_rate_limits()?;
+    } = self.services.build_rate_limits(resources.tenant_domain())?;
     #[cfg(feature = "resource-feedback")]
     let feedback_meters = self
       .services
       .feedback
       .as_ref()
-      .map(|_| FeedbackMeters::new());
-    let resources = match self.tenant {
-      Some(tenant) => ResourceScope::from_tenant(self.resources, tenant),
-      None => ResourceScope::new(self.resources),
-    };
+      .map(|_| match resources.tenant_domain() {
+        Some(tenant) => FeedbackMeters::new_in_tenant(tenant),
+        None => Ok(FeedbackMeters::new()),
+      })
+      .transpose()
+      .map_err(DriverBuildError::ResourceDomain)?;
     let mut startup = StartupGuard::default();
     let asynchronous = match (self.handoffs, self.thread_options) {
       (Some(handoffs), Some(options)) => AsyncRuntime::with_resources_handoffs_and_thread_options(
@@ -1131,6 +1196,7 @@ impl MultiThreadBuilder {
       blocking_shutdown_requested: false,
       process_shutdown_requested: false,
       io_shutdown_requested: false,
+      _control: owner_control,
     })
   }
 }
@@ -1212,6 +1278,7 @@ pub struct CurrentThreadDriver {
   blocking_shutdown_requested: bool,
   process_shutdown_requested: bool,
   io_shutdown_requested: bool,
+  _control: ControlCharge,
 }
 
 impl CurrentThreadDriver {
@@ -1576,6 +1643,7 @@ pub struct MultiThreadDriver {
   blocking_shutdown_requested: bool,
   process_shutdown_requested: bool,
   io_shutdown_requested: bool,
+  _control: ControlCharge,
 }
 
 impl MultiThreadDriver {
@@ -2727,6 +2795,7 @@ mod tests {
     let asynchronous = AsyncRuntime::with_resources(async_config(), resources.clone())
       .unwrap_or_else(|error| panic!("async runtime build failed: {error}"));
     let mut driver = MultiThreadDriver {
+      _control: ControlCharge::unbounded(std::mem::size_of::<MultiThreadDriver>()),
       asynchronous,
       resources,
       timer: Some(
@@ -3560,5 +3629,102 @@ mod tests {
       );
       std::thread::yield_now();
     }
+  }
+
+  #[cfg(feature = "resource-feedback")]
+  #[test]
+  fn bound_builder_charges_values_once_and_retained_handles_keep_metadata() {
+    let (domain, tenant) = feedback_domain();
+    let baseline = domain.snapshot().used.get(DomainResource::Control);
+    let seen = Arc::new(Mutex::new(None));
+    let observed = seen.clone();
+    let factory = feedback_sources(feedback_policy(), move |context| {
+      assert!(context.resources.is_control_accounted());
+      *observed.lock().unwrap() = Some(context.disk_meter.clone());
+      Ok((
+        MissingFeedbackSensor,
+        TestFeedbackActuator {
+          limits: [16, 1000, 1000],
+        },
+      ))
+    });
+    let mut driver = MultiThreadBuilder::new(async_config())
+      .resources(limits(64))
+      .resource_domain(tenant)
+      .disk_rate(feedback_rate_config())
+      .feedback_sources(factory)
+      .build()
+      .unwrap();
+    assert!(driver.resources().is_control_accounted());
+    assert_eq!(
+      driver._control.bytes(),
+      std::mem::size_of::<MultiThreadDriver>()
+        - std::mem::size_of::<AsyncRuntime>()
+        - ResourceFeedbackService::owner_payload_bytes()
+    );
+    let ledger = driver.resources().clone();
+    let buffer = ledger.try_alloc_zeroed(1).unwrap();
+    let bucket = driver.disk_rate().unwrap();
+    let meter = seen.lock().unwrap().take().unwrap();
+    let metrics = driver.feedback_metrics().unwrap();
+    shutdown_multi_driver(&mut driver);
+    drop(driver);
+    let before = domain.snapshot().used.get(DomainResource::Control);
+    assert!(before > baseline);
+    drop(metrics);
+    let after_metrics = domain.snapshot().used.get(DomainResource::Control);
+    assert!(after_metrics < before);
+    drop(meter);
+    let after_meter = domain.snapshot().used.get(DomainResource::Control);
+    assert!(after_meter < after_metrics);
+    drop(bucket);
+    let after_bucket = domain.snapshot().used.get(DomainResource::Control);
+    assert!(after_bucket < after_meter);
+    drop(ledger);
+    assert_eq!(
+      domain.snapshot().used.get(DomainResource::Control),
+      after_bucket
+    );
+    drop(buffer);
+    assert_eq!(domain.snapshot().used.get(DomainResource::Memory), 0);
+    assert_eq!(
+      domain.snapshot().used.get(DomainResource::Control),
+      baseline
+    );
+  }
+
+  #[test]
+  fn charged_builder_refuses_metadata_before_startup_callbacks() {
+    use crate::runtime::resource_domain::{DomainResource, DomainResources, ResourceDomain};
+    let ceiling = DomainResources::ZERO
+      .with(DomainResource::Control, 1 << 20)
+      .with(DomainResource::Cpu, 4)
+      .with(DomainResource::Tasks, 16);
+    let domain = ResourceDomain::with_waiters(ceiling, 1, 32).unwrap();
+    let tenant = domain.tenant(ceiling).unwrap();
+    let baseline = domain.snapshot();
+    domain
+      .set_limits(baseline.limit.with(
+        DomainResource::Control,
+        baseline.used.get(DomainResource::Control),
+      ))
+      .unwrap();
+    let before = domain.snapshot();
+    let called = Arc::new(AtomicUsize::new(0));
+    let observed = called.clone();
+    let result = MultiThreadBuilder::new(async_config())
+      .resource_domain(tenant.clone())
+      .thread_options(AsyncThreadOptions::new().on_thread_start(move |_| {
+        observed.fetch_add(1, Ordering::SeqCst);
+      }))
+      .build();
+    assert!(matches!(
+      result,
+      Err(DriverBuildError::ResourceDomain(DomainError::Exhausted(
+        DomainResource::Control
+      )))
+    ));
+    assert_eq!(called.load(Ordering::SeqCst), 0);
+    assert_eq!(domain.snapshot(), before);
   }
 }

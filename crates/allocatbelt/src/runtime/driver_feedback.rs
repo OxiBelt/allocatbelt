@@ -10,6 +10,7 @@ use std::sync::Arc;
 use super::super::asynchronous::RuntimeMetrics;
 use super::super::byte_rate::ByteRateLimit;
 use super::super::managed::ResourceScope;
+use super::super::resource_domain::{DomainError, TenantDomain};
 use super::super::resource_feedback::{
   FeedbackActuator, FeedbackSensor, FeedbackStartError, ResourceFeedbackService,
 };
@@ -87,6 +88,14 @@ impl FeedbackMeters {
       upload: IoFeedbackMeter::new(),
       download: IoFeedbackMeter::new(),
     }
+  }
+
+  pub(crate) fn new_in_tenant(tenant: &TenantDomain) -> Result<Self, DomainError> {
+    Ok(Self {
+      disk: IoFeedbackMeter::new_in_tenant(tenant)?,
+      upload: IoFeedbackMeter::new_in_tenant(tenant)?,
+      download: IoFeedbackMeter::new_in_tenant(tenant)?,
+    })
   }
 }
 
