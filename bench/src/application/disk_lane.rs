@@ -252,23 +252,26 @@ where
 pub(crate) fn run_and_print(
   allocator: &str,
   options: Options,
-  arrivals: usize,
+  plan: super::ArrivalPlan,
 ) -> Result<(), String> {
   if options.workload != super::Workload::Disk {
     return Err("disk lane received a non-disk workload".into());
   }
-  let counts = super::run_with_limits(options, None, Some(arrivals))?;
-  super::write_id_report(&counts.observer.records, allocator, options)?;
+  let counts = super::run_with_plan(options, plan, None)?;
+  super::write_id_report(&counts.observer.records, allocator, options, plan.profile)?;
   super::print_row(allocator, options, &counts);
   Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-  use super::run_tokio_operation;
+  use super::{run_tokio_operation, submit_step};
   use allocatbelt::runtime::managed::{ResourceLimits, ResourceScope};
   use allocatbelt_app_ports::disk::DiskConfig;
-  use std::sync::Arc;
+  use std::sync::atomic::{AtomicUsize, Ordering};
+  use std::sync::{Arc, Condvar, Mutex};
+  use std::thread;
+  use std::time::{Duration, Instant};
 
   #[test]
   fn tokio_multi_chunk_positional_transaction_reads_back_and_cleans() {
@@ -303,5 +306,78 @@ mod tests {
     assert_eq!(resources.snapshot().managed_memory, 0);
     assert_eq!(resources.snapshot().disk_ops, 0);
     runtime.shutdown_timeout(std::time::Duration::from_secs(5));
+  }
+
+  #[test]
+  fn tokio_filesystem_semaphore_caps_more_jobs_than_workers_until_completion() {
+    const WORKERS: usize = 2;
+    const JOBS: usize = 7;
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+      .worker_threads(2)
+      .max_blocking_threads(WORKERS + 1)
+      .enable_all()
+      .build()
+      .unwrap();
+    let resources = ResourceScope::new(ResourceLimits {
+      managed_memory: 0,
+      disk_concurrent_ops: JOBS,
+      network_concurrent_ops: 0,
+    });
+    let slots = Arc::new(tokio::sync::Semaphore::new(WORKERS));
+    let active = Arc::new(AtomicUsize::new(0));
+    let peak = Arc::new(AtomicUsize::new(0));
+    let released = Arc::new((Mutex::new(false), Condvar::new()));
+    let jobs = (0..JOBS)
+      .map(|_| {
+        let handle = runtime.handle().clone();
+        let task_handle = handle.clone();
+        let slots = Arc::clone(&slots);
+        let resources = resources.clone();
+        let active = Arc::clone(&active);
+        let peak = Arc::clone(&peak);
+        let released = Arc::clone(&released);
+        handle.spawn(async move {
+          let operation_handle = task_handle.clone();
+          submit_step(&operation_handle, &slots, &resources, move || {
+            let current = active.fetch_add(1, Ordering::SeqCst) + 1;
+            peak.fetch_max(current, Ordering::SeqCst);
+            let (lock, changed) = &*released;
+            let mut is_released = lock.lock().unwrap_or_else(|error| error.into_inner());
+            while !*is_released {
+              is_released = changed
+                .wait(is_released)
+                .unwrap_or_else(|error| error.into_inner());
+            }
+            active.fetch_sub(1, Ordering::SeqCst);
+            Ok(())
+          })
+          .await
+        })
+      })
+      .collect::<Vec<_>>();
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while active.load(Ordering::SeqCst) < WORKERS && Instant::now() < deadline {
+      thread::sleep(Duration::from_millis(1));
+    }
+    let reached_limit = active.load(Ordering::SeqCst) == WORKERS;
+    {
+      let (lock, changed) = &*released;
+      *lock.lock().unwrap_or_else(|error| error.into_inner()) = true;
+      changed.notify_all();
+    }
+    for job in jobs {
+      runtime
+        .block_on(job)
+        .expect("Tokio filesystem wrapper task should join")
+        .expect("Tokio filesystem step should complete");
+    }
+    assert!(
+      reached_limit,
+      "filesystem workers did not fill the configured cap"
+    );
+    assert_eq!(peak.load(Ordering::SeqCst), WORKERS);
+    assert_eq!(resources.snapshot().disk_ops, 0);
+    runtime.shutdown_timeout(Duration::from_secs(5));
   }
 }

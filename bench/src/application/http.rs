@@ -4,7 +4,7 @@
 //! owns only listener/client setup, bounded admission, result pairing, and
 //! executor-specific endpoint adapters.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::io;
 use std::net::{SocketAddr, SocketAddrV4, TcpListener as StdTcpListener};
@@ -29,7 +29,12 @@ use allocatbelt_app_ports::http::{self, HttpConfig};
 use allocatbelt_app_ports::memory::pattern_byte;
 use tokio::io::{AsyncRead as TokioAsyncRead, AsyncWrite as TokioAsyncWrite};
 
-use super::{Executor, Mode, ObserverEventSender, ObserverWake, Options, WORKERS};
+#[cfg(test)]
+use super::Profile;
+use super::{
+  ArrivalPlan, Executor, Mode, Observer, ObserverEventSender, ObserverWake, Options, WorkOutput,
+  Workload,
+};
 
 const WINDOW: usize = 8;
 const TASK_LIMIT: usize = 2 * WINDOW + 1;
@@ -161,6 +166,12 @@ enum Event {
     horizon_end: Instant,
     job: ClientJob,
   },
+  App {
+    id: u64,
+    scheduled: Instant,
+    horizon_end: Instant,
+    job: super::Job,
+  },
   Rejected(u64, Instant),
   Handler(HandlerRecord),
   Done(ProducerReport),
@@ -207,6 +218,7 @@ struct Report {
   p95_ns: u64,
   p99_ns: u64,
   max_observed_managed_bytes: usize,
+  retained_managed_bytes: usize,
   final_resources: ResourceSnapshot,
   shutdown_ns: u128,
   last_observed: Instant,
@@ -226,6 +238,7 @@ struct ObserverReport {
   expected: u64,
   latencies: Vec<u64>,
   max_observed_managed_bytes: usize,
+  retained_managed_bytes: usize,
   last_observed: Instant,
   records: Vec<super::IdRecord>,
 }
@@ -246,54 +259,36 @@ struct Settings {
 }
 
 impl Settings {
-  fn production(options: Options, arrivals: usize) -> Result<Self, String> {
-    if options.workload != super::Workload::Http {
-      return Err("HTTP lane received a non-HTTP workload".into());
+  fn production(options: Options, plan: ArrivalPlan) -> Result<Self, String> {
+    if options.workload != plan.workload {
+      return Err("HTTP settings workload differs from arrival plan".into());
     }
     if options.mode == Mode::OpenLoop {
-      let rate = options
-        .rate_per_second
-        .ok_or_else(|| "open-loop mode requires --rate".to_owned())?;
-      if rate == 0 || rate > 1_000_000_000 {
-        return Err("open-loop --rate must be in 1..=1000000000".into());
-      }
-      super::validate_arrivals(arrivals)?;
-      super::validate_trace(options, arrivals, super::execution_deadlines().trace)?;
-      let trace_ns = (arrivals as u128 * 1_000_000_000) / rate as u128;
-      if trace_ns > super::execution_deadlines().trace.as_nanos() {
-        return Err("open-loop trace exceeds its finite trace deadline".into());
-      }
+      super::validate_arrival_plan(plan, super::execution_deadlines().trace)?;
     }
     Ok(Self {
       horizon: CAPACITY_HORIZON,
-      arrivals,
+      arrivals: plan.arrivals,
       body_bytes: BODY_BYTES,
     })
   }
 
-  fn event_capacity(self, mode: Mode) -> Result<usize, String> {
-    match mode {
-      Mode::Capacity => Ok(4 * WINDOW + 1),
-      Mode::OpenLoop => self
-        .arrivals
-        .checked_mul(4)
-        .and_then(|count| count.checked_add(1))
-        .ok_or_else(|| "HTTP open-loop event capacity overflow".to_owned()),
-    }
+  fn event_capacity(self, _mode: Mode) -> Result<usize, String> {
+    Ok(4 * WINDOW + 1)
   }
 }
 
 pub(super) fn run_and_print(
   allocator: &str,
   options: Options,
-  arrivals: usize,
+  plan: ArrivalPlan,
 ) -> Result<(), String> {
-  let settings = Settings::production(options, arrivals)?;
+  let settings = Settings::production(options, plan)?;
   let report = match options.executor {
-    Executor::Bounded => run_bounded(options, settings)?,
-    Executor::Tokio => run_tokio(options, settings)?,
+    Executor::Bounded => run_bounded(options, settings, plan)?,
+    Executor::Tokio => run_tokio(options, settings, plan)?,
   };
-  super::write_id_report(&report.records, allocator, options)?;
+  super::write_id_report(&report.records, allocator, options, plan.profile)?;
   print_row(allocator, options, &report);
   Ok(())
 }
@@ -336,12 +331,23 @@ fn std_listener() -> Result<(StdTcpListener, SocketAddrV4), String> {
   Ok((listener, address))
 }
 
-fn run_bounded(options: Options, settings: Settings) -> Result<Report, String> {
+fn run_bounded(options: Options, settings: Settings, plan: ArrivalPlan) -> Result<Report, String> {
   let setup_started = Instant::now();
-  let expected_oracle = build_open_loop_checksum_oracle(options.mode, settings)?;
-  let resources = ResourceScope::new(limits());
+  let expected_oracle = if options.mode == Mode::OpenLoop {
+    Some(super::build_plan_expected_oracle(
+      plan,
+      &super::LaneConfig::default(),
+    )?)
+  } else {
+    None
+  };
+  let resources = ResourceScope::new(if options.workload == Workload::Mixed {
+    super::resource_limits(Workload::Mixed)
+  } else {
+    limits()
+  });
   let async_runtime = AsyncRuntime::new(AsyncConfig {
-    workers: WORKERS,
+    workers: plan.async_workers,
     max_outstanding: TASK_LIMIT,
     max_scopes: 2,
   })
@@ -350,7 +356,33 @@ fn run_bounded(options: Options, settings: Settings) -> Result<Report, String> {
     .scope_with_resources(&resources)
     .map_err(|error| format!("allocatbelt task scope start failed: {error}"))?;
   let async_handle = scope.handle();
-  super::warm_bounded(&async_handle)?;
+  super::warm_bounded_for(&async_handle, plan.async_workers)?;
+
+  let mut filesystem_runtime = if options.workload == Workload::Mixed {
+    Some(
+      allocatbelt::runtime::Runtime::new(BlockingConfig {
+        workers: plan.async_workers,
+        max_outstanding: WINDOW,
+        capacity: Resources {
+          disk: WINDOW,
+          ..Resources::ZERO
+        },
+      })
+      .map_err(|error| format!("allocatbelt filesystem runtime start failed: {error}"))?,
+    )
+  } else {
+    None
+  };
+  let filesystem_handle = filesystem_runtime
+    .as_ref()
+    .map(|runtime| allocatbelt::runtime::fs::FsHandle::new(runtime.handle(), resources.clone()));
+  if let Some(runtime) = &filesystem_runtime {
+    super::disk_lane::warm_native_workers(runtime, &async_handle, plan.async_workers)?;
+  }
+  let app_submitter = (options.workload == Workload::Mixed).then(|| super::Submitter::Bounded {
+    handle: async_handle.clone(),
+    disk: filesystem_handle,
+  });
 
   let mut blocking_runtime = allocatbelt::runtime::Runtime::new(BlockingConfig {
     workers: 1,
@@ -413,11 +445,12 @@ fn run_bounded(options: Options, settings: Settings) -> Result<Report, String> {
   let (producer_tx, producer_rx) = mpsc::sync_channel(1);
   let observer_resources = resources.clone();
   let observer_expected_oracle = expected_oracle.clone();
+  let observer_application = Observer::Bounded(async_handle.clone());
   let (observer_tx, observer_rx) = mpsc::sync_channel(1);
   let observer_thread = thread::Builder::new()
     .name("http-application-observer".into())
     .spawn(move || {
-      let report = observe_events(
+      let report = observe_events_with_plan(
         Joiner::Bounded,
         options,
         settings,
@@ -425,6 +458,8 @@ fn run_bounded(options: Options, settings: Settings) -> Result<Report, String> {
         events_rx,
         credits_tx,
         observer_expected_oracle,
+        plan,
+        Some(observer_application),
       );
       let _ = observer_tx.send(report);
     })
@@ -458,6 +493,8 @@ fn run_bounded(options: Options, settings: Settings) -> Result<Report, String> {
         credits_rx,
         options,
         settings,
+        plan,
+        app_submitter,
       );
       let _ = producer_tx.send(report);
     })
@@ -493,6 +530,7 @@ fn run_bounded(options: Options, settings: Settings) -> Result<Report, String> {
     &producer,
     &observed,
     expected_oracle.as_deref(),
+    plan,
   )?;
   if observed
     .last_observed
@@ -525,6 +563,15 @@ fn run_bounded(options: Options, settings: Settings) -> Result<Report, String> {
       .map_err(|error| format!("allocatbelt reactor shutdown failed: {error}"))
   })?;
   shutdown_timings.push(("allocatbelt reactor", elapsed_ns));
+  if let Some(mut filesystem_runtime) = filesystem_runtime.take() {
+    let elapsed_ns =
+      super::run_shutdown_with_timeout("allocatbelt filesystem runtime", move || {
+        filesystem_runtime
+          .shutdown(allocatbelt::runtime::ShutdownMode::Drain)
+          .map_err(|error| format!("allocatbelt filesystem runtime shutdown failed: {error}"))
+      })?;
+    shutdown_timings.push(("allocatbelt filesystem runtime", elapsed_ns));
+  }
   let shutdown_ns = shutdown_started.elapsed().as_nanos();
   super::write_shutdown_report(
     producer
@@ -560,28 +607,67 @@ fn run_bounded(options: Options, settings: Settings) -> Result<Report, String> {
     observed,
     final_resources,
     shutdown_ns,
-    1,
-    "4 async + 1 reserved blocking worker (unused by HTTP connect) + dedicated reactor; NetHandle::connect_nonblocking",
+    plan.async_workers,
+    if options.workload == Workload::Mixed {
+      plan.async_workers + 1
+    } else {
+      1
+    },
+    if options.workload == Workload::Mixed && plan.async_workers == 2 {
+      "2 async + 1 connector + 2 filesystem workers + dedicated reactor"
+    } else if options.workload == Workload::Mixed {
+      "4 async + 1 connector + 4 filesystem workers + dedicated reactor"
+    } else if plan.async_workers == 2 {
+      "2 async + 1 reserved blocking worker (unused by HTTP connect) + dedicated reactor; NetHandle::connect_nonblocking"
+    } else {
+      "4 async + 1 reserved blocking worker (unused by HTTP connect) + dedicated reactor; NetHandle::connect_nonblocking"
+    },
   ))
 }
 
-fn run_tokio(options: Options, settings: Settings) -> Result<Report, String> {
+fn run_tokio(options: Options, settings: Settings, plan: ArrivalPlan) -> Result<Report, String> {
   let setup_started = Instant::now();
-  let expected_oracle = build_open_loop_checksum_oracle(options.mode, settings)?;
-  let resources = ResourceScope::new(limits());
+  let expected_oracle = if options.mode == Mode::OpenLoop {
+    Some(super::build_plan_expected_oracle(
+      plan,
+      &super::LaneConfig::default(),
+    )?)
+  } else {
+    None
+  };
+  let resources = ResourceScope::new(if options.workload == Workload::Mixed {
+    super::resource_limits(Workload::Mixed)
+  } else {
+    limits()
+  });
   let runtime = tokio::runtime::Builder::new_multi_thread()
-    .worker_threads(WORKERS)
-    .max_blocking_threads(1)
+    .worker_threads(plan.async_workers)
+    .max_blocking_threads(if options.workload == Workload::Mixed {
+      plan.async_workers + 1
+    } else {
+      1
+    })
     .thread_name("allocatbelt-app-tokio")
     .enable_all()
     .build()
     .map_err(|error| format!("Tokio runtime start failed: {error}"))?;
   let handle = runtime.handle().clone();
-  super::warm_tokio(&handle)?;
+  super::warm_tokio_for(&handle, plan.async_workers)?;
   let connector_thread = handle.spawn_blocking(|| thread::current().id());
   let _connector_worker_started = handle
     .block_on(connector_thread)
     .map_err(|error| format!("Tokio connector warm-up failed: {error}"))?;
+  let task_slots = Arc::new(tokio::sync::Semaphore::new(TASK_LIMIT));
+  let mixed_disk_slots = (options.workload == Workload::Mixed)
+    .then(|| Arc::new(tokio::sync::Semaphore::new(plan.async_workers)));
+  if options.workload == Workload::Mixed {
+    super::disk_lane::warm_tokio_workers(&handle, plan.async_workers)?;
+  }
+  let app_submitter = (options.workload == Workload::Mixed).then(|| super::Submitter::Tokio {
+    handle: handle.clone(),
+    slots: task_slots.clone(),
+    disk_slots: mixed_disk_slots,
+  });
 
   let (std_listener, address) = std_listener()?;
   std_listener
@@ -593,7 +679,6 @@ fn run_tokio(options: Options, settings: Settings) -> Result<Report, String> {
       .map_err(|error| format!("Tokio listener registration failed: {error}"))?
   };
 
-  let task_slots = Arc::new(tokio::sync::Semaphore::new(TASK_LIMIT));
   let accept_slot = task_slots
     .clone()
     .try_acquire_owned()
@@ -629,11 +714,12 @@ fn run_tokio(options: Options, settings: Settings) -> Result<Report, String> {
   let (producer_tx, producer_rx) = mpsc::sync_channel(1);
   let observer_resources = resources.clone();
   let observer_expected_oracle = expected_oracle.clone();
+  let observer_application = Observer::Tokio;
   let (observer_tx, observer_rx) = mpsc::sync_channel(1);
   let observer_thread = thread::Builder::new()
     .name("http-application-observer".into())
     .spawn(move || {
-      let report = observe_events(
+      let report = observe_events_with_plan(
         Joiner::Tokio,
         options,
         settings,
@@ -641,6 +727,8 @@ fn run_tokio(options: Options, settings: Settings) -> Result<Report, String> {
         events_rx,
         credits_tx,
         observer_expected_oracle,
+        plan,
+        Some(observer_application),
       );
       let _ = observer_tx.send(report);
     })
@@ -673,6 +761,8 @@ fn run_tokio(options: Options, settings: Settings) -> Result<Report, String> {
         credits_rx,
         options,
         settings,
+        plan,
+        app_submitter,
       );
       let _ = producer_tx.send(report);
     })
@@ -707,6 +797,7 @@ fn run_tokio(options: Options, settings: Settings) -> Result<Report, String> {
     &producer,
     &observed,
     expected_oracle.as_deref(),
+    plan,
   )?;
   if observed
     .last_observed
@@ -757,8 +848,21 @@ fn run_tokio(options: Options, settings: Settings) -> Result<Report, String> {
     observed,
     final_resources,
     shutdown_ns,
-    1,
-    "4 async + 1 reserved blocking worker (unused by HTTP connect) + integrated I/O driver; Tokio TcpSocket::connect",
+    plan.async_workers,
+    if options.workload == Workload::Mixed {
+      plan.async_workers + 1
+    } else {
+      1
+    },
+    if options.workload == Workload::Mixed && plan.async_workers == 2 {
+      "2 async + Tokio blocking pool max3 (filesystem execution cap2) + integrated I/O driver"
+    } else if options.workload == Workload::Mixed {
+      "4 async + Tokio blocking pool max5 (filesystem execution cap4) + integrated I/O driver"
+    } else if plan.async_workers == 2 {
+      "2 async + 1 reserved blocking worker (unused by HTTP connect) + integrated I/O driver; Tokio TcpSocket::connect"
+    } else {
+      "4 async + 1 reserved blocking worker (unused by HTTP connect) + integrated I/O driver; Tokio TcpSocket::connect"
+    },
   ))
 }
 
@@ -895,58 +999,75 @@ fn produce_native(
   credits: mpsc::Receiver<()>,
   options: Options,
   settings: Settings,
+  plan: ArrivalPlan,
+  app_submitter: Option<super::Submitter>,
 ) -> Result<ProducerReport, String> {
   let role_sender = roles.clone();
   let ready_events = events.clone();
-  produce(options, settings, events, credits, move |id, lease| {
-    let net = net.clone();
-    let resources = resources.clone();
-    let operation = async move {
-      let mut stream = net
-        .connect_nonblocking(SocketAddr::V4(address))
-        .await
-        .map_err(|error| format!("allocatbelt HTTP connect failed: {error}"))?;
-      let permit = resources
-        .try_acquire(OperationRequest {
-          disk: 0,
-          network: 1,
-        })
-        .map_err(|error| format!("allocatbelt client endpoint admission failed: {error}"))?;
-      let result = http::transact_client_io(
-        &mut stream,
-        &resources,
-        id,
-        HttpConfig {
-          body_bytes: settings.body_bytes,
-          seed: request_seed(id),
-        },
-      )
-      .await
-      .map_err(|error| error.to_string());
-      drop(stream);
-      drop(permit);
-      result
-    };
-    let ready_events = ready_events.clone();
-    let future = async move {
-      let result = operation.await;
-      let _ = ready_events.send(Event::Ready);
-      result
-    };
-    let job = handle.spawn(future).map_err(|error| {
-      if error.kind == allocatbelt::runtime::asynchronous::AsyncError::Full {
-        SubmitResult::Full
-      } else {
-        SubmitResult::Closed
+  produce_with_plan(
+    options,
+    settings,
+    plan,
+    events,
+    credits,
+    move |id, workload, lease| {
+      if workload != Workload::Http {
+        drop(lease);
+        let submitter = app_submitter.as_ref().ok_or(SubmitResult::Closed)?;
+        return submitter
+          .submit(workload, super::LaneConfig::default(), &resources, id)
+          .map(Submission::App)
+          .map_err(map_app_rejection);
       }
-    })?;
-    let token = PairToken { id, lease };
-    handle
-      .block_on(role_sender.send(token))
-      .map_err(|_| SubmitResult::Closed)?
-      .map_err(|_| SubmitResult::Closed)?;
-    Ok(ClientJob::Bounded { job, result: None })
-  })
+      let net = net.clone();
+      let resources = resources.clone();
+      let operation = async move {
+        let mut stream = net
+          .connect_nonblocking(SocketAddr::V4(address))
+          .await
+          .map_err(|error| format!("allocatbelt HTTP connect failed: {error}"))?;
+        let permit = resources
+          .try_acquire(OperationRequest {
+            disk: 0,
+            network: 1,
+          })
+          .map_err(|error| format!("allocatbelt client endpoint admission failed: {error}"))?;
+        let result = http::transact_client_io(
+          &mut stream,
+          &resources,
+          id,
+          HttpConfig {
+            body_bytes: settings.body_bytes,
+            seed: request_seed(id),
+          },
+        )
+        .await
+        .map_err(|error| error.to_string());
+        drop(stream);
+        drop(permit);
+        result
+      };
+      let ready_events = ready_events.clone();
+      let future = async move {
+        let result = operation.await;
+        let _ = ready_events.send(Event::Ready);
+        result
+      };
+      let job = handle.spawn(future).map_err(|error| {
+        if error.kind == allocatbelt::runtime::asynchronous::AsyncError::Full {
+          SubmitResult::Full
+        } else {
+          SubmitResult::Closed
+        }
+      })?;
+      let token = PairToken { id, lease };
+      handle
+        .block_on(role_sender.send(token))
+        .map_err(|_| SubmitResult::Closed)?
+        .map_err(|_| SubmitResult::Closed)?;
+      Ok(Submission::Http(ClientJob::Bounded { job, result: None }))
+    },
+  )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -960,61 +1081,78 @@ fn produce_tokio(
   credits: mpsc::Receiver<()>,
   options: Options,
   settings: Settings,
+  plan: ArrivalPlan,
+  app_submitter: Option<super::Submitter>,
 ) -> Result<ProducerReport, String> {
   let role_sender = roles.clone();
   let ready_events = events.clone();
-  produce(options, settings, events, credits, move |id, lease| {
-    let task_slot = slots
-      .clone()
-      .try_acquire_owned()
-      .map_err(|error| match error {
-        tokio::sync::TryAcquireError::Closed => SubmitResult::Closed,
-        tokio::sync::TryAcquireError::NoPermits => SubmitResult::Full,
-      })?;
-    let token = PairToken { id, lease };
-    handle
-      .block_on(role_sender.send(token))
-      .map_err(|_| SubmitResult::Closed)?;
-    let resources_for_client = resources.clone();
-    let operation = async move {
-      let stream = tokio_connect_nonblocking(&resources_for_client, address)
+  produce_with_plan(
+    options,
+    settings,
+    plan,
+    events,
+    credits,
+    move |id, workload, lease| {
+      if workload != Workload::Http {
+        drop(lease);
+        let submitter = app_submitter.as_ref().ok_or(SubmitResult::Closed)?;
+        return submitter
+          .submit(workload, super::LaneConfig::default(), &resources, id)
+          .map(Submission::App)
+          .map_err(map_app_rejection);
+      }
+      let task_slot = slots
+        .clone()
+        .try_acquire_owned()
+        .map_err(|error| match error {
+          tokio::sync::TryAcquireError::Closed => SubmitResult::Closed,
+          tokio::sync::TryAcquireError::NoPermits => SubmitResult::Full,
+        })?;
+      let token = PairToken { id, lease };
+      handle
+        .block_on(role_sender.send(token))
+        .map_err(|_| SubmitResult::Closed)?;
+      let resources_for_client = resources.clone();
+      let operation = async move {
+        let stream = tokio_connect_nonblocking(&resources_for_client, address)
+          .await
+          .map_err(|error| format!("Tokio HTTP connect failed: {error}"))?;
+        let permit = resources_for_client
+          .try_acquire(OperationRequest {
+            disk: 0,
+            network: 1,
+          })
+          .map_err(|error| format!("Tokio client endpoint admission failed: {error}"))?;
+        let mut endpoint = TokioEndpoint {
+          stream,
+          _permit: permit,
+        };
+        let result = http::transact_client_io(
+          &mut endpoint,
+          &resources_for_client,
+          id,
+          HttpConfig {
+            body_bytes: settings.body_bytes,
+            seed: request_seed(id),
+          },
+        )
         .await
-        .map_err(|error| format!("Tokio HTTP connect failed: {error}"))?;
-      let permit = resources_for_client
-        .try_acquire(OperationRequest {
-          disk: 0,
-          network: 1,
-        })
-        .map_err(|error| format!("Tokio client endpoint admission failed: {error}"))?;
-      let mut endpoint = TokioEndpoint {
-        stream,
-        _permit: permit,
-      };
-      let result = http::transact_client_io(
-        &mut endpoint,
-        &resources_for_client,
-        id,
-        HttpConfig {
-          body_bytes: settings.body_bytes,
-          seed: request_seed(id),
-        },
-      )
-      .await
-      .map_err(|error| error.to_string());
-      drop(endpoint);
-      result
-    };
-    let ready_events = ready_events.clone();
-    Ok(ClientJob::Tokio {
-      handle: handle.spawn(async move {
-        let _task_slot = task_slot;
-        let result = operation.await;
-        let _ = ready_events.send(Event::Ready);
+        .map_err(|error| error.to_string());
+        drop(endpoint);
         result
-      }),
-      result: None,
-    })
-  })
+      };
+      let ready_events = ready_events.clone();
+      Ok(Submission::Http(ClientJob::Tokio {
+        handle: handle.spawn(async move {
+          let _task_slot = task_slot;
+          let result = operation.await;
+          let _ = ready_events.send(Event::Ready);
+          result
+        }),
+        result: None,
+      }))
+    },
+  )
 }
 
 #[derive(Clone, Copy)]
@@ -1023,23 +1161,32 @@ enum SubmitResult {
   Closed,
 }
 
-fn produce(
+enum Submission {
+  Http(ClientJob),
+  App(super::Job),
+}
+
+fn map_app_rejection(error: super::Rejection) -> SubmitResult {
+  match error {
+    super::Rejection::Full => SubmitResult::Full,
+    super::Rejection::Closed => SubmitResult::Closed,
+  }
+}
+
+fn produce_with_plan(
   options: Options,
   settings: Settings,
+  plan: ArrivalPlan,
   events: ObserverEventSender<Event>,
   credits: mpsc::Receiver<()>,
-  mut submit: impl FnMut(u64, RoleLease) -> Result<ClientJob, SubmitResult>,
+  mut submit: impl FnMut(u64, Workload, RoleLease) -> Result<Submission, SubmitResult>,
 ) -> Result<ProducerReport, String> {
   let started_at = Instant::now();
   let horizon_end = match options.mode {
     Mode::Capacity => started_at + settings.horizon,
-    Mode::OpenLoop => {
-      let rate = options
-        .rate_per_second
-        .expect("validated HTTP open-loop rate");
-      started_at
-        + Duration::from_nanos(((settings.arrivals as u128 * 1_000_000_000) / rate as u128) as u64)
-    }
+    Mode::OpenLoop => started_at
+      .checked_add(Duration::from_nanos(plan.trace_duration_ns()?))
+      .ok_or_else(|| "HTTP arrival trace end instant overflow".to_owned())?,
   };
   let mut attempted = 0usize;
   let mut admitted = 0usize;
@@ -1054,6 +1201,9 @@ fn produce(
     while let Ok(()) = credits.try_recv() {
       outstanding = outstanding.saturating_sub(1);
     }
+    if options.mode == Mode::Capacity {
+      super::wait_until_capacity_pulse(plan, started_at, horizon_end);
+    }
     let (id, scheduled) = match options.mode {
       Mode::Capacity => {
         if Instant::now() >= horizon_end {
@@ -1062,11 +1212,12 @@ fn produce(
         if attempted >= MAX_CAPACITY_JOBS {
           return Err("HTTP capacity lane reached its 10M operation safety cap".into());
         }
+        let pulse_end = super::capacity_pulse_end(plan, started_at, horizon_end);
         while outstanding >= WINDOW {
           if Instant::now() >= horizon_end {
             break;
           }
-          match credits.recv_timeout(horizon_end.saturating_duration_since(Instant::now())) {
+          match credits.recv_timeout(pulse_end.saturating_duration_since(Instant::now())) {
             Ok(()) => outstanding -= 1,
             Err(mpsc::RecvTimeoutError::Timeout) => break,
             Err(mpsc::RecvTimeoutError::Disconnected) => {
@@ -1077,6 +1228,9 @@ fn produce(
         if Instant::now() >= horizon_end {
           break;
         }
+        if Instant::now() >= pulse_end {
+          continue;
+        }
         let id = next_capacity_id;
         next_capacity_id += 1;
         (id, Instant::now())
@@ -1085,11 +1239,10 @@ fn produce(
         if attempted >= settings.arrivals {
           break;
         }
-        let rate = options
-          .rate_per_second
-          .expect("validated HTTP open-loop rate");
-        let offset_ns = (attempted as u128 * 1_000_000_000) / rate as u128;
-        let scheduled = started_at + Duration::from_nanos(offset_ns as u64);
+        let offset_ns = plan.scheduled_offset_ns(attempted as u64)?;
+        let scheduled = started_at
+          .checked_add(Duration::from_nanos(offset_ns))
+          .ok_or_else(|| "HTTP scheduled instant overflow".to_owned())?;
         if let Some(remaining) = scheduled.checked_duration_since(Instant::now()) {
           thread::sleep(remaining);
         }
@@ -1115,8 +1268,9 @@ fn produce(
     let lease = RoleLease {
       _hold: Arc::new(()),
     };
-    match submit(id, lease) {
-      Ok(job) => {
+    let workload = plan.workload_for(id);
+    match submit(id, workload, lease) {
+      Ok(Submission::Http(job)) => {
         admitted += 1;
         outstanding += 1;
         events
@@ -1127,6 +1281,18 @@ fn produce(
             job,
           })
           .map_err(|_| "HTTP observer queue closed before client publication".to_owned())?;
+      }
+      Ok(Submission::App(job)) => {
+        admitted += 1;
+        outstanding += 1;
+        events
+          .send(Event::App {
+            id,
+            scheduled,
+            horizon_end,
+            job,
+          })
+          .map_err(|_| "HTTP observer queue closed before application publication".to_owned())?;
       }
       Err(SubmitResult::Full) => {
         rejected_backend_full += 1;
@@ -1144,8 +1310,14 @@ fn produce(
       }
     }
   }
+  if options.mode == Mode::OpenLoop
+    && let Some(remaining) = horizon_end.checked_duration_since(Instant::now())
+  {
+    thread::sleep(remaining);
+  }
   let production_end = Instant::now();
-  let trace_overrun = super::trace_exceeded(options.mode, started_at, production_end);
+  let trace_overrun =
+    super::trace_exceeded_for_plan(options.mode, started_at, production_end, plan)?;
   let report = ProducerReport {
     attempted,
     admitted,
@@ -1227,6 +1399,7 @@ impl Joiner {
   }
 }
 
+#[cfg(test)]
 fn observe_events(
   joiner: Joiner,
   options: Options,
@@ -1235,6 +1408,33 @@ fn observe_events(
   events: mpsc::Receiver<Event>,
   credits: mpsc::SyncSender<()>,
   expected_oracle: Option<Arc<Vec<u64>>>,
+) -> Result<ObserverReport, String> {
+  let rate = options.rate_per_second.unwrap_or(1);
+  let plan = ArrivalPlan::new(Profile::Steady, options.workload, settings.arrivals, rate)?;
+  observe_events_with_plan(
+    joiner,
+    options,
+    settings,
+    resources,
+    events,
+    credits,
+    expected_oracle,
+    plan,
+    None,
+  )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn observe_events_with_plan(
+  joiner: Joiner,
+  options: Options,
+  settings: Settings,
+  resources: ResourceScope,
+  events: mpsc::Receiver<Event>,
+  credits: mpsc::SyncSender<()>,
+  expected_oracle: Option<Arc<Vec<u64>>>,
+  plan: ArrivalPlan,
+  application_observer: Option<Observer>,
 ) -> Result<ObserverReport, String> {
   let mut pending = HashMap::<u64, PendingPair>::new();
   pending
@@ -1247,6 +1447,10 @@ fn observe_events(
   handler_jobs
     .try_reserve_exact(WINDOW)
     .map_err(|_| "could not reserve bounded HTTP handler jobs".to_owned())?;
+  let mut application_jobs = Vec::<(u64, Instant, Instant, super::Job)>::new();
+  application_jobs
+    .try_reserve_exact(WINDOW)
+    .map_err(|_| "could not reserve bounded mixed application jobs".to_owned())?;
   let mut states = if options.mode == Mode::OpenLoop {
     let mut values = Vec::new();
     values
@@ -1278,6 +1482,8 @@ fn observe_events(
       .map_err(|_| "could not reserve bounded HTTP latency samples".to_owned())?;
   }
   let mut max_observed_managed_bytes = 0usize;
+  let mut retained_outputs = VecDeque::<WorkOutput>::new();
+  let mut retained_managed_bytes = 0usize;
   let mut last_observed = Instant::now();
   let completion_waker = Waker::from(Arc::new(ObserverWake(thread::current())));
 
@@ -1337,16 +1543,22 @@ fn observe_events(
             *state = IdState::Rejected;
           }
           let completion = Instant::now();
-          let rate = options
-            .rate_per_second
-            .ok_or_else(|| "HTTP open-loop rate missing".to_owned())?;
           let (scheduled_ns, completion_ns) =
-            super::arrival_times(id, scheduled, completion, rate)?;
-          let expected_checksum =
-            expected_response_checksum(expected_oracle.as_deref(), id, settings)
-              .ok_or_else(|| "HTTP per-ID oracle missed a rejected request".to_owned())?;
+            super::arrival_times_for_plan(id, scheduled, completion, plan)?;
+          let workload = plan.workload_for(id);
+          let expected_checksum = expected_oracle
+            .as_deref()
+            .and_then(|values| values.get(id as usize).copied())
+            .unwrap_or_else(|| {
+              if workload == Workload::Http {
+                expected_request_checksum(id, settings.body_bytes)
+              } else {
+                super::expected_value(workload, &super::LaneConfig::default(), id)
+              }
+            });
           records.push(super::IdRecord {
             id,
+            workload,
             scheduled_ns,
             completion_ns,
             terminal: "rejected",
@@ -1356,6 +1568,27 @@ fn observe_events(
         }
         Event::Handler(record) => {
           handler_jobs.push((record.id, record.job, record._lease));
+        }
+        Event::App {
+          id,
+          scheduled,
+          horizon_end,
+          job,
+        } => {
+          if id != next_scheduled_id {
+            return Err("HTTP producer published application IDs out of sequence".into());
+          }
+          next_scheduled_id += 1;
+          if let Some(states) = &mut states {
+            let state = states
+              .get_mut(id as usize)
+              .ok_or_else(|| "mixed application ID was out of range".to_owned())?;
+            if *state != IdState::Unseen {
+              return Err("HTTP producer repeated an open-loop application ID".into());
+            }
+            *state = IdState::Admitted;
+          }
+          application_jobs.push((id, scheduled, horizon_end, job));
         }
         Event::Ready => {}
       }
@@ -1392,6 +1625,108 @@ fn observe_events(
       if let Some((_, _, job)) = pair.client.as_mut() {
         let _ = job.poll_finished(&mut context);
       }
+    }
+
+    let mut index = 0;
+    while index < application_jobs.len() {
+      if application_jobs[index]
+        .3
+        .poll_finished(&mut context)
+        .is_pending()
+      {
+        index += 1;
+        continue;
+      }
+      let (id, scheduled, horizon_end, job) = application_jobs.swap_remove(index);
+      made_progress = true;
+      let result = application_observer
+        .as_ref()
+        .ok_or_else(|| "mixed application observer is missing".to_owned())?
+        .join(job);
+      let observed = Instant::now();
+      last_observed = observed;
+      if options.mode == Mode::OpenLoop {
+        latencies.push(observed.saturating_duration_since(scheduled).as_nanos() as u64);
+      }
+      let workload = plan.workload_for(id);
+      let oracle_checksum = expected_oracle
+        .as_deref()
+        .and_then(|values| values.get(id as usize).copied())
+        .unwrap_or_else(|| super::expected_value(workload, &super::LaneConfig::default(), id));
+      let mut checksum = 0;
+      let succeeded = match result {
+        Ok(output)
+          if super::validate_output_with_oracle(
+            workload,
+            &super::LaneConfig::default(),
+            id,
+            &output,
+            expected_oracle.as_deref(),
+          ) =>
+        {
+          let value = output.value();
+          checksum = value;
+          if observed <= horizon_end {
+            on_time += 1;
+          } else {
+            late += 1;
+          }
+          digest = digest.wrapping_add(value ^ id);
+          if let Some(states) = &mut states {
+            let state = states
+              .get_mut(id as usize)
+              .ok_or_else(|| "mixed observer saw an out-of-range ID".to_owned())?;
+            if *state != IdState::Admitted {
+              return Err("mixed observer saw a duplicate or unadmitted ID".into());
+            }
+            *state = IdState::Completed;
+          }
+          if let WorkOutput::Memory(memory) = output {
+            if retained_outputs.len() == WINDOW
+              && let Some(WorkOutput::Memory(old)) = retained_outputs.pop_front()
+            {
+              retained_managed_bytes =
+                retained_managed_bytes.saturating_sub(old.buffer.charged_bytes());
+            }
+            retained_managed_bytes += memory.buffer.charged_bytes();
+            retained_outputs.push_back(WorkOutput::Memory(memory));
+          }
+          true
+        }
+        Ok(_) => {
+          errors += 1;
+          first_error
+            .get_or_insert_with(|| "mixed result checksum differs from its ID oracle".into());
+          false
+        }
+        Err(error) => {
+          errors += 1;
+          first_error.get_or_insert(error);
+          false
+        }
+      };
+      if !succeeded
+        && let Some(states) = &mut states
+        && let Some(state) = states.get_mut(id as usize)
+        && *state == IdState::Admitted
+      {
+        *state = IdState::Failed;
+      }
+      if options.mode == Mode::OpenLoop {
+        let (scheduled_ns, completion_ns) =
+          super::arrival_times_for_plan(id, scheduled, observed, plan)?;
+        records.push(super::IdRecord {
+          id,
+          workload,
+          scheduled_ns,
+          completion_ns,
+          terminal: if succeeded { "completed" } else { "error" },
+          checksum,
+          expected_checksum: oracle_checksum,
+        });
+      }
+      completed += 1;
+      let _ = credits.send(());
     }
 
     while let Some(id) = pending.iter().find_map(|(id, pair)| {
@@ -1441,7 +1776,11 @@ fn observe_events(
           } else {
             late += 1;
           }
-          digest = digest.wrapping_add(value);
+          digest = digest.wrapping_add(if plan.workload == Workload::Mixed {
+            value ^ id
+          } else {
+            value
+          });
           if let Some(states) = &mut states {
             let state = states
               .get_mut(id as usize)
@@ -1466,15 +1805,15 @@ fn observe_events(
         }
       }
       if options.mode == Mode::OpenLoop {
-        let rate = options
-          .rate_per_second
-          .ok_or_else(|| "HTTP open-loop rate missing".to_owned())?;
-        let (scheduled_ns, completion_ns) = super::arrival_times(id, scheduled, observed, rate)?;
+        let (scheduled_ns, completion_ns) =
+          super::arrival_times_for_plan(id, scheduled, observed, plan)?;
+        let workload = plan.workload_for(id);
         let expected_checksum =
           expected_response_checksum(expected_oracle.as_deref(), id, settings)
             .ok_or_else(|| "HTTP per-ID oracle missed a completed request".to_owned())?;
         records.push(super::IdRecord {
           id,
+          workload,
           scheduled_ns,
           completion_ns,
           terminal: if succeeded { "completed" } else { "error" },
@@ -1496,10 +1835,11 @@ fn observe_events(
         return Err(format!(
           "HTTP event channel closed before producer completion (completed {completed}, handler jobs {}, pending {})",
           handler_jobs.len(),
-          pending.len(),
+          pending.len() + application_jobs.len(),
         ));
       }
       if handler_jobs.is_empty()
+        && application_jobs.is_empty()
         && pending
           .values()
           .any(|pair| pair.client.is_none() || pair.handler.is_none())
@@ -1510,7 +1850,11 @@ fn observe_events(
           pending.len(),
         ));
       }
-      if handler_jobs.is_empty() && pending.is_empty() && completed < producer.unwrap().admitted {
+      if handler_jobs.is_empty()
+        && application_jobs.is_empty()
+        && pending.is_empty()
+        && completed < producer.unwrap().admitted
+      {
         return Err(format!(
           "HTTP event channel closed before all admitted pairs were reported (completed {completed}, admitted {})",
           producer.unwrap().admitted,
@@ -1555,7 +1899,11 @@ fn observe_events(
                 .ok_or_else(|| "HTTP open-loop checksum oracle missed a completed ID".to_owned())?,
               None => expected_request_checksum(id as u64, settings.body_bytes),
             };
-            expected = expected.wrapping_add(expected_value);
+            expected = expected.wrapping_add(if plan.workload == Workload::Mixed {
+              expected_value ^ id as u64
+            } else {
+              expected_value
+            });
           }
           IdState::Rejected => {}
           _ => return Err("HTTP open-loop ID table has an unresolved request".into()),
@@ -1564,7 +1912,17 @@ fn observe_events(
     }
     None => {
       for id in 0..producer.admitted as u64 {
-        expected = expected.wrapping_add(expected_request_checksum(id, settings.body_bytes));
+        let workload = plan.workload_for(id);
+        let value = if workload == Workload::Http {
+          expected_request_checksum(id, settings.body_bytes)
+        } else {
+          super::expected_value(workload, &super::LaneConfig::default(), id)
+        };
+        expected = expected.wrapping_add(if plan.workload == Workload::Mixed {
+          value ^ id
+        } else {
+          value
+        });
       }
     }
   }
@@ -1582,6 +1940,7 @@ fn observe_events(
     expected,
     latencies,
     max_observed_managed_bytes,
+    retained_managed_bytes,
     last_observed,
     records,
   })
@@ -1678,6 +2037,7 @@ fn validate_response_pair(
   Ok(client_checksum)
 }
 
+#[cfg(test)]
 fn build_open_loop_checksum_oracle(
   mode: Mode,
   settings: Settings,
@@ -1708,6 +2068,7 @@ fn validate_pair_counts(
   producer: &ProducerReport,
   observer: &ObserverReport,
   expected_oracle: Option<&Vec<u64>>,
+  plan: ArrivalPlan,
 ) -> Result<(), String> {
   let completed = observer.on_time + observer.late;
   if producer.rejected_full != producer.rejected_logical_window + producer.rejected_backend_full
@@ -1734,6 +2095,12 @@ fn validate_pair_counts(
     }
     let (recorded_completed, recorded_rejected) =
       super::validate_id_records(&observer.records, oracle)?;
+    if observer.records.iter().any(|record| {
+      plan.workload_for(record.id) != record.workload
+        || plan.scheduled_offset_ns(record.id).ok() != Some(record.scheduled_ns)
+    }) {
+      return Err("HTTP per-ID schedule or workload differs from the canonical profile".into());
+    }
     if recorded_completed != producer.admitted || recorded_rejected != producer.rejected_full {
       return Err("HTTP per-ID terminal counts differ from the producer report".into());
     }
@@ -1741,12 +2108,14 @@ fn validate_pair_counts(
   Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_report(
   checkpoints: super::ProcessCheckpoints,
   producer: ProducerReport,
   observer: ObserverReport,
   final_resources: ResourceSnapshot,
   shutdown_ns: u128,
+  async_workers: usize,
   blocking_workers: usize,
   topology: &'static str,
 ) -> Report {
@@ -1775,11 +2144,12 @@ fn build_report(
     p95_ns: percentile(&latencies, 95),
     p99_ns: percentile(&latencies, 99),
     max_observed_managed_bytes: observer.max_observed_managed_bytes,
+    retained_managed_bytes: observer.retained_managed_bytes,
     final_resources,
     shutdown_ns,
     last_observed,
     drain_tail_ns,
-    async_workers: WORKERS,
+    async_workers,
     blocking_workers,
     topology,
     records: observer.records,
@@ -1811,17 +2181,25 @@ fn print_row(allocator: &str, options: Options, report: &Report) {
   let drained_rate =
     (report.on_time + report.late) as f64 / wall_ns.max(1) as f64 * 1_000_000_000.0;
   let values = [
-    super::HTTP_CONNECT_POLICY_SCHEMA.to_owned(),
+    if options.workload == Workload::Mixed {
+      "mixed-application-v1".to_owned()
+    } else {
+      super::HTTP_CONNECT_POLICY_SCHEMA.to_owned()
+    },
     allocator.to_owned(),
     options.executor.label().to_owned(),
-    "http".to_owned(),
+    options.workload.label().to_owned(),
     options.mode.label().to_owned(),
     report.async_workers.to_string(),
     report.blocking_workers.to_string(),
     report.topology.to_owned(),
     WINDOW.to_string(),
     TASK_LIMIT.to_string(),
-    "0".to_owned(),
+    if options.workload == Workload::Mixed {
+      WINDOW.to_string()
+    } else {
+      "0".to_owned()
+    },
     options
       .rate_per_second
       .map_or(String::new(), |rate| rate.to_string()),
@@ -1866,10 +2244,21 @@ fn print_row(allocator: &str, options: Options, report: &Report) {
     },
     report.producer.lateness_max_ns.to_string(),
     report.max_observed_managed_bytes.to_string(),
-    "0".to_owned(),
-    limits().managed_memory.to_string(),
-    "0".to_owned(),
-    limits().network_concurrent_ops.to_string(),
+    report.retained_managed_bytes.to_string(),
+    if options.workload == Workload::Mixed {
+      super::resource_limits(Workload::Mixed)
+        .managed_memory
+        .to_string()
+    } else {
+      limits().managed_memory.to_string()
+    },
+    if options.workload == Workload::Mixed {
+      "8"
+    } else {
+      "0"
+    }
+    .to_owned(),
+    "16".to_owned(),
     report.final_resources.managed_memory.to_string(),
     report.final_resources.disk_ops.to_string(),
     report.final_resources.network_ops.to_string(),
@@ -2558,7 +2947,16 @@ mod tests {
   #[test]
   fn allocatbelt_pairs_each_http_client_with_handler_and_cleans_ledgers() {
     let mode = Mode::OpenLoop;
-    let report = run_bounded(options(Executor::Bounded, mode, Some(1000)), settings(mode))
+    let selected_options = options(Executor::Bounded, mode, Some(1000));
+    let selected_settings = settings(mode);
+    let plan = super::super::ArrivalPlan::new(
+      super::super::Profile::Steady,
+      super::super::Workload::Http,
+      selected_settings.arrivals,
+      1000,
+    )
+    .expect("steady HTTP plan");
+    let report = run_bounded(selected_options, selected_settings, plan)
       .expect("bounded HTTP pair lane should drain");
     assert_eq!(report.producer.attempted, 32);
     assert_eq!(report.producer.admitted, report.on_time + report.late);
@@ -2566,12 +2964,91 @@ mod tests {
     assert_eq!(report.digest, report.expected);
     assert_eq!(report.final_resources.managed_memory, 0);
     assert_eq!(report.final_resources.network_ops, 0);
+    assert_eq!(report.records.len(), 32);
+  }
+
+  #[test]
+  fn mixed_trace_dispatches_all_four_families_through_one_executor_domain() {
+    for executor in [Executor::Bounded, Executor::Tokio] {
+      let selected_options = Options {
+        executor,
+        workload: Workload::Mixed,
+        mode: Mode::OpenLoop,
+        rate_per_second: Some(16),
+      };
+      let selected_settings = Settings {
+        horizon: super::CAPACITY_HORIZON,
+        arrivals: 16,
+        body_bytes: super::BODY_BYTES,
+      };
+      let plan = super::super::ArrivalPlan::new(
+        super::super::Profile::Mixed,
+        Workload::Mixed,
+        selected_settings.arrivals,
+        16,
+      )
+      .expect("mixed one-per-family schedule");
+      let report = match executor {
+        Executor::Bounded => run_bounded(selected_options, selected_settings, plan),
+        Executor::Tokio => run_tokio(selected_options, selected_settings, plan),
+      }
+      .expect("mixed per-ID lane should complete and validate");
+      assert_eq!(report.producer.attempted, 16);
+      assert_eq!(report.producer.admitted, 16);
+      assert!(
+        report
+          .producer
+          .production_end
+          .saturating_duration_since(report.producer.started_at)
+          >= Duration::from_nanos(plan.trace_duration_ns().expect("finite mixed horizon")),
+        "producer must remain open through the canonical mixed trace horizon"
+      );
+      assert_eq!(report.on_time + report.late, 16);
+      assert_eq!(report.errors, 0);
+      assert_eq!(report.digest, report.expected);
+      assert_eq!(report.final_resources.managed_memory, 0);
+      assert_eq!(report.final_resources.disk_ops, 0);
+      assert_eq!(report.final_resources.network_ops, 0);
+      assert_eq!(report.records.len(), 16);
+      for id in 0..16 {
+        assert!(
+          report
+            .records
+            .iter()
+            .any(|record| { record.id == id && record.workload == plan.workload_for(id) })
+        );
+      }
+      for workload in [
+        Workload::Cpu,
+        Workload::Memory,
+        Workload::Http,
+        Workload::Disk,
+      ] {
+        assert_eq!(
+          report
+            .records
+            .iter()
+            .filter(|record| record.workload == workload)
+            .count(),
+          4
+        );
+      }
+    }
   }
 
   #[test]
   fn tokio_pairs_each_http_client_with_handler_and_cleans_ledgers() {
     let mode = Mode::Capacity;
-    let report = run_tokio(options(Executor::Tokio, mode, None), settings(mode))
+    let selected_options = options(Executor::Tokio, mode, None);
+    let selected_settings = settings(mode);
+    let plan = super::super::ArrivalPlan::new(
+      super::super::Profile::Steady,
+      super::super::Workload::Http,
+      selected_settings.arrivals,
+      1,
+    )
+    .expect("capacity HTTP plan");
+    let report = run_tokio(selected_options, selected_settings, plan)
       .expect("Tokio HTTP pair lane should drain");
     assert_eq!(report.producer.rejected_full, 0);
     assert_eq!(report.producer.admitted, report.on_time + report.late);

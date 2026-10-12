@@ -14,7 +14,11 @@ secure feature from the main bench workspace. It imports the same
 allocators. Build and audit it separately from the secure baseline.
 
 Each application binary selects its global allocator and accepts
-`--executor bounded|tokio --workload cpu|memory|http|disk --mode capacity|open_loop`.
+`--executor bounded|tokio --workload cpu|memory|http|disk|mixed --mode capacity|open_loop`.
+Profiles are `steady`, `mixed`, `burst`, `oversubscribed` and `safety_overload`.
+Mixed work uses one executor and shared local resource ledger, evenly cycling
+CPU, memory, HTTP and disk IDs. This profile harness does not yet qualify the
+runtime's global/tenant domain or autonomous controls.
 Open-loop runs also require `--rate`. A process executes one cell and emits a
 TSV header plus one result row. CPU, memory, and disk retain schema `2`, which
 appends `rejected_logical_window` and `rejected_backend_full` while retaining
@@ -39,7 +43,12 @@ and system CPU time and maximum RSS. `timer_pair_median_ns` is the median of
 257 back-to-back `Instant` pairs measured before arrivals; it is diagnostic
 context, not subtracted from operation latencies.
 
-The lanes use four async workers and a logical window of eight. HTTP counts
+The lanes use four async workers, or two for the oversubscribed profile, and a
+logical window of eight. Burst arrivals pack one second's average-rate work
+into a 250 ms pulse followed by 750 ms idle. Backlogged burst capacity refills
+only during pulses and reports throughput over full cycles. Open-loop producers
+wait through the entire canonical trace horizon, including the final idle gap.
+HTTP counts
 8 client jobs, 8 handler jobs, and one accept job (global task cap 17), with
 pre-accept handler leases and up to 16 retained endpoint descriptors. Both
 executors connect once to the checked IPv4 loopback address without DNS or
@@ -92,11 +101,17 @@ reference at result validation. Setup time remains reported and whole-process
 CPU measurements include oracle setup; the arrival clock and response latency
 measurements begin after setup.
 
+Mixed observers apply the same memory-byte and disk-metadata checks as the
+standalone lanes. Their managed ceiling covers eight retained disk buffers plus
+eight retained memory results. Both executors cap filesystem execution at the
+profile's worker count; Tokio's unused connector capacity does not enlarge that
+filesystem cap. Response timestamps follow consumption of the joined result.
+
 `scripts/run-application-pair.sh` prepares one fresh bounded/Tokio pair for a
 single allocator/workload/mode/rate. It pins both processes to the supplied CPU
 set and applies finite phase deadlines: by default, 300 seconds for the
 open-loop trace, 300 seconds from production end through drain, 60 seconds per
-explicit driver shutdown, and 900 seconds for the whole process. Validated CLI
+explicit driver shutdown, and 1,200 seconds for the whole process. Validated CLI
 settings can extend these bounds for larger preregistered traces. The process limit also bounds
 failures outside those phase-specific watchdogs.
 The runner captures the TSV rows and
@@ -115,6 +130,9 @@ rates, and rejects non-monotone latency quantiles. Open-loop losses remain
 visible in a valid descriptive row; accepted-only p99 is eligible only when
 all requested arrivals were admitted and completed without rejection.
 Full qualification additionally requires the preregistered observation count.
+Standalone p99 eligibility requires at least 100,000 successful observations;
+mixed eligibility requires 400,000, including 100,000 from each family. Smaller
+valid traces are descriptive only. Deliberate overload is always safety-only.
 The secondary wall-through-drain rate uses the later of production end and
 the last consumed result as its endpoint, so early completion cannot shorten
 the denominator below the full production horizon.

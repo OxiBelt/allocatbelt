@@ -38,7 +38,7 @@ const MAX_CAPACITY_JOBS: usize = 10_000_000;
 const WARMUP_TIMEOUT: Duration = Duration::from_secs(30);
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(300);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(60);
-const PROCESS_TIMEOUT: Duration = Duration::from_secs(900);
+const PROCESS_TIMEOUT: Duration = Duration::from_secs(1200);
 pub(super) const SETUP_DEADLINE: Duration = Duration::from_secs(120);
 const MAX_RETAINED_MEMORY_OUTPUTS: usize = WINDOW;
 static EXECUTION_DEADLINES: OnceLock<ExecutionDeadlines> = OnceLock::new();
@@ -72,6 +72,43 @@ pub(super) fn remaining_process_deadline(started: Instant) -> Duration {
     .map_or(Duration::ZERO, |deadline| {
       deadline.saturating_duration_since(Instant::now())
     })
+}
+
+pub(super) fn capacity_pulse_end(
+  plan: ArrivalPlan,
+  started: Instant,
+  horizon_end: Instant,
+) -> Instant {
+  if plan.profile != Profile::Burst {
+    return horizon_end;
+  }
+  let elapsed_ns = Instant::now().saturating_duration_since(started).as_nanos();
+  let cycle = (elapsed_ns / 1_000_000_000) as u64;
+  started
+    .checked_add(Duration::from_secs(cycle))
+    .and_then(|cycle_start| cycle_start.checked_add(Duration::from_millis(250)))
+    .map_or(horizon_end, |pulse_end| pulse_end.min(horizon_end))
+}
+
+pub(super) fn wait_until_capacity_pulse(plan: ArrivalPlan, started: Instant, horizon_end: Instant) {
+  if plan.profile != Profile::Burst {
+    return;
+  }
+  let now = Instant::now();
+  let elapsed_ns = now.saturating_duration_since(started).as_nanos();
+  let phase_ns = elapsed_ns % 1_000_000_000;
+  if capacity_pulse_active(elapsed_ns) {
+    return;
+  }
+  let wait_ns = 1_000_000_000 - phase_ns;
+  let pulse_start = now
+    .checked_add(Duration::from_nanos(wait_ns as u64))
+    .unwrap_or(horizon_end);
+  thread::sleep(pulse_start.min(horizon_end).saturating_duration_since(now));
+}
+
+fn capacity_pulse_active(elapsed_ns: u128) -> bool {
+  elapsed_ns % 1_000_000_000 < 250_000_000
 }
 pub(super) const HTTP_CONNECT_POLICY_SCHEMA: &str = "http-nonblocking-connect-v1";
 const TSV_HEADER: &str = "schema\tallocator\texecutor\tworkload\tmode\tasync_workers\tblocking_workers\ttopology\tlogical_window\tglobal_task_limit\tretained_window\tarrival_rate_per_second\trequested_arrivals\tattempted\tadmitted\trejected_full\trejected_resource\tcompleted_on_time\tcompleted_late\terrors\tcancellations\tunresolved\tlost\tresult_digest\texpected_digest\tcapacity_publications_per_second\tsuccessful_throughput_through_drain_per_second\tsetup_ns\ttimer_pair_median_ns\twall_through_drain_ns\tdrain_tail_ns\tresponse_p50_ns\tresponse_p95_ns\tresponse_p99_ns\tproducer_lateness_mean_ns\tproducer_lateness_max_ns\tmax_observed_managed_bytes\tretained_managed_bytes\tmanaged_limit_bytes\tdisk_limit_ops\tnetwork_limit_ops\tfinal_managed_bytes\tfinal_disk_ops\tfinal_network_ops\trss_before_kib\trss_after_drain_kib\trss_after_shutdown_kib\thwm_before_kib\thwm_after_drain_kib\thwm_after_shutdown_kib\tshutdown_ns\trejected_logical_window\trejected_backend_full";
@@ -113,26 +150,174 @@ pub enum Workload {
   Http,
   /// Multi-chunk positional file transaction.
   Disk,
+  /// Evenly interleaved CPU, memory, HTTP, and disk transactions.
+  Mixed,
 }
 
 impl Workload {
-  fn parse(value: &str) -> Result<Self, String> {
+  pub(super) fn parse(value: &str) -> Result<Self, String> {
     match value {
       "cpu" => Ok(Self::Cpu),
       "memory" => Ok(Self::Memory),
       "http" => Ok(Self::Http),
       "disk" => Ok(Self::Disk),
-      _ => Err("--workload must be cpu, memory, http, or disk".into()),
+      "mixed" => Ok(Self::Mixed),
+      _ => Err("--workload must be cpu, memory, http, disk, or mixed".into()),
     }
   }
 
-  fn label(self) -> &'static str {
+  pub(super) fn label(self) -> &'static str {
     match self {
       Self::Cpu => "cpu",
       Self::Memory => "memory",
       Self::Http => "http",
       Self::Disk => "disk",
+      Self::Mixed => "mixed",
     }
+  }
+}
+
+/// Frozen open-loop arrival/workload schedule.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Profile {
+  /// Uniform single-workload arrivals.
+  Steady,
+  /// One global stream evenly split across CPU, memory, HTTP, and disk.
+  Mixed,
+  /// Uniform average rate delivered in 250 ms pulses once per second.
+  Burst,
+  /// Uniform arrivals on a matched two-worker executor.
+  Oversubscribed,
+  /// Deliberate safety overload, excluded from qualification.
+  SafetyOverload,
+}
+
+impl Profile {
+  fn parse(value: &str) -> Result<Self, String> {
+    match value {
+      "steady" => Ok(Self::Steady),
+      "mixed" => Ok(Self::Mixed),
+      "burst" => Ok(Self::Burst),
+      "oversubscribed" => Ok(Self::Oversubscribed),
+      "safety_overload" => Ok(Self::SafetyOverload),
+      _ => Err("--profile must be steady, mixed, burst, oversubscribed, or safety_overload".into()),
+    }
+  }
+
+  pub fn label(self) -> &'static str {
+    match self {
+      Self::Steady => "steady",
+      Self::Mixed => "mixed",
+      Self::Burst => "burst",
+      Self::Oversubscribed => "oversubscribed",
+      Self::SafetyOverload => "safety_overload",
+    }
+  }
+
+  pub fn minimum_successes(self) -> usize {
+    if self == Self::Mixed {
+      400_000
+    } else {
+      100_000
+    }
+  }
+
+  pub fn qualifies(self) -> bool {
+    self != Self::SafetyOverload
+  }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ArrivalPlan {
+  pub profile: Profile,
+  pub workload: Workload,
+  pub arrivals: usize,
+  pub average_rate_per_second: u64,
+  pub async_workers: usize,
+}
+
+impl ArrivalPlan {
+  fn new(profile: Profile, workload: Workload, arrivals: usize, rate: u64) -> Result<Self, String> {
+    validate_arrivals(arrivals)?;
+    if rate == 0 || rate > 1_000_000_000 {
+      return Err("open-loop --rate must be in 1..=1000000000".into());
+    }
+    if profile == Profile::Mixed && workload != Workload::Mixed {
+      return Err("--profile mixed requires --workload mixed".into());
+    }
+    if workload == Workload::Mixed && profile == Profile::Steady {
+      return Err(
+        "--workload mixed requires the mixed, burst, oversubscribed, or safety_overload profile"
+          .into(),
+      );
+    }
+    if profile == Profile::Burst && rate > 250_000_000 {
+      return Err("burst average rate must not exceed 250000000 arrivals per second".into());
+    }
+    Ok(Self {
+      profile,
+      workload,
+      arrivals,
+      average_rate_per_second: rate,
+      async_workers: if profile == Profile::Oversubscribed {
+        2
+      } else {
+        WORKERS
+      },
+    })
+  }
+
+  pub fn workload_for(self, id: u64) -> Workload {
+    if self.workload != Workload::Mixed {
+      return self.workload;
+    }
+    match id % 4 {
+      0 => Workload::Cpu,
+      1 => Workload::Memory,
+      2 => Workload::Http,
+      _ => Workload::Disk,
+    }
+  }
+
+  pub fn scheduled_offset_ns(self, id: u64) -> Result<u64, String> {
+    if id >= self.arrivals as u64 {
+      return Err("arrival plan ID is outside its finite count".into());
+    }
+    let offset = match self.profile {
+      Profile::Burst => {
+        let rate = u128::from(self.average_rate_per_second);
+        let cycle = u128::from(id) / rate;
+        let slot = u128::from(id) % rate;
+        cycle
+          .checked_mul(1_000_000_000)
+          .and_then(|base| base.checked_add(slot.checked_mul(250_000_000)? / rate))
+          .ok_or_else(|| "burst arrival offset overflow".to_owned())?
+      }
+      _ => {
+        u128::from(id)
+          .checked_mul(1_000_000_000)
+          .ok_or_else(|| "arrival offset overflow".to_owned())?
+          / u128::from(self.average_rate_per_second)
+      }
+    };
+    u64::try_from(offset).map_err(|_| "arrival offset exceeds finite timestamp".to_owned())
+  }
+
+  pub fn trace_duration_ns(self) -> Result<u64, String> {
+    let duration = if self.profile == Profile::Burst {
+      let rate = u128::from(self.average_rate_per_second);
+      let cycles = (self.arrivals as u128).div_ceil(rate);
+      cycles
+        .checked_mul(1_000_000_000)
+        .ok_or_else(|| "burst trace duration overflow".to_owned())?
+    } else {
+      (self.arrivals as u128)
+        .checked_mul(1_000_000_000)
+        .ok_or_else(|| "open-loop trace duration overflow".to_owned())?
+        / u128::from(self.average_rate_per_second)
+    };
+    u64::try_from(duration)
+      .map_err(|_| "open-loop trace duration exceeds finite timestamp".to_owned())
   }
 }
 
@@ -177,7 +362,7 @@ pub struct Options {
 }
 
 #[derive(Clone, Copy, Debug)]
-struct LaneConfig {
+pub(super) struct LaneConfig {
   rounds: u32,
   memory: MemoryConfig,
   disk: DiskConfig,
@@ -419,6 +604,7 @@ async fn operation(
       };
       Ok(WorkOutput::Disk(output))
     }
+    Workload::Mixed => Err("mixed workload must be dispatched by its per-ID plan".into()),
   }
 }
 
@@ -505,6 +691,7 @@ struct ObserverReport {
 #[derive(Clone, Copy, Debug)]
 pub(super) struct IdRecord {
   pub(super) id: u64,
+  pub(super) workload: Workload,
   pub(super) scheduled_ns: u64,
   pub(super) completion_ns: u64,
   pub(super) terminal: &'static str,
@@ -519,6 +706,7 @@ pub(crate) struct Counts {
   expected_checksum: u64,
   final_resources: allocatbelt::runtime::managed::ResourceSnapshot,
   blocking_workers: usize,
+  async_workers: usize,
   topology: &'static str,
   setup_ns: u128,
   timer_pair_median_ns: u64,
@@ -647,6 +835,7 @@ pub(super) fn write_id_report(
   records: &[IdRecord],
   allocator: &str,
   options: Options,
+  profile: Profile,
 ) -> Result<(), String> {
   let Some(path) = env::var_os("ALLOCATBELT_APP_ID_REPORT") else {
     return Ok(());
@@ -664,17 +853,20 @@ pub(super) fn write_id_report(
   }
   let mut ordered = records.to_vec();
   ordered.sort_unstable_by_key(|record| record.id);
-  let mut report = String::from("schema\tallocatbelt-app-arrivals-v2\nidentity\t");
+  let mut report = String::from("schema\tallocatbelt-app-arrivals-v3\nidentity\t");
   report.push_str(&format!(
-    "{nonce}\t{run_id}\t{}\t{allocator}\t{}\t{source_hash}\t{binary_hash}\n",
+    "{nonce}\t{run_id}\t{}\t{allocator}\t{}\t{}\t{source_hash}\t{binary_hash}\n",
     options.executor.label(),
-    options.workload.label()
+    options.workload.label(),
+    profile.label()
   ));
-  report.push_str("id\tscheduled_ns\tcompletion_ns\tterminal\tchecksum\texpected_checksum\n");
+  report
+    .push_str("id\tworkload\tscheduled_ns\tcompletion_ns\tterminal\tchecksum\texpected_checksum\n");
   for record in ordered {
     report.push_str(&format!(
-      "{}\t{}\t{}\t{}\t{}\t{}\n",
+      "{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
       record.id,
+      record.workload.label(),
       record.scheduled_ns,
       record.completion_ns,
       record.terminal,
@@ -718,57 +910,69 @@ pub(super) fn measure_timer_pair_median_ns() -> u64 {
   samples[samples.len() / 2]
 }
 
+#[cfg(test)]
 fn run_with_limits(
   options: Options,
   capacity_horizon: Option<Duration>,
   open_loop_arrivals: Option<usize>,
 ) -> Result<Counts, String> {
+  let arrivals = open_loop_arrivals.unwrap_or(OPEN_LOOP_ARRIVALS);
+  let rate = options.rate_per_second.unwrap_or(1);
+  let plan = ArrivalPlan::new(Profile::Steady, options.workload, arrivals, rate)?;
+  run_with_plan(options, plan, capacity_horizon)
+}
+
+fn run_with_plan(
+  options: Options,
+  plan: ArrivalPlan,
+  capacity_horizon: Option<Duration>,
+) -> Result<Counts, String> {
   let setup_started = Instant::now();
   validate_options(options)?;
-  let open_loop_arrivals = open_loop_arrivals.unwrap_or(OPEN_LOOP_ARRIVALS);
+  let open_loop_arrivals = plan.arrivals;
   if options.mode == Mode::OpenLoop {
-    validate_arrivals(open_loop_arrivals)?;
-    validate_trace(options, open_loop_arrivals, execution_deadlines().trace)?;
+    validate_arrival_plan(plan, execution_deadlines().trace)?;
+  } else if !matches!(
+    plan.profile,
+    Profile::Steady | Profile::Mixed | Profile::Burst | Profile::Oversubscribed
+  ) {
+    return Err("capacity mode supports steady, mixed, burst, or oversubscribed profiles".into());
   }
   let config = LaneConfig::default();
-  let oracle_count = open_loop_arrivals;
   // Open-loop reference work is bounded and belongs to setup: recomputing the
   // memory or disk reference payload after observing a result delays the
   // credit that releases the producer's unchanged eight-operation window.
   let open_loop_oracle = if options.mode == Mode::OpenLoop {
-    Some(build_expected_oracle(
-      options.workload,
-      &config,
-      oracle_count,
-    )?)
+    Some(build_plan_expected_oracle(plan, &config)?)
   } else {
     None
   };
   let limits = resource_limits(options.workload);
   let resources = ResourceScope::new(limits);
-  let mut disk_runtime =
-    if options.workload == Workload::Disk && options.executor == Executor::Bounded {
-      Some(
-        allocatbelt::runtime::Runtime::new(allocatbelt::runtime::Config {
-          workers: 4,
-          max_outstanding: WINDOW,
-          capacity: allocatbelt::runtime::Resources {
-            disk: WINDOW,
-            ..allocatbelt::runtime::Resources::ZERO
-          },
-        })
-        .map_err(|error| format!("allocatbelt filesystem runtime start failed: {error}"))?,
-      )
-    } else {
-      None
-    };
+  let mut disk_runtime = if matches!(options.workload, Workload::Disk | Workload::Mixed)
+    && options.executor == Executor::Bounded
+  {
+    Some(
+      allocatbelt::runtime::Runtime::new(allocatbelt::runtime::Config {
+        workers: plan.async_workers,
+        max_outstanding: WINDOW,
+        capacity: allocatbelt::runtime::Resources {
+          disk: WINDOW,
+          ..allocatbelt::runtime::Resources::ZERO
+        },
+      })
+      .map_err(|error| format!("allocatbelt filesystem runtime start failed: {error}"))?,
+    )
+  } else {
+    None
+  };
   let native_fs = disk_runtime
     .as_ref()
     .map(|runtime| allocatbelt::runtime::fs::FsHandle::new(runtime.handle(), resources.clone()));
   let (submitter, observer, scope, runtime) = match options.executor {
     Executor::Bounded => {
       let async_runtime = AsyncRuntime::new(AsyncConfig {
-        workers: WORKERS,
+        workers: plan.async_workers,
         max_outstanding: WINDOW,
         max_scopes: 2,
       })
@@ -777,11 +981,11 @@ fn run_with_limits(
         .scope_with_resources(&resources)
         .map_err(|error| format!("allocatbelt scope start failed: {error}"))?;
       let handle = scope.handle();
-      warm_bounded(&handle)?;
-      if options.workload == Workload::Disk
+      warm_bounded_for(&handle, plan.async_workers)?;
+      if matches!(options.workload, Workload::Disk | Workload::Mixed)
         && let Some(fs_runtime) = &disk_runtime
       {
-        disk_lane::warm_native_workers(fs_runtime, &handle, 4)?;
+        disk_lane::warm_native_workers(fs_runtime, &handle, plan.async_workers)?;
       }
       let observer = Observer::Bounded(handle.clone());
       (
@@ -796,18 +1000,18 @@ fn run_with_limits(
     }
     Executor::Tokio => {
       let runtime_built = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(WORKERS)
-        .max_blocking_threads(4)
+        .worker_threads(plan.async_workers)
+        .max_blocking_threads(plan.async_workers)
         .thread_name("allocatbelt-app-tokio")
         .build()
         .map_err(|error| format!("Tokio runtime start failed: {error}"))?;
       let handle = runtime_built.handle().clone();
       let slots = Arc::new(tokio::sync::Semaphore::new(WINDOW));
-      let disk_slots =
-        (options.workload == Workload::Disk).then(|| Arc::new(tokio::sync::Semaphore::new(WINDOW)));
-      warm_tokio(&handle)?;
-      if options.workload == Workload::Disk {
-        disk_lane::warm_tokio_workers(&handle, 4)?;
+      let disk_slots = matches!(options.workload, Workload::Disk | Workload::Mixed)
+        .then(|| Arc::new(tokio::sync::Semaphore::new(WINDOW)));
+      warm_tokio_for(&handle, plan.async_workers)?;
+      if matches!(options.workload, Workload::Disk | Workload::Mixed) {
+        disk_lane::warm_tokio_workers(&handle, plan.async_workers)?;
       }
       let observer = Observer::Tokio;
       (
@@ -838,10 +1042,7 @@ fn run_with_limits(
   };
   let event_capacity = match options.mode {
     Mode::Capacity => 2 * WINDOW + 1,
-    Mode::OpenLoop => open_loop_arrivals
-      .checked_mul(4)
-      .and_then(|n| n.checked_add(1))
-      .ok_or_else(|| "open-loop event capacity overflow".to_owned())?,
+    Mode::OpenLoop => 2 * WINDOW + 1,
   };
   let (events_tx, events_rx) = mpsc::sync_channel(event_capacity);
   let observer_thread_target = Arc::new(OnceLock::new());
@@ -861,7 +1062,7 @@ fn run_with_limits(
   let observer_thread = thread::Builder::new()
     .name("application-observer".into())
     .spawn(move || {
-      let report = observe(
+      let report = observe_with_plan(
         observer,
         options,
         config,
@@ -873,6 +1074,7 @@ fn run_with_limits(
         observer_pending_limit,
         Duration::from_millis(100),
         observer_open_loop_oracle,
+        plan,
       );
       let _ = observer_tx.send(report);
     })
@@ -895,7 +1097,7 @@ fn run_with_limits(
   let producer_thread = thread::Builder::new()
     .name("application-producer".into())
     .spawn(move || {
-      let report = produce(
+      let report = produce_with_plan(
         submitter,
         options,
         config,
@@ -904,7 +1106,7 @@ fn run_with_limits(
         credits_rx,
         producer_states,
         capacity_horizon.unwrap_or(CAPACITY_HORIZON),
-        open_loop_arrivals,
+        plan,
       );
       let _ = producer_tx.send(report);
     })
@@ -943,6 +1145,7 @@ fn run_with_limits(
     expected_checksum,
     open_loop_arrivals,
     open_loop_oracle.as_deref(),
+    plan,
   )?;
   let last_observed = observer_report.last_observed;
   if last_observed.saturating_duration_since(producer.production_end) > execution_deadlines().drain
@@ -1008,10 +1211,21 @@ fn run_with_limits(
     return Err("open-loop producer exceeded its finite trace deadline".into());
   }
   let (blocking_workers, topology) = match (options.executor, options.workload) {
+    (Executor::Bounded, Workload::Mixed) if plan.async_workers == 2 => {
+      (2, "2 async + 2 filesystem workers")
+    }
+    (Executor::Bounded, Workload::Mixed) => (4, "4 async + 4 filesystem workers"),
+    (Executor::Tokio, Workload::Mixed) if plan.async_workers == 2 => {
+      (2, "2 async + 2 blocking workers")
+    }
+    (Executor::Tokio, Workload::Mixed) => (4, "4 async + 4 blocking workers"),
     (_, Workload::Disk) => match options.executor {
+      Executor::Bounded if plan.async_workers == 2 => (2, "2 async + 2 filesystem workers"),
       Executor::Bounded => (4, "4 async + 4 filesystem workers"),
+      Executor::Tokio if plan.async_workers == 2 => (2, "2 async + 2 blocking workers"),
       Executor::Tokio => (4, "4 async + 4 blocking workers"),
     },
+    (_, _) if plan.async_workers == 2 => (0, "2 async workers"),
     (_, _) => (0, "4 async workers"),
   };
   let setup_ns = producer
@@ -1024,6 +1238,7 @@ fn run_with_limits(
     expected_checksum,
     final_resources,
     blocking_workers,
+    async_workers: plan.async_workers,
     topology,
     setup_ns,
     timer_pair_median_ns,
@@ -1061,6 +1276,16 @@ fn resource_limits(workload: Workload) -> ResourceLimits {
       disk_concurrent_ops: 8,
       network_concurrent_ops: 0,
     },
+    Workload::Mixed => ResourceLimits {
+      // The shared live window can skew toward the most memory-heavy family.
+      // Reserve eight maximum disk buffers plus the observer's retained
+      // memory-output window so slow families cannot turn interleaving into
+      // a resource-admission failure.
+      managed_memory: WINDOW * DiskConfig::default().bytes
+        + MAX_RETAINED_MEMORY_OUTPUTS * MemoryConfig::default().grown_bytes,
+      disk_concurrent_ops: 8,
+      network_concurrent_ops: 16,
+    },
   }
 }
 
@@ -1076,22 +1301,15 @@ fn validate_options(options: Options) -> Result<(), String> {
   Ok(())
 }
 
-fn validate_trace(options: Options, arrivals: usize, deadline: Duration) -> Result<(), String> {
-  let rate = options
-    .rate_per_second
-    .ok_or_else(|| "open-loop mode requires --rate".to_owned())?;
-  let trace_ns = (arrivals as u128)
-    .checked_mul(1_000_000_000)
-    .ok_or_else(|| "open-loop trace duration overflow".to_owned())?
-    / u128::from(rate);
-  let trace_ns =
-    u64::try_from(trace_ns).map_err(|_| "open-loop trace duration overflow".to_owned())?;
+fn validate_arrival_plan(plan: ArrivalPlan, deadline: Duration) -> Result<(), String> {
+  let trace_ns = plan.trace_duration_ns()?;
   if Duration::from_nanos(trace_ns) > deadline {
-    return Err("open-loop trace exceeds its finite trace deadline".into());
+    return Err("arrival plan exceeds its finite trace deadline".into());
   }
   Ok(())
 }
 
+#[cfg(test)]
 pub(super) fn arrival_times(
   id: u64,
   scheduled: Instant,
@@ -1107,6 +1325,24 @@ pub(super) fn arrival_times(
     / u128::from(rate);
   let offset_ns =
     u64::try_from(offset_ns).map_err(|_| "per-ID scheduled offset overflow".to_owned())?;
+  arrival_times_from_offset(scheduled, completed, offset_ns)
+}
+
+pub(super) fn arrival_times_for_plan(
+  id: u64,
+  scheduled: Instant,
+  completed: Instant,
+  plan: ArrivalPlan,
+) -> Result<(u64, u64), String> {
+  let scheduled_ns = plan.scheduled_offset_ns(id)?;
+  arrival_times_from_offset(scheduled, completed, scheduled_ns)
+}
+
+fn arrival_times_from_offset(
+  scheduled: Instant,
+  completed: Instant,
+  offset_ns: u64,
+) -> Result<(u64, u64), String> {
   let origin = scheduled
     .checked_sub(Duration::from_nanos(offset_ns))
     .ok_or_else(|| "per-ID scheduled instant precedes trace origin".to_owned())?;
@@ -1158,9 +1394,25 @@ pub(super) fn validate_id_records(
   Ok((completed, rejected))
 }
 
+#[cfg(test)]
 fn trace_exceeded(mode: Mode, started_at: Instant, ended_at: Instant) -> bool {
   mode == Mode::OpenLoop
     && ended_at.saturating_duration_since(started_at) > execution_deadlines().trace
+}
+
+pub(super) fn trace_exceeded_for_plan(
+  mode: Mode,
+  started_at: Instant,
+  ended_at: Instant,
+  plan: ArrivalPlan,
+) -> Result<bool, String> {
+  if mode == Mode::Capacity {
+    return Ok(false);
+  }
+  let planned_ns = plan.trace_duration_ns()?;
+  let planned = Duration::from_nanos(planned_ns);
+  let configured = execution_deadlines().trace;
+  Ok(planned > configured || ended_at.saturating_duration_since(started_at) > configured)
 }
 
 fn wall_through_drain_ns(
@@ -1239,13 +1491,13 @@ impl WarmGate {
   }
 }
 
-fn warm_bounded(handle: &AsyncHandle) -> Result<(), String> {
-  let gate = WarmGate::new(WORKERS, WARMUP_TIMEOUT);
+fn warm_bounded_for(handle: &AsyncHandle, workers: usize) -> Result<(), String> {
+  let gate = WarmGate::new(workers, WARMUP_TIMEOUT);
   let mut jobs = Vec::new();
   jobs
-    .try_reserve_exact(WORKERS)
+    .try_reserve_exact(workers)
     .map_err(|_| "could not reserve worker warm-up handles".to_owned())?;
-  for _ in 0..WORKERS {
+  for _ in 0..workers {
     let gate = Arc::clone(&gate);
     jobs.push(
       handle
@@ -1257,7 +1509,7 @@ fn warm_bounded(handle: &AsyncHandle) -> Result<(), String> {
         .map_err(|error| format!("allocatbelt warm-up admission failed: {}", error.kind))?,
     );
   }
-  gate.release_after_all(WORKERS)?;
+  gate.release_after_all(workers)?;
   let mut seen = HashSet::new();
   for job in jobs {
     let (thread_id, ready) = handle
@@ -1269,22 +1521,22 @@ fn warm_bounded(handle: &AsyncHandle) -> Result<(), String> {
     }
     seen.insert(thread_id);
   }
-  if seen.len() != WORKERS {
+  if seen.len() != workers {
     return Err(format!(
-      "expected {WORKERS} started async workers, saw {}",
+      "expected {workers} started async workers, saw {}",
       seen.len()
     ));
   }
   Ok(())
 }
 
-fn warm_tokio(handle: &tokio::runtime::Handle) -> Result<(), String> {
-  let gate = WarmGate::new(WORKERS, WARMUP_TIMEOUT);
+fn warm_tokio_for(handle: &tokio::runtime::Handle, workers: usize) -> Result<(), String> {
+  let gate = WarmGate::new(workers, WARMUP_TIMEOUT);
   let mut jobs = Vec::new();
   jobs
-    .try_reserve_exact(WORKERS)
+    .try_reserve_exact(workers)
     .map_err(|_| "could not reserve Tokio warm-up handles".to_owned())?;
-  for _ in 0..WORKERS {
+  for _ in 0..workers {
     let gate = Arc::clone(&gate);
     jobs.push(handle.spawn(async move {
       let thread_id = thread::current().id();
@@ -1292,7 +1544,7 @@ fn warm_tokio(handle: &tokio::runtime::Handle) -> Result<(), String> {
       (thread_id, ready)
     }));
   }
-  gate.release_after_all(WORKERS)?;
+  gate.release_after_all(workers)?;
   let mut seen = HashSet::new();
   for job in jobs {
     let (thread_id, ready) = handle
@@ -1303,9 +1555,9 @@ fn warm_tokio(handle: &tokio::runtime::Handle) -> Result<(), String> {
     }
     seen.insert(thread_id);
   }
-  if seen.len() != WORKERS {
+  if seen.len() != workers {
     return Err(format!(
-      "expected {WORKERS} started Tokio workers, saw {}",
+      "expected {workers} started Tokio workers, saw {}",
       seen.len()
     ));
   }
@@ -1313,7 +1565,7 @@ fn warm_tokio(handle: &tokio::runtime::Handle) -> Result<(), String> {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn produce(
+fn produce_with_plan(
   submitter: Submitter,
   options: Options,
   config: LaneConfig,
@@ -1322,16 +1574,14 @@ fn produce(
   credits: mpsc::Receiver<()>,
   states: Option<Arc<Mutex<Vec<IdState>>>>,
   capacity_horizon: Duration,
-  open_loop_arrivals: usize,
+  plan: ArrivalPlan,
 ) -> Result<ProducerReport, String> {
   let start = Instant::now();
   let horizon_end = match options.mode {
     Mode::Capacity => start + capacity_horizon,
-    Mode::OpenLoop => {
-      let rate = options.rate_per_second.expect("validated open-loop rate");
-      start
-        + Duration::from_nanos(((open_loop_arrivals as u128 * 1_000_000_000) / rate as u128) as u64)
-    }
+    Mode::OpenLoop => start
+      .checked_add(Duration::from_nanos(plan.trace_duration_ns()?))
+      .ok_or_else(|| "arrival trace end instant overflow".to_owned())?,
   };
   let mut attempted = 0;
   let mut admitted = 0;
@@ -1346,6 +1596,9 @@ fn produce(
     while let Ok(()) = credits.try_recv() {
       outstanding = outstanding.saturating_sub(1);
     }
+    if options.mode == Mode::Capacity {
+      wait_until_capacity_pulse(plan, start, horizon_end);
+    }
     let (id, scheduled) = match options.mode {
       Mode::Capacity => {
         if Instant::now() >= horizon_end {
@@ -1356,11 +1609,12 @@ fn produce(
             "capacity mode reached the 10,000,000 operation safety cap before its horizon".into(),
           );
         }
+        let pulse_end = capacity_pulse_end(plan, start, horizon_end);
         while outstanding >= WINDOW {
           if Instant::now() >= horizon_end {
             break;
           }
-          match credits.recv_timeout(horizon_end.saturating_duration_since(Instant::now())) {
+          match credits.recv_timeout(pulse_end.saturating_duration_since(Instant::now())) {
             Ok(()) => outstanding -= 1,
             Err(mpsc::RecvTimeoutError::Timeout) => break,
             Err(mpsc::RecvTimeoutError::Disconnected) => {
@@ -1371,17 +1625,21 @@ fn produce(
         if Instant::now() >= horizon_end {
           break;
         }
+        if Instant::now() >= pulse_end {
+          continue;
+        }
         let id = next_capacity_id;
         next_capacity_id += 1;
         (id, Instant::now())
       }
       Mode::OpenLoop => {
-        if attempted >= open_loop_arrivals {
+        if attempted >= plan.arrivals {
           break;
         }
-        let rate = options.rate_per_second.expect("validated open-loop rate");
-        let scheduled_ns = (attempted as u128 * 1_000_000_000) / rate as u128;
-        let scheduled = start + Duration::from_nanos(scheduled_ns as u64);
+        let scheduled_ns = plan.scheduled_offset_ns(attempted as u64)?;
+        let scheduled = start
+          .checked_add(Duration::from_nanos(scheduled_ns))
+          .ok_or_else(|| "arrival scheduled instant overflow".to_owned())?;
         if let Some(remaining) = scheduled.checked_duration_since(Instant::now()) {
           thread::sleep(remaining);
         }
@@ -1408,7 +1666,8 @@ fn produce(
         .map_err(|_| "observer queue closed before rejection publication".to_owned())?;
       continue;
     }
-    match submitter.submit(options.workload, config, resources, id) {
+    let workload = plan.workload_for(id);
+    match submitter.submit(workload, config, resources, id) {
       Ok(job) => {
         admitted += 1;
         outstanding += 1;
@@ -1441,8 +1700,13 @@ fn produce(
       Err(Rejection::Closed) => return Err("executor closed during admission".into()),
     }
   }
+  if options.mode == Mode::OpenLoop
+    && let Some(remaining) = horizon_end.checked_duration_since(Instant::now())
+  {
+    thread::sleep(remaining);
+  }
   let production_end = Instant::now();
-  let trace_overrun = trace_exceeded(options.mode, start, production_end);
+  let trace_overrun = trace_exceeded_for_plan(options.mode, start, production_end, plan)?;
   events
     .send(ObserverEvent::Done {
       attempted,
@@ -1464,6 +1728,7 @@ fn produce(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 fn observe(
   observer: Observer,
   options: Options,
@@ -1476,6 +1741,43 @@ fn observe(
   pending_limit: usize,
   watchdog_timeout: Duration,
   open_loop_oracle: Option<Arc<Vec<u64>>>,
+) -> Result<ObserverReport, String> {
+  let plan = ArrivalPlan::new(
+    Profile::Steady,
+    options.workload,
+    open_loop_arrivals,
+    options.rate_per_second.unwrap_or(1),
+  )?;
+  observe_with_plan(
+    observer,
+    options,
+    config,
+    resources,
+    events,
+    credits,
+    states,
+    open_loop_arrivals,
+    pending_limit,
+    watchdog_timeout,
+    open_loop_oracle,
+    plan,
+  )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn observe_with_plan(
+  observer: Observer,
+  options: Options,
+  config: LaneConfig,
+  resources: ResourceScope,
+  events: mpsc::Receiver<ObserverEvent>,
+  credits: mpsc::SyncSender<()>,
+  states: Option<Arc<Mutex<Vec<IdState>>>>,
+  open_loop_arrivals: usize,
+  pending_limit: usize,
+  watchdog_timeout: Duration,
+  open_loop_oracle: Option<Arc<Vec<u64>>>,
+  plan: ArrivalPlan,
 ) -> Result<ObserverReport, String> {
   let mut completed_on_time = 0;
   let mut completed_late = 0;
@@ -1528,14 +1830,14 @@ fn observe(
         }
         ObserverEvent::Rejected { id, scheduled } => {
           let completion = Instant::now();
-          let rate = options
-            .rate_per_second
-            .ok_or_else(|| "open-loop rate missing".to_owned())?;
-          let (scheduled_ns, completion_ns) = arrival_times(id, scheduled, completion, rate)?;
+          let (scheduled_ns, completion_ns) =
+            arrival_times_for_plan(id, scheduled, completion, plan)?;
+          let workload = plan.workload_for(id);
           let expected_checksum =
-            open_loop_expected(options.workload, &config, id, open_loop_oracle.as_deref())?;
+            open_loop_expected(workload, &config, id, open_loop_oracle.as_deref())?;
           records.push(IdRecord {
             id,
+            workload,
             scheduled_ns,
             completion_ns,
             terminal: "rejected",
@@ -1574,12 +1876,13 @@ fn observe(
       last_observed = observed;
       let mut completed = false;
       let mut checksum = 0;
+      let workload = plan.workload_for(id);
       match result {
         Ok(output) => {
           let output_value = output.value();
           checksum = output_value;
           if !validate_output_with_oracle(
-            options.workload,
+            workload,
             &config,
             id,
             &output,
@@ -1618,14 +1921,12 @@ fn observe(
         }
       }
       if options.mode == Mode::OpenLoop {
-        let rate = options
-          .rate_per_second
-          .ok_or_else(|| "open-loop rate missing".to_owned())?;
-        let (scheduled_ns, completion_ns) = arrival_times(id, scheduled, observed, rate)?;
+        let (scheduled_ns, completion_ns) = arrival_times_for_plan(id, scheduled, observed, plan)?;
         let expected_checksum =
-          open_loop_expected(options.workload, &config, id, open_loop_oracle.as_deref())?;
+          open_loop_expected(workload, &config, id, open_loop_oracle.as_deref())?;
         records.push(IdRecord {
           id,
+          workload,
           scheduled_ns,
           completion_ns,
           terminal: if completed { "completed" } else { "error" },
@@ -1704,6 +2005,12 @@ fn expected_value(workload: Workload, config: &LaneConfig, id: u64) -> u64 {
           .wrapping_mul(0x0000_0100_0000_01b3)
       })
     }
+    Workload::Mixed => match id % 4 {
+      0 => expected_value(Workload::Cpu, config, id),
+      1 => expected_value(Workload::Memory, config, id),
+      2 => http::expected_request_checksum(id, http::ORACLE_BODY_BYTES),
+      _ => expected_value(Workload::Disk, config, id),
+    },
   }
 }
 
@@ -1722,6 +2029,7 @@ fn open_loop_expected(
   }
 }
 
+#[cfg(test)]
 fn build_expected_oracle(
   workload: Workload,
   config: &LaneConfig,
@@ -1735,6 +2043,24 @@ fn build_expected_oracle(
     .try_reserve_exact(count)
     .map_err(|_| "could not reserve bounded open-loop result oracle".to_owned())?;
   oracle.extend((0..count).map(|id| canonical_expected_value(workload, config, id as u64)));
+  Ok(Arc::new(oracle))
+}
+
+pub(super) fn build_plan_expected_oracle(
+  plan: ArrivalPlan,
+  config: &LaneConfig,
+) -> Result<Arc<Vec<u64>>, String> {
+  let mut oracle = Vec::new();
+  oracle
+    .try_reserve_exact(plan.arrivals)
+    .map_err(|_| "could not reserve bounded profile oracle".to_owned())?;
+  for id in 0..plan.arrivals {
+    oracle.push(canonical_expected_value(
+      plan.workload_for(id as u64),
+      config,
+      id as u64,
+    ));
+  }
   Ok(Arc::new(oracle))
 }
 
@@ -1757,6 +2083,7 @@ fn oracle_kernel_config(workload: Workload, config: &LaneConfig) -> String {
       config.disk.bytes, config.disk.offset, config.disk.seed
     ),
     Workload::Http => format!("body_bytes={}", http::ORACLE_BODY_BYTES),
+    Workload::Mixed => "interleave=cpu,memory,http,disk".to_owned(),
   }
 }
 
@@ -1773,6 +2100,7 @@ fn emit_oracle_only(args: impl Iterator<Item = String>) -> Result<(), String> {
     .ok_or_else(|| "--emit-oracle-only requires an output path".to_owned())?;
   let mut workload = None;
   let mut rate = None;
+  let mut profile = None;
   let mut arrivals = OPEN_LOOP_ARRIVALS;
   let mut arrivals_set = false;
   let mut deadlines = ExecutionDeadlines::default();
@@ -1784,6 +2112,7 @@ fn emit_oracle_only(args: impl Iterator<Item = String>) -> Result<(), String> {
       .ok_or_else(|| format!("missing value for {key}"))?;
     match key.as_str() {
       "--workload" => workload = Some(Workload::parse(&value)?),
+      "--profile" => profile = Some(Profile::parse(&value)?),
       "--rate" => rate = Some(value.parse().map_err(|_| "invalid --rate".to_owned())?),
       "--arrivals" => {
         arrivals = value.parse().map_err(|_| "invalid --arrivals".to_owned())?;
@@ -1796,6 +2125,7 @@ fn emit_oracle_only(args: impl Iterator<Item = String>) -> Result<(), String> {
     }
   }
   let workload = workload.ok_or_else(|| "oracle emitter requires --workload".to_owned())?;
+  let profile = profile.ok_or_else(|| "oracle emitter requires --profile".to_owned())?;
   let source_hash =
     source_hash.ok_or_else(|| "oracle emitter requires --source-sha256".to_owned())?;
   let binary_hash =
@@ -1814,31 +2144,44 @@ fn emit_oracle_only(args: impl Iterator<Item = String>) -> Result<(), String> {
     return Err("oracle trace deadline exceeds its finite 3600 second bound".into());
   }
   validate_arrivals(arrivals)?;
-  let options = Options {
-    executor: Executor::Bounded,
-    workload,
-    mode: Mode::OpenLoop,
-    rate_per_second: Some(rate),
-  };
-  validate_trace(options, arrivals, deadlines.trace)?;
+  let plan = ArrivalPlan::new(profile, workload, arrivals, rate)?;
+  validate_arrival_plan(plan, deadlines.trace)?;
   let config = LaneConfig::default();
-  let oracle = build_expected_oracle(workload, &config, arrivals)?;
-  let mut report = String::from("schema\tallocatbelt-app-oracle-v1\n");
+  let oracle = build_plan_expected_oracle(plan, &config)?;
+  let pulse_rate = if profile == Profile::Burst {
+    rate
+      .checked_mul(4)
+      .ok_or_else(|| "burst pulse rate overflow".to_owned())?
+  } else {
+    rate
+  };
+  let mut report = String::from("schema\tallocatbelt-app-oracle-v2\n");
   report.push_str(&format!(
     "source_sha256\t{source_hash}\nbinary_sha256\t{binary_hash}\n"
   ));
   report.push_str(&format!(
-    "workload\t{}\nmode\topen_loop\n",
+    "profile\t{}\nworkload\t{}\nmode\topen_loop\n",
+    profile.label(),
     workload.label()
   ));
-  report.push_str(&format!("rate_per_second\t{rate}\narrivals\t{arrivals}\n"));
+  report.push_str(&format!(
+    "average_rate_per_second\t{rate}\npulse_rate_per_second\t{pulse_rate}\narrivals\t{arrivals}\n"
+  ));
+  report.push_str(&format!(
+    "trace_duration_ns\t{}\n",
+    plan.trace_duration_ns()?
+  ));
   report.push_str(&format!(
     "kernel_config\t{}\n",
-    oracle_kernel_config(workload, &config)
+    oracle_kernel_config(plan.workload, &config)
   ));
-  report.push_str("id\texpected_checksum\n");
+  report.push_str("id\tscheduled_ns\tworkload\texpected_checksum\n");
   for (id, checksum) in oracle.iter().enumerate() {
-    report.push_str(&format!("{id}\t{checksum}\n"));
+    report.push_str(&format!(
+      "{id}\t{}\t{}\t{checksum}\n",
+      plan.scheduled_offset_ns(id as u64)?,
+      plan.workload_for(id as u64).label()
+    ));
   }
   let mut file = OpenOptions::new()
     .write(true)
@@ -1937,6 +2280,7 @@ fn expected_digest(
   digest
 }
 
+#[allow(clippy::too_many_arguments)]
 fn validate_counts(
   options: Options,
   producer: &ProducerReport,
@@ -1945,6 +2289,7 @@ fn validate_counts(
   expected_checksum: u64,
   open_loop_arrivals: usize,
   open_loop_oracle: Option<&Vec<u64>>,
+  plan: ArrivalPlan,
 ) -> Result<(), String> {
   let completed = observer.completed_on_time + observer.completed_late;
   if producer.rejected_full != producer.rejected_logical_window + producer.rejected_backend_full {
@@ -1972,6 +2317,13 @@ fn validate_counts(
       return Err("open-loop checksum oracle length differs from requested arrivals".into());
     }
     let (recorded_completed, recorded_rejected) = validate_id_records(&observer.records, oracle)?;
+    if observer
+      .records
+      .iter()
+      .any(|record| plan.workload_for(record.id) != record.workload)
+    {
+      return Err("per-ID workload differs from the canonical profile".into());
+    }
     if recorded_completed != producer.admitted || recorded_rejected != producer.rejected_full {
       return Err("per-ID terminal counts differ from the producer report".into());
     }
@@ -2015,9 +2367,11 @@ pub fn main(allocator: &'static str) -> ExitCode {
     };
   }
   match parse_args(args.into_iter()) {
-    Ok((options, arrivals, deadlines)) if options.workload == Workload::Http => {
+    Ok((options, plan, deadlines))
+      if matches!(options.workload, Workload::Http | Workload::Mixed) =>
+    {
       let _ = EXECUTION_DEADLINES.set(deadlines);
-      match http::run_and_print(allocator, options, arrivals) {
+      match http::run_and_print(allocator, options, plan) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
           eprintln!("application run invalid: {error}");
@@ -2025,9 +2379,9 @@ pub fn main(allocator: &'static str) -> ExitCode {
         }
       }
     }
-    Ok((options, arrivals, deadlines)) if options.workload == Workload::Disk => {
+    Ok((options, plan, deadlines)) if options.workload == Workload::Disk => {
       let _ = EXECUTION_DEADLINES.set(deadlines);
-      match disk_lane::run_and_print(allocator, options, arrivals) {
+      match disk_lane::run_and_print(allocator, options, plan) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
           eprintln!("application run invalid: {error}");
@@ -2035,11 +2389,13 @@ pub fn main(allocator: &'static str) -> ExitCode {
         }
       }
     }
-    Ok((options, arrivals, deadlines)) => {
+    Ok((options, plan, deadlines)) => {
       let _ = EXECUTION_DEADLINES.set(deadlines);
-      match run_with_limits(options, None, Some(arrivals)) {
+      match run_with_plan(options, plan, None) {
         Ok(counts) => {
-          if let Err(error) = write_id_report(&counts.observer.records, allocator, options) {
+          if let Err(error) =
+            write_id_report(&counts.observer.records, allocator, options, plan.profile)
+          {
             eprintln!("application run invalid: {error}");
             return ExitCode::FAILURE;
           }
@@ -2061,13 +2417,14 @@ pub fn main(allocator: &'static str) -> ExitCode {
 
 fn parse_args(
   args: impl Iterator<Item = String>,
-) -> Result<(Options, usize, ExecutionDeadlines), String> {
+) -> Result<(Options, ArrivalPlan, ExecutionDeadlines), String> {
   let mut executor = None;
   let mut workload = None;
   let mut mode = None;
   let mut rate = None;
   let mut arrivals = OPEN_LOOP_ARRIVALS;
   let mut arrivals_set = false;
+  let mut profile = Profile::Steady;
   let mut deadlines = ExecutionDeadlines::default();
   let mut args = args;
   while let Some(key) = args.next() {
@@ -2083,6 +2440,7 @@ fn parse_args(
         arrivals = value.parse().map_err(|_| "invalid --arrivals".to_owned())?;
         arrivals_set = true;
       }
+      "--profile" => profile = Profile::parse(&value)?,
       "--trace-deadline-seconds" => deadlines.trace = parse_deadline(&value, "trace")?,
       "--drain-deadline-seconds" => deadlines.drain = parse_deadline(&value, "drain")?,
       "--shutdown-deadline-seconds" => deadlines.shutdown = parse_deadline(&value, "shutdown")?,
@@ -2097,14 +2455,26 @@ fn parse_args(
     rate_per_second: rate,
   };
   validate_options(options)?;
-  validate_deadline_budget(deadlines, options.workload, options.executor, options.mode)?;
-  if options.mode == Mode::OpenLoop {
-    validate_arrivals(arrivals)?;
-    validate_trace(options, arrivals, deadlines.trace)?;
+  if options.mode == Mode::Capacity
+    && !matches!(
+      profile,
+      Profile::Steady | Profile::Mixed | Profile::Burst | Profile::Oversubscribed
+    )
+  {
+    return Err("capacity mode supports steady, mixed, burst, or oversubscribed profiles".into());
+  }
+  let plan = if options.mode == Mode::OpenLoop {
+    let rate = rate.ok_or_else(|| "open-loop mode requires --rate".to_owned())?;
+    let plan = ArrivalPlan::new(profile, options.workload, arrivals, rate)?;
+    validate_arrival_plan(plan, deadlines.trace)?;
+    plan
   } else if arrivals_set {
     return Err("--arrivals applies only to open_loop mode".into());
-  }
-  Ok((options, arrivals, deadlines))
+  } else {
+    ArrivalPlan::new(profile, options.workload, OPEN_LOOP_ARRIVALS, 1)?
+  };
+  validate_deadline_budget(deadlines, plan, options.executor, options.mode)?;
+  Ok((options, plan, deadlines))
 }
 
 fn parse_deadline(value: &str, name: &str) -> Result<Duration, String> {
@@ -2119,7 +2489,7 @@ fn parse_deadline(value: &str, name: &str) -> Result<Duration, String> {
 
 fn validate_deadline_budget(
   deadlines: ExecutionDeadlines,
-  workload: Workload,
+  plan: ArrivalPlan,
   executor: Executor,
   mode: Mode,
 ) -> Result<(), String> {
@@ -2140,7 +2510,8 @@ fn validate_deadline_budget(
     // allowance to observe that horizon and publish production completion.
     CAPACITY_HORIZON.as_secs() + 1
   };
-  let shutdown_units = match (workload, executor) {
+  let shutdown_units = match (plan.workload, executor) {
+    (Workload::Mixed, Executor::Bounded) => 4,
     (Workload::Http, Executor::Bounded) => 3,
     (Workload::Disk, Executor::Bounded) => 2,
     _ => 1,
@@ -2205,7 +2576,7 @@ fn print_row(allocator: &str, options: Options, counts: &Counts) {
     options.executor.label().to_owned(),
     options.workload.label().to_owned(),
     options.mode.label().to_owned(),
-    WORKERS.to_string(),
+    counts.async_workers.to_string(),
     counts.blocking_workers.to_string(),
     counts.topology.to_owned(),
     WINDOW.to_string(),
@@ -2298,7 +2669,7 @@ fn percentile(samples: &[u64], percentile: usize) -> u64 {
 mod tests {
   use super::{
     AsyncConfig, AsyncRuntime, AsyncShutdown, DiskReport, Executor, IdState, Job, LaneConfig, Mode,
-    Observer, ObserverEvent, ObserverEventSender, ObserverReport, Options, ProducerReport,
+    Observer, ObserverEvent, ObserverEventSender, ObserverReport, Options, ProducerReport, Profile,
     WorkOutput, Workload, accept_capacity_id, observe, resource_limits, run_with_limits,
     validate_output,
   };
@@ -2322,12 +2693,13 @@ mod tests {
     ];
     let parsed =
       super::parse_args(base.iter().map(|value| (*value).to_owned())).expect("default arrivals");
-    assert_eq!(parsed.1, 5000);
+    assert_eq!(parsed.1.arrivals, 5000);
     let custom = base.iter().copied().chain(["--arrivals", "42"]);
     assert_eq!(
       super::parse_args(custom.map(str::to_owned))
         .expect("custom arrivals")
-        .1,
+        .1
+        .arrivals,
       42
     );
     let excessive = base.iter().copied().chain(["--arrivals", "1000001"]);
@@ -2419,6 +2791,66 @@ mod tests {
   }
 
   #[test]
+  fn arrival_profiles_freeze_burst_pulses_mixed_interleave_and_worker_count() {
+    let burst = super::ArrivalPlan::new(Profile::Burst, Workload::Cpu, 6, 4).expect("burst plan");
+    assert_eq!(
+      burst.trace_duration_ns().expect("burst duration"),
+      2_000_000_000
+    );
+    assert_eq!(burst.scheduled_offset_ns(0).expect("first pulse slot"), 0);
+    assert_eq!(
+      burst.scheduled_offset_ns(1).expect("second pulse slot"),
+      62_500_000
+    );
+    assert_eq!(
+      burst.scheduled_offset_ns(3).expect("last pulse slot"),
+      187_500_000
+    );
+    assert_eq!(
+      burst.scheduled_offset_ns(4).expect("next cycle"),
+      1_000_000_000
+    );
+
+    let mixed =
+      super::ArrivalPlan::new(Profile::Mixed, Workload::Mixed, 400_000, 4000).expect("mixed plan");
+    assert_eq!(
+      (0..8)
+        .map(|id| mixed.workload_for(id).label())
+        .collect::<Vec<_>>(),
+      [
+        "cpu", "memory", "http", "disk", "cpu", "memory", "http", "disk"
+      ]
+    );
+
+    let oversubscribed =
+      super::ArrivalPlan::new(Profile::Oversubscribed, Workload::Cpu, 100_000, 1000)
+        .expect("two-worker plan");
+    assert_eq!(oversubscribed.async_workers, 2);
+    assert!(!Profile::SafetyOverload.qualifies());
+  }
+
+  #[test]
+  fn burst_capacity_window_is_active_only_for_the_quarter_cycle() {
+    assert!(super::capacity_pulse_active(0));
+    assert!(super::capacity_pulse_active(249_999_999));
+    assert!(!super::capacity_pulse_active(250_000_000));
+    assert!(!super::capacity_pulse_active(999_999_999));
+    assert!(super::capacity_pulse_active(1_000_000_000));
+    assert!(super::capacity_pulse_active(1_249_999_999));
+    assert!(!super::capacity_pulse_active(1_250_000_000));
+  }
+
+  #[test]
+  fn mixed_memory_ceiling_covers_eight_disk_jobs_and_retained_memory_outputs() {
+    let limits = super::resource_limits(Workload::Mixed);
+    let expected = super::WINDOW * super::DiskConfig::default().bytes
+      + super::MAX_RETAINED_MEMORY_OUTPUTS * super::MemoryConfig::default().grown_bytes;
+    assert_eq!(limits.managed_memory, expected);
+    assert_eq!(limits.disk_concurrent_ops, super::WINDOW);
+    assert_eq!(limits.network_concurrent_ops, 2 * super::WINDOW);
+  }
+
+  #[test]
   fn oracle_only_emitter_writes_the_canonical_reference_without_a_timing_run() {
     let nonce = std::time::SystemTime::now()
       .duration_since(std::time::UNIX_EPOCH)
@@ -2433,6 +2865,8 @@ mod tests {
       path.to_str().expect("UTF-8 temporary path").to_owned(),
       "--workload".to_owned(),
       "cpu".to_owned(),
+      "--profile".to_owned(),
+      "steady".to_owned(),
       "--source-sha256".to_owned(),
       "b".repeat(64),
       "--binary-sha256".to_owned(),
@@ -2445,26 +2879,29 @@ mod tests {
     super::emit_oracle_only(args.iter().cloned()).expect("write canonical oracle");
     let contents = std::fs::read_to_string(&path).expect("oracle output");
     let lines = contents.lines().collect::<Vec<_>>();
-    assert_eq!(lines[0], "schema\tallocatbelt-app-oracle-v1");
+    assert_eq!(lines[0], "schema\tallocatbelt-app-oracle-v2");
     assert_eq!(lines[1], format!("source_sha256\t{}", "b".repeat(64)));
     assert_eq!(lines[2], format!("binary_sha256\t{}", "c".repeat(64)));
-    assert_eq!(lines[3], "workload\tcpu");
-    assert_eq!(lines[4], "mode\topen_loop");
-    assert_eq!(lines[5], "rate_per_second\t1000");
-    assert_eq!(lines[6], "arrivals\t2");
-    assert_eq!(lines[7], "kernel_config\trounds=50000");
-    assert_eq!(lines[8], "id\texpected_checksum");
+    assert_eq!(lines[3], "profile\tsteady");
+    assert_eq!(lines[4], "workload\tcpu");
+    assert_eq!(lines[5], "mode\topen_loop");
+    assert_eq!(lines[6], "average_rate_per_second\t1000");
+    assert_eq!(lines[7], "pulse_rate_per_second\t1000");
+    assert_eq!(lines[8], "arrivals\t2");
+    assert_eq!(lines[9], "trace_duration_ns\t2000000");
+    assert_eq!(lines[10], "kernel_config\trounds=50000");
+    assert_eq!(lines[11], "id\tscheduled_ns\tworkload\texpected_checksum");
     assert_eq!(
-      lines[9],
+      lines[12],
       format!(
-        "0\t{}",
+        "0\t0\tcpu\t{}",
         super::expected_value(Workload::Cpu, &LaneConfig::default(), 0)
       )
     );
     assert_eq!(
-      lines[10],
+      lines[13],
       format!(
-        "1\t{}",
+        "1\t1000000\tcpu\t{}",
         super::expected_value(Workload::Cpu, &LaneConfig::default(), 1)
       )
     );
@@ -2495,6 +2932,7 @@ mod tests {
     let valid = [
       super::IdRecord {
         id: 2,
+        workload: Workload::Cpu,
         scheduled_ns: 2,
         completion_ns: 5,
         terminal: "completed",
@@ -2503,6 +2941,7 @@ mod tests {
       },
       super::IdRecord {
         id: 0,
+        workload: Workload::Cpu,
         scheduled_ns: 0,
         completion_ns: 4,
         terminal: "completed",
@@ -2511,6 +2950,7 @@ mod tests {
       },
       super::IdRecord {
         id: 1,
+        workload: Workload::Cpu,
         scheduled_ns: 1,
         completion_ns: 3,
         terminal: "rejected",
@@ -2650,6 +3090,21 @@ mod tests {
     }
     corrupted.get_mut().expect("unique corruption-test buffer")[7] ^= 1;
     let corrupted_checksum = super::memory::checksum(corrupted.as_slice());
+    let forged_checksum_with_bad_payload = WorkOutput::Memory(super::MemoryOutput {
+      report: super::memory::MemoryReport {
+        peak_replacement_was_enforced: false,
+        charged_after_growth: corrupted.charged_bytes(),
+        checksum: oracle[1],
+      },
+      buffer: corrupted.clone(),
+    });
+    assert!(!super::validate_output_with_oracle(
+      Workload::Memory,
+      &config,
+      1,
+      &forged_checksum_with_bad_payload,
+      Some(&oracle),
+    ));
     let corrupted_output = WorkOutput::Memory(super::MemoryOutput {
       report: super::memory::MemoryReport {
         peak_replacement_was_enforced: false,
@@ -2663,6 +3118,17 @@ mod tests {
       &config,
       1,
       &corrupted_output,
+      Some(&oracle),
+    ));
+    let mut forged_charge = output();
+    if let WorkOutput::Memory(output) = &mut forged_charge {
+      output.report.charged_after_growth += 1;
+    }
+    assert!(!super::validate_output_with_oracle(
+      Workload::Memory,
+      &config,
+      1,
+      &forged_charge,
       Some(&oracle),
     ));
     drop(resources);
@@ -2713,6 +3179,28 @@ mod tests {
       &config,
       id + 1,
       &output(expected_from_payload),
+      Some(&oracle),
+    ));
+    let mut wrong_offset = output(expected_from_payload);
+    if let WorkOutput::Disk(report) = &mut wrong_offset {
+      report.offset += 1;
+    }
+    assert!(!super::validate_output_with_oracle(
+      Workload::Disk,
+      &config,
+      id,
+      &wrong_offset,
+      Some(&oracle),
+    ));
+    let mut missing_cleanup = output(expected_from_payload);
+    if let WorkOutput::Disk(report) = &mut missing_cleanup {
+      report.temp_directory_removed = false;
+    }
+    assert!(!super::validate_output_with_oracle(
+      Workload::Disk,
+      &config,
+      id,
+      &missing_cleanup,
       Some(&oracle),
     ));
   }
