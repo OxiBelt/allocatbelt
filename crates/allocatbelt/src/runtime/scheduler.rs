@@ -123,19 +123,26 @@ impl Shared {
     resources: Option<ResourceScope>,
   ) -> io::Result<Self> {
     let tenant = resources.as_ref().and_then(ResourceScope::tenant_domain);
+    let domain_bound = tenant.is_some();
     let shared_bytes = std::mem::size_of::<Shared>()
-      .checked_add(payload_bytes::<Option<Arc<Control>>>(workers).map_err(domain_build_error)?)
-      .ok_or_else(|| domain_build_error(DomainError::Invalid))?;
-    let mut shared_control =
-      ControlCharge::try_new(tenant, shared_bytes).map_err(domain_build_error)?;
-    let queue_bytes = payload_bytes::<Entry>(max_outstanding).map_err(domain_build_error)?;
-    let mut queue_control =
-      ControlCharge::try_new(tenant, queue_bytes).map_err(domain_build_error)?;
+      .checked_add(
+        payload_bytes::<Option<Arc<Control>>>(workers)
+          .map_err(|error| shared_build_error(error, domain_bound))?,
+      )
+      .ok_or_else(|| shared_build_error(DomainError::Invalid, domain_bound))?;
+    let mut shared_control = ControlCharge::try_new(tenant, shared_bytes)
+      .map_err(|error| shared_build_error(error, domain_bound))?;
+    let queue_bytes = payload_bytes::<Entry>(max_outstanding)
+      .map_err(|error| shared_build_error(error, domain_bound))?;
+    let mut queue_control = ControlCharge::try_new(tenant, queue_bytes)
+      .map_err(|error| shared_build_error(error, domain_bound))?;
     let identity_bytes = std::mem::size_of::<Ident>()
       .checked_add(std::mem::size_of::<ControlCharge>())
-      .ok_or_else(|| domain_build_error(DomainError::Invalid))?;
-    let identity_control =
-      Arc::new(ControlCharge::try_new(tenant, identity_bytes).map_err(domain_build_error)?);
+      .ok_or_else(|| shared_build_error(DomainError::Invalid, domain_bound))?;
+    let identity_control = Arc::new(
+      ControlCharge::try_new(tenant, identity_bytes)
+        .map_err(|error| shared_build_error(error, domain_bound))?,
+    );
 
     let mut queue = VecDeque::new();
     queue
@@ -149,25 +156,29 @@ impl Shared {
     let (tenant, domain_waiters) = if let Some(tenant) = tenant {
       tenant
         .validate_cpu_execution()
-        .map_err(domain_build_error)?;
+        .map_err(|error| shared_build_error(error, domain_bound))?;
       let waiters = tenant
         .reserve_waiters(max_outstanding)
-        .map_err(domain_build_error)?;
+        .map_err(|error| shared_build_error(error, domain_bound))?;
       (Some(tenant.clone()), Some(waiters))
     } else {
       (None, None)
     };
     let actual_shared_bytes = std::mem::size_of::<Shared>()
       .checked_add(
-        payload_bytes::<Option<Arc<Control>>>(running.capacity()).map_err(domain_build_error)?,
+        payload_bytes::<Option<Arc<Control>>>(running.capacity())
+          .map_err(|error| shared_build_error(error, domain_bound))?,
       )
-      .ok_or_else(|| domain_build_error(DomainError::Invalid))?;
+      .ok_or_else(|| shared_build_error(DomainError::Invalid, domain_bound))?;
     shared_control
       .try_resize(actual_shared_bytes)
-      .map_err(domain_build_error)?;
+      .map_err(|error| shared_build_error(error, domain_bound))?;
     queue_control
-      .try_resize(payload_bytes::<Entry>(queue.capacity()).map_err(domain_build_error)?)
-      .map_err(domain_build_error)?;
+      .try_resize(
+        payload_bytes::<Entry>(queue.capacity())
+          .map_err(|error| shared_build_error(error, domain_bound))?,
+      )
+      .map_err(|error| shared_build_error(error, domain_bound))?;
     Ok(Self {
       ident: Ident::new(id),
       state: Mutex::new(State {
@@ -321,6 +332,14 @@ impl Shared {
       entries: pending,
       _control: queue_control,
     }
+  }
+}
+
+fn shared_build_error(error: DomainError, domain_bound: bool) -> io::Error {
+  if !domain_bound && matches!(error, DomainError::Invalid) {
+    io::ErrorKind::OutOfMemory.into()
+  } else {
+    domain_build_error(error)
   }
 }
 
