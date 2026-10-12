@@ -463,6 +463,15 @@ impl fmt::Debug for TenantDomain {
 }
 
 impl TenantDomain {
+  /// Whether both handles identify the same global-domain tenant generation.
+  ///
+  /// Identity remains stable after closure. Equal limits alone do not identify
+  /// the same account; this comparison exposes no reusable slot identifier.
+  #[must_use]
+  pub fn same_account(&self, other: &Self) -> bool {
+    Arc::ptr_eq(&self.owner, &other.owner)
+  }
+
   pub(crate) fn domain_identity(&self) -> DomainIdentity {
     self.owner.domain.identity
   }

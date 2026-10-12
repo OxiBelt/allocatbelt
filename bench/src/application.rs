@@ -16,9 +16,15 @@ use std::time::{Duration, Instant};
 use std::{future::Future, pin::Pin};
 
 use allocatbelt::runtime::asynchronous::{
-  AsyncConfig, AsyncError, AsyncHandle, AsyncJob, AsyncRuntime, AsyncShutdown,
+  AsyncConfig, AsyncError, AsyncHandle, AsyncJob, AsyncShutdown,
 };
+use allocatbelt::runtime::cpu_gate::CpuGate;
 use allocatbelt::runtime::managed::{ResourceLimits, ResourceScope};
+use allocatbelt::runtime::process::ProcessShutdownMode;
+use allocatbelt::runtime::resource_domain::DomainResource;
+use allocatbelt::runtime::{
+  Config as BlockingConfig, MultiShutdown, MultiThreadBuilder, MultiThreadDriver, ShutdownMode,
+};
 use allocatbelt_app_ports::cpu;
 use allocatbelt_app_ports::disk::{self, DiskConfig, DiskReport};
 use allocatbelt_app_ports::memory::{self, MemoryConfig, MemoryOutput};
@@ -27,6 +33,12 @@ use allocatbelt_app_ports::memory::{self, MemoryConfig, MemoryOutput};
 mod disk_lane;
 #[path = "application/http.rs"]
 mod http;
+#[path = "application/runtime_bindings.rs"]
+mod runtime_bindings;
+pub(super) use runtime_bindings::{
+  APPLICATION_TASK_CEILING, ApplicationDomain, ApplicationIoBindings, ApplicationRunBindings,
+  ApplicationTaskAdmission,
+};
 
 const WORKERS: usize = 4;
 const WINDOW: usize = 8;
@@ -173,6 +185,16 @@ impl Workload {
       Self::Http => "http",
       Self::Disk => "disk",
       Self::Mixed => "mixed",
+    }
+  }
+
+  pub(super) fn family_index(self) -> Option<usize> {
+    match self {
+      Self::Cpu => Some(0),
+      Self::Memory => Some(1),
+      Self::Http => Some(2),
+      Self::Disk => Some(3),
+      Self::Mixed => None,
     }
   }
 }
@@ -491,6 +513,9 @@ enum DiskDriver {
   Tokio {
     handle: tokio::runtime::Handle,
     slots: Arc<tokio::sync::Semaphore>,
+    disk_io: allocatbelt::runtime::fs::BlockingByteIo,
+    cpu_gate: CpuGate,
+    task_admission: ApplicationTaskAdmission,
   },
 }
 
@@ -504,6 +529,9 @@ enum Submitter {
     handle: tokio::runtime::Handle,
     slots: Arc<tokio::sync::Semaphore>,
     disk_slots: Option<Arc<tokio::sync::Semaphore>>,
+    disk_io: Option<allocatbelt::runtime::fs::BlockingByteIo>,
+    cpu_gate: CpuGate,
+    task_admission: ApplicationTaskAdmission,
   },
 }
 
@@ -544,6 +572,9 @@ impl Submitter {
         handle,
         slots,
         disk_slots,
+        disk_io,
+        cpu_gate,
+        task_admission,
       } => {
         let permit = slots
           .clone()
@@ -552,21 +583,44 @@ impl Submitter {
             tokio::sync::TryAcquireError::Closed => Rejection::Closed,
             tokio::sync::TryAcquireError::NoPermits => Rejection::Full,
           })?;
-        let driver = disk_slots.clone().map(|slots| DiskDriver::Tokio {
-          handle: handle.clone(),
-          slots,
-        });
+        let driver = match disk_slots.clone() {
+          Some(slots) => Some(DiskDriver::Tokio {
+            handle: handle.clone(),
+            slots,
+            disk_io: disk_io.clone().ok_or(Rejection::Closed)?,
+            cpu_gate: cpu_gate.clone(),
+            task_admission: task_admission.clone(),
+          }),
+          None => None,
+        };
         let operation = operation(workload, config, resources.clone(), seed, driver);
+        let task_lease = task_admission.reserve().map_err(|_| Rejection::Closed)?;
+        let gated = cpu_gate.wrap(operation).map_err(|_| Rejection::Closed)?;
         Ok(Job::Tokio {
           handle: handle.spawn(async move {
-            let result = operation.await;
+            let result = normalize_cpu_gated_result(gated.await);
             drop(permit);
+            drop(task_lease);
             result
           }),
           result: None,
         })
       }
     }
+  }
+}
+
+fn normalize_cpu_gated_result<T>(
+  result: Result<
+    allocatbelt_app_ports::PortResult<T>,
+    allocatbelt::runtime::resource_domain::DomainError,
+  >,
+) -> allocatbelt_app_ports::PortResult<T> {
+  match result {
+    Ok(output) => output,
+    Err(error) => Err(Box::new(std::io::Error::other(format!(
+      "CPU gate rejected a productive poll: {error:?}"
+    )))),
   }
 }
 
@@ -596,11 +650,23 @@ async fn operation(
         DiskDriver::Native(fs_handle) => {
           disk_lane::run_native_operation(&fs_handle, &resources, disk_config).await?
         }
-        DiskDriver::Tokio { handle, slots } => {
-          disk_lane::run_tokio_operation(&handle, &slots, &resources, disk_config)
-            .await
-            .map_err(std::io::Error::other)?
-        }
+        DiskDriver::Tokio {
+          handle,
+          slots,
+          disk_io,
+          cpu_gate,
+          task_admission,
+        } => disk_lane::run_tokio_operation(
+          &handle,
+          &slots,
+          &resources,
+          &disk_io,
+          &cpu_gate,
+          &task_admission,
+          disk_config,
+        )
+        .await
+        .map_err(std::io::Error::other)?,
       };
       Ok(WorkOutput::Disk(output))
     }
@@ -670,6 +736,7 @@ struct ProducerReport {
   lateness_max_ns: u64,
   started_at: Instant,
   production_end: Instant,
+  production_cpu_started_ns: u128,
   trace_overrun: bool,
 }
 
@@ -686,6 +753,7 @@ struct ObserverReport {
   final_statuses: Option<Vec<IdState>>,
   last_observed: Instant,
   records: Vec<IdRecord>,
+  family_published_on_time: [u64; 4],
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -788,7 +856,8 @@ where
 
 pub(super) fn write_shutdown_report(
   trace_ns: u128,
-  production_through_drain_cpu_ns: u128,
+  production_cpu_started_ns: u128,
+  production_cpu_ended_ns: u128,
   successful_completions: usize,
   timings: &[(&'static str, u128)],
 ) -> Result<(), String> {
@@ -798,8 +867,31 @@ pub(super) fn write_shutdown_report(
   if timings.is_empty() {
     return Err("shutdown report requires at least one driver timing".into());
   }
-  let mut report = String::from("kind\tname\tduration_ns\n");
+  let identity = [
+    ("report_nonce", "ALLOCATBELT_APP_REPORT_NONCE"),
+    ("run_id", "ALLOCATBELT_APP_RUN_ID"),
+    ("executor", "ALLOCATBELT_APP_EXECUTOR"),
+    ("allocator", "ALLOCATBELT_APP_ALLOCATOR"),
+    ("workload", "ALLOCATBELT_APP_WORKLOAD"),
+    ("profile", "ALLOCATBELT_APP_PROFILE"),
+    ("source_sha256", "ALLOCATBELT_APP_SOURCE_SHA256"),
+    ("binary_sha256", "ALLOCATBELT_APP_BINARY_SHA256"),
+  ];
+  let mut report = String::from("schema\tallocatbelt-app-phase-v1\t\n");
+  for (name, variable) in identity {
+    let value =
+      env::var(variable).map_err(|_| format!("phase report identity is missing {variable}"))?;
+    report.push_str(&format!("identity\t{name}\t{value}\n"));
+  }
+  let production_through_drain_cpu_ns =
+    production_cpu_ended_ns.saturating_sub(production_cpu_started_ns);
   report.push_str(&format!("phase\tproduction_trace\t{trace_ns}\n"));
+  report.push_str(&format!(
+    "phase\tproduction_cpu_started_ns\t{production_cpu_started_ns}\n"
+  ));
+  report.push_str(&format!(
+    "phase\tproduction_cpu_ended_ns\t{production_cpu_ended_ns}\n"
+  ));
   report.push_str(&format!(
     "phase\tproduction_through_drain_cpu_ns\t{production_through_drain_cpu_ns}\n"
   ));
@@ -884,6 +976,68 @@ pub(super) fn write_id_report(
     .map_err(|error| format!("per-ID report write failed: {error}"))
 }
 
+pub(super) fn write_capacity_family_report(
+  attempted: usize,
+  family_published_on_time: [u64; 4],
+  options: Options,
+  profile: Profile,
+) -> Result<(), String> {
+  if options.mode != Mode::Capacity || options.workload != Workload::Mixed {
+    return Ok(());
+  }
+  let Some(path) = env::var_os("ALLOCATBELT_APP_FAMILY_REPORT") else {
+    return Ok(());
+  };
+  let fields = [
+    ("report_nonce", "ALLOCATBELT_APP_REPORT_NONCE"),
+    ("run_id", "ALLOCATBELT_APP_RUN_ID"),
+    ("executor", "ALLOCATBELT_APP_EXECUTOR"),
+    ("allocator", "ALLOCATBELT_APP_ALLOCATOR"),
+    ("workload", "ALLOCATBELT_APP_WORKLOAD"),
+    ("profile", "ALLOCATBELT_APP_PROFILE"),
+    ("source_sha256", "ALLOCATBELT_APP_SOURCE_SHA256"),
+    ("binary_sha256", "ALLOCATBELT_APP_BINARY_SHA256"),
+  ];
+  let mut report = String::from("schema\tallocatbelt-app-capacity-families-v1\t\n");
+  for (name, variable) in fields {
+    let value =
+      env::var(variable).map_err(|_| format!("capacity family identity is missing {variable}"))?;
+    report.push_str(&format!("identity\t{name}\t{value}\n"));
+  }
+  let family_names = ["cpu", "memory", "http", "disk"];
+  let mut expected_total = 0u64;
+  let mut completed_total = 0u64;
+  for (index, family) in family_names.into_iter().enumerate() {
+    let scheduled = if attempted.is_multiple_of(4) {
+      attempted / 4
+    } else if index < attempted % 4 {
+      attempted / 4 + 1
+    } else {
+      attempted / 4
+    };
+    let published = family_published_on_time[index];
+    report.push_str(&format!("family\t{family}\t{scheduled}\t{published}\n"));
+    expected_total += scheduled as u64;
+    completed_total += published;
+  }
+  if expected_total != attempted as u64 || completed_total > attempted as u64 {
+    return Err("capacity family counts do not balance the production stream".into());
+  }
+  report.push_str(&format!(
+    "phase\ttrace_seconds\t{}\n",
+    CAPACITY_HORIZON.as_secs()
+  ));
+  report.push_str(&format!("phase\tprofile\t{}\n", profile.label()));
+  let mut file = OpenOptions::new()
+    .write(true)
+    .create_new(true)
+    .open(path)
+    .map_err(|error| format!("capacity family report create failed: {error}"))?;
+  file
+    .write_all(report.as_bytes())
+    .map_err(|error| format!("capacity family report write failed: {error}"))
+}
+
 fn required_report_field(name: &str) -> Result<String, String> {
   env::var(name).map_err(|_| format!("per-ID report requires {name}"))
 }
@@ -897,6 +1051,32 @@ fn is_token(value: &str) -> bool {
     && value
       .bytes()
       .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+}
+
+fn validate_runtime_report_allocator(
+  actual_binary_allocator: &str,
+  report_requested: bool,
+  reported_allocator: Option<&str>,
+) -> Result<(), String> {
+  if !report_requested {
+    return Ok(());
+  }
+  let reported = reported_allocator
+    .ok_or_else(|| "runtime report requires ALLOCATBELT_APP_ALLOCATOR".to_owned())?;
+  if reported != actual_binary_allocator {
+    return Err(format!(
+      "runtime report allocator {reported:?} differs from executable allocator {actual_binary_allocator:?}"
+    ));
+  }
+  Ok(())
+}
+
+fn validate_runtime_report_allocator_from_env(actual_binary_allocator: &str) -> Result<(), String> {
+  validate_runtime_report_allocator(
+    actual_binary_allocator,
+    env::var_os("ALLOCATBELT_APP_RUNTIME_REPORT").is_some(),
+    env::var("ALLOCATBELT_APP_ALLOCATOR").ok().as_deref(),
+  )
 }
 
 pub(super) fn measure_timer_pair_median_ns() -> u64 {
@@ -947,45 +1127,49 @@ fn run_with_plan(
   } else {
     None
   };
-  let limits = resource_limits(options.workload);
-  let resources = ResourceScope::new(limits);
-  let mut disk_runtime = if matches!(options.workload, Workload::Disk | Workload::Mixed)
-    && options.executor == Executor::Bounded
-  {
-    Some(
-      allocatbelt::runtime::Runtime::new(allocatbelt::runtime::Config {
-        workers: plan.async_workers,
-        max_outstanding: WINDOW,
-        capacity: allocatbelt::runtime::Resources {
-          disk: WINDOW,
-          ..allocatbelt::runtime::Resources::ZERO
-        },
-      })
-      .map_err(|error| format!("allocatbelt filesystem runtime start failed: {error}"))?,
-    )
-  } else {
-    None
-  };
-  let native_fs = disk_runtime
-    .as_ref()
-    .map(|runtime| allocatbelt::runtime::fs::FsHandle::new(runtime.handle(), resources.clone()));
-  let (submitter, observer, scope, runtime) = match options.executor {
+  let domain = ApplicationDomain::new(options.workload, plan.async_workers)?;
+  let (submitter, observer, scope, runtime, resources, mut run_bindings) = match options.executor {
     Executor::Bounded => {
-      let async_runtime = AsyncRuntime::new(AsyncConfig {
+      let async_config = AsyncConfig {
         workers: plan.async_workers,
         max_outstanding: WINDOW,
         max_scopes: 2,
-      })
-      .map_err(|error| format!("allocatbelt async runtime start failed: {error}"))?;
-      let scope = async_runtime
-        .scope_with_resources(&resources)
+      };
+      let mut builder = MultiThreadBuilder::new(async_config)
+        .resource_domain(domain.tenant())
+        .resources(domain.local_limits())
+        .rate_timer_registrations(256)
+        .disk_rate(domain.rate_config())
+        .upload_rate(domain.rate_config())
+        .download_rate(domain.rate_config());
+      if matches!(options.workload, Workload::Disk | Workload::Mixed) {
+        builder = builder
+          .blocking(BlockingConfig {
+            workers: plan.async_workers,
+            max_outstanding: WINDOW,
+            capacity: allocatbelt::runtime::Resources {
+              disk: WINDOW,
+              ..allocatbelt::runtime::Resources::ZERO
+            },
+          })
+          .filesystem();
+      }
+      let driver = builder
+        .build()
+        .map_err(|error| format!("allocatbelt application driver start failed: {error}"))?;
+      let run_bindings = domain.for_native(&driver)?;
+      let resources = run_bindings.resources();
+      let scope = driver
+        .scope()
         .map_err(|error| format!("allocatbelt scope start failed: {error}"))?;
+      let native_fs = driver.filesystem();
       let handle = scope.handle();
       warm_bounded_for(&handle, plan.async_workers)?;
-      if matches!(options.workload, Workload::Disk | Workload::Mixed)
-        && let Some(fs_runtime) = &disk_runtime
-      {
-        disk_lane::warm_native_workers(fs_runtime, &handle, plan.async_workers)?;
+      if matches!(options.workload, Workload::Disk | Workload::Mixed) {
+        let blocking = driver.blocking().ok_or_else(|| {
+          "owning driver omitted its selected blocking filesystem pool".to_owned()
+        })?;
+        disk_lane::warm_native_workers(&blocking, &handle, plan.async_workers)?;
       }
       let observer = Observer::Bounded(handle.clone());
       (
@@ -995,10 +1179,14 @@ fn run_with_plan(
         },
         observer,
         Some(scope),
-        ExecutorRuntime::Bounded(async_runtime),
+        ExecutorRuntime::Bounded(Box::new(driver)),
+        resources,
+        run_bindings,
       )
     }
     Executor::Tokio => {
+      let run_bindings = domain.for_tokio()?;
+      let resources = run_bindings.resources();
       let runtime_built = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(plan.async_workers)
         .max_blocking_threads(plan.async_workers)
@@ -1019,15 +1207,21 @@ fn run_with_plan(
           handle,
           slots,
           disk_slots,
+          disk_io: run_bindings.io().blocking_disk_io(),
+          cpu_gate: run_bindings.cpu_gate(),
+          task_admission: run_bindings.task_admission(),
         },
         observer,
         None,
         ExecutorRuntime::Tokio(runtime_built),
+        resources,
+        run_bindings,
       )
     }
   };
-  // CPU/memory intentionally create no blocking-service workers.
+  // CPU/memory intentionally create no filesystem blocking-service workers.
   let mut scope_keepalive = scope;
+  let observer_task_lease = run_bindings.reserve_task()?;
 
   let id_states = if options.mode == Mode::OpenLoop {
     let arrivals = open_loop_arrivals;
@@ -1062,6 +1256,7 @@ fn run_with_plan(
   let observer_thread = thread::Builder::new()
     .name("application-observer".into())
     .spawn(move || {
+      let _task_lease = observer_task_lease;
       let report = observe_with_plan(
         observer,
         options,
@@ -1091,12 +1286,14 @@ fn run_with_plan(
   if setup_started.elapsed() > SETUP_DEADLINE {
     return Err("application setup exceeded its 120 second finite deadline".into());
   }
+  let mut runtime_readback = RuntimeBindingWriter::begin(options, plan, &run_bindings)?;
   let producer_states = id_states;
   let producer_resources = resources.clone();
-  let production_cpu_started = process_cpu_time_ns();
+  let producer_task_lease = run_bindings.reserve_task()?;
   let producer_thread = thread::Builder::new()
     .name("application-producer".into())
     .spawn(move || {
+      let _task_lease = producer_task_lease;
       let report = produce_with_plan(
         submitter,
         options,
@@ -1128,7 +1325,10 @@ fn run_with_plan(
   observer_thread
     .join()
     .map_err(|_| "application observer panicked".to_owned())?;
-  let production_cpu_ns = process_cpu_time_ns().saturating_sub(production_cpu_started);
+  let production_cpu_ended_ns = process_cpu_time_ns();
+  if let Some(readback) = runtime_readback.as_mut() {
+    readback.capture("after_drain", &run_bindings)?;
+  }
   let rss_after_drain = sample_after_checkpoint_delay()?;
   let expected_checksum = expected_digest(
     options,
@@ -1156,22 +1356,41 @@ fn run_with_plan(
   let shutdown_started = Instant::now();
   let mut shutdown_timings = Vec::with_capacity(2);
   match (options.executor, runtime) {
-    (Executor::Bounded, ExecutorRuntime::Bounded(runtime)) => {
+    (Executor::Bounded, ExecutorRuntime::Bounded(mut runtime)) => {
       let scope = scope_keepalive
         .take()
         .ok_or_else(|| "bounded scope ownership was lost".to_owned())?;
-      let elapsed_ns = run_shutdown_with_timeout("allocatbelt async runtime", move || {
+      let shutdown_task_lease = run_bindings.reserve_task()?;
+      let elapsed_ns = run_shutdown_with_timeout("allocatbelt application driver", move || {
+        let _task_lease = shutdown_task_lease;
         runtime
           .block_on(scope.close())
           .map_err(|error| format!("scope close failed: {error}"))?;
         runtime
-          .shutdown(AsyncShutdown::Drain)
-          .map_err(|error| format!("allocatbelt runtime shutdown failed: {error}"))
+          .request_shutdown(MultiShutdown {
+            tasks: AsyncShutdown::Drain,
+            blocking: ShutdownMode::Drain,
+            processes: ProcessShutdownMode::Wait,
+          })
+          .map_err(|error| format!("allocatbelt driver shutdown request failed: {error}"))?;
+        loop {
+          match runtime
+            .drive_shutdown_step()
+            .map_err(|error| format!("allocatbelt driver shutdown failed: {error}"))?
+          {
+            allocatbelt::runtime::ShutdownProgress::Complete => return Ok(()),
+            allocatbelt::runtime::ShutdownProgress::Pending => {
+              thread::sleep(Duration::from_millis(1));
+            }
+          }
+        }
       })?;
-      shutdown_timings.push(("allocatbelt async runtime", elapsed_ns));
+      shutdown_timings.push(("allocatbelt application driver", elapsed_ns));
     }
     (Executor::Tokio, ExecutorRuntime::Tokio(runtime)) => {
+      let shutdown_task_lease = run_bindings.reserve_task()?;
       let elapsed_ns = run_shutdown_with_timeout("Tokio runtime", move || {
+        let _task_lease = shutdown_task_lease;
         runtime.shutdown_timeout(execution_deadlines().shutdown);
         Ok(())
       })?;
@@ -1179,13 +1398,9 @@ fn run_with_plan(
     }
     _ => return Err("executor runtime ownership mismatch".into()),
   }
-  if let Some(mut fs_runtime) = disk_runtime.take() {
-    let elapsed_ns = run_shutdown_with_timeout("allocatbelt filesystem runtime", move || {
-      fs_runtime
-        .shutdown(allocatbelt::runtime::ShutdownMode::Drain)
-        .map_err(|error| format!("allocatbelt filesystem runtime shutdown failed: {error}"))
-    })?;
-    shutdown_timings.push(("allocatbelt filesystem runtime", elapsed_ns));
+  run_bindings.shutdown_auxiliary_timer()?;
+  if let Some(readback) = runtime_readback.as_mut() {
+    readback.capture("after_shutdown", &run_bindings)?;
   }
   let driver_shutdown_ns = shutdown_started.elapsed().as_nanos();
   write_shutdown_report(
@@ -1193,11 +1408,11 @@ fn run_with_plan(
       .production_end
       .saturating_duration_since(producer.started_at)
       .as_nanos(),
-    production_cpu_ns,
+    producer.production_cpu_started_ns,
+    production_cpu_ended_ns,
     observer_report.completed_on_time + observer_report.completed_late,
     &shutdown_timings,
   )?;
-  let rss_after_shutdown = sample_after_checkpoint_delay()?;
   let final_resources = resources.snapshot();
   if final_resources.managed_memory != 0
     || final_resources.disk_ops != 0
@@ -1207,6 +1422,29 @@ fn run_with_plan(
       "nonzero final resource ledger: {final_resources:?}"
     ));
   }
+  let (global_domain, tenant_domain, _) = run_bindings.snapshots()?;
+  for (name, snapshot) in [("global", global_domain), ("tenant", tenant_domain)] {
+    if snapshot.used.get(DomainResource::Cpu) != 0
+      || snapshot.used.get(DomainResource::Memory) != 0
+      || snapshot.used.get(DomainResource::Disk) != 0
+      || snapshot.used.get(DomainResource::Network) != 0
+      || snapshot.used.get(DomainResource::Tasks) != 0
+    {
+      return Err(format!(
+        "nonzero final {name} resource usage: {:?}",
+        snapshot.used
+      ));
+    }
+  }
+  let readback_domain = domain.readback_domain();
+  let fixed_control_baseline = domain.fixed_global_control_baseline();
+  drop(run_bindings);
+  drop(resources);
+  drop(domain);
+  if let Some(readback) = runtime_readback {
+    readback.finish(&readback_domain, fixed_control_baseline)?;
+  }
+  let rss_after_shutdown = sample_after_checkpoint_delay()?;
   if producer.trace_overrun {
     return Err("open-loop producer exceeded its finite trace deadline".into());
   }
@@ -1250,7 +1488,7 @@ fn run_with_plan(
 }
 
 enum ExecutorRuntime {
-  Bounded(AsyncRuntime),
+  Bounded(Box<MultiThreadDriver>),
   Tokio(tokio::runtime::Runtime),
 }
 
@@ -1299,6 +1537,373 @@ fn validate_options(options: Options) -> Result<(), String> {
     }
   }
   Ok(())
+}
+
+pub(super) struct RuntimeBindingWriter {
+  path: std::path::PathBuf,
+  rows: Vec<(String, String)>,
+}
+
+impl RuntimeBindingWriter {
+  pub(super) fn begin(
+    options: Options,
+    plan: ArrivalPlan,
+    bindings: &ApplicationRunBindings,
+  ) -> Result<Option<Self>, String> {
+    let Some(path) = env::var_os("ALLOCATBELT_APP_RUNTIME_REPORT") else {
+      return Ok(None);
+    };
+    let mut writer = Self {
+      path: path.into(),
+      rows: Vec::new(),
+    };
+    let identity = [
+      ("report_nonce", "ALLOCATBELT_APP_REPORT_NONCE"),
+      ("run_id", "ALLOCATBELT_APP_RUN_ID"),
+      ("allocator", "ALLOCATBELT_APP_ALLOCATOR"),
+      ("executor", "ALLOCATBELT_APP_EXECUTOR"),
+      ("source_sha256", "ALLOCATBELT_APP_SOURCE_SHA256"),
+      ("binary_sha256", "ALLOCATBELT_APP_BINARY_SHA256"),
+      ("comparison_family", "ALLOCATBELT_APP_COMPARISON_FAMILY"),
+      (
+        "resource_ceiling_sha256",
+        "ALLOCATBELT_APP_RESOURCE_CEILING_SHA256",
+      ),
+      ("policy_sha256", "ALLOCATBELT_APP_POLICY_SHA256"),
+    ];
+    for (name, variable) in identity {
+      let value = env::var(variable)
+        .map_err(|_| format!("runtime readback identity is missing {variable}"))?;
+      if matches!(
+        name,
+        "source_sha256" | "binary_sha256" | "resource_ceiling_sha256" | "policy_sha256"
+      ) && !is_hex(&value, 64)
+      {
+        return Err(format!(
+          "runtime readback identity {name} is not a SHA-256 value"
+        ));
+      }
+      if name == "report_nonce" && !is_hex(&value, 32) {
+        return Err("runtime readback report nonce is malformed".into());
+      }
+      if name == "run_id" && !is_token(&value) {
+        return Err("runtime readback run ID is malformed".into());
+      }
+      writer.add(format!("identity.{name}"), value)?;
+    }
+    writer.add(
+      "identity.hashes_are_echoed_bindings_not_self_proof".to_owned(),
+      "controller_must_independently_verify_source_binary_TSV_and_receipt_hashes".to_owned(),
+    )?;
+    let profile = env::var("ALLOCATBELT_APP_PROFILE")
+      .map_err(|_| "runtime readback identity is missing ALLOCATBELT_APP_PROFILE".to_owned())?;
+    let workload = env::var("ALLOCATBELT_APP_WORKLOAD")
+      .map_err(|_| "runtime readback identity is missing ALLOCATBELT_APP_WORKLOAD".to_owned())?;
+    let executor = env::var("ALLOCATBELT_APP_EXECUTOR").unwrap_or_default();
+    let comparison_family = env::var("ALLOCATBELT_APP_COMPARISON_FAMILY").unwrap_or_default();
+    if profile != plan.profile.label() || workload != options.workload.label() {
+      return Err(
+        "runtime readback profile/workload differs from the selected application run".into(),
+      );
+    }
+    let expected_executor = match options.executor {
+      Executor::Bounded => "allocatbelt",
+      Executor::Tokio => "tokio-1.53.1",
+    };
+    if executor != expected_executor {
+      return Err("runtime readback executor differs from the selected executor".into());
+    }
+    if comparison_family != "fixed_policy" {
+      return Err("external-pressure runtime policy is unavailable in this binary".into());
+    }
+    for (key, value) in [
+      ("identity.profile", profile),
+      ("identity.workload", workload),
+      ("configuration.mode", options.mode.label().to_owned()),
+      (
+        "configuration.rate_per_second",
+        options
+          .rate_per_second
+          .map_or_else(|| "0".to_owned(), |rate| rate.to_string()),
+      ),
+      ("configuration.arrivals", plan.arrivals.to_string()),
+      (
+        "configuration.async_workers",
+        plan.async_workers.to_string(),
+      ),
+      ("configuration.logical_window", WINDOW.to_string()),
+      (
+        "configuration.trace_duration_ns",
+        if options.mode == Mode::OpenLoop {
+          plan.trace_duration_ns()?.to_string()
+        } else {
+          CAPACITY_HORIZON.as_nanos().to_string()
+        },
+      ),
+      (
+        "configuration.pulse_rate_per_second",
+        if plan.profile == Profile::Burst {
+          options
+            .rate_per_second
+            .unwrap_or(0)
+            .checked_mul(4)
+            .ok_or_else(|| "runtime readback burst rate overflow".to_owned())?
+            .to_string()
+        } else {
+          options
+            .rate_per_second
+            .map_or_else(|| "0".to_owned(), |rate| rate.to_string())
+        },
+      ),
+      (
+        "configuration.task_ceiling",
+        APPLICATION_TASK_CEILING.to_string(),
+      ),
+      (
+        "configuration.resource_policy",
+        "fixed_primary_v1".to_owned(),
+      ),
+      ("configuration.feedback_enabled", "false".to_owned()),
+      (
+        "configuration.network_direction",
+        "upload_and_download".to_owned(),
+      ),
+      (
+        "accounting.cpu",
+        if options.executor == Executor::Bounded {
+          "owning_scheduler_domain_cpu_tickets"
+        } else {
+          "cpu_gate_per_tokio_future_poll_and_blocking_io"
+        }
+        .to_owned(),
+      ),
+      (
+        "accounting.tasks",
+        if options.executor == Executor::Bounded {
+          "owning_scheduler_tasks_plus_explicit_root_roles"
+        } else {
+          "explicit_tokio_task_leases_plus_root_roles"
+        }
+        .to_owned(),
+      ),
+      (
+        "accounting.managed_payload",
+        "ResourceScope_and_tenant_domain".to_owned(),
+      ),
+      (
+        "accounting.disk_operations",
+        "ResourceScope_disk_permits".to_owned(),
+      ),
+      (
+        "accounting.disk_bytes",
+        if options.executor == Executor::Bounded {
+          "owning_FsRate_per_syscall"
+        } else {
+          "shared_BlockingByteIo_per_syscall_inside_spawn_blocking"
+        }
+        .to_owned(),
+      ),
+      (
+        "accounting.network_operations",
+        "ResourceScope_network_permits".to_owned(),
+      ),
+      (
+        "accounting.network_bytes",
+        "IoBindings_directional_byte_buckets".to_owned(),
+      ),
+      (
+        "accounting.opaque_runtime_allocations",
+        "excluded_from_managed_payload_and_measured_by_RSS".to_owned(),
+      ),
+      (
+        "accounting.receipt_writer_storage",
+        "bounded_metadata_outside_application_ResourceScope".to_owned(),
+      ),
+    ] {
+      writer.add(key.to_owned(), value)?;
+    }
+    let lane = LaneConfig::default();
+    for (key, value) in [
+      ("kernel.cpu_rounds", lane.rounds.to_string()),
+      (
+        "kernel.memory_initial_bytes",
+        lane.memory.initial_bytes.to_string(),
+      ),
+      (
+        "kernel.memory_grown_bytes",
+        lane.memory.grown_bytes.to_string(),
+      ),
+      ("kernel.memory_seed", lane.memory.seed.to_string()),
+      ("kernel.disk_bytes", lane.disk.bytes.to_string()),
+      ("kernel.disk_offset", lane.disk.offset.to_string()),
+      ("kernel.disk_seed", lane.disk.seed.to_string()),
+      (
+        "kernel.http_body_bytes",
+        http::ORACLE_BODY_BYTES.to_string(),
+      ),
+      ("kernel.mixed_interleave", "cpu,memory,http,disk".to_owned()),
+    ] {
+      writer.add(key.to_owned(), value)?;
+    }
+    let domain_limits = bindings.domain_limits();
+    for (name, resource) in [
+      ("cpu", DomainResource::Cpu),
+      ("memory", DomainResource::Memory),
+      ("disk", DomainResource::Disk),
+      ("network", DomainResource::Network),
+      ("tasks", DomainResource::Tasks),
+      ("control", DomainResource::Control),
+    ] {
+      writer.add(
+        format!("configuration.domain_ceiling.{name}"),
+        domain_limits.get(resource).to_string(),
+      )?;
+    }
+    writer.add(
+      "configuration.managed_memory_limit_bytes".to_owned(),
+      bindings.resources().limits().managed_memory.to_string(),
+    )?;
+    writer.add(
+      "configuration.disk_operation_limit".to_owned(),
+      bindings
+        .resources()
+        .limits()
+        .disk_concurrent_ops
+        .to_string(),
+    )?;
+    writer.add(
+      "configuration.network_operation_limit".to_owned(),
+      bindings
+        .resources()
+        .limits()
+        .network_concurrent_ops
+        .to_string(),
+    )?;
+    writer.add(
+      "configuration.fixed_global_control_baseline".to_owned(),
+      bindings.fixed_global_control_baseline().to_string(),
+    )?;
+    writer.add(
+      "configuration.setup_global_control".to_owned(),
+      bindings.setup_global_control_baseline().to_string(),
+    )?;
+    writer.add(
+      "configuration.blocking_disk_adapter_constructed".to_owned(),
+      bindings.io().has_blocking_disk_byte_io().to_string(),
+    )?;
+    for (key, value) in bindings.runtime_rows("setup")? {
+      writer.add(key, value)?;
+    }
+    Ok(Some(writer))
+  }
+
+  pub(super) fn capture(
+    &mut self,
+    stage: &str,
+    bindings: &ApplicationRunBindings,
+  ) -> Result<(), String> {
+    let rows = bindings.runtime_rows(stage)?;
+    if matches!(stage, "after_drain" | "after_shutdown") {
+      let required_zero = [
+        ".global.used.cpu",
+        ".global.used.memory",
+        ".global.used.disk",
+        ".global.used.network",
+        ".global.used.tasks",
+        ".tenant.used.cpu",
+        ".tenant.used.memory",
+        ".tenant.used.disk",
+        ".tenant.used.network",
+        ".tenant.used.tasks",
+        ".scope.managed_memory_used",
+        ".scope.disk_operations_used",
+        ".scope.network_operations_used",
+      ];
+      for suffix in required_zero {
+        let key = format!("{stage}{suffix}");
+        let value = rows
+          .iter()
+          .find(|(candidate, _)| candidate == &key)
+          .map(|(_, value)| value)
+          .ok_or_else(|| format!("runtime readback omitted {key}"))?;
+        if value != "0" {
+          return Err(format!(
+            "runtime readback found nonzero usage at {key}: {value}"
+          ));
+        }
+      }
+    }
+    for (key, value) in rows {
+      self.add(key, value)?;
+    }
+    Ok(())
+  }
+
+  fn add(&mut self, key: String, value: String) -> Result<(), String> {
+    if key.is_empty()
+      || key.contains(['\t', '\n', '\r'])
+      || value.contains(['\t', '\n', '\r'])
+      || self.rows.iter().any(|(existing, _)| existing == &key)
+    {
+      return Err("runtime readback contains a duplicate or unframed field".into());
+    }
+    self.rows.push((key, value));
+    Ok(())
+  }
+
+  pub(super) fn finish(
+    mut self,
+    readback_domain: &allocatbelt::runtime::resource_domain::ResourceDomain,
+    fixed_global_control_baseline: usize,
+  ) -> Result<(), String> {
+    let released = readback_domain.snapshot();
+    self.add(
+      "after_release.global.live_tenants".to_owned(),
+      released.live_tenants.to_string(),
+    )?;
+    self.add(
+      "after_release.global.used.control".to_owned(),
+      released.used.get(DomainResource::Control).to_string(),
+    )?;
+    self.add(
+      "after_release.expected_global_control_baseline".to_owned(),
+      fixed_global_control_baseline.to_string(),
+    )?;
+    self.add(
+      "after_release.control_matches_fixed_baseline".to_owned(),
+      (released.used.get(DomainResource::Control) == fixed_global_control_baseline
+        && released.live_tenants == 0)
+        .to_string(),
+    )?;
+    if released.used.get(DomainResource::Control) != fixed_global_control_baseline
+      || released.live_tenants != 0
+    {
+      return Err(
+        "application binding cleanup did not return Control to its fixed domain baseline".into(),
+      );
+    }
+    self.rows.sort_by(|left, right| left.0.cmp(&right.0));
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+      use std::os::unix::fs::OpenOptionsExt;
+      options.mode(0o600);
+    }
+    let mut file = options
+      .open(&self.path)
+      .map_err(|error| format!("runtime readback create failed: {error}"))?;
+    writeln!(file, "schema\tallocatbelt.application-runtime-binding.v1")
+      .map_err(|error| format!("runtime readback schema write failed: {error}"))?;
+    for (key, value) in self.rows {
+      writeln!(file, "{key}\t{value}")
+        .map_err(|error| format!("runtime readback field write failed: {error}"))?;
+    }
+    file
+      .sync_all()
+      .map_err(|error| format!("runtime readback sync failed: {error}"))?;
+    Ok(())
+  }
 }
 
 fn validate_arrival_plan(plan: ArrivalPlan, deadline: Duration) -> Result<(), String> {
@@ -1474,7 +2079,10 @@ impl WarmGate {
     let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
     while state.entrants < expected {
       let Some(remaining) = self.deadline.checked_duration_since(Instant::now()) else {
-        return Err("worker warm-up exceeded 30 seconds".into());
+        return Err(format!(
+          "worker warm-up exceeded 30 seconds ({} of {expected} workers arrived)",
+          state.entrants
+        ));
       };
       let (next, result) = self
         .changed
@@ -1482,7 +2090,10 @@ impl WarmGate {
         .unwrap_or_else(|e| e.into_inner());
       state = next;
       if result.timed_out() && state.entrants < expected {
-        return Err("worker warm-up exceeded 30 seconds".into());
+        return Err(format!(
+          "worker warm-up exceeded 30 seconds ({} of {expected} workers arrived)",
+          state.entrants
+        ));
       }
     }
     state.released = true;
@@ -1592,6 +2203,9 @@ fn produce_with_plan(
   let mut outstanding = 0usize;
   let mut next_capacity_id = 0u64;
 
+  // Start the production CPU interval after warmup/setup and immediately
+  // before the producer can observe or schedule its first operation.
+  let production_cpu_started_ns = process_cpu_time_ns();
   loop {
     while let Ok(()) = credits.try_recv() {
       outstanding = outstanding.saturating_sub(1);
@@ -1723,6 +2337,7 @@ fn produce_with_plan(
     lateness_max_ns,
     started_at: start,
     production_end,
+    production_cpu_started_ns,
     trace_overrun,
   })
 }
@@ -1786,6 +2401,7 @@ fn observe_with_plan(
   let mut digest = 0u64;
   let mut latencies_ns = Vec::new();
   let mut records = Vec::new();
+  let mut family_published_on_time = [0u64; 4];
   if options.mode == Mode::OpenLoop {
     records
       .try_reserve_exact(open_loop_arrivals)
@@ -1894,6 +2510,9 @@ fn observe_with_plan(
             digest = digest.wrapping_add(output_value ^ id);
             if observed <= horizon_end {
               completed_on_time += 1;
+              if let Some(index) = workload.family_index() {
+                family_published_on_time[index] = family_published_on_time[index].saturating_add(1);
+              }
             } else {
               completed_late += 1;
             }
@@ -1965,6 +2584,7 @@ fn observe_with_plan(
         final_statuses,
         last_observed,
         records,
+        family_published_on_time,
       });
     }
     if !made_progress {
@@ -2366,51 +2986,59 @@ pub fn main(allocator: &'static str) -> ExitCode {
       }
     };
   }
-  match parse_args(args.into_iter()) {
-    Ok((options, plan, deadlines))
-      if matches!(options.workload, Workload::Http | Workload::Mixed) =>
-    {
-      let _ = EXECUTION_DEADLINES.set(deadlines);
-      match http::run_and_print(allocator, options, plan) {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(error) => {
-          eprintln!("application run invalid: {error}");
-          ExitCode::FAILURE
-        }
-      }
-    }
-    Ok((options, plan, deadlines)) if options.workload == Workload::Disk => {
-      let _ = EXECUTION_DEADLINES.set(deadlines);
-      match disk_lane::run_and_print(allocator, options, plan) {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(error) => {
-          eprintln!("application run invalid: {error}");
-          ExitCode::FAILURE
-        }
-      }
-    }
-    Ok((options, plan, deadlines)) => {
-      let _ = EXECUTION_DEADLINES.set(deadlines);
-      match run_with_plan(options, plan, None) {
-        Ok(counts) => {
-          if let Err(error) =
-            write_id_report(&counts.observer.records, allocator, options, plan.profile)
-          {
-            eprintln!("application run invalid: {error}");
-            return ExitCode::FAILURE;
-          }
-          print_row(allocator, options, &counts);
-          ExitCode::SUCCESS
-        }
-        Err(error) => {
-          eprintln!("application run invalid: {error}");
-          ExitCode::FAILURE
-        }
-      }
-    }
+  let (options, plan, deadlines) = match parse_args(args.into_iter()) {
+    Ok(parsed) => parsed,
     Err(error) => {
       eprintln!("{error}\n{}", usage());
-      ExitCode::from(2)
+      return ExitCode::from(2);
+    }
+  };
+  if let Err(error) = validate_runtime_report_allocator_from_env(allocator) {
+    eprintln!("application runtime identity invalid: {error}");
+    return ExitCode::FAILURE;
+  }
+  let _ = EXECUTION_DEADLINES.set(deadlines);
+  if matches!(options.workload, Workload::Http | Workload::Mixed) {
+    return match http::run_and_print(allocator, options, plan) {
+      Ok(()) => ExitCode::SUCCESS,
+      Err(error) => {
+        eprintln!("application run invalid: {error}");
+        ExitCode::FAILURE
+      }
+    };
+  }
+  if options.workload == Workload::Disk {
+    return match disk_lane::run_and_print(allocator, options, plan) {
+      Ok(()) => ExitCode::SUCCESS,
+      Err(error) => {
+        eprintln!("application run invalid: {error}");
+        ExitCode::FAILURE
+      }
+    };
+  }
+  match run_with_plan(options, plan, None) {
+    Ok(counts) => {
+      if let Err(error) =
+        write_id_report(&counts.observer.records, allocator, options, plan.profile)
+      {
+        eprintln!("application run invalid: {error}");
+        return ExitCode::FAILURE;
+      }
+      if let Err(error) = write_capacity_family_report(
+        counts.producer.attempted,
+        counts.observer.family_published_on_time,
+        options,
+        plan.profile,
+      ) {
+        eprintln!("application run invalid: {error}");
+        return ExitCode::FAILURE;
+      }
+      print_row(allocator, options, &counts);
+      ExitCode::SUCCESS
+    }
+    Err(error) => {
+      eprintln!("application run invalid: {error}");
+      ExitCode::FAILURE
     }
   }
 }
@@ -2668,11 +3296,12 @@ fn percentile(samples: &[u64], percentile: usize) -> u64 {
 #[cfg(test)]
 mod tests {
   use super::{
-    AsyncConfig, AsyncRuntime, AsyncShutdown, DiskReport, Executor, IdState, Job, LaneConfig, Mode,
-    Observer, ObserverEvent, ObserverEventSender, ObserverReport, Options, ProducerReport, Profile,
+    AsyncConfig, AsyncShutdown, DiskReport, Executor, IdState, Job, LaneConfig, Mode, Observer,
+    ObserverEvent, ObserverEventSender, ObserverReport, Options, ProducerReport, Profile,
     WorkOutput, Workload, accept_capacity_id, observe, resource_limits, run_with_limits,
     validate_output,
   };
+  use allocatbelt::runtime::asynchronous::AsyncRuntime;
   use allocatbelt::runtime::managed::{ResourceLimits, ResourceScope};
   use std::sync::{Arc, Mutex, OnceLock, mpsc};
   use std::task::Waker;
@@ -2788,6 +3417,23 @@ mod tests {
       "42",
     ];
     assert!(super::parse_args(capacity.iter().map(|value| (*value).to_owned())).is_err());
+  }
+
+  #[test]
+  fn runtime_report_allocator_must_match_the_executable_identity() {
+    assert_eq!(
+      super::validate_runtime_report_allocator("allocatbelt", true, Some("allocatbelt")),
+      Ok(())
+    );
+    assert!(
+      super::validate_runtime_report_allocator("allocatbelt", true, Some("mimalloc-secure"))
+        .is_err()
+    );
+    assert!(super::validate_runtime_report_allocator("tokio-1.53.1", true, None).is_err());
+    assert_eq!(
+      super::validate_runtime_report_allocator("allocatbelt", false, None),
+      Ok(())
+    );
   }
 
   #[test]
@@ -2974,7 +3620,7 @@ mod tests {
 
   #[test]
   fn producer_wait_uses_remaining_whole_process_budget() {
-    let expired = Instant::now() - Duration::from_secs(901);
+    let expired = Instant::now() - super::execution_deadlines().process - Duration::from_secs(1);
     assert_eq!(super::remaining_process_deadline(expired), Duration::ZERO);
     assert!(super::remaining_process_deadline(Instant::now()) > Duration::ZERO);
   }
@@ -3227,6 +3873,7 @@ mod tests {
       ]),
       last_observed: Instant::now(),
       records: Vec::new(),
+      family_published_on_time: [0; 4],
     };
     let producer = ProducerReport {
       attempted: 4,
@@ -3238,6 +3885,7 @@ mod tests {
       lateness_max_ns: 0,
       started_at: Instant::now(),
       production_end: Instant::now(),
+      production_cpu_started_ns: super::process_cpu_time_ns(),
       trace_overrun: false,
     };
     let expected = oracle[0].wrapping_add(oracle[2] ^ 2);
@@ -3367,7 +4015,7 @@ mod tests {
         events_rx,
         mpsc::sync_channel(8).0,
         None,
-        0,
+        1,
         0,
         Duration::from_secs(5),
         None,
@@ -3387,7 +4035,10 @@ mod tests {
       .recv_timeout(Duration::from_secs(1))
       .expect("last sender drop must wake observer")
       .expect_err("missing Done must remain an error");
-    assert!(error.contains("observer queue closed before pending jobs"));
+    assert!(
+      error.contains("observer queue closed before pending jobs"),
+      "unexpected observer failure after producer panic: {error}"
+    );
     observer.join().expect("observer thread should exit");
   }
 

@@ -15,16 +15,22 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use allocatbelt::runtime::asynchronous::{
-  AsyncConfig, AsyncHandle, AsyncJob, AsyncJoinError, AsyncRuntime, AsyncShutdown,
+  AsyncConfig, AsyncHandle, AsyncJob, AsyncJoinError, AsyncShutdown,
 };
 use allocatbelt::runtime::channel;
 use allocatbelt::runtime::io::{AsyncRead, AsyncWrite};
 use allocatbelt::runtime::managed::{
-  OperationRequest, ResourceLimits, ResourceScope, ResourceSnapshot,
+  OperationPermit, OperationRequest, ResourceLimits, ResourceScope, ResourceSnapshot,
 };
-use allocatbelt::runtime::net::{NetHandle, TcpListener as NativeListener};
-use allocatbelt::runtime::reactor::{Reactor, ReactorConfig, ReactorHandle};
-use allocatbelt::runtime::{Config as BlockingConfig, Resources};
+use allocatbelt::runtime::net::{
+  NetHandle, TcpListener as NativeListener, TcpStream as NativeStream,
+};
+use allocatbelt::runtime::reactor::{ReactorConfig, ReactorHandle};
+use allocatbelt::runtime::resource_domain::{DomainResource, DomainSnapshot};
+use allocatbelt::runtime::{
+  Config as BlockingConfig, MultiShutdown, MultiThreadBuilder, Resources, ShutdownMode,
+  ShutdownProgress,
+};
 use allocatbelt_app_ports::http::{self, HttpConfig};
 use allocatbelt_app_ports::memory::pattern_byte;
 use tokio::io::{AsyncRead as TokioAsyncRead, AsyncWrite as TokioAsyncWrite};
@@ -32,12 +38,19 @@ use tokio::io::{AsyncRead as TokioAsyncRead, AsyncWrite as TokioAsyncWrite};
 #[cfg(test)]
 use super::Profile;
 use super::{
-  ArrivalPlan, Executor, Mode, Observer, ObserverEventSender, ObserverWake, Options, WorkOutput,
-  Workload,
+  ApplicationDomain, ApplicationIoBindings, ApplicationRunBindings, ApplicationTaskAdmission,
+  ArrivalPlan, Executor, Mode, Observer, ObserverEventSender, ObserverWake, Options,
+  RuntimeBindingWriter, WorkOutput, Workload,
 };
 
 const WINDOW: usize = 8;
-const TASK_LIMIT: usize = 2 * WINDOW + 1;
+// One accept loop may coexist with both endpoint tasks for every live pair.
+// The producer and observer are separate OS-thread roots with their own
+// tenant task leases, not slots in this executor task table.
+const ACCEPTOR_TASKS: usize = 1;
+const CLIENT_TASKS: usize = WINDOW;
+const HANDLER_TASKS: usize = WINDOW;
+const TASK_LIMIT: usize = ACCEPTOR_TASKS + CLIENT_TASKS + HANDLER_TASKS;
 const BODY_BYTES: usize = 4096;
 const CAPACITY_HORIZON: Duration = Duration::from_secs(30);
 const MAX_CAPACITY_JOBS: usize = 10_000_000;
@@ -198,6 +211,7 @@ struct ProducerReport {
   lateness_max_ns: u64,
   started_at: Instant,
   production_end: Instant,
+  production_cpu_started_ns: u128,
   trace_overrun: bool,
 }
 
@@ -220,6 +234,8 @@ struct Report {
   max_observed_managed_bytes: usize,
   retained_managed_bytes: usize,
   final_resources: ResourceSnapshot,
+  final_global_domain: DomainSnapshot,
+  final_tenant_domain: DomainSnapshot,
   shutdown_ns: u128,
   last_observed: Instant,
   drain_tail_ns: u128,
@@ -227,6 +243,7 @@ struct Report {
   blocking_workers: usize,
   topology: &'static str,
   records: Vec<super::IdRecord>,
+  family_published_on_time: [u64; 4],
 }
 
 #[derive(Debug)]
@@ -241,6 +258,7 @@ struct ObserverReport {
   retained_managed_bytes: usize,
   last_observed: Instant,
   records: Vec<super::IdRecord>,
+  family_published_on_time: [u64; 4],
 }
 
 #[derive(Default)]
@@ -289,6 +307,12 @@ pub(super) fn run_and_print(
     Executor::Tokio => run_tokio(options, settings, plan)?,
   };
   super::write_id_report(&report.records, allocator, options, plan.profile)?;
+  super::write_capacity_family_report(
+    report.producer.attempted,
+    report.family_published_on_time,
+    options,
+    plan.profile,
+  )?;
   print_row(allocator, options, &report);
   Ok(())
 }
@@ -299,6 +323,47 @@ pub(super) fn limits() -> ResourceLimits {
     disk_concurrent_ops: 0,
     network_concurrent_ops: 2 * WINDOW,
   }
+}
+
+fn validate_domain_receipt(
+  bindings: &ApplicationRunBindings,
+  lane: &str,
+) -> Result<(DomainSnapshot, DomainSnapshot, ResourceSnapshot), String> {
+  let (global, tenant, resources) = bindings.snapshots()?;
+  let resource_dimensions = [
+    DomainResource::Cpu,
+    DomainResource::Memory,
+    DomainResource::Disk,
+    DomainResource::Network,
+    DomainResource::Tasks,
+  ];
+  for resource in resource_dimensions {
+    let global_used = global.used.get(resource);
+    let tenant_used = tenant.used.get(resource);
+    if global_used != 0 || tenant_used != 0 {
+      return Err(format!(
+        "{lane} final domain receipt retains {resource:?}: global={global_used}, tenant={tenant_used}"
+      ));
+    }
+  }
+  if resources.managed_memory != 0 || resources.disk_ops != 0 || resources.network_ops != 0 {
+    return Err(format!(
+      "{lane} final managed-resource receipt is not empty: {resources:?}"
+    ));
+  }
+  Ok((global, tenant, resources))
+}
+
+fn domain_non_control_resources_empty(snapshot: DomainSnapshot) -> bool {
+  [
+    DomainResource::Cpu,
+    DomainResource::Memory,
+    DomainResource::Disk,
+    DomainResource::Network,
+    DomainResource::Tasks,
+  ]
+  .into_iter()
+  .all(|resource| snapshot.used.get(resource) == 0)
 }
 
 fn checked_loopback_v4(address: SocketAddr) -> Result<SocketAddrV4, String> {
@@ -333,65 +398,88 @@ fn std_listener() -> Result<(StdTcpListener, SocketAddrV4), String> {
 
 fn run_bounded(options: Options, settings: Settings, plan: ArrivalPlan) -> Result<Report, String> {
   let setup_started = Instant::now();
-  let expected_oracle = if options.mode == Mode::OpenLoop {
-    Some(super::build_plan_expected_oracle(
-      plan,
-      &super::LaneConfig::default(),
-    )?)
+  let expected_oracle = build_expected_oracle(options, settings, plan)?;
+  let domain = ApplicationDomain::new(options.workload, plan.async_workers)?;
+  let local_limits = domain.local_limits();
+  let rate_config = domain.rate_config();
+  let blocking_workers = if options.workload == Workload::Mixed {
+    plan.async_workers
   } else {
-    None
+    1
   };
-  let resources = ResourceScope::new(if options.workload == Workload::Mixed {
-    super::resource_limits(Workload::Mixed)
-  } else {
-    limits()
-  });
-  let async_runtime = AsyncRuntime::new(AsyncConfig {
+  let builder = MultiThreadBuilder::new(AsyncConfig {
     workers: plan.async_workers,
     max_outstanding: TASK_LIMIT,
     max_scopes: 2,
   })
-  .map_err(|error| format!("allocatbelt async runtime start failed: {error}"))?;
+  .resources(local_limits)
+  .resource_domain(domain.tenant())
+  .blocking(BlockingConfig {
+    workers: blocking_workers,
+    max_outstanding: if options.workload == Workload::Mixed {
+      TASK_LIMIT
+    } else {
+      WINDOW + 1
+    },
+    capacity: Resources {
+      disk: if options.workload == Workload::Mixed {
+        WINDOW
+      } else {
+        0
+      },
+      ..Resources::ZERO
+    },
+  })
+  .reactor(ReactorConfig {
+    max_registrations: 2 * WINDOW + 4,
+    max_waiters: 4 * WINDOW + 8,
+  });
+  let builder = if options.workload == Workload::Mixed {
+    builder.filesystem()
+  } else {
+    builder
+  };
+  let mut async_runtime = builder
+    .disk_rate(rate_config)
+    .upload_rate(rate_config)
+    .download_rate(rate_config)
+    .build()
+    .map_err(|error| format!("allocatbelt owning HTTP runtime start failed: {error}"))?;
+  let run_bindings = domain.for_native(&async_runtime)?;
+  let mut runtime_readback = RuntimeBindingWriter::begin(options, plan, &run_bindings)?;
+  let resources = run_bindings.resources();
+  let io_bindings = run_bindings.io();
+  let observer_task = run_bindings.reserve_task()?;
+  let producer_task = run_bindings.reserve_task()?;
   let scope = async_runtime
-    .scope_with_resources(&resources)
+    .scope()
     .map_err(|error| format!("allocatbelt task scope start failed: {error}"))?;
   let async_handle = scope.handle();
-  super::warm_bounded_for(&async_handle, plan.async_workers)?;
+  super::warm_bounded_for(&async_handle, plan.async_workers)
+    .map_err(|error| format!("HTTP native async worker warm-up failed: {error}"))?;
 
-  let mut filesystem_runtime = if options.workload == Workload::Mixed {
+  let filesystem_handle = if options.workload == Workload::Mixed {
     Some(
-      allocatbelt::runtime::Runtime::new(BlockingConfig {
-        workers: plan.async_workers,
-        max_outstanding: WINDOW,
-        capacity: Resources {
-          disk: WINDOW,
-          ..Resources::ZERO
-        },
-      })
-      .map_err(|error| format!("allocatbelt filesystem runtime start failed: {error}"))?,
+      async_runtime
+        .filesystem()
+        .ok_or_else(|| "owning HTTP runtime omitted its selected filesystem".to_owned())?,
     )
   } else {
     None
   };
-  let filesystem_handle = filesystem_runtime
-    .as_ref()
-    .map(|runtime| allocatbelt::runtime::fs::FsHandle::new(runtime.handle(), resources.clone()));
-  if let Some(runtime) = &filesystem_runtime {
-    super::disk_lane::warm_native_workers(runtime, &async_handle, plan.async_workers)?;
+  let blocking_handle = async_runtime
+    .blocking()
+    .ok_or_else(|| "owning HTTP runtime omitted its connector pool".to_owned())?;
+  if options.workload == Workload::Mixed {
+    super::disk_lane::warm_native_workers(&blocking_handle, &async_handle, blocking_workers)
+      .map_err(|error| format!("HTTP native blocking worker warm-up failed: {error}"))?;
   }
   let app_submitter = (options.workload == Workload::Mixed).then(|| super::Submitter::Bounded {
     handle: async_handle.clone(),
     disk: filesystem_handle,
   });
 
-  let mut blocking_runtime = allocatbelt::runtime::Runtime::new(BlockingConfig {
-    workers: 1,
-    max_outstanding: WINDOW + 1,
-    capacity: Resources::ZERO,
-  })
-  .map_err(|error| format!("allocatbelt connector pool start failed: {error}"))?;
-  let warm_job = blocking_runtime
-    .handle()
+  let warm_job = blocking_handle
     .try_spawn(Resources::ZERO, |_token| thread::current().id())
     .map_err(|error| format!("allocatbelt connector warm-up submit failed: {error:?}"))?;
   let connector_thread = async_handle
@@ -400,14 +488,11 @@ fn run_bounded(options: Options, settings: Settings, plan: ArrivalPlan) -> Resul
     .map_err(|error| format!("allocatbelt connector warm-up task failed: {error}"))?;
   let _connector_worker_started = connector_thread;
 
-  let reactor = Reactor::new(ReactorConfig {
-    max_registrations: 2 * WINDOW + 4,
-    max_waiters: 4 * WINDOW + 8,
-  })
-  .map_err(|error| format!("allocatbelt reactor start failed: {error}"))?;
-  let reactor_handle = reactor.handle();
+  let reactor_handle = async_runtime
+    .reactor()
+    .ok_or_else(|| "owning HTTP runtime omitted its selected reactor".to_owned())?;
   let net = NetHandle::new(
-    blocking_runtime.handle(),
+    blocking_handle,
     resources.clone(),
     reactor_handle.clone(),
     1,
@@ -423,6 +508,7 @@ fn run_bounded(options: Options, settings: Settings, plan: ArrivalPlan) -> Resul
   let (ready_tx, ready_rx) = mpsc::sync_channel(1);
   let accept_handle = async_handle.clone();
   let accept_resources = resources.clone();
+  let accept_io = io_bindings.clone();
   let accept_event_tx = events_tx.clone();
   let accept_task = async_handle
     .spawn(async move {
@@ -432,6 +518,7 @@ fn run_bounded(options: Options, settings: Settings, plan: ArrivalPlan) -> Resul
         roles_rx,
         accept_handle,
         accept_resources,
+        accept_io,
         accept_event_tx,
       )
       .await
@@ -450,6 +537,7 @@ fn run_bounded(options: Options, settings: Settings, plan: ArrivalPlan) -> Resul
   let observer_thread = thread::Builder::new()
     .name("http-application-observer".into())
     .spawn(move || {
+      let _task_owner = observer_task;
       let report = observe_events_with_plan(
         Joiner::Bounded,
         options,
@@ -479,14 +567,15 @@ fn run_bounded(options: Options, settings: Settings, plan: ArrivalPlan) -> Resul
   let producer_handle = async_handle.clone();
   let producer_resources = resources.clone();
   let producer_net = net.clone();
-  let production_cpu_started = super::process_cpu_time_ns();
   let producer_thread = thread::Builder::new()
     .name("http-application-producer".into())
     .spawn(move || {
+      let _task_owner = producer_task;
       let report = produce_native(
         producer_handle,
         producer_net,
         producer_resources,
+        io_bindings,
         address,
         roles_tx,
         events_tx,
@@ -517,13 +606,15 @@ fn run_bounded(options: Options, settings: Settings, plan: ArrivalPlan) -> Resul
   observer_thread
     .join()
     .map_err(|_| "HTTP observer panicked".to_owned())?;
-  let production_cpu_ns = super::process_cpu_time_ns().saturating_sub(production_cpu_started);
-  let rss_after_drain = super::sample_after_checkpoint_delay()?;
   async_handle
     .block_on(accept_task)
     .map_err(|error| format!("allocatbelt accept task join failed: {error}"))?
     .map_err(|error| format!("allocatbelt accept task output join failed: {error}"))?
     .map_err(|error| format!("allocatbelt accept task failed: {error}"))?;
+  let production_cpu_ended_ns = super::process_cpu_time_ns();
+  if let Some(readback) = runtime_readback.as_mut() {
+    readback.capture("after_drain", &run_bindings)?;
+  }
   validate_pair_counts(
     options.mode,
     settings.arrivals,
@@ -539,62 +630,70 @@ fn run_bounded(options: Options, settings: Settings, plan: ArrivalPlan) -> Resul
   {
     return Err("HTTP transaction drain exceeded its finite deadline".into());
   }
+  let rss_after_drain = super::sample_after_checkpoint_delay()?;
 
   let shutdown_started = Instant::now();
   let mut shutdown_timings = Vec::with_capacity(3);
-  let elapsed_ns = super::run_shutdown_with_timeout("allocatbelt HTTP async runtime", move || {
-    async_runtime
-      .block_on(scope.close())
-      .map_err(|error| format!("allocatbelt scope close failed: {error}"))?;
-    async_runtime
-      .shutdown(AsyncShutdown::Drain)
-      .map_err(|error| format!("allocatbelt async runtime shutdown failed: {error}"))
-  })?;
-  shutdown_timings.push(("allocatbelt HTTP async runtime", elapsed_ns));
-  let elapsed_ns = super::run_shutdown_with_timeout("allocatbelt connector pool", move || {
-    blocking_runtime
-      .shutdown(allocatbelt::runtime::ShutdownMode::Drain)
-      .map_err(|error| format!("allocatbelt connector pool shutdown failed: {error}"))
-  })?;
-  shutdown_timings.push(("allocatbelt connector pool", elapsed_ns));
-  let elapsed_ns = super::run_shutdown_with_timeout("allocatbelt reactor", move || {
-    reactor
-      .shutdown()
-      .map_err(|error| format!("allocatbelt reactor shutdown failed: {error}"))
-  })?;
-  shutdown_timings.push(("allocatbelt reactor", elapsed_ns));
-  if let Some(mut filesystem_runtime) = filesystem_runtime.take() {
-    let elapsed_ns =
-      super::run_shutdown_with_timeout("allocatbelt filesystem runtime", move || {
-        filesystem_runtime
-          .shutdown(allocatbelt::runtime::ShutdownMode::Drain)
-          .map_err(|error| format!("allocatbelt filesystem runtime shutdown failed: {error}"))
-      })?;
-    shutdown_timings.push(("allocatbelt filesystem runtime", elapsed_ns));
-  }
+  let elapsed_ns =
+    super::run_shutdown_with_timeout("allocatbelt owning HTTP runtime", move || {
+      async_runtime
+        .block_on(scope.close())
+        .map_err(|error| format!("allocatbelt scope close failed: {error}"))?;
+      async_runtime
+        .request_shutdown(MultiShutdown {
+          tasks: AsyncShutdown::Drain,
+          blocking: ShutdownMode::Drain,
+          ..MultiShutdown::default()
+        })
+        .map_err(|error| format!("allocatbelt owning runtime shutdown request failed: {error}"))?;
+      let deadline = Instant::now() + super::execution_deadlines().shutdown;
+      loop {
+        match async_runtime
+          .drive_shutdown_step()
+          .map_err(|error| format!("allocatbelt owning runtime shutdown failed: {error}"))?
+        {
+          ShutdownProgress::Complete => return Ok(()),
+          ShutdownProgress::Pending if Instant::now() < deadline => {
+            thread::sleep(Duration::from_millis(1));
+          }
+          ShutdownProgress::Pending => {
+            return Err("allocatbelt owning runtime shutdown exceeded its finite deadline".into());
+          }
+        }
+      }
+    })?;
+  shutdown_timings.push(("allocatbelt owning HTTP runtime", elapsed_ns));
   let shutdown_ns = shutdown_started.elapsed().as_nanos();
   super::write_shutdown_report(
     producer
       .production_end
       .saturating_duration_since(producer.started_at)
       .as_nanos(),
-    production_cpu_ns,
+    producer.production_cpu_started_ns,
+    production_cpu_ended_ns,
     observed.on_time + observed.late,
     &shutdown_timings,
   )?;
-  let rss_after_shutdown = super::sample_after_checkpoint_delay()?;
-  let final_resources = resources.snapshot();
-  if final_resources.managed_memory != 0
-    || final_resources.disk_ops != 0
-    || final_resources.network_ops != 0
-  {
-    return Err(format!(
-      "HTTP final resource ledger is not empty: {final_resources:?}"
-    ));
+  if let Some(readback) = runtime_readback.as_mut() {
+    readback.capture("after_shutdown", &run_bindings)?;
   }
+  let (final_global_domain, final_tenant_domain, final_resources) =
+    validate_domain_receipt(&run_bindings, "HTTP")?;
   if producer.trace_overrun {
     return Err("HTTP open-loop producer exceeded its finite trace deadline".into());
   }
+  let readback_domain = domain.readback_domain();
+  let fixed_control_baseline = domain.fixed_global_control_baseline();
+  drop(net);
+  drop(reactor_handle);
+  drop(async_handle);
+  drop(run_bindings);
+  drop(resources);
+  drop(domain);
+  if let Some(readback) = runtime_readback {
+    readback.finish(&readback_domain, fixed_control_baseline)?;
+  }
+  let rss_after_shutdown = super::sample_after_checkpoint_delay()?;
   Ok(build_report(
     super::ProcessCheckpoints {
       setup_started,
@@ -606,44 +705,44 @@ fn run_bounded(options: Options, settings: Settings, plan: ArrivalPlan) -> Resul
     producer,
     observed,
     final_resources,
+    final_global_domain,
+    final_tenant_domain,
     shutdown_ns,
     plan.async_workers,
     if options.workload == Workload::Mixed {
-      plan.async_workers + 1
+      plan.async_workers
     } else {
       1
     },
     if options.workload == Workload::Mixed && plan.async_workers == 2 {
-      "2 async + 1 connector + 2 filesystem workers + dedicated reactor"
+      "2 async + 2 owning blocking workers (connector and filesystem) + owning reactor"
     } else if options.workload == Workload::Mixed {
-      "4 async + 1 connector + 4 filesystem workers + dedicated reactor"
+      "4 async + 4 owning blocking workers (connector and filesystem) + owning reactor"
     } else if plan.async_workers == 2 {
-      "2 async + 1 reserved blocking worker (unused by HTTP connect) + dedicated reactor; NetHandle::connect_nonblocking"
+      "2 async + 1 owning blocking connector + owning reactor; NetHandle::connect_nonblocking"
     } else {
-      "4 async + 1 reserved blocking worker (unused by HTTP connect) + dedicated reactor; NetHandle::connect_nonblocking"
+      "4 async + 1 owning blocking connector + owning reactor; NetHandle::connect_nonblocking"
     },
   ))
 }
 
 fn run_tokio(options: Options, settings: Settings, plan: ArrivalPlan) -> Result<Report, String> {
   let setup_started = Instant::now();
-  let expected_oracle = if options.mode == Mode::OpenLoop {
-    Some(super::build_plan_expected_oracle(
-      plan,
-      &super::LaneConfig::default(),
-    )?)
-  } else {
-    None
-  };
-  let resources = ResourceScope::new(if options.workload == Workload::Mixed {
-    super::resource_limits(Workload::Mixed)
-  } else {
-    limits()
-  });
+  let expected_oracle = build_expected_oracle(options, settings, plan)?;
+  let domain = ApplicationDomain::new(options.workload, plan.async_workers)?;
+  let mut run_bindings = domain.for_tokio()?;
+  let mut runtime_readback = RuntimeBindingWriter::begin(options, plan, &run_bindings)?;
+  let resources = run_bindings.resources();
+  let io_bindings = run_bindings.io();
+  let cpu_gate = run_bindings.cpu_gate();
+  let task_admission = run_bindings.task_admission();
+  let observer_task = run_bindings.reserve_task()?;
+  let producer_task = run_bindings.reserve_task()?;
+  let accept_task_owner = task_admission.reserve()?;
   let runtime = tokio::runtime::Builder::new_multi_thread()
     .worker_threads(plan.async_workers)
     .max_blocking_threads(if options.workload == Workload::Mixed {
-      plan.async_workers + 1
+      plan.async_workers
     } else {
       1
     })
@@ -652,7 +751,8 @@ fn run_tokio(options: Options, settings: Settings, plan: ArrivalPlan) -> Result<
     .build()
     .map_err(|error| format!("Tokio runtime start failed: {error}"))?;
   let handle = runtime.handle().clone();
-  super::warm_tokio_for(&handle, plan.async_workers)?;
+  super::warm_tokio_for(&handle, plan.async_workers)
+    .map_err(|error| format!("HTTP Tokio worker warm-up failed: {error}"))?;
   let connector_thread = handle.spawn_blocking(|| thread::current().id());
   let _connector_worker_started = handle
     .block_on(connector_thread)
@@ -661,12 +761,16 @@ fn run_tokio(options: Options, settings: Settings, plan: ArrivalPlan) -> Result<
   let mixed_disk_slots = (options.workload == Workload::Mixed)
     .then(|| Arc::new(tokio::sync::Semaphore::new(plan.async_workers)));
   if options.workload == Workload::Mixed {
-    super::disk_lane::warm_tokio_workers(&handle, plan.async_workers)?;
+    super::disk_lane::warm_tokio_workers(&handle, plan.async_workers)
+      .map_err(|error| format!("HTTP Tokio blocking worker warm-up failed: {error}"))?;
   }
   let app_submitter = (options.workload == Workload::Mixed).then(|| super::Submitter::Tokio {
     handle: handle.clone(),
     slots: task_slots.clone(),
     disk_slots: mixed_disk_slots,
+    disk_io: io_bindings.blocking_disk_io(),
+    cpu_gate: cpu_gate.clone(),
+    task_admission: task_admission.clone(),
   });
 
   let (std_listener, address) = std_listener()?;
@@ -691,20 +795,35 @@ fn run_tokio(options: Options, settings: Settings, plan: ArrivalPlan) -> Result<
   let (ready_tx, ready_rx) = mpsc::sync_channel(1);
   let accept_handle = handle.clone();
   let accept_resources = resources.clone();
+  let accept_io = io_bindings.clone();
   let accept_slots = task_slots.clone();
+  let accept_cpu_gate = cpu_gate.clone();
+  let handler_cpu_gate = accept_cpu_gate.clone();
+  let accept_task_admission = task_admission.clone();
   let accept_event_tx = events_tx.clone();
+  let accept_future = accept_cpu_gate
+    .wrap(async move {
+      let _ = ready_tx.send(());
+      accept_tokio(
+        listener,
+        roles_rx,
+        accept_handle,
+        accept_slots,
+        accept_resources,
+        accept_io,
+        handler_cpu_gate,
+        accept_task_admission,
+        accept_event_tx,
+      )
+      .await
+    })
+    .map_err(|error| format!("Tokio accept CPU admission failed: {:?}", error.kind))?;
   let accept_task = handle.spawn(async move {
     let _accept_slot = accept_slot;
-    let _ = ready_tx.send(());
-    accept_tokio(
-      listener,
-      roles_rx,
-      accept_handle,
-      accept_slots,
-      accept_resources,
-      accept_event_tx,
-    )
-    .await
+    let _accept_task_owner = accept_task_owner;
+    accept_future
+      .await
+      .map_err(|error| format!("Tokio accept CPU poll failed: {error:?}"))?
   });
   ready_rx
     .recv_timeout(WARMUP_TIMEOUT)
@@ -719,6 +838,7 @@ fn run_tokio(options: Options, settings: Settings, plan: ArrivalPlan) -> Result<
   let observer_thread = thread::Builder::new()
     .name("http-application-observer".into())
     .spawn(move || {
+      let _task_owner = observer_task;
       let report = observe_events_with_plan(
         Joiner::Tokio,
         options,
@@ -747,14 +867,18 @@ fn run_tokio(options: Options, settings: Settings, plan: ArrivalPlan) -> Result<
   let producer_handle = handle.clone();
   let producer_resources = resources.clone();
   let producer_slots = task_slots.clone();
-  let production_cpu_started = super::process_cpu_time_ns();
+  let producer_task_admission = task_admission.clone();
   let producer_thread = thread::Builder::new()
     .name("http-application-producer".into())
     .spawn(move || {
+      let _task_owner = producer_task;
       let report = produce_tokio(
         producer_handle,
         producer_slots,
         producer_resources,
+        io_bindings,
+        cpu_gate,
+        producer_task_admission,
         address,
         roles_tx,
         events_tx,
@@ -785,12 +909,14 @@ fn run_tokio(options: Options, settings: Settings, plan: ArrivalPlan) -> Result<
   observer_thread
     .join()
     .map_err(|_| "HTTP observer panicked".to_owned())?;
-  let production_cpu_ns = super::process_cpu_time_ns().saturating_sub(production_cpu_started);
-  let rss_after_drain = super::sample_after_checkpoint_delay()?;
   handle
     .block_on(accept_task)
     .map_err(|error| format!("Tokio accept task join failed: {error}"))?
     .map_err(|error| format!("Tokio accept task failed: {error}"))?;
+  let production_cpu_ended_ns = super::process_cpu_time_ns();
+  if let Some(readback) = runtime_readback.as_mut() {
+    readback.capture("after_drain", &run_bindings)?;
+  }
   validate_pair_counts(
     options.mode,
     settings.arrivals,
@@ -806,36 +932,51 @@ fn run_tokio(options: Options, settings: Settings, plan: ArrivalPlan) -> Result<
   {
     return Err("HTTP transaction drain exceeded its finite deadline".into());
   }
+  let rss_after_drain = super::sample_after_checkpoint_delay()?;
 
   let shutdown_started = Instant::now();
   let elapsed_ns = super::run_shutdown_with_timeout("Tokio HTTP runtime", move || {
     runtime.shutdown_timeout(super::execution_deadlines().shutdown);
     Ok(())
   })?;
-  let shutdown_timings = [("Tokio HTTP runtime", elapsed_ns)];
+  let rate_timer_started = Instant::now();
+  run_bindings.shutdown_auxiliary_timer()?;
+  let rate_timer_shutdown_ns = rate_timer_started.elapsed().as_nanos();
+  let shutdown_timings = [
+    ("Tokio HTTP runtime", elapsed_ns),
+    ("Tokio fixed rate timer", rate_timer_shutdown_ns),
+  ];
   let shutdown_ns = shutdown_started.elapsed().as_nanos();
   super::write_shutdown_report(
     producer
       .production_end
       .saturating_duration_since(producer.started_at)
       .as_nanos(),
-    production_cpu_ns,
+    producer.production_cpu_started_ns,
+    production_cpu_ended_ns,
     observed.on_time + observed.late,
     &shutdown_timings,
   )?;
-  let rss_after_shutdown = super::sample_after_checkpoint_delay()?;
-  let final_resources = resources.snapshot();
-  if final_resources.managed_memory != 0
-    || final_resources.disk_ops != 0
-    || final_resources.network_ops != 0
-  {
-    return Err(format!(
-      "Tokio HTTP final resource ledger is not empty: {final_resources:?}"
-    ));
+  if let Some(readback) = runtime_readback.as_mut() {
+    readback.capture("after_shutdown", &run_bindings)?;
   }
+  let (final_global_domain, final_tenant_domain, final_resources) =
+    validate_domain_receipt(&run_bindings, "Tokio HTTP")?;
   if producer.trace_overrun {
     return Err("HTTP open-loop producer exceeded its finite trace deadline".into());
   }
+  let readback_domain = domain.readback_domain();
+  let fixed_control_baseline = domain.fixed_global_control_baseline();
+  drop(task_admission);
+  drop(task_slots);
+  drop(handle);
+  drop(run_bindings);
+  drop(resources);
+  drop(domain);
+  if let Some(readback) = runtime_readback {
+    readback.finish(&readback_domain, fixed_control_baseline)?;
+  }
+  let rss_after_shutdown = super::sample_after_checkpoint_delay()?;
   Ok(build_report(
     super::ProcessCheckpoints {
       setup_started,
@@ -847,21 +988,23 @@ fn run_tokio(options: Options, settings: Settings, plan: ArrivalPlan) -> Result<
     producer,
     observed,
     final_resources,
+    final_global_domain,
+    final_tenant_domain,
     shutdown_ns,
     plan.async_workers,
     if options.workload == Workload::Mixed {
-      plan.async_workers + 1
+      plan.async_workers
     } else {
       1
     },
     if options.workload == Workload::Mixed && plan.async_workers == 2 {
-      "2 async + Tokio blocking pool max3 (filesystem execution cap2) + integrated I/O driver"
+      "2 async + Tokio blocking pool max2 (filesystem execution cap2) + integrated I/O driver"
     } else if options.workload == Workload::Mixed {
-      "4 async + Tokio blocking pool max5 (filesystem execution cap4) + integrated I/O driver"
+      "4 async + Tokio blocking pool max4 (filesystem execution cap4) + integrated I/O driver"
     } else if plan.async_workers == 2 {
-      "2 async + 1 reserved blocking worker (unused by HTTP connect) + integrated I/O driver; Tokio TcpSocket::connect"
+      "2 async + 1 reserved blocking worker (Tokio TcpSocket::connect) + integrated I/O driver"
     } else {
-      "4 async + 1 reserved blocking worker (unused by HTTP connect) + integrated I/O driver; Tokio TcpSocket::connect"
+      "4 async + 1 reserved blocking worker (Tokio TcpSocket::connect) + integrated I/O driver"
     },
   ))
 }
@@ -871,12 +1014,13 @@ async fn accept_native(
   mut roles: channel::Receiver<PairToken>,
   handle: AsyncHandle,
   resources: ResourceScope,
+  io_bindings: ApplicationIoBindings,
   events: ObserverEventSender<Event>,
 ) -> Result<(), String> {
   while let Some(token) = roles.recv().await {
     // A producer-issued role token is consumed before accept, so the listener
     // cannot retain an unaccounted accepted socket while awaiting a handler.
-    let (mut stream, _) = listener
+    let (stream, _) = listener
       .accept()
       .await
       .map_err(|error| format!("allocatbelt accept failed: {error}"))?;
@@ -884,29 +1028,37 @@ async fn accept_native(
     let observer_lease = token.lease.clone();
     let task_lease = token.lease;
     let handler_resources = resources.clone();
+    let handler_io = io_bindings.clone();
     let ready_events = events.clone();
+    let handler = async move {
+      let endpoint_permit = handler_resources
+        .try_acquire(OperationRequest {
+          disk: 0,
+          network: 1,
+        })
+        .map_err(|error| error.to_string());
+      match endpoint_permit {
+        Ok(permit) => {
+          let endpoint = NativeEndpoint {
+            stream,
+            _permit: permit,
+          };
+          match handler_io.rate_io(endpoint) {
+            Ok(mut endpoint) => http::serve_connection_io(&mut endpoint, &handler_resources)
+              .await
+              .map_err(|error| error.to_string()),
+            Err(error) => Err(error),
+          }
+        }
+        Err(error) => {
+          drop(stream);
+          Err(error)
+        }
+      }
+    };
     let job = handle
       .spawn(async move {
-        let endpoint_permit = handler_resources
-          .try_acquire(OperationRequest {
-            disk: 0,
-            network: 1,
-          })
-          .map_err(|error| error.to_string());
-        let result = match endpoint_permit {
-          Ok(permit) => {
-            let result = http::serve_connection_io(&mut stream, &handler_resources)
-              .await
-              .map_err(|error| error.to_string());
-            drop(stream);
-            drop(permit);
-            result
-          }
-          Err(error) => {
-            drop(stream);
-            Err(error)
-          }
-        };
+        let result = handler.await;
         let output = (result, task_lease);
         let _ = ready_events.send(Event::Ready);
         output
@@ -923,12 +1075,16 @@ async fn accept_native(
   Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn accept_tokio(
   listener: tokio::net::TcpListener,
   mut roles: channel::Receiver<PairToken>,
   handle: tokio::runtime::Handle,
   slots: Arc<tokio::sync::Semaphore>,
   resources: ResourceScope,
+  io_bindings: ApplicationIoBindings,
+  cpu_gate: allocatbelt::runtime::cpu_gate::CpuGate,
+  task_admission: ApplicationTaskAdmission,
   events: ObserverEventSender<Event>,
 ) -> Result<(), String> {
   while let Some(token) = roles.recv().await {
@@ -939,6 +1095,7 @@ async fn accept_tokio(
       .acquire_owned()
       .await
       .map_err(|error| format!("Tokio handler task window closed: {error}"))?;
+    let task_owner = task_admission.reserve()?;
     let (stream, _) = listener
       .accept()
       .await
@@ -947,28 +1104,41 @@ async fn accept_tokio(
     let observer_lease = token.lease.clone();
     let task_lease = token.lease;
     let handler_resources = resources.clone();
+    let handler_io = io_bindings.clone();
+    let handler_cpu_gate = cpu_gate.clone();
     let ready_events = events.clone();
-    let job = handle.spawn(async move {
-      let _task_slot = task_slot;
-      let result = match handler_resources.try_acquire(OperationRequest {
+    let handler = async move {
+      match handler_resources.try_acquire(OperationRequest {
         disk: 0,
         network: 1,
       }) {
         Ok(permit) => {
-          let mut endpoint = TokioEndpoint {
+          let endpoint = TokioEndpoint {
             stream,
             _permit: permit,
           };
-          let result = http::serve_connection_io(&mut endpoint, &handler_resources)
-            .await
-            .map_err(|error| error.to_string());
-          drop(endpoint);
-          result
+          match handler_io.rate_io(endpoint) {
+            Ok(mut endpoint) => http::serve_connection_io(&mut endpoint, &handler_resources)
+              .await
+              .map_err(|error| error.to_string()),
+            Err(error) => Err(error),
+          }
         }
         Err(error) => {
           drop(stream);
           Err(error.to_string())
         }
+      }
+    };
+    let handler = handler_cpu_gate
+      .wrap(handler)
+      .map_err(|error| format!("Tokio handler CPU admission failed: {:?}", error.kind))?;
+    let job = handle.spawn(async move {
+      let _task_slot = task_slot;
+      let _task_owner = task_owner;
+      let result = match handler.await {
+        Ok(output) => output,
+        Err(error) => Err(format!("Tokio handler CPU poll failed: {error:?}")),
       };
       let output = (result, task_lease);
       let _ = ready_events.send(Event::Ready);
@@ -993,6 +1163,7 @@ fn produce_native(
   handle: AsyncHandle,
   net: NetHandle,
   resources: ResourceScope,
+  io_bindings: ApplicationIoBindings,
   address: SocketAddrV4,
   roles: channel::Sender<PairToken>,
   events: ObserverEventSender<Event>,
@@ -1021,8 +1192,9 @@ fn produce_native(
       }
       let net = net.clone();
       let resources = resources.clone();
+      let io_bindings = io_bindings.clone();
       let operation = async move {
-        let mut stream = net
+        let stream = net
           .connect_nonblocking(SocketAddr::V4(address))
           .await
           .map_err(|error| format!("allocatbelt HTTP connect failed: {error}"))?;
@@ -1032,8 +1204,13 @@ fn produce_native(
             network: 1,
           })
           .map_err(|error| format!("allocatbelt client endpoint admission failed: {error}"))?;
-        let result = http::transact_client_io(
-          &mut stream,
+        let endpoint = NativeEndpoint {
+          stream,
+          _permit: permit,
+        };
+        let mut endpoint = io_bindings.rate_io(endpoint)?;
+        http::transact_client_io(
+          &mut endpoint,
           &resources,
           id,
           HttpConfig {
@@ -1042,10 +1219,7 @@ fn produce_native(
           },
         )
         .await
-        .map_err(|error| error.to_string());
-        drop(stream);
-        drop(permit);
-        result
+        .map_err(|error| error.to_string())
       };
       let ready_events = ready_events.clone();
       let future = async move {
@@ -1075,6 +1249,9 @@ fn produce_tokio(
   handle: tokio::runtime::Handle,
   slots: Arc<tokio::sync::Semaphore>,
   resources: ResourceScope,
+  io_bindings: ApplicationIoBindings,
+  cpu_gate: allocatbelt::runtime::cpu_gate::CpuGate,
+  task_admission: ApplicationTaskAdmission,
   address: SocketAddrV4,
   roles: channel::Sender<PairToken>,
   events: ObserverEventSender<Event>,
@@ -1108,11 +1285,9 @@ fn produce_tokio(
           tokio::sync::TryAcquireError::Closed => SubmitResult::Closed,
           tokio::sync::TryAcquireError::NoPermits => SubmitResult::Full,
         })?;
-      let token = PairToken { id, lease };
-      handle
-        .block_on(role_sender.send(token))
-        .map_err(|_| SubmitResult::Closed)?;
+      let task_owner = task_admission.reserve().map_err(|_| SubmitResult::Closed)?;
       let resources_for_client = resources.clone();
+      let io_for_client = io_bindings.clone();
       let operation = async move {
         let stream = tokio_connect_nonblocking(&resources_for_client, address)
           .await
@@ -1123,11 +1298,12 @@ fn produce_tokio(
             network: 1,
           })
           .map_err(|error| format!("Tokio client endpoint admission failed: {error}"))?;
-        let mut endpoint = TokioEndpoint {
+        let endpoint = TokioEndpoint {
           stream,
           _permit: permit,
         };
-        let result = http::transact_client_io(
+        let mut endpoint = io_for_client.rate_io(endpoint)?;
+        http::transact_client_io(
           &mut endpoint,
           &resources_for_client,
           id,
@@ -1137,15 +1313,21 @@ fn produce_tokio(
           },
         )
         .await
-        .map_err(|error| error.to_string());
-        drop(endpoint);
-        result
+        .map_err(|error| error.to_string())
       };
+      let gated = cpu_gate.wrap(operation).map_err(|_| SubmitResult::Closed)?;
+      let token = PairToken { id, lease };
+      handle
+        .block_on(role_sender.send(token))
+        .map_err(|_| SubmitResult::Closed)?;
       let ready_events = ready_events.clone();
       Ok(Submission::Http(ClientJob::Tokio {
         handle: handle.spawn(async move {
           let _task_slot = task_slot;
-          let result = operation.await;
+          let _task_owner = task_owner;
+          let result = gated
+            .await
+            .unwrap_or_else(|error| Err(format!("Tokio client CPU poll failed: {error:?}")));
           let _ = ready_events.send(Event::Ready);
           result
         }),
@@ -1197,6 +1379,7 @@ fn produce_with_plan(
   let mut outstanding = 0usize;
   let mut next_capacity_id = 0u64;
 
+  let production_cpu_started_ns = super::process_cpu_time_ns();
   loop {
     while let Ok(()) = credits.try_recv() {
       outstanding = outstanding.saturating_sub(1);
@@ -1328,6 +1511,7 @@ fn produce_with_plan(
     lateness_max_ns,
     started_at,
     production_end,
+    production_cpu_started_ns,
     trace_overrun,
   };
   events
@@ -1471,6 +1655,7 @@ fn observe_events_with_plan(
   let mut digest = 0u64;
   let mut latencies = Vec::new();
   let mut records = Vec::new();
+  let mut family_published_on_time = [0u64; 4];
   if options.mode == Mode::OpenLoop {
     records
       .try_reserve_exact(settings.arrivals)
@@ -1668,6 +1853,9 @@ fn observe_events_with_plan(
           checksum = value;
           if observed <= horizon_end {
             on_time += 1;
+            if let Some(index) = workload.family_index() {
+              family_published_on_time[index] = family_published_on_time[index].saturating_add(1);
+            }
           } else {
             late += 1;
           }
@@ -1773,6 +1961,9 @@ fn observe_events_with_plan(
           succeeded = true;
           if observed <= horizon_end {
             on_time += 1;
+            if let Some(index) = plan.workload_for(id).family_index() {
+              family_published_on_time[index] = family_published_on_time[index].saturating_add(1);
+            }
           } else {
             late += 1;
           }
@@ -1906,7 +2097,17 @@ fn observe_events_with_plan(
             });
           }
           IdState::Rejected => {}
-          _ => return Err("HTTP open-loop ID table has an unresolved request".into()),
+          IdState::Failed => {
+            return Err(format!(
+              "HTTP open-loop request {id} failed before result accounting: {:?}",
+              first_error.as_deref()
+            ));
+          }
+          state => {
+            return Err(format!(
+              "HTTP open-loop ID {id} remained unresolved as {state:?}"
+            ));
+          }
         }
       }
     }
@@ -1943,9 +2144,41 @@ fn observe_events_with_plan(
     retained_managed_bytes,
     last_observed,
     records,
+    family_published_on_time,
   })
 }
 
+#[derive(Debug)]
+struct NativeEndpoint {
+  stream: NativeStream,
+  _permit: OperationPermit,
+}
+
+impl AsyncRead for NativeEndpoint {
+  fn poll_read(
+    self: Pin<&mut Self>,
+    cx: &mut Context<'_>,
+    buf: &mut [u8],
+  ) -> Poll<io::Result<usize>> {
+    Pin::new(&mut self.get_mut().stream).poll_read(cx, buf)
+  }
+}
+
+impl AsyncWrite for NativeEndpoint {
+  fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+    Pin::new(&mut self.get_mut().stream).poll_write(cx, buf)
+  }
+
+  fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+    Pin::new(&mut self.get_mut().stream).poll_flush(cx)
+  }
+
+  fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+    Pin::new(&mut self.get_mut().stream).poll_shutdown(cx)
+  }
+}
+
+#[derive(Debug)]
 struct TokioEndpoint {
   stream: tokio::net::TcpStream,
   _permit: allocatbelt::runtime::managed::OperationPermit,
@@ -2003,6 +2236,26 @@ async fn tokio_connect_nonblocking(
 
 pub(super) const ORACLE_BODY_BYTES: usize = BODY_BYTES;
 
+fn build_expected_oracle(
+  options: Options,
+  settings: Settings,
+  plan: ArrivalPlan,
+) -> Result<Option<Arc<Vec<u64>>>, String> {
+  if options.mode != Mode::OpenLoop {
+    return Ok(None);
+  }
+  if options.workload != plan.workload {
+    return Err("HTTP oracle workload differs from the arrival plan".into());
+  }
+  if options.workload == Workload::Http {
+    return build_open_loop_checksum_oracle(Mode::OpenLoop, settings);
+  }
+  if settings.body_bytes != ORACLE_BODY_BYTES {
+    return Err("mixed HTTP body size differs from the frozen per-ID oracle".into());
+  }
+  super::build_plan_expected_oracle(plan, &super::LaneConfig::default()).map(Some)
+}
+
 pub(super) fn expected_request_checksum(id: u64, body_bytes: usize) -> u64 {
   (0..body_bytes).fold(0xcbf2_9ce4_8422_2325, |hash, index| {
     (hash ^ u64::from(pattern_byte(request_seed(id), index))).wrapping_mul(0x0000_0100_0000_01b3)
@@ -2027,17 +2280,22 @@ fn validate_response_pair(
   handler_checksum: u64,
   oracle: Option<&Vec<u64>>,
   settings: Settings,
-) -> Result<u64, &'static str> {
+) -> Result<u64, String> {
   if handler_id != request_id || handler_checksum != client_checksum {
-    return Err("HTTP client/handler request IDs or checksums differ");
+    return Err(format!(
+      "HTTP client/handler request IDs or checksums differ (request={request_id}, handler={handler_id}, client={client_checksum:#x}, server={handler_checksum:#x})"
+    ));
   }
-  if expected_response_checksum(oracle, request_id, settings) != Some(client_checksum) {
-    return Err("HTTP response checksum does not match its request ID");
+  let expected = expected_response_checksum(oracle, request_id, settings)
+    .ok_or_else(|| format!("HTTP checksum oracle missed request {request_id}"))?;
+  if expected != client_checksum {
+    return Err(format!(
+      "HTTP response checksum for request {request_id} was {client_checksum:#x}, expected {expected:#x}"
+    ));
   }
   Ok(client_checksum)
 }
 
-#[cfg(test)]
 fn build_open_loop_checksum_oracle(
   mode: Mode,
   settings: Settings,
@@ -2114,6 +2372,8 @@ fn build_report(
   producer: ProducerReport,
   observer: ObserverReport,
   final_resources: ResourceSnapshot,
+  final_global_domain: DomainSnapshot,
+  final_tenant_domain: DomainSnapshot,
   shutdown_ns: u128,
   async_workers: usize,
   blocking_workers: usize,
@@ -2146,6 +2406,8 @@ fn build_report(
     max_observed_managed_bytes: observer.max_observed_managed_bytes,
     retained_managed_bytes: observer.retained_managed_bytes,
     final_resources,
+    final_global_domain,
+    final_tenant_domain,
     shutdown_ns,
     last_observed,
     drain_tail_ns,
@@ -2153,6 +2415,7 @@ fn build_report(
     blocking_workers,
     topology,
     records: observer.records,
+    family_published_on_time: observer.family_published_on_time,
   }
 }
 
@@ -2168,6 +2431,12 @@ fn percentile(samples: &[u64], percentile: usize) -> u64 {
 }
 
 fn print_row(allocator: &str, options: Options, report: &Report) {
+  debug_assert!(domain_non_control_resources_empty(
+    report.final_global_domain
+  ));
+  debug_assert!(domain_non_control_resources_empty(
+    report.final_tenant_domain
+  ));
   let capacity_rate = if options.mode == Mode::Capacity {
     (report.on_time as f64 / CAPACITY_HORIZON.as_secs_f64()).to_string()
   } else {
@@ -2280,12 +2549,13 @@ fn print_row(allocator: &str, options: Options, report: &Report) {
 #[cfg(test)]
 mod tests {
   use super::{
-    AsyncConfig, AsyncHandle, AsyncRuntime, AsyncShutdown, ClientJob, Event, HandlerJob,
-    HandlerRecord, Joiner, Mode, ProducerReport, RoleLease, Settings, TASK_LIMIT, WINDOW,
-    build_open_loop_checksum_oracle, checked_loopback_v4, expected_request_checksum,
-    observe_events, run_bounded, run_tokio, tokio_connect_nonblocking, validate_response_pair,
+    AsyncConfig, AsyncHandle, AsyncShutdown, ClientJob, Event, HandlerJob, HandlerRecord, Joiner,
+    Mode, ProducerReport, RoleLease, Settings, TASK_LIMIT, WINDOW, build_open_loop_checksum_oracle,
+    checked_loopback_v4, expected_request_checksum, observe_events, run_bounded, run_tokio,
+    tokio_connect_nonblocking, validate_response_pair,
   };
   use crate::application::{Executor, HTTP_CONNECT_POLICY_SCHEMA, Options, Workload};
+  use allocatbelt::runtime::asynchronous::AsyncRuntime;
   use allocatbelt::runtime::managed::ResourceScope;
   use allocatbelt::runtime::managed::{OperationRequest, ResourceLimits};
   use allocatbelt::runtime::net::{
@@ -2318,6 +2588,19 @@ mod tests {
       horizon: Duration::from_millis(40),
       arrivals: if mode == Mode::OpenLoop { 32 } else { 64 },
       body_bytes: 256,
+    }
+  }
+
+  fn assert_domain_receipt(report: &super::Report) {
+    for resource in [
+      allocatbelt::runtime::resource_domain::DomainResource::Cpu,
+      allocatbelt::runtime::resource_domain::DomainResource::Memory,
+      allocatbelt::runtime::resource_domain::DomainResource::Disk,
+      allocatbelt::runtime::resource_domain::DomainResource::Network,
+      allocatbelt::runtime::resource_domain::DomainResource::Tasks,
+    ] {
+      assert_eq!(report.final_global_domain.used.get(resource), 0);
+      assert_eq!(report.final_tenant_domain.used.get(resource), 0);
     }
   }
 
@@ -2701,11 +2984,14 @@ mod tests {
   }
 
   fn shutdown_bounded_runtime(
-    handle: AsyncHandle,
+    _handle: AsyncHandle,
     scope: allocatbelt::runtime::asynchronous::OwnedTaskScope,
     runtime: AsyncRuntime,
   ) {
-    handle
+    // Close from the runtime's implicit root. The scoped handle is a borrowed
+    // task context, so waiting on its own scope-close future can be rejected
+    // as a same-scope wait.
+    runtime
       .block_on(scope.close())
       .expect("bounded scope close root");
     runtime
@@ -2775,7 +3061,9 @@ mod tests {
     assert!(client.is_finished());
     assert_eq!(Joiner::Bounded.client(client), Ok(71));
 
-    handle.block_on(scope.close()).expect("scope close root");
+    // Close from the implicit root because the scoped handle would wait on
+    // its own borrowed task admission.
+    runtime.block_on(scope.close()).expect("scope close root");
     runtime
       .shutdown(AsyncShutdown::Drain)
       .expect("bounded runtime shutdown");
@@ -2827,7 +3115,7 @@ mod tests {
       Err("allocatbelt client was consumed before terminal completion".into())
     );
 
-    handle.block_on(scope.close()).expect("scope close root");
+    runtime.block_on(scope.close()).expect("scope close root");
     runtime
       .shutdown(AsyncShutdown::Drain)
       .expect("bounded runtime shutdown");
@@ -2869,6 +3157,7 @@ mod tests {
         lateness_max_ns: 0,
         started_at: started,
         production_end: Instant::now(),
+        production_cpu_started_ns: 0,
         trace_overrun: false,
       }))
       .expect("producer completion event");
@@ -2965,6 +3254,26 @@ mod tests {
     assert_eq!(report.final_resources.managed_memory, 0);
     assert_eq!(report.final_resources.network_ops, 0);
     assert_eq!(report.records.len(), 32);
+    assert_domain_receipt(&report);
+  }
+
+  #[test]
+  fn allocatbelt_single_http_pair_has_a_quiet_tenant_receipt() {
+    let selected_options = options(Executor::Bounded, Mode::OpenLoop, Some(1000));
+    let selected_settings = Settings {
+      horizon: Duration::from_millis(40),
+      arrivals: 1,
+      body_bytes: 256,
+    };
+    let plan =
+      super::super::ArrivalPlan::new(super::super::Profile::Steady, Workload::Http, 1, 1000)
+        .expect("single HTTP plan");
+    let report = run_bounded(selected_options, selected_settings, plan)
+      .expect("single bound HTTP pair should drain");
+    assert_eq!(report.producer.admitted, 1);
+    assert_eq!(report.errors, 0);
+    assert_eq!(report.digest, report.expected);
+    assert_domain_receipt(&report);
   }
 
   #[test]
@@ -3010,6 +3319,7 @@ mod tests {
       assert_eq!(report.final_resources.disk_ops, 0);
       assert_eq!(report.final_resources.network_ops, 0);
       assert_eq!(report.records.len(), 16);
+      assert_domain_receipt(&report);
       for id in 0..16 {
         assert!(
           report
@@ -3056,6 +3366,7 @@ mod tests {
     assert_eq!(report.digest, report.expected);
     assert_eq!(report.final_resources.managed_memory, 0);
     assert_eq!(report.final_resources.network_ops, 0);
+    assert_domain_receipt(&report);
   }
 
   #[test]
@@ -3280,6 +3591,7 @@ mod tests {
         lateness_max_ns: 0,
         started_at: started,
         production_end: Instant::now(),
+        production_cpu_started_ns: 0,
         trace_overrun: false,
       }))
       .expect("producer completion event");
@@ -3374,6 +3686,7 @@ mod tests {
         lateness_max_ns: 0,
         started_at: started,
         production_end: Instant::now(),
+        production_cpu_started_ns: 0,
         trace_overrun: false,
       }))
       .expect("producer completion event");

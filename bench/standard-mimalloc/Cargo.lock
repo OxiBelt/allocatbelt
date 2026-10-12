@@ -25,6 +25,7 @@ dependencies = [
  "allocatbelt",
  "allocatbelt-app-ports",
  "mimalloc",
+ "rustix",
  "tokio",
 ]
 

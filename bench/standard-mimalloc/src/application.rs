@@ -1,6 +1,6 @@
 //! Standard-mimalloc application comparator in its isolated Cargo graph.
 #[path = "../../src/application.rs"]
-mod application;
+pub mod application;
 
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
