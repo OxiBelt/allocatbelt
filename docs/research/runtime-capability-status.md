@@ -104,6 +104,18 @@ evidence; it does not qualify the complete current guest configuration,
 workspace, feature, package or platform matrix, broader sandbox suite, or
 performance.
 
+At signed source `8b1ad4ab810cfc1889b201ada62d17f672cf7d00`, a fresh full-system
+RISC-V build, static-musl payload and both vector-disabled and vector-enabled
+boots completed with zero exits. Both scenarios emitted every required
+`PASS` and `COMPLETE` marker under payload identity
+`c479406df14133b27c45e9a5671e868aeef2f18b344d472e3fd154dfe19ca768`.
+The disabled scenario covered platform, region, runtime and disabled dispatch;
+the enabled scenario additionally covered the RVV kernel, enabled/disabled
+dispatch and per-thread vector policy. The repaired recipe supplies guest
+shell tools, loopback networking and device-option kernel support needed by
+these fixtures. These TCG guest results establish correctness only and do not
+qualify later clock, metrics or resource-domain changes.
+
 Release requires source-specific ownership and lifecycle review, appropriate
 concurrent models, standard checks, the complete isolated core Miri campaign,
 supported-platform checks, feature combinations, a packaged consumer, and the

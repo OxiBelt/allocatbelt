@@ -8,9 +8,14 @@ reserves a fixed CPU-waiter table. Actual retained slot capacities are charged
 to `Control`; allocator rounding, `Arc` headers and waker payload allocations
 are not measured physical memory. The existing `new` constructor keeps a
 zero-waiter table for callers that only need synchronous reservations.
-This charges the domain's tenant and waiter tables; runtime-owned queue,
-scope and task tables, per-task frames, and handoff helper infrastructure are
-not yet charged to `Control`.
+The domain constructor charges its tenant and waiter tables. Tenant-bound
+schedulers, scopes, task frames, queues, wake owners and selected service
+adapters also reserve their declared metadata payloads before admission or
+startup, retaining those fees with the final owners. Unbound lower-level
+constructors retain their existing behavior. This is declared-payload
+accounting rather than a physical-memory bound; the
+[runtime contract](runtime.md#owning-driver-facades) describes its coverage
+and remaining provider requirements.
 
 A tenant has immutable hard ceilings and independently adjustable soft limits.
 `TenantDomain::try_acquire` takes a complete `DomainResources` vector against

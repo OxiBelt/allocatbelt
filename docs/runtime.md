@@ -430,11 +430,17 @@ events after reuse. Idle writable descriptors do not cause continuous polling.
 
 External close waits for claimed callback drains before returning; callbacks
 closing their own reactor and the service thread avoid waiting for themselves.
-External shutdown also joins the service; self-joining returns `WouldDeadlock`.
+External shutdown also joins the service; shutdown inside a callback or on a
+service thread returns `WouldDeadlock`.
 Callbacks run outside driver and callback-tracking locks, including during
-thread-local teardown. Registration and waiter tables are preallocated; close
-scratch and per-thread callback ownership tracking allocate separately and are
-not managed-storage charges or a total memory budget. Socket wrappers and their
+thread-local teardown. Registration, waiter, dispatch and callback-scratch
+tables are preallocated. Callback tracking uses a fixed shared table and fixed
+thread-local identity fallback; nested drains reuse scratch or claim one
+waiter at a time without allocating a new waker vector. `new_in_tenant` charges
+declared owner, shared, registration and worker-capture payloads to `Control`;
+retained handles keep their fees until final release. These fees exclude
+allocator headers, thread stacks and opaque thread-local backing, and are not
+a total memory budget. Socket wrappers and their
 I/O-trait integration are provided by the network module. Owned readiness
 futures and guards retain an `AsyncFd` clone, keeping the registration and
 underlying value alive until their final release. Dropping a pending owned
@@ -1718,10 +1724,28 @@ full-bucket clamping discards accumulated surplus. Shared clones observe the
 same reservation count and byte balance.
 
 These buckets account application-byte admission, not physical disk traffic,
-wire bandwidth or operation-slot permits. Owning-facade bucket getters permit
-explicit use; network and filesystem enforcement adapters require their own
-integration and acceptance. A bucket configured on a builder alone does not
-automatically intercept lower-level I/O.
+wire bandwidth or operation-slot permits. `runtime::rate_io::RateLimitedIo`
+reserves available credit before each initialized stream poll and refunds
+unused credit on pending/error/partial completion. Its timer must use an
+immutable real clock. Owning-facade `rate_io` adapters use download credit for
+reads and upload credit for writes; `disk_io` uses the shared disk bucket.
+
+A selected `disk_rate` also binds the owning filesystem handle. Sequential
+and positional reads/writes reserve before each byte syscall. Rate-selected
+copy uses bounded managed scratch, charges both reads and writes, preserves
+source creation permissions and existing nonregular-destination permissions,
+and observes cancellation between calls. Direct standard-library I/O remains
+outside this contract.
+
+`runtime::rate_datagram::RateLimitedUdp` reserves exact datagram or receive-
+buffer credit, then one network operation permit before socket I/O. Pending
+receives retain both owners; cancellation removes their readiness waiter and
+refunds credit. Oversized sends return an error before sending any fragment,
+and callers retain their complete borrowed input. Empty buffers still send
+or consume empty datagrams. Receives preserve kernel truncation behavior and
+charge copied application bytes. Constructor failures recover every owned
+input. Clones share a charged metadata owner and optional committed-byte
+meters until the final owner is dropped.
 
 ## Owning driver facades
 
@@ -1738,7 +1762,12 @@ last during startup because its process-global bridge remains permanent.
 `ShutdownProgress::Pending` while task cleanup, blocking work, child reaping,
 callbacks or service threads remain owned. Async/local work finishes first,
 followed by blocking work and child reaping; timer and readiness services close
-last so admitted drains retain their dependencies. Status calls retain joined
+last so admitted drains retain their dependencies. Thread owners use bounded
+join monitors to observe actual completion through thread-local cleanup;
+polling does not join an unfinished worker on the caller. A failed monitor
+launch retains the original handle and returns a retryable typed error.
+`DriverShutdownError::is_retryable` distinguishes these failures from sticky
+worker failures. Status calls retain joined
 worker panic payloads and return sticky typed failures instead of running their
 destructors on the caller. Explicit cleanup and owner destruction contain
 payload destructor panics, but a blocking destructor can still delay them.
@@ -1747,10 +1776,34 @@ Local future and queued-blocking capture cleanup is explicit through
 `drive_shutdown_step`; it can invoke arbitrary caller code and has no finite
 wall-time guarantee. Keep an unfinished facade owner alive until cleanup
 completes. Process-wide signal bridge lifetime is not included in
-`ShutdownProgress::Complete`. These ownership operations do not yet provide
-automatic CPU enforcement or a sampling service. Current-thread automatic
-paused time and worker observability have focused fixtures; their qualification
-remains separate from the full replacement and performance gates.
+`ShutdownProgress::Complete`. When a tenant resource domain is bound, root
+polls, owned tasks and blocking execution share its CPU and task admission.
+Declared scheduler payloads, owning facades, controlled scopes, queues, metrics,
+flags, waiter owners, byte buckets and feedback state retain Control charges
+through their final handles. Bound filesystem requests reserve their shared
+input-and-mutex payload before disk or job admission; that charge survives
+queued cancellation and detached execution. Caller-owned allocations reachable
+from an input remain outside this declared-payload charge. This accounting excludes
+physical allocator overhead, arbitrary application allocations and OS stacks;
+provider metadata coverage remains a separate implementation requirement.
+
+`runtime::cpu_gate::CpuGate` provides the same domain admission to external
+executors. A wrapped future holds a CPU ticket for each inner poll; `run` holds
+one through a synchronous closure. Its bounded waiter share, wrapper, boxed
+future payload and blocking waker have declared Control charges. Temporary
+exhaustion registers a real wake or parks the blocking caller; reentrant work
+on the same active domain fails promptly if capacity is exhausted. The gate
+does not account an external executor's opaque task allocations or control CPU
+time. Original futures and closures are recovered if initial admission fails.
+
+The optional `resource-feedback` feature permits an explicitly selected
+`feedback_sources` factory. Each build creates fresh source contexts and
+directional application-byte meters; feedback is off by default. The sampler
+uses real monotonic time, bounded policy state, explicit floors and ceilings,
+readback verification and fixed diagnostics. Missing, sparse or stale telemetry
+freezes its affected control. Feedback stops before other selected services.
+These source and ownership fixtures do not establish native performance or
+complete replacement qualification.
 
 `AsyncThreadOptions`, also accepted by `MultiThreadBuilder::thread_options`,
 configures executor names, stack sizes and start, stop, park and unpark hooks.
