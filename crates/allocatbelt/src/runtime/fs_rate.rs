@@ -6,7 +6,7 @@ use std::io;
 use std::sync::Arc;
 use std::time::Duration;
 
-use super::super::byte_rate::{ByteRateError, ByteRateLimit};
+use super::super::byte_rate::{ByteRateError, ByteRateLimit, ByteReservation};
 use super::super::job::CancellationToken;
 use super::super::resource_domain::{ControlCharge, DomainError, TenantDomain};
 #[cfg(feature = "resource-feedback")]
@@ -49,6 +49,57 @@ impl FsRateControl {
   }
 }
 
+/// Shared synchronous byte admission for owned blocking I/O on any executor.
+///
+/// Each call reserves immediately before its operation, waits on real time,
+/// commits the reported prefix and refunds the unused offer. The operation
+/// must report its actual byte count and transfer no bytes on an error.
+/// Known shared metadata is charged once; caller-owned operation state,
+/// allocator headers and worker stacks remain outside that charge.
+#[derive(Clone)]
+pub struct BlockingByteIo(FsRateControl);
+
+impl BlockingByteIo {
+  /// Creates a shared byte policy, retaining its bucket through final clones.
+  pub fn new(bucket: &ByteRateLimit, tenant: Option<&TenantDomain>) -> Result<Self, DomainError> {
+    FsRateControl::new(
+      bucket,
+      tenant,
+      #[cfg(feature = "resource-feedback")]
+      None,
+    )
+    .map(Self)
+  }
+
+  /// Creates the same policy with one completion-meter source registration.
+  #[cfg(feature = "resource-feedback")]
+  pub fn new_metered(
+    bucket: &ByteRateLimit,
+    tenant: Option<&TenantDomain>,
+    meter: &IoFeedbackMeter,
+  ) -> Result<Self, DomainError> {
+    FsRateControl::new(bucket, tenant, Some(meter)).map(Self)
+  }
+
+  /// Executes one byte operation after admission, retaining credit while it runs.
+  /// Cancellation is checked before waiting and before operation entry. Running
+  /// syscalls are not interrupted. A panic spends the full offer conservatively.
+  pub fn run(
+    &self,
+    maximum: usize,
+    is_cancelled: impl FnMut() -> bool,
+    operation: impl FnOnce(usize) -> io::Result<usize>,
+  ) -> io::Result<usize> {
+    limited_io_cancel_with_wait(
+      Some(&self.0),
+      maximum,
+      is_cancelled,
+      operation,
+      std::thread::sleep,
+    )
+  }
+}
+
 /// Runs one byte syscall. No rate state or measurement work when unconfigured.
 pub(super) fn limited_io(
   rate: Option<&FsRateControl>,
@@ -64,13 +115,29 @@ fn limited_io_with_wait(
   maximum: usize,
   token: &CancellationToken,
   operation: impl FnOnce(usize) -> io::Result<usize>,
+  wait_for_credit: impl FnMut(Duration),
+) -> io::Result<usize> {
+  limited_io_cancel_with_wait(
+    rate,
+    maximum,
+    || token.is_cancelled(),
+    operation,
+    wait_for_credit,
+  )
+}
+
+fn limited_io_cancel_with_wait(
+  rate: Option<&FsRateControl>,
+  maximum: usize,
+  mut is_cancelled: impl FnMut() -> bool,
+  operation: impl FnOnce(usize) -> io::Result<usize>,
   mut wait_for_credit: impl FnMut(Duration),
 ) -> io::Result<usize> {
   let Some(rate) = rate else {
     return operation(maximum);
   };
   let reservation = loop {
-    if token.is_cancelled() {
+    if is_cancelled() {
       return Err(io::Error::new(
         io::ErrorKind::Interrupted,
         "filesystem byte admission cancelled",
@@ -87,13 +154,32 @@ fn limited_io_with_wait(
     }
   };
   let offered = reservation.bytes();
-  if token.is_cancelled() {
+  if is_cancelled() {
     return Err(io::Error::new(
       io::ErrorKind::Interrupted,
       "filesystem byte admission cancelled",
     ));
   }
-  let count = operation(offered)?;
+  let mut guarded = PanicOffer {
+    reservation: Some(reservation),
+    #[cfg(feature = "resource-feedback")]
+    meter: rate.0.meter.as_ref(),
+    #[cfg(not(feature = "resource-feedback"))]
+    _lifetime: std::marker::PhantomData,
+  };
+  let count = match operation(offered) {
+    Ok(count) => count,
+    Err(error) => {
+      // A normal error guarantees no transfer even if this call is made by
+      // a destructor during an unrelated unwind. Disarm before returning.
+      drop(guarded.reservation.take());
+      return Err(error);
+    }
+  };
+  let reservation = guarded
+    .reservation
+    .take()
+    .unwrap_or_else(|| unreachable!("byte offer was consumed"));
   if count > offered {
     // An invalid completion cannot mint credit. Spend the complete offer and
     // invalidate telemetry; never infer the endpoint's actual byte count.
@@ -117,6 +203,29 @@ fn limited_io_with_wait(
     meter.record_completion(count as u64);
   }
   Ok(count)
+}
+
+struct PanicOffer<'a> {
+  reservation: Option<ByteReservation>,
+  #[cfg(feature = "resource-feedback")]
+  meter: Option<&'a IoFeedbackMeter>,
+  #[cfg(not(feature = "resource-feedback"))]
+  _lifetime: std::marker::PhantomData<&'a ()>,
+}
+
+impl Drop for PanicOffer<'_> {
+  fn drop(&mut self) {
+    if std::thread::panicking()
+      && let Some(reservation) = self.reservation.take()
+    {
+      let offered = reservation.bytes();
+      let _ = reservation.commit(offered);
+      #[cfg(feature = "resource-feedback")]
+      if let Some(meter) = self.meter {
+        meter.mark_invalid_io();
+      }
+    }
+  }
 }
 
 /// A rate-selected copy charges both its reads and writes. Metadata does not

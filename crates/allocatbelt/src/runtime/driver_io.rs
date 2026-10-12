@@ -78,6 +78,58 @@ impl fmt::Debug for IoBindings {
 }
 
 impl IoBindings {
+  /// Creates shared policies for an external executor from borrowed components.
+  ///
+  /// The caller retains the timer service owner. Missing or closed components
+  /// are reported when wrapping an endpoint, recovering that endpoint. The
+  /// scope's tenant admits this shared payload before allocation.
+  pub fn from_components(
+    resources: &ResourceScope,
+    disk_rate: Option<&ByteRateLimit>,
+    upload_rate: Option<&ByteRateLimit>,
+    download_rate: Option<&ByteRateLimit>,
+    rate_timer: Option<&TimerHandle>,
+  ) -> Result<Self, DomainError> {
+    Self::new(
+      resources,
+      disk_rate,
+      upload_rate,
+      download_rate,
+      rate_timer,
+      #[cfg(feature = "resource-feedback")]
+      None,
+    )
+  }
+
+  /// Creates the same policies with disk, upload and download feedback meters.
+  /// Sources register when adapters are created, rather than at binding time.
+  #[cfg(feature = "resource-feedback")]
+  pub fn from_metered_components(
+    resources: &ResourceScope,
+    disk_rate: Option<&ByteRateLimit>,
+    upload_rate: Option<&ByteRateLimit>,
+    download_rate: Option<&ByteRateLimit>,
+    rate_timer: Option<&TimerHandle>,
+    meters: (
+      &super::super::resource_feedback_meter::IoFeedbackMeter,
+      &super::super::resource_feedback_meter::IoFeedbackMeter,
+      &super::super::resource_feedback_meter::IoFeedbackMeter,
+    ),
+  ) -> Result<Self, DomainError> {
+    Self::new(
+      resources,
+      disk_rate,
+      upload_rate,
+      download_rate,
+      rate_timer,
+      Some(IoMeters {
+        disk: meters.0.clone(),
+        upload: meters.1.clone(),
+        download: meters.2.clone(),
+      }),
+    )
+  }
+
   /// Builds one shared policy binding from the driver's selected components.
   ///
   /// The declared Inner payload is admitted to Control before cloning the

@@ -333,3 +333,142 @@ fn source_symlink_copy_preserves_existing_fifo_permissions() {
   std::fs::remove_file(destination).unwrap();
   std::fs::remove_dir(base).unwrap();
 }
+
+#[test]
+fn public_blocking_adapter_commits_real_file_prefix_and_recovers_cancelled_entry() {
+  use std::os::unix::fs::FileExt;
+  let bucket = bucket(8);
+  let adapter = BlockingByteIo::new(&bucket, None).unwrap();
+  let path = std::env::temp_dir().join(format!(
+    "allocatbelt-blocking-byte-prefix-{}",
+    std::process::id()
+  ));
+  let file = std::fs::OpenOptions::new()
+    .read(true)
+    .write(true)
+    .create_new(true)
+    .open(&path)
+    .unwrap();
+  std::fs::remove_file(&path).unwrap();
+  assert_eq!(
+    adapter
+      .run(
+        8,
+        || false,
+        |offered| {
+          assert_eq!(offered, 8);
+          file.write_at(&b"abc"[..], 0)
+        }
+      )
+      .unwrap(),
+    3
+  );
+  assert_eq!(bucket.snapshot().reserved_bytes, 0);
+  let error = adapter
+    .run(5, || true, |_| panic!("cancelled endpoint must not run"))
+    .unwrap_err();
+  assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+  let mut output = [0; 3];
+  assert_eq!(file.read_at(&mut output, 0).unwrap(), 3);
+  assert_eq!(&output, b"abc");
+}
+
+#[test]
+fn public_blocking_adapter_waits_for_credit_then_observes_cancellation() {
+  let bucket = bucket(1);
+  bucket.try_reserve(1).unwrap().commit(1).unwrap();
+  let adapter = BlockingByteIo::new(&bucket, None).unwrap();
+  let cancelled = Arc::new(AtomicBool::new(false));
+  let stop = cancelled.clone();
+  let (waited_tx, waited_rx) = mpsc::channel();
+  let worker = std::thread::spawn(move || {
+    let mut checks = 0;
+    adapter.run(
+      1,
+      || {
+        checks += 1;
+        // The first admission failed against the empty bucket, so this second
+        // check happens after the actual credit-wait branch has slept.
+        if checks == 2 {
+          waited_tx.send(()).unwrap();
+        }
+        stop.load(Ordering::Acquire)
+      },
+      |_| panic!("cancelled empty-bucket endpoint must not run"),
+    )
+  });
+  waited_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+  cancelled.store(true, Ordering::Release);
+  assert_eq!(
+    worker.join().unwrap().unwrap_err().kind(),
+    io::ErrorKind::Interrupted
+  );
+  assert_eq!(bucket.snapshot().reserved_bytes, 0);
+}
+
+#[test]
+fn panicking_byte_operation_spends_unknown_offer_and_invalidates_telemetry() {
+  let bucket = bucket(8);
+  #[cfg(feature = "resource-feedback")]
+  let meter = IoFeedbackMeter::new();
+  let adapter = {
+    #[cfg(feature = "resource-feedback")]
+    {
+      BlockingByteIo::new_metered(&bucket, None, &meter).unwrap()
+    }
+    #[cfg(not(feature = "resource-feedback"))]
+    {
+      BlockingByteIo::new(&bucket, None).unwrap()
+    }
+  };
+  let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    let _ = adapter.run(
+      8,
+      || false,
+      |_| -> io::Result<usize> { panic!("unknown I/O completion") },
+    );
+  }));
+  assert!(result.is_err());
+  assert_eq!(bucket.snapshot().reserved_bytes, 0);
+  assert_eq!(bucket.snapshot().available_bytes, 0);
+  #[cfg(feature = "resource-feedback")]
+  {
+    assert!(meter.snapshot().diagnostics.invalid_io);
+    assert_eq!(meter.snapshot().committed_bytes, 0);
+    assert_eq!(meter.snapshot().completions, 0);
+  }
+}
+
+#[test]
+fn normal_io_error_refunds_during_an_unrelated_outer_unwind() {
+  use std::sync::atomic::AtomicUsize;
+  let bucket = bucket(8);
+  let adapter = BlockingByteIo::new(&bucket, None).unwrap();
+  let observed = AtomicUsize::new(usize::MAX);
+  struct ErrorOnDrop<'a> {
+    adapter: &'a BlockingByteIo,
+    bucket: &'a ByteRateLimit,
+    observed: &'a AtomicUsize,
+  }
+  impl Drop for ErrorOnDrop<'_> {
+    fn drop(&mut self) {
+      let _ = self
+        .adapter
+        .run(8, || false, |_| Err(io::ErrorKind::PermissionDenied.into()));
+      self
+        .observed
+        .store(self.bucket.snapshot().available_bytes, Ordering::Release);
+    }
+  }
+  let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    let _drop = ErrorOnDrop {
+      adapter: &adapter,
+      bucket: &bucket,
+      observed: &observed,
+    };
+    panic!("unrelated outer unwind");
+  }));
+  assert!(result.is_err());
+  assert_eq!(observed.load(Ordering::Acquire), 8);
+  assert_eq!(bucket.snapshot().reserved_bytes, 0);
+}

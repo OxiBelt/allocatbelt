@@ -55,6 +55,8 @@ use crate::runtime::resources::Resources;
 #[path = "fs_rate.rs"]
 mod fs_rate;
 #[cfg(not(loom))]
+pub use fs_rate::BlockingByteIo;
+#[cfg(not(loom))]
 use fs_rate::{FsRateControl, limited_io};
 
 // The checking configuration excludes real-time byte buckets and syscall I/O.
