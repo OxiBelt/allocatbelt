@@ -87,9 +87,21 @@ fixture required a shell absent from the empty image. The separate
 [full-system RISC-V campaign](https://github.com/OxiBelt/allocatbelt/actions/runs/38057356207)
 failed its baseline runtime suite: 33 cases encountered missing Bash,
 uninitialized loopback or unavailable socket device-binding support. The
-guest rejected that run correctly. Fixture and guest-prerequisite repairs
-require fresh remote verification; the successful jobs above do not qualify
-those changed inputs or close sandbox and full-system guest acceptance.
+guest rejected that run correctly. A later check qualifies one repaired
+sandbox signal component, described below; the full hardened-sandbox matrix
+remains open, and full-system guest acceptance remains pending. The successful
+jobs above do not qualify other changed inputs.
+
+A fresh Linux x86_64 native-guest check qualified the static-musl
+empty-rootfs runtime-signal component. The build and export succeeded, and the
+container test passed its five parent tests and four isolated child summaries
+with exit code zero, no reported OOM kill or runtime error, no restart,
+container PID zero, and no caller or container cgroup. The check used a bridge
+of 314 base source entries and eight overlay entries that preserved the current
+Rust signal and process-fixture bodies. This is focused component-correctness
+evidence; it does not qualify the complete current guest configuration,
+workspace, feature, package or platform matrix, broader sandbox suite, or
+performance.
 
 Release requires source-specific ownership and lifecycle review, appropriate
 concurrent models, standard checks, the complete isolated core Miri campaign,
