@@ -716,14 +716,16 @@ fn submission_error(error: FsSubmissionErrorKind) -> io::Error {
       crate::runtime::error::SubmitErrorKind::Full
       | crate::runtime::error::SubmitErrorKind::InsufficientResources,
     )
-    | FsSubmissionErrorKind::Resource(ResourceError::Exhausted(_)) => io::ErrorKind::WouldBlock,
-    FsSubmissionErrorKind::Runtime(crate::runtime::error::SubmitErrorKind::Closed) => {
-      io::ErrorKind::BrokenPipe
-    }
+    | FsSubmissionErrorKind::Resource(
+      ResourceError::Exhausted(_) | ResourceError::DomainControlExhausted,
+    ) => io::ErrorKind::WouldBlock,
+    FsSubmissionErrorKind::Runtime(crate::runtime::error::SubmitErrorKind::Closed)
+    | FsSubmissionErrorKind::Resource(ResourceError::Closed) => io::ErrorKind::BrokenPipe,
     FsSubmissionErrorKind::Runtime(crate::runtime::error::SubmitErrorKind::InvalidRequest)
     | FsSubmissionErrorKind::Resource(ResourceError::Invalid(_))
     | FsSubmissionErrorKind::Resource(ResourceError::OutOfMemory)
-    | FsSubmissionErrorKind::Resource(ResourceError::Shared) => io::ErrorKind::Other,
+    | FsSubmissionErrorKind::Resource(ResourceError::Shared)
+    | FsSubmissionErrorKind::Resource(ResourceError::DomainAdmission) => io::ErrorKind::Other,
   };
   io::Error::new(kind, error)
 }

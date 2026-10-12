@@ -43,13 +43,65 @@
 //! its charge is released. A poisoned lock therefore still holds consistent
 //! counts and is used as is; no panic is caught.
 
+use std::array;
 use std::fmt;
 use std::ops::Deref;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
+use super::resource_domain::{
+  DomainError, DomainReservation, DomainResource, DomainResources, TenantDomain,
+};
+
 #[cfg(all(test, loom))]
 #[path = "managed_model.rs"]
 mod model;
+
+#[cfg(all(test, loom))]
+mod domain_model {
+  use loom::thread;
+
+  use super::{ResourceLimits, ResourceScope, domain_memory};
+  use crate::runtime::resource_domain::{DomainResource, DomainResources, ResourceDomain};
+
+  #[test]
+  fn loom_bound_scopes_compete_in_the_same_global_and_tenant_ledger() {
+    loom::model(|| {
+      let ceiling = DomainResources::ZERO
+        .with(DomainResource::Memory, 8)
+        .with(DomainResource::Control, 4096);
+      let domain = ResourceDomain::new(ceiling, 2).unwrap();
+      let tenant_ceiling = domain_memory(8).with(DomainResource::Control, 4096);
+      let left = ResourceScope::from_tenant(
+        ResourceLimits {
+          managed_memory: 8,
+          ..ResourceLimits::default()
+        },
+        domain.tenant(tenant_ceiling).unwrap(),
+      );
+      let right = ResourceScope::from_tenant(
+        ResourceLimits {
+          managed_memory: 8,
+          ..ResourceLimits::default()
+        },
+        domain.tenant(tenant_ceiling).unwrap(),
+      );
+
+      let left = thread::spawn(move || left.try_alloc_zeroed(8));
+      let right = thread::spawn(move || right.try_alloc_zeroed(8));
+      let left = left.join().unwrap();
+      let right = right.join().unwrap();
+      assert_ne!(left.is_ok(), right.is_ok());
+      assert_eq!(domain.snapshot().used.get(DomainResource::Memory), 8);
+      drop(left);
+      drop(right);
+      assert_eq!(domain.snapshot().used.get(DomainResource::Memory), 0);
+    });
+  }
+}
+
+#[cfg(all(test, not(loom)))]
+#[path = "managed_domain_tests.rs"]
+mod domain_tests;
 
 /// The largest storage a buffer can request: a Rust allocation is at most
 /// `isize::MAX` bytes.
@@ -111,6 +163,15 @@ pub enum ResourceError {
   /// The buffer has other clones, and only a uniquely owned buffer can be
   /// resized.
   Shared,
+  /// The attached tenant has closed admission. Existing charges remain live
+  /// until their buffers and permits are dropped.
+  Closed,
+  /// The attached domain could not track another live reservation because
+  /// its fixed control-reservation count was exhausted.
+  DomainControlExhausted,
+  /// The attached domain refused admission for a condition outside the
+  /// managed memory, disk and network resource kinds.
+  DomainAdmission,
 }
 
 impl fmt::Display for ResourceError {
@@ -120,6 +181,11 @@ impl fmt::Display for ResourceError {
       Self::Exhausted(kind) => write!(f, "not enough free {kind} capacity"),
       Self::OutOfMemory => f.write_str("the allocator refused the buffer's storage"),
       Self::Shared => f.write_str("the buffer has other clones"),
+      Self::Closed => f.write_str("the attached tenant has closed admission"),
+      Self::DomainControlExhausted => {
+        f.write_str("the resource domain has no free control reservation capacity")
+      }
+      Self::DomainAdmission => f.write_str("the resource domain refused admission"),
     }
   }
 }
@@ -268,10 +334,14 @@ fn lock(ledger: &Mutex<Ledger>) -> MutexGuard<'_, Ledger> {
 /// Cloning the handle shares the same ledger and reserves nothing. Buffers
 /// and permits hold the ledger themselves, so every scope handle may be
 /// dropped while they live; their charges are still returned when they are
-/// dropped.
+/// dropped. A scope made with [`ResourceScope::from_tenant`] also charges
+/// those resources to one global and one tenant ledger under the resource
+/// domain's lock. Its local snapshot remains scoped to this handle's
+/// [`ResourceLimits`]; it is not a transactional view of both locks.
 #[derive(Clone)]
 pub struct ResourceScope {
   ledger: Arc<Mutex<Ledger>>,
+  tenant: Option<TenantDomain>,
 }
 
 impl ResourceScope {
@@ -281,6 +351,26 @@ impl ResourceScope {
   pub fn new(limits: ResourceLimits) -> Self {
     Self {
       ledger: Arc::new(Mutex::new(Ledger::new(limits))),
+      tenant: None,
+    }
+  }
+
+  /// A scope with local limits that also reserves every managed memory,
+  /// disk and network charge from `tenant`'s global and tenant domain ledgers.
+  ///
+  /// Each domain reservation updates the global and tenant dimensions
+  /// atomically. The local [`ResourceLimits`] remain an additional bound and
+  /// can reject earlier; [`ResourceScope::snapshot`] reports only that local
+  /// ledger. Clones, buffers and permits retain the tenant owner so the
+  /// tenant generation cannot be recycled while any bounded handle remains.
+  /// Closing the tenant rejects new positive memory reservations and operation
+  /// permits while existing buffers and permits continue to hold their
+  /// reservations until their actual drop.
+  #[must_use]
+  pub fn from_tenant(limits: ResourceLimits, tenant: TenantDomain) -> Self {
+    Self {
+      ledger: Arc::new(Mutex::new(Ledger::new(limits))),
+      tenant: Some(tenant),
     }
   }
 
@@ -316,6 +406,8 @@ impl ResourceScope {
       storage: Vec::new(),
       charged: 0,
       ledger: Arc::clone(&self.ledger),
+      domain_charges: empty_domain_charges(),
+      tenant: self.tenant.clone(),
     };
     backing.try_resize(len)?;
     Ok(ManagedBuf {
@@ -326,8 +418,9 @@ impl ResourceScope {
   /// A permit holding every slot of `request`, or none of them.
   ///
   /// Both components are checked and taken under one lock acquisition, so
-  /// a refused request leaves the ledger unchanged. A zero request always
-  /// succeeds and holds nothing.
+  /// a refused request leaves the ledger unchanged. A zero request holds no
+  /// operation slots; a tenant-bound request still requires open admission
+  /// and retains that tenant generation until the permit drops.
   ///
   /// # Errors
   ///
@@ -336,9 +429,24 @@ impl ResourceScope {
   /// `Exhausted(Network)` when a component does not fit what is free now.
   pub fn try_acquire(&self, request: OperationRequest) -> Result<OperationPermit, ResourceError> {
     lock(&self.ledger).acquire_ops(request)?;
+    let domain_charge = match self.tenant.as_ref() {
+      Some(tenant) => match tenant.try_acquire(domain_ops(request)) {
+        Ok(reservation) => Some(reservation),
+        Err(error) => {
+          // The domain and local ledgers have separate locks. Roll the local
+          // reservation back only after the domain lock has been released.
+          let released = lock(&self.ledger).release_ops(request);
+          debug_assert!(released, "operation slots rolled back without a charge");
+          return Err(map_domain_error(error));
+        }
+      },
+      None => None,
+    };
     Ok(OperationPermit {
       ledger: Arc::clone(&self.ledger),
       request,
+      _domain_charge: domain_charge,
+      _tenant: self.tenant.clone(),
     })
   }
 }
@@ -360,6 +468,10 @@ impl fmt::Debug for ResourceScope {
 pub struct OperationPermit {
   ledger: Arc<Mutex<Ledger>>,
   request: OperationRequest,
+  // Drop the reservation before the final tenant handle. Neither destructor
+  // runs while the local ledger lock is held.
+  _domain_charge: Option<DomainReservation>,
+  _tenant: Option<TenantDomain>,
 }
 
 impl OperationPermit {
@@ -403,6 +515,59 @@ struct Backing {
   storage: Vec<u8>,
   charged: usize,
   ledger: Arc<Mutex<Ledger>>,
+  // At most two tickets account for this Vec: its requested length and any
+  // capacity the allocator returned beyond that length. New tickets replace
+  // this fixed array during growth; the list cannot grow with resize history.
+  domain_charges: [Option<DomainReservation>; 2],
+  tenant: Option<TenantDomain>,
+}
+
+fn empty_domain_charges() -> [Option<DomainReservation>; 2] {
+  array::from_fn(|_| None)
+}
+
+fn domain_memory(bytes: usize) -> DomainResources {
+  DomainResources::ZERO.with(DomainResource::Memory, bytes)
+}
+
+fn domain_ops(request: OperationRequest) -> DomainResources {
+  DomainResources::ZERO
+    .with(DomainResource::Disk, request.disk)
+    .with(DomainResource::Network, request.network)
+}
+
+fn map_domain_error(error: DomainError) -> ResourceError {
+  match error {
+    DomainError::Closed => ResourceError::Closed,
+    DomainError::AboveCeiling(DomainResource::Memory) => {
+      ResourceError::Invalid(ResourceKind::Memory)
+    }
+    DomainError::AboveCeiling(DomainResource::Disk) => ResourceError::Invalid(ResourceKind::Disk),
+    DomainError::AboveCeiling(DomainResource::Network) => {
+      ResourceError::Invalid(ResourceKind::Network)
+    }
+    DomainError::Exhausted(DomainResource::Memory) => {
+      ResourceError::Exhausted(ResourceKind::Memory)
+    }
+    DomainError::Exhausted(DomainResource::Disk) => ResourceError::Exhausted(ResourceKind::Disk),
+    DomainError::Exhausted(DomainResource::Network) => {
+      ResourceError::Exhausted(ResourceKind::Network)
+    }
+    DomainError::Exhausted(DomainResource::Control) => ResourceError::DomainControlExhausted,
+    // Managed scopes never request CPU, tasks or control. Keep every
+    // unexpected domain refusal visible as a typed error rather than
+    // bypassing domain admission.
+    DomainError::Invalid
+    | DomainError::OutOfMemory
+    | DomainError::TenantsFull
+    | DomainError::GenerationExhausted
+    | DomainError::AboveCeiling(
+      DomainResource::Cpu | DomainResource::Tasks | DomainResource::Control,
+    )
+    | DomainError::Exhausted(DomainResource::Cpu | DomainResource::Tasks) => {
+      ResourceError::DomainAdmission
+    }
+  }
 }
 
 impl Backing {
@@ -420,8 +585,19 @@ impl Backing {
     // The old storage remains live until replacement succeeds. Reserving
     // only a size delta would undercount the moving allocation's peak.
     lock(&self.ledger).reserve_memory(new_len, new_len)?;
+    let mut domain_charges = empty_domain_charges();
+    if let Some(tenant) = &self.tenant {
+      match tenant.try_acquire(domain_memory(new_len)) {
+        Ok(reservation) => domain_charges[0] = Some(reservation),
+        Err(error) => {
+          self.release(new_len);
+          return Err(map_domain_error(error));
+        }
+      }
+    }
     let mut replacement = Vec::new();
     if replacement.try_reserve_exact(new_len).is_err() {
+      drop(domain_charges);
       self.release(new_len);
       return Err(ResourceError::OutOfMemory);
     }
@@ -432,17 +608,33 @@ impl Backing {
       let reservation = lock(&self.ledger).reserve_memory(capacity, capacity - new_len);
       if let Err(error) = reservation {
         drop(replacement);
+        drop(domain_charges);
         self.release(new_len);
         return Err(error);
+      }
+      if let Some(tenant) = &self.tenant {
+        match tenant.try_acquire(domain_memory(capacity - new_len)) {
+          Ok(reservation) => domain_charges[1] = Some(reservation),
+          Err(error) => {
+            drop(replacement);
+            drop(domain_charges);
+            self.release(capacity);
+            return Err(map_domain_error(error));
+          }
+        }
       }
     }
     replacement.resize(new_len, 0);
     replacement[..self.storage.len()].copy_from_slice(&self.storage);
     let old_charge = self.charged;
     let old_storage = std::mem::replace(&mut self.storage, replacement);
+    let old_domain_charges = std::mem::replace(&mut self.domain_charges, domain_charges);
     self.charged = capacity;
     drop(old_storage);
     self.release(old_charge);
+    // Ticket drops take the domain mutex, so keep them outside the local
+    // ledger lock and after the replaced storage has actually been freed.
+    drop(old_domain_charges);
     Ok(())
   }
 
