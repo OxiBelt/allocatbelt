@@ -92,6 +92,7 @@ pub mod concurrency;
 pub mod concurrency_macros;
 pub mod concurrency_many;
 mod cpu_execution;
+pub mod cpu_gate;
 #[cfg(not(loom))]
 pub mod driver;
 mod error;
