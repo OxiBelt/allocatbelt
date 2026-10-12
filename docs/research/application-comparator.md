@@ -80,7 +80,7 @@ paired joins and before request-ID/checksum validation. Only successful
 transactions count as on-time or late completions; failed admitted operations
 remain in the error/lost accounting.
 
-For bounded 5,000-ID open-loop lanes, the per-ID reference oracle for CPU,
+For bounded open-loop lanes (5,000 IDs by default), the per-ID reference oracle for CPU,
 memory, disk, and HTTP is computed during setup before the producer's arrival
 clock starts. Timed results are checked against those stable IDs, and the
 aggregate digest is rebuilt from the immutable oracle. Memory validation still
@@ -94,9 +94,10 @@ measurements begin after setup.
 
 `scripts/run-application-pair.sh` prepares one fresh bounded/Tokio pair for a
 single allocator/workload/mode/rate. It pins both processes to the supplied CPU
-set and applies fixed phase deadlines: 300 seconds for the open-loop trace, 300
-seconds from production end through drain, 60 seconds per explicit driver
-shutdown, and 900 seconds for the whole process. The process limit also bounds
+set and applies finite phase deadlines: by default, 300 seconds for the
+open-loop trace, 300 seconds from production end through drain, 60 seconds per
+explicit driver shutdown, and 900 seconds for the whole process. Validated CLI
+settings can extend these bounds for larger preregistered traces. The process limit also bounds
 failures outside those phase-specific watchdogs.
 The runner captures the TSV rows and
 GNU `time -v` report, records source/binary/toolchain/host hashes and argv, and
@@ -107,12 +108,13 @@ paired order balance across fresh pair IDs, host/load preregistration, and
 confirmation counts must be frozen before timing collection.
 
 The producer measures its actual open-loop elapsed time and invalidates a trace
-that runs past the 300-second ceiling. Before marking a pair complete, the
+that runs past its configured finite ceiling. Before marking a pair complete, the
 runner checks the workload-specific worker/topology and resource policy,
 reconciles attempted/admitted/rejected/completed/lost counts and both reported
 rates, and rejects non-monotone latency quantiles. Open-loop losses remain
 visible in a valid descriptive row; accepted-only p99 is eligible only when
-all 5,000 arrivals were admitted and completed without rejection.
+all requested arrivals were admitted and completed without rejection.
+Full qualification additionally requires the preregistered observation count.
 The secondary wall-through-drain rate uses the later of production end and
 the last consumed result as its endpoint, so early completion cannot shorten
 the denominator below the full production horizon.
@@ -125,7 +127,7 @@ reordered, over-budget, or pre-existing report. Native allocatbelt reports its
 async runtime, then its filesystem runtime for disk, or its async runtime,
 connector pool, and reactor for HTTP. Tokio reports one runtime shutdown per
 workload. Driver timing includes the watchdog boundary and operation, and the
-900-second process limit remains the outer bound.
+selected whole-process limit remains the outer bound.
 
 Synthetic and real-loopback/file tests validate work accounting, per-operation
 checksums, managed-output retention, HTTP ID pairing, multichunk positional
@@ -134,6 +136,42 @@ throughput or establish that either executor is faster. The existing functional
 app-port tests remain separate from the benchmark kernels and continue to use
 their original otherwise-idle ledger contracts.
 
-For open-loop rows, `requested_arrivals` is the fixed 5,000-ID trace length.
+For open-loop rows, `requested_arrivals` is the selected finite trace length.
 It is blank in duration-based capacity mode, where the observed attempt count
 is determined by the 30-second horizon.
+
+## Parameterized observation and reference artifacts
+
+`--arrivals N` selects 1 through 1,000,000 scheduled IDs in open-loop mode; the
+default 5,000 is a diagnostic fixture size. Standalone confirmation uses at
+least 100,000 successful observations. Trace, drain, per-driver shutdown and
+whole-process deadlines are explicit finite CLI arguments. The process budget
+includes a 120-second setup allowance and every driver shutdown. Capacity keeps
+its 30-second throughput horizon, with a separate 31-second ceiling for
+coordinator completion; metadata records both.
+
+Before timing, `--emit-oracle-only PATH --workload WORKLOAD --rate RATE
+--arrivals N --source-sha256 SOURCE_SHA --binary-sha256 BINARY_SHA` produces a
+canonical reference without constructing an executor or starting an arrival
+clock. Freeze this file and its SHA-256 in the campaign manifest. Open-loop
+pair-runner arguments append the arrival/deadline settings followed by
+`ORACLE_FILE ORACLE_SHA256`. The runner verifies the reference before execution,
+regenerates it with the measured executable and its source/binary identities,
+and requires exact equality. It checks that the source, executable and oracle
+are unchanged after both processes.
+
+Each open-loop process writes a versioned per-ID report bound to its run,
+executor, allocator, workload, source/executable hashes and fresh nonce. The
+validator checks every observed and expected checksum against the separate
+canonical oracle, reconciles successful/rejected and on-time/late counts, and
+recomputes nearest-rank quantiles from scheduled-to-observed latencies. Duplicate
+IDs, stale identities, compensating checksum alterations, missing rows and
+incorrect aggregates are refused. Zero-loss eligibility is necessary but does
+not by itself establish the required observation count or confidence bounds.
+
+The shutdown sidecar records production-through-drain process CPU and CPU per
+successful completion. These exclude oracle setup, post-drain RSS sampling and
+driver shutdown; GNU time continues to record whole-process cost separately.
+The source-specific pipeline check passed 40 focused application tests and
+five remote validator tests. This is harness correctness evidence, not an
+application throughput, tail-latency or release qualification result.

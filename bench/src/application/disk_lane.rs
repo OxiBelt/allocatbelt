@@ -249,11 +249,16 @@ where
     .map_err(|error| format!("Tokio filesystem operation failed: {error}"))
 }
 
-pub(crate) fn run_and_print(allocator: &str, options: Options) -> Result<(), String> {
+pub(crate) fn run_and_print(
+  allocator: &str,
+  options: Options,
+  arrivals: usize,
+) -> Result<(), String> {
   if options.workload != super::Workload::Disk {
     return Err("disk lane received a non-disk workload".into());
   }
-  let counts = super::run(options)?;
+  let counts = super::run_with_limits(options, None, Some(arrivals))?;
+  super::write_id_report(&counts.observer.records, allocator, options)?;
   super::print_row(allocator, options, &counts);
   Ok(())
 }

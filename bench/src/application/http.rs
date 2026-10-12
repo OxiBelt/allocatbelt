@@ -35,13 +35,8 @@ const WINDOW: usize = 8;
 const TASK_LIMIT: usize = 2 * WINDOW + 1;
 const BODY_BYTES: usize = 4096;
 const CAPACITY_HORIZON: Duration = Duration::from_secs(30);
-const OPEN_LOOP_ARRIVALS: usize = 5000;
-const MAX_TRACE: Duration = Duration::from_secs(300);
 const MAX_CAPACITY_JOBS: usize = 10_000_000;
 const WARMUP_TIMEOUT: Duration = Duration::from_secs(30);
-const DRAIN_TIMEOUT: Duration = Duration::from_secs(300);
-const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(60);
-const PROCESS_TIMEOUT: Duration = Duration::from_secs(900);
 
 #[derive(Clone)]
 struct RoleLease {
@@ -166,7 +161,7 @@ enum Event {
     horizon_end: Instant,
     job: ClientJob,
   },
-  Rejected(u64),
+  Rejected(u64, Instant),
   Handler(HandlerRecord),
   Done(ProducerReport),
   Ready,
@@ -219,6 +214,7 @@ struct Report {
   async_workers: usize,
   blocking_workers: usize,
   topology: &'static str,
+  records: Vec<super::IdRecord>,
 }
 
 #[derive(Debug)]
@@ -231,6 +227,7 @@ struct ObserverReport {
   latencies: Vec<u64>,
   max_observed_managed_bytes: usize,
   last_observed: Instant,
+  records: Vec<super::IdRecord>,
 }
 
 #[derive(Default)]
@@ -249,7 +246,7 @@ struct Settings {
 }
 
 impl Settings {
-  fn production(options: Options) -> Result<Self, String> {
+  fn production(options: Options, arrivals: usize) -> Result<Self, String> {
     if options.workload != super::Workload::Http {
       return Err("HTTP lane received a non-HTTP workload".into());
     }
@@ -260,32 +257,43 @@ impl Settings {
       if rate == 0 || rate > 1_000_000_000 {
         return Err("open-loop --rate must be in 1..=1000000000".into());
       }
-      let trace_ns = (OPEN_LOOP_ARRIVALS as u128 * 1_000_000_000) / rate as u128;
-      if trace_ns > MAX_TRACE.as_nanos() {
-        return Err("5,000-arrival open-loop trace exceeds 300 seconds".into());
+      super::validate_arrivals(arrivals)?;
+      super::validate_trace(options, arrivals, super::execution_deadlines().trace)?;
+      let trace_ns = (arrivals as u128 * 1_000_000_000) / rate as u128;
+      if trace_ns > super::execution_deadlines().trace.as_nanos() {
+        return Err("open-loop trace exceeds its finite trace deadline".into());
       }
     }
     Ok(Self {
       horizon: CAPACITY_HORIZON,
-      arrivals: OPEN_LOOP_ARRIVALS,
+      arrivals,
       body_bytes: BODY_BYTES,
     })
   }
 
-  fn event_capacity(self, mode: Mode) -> usize {
+  fn event_capacity(self, mode: Mode) -> Result<usize, String> {
     match mode {
-      Mode::Capacity => 4 * WINDOW + 1,
-      Mode::OpenLoop => 4 * self.arrivals + 1,
+      Mode::Capacity => Ok(4 * WINDOW + 1),
+      Mode::OpenLoop => self
+        .arrivals
+        .checked_mul(4)
+        .and_then(|count| count.checked_add(1))
+        .ok_or_else(|| "HTTP open-loop event capacity overflow".to_owned()),
     }
   }
 }
 
-pub(super) fn run_and_print(allocator: &str, options: Options) -> Result<(), String> {
-  let settings = Settings::production(options)?;
+pub(super) fn run_and_print(
+  allocator: &str,
+  options: Options,
+  arrivals: usize,
+) -> Result<(), String> {
+  let settings = Settings::production(options, arrivals)?;
   let report = match options.executor {
     Executor::Bounded => run_bounded(options, settings)?,
     Executor::Tokio => run_tokio(options, settings)?,
   };
+  super::write_id_report(&report.records, allocator, options)?;
   print_row(allocator, options, &report);
   Ok(())
 }
@@ -377,7 +385,7 @@ fn run_bounded(options: Options, settings: Settings) -> Result<Report, String> {
 
   let (roles_tx, roles_rx) = channel::channel(WINDOW, WINDOW)
     .map_err(|error| format!("HTTP accept-role channel setup failed: {error}"))?;
-  let (events_tx, events_rx) = mpsc::sync_channel(settings.event_capacity(options.mode));
+  let (events_tx, events_rx) = mpsc::sync_channel(settings.event_capacity(options.mode)?);
   let observer_thread_target = Arc::new(OnceLock::new());
   let events_tx = ObserverEventSender::new(events_tx, Arc::clone(&observer_thread_target));
   let (ready_tx, ready_rx) = mpsc::sync_channel(1);
@@ -430,9 +438,13 @@ fn run_bounded(options: Options, settings: Settings) -> Result<Report, String> {
 
   let timer_pair_median_ns = super::measure_timer_pair_median_ns();
   let rss_before = super::sample_process_memory()?;
+  if setup_started.elapsed() > super::SETUP_DEADLINE {
+    return Err("HTTP setup exceeded its 120 second finite deadline".into());
+  }
   let producer_handle = async_handle.clone();
   let producer_resources = resources.clone();
   let producer_net = net.clone();
+  let production_cpu_started = super::process_cpu_time_ns();
   let producer_thread = thread::Builder::new()
     .name("http-application-producer".into())
     .spawn(move || {
@@ -452,13 +464,15 @@ fn run_bounded(options: Options, settings: Settings) -> Result<Report, String> {
     .map_err(|error| format!("HTTP producer thread start failed: {error}"))?;
 
   let producer_result = producer_rx
-    .recv_timeout(PROCESS_TIMEOUT)
+    .recv_timeout(super::remaining_process_deadline(setup_started))
     .map_err(|error| format!("HTTP producer deadline failed: {error}"))?;
   producer_thread
     .join()
     .map_err(|_| "HTTP producer panicked".to_owned())?;
   let producer = producer_result?;
-  let drain_deadline = producer.production_end + DRAIN_TIMEOUT;
+  let process_deadline = setup_started + super::execution_deadlines().process;
+  let drain_deadline =
+    (producer.production_end + super::execution_deadlines().drain).min(process_deadline);
   let drain_remaining = drain_deadline.saturating_duration_since(Instant::now());
   let observed = observer_rx
     .recv_timeout(drain_remaining)
@@ -466,19 +480,26 @@ fn run_bounded(options: Options, settings: Settings) -> Result<Report, String> {
   observer_thread
     .join()
     .map_err(|_| "HTTP observer panicked".to_owned())?;
+  let production_cpu_ns = super::process_cpu_time_ns().saturating_sub(production_cpu_started);
   let rss_after_drain = super::sample_after_checkpoint_delay()?;
   async_handle
     .block_on(accept_task)
     .map_err(|error| format!("allocatbelt accept task join failed: {error}"))?
     .map_err(|error| format!("allocatbelt accept task output join failed: {error}"))?
     .map_err(|error| format!("allocatbelt accept task failed: {error}"))?;
-  validate_pair_counts(options.mode, settings.arrivals, &producer, &observed)?;
+  validate_pair_counts(
+    options.mode,
+    settings.arrivals,
+    &producer,
+    &observed,
+    expected_oracle.as_deref(),
+  )?;
   if observed
     .last_observed
     .saturating_duration_since(producer.production_end)
-    > DRAIN_TIMEOUT
+    > super::execution_deadlines().drain
   {
-    return Err("HTTP transaction drain exceeded 300 seconds".into());
+    return Err("HTTP transaction drain exceeded its finite deadline".into());
   }
 
   let shutdown_started = Instant::now();
@@ -510,6 +531,8 @@ fn run_bounded(options: Options, settings: Settings) -> Result<Report, String> {
       .production_end
       .saturating_duration_since(producer.started_at)
       .as_nanos(),
+    production_cpu_ns,
+    observed.on_time + observed.late,
     &shutdown_timings,
   )?;
   let rss_after_shutdown = super::sample_after_checkpoint_delay()?;
@@ -523,7 +546,7 @@ fn run_bounded(options: Options, settings: Settings) -> Result<Report, String> {
     ));
   }
   if producer.trace_overrun {
-    return Err("HTTP open-loop producer exceeded its 300 second trace deadline".into());
+    return Err("HTTP open-loop producer exceeded its finite trace deadline".into());
   }
   Ok(build_report(
     super::ProcessCheckpoints {
@@ -577,7 +600,7 @@ fn run_tokio(options: Options, settings: Settings) -> Result<Report, String> {
     .map_err(|_| "Tokio task window could not reserve its accept slot".to_owned())?;
   let (roles_tx, roles_rx) = channel::channel(WINDOW, WINDOW)
     .map_err(|error| format!("HTTP accept-role channel setup failed: {error}"))?;
-  let (events_tx, events_rx) = mpsc::sync_channel(settings.event_capacity(options.mode));
+  let (events_tx, events_rx) = mpsc::sync_channel(settings.event_capacity(options.mode)?);
   let observer_thread_target = Arc::new(OnceLock::new());
   let events_tx = ObserverEventSender::new(events_tx, Arc::clone(&observer_thread_target));
   let (ready_tx, ready_rx) = mpsc::sync_channel(1);
@@ -630,9 +653,13 @@ fn run_tokio(options: Options, settings: Settings) -> Result<Report, String> {
   }
   let timer_pair_median_ns = super::measure_timer_pair_median_ns();
   let rss_before = super::sample_process_memory()?;
+  if setup_started.elapsed() > super::SETUP_DEADLINE {
+    return Err("HTTP setup exceeded its 120 second finite deadline".into());
+  }
   let producer_handle = handle.clone();
   let producer_resources = resources.clone();
   let producer_slots = task_slots.clone();
+  let production_cpu_started = super::process_cpu_time_ns();
   let producer_thread = thread::Builder::new()
     .name("http-application-producer".into())
     .spawn(move || {
@@ -652,13 +679,15 @@ fn run_tokio(options: Options, settings: Settings) -> Result<Report, String> {
     .map_err(|error| format!("HTTP producer thread start failed: {error}"))?;
 
   let producer_result = producer_rx
-    .recv_timeout(PROCESS_TIMEOUT)
+    .recv_timeout(super::remaining_process_deadline(setup_started))
     .map_err(|error| format!("HTTP producer deadline failed: {error}"))?;
   producer_thread
     .join()
     .map_err(|_| "HTTP producer panicked".to_owned())?;
   let producer = producer_result?;
-  let drain_deadline = producer.production_end + DRAIN_TIMEOUT;
+  let process_deadline = setup_started + super::execution_deadlines().process;
+  let drain_deadline =
+    (producer.production_end + super::execution_deadlines().drain).min(process_deadline);
   let drain_remaining = drain_deadline.saturating_duration_since(Instant::now());
   let observed = observer_rx
     .recv_timeout(drain_remaining)
@@ -666,23 +695,30 @@ fn run_tokio(options: Options, settings: Settings) -> Result<Report, String> {
   observer_thread
     .join()
     .map_err(|_| "HTTP observer panicked".to_owned())?;
+  let production_cpu_ns = super::process_cpu_time_ns().saturating_sub(production_cpu_started);
   let rss_after_drain = super::sample_after_checkpoint_delay()?;
   handle
     .block_on(accept_task)
     .map_err(|error| format!("Tokio accept task join failed: {error}"))?
     .map_err(|error| format!("Tokio accept task failed: {error}"))?;
-  validate_pair_counts(options.mode, settings.arrivals, &producer, &observed)?;
+  validate_pair_counts(
+    options.mode,
+    settings.arrivals,
+    &producer,
+    &observed,
+    expected_oracle.as_deref(),
+  )?;
   if observed
     .last_observed
     .saturating_duration_since(producer.production_end)
-    > DRAIN_TIMEOUT
+    > super::execution_deadlines().drain
   {
-    return Err("HTTP transaction drain exceeded 300 seconds".into());
+    return Err("HTTP transaction drain exceeded its finite deadline".into());
   }
 
   let shutdown_started = Instant::now();
   let elapsed_ns = super::run_shutdown_with_timeout("Tokio HTTP runtime", move || {
-    runtime.shutdown_timeout(SHUTDOWN_TIMEOUT);
+    runtime.shutdown_timeout(super::execution_deadlines().shutdown);
     Ok(())
   })?;
   let shutdown_timings = [("Tokio HTTP runtime", elapsed_ns)];
@@ -692,6 +728,8 @@ fn run_tokio(options: Options, settings: Settings) -> Result<Report, String> {
       .production_end
       .saturating_duration_since(producer.started_at)
       .as_nanos(),
+    production_cpu_ns,
+    observed.on_time + observed.late,
     &shutdown_timings,
   )?;
   let rss_after_shutdown = super::sample_after_checkpoint_delay()?;
@@ -705,7 +743,7 @@ fn run_tokio(options: Options, settings: Settings) -> Result<Report, String> {
     ));
   }
   if producer.trace_overrun {
-    return Err("HTTP open-loop producer exceeded its 300 second trace deadline".into());
+    return Err("HTTP open-loop producer exceeded its finite trace deadline".into());
   }
   Ok(build_report(
     super::ProcessCheckpoints {
@@ -1070,7 +1108,7 @@ fn produce(
     if options.mode == Mode::OpenLoop && outstanding >= WINDOW {
       rejected_logical_window += 1;
       events
-        .send(Event::Rejected(id))
+        .send(Event::Rejected(id, scheduled))
         .map_err(|_| "HTTP observer queue closed before rejection publication".to_owned())?;
       continue;
     }
@@ -1094,7 +1132,7 @@ fn produce(
         rejected_backend_full += 1;
         if options.mode == Mode::OpenLoop {
           events
-            .send(Event::Rejected(id))
+            .send(Event::Rejected(id, scheduled))
             .map_err(|_| "HTTP observer queue closed before rejection publication".to_owned())?;
         }
         if options.mode == Mode::Capacity {
@@ -1228,6 +1266,12 @@ fn observe_events(
   let mut first_error = None;
   let mut digest = 0u64;
   let mut latencies = Vec::new();
+  let mut records = Vec::new();
+  if options.mode == Mode::OpenLoop {
+    records
+      .try_reserve_exact(settings.arrivals)
+      .map_err(|_| "could not reserve bounded HTTP per-ID records".to_owned())?;
+  }
   if options.mode == Mode::OpenLoop {
     latencies
       .try_reserve_exact(settings.arrivals)
@@ -1278,7 +1322,7 @@ fn observe_events(
             return Err(format!("duplicate HTTP client result record for ID {id}"));
           }
         }
-        Event::Rejected(id) => {
+        Event::Rejected(id, scheduled) => {
           if id != next_scheduled_id {
             return Err("HTTP producer published rejected IDs out of sequence".into());
           }
@@ -1292,6 +1336,23 @@ fn observe_events(
             }
             *state = IdState::Rejected;
           }
+          let completion = Instant::now();
+          let rate = options
+            .rate_per_second
+            .ok_or_else(|| "HTTP open-loop rate missing".to_owned())?;
+          let (scheduled_ns, completion_ns) =
+            super::arrival_times(id, scheduled, completion, rate)?;
+          let expected_checksum =
+            expected_response_checksum(expected_oracle.as_deref(), id, settings)
+              .ok_or_else(|| "HTTP per-ID oracle missed a rejected request".to_owned())?;
+          records.push(super::IdRecord {
+            id,
+            scheduled_ns,
+            completion_ns,
+            terminal: "rejected",
+            checksum: 0,
+            expected_checksum,
+          });
         }
         Event::Handler(record) => {
           handler_jobs.push((record.id, record.job, record._lease));
@@ -1369,8 +1430,12 @@ fn observe_events(
         .map_err(|error| error.to_owned()),
         (Err(error), _) | (_, Err(error)) => Err(error),
       };
+      let mut checksum = 0;
+      let mut succeeded = false;
       match result {
         Ok(value) => {
+          checksum = value;
+          succeeded = true;
           if observed <= horizon_end {
             on_time += 1;
           } else {
@@ -1399,6 +1464,23 @@ fn observe_events(
             *state = IdState::Failed;
           }
         }
+      }
+      if options.mode == Mode::OpenLoop {
+        let rate = options
+          .rate_per_second
+          .ok_or_else(|| "HTTP open-loop rate missing".to_owned())?;
+        let (scheduled_ns, completion_ns) = super::arrival_times(id, scheduled, observed, rate)?;
+        let expected_checksum =
+          expected_response_checksum(expected_oracle.as_deref(), id, settings)
+            .ok_or_else(|| "HTTP per-ID oracle missed a completed request".to_owned())?;
+        records.push(super::IdRecord {
+          id,
+          scheduled_ns,
+          completion_ns,
+          terminal: if succeeded { "completed" } else { "error" },
+          checksum,
+          expected_checksum,
+        });
       }
       completed += 1;
       // In open-loop mode the producer never waits for the observer and may
@@ -1501,6 +1583,7 @@ fn observe_events(
     latencies,
     max_observed_managed_bytes,
     last_observed,
+    records,
   })
 }
 
@@ -1559,7 +1642,9 @@ async fn tokio_connect_nonblocking(
   Ok(stream)
 }
 
-fn expected_request_checksum(id: u64, body_bytes: usize) -> u64 {
+pub(super) const ORACLE_BODY_BYTES: usize = BODY_BYTES;
+
+pub(super) fn expected_request_checksum(id: u64, body_bytes: usize) -> u64 {
   (0..body_bytes).fold(0xcbf2_9ce4_8422_2325, |hash, index| {
     (hash ^ u64::from(pattern_byte(request_seed(id), index))).wrapping_mul(0x0000_0100_0000_01b3)
   })
@@ -1600,8 +1685,8 @@ fn build_open_loop_checksum_oracle(
   if mode != Mode::OpenLoop {
     return Ok(None);
   }
-  if settings.arrivals > OPEN_LOOP_ARRIVALS {
-    return Err("HTTP checksum oracle exceeds the 5,000-ID open-loop bound".into());
+  if settings.arrivals > super::MAX_OPEN_LOOP_ARRIVALS {
+    return Err("HTTP checksum oracle exceeds the configured ID bound".into());
   }
   let mut oracle = Vec::new();
   oracle
@@ -1622,6 +1707,7 @@ fn validate_pair_counts(
   arrivals: usize,
   producer: &ProducerReport,
   observer: &ObserverReport,
+  expected_oracle: Option<&Vec<u64>>,
 ) -> Result<(), String> {
   let completed = observer.on_time + observer.late;
   if producer.rejected_full != producer.rejected_logical_window + producer.rejected_backend_full
@@ -1638,6 +1724,19 @@ fn validate_pair_counts(
   }
   if mode == Mode::OpenLoop && producer.attempted != arrivals {
     return Err("HTTP open-loop lane did not schedule every request ID".into());
+  }
+  if mode == Mode::OpenLoop {
+    let oracle = expected_oracle.ok_or_else(|| {
+      "HTTP open-loop checksum oracle missing during per-ID validation".to_owned()
+    })?;
+    if oracle.len() != arrivals {
+      return Err("HTTP checksum oracle length differs from requested arrivals".into());
+    }
+    let (recorded_completed, recorded_rejected) =
+      super::validate_id_records(&observer.records, oracle)?;
+    if recorded_completed != producer.admitted || recorded_rejected != producer.rejected_full {
+      return Err("HTTP per-ID terminal counts differ from the producer report".into());
+    }
   }
   Ok(())
 }
@@ -1683,6 +1782,7 @@ fn build_report(
     async_workers: WORKERS,
     blocking_workers,
     topology,
+    records: observer.records,
   }
 }
 
@@ -2449,7 +2549,7 @@ mod tests {
         .is_none()
     );
     let oversized = Settings {
-      arrivals: super::OPEN_LOOP_ARRIVALS + 1,
+      arrivals: super::super::MAX_OPEN_LOOP_ARRIVALS + 1,
       ..selected
     };
     assert!(build_open_loop_checksum_oracle(Mode::OpenLoop, oversized).is_err());
