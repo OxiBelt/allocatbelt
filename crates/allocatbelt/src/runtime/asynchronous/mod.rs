@@ -27,15 +27,19 @@ mod handoff_protocol;
 mod identity;
 mod join;
 mod local;
+mod metrics;
 mod protocol;
 mod scheduler;
 mod task;
 mod task_set;
+mod thread_options;
 
 #[cfg(all(test, not(loom)))]
 mod cooperative_tests;
 #[cfg(all(test, not(loom)))]
 mod handoff_tests;
+#[cfg(all(test, not(loom)))]
+mod metrics_tests;
 #[cfg(all(test, not(loom)))]
 mod tests;
 
@@ -60,8 +64,28 @@ pub use local::{
   LocalConfig, LocalEnterGuard, LocalError, LocalHandle, LocalRuntime, LocalScopeClose,
   LocalSendHandle, LocalSpawnError, LocalTaskScope,
 };
+pub use metrics::{AsyncThreadMetrics, RuntimeMetrics, RuntimeMetricsSnapshot};
 pub use scheduler::{OwnedTaskScope, ScopeClose};
 pub use task_set::{JoinNext, SetTaskId, TaskSet, TaskSetError};
+pub use thread_options::{AsyncThreadContext, AsyncThreadOptions, AsyncThreadRole};
+
+fn thread_contexts(workers: usize, handoffs: usize) -> impl Iterator<Item = AsyncThreadContext> {
+  (0..workers + handoffs).map(move |physical_index| {
+    if physical_index < workers {
+      AsyncThreadContext {
+        role: AsyncThreadRole::Worker,
+        index: physical_index,
+        physical_index,
+      }
+    } else {
+      AsyncThreadContext {
+        role: AsyncThreadRole::HandoffHelper,
+        index: physical_index - workers,
+        physical_index,
+      }
+    }
+  })
+}
 
 /// Fixed limits for an [`AsyncRuntime`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -102,7 +126,8 @@ pub struct AsyncScopeSnapshot {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum AsyncError {
-  /// A required bound is zero or cannot be represented by the runtime.
+  /// A required bound or thread stack size is zero, thread naming is invalid,
+  /// or the configuration cannot be represented by the runtime.
   InvalidConfig,
   /// Pre-reserving bounded scheduler storage or starting a worker failed.
   OutOfMemory,
@@ -203,7 +228,15 @@ impl AsyncRuntime {
   /// [`try_block_in_place`] on one of its turns returns
   /// [`BlockInPlaceErrorKind::Disabled`].
   pub fn new(config: AsyncConfig) -> Result<Self, AsyncError> {
-    Self::start(config, 0, None)
+    Self::start(config, 0, None, AsyncThreadOptions::default())
+  }
+
+  /// Creates a runtime with additive per-thread naming, stack and lifecycle options.
+  pub fn new_with_thread_options(
+    config: AsyncConfig,
+    options: AsyncThreadOptions,
+  ) -> Result<Self, AsyncError> {
+    Self::start(config, 0, None, options)
   }
 
   /// Creates a runtime whose implicit root scope uses `resources` for every
@@ -216,7 +249,16 @@ impl AsyncRuntime {
     config: AsyncConfig,
     resources: ResourceScope,
   ) -> Result<Self, AsyncError> {
-    Self::start(config, 0, Some(resources))
+    Self::start(config, 0, Some(resources), AsyncThreadOptions::default())
+  }
+
+  /// Resource-bound counterpart used by the owning runtime facade.
+  pub(super) fn with_resources_and_thread_options(
+    config: AsyncConfig,
+    resources: ResourceScope,
+    options: AsyncThreadOptions,
+  ) -> Result<Self, AsyncError> {
+    Self::start(config, 0, Some(resources), options)
   }
 
   /// Like [`AsyncRuntime::new`], and also prestarts
@@ -239,7 +281,25 @@ impl AsyncRuntime {
     if handoffs.max_handoffs == 0 {
       return Err(AsyncError::InvalidConfig);
     }
-    Self::start(config, handoffs.max_handoffs, None)
+    Self::start(
+      config,
+      handoffs.max_handoffs,
+      None,
+      AsyncThreadOptions::default(),
+    )
+  }
+
+  /// Like [`AsyncRuntime::new_with_thread_options`], with prestarted helpers
+  /// available while an owned turn runs a [`try_block_in_place`] closure.
+  pub fn new_with_handoffs_and_thread_options(
+    config: AsyncConfig,
+    handoffs: HandoffConfig,
+    options: AsyncThreadOptions,
+  ) -> Result<Self, AsyncError> {
+    if handoffs.max_handoffs == 0 {
+      return Err(AsyncError::InvalidConfig);
+    }
+    Self::start(config, handoffs.max_handoffs, None, options)
   }
 
   /// Resource-bound counterpart used by the owning facade.
@@ -251,13 +311,32 @@ impl AsyncRuntime {
     if handoffs.max_handoffs == 0 {
       return Err(AsyncError::InvalidConfig);
     }
-    Self::start(config, handoffs.max_handoffs, Some(resources))
+    Self::start(
+      config,
+      handoffs.max_handoffs,
+      Some(resources),
+      AsyncThreadOptions::default(),
+    )
+  }
+
+  /// Resource-bound counterpart used by the owning runtime facade.
+  pub(super) fn with_resources_handoffs_and_thread_options(
+    config: AsyncConfig,
+    handoffs: HandoffConfig,
+    resources: ResourceScope,
+    options: AsyncThreadOptions,
+  ) -> Result<Self, AsyncError> {
+    if handoffs.max_handoffs == 0 {
+      return Err(AsyncError::InvalidConfig);
+    }
+    Self::start(config, handoffs.max_handoffs, Some(resources), options)
   }
 
   fn start(
     config: AsyncConfig,
     max_handoffs: usize,
     resources: Option<ResourceScope>,
+    options: AsyncThreadOptions,
   ) -> Result<Self, AsyncError> {
     if config.workers == 0 || config.max_outstanding == 0 || config.max_scopes == 0 {
       return Err(AsyncError::InvalidConfig);
@@ -265,7 +344,33 @@ impl AsyncRuntime {
     let Some(threads) = config.workers.checked_add(max_handoffs) else {
       return Err(AsyncError::InvalidConfig);
     };
-    let (shared, root) = Shared::new(config, max_handoffs, resources)?;
+    if options.stack_size().is_some_and(|size| size == 0) {
+      return Err(AsyncError::InvalidConfig);
+    }
+    let metrics = RuntimeMetrics::try_new(
+      config.workers,
+      thread_contexts(config.workers, max_handoffs),
+      threads,
+    )
+    .map_err(|_| AsyncError::OutOfMemory)?;
+    let mut names = Vec::new();
+    names
+      .try_reserve_exact(threads)
+      .map_err(|_| AsyncError::OutOfMemory)?;
+    for context in thread_contexts(config.workers, max_handoffs) {
+      let name = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        options.resolve_name(context)
+      }));
+      match name {
+        Ok(Ok(name)) => names.push(name),
+        Ok(Err(())) => return Err(AsyncError::InvalidConfig),
+        Err(payload) => {
+          crate::runtime::task::drop_contained(payload);
+          return Err(AsyncError::InvalidConfig);
+        }
+      }
+    }
+    let (shared, root) = Shared::new(config, max_handoffs, resources, options.clone(), metrics)?;
     let mut workers = Vec::new();
     workers
       .try_reserve_exact(threads)
@@ -274,20 +379,31 @@ impl AsyncRuntime {
     panic_payloads
       .try_reserve_exact(threads)
       .map_err(|_| AsyncError::OutOfMemory)?;
-    for index in 0..threads {
+    for (index, name) in names.into_iter().enumerate() {
       let thread_shared = Arc::clone(&shared);
-      let started = if index < config.workers {
-        thread::Builder::new()
-          .name(format!("allocatbelt-async-{index}"))
-          .spawn(move || scheduler::worker(thread_shared, index))
+      let context = if index < config.workers {
+        thread_options::AsyncThreadContext {
+          role: thread_options::AsyncThreadRole::Worker,
+          index,
+          physical_index: index,
+        }
       } else {
-        // Helpers continue the workers' shard hints, one per thread.
-        thread::Builder::new()
-          .name(format!(
-            "allocatbelt-async-handoff-{}",
-            index - config.workers
-          ))
-          .spawn(move || scheduler::helper(thread_shared, index))
+        thread_options::AsyncThreadContext {
+          role: thread_options::AsyncThreadRole::HandoffHelper,
+          index: index - config.workers,
+          physical_index: index,
+        }
+      };
+      let builder = thread::Builder::new().name(name);
+      let builder = if let Some(size) = options.stack_size() {
+        builder.stack_size(size)
+      } else {
+        builder
+      };
+      let started = if context.role == thread_options::AsyncThreadRole::Worker {
+        builder.spawn(move || scheduler::worker(thread_shared, context))
+      } else {
+        builder.spawn(move || scheduler::helper(thread_shared, context))
       };
       match started {
         Ok(worker) => workers.push(worker),
@@ -318,6 +434,12 @@ impl AsyncRuntime {
       scope: self.root,
       resources: self.shared.root_resources(),
     }
+  }
+
+  /// Returns a cloneable diagnostic view that remains usable after shutdown.
+  #[must_use]
+  pub fn metrics(&self) -> RuntimeMetrics {
+    self.shared.metrics.clone()
   }
 
   /// Polls a caller-owned future on this thread until it completes. The root
@@ -474,6 +596,11 @@ pub struct AsyncHandle {
 }
 
 impl AsyncHandle {
+  /// Returns a cloneable diagnostic view that remains usable after shutdown.
+  #[must_use]
+  pub fn metrics(&self) -> RuntimeMetrics {
+    self.shared.metrics.clone()
+  }
   /// Polls a caller-owned future on this thread until it completes. This
   /// borrowed root poll has no spawned task ID; if this handle belongs to a
   /// resource-bound scope, it exposes that explicitly bound resource ledger

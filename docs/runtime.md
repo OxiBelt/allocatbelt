@@ -1232,10 +1232,26 @@ native tests cover them.
 `advance` updates that driver's time monotonically and publishes due outcomes
 through fixed batches on the advancing thread. Creation, reset, timeouts and
 all interval policies use the same clock. It does not poll executor tasks or
-automatically jump time when tasks are idle. Concurrent and reentrant advances
+automatically jump time when tasks are idle. `TimerHandle::pause` and `resume`
+switch between manual and real time without moving time backwards. If resumed
+real time exceeds `Instant`'s representable range, it freezes at its last
+instant; `is_clock_saturated` reports this and later real-time resume returns
+`ClockSaturated`. Concurrent and reentrant advances
 serialize clock updates; already-claimed callbacks can continue, and concurrent
 close can resolve remaining registrations with `Closed`. Native tests cover
 these behaviors; clock control is outside the two helper Loom models.
+
+An owning `CurrentThreadBuilder` can select `ClockMode::PausedAuto`. It advances
+to the next registered deadline only after the local executor observes
+quiescence and commits an unchanged idle epoch. Task wakes, imports, timer
+changes and associated blocking admissions invalidate that epoch before their
+transition. Blocking work inhibits advancement through closure and capture
+cleanup; an unrelated standalone blocking pool has no such association.
+Explicit inhibit guards cover other work the application needs to hold open.
+`MultiThreadBuilder` rejects automatic paused time. This clock affects timer
+semantics; byte refill and shutdown deadlines continue using real time.
+The epoch Loom model covers event-versus-commit ordering, while native fixtures
+cover executor quiescence, lost notifications and blocking ownership.
 
 ## First milestone contract
 
@@ -1732,6 +1748,20 @@ Local future and queued-blocking capture cleanup is explicit through
 wall-time guarantee. Keep an unfinished facade owner alive until cleanup
 completes. Process-wide signal bridge lifetime is not included in
 `ShutdownProgress::Complete`. These ownership operations do not yet provide
-automatic CPU enforcement, runtime metrics, a sampling service or paused-clock
-automatic advancement. Their qualification remains separate from the full
-replacement and performance gates.
+automatic CPU enforcement or a sampling service. Current-thread automatic
+paused time and worker observability have focused fixtures; their qualification
+remains separate from the full replacement and performance gates.
+
+`AsyncThreadOptions`, also accepted by `MultiThreadBuilder::thread_options`,
+configures executor names, stack sizes and start, stop, park and unpark hooks.
+Hooks receive stable physical worker/helper identities and run outside runtime
+locks and TLS borrows. Hook panics are contained and counted. Park attempts
+that skip a condition wait still pair callbacks; metrics count actual waits.
+`RuntimeMetrics` remains readable after shutdown and distinguishes primary
+dispatch capacity from physical helper threads. Busy time excludes handoff
+closures and restoration waits. Scalar and per-thread reads allocate nothing;
+`try_snapshot` reports reservation failure, while the convenience snapshot
+allocates ordinary metadata. Fields are sampled independently rather than
+transactionally. Counter updates and monotonic timestamps are present even
+when the application does not read metrics, and require native performance
+qualification.

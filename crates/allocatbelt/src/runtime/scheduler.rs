@@ -12,6 +12,7 @@ use crate::runtime::error::{SubmitError, SubmitErrorKind};
 use crate::runtime::job::{CancellationToken, Control, Job, Packet};
 use crate::runtime::resources::Resources;
 use crate::runtime::task::{Runnable, Task};
+use crate::runtime::time::TimerHandle;
 use crate::runtime::worker::Ident;
 
 /// A queued job and the resources it reserved.
@@ -42,6 +43,7 @@ pub(crate) type ParkHook = Box<dyn Fn() + Send + Sync>;
 pub(crate) struct Shared {
   pub(crate) ident: Arc<Ident>,
   state: Mutex<State>,
+  clock: Mutex<Option<TimerHandle>>,
   pub(crate) work: Condvar,
   #[cfg(test)]
   pub(crate) park_hook: Option<ParkHook>,
@@ -97,6 +99,7 @@ impl Shared {
         idle: 0,
         closed: false,
       }),
+      clock: Mutex::new(None),
       work: Condvar::new(),
       #[cfg(test)]
       park_hook: None,
@@ -109,14 +112,31 @@ impl Shared {
     self.state.lock().unwrap_or_else(PoisonError::into_inner)
   }
 
+  pub(crate) fn bind_clock(&self, timer: TimerHandle) {
+    let mut clock = self.clock.lock().unwrap_or_else(PoisonError::into_inner);
+    debug_assert!(clock.is_none());
+    *clock = Some(timer);
+  }
+
   pub(crate) fn try_spawn<F, T>(&self, request: Resources, f: F) -> Result<Job<T>, SubmitError<F>>
   where
     F: FnOnce(CancellationToken) -> T + Send + 'static,
     T: Send + 'static,
   {
+    let clock = self
+      .clock
+      .lock()
+      .unwrap_or_else(PoisonError::into_inner)
+      .clone();
+    let auto_advance_inhibit = clock.map(|timer| timer.inhibit_auto_advance());
     let control = Control::new(Arc::clone(&self.ident));
     let packet = Packet::new();
-    let task = Box::new(Task::new(f, Arc::clone(&control), Arc::clone(&packet)));
+    let task = Box::new(Task::new(
+      f,
+      Arc::clone(&control),
+      Arc::clone(&packet),
+      auto_advance_inhibit,
+    ));
     let mut state = self.lock();
     let admitted = if state.closed {
       Err(SubmitErrorKind::Closed)

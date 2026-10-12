@@ -6,10 +6,13 @@
 use std::cell::RefCell;
 use std::fmt;
 use std::sync::Arc;
+#[cfg(not(loom))]
+use std::time::Instant;
 
 use super::entry::{self, ClosureContextGuard};
 use super::handoff_protocol::{DispatchTurn, HandoffLoan};
 use super::scheduler::Shared;
+use super::thread_options::AsyncThreadContext;
 use crate::runtime::cache;
 
 /// Handoff limits for [`AsyncRuntime::new_with_handoffs`](super::AsyncRuntime::new_with_handoffs).
@@ -167,15 +170,17 @@ where
       Ok(f())
     }
     Placement::Disabled => Err(BlockInPlaceError::new(BlockInPlaceErrorKind::Disabled, f)),
-    Placement::HandOff(shared, turn) => match shared.hand_off(turn) {
+    Placement::HandOff(shared, turn, context) => match shared.hand_off(turn) {
       Err(turn) => {
         restore_phase(turn);
         Err(BlockInPlaceError::new(BlockInPlaceErrorKind::Full, f))
       }
       Ok(loan) => {
+        pause_busy();
         let restore = Restore {
           shared,
           loan: Some(loan),
+          context,
           _context: ClosureContextGuard::suspend(true),
         };
         cache::flush();
@@ -192,14 +197,16 @@ where
 struct Restore {
   shared: Arc<Shared>,
   loan: Option<HandoffLoan>,
+  context: AsyncThreadContext,
   _context: ClosureContextGuard,
 }
 
 impl Drop for Restore {
   fn drop(&mut self) {
     if let Some(loan) = self.loan.take() {
-      let turn = self.shared.restore(loan);
+      let turn = self.shared.restore(loan, self.context);
       restore_phase(turn);
+      resume_busy();
     }
   }
 }
@@ -215,7 +222,10 @@ enum Phase {
 
 struct DispatcherThread {
   shared: Arc<Shared>,
+  context: AsyncThreadContext,
   phase: Phase,
+  #[cfg(not(loom))]
+  busy_since: Option<Instant>,
 }
 
 thread_local! {
@@ -225,7 +235,7 @@ thread_local! {
 enum Placement {
   Inline,
   Disabled,
-  HandOff(Arc<Shared>, DispatchTurn),
+  HandOff(Arc<Shared>, DispatchTurn, AsyncThreadContext),
 }
 
 fn take_turn() -> Placement {
@@ -237,7 +247,7 @@ fn take_turn() -> Placement {
       };
       match std::mem::replace(&mut thread.phase, Phase::HandedOff) {
         Phase::Dispatching(turn) if thread.shared.handoffs_enabled() => {
-          Placement::HandOff(Arc::clone(&thread.shared), turn)
+          Placement::HandOff(Arc::clone(&thread.shared), turn, thread.context)
         }
         Phase::Dispatching(turn) => {
           thread.phase = Phase::Dispatching(turn);
@@ -260,14 +270,57 @@ fn restore_phase(turn: DispatchTurn) {
   });
 }
 
+#[cfg(not(loom))]
+fn pause_busy() {
+  let paused = DISPATCHER
+    .try_with(|slot| {
+      let mut slot = slot.try_borrow_mut().ok()?;
+      let dispatcher = slot.as_mut()?;
+      let started = dispatcher.busy_since.take()?;
+      Some((
+        Arc::clone(&dispatcher.shared),
+        dispatcher.context.physical_index,
+        started.elapsed().as_nanos().min(u64::MAX as u128) as u64,
+      ))
+    })
+    .ok()
+    .flatten();
+  if let Some((shared, physical_index, nanos)) = paused
+    && let Some(metrics) = shared.metrics.inner().thread(physical_index)
+  {
+    metrics.add_busy_nanos(nanos);
+  }
+}
+
+#[cfg(loom)]
+fn pause_busy() {}
+
+#[cfg(not(loom))]
+fn resume_busy() {
+  let _ = DISPATCHER.try_with(|slot| {
+    if let Ok(mut slot) = slot.try_borrow_mut()
+      && let Some(dispatcher) = slot.as_mut()
+      && dispatcher.busy_since.is_none()
+      && matches!(&dispatcher.phase, Phase::Dispatching(_))
+    {
+      dispatcher.busy_since = Some(Instant::now());
+    }
+  });
+}
+
+#[cfg(loom)]
+fn resume_busy() {}
+
 /// Starts an owned turn on this executor thread.
 pub(super) fn enter_turn(turn: DispatchTurn) {
   restore_phase(turn);
+  resume_busy();
 }
 
 /// Ends this thread's owned turn and returns its permit for release under
 /// the scheduler lock.
 pub(super) fn leave_turn() -> Option<DispatchTurn> {
+  pause_busy();
   DISPATCHER
     .try_with(|slot| {
       let mut slot = slot.borrow_mut();
@@ -291,12 +344,15 @@ pub(super) fn leave_turn() -> Option<DispatchTurn> {
 pub(super) struct DispatcherGuard(());
 
 impl DispatcherGuard {
-  pub(super) fn install(shared: &Arc<Shared>) -> Self {
+  pub(super) fn install(shared: &Arc<Shared>, context: AsyncThreadContext) -> Self {
     let replaced = DISPATCHER
       .try_with(|slot| {
         slot.borrow_mut().replace(DispatcherThread {
           shared: Arc::clone(shared),
+          context,
           phase: Phase::Idle,
+          #[cfg(not(loom))]
+          busy_since: None,
         })
       })
       .ok()
@@ -315,6 +371,7 @@ impl Drop for DispatcherGuard {
     if let Some(DispatcherThread {
       shared,
       phase: Phase::Dispatching(turn),
+      ..
     }) = removed
     {
       shared.abandon_turn(turn);

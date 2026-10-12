@@ -57,11 +57,12 @@
 //! scheduling latency. Between deadlines the thread waits on a condition
 //! variable until the earliest deadline or a new earlier registration; it
 //! does not poll. There is no thread per sleep.
-//! [`TimerDriver::new_paused`] instead supplies a [`ManualClock`]: real time
-//! never fires its registrations, and `advance` publishes due outcomes through
-//! fixed batches on the advancing thread. Sleeps, timeouts, intervals and
-//! resets all use that driver's clock. Advancement does not poll executor
-//! tasks or automatically jump to the next deadline when tasks are idle.
+//! [`TimerDriver::new_paused`] supplies a [`ManualClock`]: while its clock
+//! remains paused, real time never fires registrations, and manual advancement
+//! publishes due outcomes through fixed batches on the advancing thread.
+//! Sleeps, timeouts, intervals and resets all use that driver's clock.
+//! Advancement does not poll executor tasks or automatically jump to the next
+//! deadline when tasks are idle.
 //!
 //! # Locks and user code
 //!
@@ -113,8 +114,13 @@ use std::panic::{self, AssertUnwindSafe};
 use std::pin::Pin;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, Weak};
 use std::task::{Context, Poll, Waker};
-use std::thread::{self, JoinHandle, ThreadId};
+use std::thread::{self, JoinHandle, Thread, ThreadId};
 use std::time::{Duration, Instant};
+
+#[cfg(loom)]
+use loom::sync::atomic::{AtomicBool, AtomicU64, Ordering as EpochOrdering};
+#[cfg(not(loom))]
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as EpochOrdering};
 
 use crate::runtime::asynchronous::{poll_cooperative, poll_cooperative_composed};
 use crate::runtime::task::drop_contained;
@@ -122,6 +128,197 @@ use crate::runtime::task::drop_contained;
 /// Registrations taken off the queue per driver lock acquisition, by the
 /// service thread or a close. Their wakers run after the lock is released.
 const BATCH: usize = 64;
+
+/// The clock used by an owning runtime.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ClockMode {
+  /// Time follows the system's monotonic clock. If `Instant` reaches its
+  /// representable boundary, reads freeze at the last representable instant;
+  /// [`TimerHandle::is_clock_saturated`] reports that condition.
+  #[default]
+  Real,
+  /// Time stops until explicitly advanced.
+  PausedManual,
+  /// Time stops and advances to the next live timer when the current-thread
+  /// executor is quiescent.
+  PausedAuto,
+}
+
+/// A monotonically changing epoch that commits idle transitions with a CAS.
+/// If an event starts before the commit, it invalidates the sampled epoch; an
+/// event after the commit is ordered after the virtual-time jump.
+struct IdleEpoch {
+  value: AtomicU64,
+  exhausted: AtomicBool,
+}
+
+impl IdleEpoch {
+  fn new() -> Self {
+    Self {
+      value: AtomicU64::new(0),
+      exhausted: AtomicBool::new(false),
+    }
+  }
+
+  fn snapshot(&self) -> Option<u64> {
+    if self.exhausted.load(EpochOrdering::Acquire) {
+      None
+    } else {
+      Some(self.value.load(EpochOrdering::Acquire))
+    }
+  }
+
+  fn event(&self) {
+    loop {
+      if self.exhausted.load(EpochOrdering::Acquire) {
+        return;
+      }
+      let current = self.value.load(EpochOrdering::Acquire);
+      let Some(next) = current.checked_add(1) else {
+        self.exhausted.store(true, EpochOrdering::Release);
+        return;
+      };
+      if self
+        .value
+        .compare_exchange(current, next, EpochOrdering::AcqRel, EpochOrdering::Acquire)
+        .is_ok()
+      {
+        return;
+      }
+    }
+  }
+
+  fn commit(&self, expected: u64) -> bool {
+    let Some(next) = expected.checked_add(1) else {
+      self.exhausted.store(true, EpochOrdering::Release);
+      return false;
+    };
+    !self.exhausted.load(EpochOrdering::Acquire)
+      && self
+        .value
+        .compare_exchange(
+          expected,
+          next,
+          EpochOrdering::AcqRel,
+          EpochOrdering::Acquire,
+        )
+        .is_ok()
+  }
+}
+
+/// Serializes local-queue and timer changes with a current-thread idle
+/// transition. Events announce themselves before waiting for `transition`,
+/// which lets a racing event invalidate an idle commit without invoking user
+/// code under this lock.
+pub(crate) struct IdleCoordinator {
+  epoch: IdleEpoch,
+  transition: Mutex<()>,
+  owner: Option<Arc<IdleSignal>>,
+}
+
+impl IdleCoordinator {
+  pub(crate) fn new(owner: Option<Arc<IdleSignal>>) -> Arc<Self> {
+    Arc::new(Self {
+      epoch: IdleEpoch::new(),
+      transition: Mutex::new(()),
+      owner,
+    })
+  }
+
+  pub(crate) fn epoch(&self) -> Option<u64> {
+    self.epoch.snapshot()
+  }
+
+  pub(crate) fn changed(&self) -> ChangeGuard<'_> {
+    self.epoch.event();
+    self.unpark_owner();
+    ChangeGuard {
+      coordinator: self,
+      _lock: self
+        .transition
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner),
+    }
+  }
+
+  pub(crate) fn signal(&self) {
+    drop(self.changed());
+  }
+
+  pub(crate) fn quiescent(&self, expected: u64) -> Option<QuiescentGuard<'_>> {
+    let lock = self
+      .transition
+      .lock()
+      .unwrap_or_else(PoisonError::into_inner);
+    if self.epoch.snapshot() != Some(expected) {
+      return None;
+    }
+    Some(QuiescentGuard {
+      coordinator: self,
+      expected,
+      _lock: lock,
+    })
+  }
+
+  fn unpark_owner(&self) {
+    if let Some(owner) = &self.owner {
+      owner.notify();
+    }
+  }
+}
+
+pub(crate) struct IdleSignal {
+  thread: Thread,
+  notified: std::sync::atomic::AtomicBool,
+}
+
+impl IdleSignal {
+  pub(crate) fn new(thread: Thread) -> Arc<Self> {
+    Arc::new(Self {
+      thread,
+      notified: std::sync::atomic::AtomicBool::new(false),
+    })
+  }
+
+  pub(crate) fn notify(&self) {
+    self
+      .notified
+      .store(true, std::sync::atomic::Ordering::Release);
+    self.thread.unpark();
+  }
+
+  pub(crate) fn park(&self) {
+    while !self
+      .notified
+      .swap(false, std::sync::atomic::Ordering::AcqRel)
+    {
+      thread::park();
+    }
+  }
+}
+
+pub(crate) struct ChangeGuard<'a> {
+  coordinator: &'a IdleCoordinator,
+  _lock: MutexGuard<'a, ()>,
+}
+
+impl Drop for ChangeGuard<'_> {
+  fn drop(&mut self) {
+    self.coordinator.unpark_owner();
+  }
+}
+
+pub(crate) struct QuiescentGuard<'a> {
+  coordinator: &'a IdleCoordinator,
+  expected: u64,
+  _lock: MutexGuard<'a, ()>,
+}
+
+impl QuiescentGuard<'_> {
+  fn commit(&self) -> bool {
+    self.coordinator.epoch.commit(self.expected)
+  }
+}
 
 /// Identifies one use of an indexed registration slot. `generation` is a
 /// globally increasing arming id, so a stale sleep cannot remove a reused
@@ -140,6 +337,10 @@ pub enum TimerError {
   /// A zero registration bound or interval period, or a deadline `Instant`
   /// cannot represent.
   Invalid,
+  /// The real monotonic clock reached the representable `Instant` boundary.
+  /// The clock is frozen at its last representable instant and must be
+  /// switched to a paused mode before it can advance again.
+  ClockSaturated,
   /// Every registration is taken (or, never in practice, the 64-bit arming
   /// ids are exhausted).
   Full,
@@ -160,6 +361,7 @@ impl fmt::Display for TimerError {
   fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
     f.write_str(match self {
       Self::Invalid => "invalid timer bound, period or deadline",
+      Self::ClockSaturated => "real timer clock reached the Instant range boundary",
       Self::Full => "timer registration bound reached",
       Self::OutOfMemory => "timer registration storage could not be reserved",
       Self::Closed => "timer driver is closed",
@@ -205,6 +407,8 @@ struct Shared {
   /// Signals the service thread: a new earliest registration, or the close.
   wakeup: Condvar,
   max_registered: usize,
+  coordinator: Arc<IdleCoordinator>,
+  auto_advance_enabled: bool,
 }
 
 /// The registrations, under the driver lock.
@@ -213,13 +417,38 @@ struct State {
   close_complete: bool,
   close_owner: Option<ThreadId>,
   next_id: u64,
-  manual_now: Option<Instant>,
+  mode: ClockMode,
+  base: Instant,
+  unfrozen_since: Option<Instant>,
+  last_now: Instant,
+  real_time_saturated: bool,
+  auto_advance_inhibit: usize,
+  auto_advance_inhibit_overflowed: bool,
   queue: RegistrationQueue,
 }
 
 impl State {
-  fn now(&self) -> Instant {
-    self.manual_now.unwrap_or_else(Instant::now)
+  fn now(&mut self) -> Instant {
+    if self.mode != ClockMode::Real {
+      self.last_now = self.last_now.max(self.base);
+      return self.last_now;
+    }
+    if self.real_time_saturated {
+      return self.last_now;
+    }
+    if let Some(unfrozen_since) = self.unfrozen_since {
+      let elapsed = Instant::now().saturating_duration_since(unfrozen_since);
+      if let Some(now) = self.base.checked_add(elapsed) {
+        self.last_now = self.last_now.max(now);
+      } else {
+        self.real_time_saturated = true;
+        self.base = self.last_now;
+        self.unfrozen_since = None;
+      }
+    } else {
+      self.last_now = self.last_now.max(self.base);
+    }
+    self.last_now
   }
 }
 
@@ -619,10 +848,34 @@ impl Shared {
 
   /// [`Shared::arm`] under both locks, taken in the driver-then-sleep order.
   fn arm_locked(&self, slot: &Arc<Slot>, deadline: Instant) -> Result<Armed, TimerError> {
+    let _changed = self.coordinator.changed();
     let mut state = lock(&self.state);
     let mut armed = lock(&slot.state);
+    let was_saturated = state.real_time_saturated;
     let now = state.now();
+    if !was_saturated && state.real_time_saturated {
+      self.wakeup.notify_all();
+    }
     self.arm(&mut state, slot, &mut armed, deadline, now)
+  }
+
+  fn arm_after_locked(
+    &self,
+    slot: &Arc<Slot>,
+    duration: Duration,
+  ) -> Result<(Instant, Armed), TimerError> {
+    let _changed = self.coordinator.changed();
+    let mut state = lock(&self.state);
+    let mut armed = lock(&slot.state);
+    let was_saturated = state.real_time_saturated;
+    let now = state.now();
+    if !was_saturated && state.real_time_saturated {
+      self.wakeup.notify_all();
+    }
+    let deadline = now.checked_add(duration).ok_or(TimerError::Invalid)?;
+    self
+      .arm(&mut state, slot, &mut armed, deadline, now)
+      .map(|armed| (deadline, armed))
   }
 
   /// Finishes an arming with no lock held.
@@ -697,7 +950,136 @@ impl Shared {
   }
 
   fn now(&self) -> Instant {
-    lock(&self.state).now()
+    let (now, saturated) = {
+      let mut state = lock(&self.state);
+      let was_saturated = state.real_time_saturated;
+      let now = state.now();
+      (now, !was_saturated && state.real_time_saturated)
+    };
+    if saturated {
+      self.coordinator.signal();
+      self.wakeup.notify_all();
+    }
+    now
+  }
+
+  fn set_mode(&self, mode: ClockMode) -> Result<(), TimerError> {
+    if mode == ClockMode::PausedAuto && !self.auto_advance_enabled {
+      return Err(TimerError::Invalid);
+    }
+    let now;
+    {
+      let _changed = self.coordinator.changed();
+      let mut state = lock(&self.state);
+      if state.closed {
+        return Err(TimerError::Closed);
+      }
+      if mode == ClockMode::Real && state.real_time_saturated {
+        return Err(TimerError::ClockSaturated);
+      }
+      if state.mode == mode && !state.real_time_saturated {
+        return Ok(());
+      }
+      now = state.now();
+      if mode == ClockMode::Real && state.real_time_saturated {
+        return Err(TimerError::ClockSaturated);
+      }
+      match mode {
+        ClockMode::Real => {
+          state.base = now;
+          state.last_now = now;
+          state.unfrozen_since = Some(Instant::now());
+        }
+        ClockMode::PausedManual | ClockMode::PausedAuto => {
+          state.base = now;
+          state.last_now = now;
+          state.unfrozen_since = None;
+        }
+      }
+      state.mode = mode;
+    }
+    self.wakeup.notify_all();
+    if mode != ClockMode::Real {
+      self.publish_due(now);
+    }
+    Ok(())
+  }
+
+  fn advance_paused(&self, duration: Duration) -> Result<Instant, TimerError> {
+    let target;
+    {
+      let _changed = self.coordinator.changed();
+      let mut state = lock(&self.state);
+      if state.closed {
+        return Err(TimerError::Closed);
+      }
+      let saturated_real = state.mode == ClockMode::Real && state.real_time_saturated;
+      if !saturated_real && !matches!(state.mode, ClockMode::PausedManual | ClockMode::PausedAuto) {
+        return Err(TimerError::Invalid);
+      }
+      let base = if saturated_real {
+        state.last_now
+      } else {
+        state.base
+      };
+      target = base.checked_add(duration).ok_or(TimerError::Invalid)?;
+      if saturated_real {
+        state.mode = ClockMode::PausedManual;
+        state.unfrozen_since = None;
+      }
+      state.base = target;
+      state.last_now = target;
+    }
+    self.publish_due(target);
+    Ok(target)
+  }
+
+  fn publish_due(&self, target: Instant) {
+    let mut batch = FiredBatch::new();
+    loop {
+      {
+        let mut state = lock(&self.state);
+        if state.closed {
+          break;
+        }
+        take_due(&mut state, Some(target), Ok(()), &mut batch);
+      }
+      if batch.is_empty() {
+        break;
+      }
+      complete(&mut batch);
+    }
+  }
+
+  fn auto_advance_if_idle(
+    &self,
+    quiescent: QuiescentGuard<'_>,
+    blocking_inhibited: bool,
+  ) -> AutoAdvance {
+    let mut state = lock(&self.state);
+    if state.closed || state.mode != ClockMode::PausedAuto {
+      return AutoAdvance::Inactive;
+    }
+    if blocking_inhibited
+      || state.auto_advance_inhibit != 0
+      || state.auto_advance_inhibit_overflowed
+    {
+      return AutoAdvance::Inhibited;
+    }
+    let Some(deadline) = state.queue.first_deadline() else {
+      return AutoAdvance::NoDeadline;
+    };
+    if !quiescent.commit() {
+      return AutoAdvance::Raced;
+    }
+    let now = state.now();
+    let target = deadline.max(now);
+    state.base = target;
+    state.last_now = target;
+    drop(state);
+    drop(quiescent);
+    self.publish_due(target);
+    AutoAdvance::Advanced
   }
 
   fn is_closed(&self) -> bool {
@@ -706,6 +1088,35 @@ impl Shared {
 
   fn close_complete(&self) -> bool {
     lock(&self.state).close_complete
+  }
+}
+
+#[derive(Debug)]
+pub(crate) enum AutoAdvance {
+  Inactive,
+  Inhibited,
+  NoDeadline,
+  Raced,
+  Advanced,
+}
+
+#[must_use = "keep this guard alive while associated work is pending"]
+pub struct AutoAdvanceInhibitGuard {
+  shared: Arc<Shared>,
+  active: bool,
+}
+
+impl Drop for AutoAdvanceInhibitGuard {
+  fn drop(&mut self) {
+    if !self.active {
+      return;
+    }
+    let _changed = self.shared.coordinator.changed();
+    let mut state = lock(&self.shared.state);
+    if !state.auto_advance_inhibit_overflowed {
+      debug_assert!(state.auto_advance_inhibit > 0);
+      state.auto_advance_inhibit = state.auto_advance_inhibit.saturating_sub(1);
+    }
   }
 }
 
@@ -769,11 +1180,44 @@ fn drive(shared: &Shared) {
   // Declared last, so released before `_close` takes the lock again.
   let mut state = lock(&shared.state);
   while !state.closed {
-    if state.manual_now.is_some() {
+    if state.mode != ClockMode::Real {
       state = wait(&shared.wakeup, state, None);
       continue;
     }
+    if state.real_time_saturated {
+      let now = state.last_now;
+      let due = state
+        .queue
+        .first_deadline()
+        .is_some_and(|deadline| deadline <= now);
+      if due {
+        take_due(&mut state, Some(now), Ok(()), &mut batch);
+        drop(state);
+        complete(&mut batch);
+        state = lock(&shared.state);
+      } else {
+        state = wait(&shared.wakeup, state, None);
+      }
+      continue;
+    }
     let now = state.now();
+    if state.real_time_saturated {
+      let due = state
+        .queue
+        .first_deadline()
+        .is_some_and(|deadline| deadline <= now);
+      if due {
+        take_due(&mut state, Some(now), Ok(()), &mut batch);
+      }
+      drop(state);
+      shared.coordinator.signal();
+      shared.wakeup.notify_all();
+      if due {
+        complete(&mut batch);
+      }
+      state = lock(&shared.state);
+      continue;
+    }
     let earliest = state.queue.first_deadline();
     match earliest {
       None => state = wait(&shared.wakeup, state, None),
@@ -810,36 +1254,73 @@ impl TimerDriver {
   /// registration storage cannot be reserved, and `Spawn` when the thread
   /// cannot be started.
   pub fn new(max_registered: usize) -> Result<Self, TimerError> {
-    Self::build(max_registered, None)
+    Self::build(
+      max_registered,
+      ClockMode::Real,
+      false,
+      IdleCoordinator::new(None),
+    )
   }
 
-  /// Creates a driver whose clock advances only through [`ManualClock::advance`].
-  /// The clock starts at construction's `Instant`; use [`TimerHandle::now`]
-  /// for deadlines. Advancing publishes due outcomes synchronously, without
-  /// automatically driving an executor or jumping time when tasks are idle.
+  /// Creates a driver whose clock starts paused and has no idle auto-advance.
+  /// It starts at construction's `Instant`; use [`TimerHandle::now`] for
+  /// deadlines. [`ManualClock::advance`] or [`TimerHandle::advance`] publishes
+  /// due outcomes synchronously. This standalone driver can be resumed to
+  /// real time, but cannot select `PausedAuto`.
   pub fn new_paused(max_registered: usize) -> Result<(Self, ManualClock), TimerError> {
-    let driver = Self::build(max_registered, Some(Instant::now()))?;
+    let driver = Self::build(
+      max_registered,
+      ClockMode::PausedManual,
+      false,
+      IdleCoordinator::new(None),
+    )?;
     let clock = ManualClock {
       shared: Arc::clone(&driver.shared),
     };
     Ok((driver, clock))
   }
 
-  fn build(max_registered: usize, manual_now: Option<Instant>) -> Result<Self, TimerError> {
+  pub(crate) fn new_for_runtime(
+    max_registered: usize,
+    mode: ClockMode,
+    auto_advance_enabled: bool,
+    coordinator: Arc<IdleCoordinator>,
+  ) -> Result<Self, TimerError> {
+    Self::build(max_registered, mode, auto_advance_enabled, coordinator)
+  }
+
+  fn build(
+    max_registered: usize,
+    mode: ClockMode,
+    auto_advance_enabled: bool,
+    coordinator: Arc<IdleCoordinator>,
+  ) -> Result<Self, TimerError> {
     if max_registered == 0 {
       return Err(TimerError::Invalid);
     }
+    if mode == ClockMode::PausedAuto && !auto_advance_enabled {
+      return Err(TimerError::Invalid);
+    }
+    let base = Instant::now();
     let shared = Arc::new(Shared {
       state: Mutex::new(State {
         closed: false,
         close_complete: false,
         close_owner: None,
         next_id: 0,
-        manual_now,
+        mode,
+        base,
+        unfrozen_since: (mode == ClockMode::Real).then_some(base),
+        last_now: base,
+        real_time_saturated: false,
+        auto_advance_inhibit: 0,
+        auto_advance_inhibit_overflowed: false,
         queue: RegistrationQueue::new(max_registered)?,
       }),
       wakeup: Condvar::new(),
       max_registered,
+      coordinator,
+      auto_advance_enabled,
     });
     let mut panic_payloads = Vec::new();
     panic_payloads
@@ -978,15 +1459,17 @@ impl TimerDriver {
   }
 }
 
-/// A monotonic manual clock belonging to exactly one paused driver.
-/// Clones share the same clock and do not keep the driver open.
+/// The low-level manual-advance handle returned by
+/// [`TimerDriver::new_paused`]. Clones share the clock and do not keep the
+/// driver open; `advance` works only while the driver is paused.
 #[derive(Clone)]
 pub struct ManualClock {
   shared: Arc<Shared>,
 }
 
 impl ManualClock {
-  /// This driver's current time, unchanged by real elapsed time.
+  /// This driver's current virtual monotonic instant. It stays fixed while
+  /// the clock is paused.
   #[must_use]
   pub fn now(&self) -> Instant {
     self.shared.now()
@@ -1001,33 +1484,11 @@ impl ManualClock {
   /// be running. A concurrent driver close may resolve sleeps with `Closed`.
   /// `Invalid` (overflow) and a close observed before this update leave the
   /// clock unchanged. This neither polls tasks nor automatically advances idle
-  /// time, and the real-clock driver cannot be paused after construction.
+  /// time. `ManualClock` remains the low-level handle returned by
+  /// [`TimerDriver::new_paused`]; a runtime-owned timer may also change modes
+  /// through [`TimerHandle::set_mode`].
   pub fn advance(&self, duration: Duration) -> Result<Instant, TimerError> {
-    let target = {
-      let mut state = lock(&self.shared.state);
-      if state.closed {
-        return Err(TimerError::Closed);
-      }
-      let now = state.manual_now.ok_or(TimerError::Invalid)?;
-      let target = now.checked_add(duration).ok_or(TimerError::Invalid)?;
-      state.manual_now = Some(target);
-      target
-    };
-    let mut batch = FiredBatch::new();
-    loop {
-      {
-        let mut state = lock(&self.shared.state);
-        if state.closed {
-          break;
-        }
-        take_due(&mut state, Some(target), Ok(()), &mut batch);
-      }
-      if batch.is_empty() {
-        break;
-      }
-      complete(&mut batch);
-    }
-    Ok(target)
+    self.shared.advance_paused(duration)
   }
 }
 
@@ -1071,10 +1532,86 @@ pub struct TimerHandle {
 }
 
 impl TimerHandle {
-  /// This driver's clock: real monotonic time, or its controlled paused time.
+  /// This driver's clock: real monotonic time or its controlled paused time.
+  /// After real-time saturation this returns the last representable instant.
   #[must_use]
   pub fn now(&self) -> Instant {
     self.shared.now()
+  }
+
+  /// The current mode of this driver's clock.
+  #[must_use]
+  pub fn mode(&self) -> ClockMode {
+    let state = lock(&self.shared.state);
+    if state.mode == ClockMode::Real && state.real_time_saturated {
+      ClockMode::PausedManual
+    } else {
+      state.mode
+    }
+  }
+
+  /// Whether real monotonic time exceeded the representable `Instant` range.
+  /// When saturated, `now` remains at its last representable instant, the
+  /// reported mode is `PausedManual`, and the clock can be advanced manually
+  /// or switched to paused-auto where supported.
+  #[must_use]
+  pub fn is_clock_saturated(&self) -> bool {
+    lock(&self.shared.state).real_time_saturated
+  }
+
+  /// Changes the clock mode while preserving its virtual monotonic position.
+  /// Switching to `PausedAuto` is available only on a current-thread runtime
+  /// that owns this timer; standalone drivers retain manual-only behavior.
+  /// Timers already due at the pause instant are published after all locks
+  /// are released.
+  ///
+  /// # Errors
+  ///
+  /// `Closed` when the driver has shut down, `Invalid` when paused-auto is not
+  /// enabled for this driver, or `ClockSaturated` when real mode is requested
+  /// after the `Instant` range is exhausted.
+  pub fn set_mode(&self, mode: ClockMode) -> Result<(), TimerError> {
+    self.shared.set_mode(mode)
+  }
+
+  /// Pauses the clock without enabling idle auto-advance.
+  pub fn pause(&self) -> Result<(), TimerError> {
+    self.set_mode(ClockMode::PausedManual)
+  }
+
+  /// Resumes real monotonic time from the current virtual instant.
+  /// Returns [`TimerError::ClockSaturated`] if the real-time source already
+  /// exhausted the representable `Instant` range.
+  pub fn resume(&self) -> Result<(), TimerError> {
+    self.set_mode(ClockMode::Real)
+  }
+
+  /// Advances a paused clock and publishes due timers after releasing locks.
+  /// The clock and arming/reset operations share one serialized update.
+  pub fn advance(&self, duration: Duration) -> Result<Instant, TimerError> {
+    self.shared.advance_paused(duration)
+  }
+
+  /// Inhibits paused-auto advancement until this guard is dropped. Acquire it
+  /// before admitting work whose completion is associated with real time,
+  /// such as a blocking operation. The executor also tracks jobs admitted
+  /// through its owned blocking facade automatically.
+  pub fn inhibit_auto_advance(&self) -> AutoAdvanceInhibitGuard {
+    let _changed = self.shared.coordinator.changed();
+    let active = {
+      let mut state = lock(&self.shared.state);
+      if let Some(next) = state.auto_advance_inhibit.checked_add(1) {
+        state.auto_advance_inhibit = next;
+        true
+      } else {
+        state.auto_advance_inhibit_overflowed = true;
+        false
+      }
+    };
+    AutoAdvanceInhibitGuard {
+      shared: Arc::clone(&self.shared),
+      active,
+    }
   }
   /// A sleep that completes `duration` from now.
   ///
@@ -1083,11 +1620,20 @@ impl TimerHandle {
   /// As [`TimerHandle::sleep_until`], and `Invalid` when the deadline
   /// cannot be represented.
   pub fn sleep(&self, duration: Duration) -> Result<Sleep, TimerError> {
-    let deadline = self
-      .now()
-      .checked_add(duration)
-      .ok_or(TimerError::Invalid)?;
-    self.sleep_until(deadline)
+    let slot = Arc::new(Slot {
+      state: Mutex::new(SlotState {
+        key: None,
+        outcome: None,
+        waker: None,
+      }),
+    });
+    let (deadline, armed) = self.shared.arm_after_locked(&slot, duration)?;
+    self.shared.finish(armed);
+    Ok(Sleep {
+      shared: Arc::clone(&self.shared),
+      slot,
+      deadline,
+    })
   }
 
   /// A sleep that completes at `deadline`: registered when the deadline is
@@ -1156,7 +1702,20 @@ impl TimerHandle {
     period: Duration,
     missed: MissedTickBehavior,
   ) -> Result<Interval, TimerError> {
-    self.interval_at(self.now(), period, missed)
+    if period.is_zero() {
+      return Err(TimerError::Invalid);
+    }
+    let sleep = self.sleep(Duration::ZERO)?;
+    let start = sleep.deadline();
+    if start.checked_add(period).is_none() {
+      return Err(TimerError::Invalid);
+    }
+    Ok(Interval {
+      sleep,
+      next: start,
+      period,
+      missed,
+    })
   }
 
   /// An interval whose first tick is at `start` and which then ticks every
@@ -1201,6 +1760,20 @@ impl TimerHandle {
   #[must_use]
   pub fn is_closed(&self) -> bool {
     self.shared.is_closed()
+  }
+
+  pub(crate) fn coordinator(&self) -> &Arc<IdleCoordinator> {
+    &self.shared.coordinator
+  }
+
+  pub(crate) fn auto_advance_if_idle(
+    &self,
+    quiescent: QuiescentGuard<'_>,
+    blocking_inhibited: bool,
+  ) -> AutoAdvance {
+    self
+      .shared
+      .auto_advance_if_idle(quiescent, blocking_inhibited)
   }
 }
 
@@ -1259,6 +1832,16 @@ impl Sleep {
     Ok(())
   }
 
+  /// Re-arms this sleep for `duration` from the clock instant serialized
+  /// with the reset. On overflow or close the sleep and its registration are
+  /// unchanged.
+  pub fn reset_after(&mut self, duration: Duration) -> Result<(), TimerError> {
+    let (deadline, armed) = self.shared.arm_after_locked(&self.slot, duration)?;
+    self.deadline = deadline;
+    self.shared.finish(armed);
+    Ok(())
+  }
+
   fn poll_inner(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), TimerError>> {
     let slot = &self.slot;
     {
@@ -1296,15 +1879,18 @@ impl Drop for Sleep {
     // `key` is set only behind `&mut self`, so once it reads unset it stays
     // unset and the driver lock is not needed.
     let registered = lock(&self.slot.state).key.is_some();
-    let waker = if registered {
-      let mut state = lock(&self.shared.state);
-      let mut armed = lock(&self.slot.state);
-      if let Some(key) = armed.key.take() {
-        let _ = state.queue.remove(key);
+    let waker = {
+      let _changed = self.shared.coordinator.changed();
+      if registered {
+        let mut state = lock(&self.shared.state);
+        let mut armed = lock(&self.slot.state);
+        if let Some(key) = armed.key.take() {
+          let _ = state.queue.remove(key);
+        }
+        armed.waker.take()
+      } else {
+        lock(&self.slot.state).waker.take()
       }
-      armed.waker.take()
-    } else {
-      lock(&self.slot.state).waker.take()
     };
     drop_contained(waker);
   }
@@ -1468,19 +2054,15 @@ impl Interval {
   /// Resets the next tick to `duration` from now, preserving the period and
   /// ignoring the missed-tick behavior. On error the interval is unchanged.
   pub fn reset_after(&mut self, duration: Duration) -> Result<(), TimerError> {
-    let deadline = self
-      .sleep
-      .shared
-      .now()
-      .checked_add(duration)
-      .ok_or(TimerError::Invalid)?;
-    self.reset_at(deadline)
+    self.sleep.reset_after(duration)?;
+    self.next = self.sleep.deadline;
+    Ok(())
   }
 
   /// Resets the next tick to now, so the next [`Interval::tick`] is ready
   /// immediately. This ignores the missed-tick behavior.
   pub fn reset_immediately(&mut self) -> Result<(), TimerError> {
-    self.reset_at(self.sleep.shared.now())
+    self.reset_after(Duration::ZERO)
   }
 
   /// Selects what happens when a tick is observed more than five
@@ -1572,7 +2154,20 @@ mod loom_tests {
   use loom::sync::{Arc, Mutex};
   use loom::thread;
 
-  use super::{Key, RegistrationQueue, SlotState, TimerError};
+  use super::{IdleEpoch, Key, RegistrationQueue, SlotState, TimerError};
+
+  #[test]
+  fn loom_idle_event_and_advance_commit_have_one_order() {
+    loom::model(|| {
+      let epoch = Arc::new(IdleEpoch::new());
+      let expected = epoch.snapshot().unwrap();
+      let racing = Arc::clone(&epoch);
+      let event = thread::spawn(move || racing.event());
+      let committed = epoch.commit(expected);
+      event.join().unwrap();
+      assert_eq!(epoch.snapshot(), Some(if committed { 2 } else { 1 }));
+    });
+  }
 
   struct WakeCounter(StdArc<AtomicUsize>);
 
@@ -1718,7 +2313,9 @@ mod tests {
   use std::thread::{self, Thread};
   use std::time::{Duration, Instant};
 
-  use super::{BATCH, TimerDriver, TimerError, TimerHandle, lock};
+  use super::{
+    AutoAdvance, BATCH, ClockMode, IdleCoordinator, TimerDriver, TimerError, TimerHandle, lock,
+  };
   use super::{Interval, MISSED_TICK_TOLERANCE, MissedTickBehavior, Sleep, Timeout, TimeoutError};
 
   #[test]
@@ -1740,6 +2337,215 @@ mod tests {
     assert_eq!(poll_with(&mut sleep, Waker::noop()), Poll::Ready(Ok(())));
     assert_eq!(woken.wakes(), 1);
     assert_eq!(handle.registered(), 0);
+    driver.shutdown().unwrap();
+  }
+
+  #[test]
+  fn dynamic_pause_resume_and_manual_advance_preserve_virtual_continuity() {
+    let driver = TimerDriver::new(2).unwrap();
+    let handle = driver.handle();
+    let start = handle.now();
+    thread::sleep(4 * MS);
+    handle.pause().unwrap();
+    let paused = handle.now();
+    assert!(paused >= start + 2 * MS);
+    thread::sleep(4 * MS);
+    assert_eq!(handle.now(), paused);
+    assert_eq!(handle.advance(2 * MS).unwrap(), paused + 2 * MS);
+    handle.resume().unwrap();
+    let resumed = handle.now();
+    thread::sleep(4 * MS);
+    assert!(handle.now() >= resumed + 2 * MS);
+    handle.pause().unwrap();
+    assert_eq!(handle.mode(), ClockMode::PausedManual);
+    driver.shutdown().unwrap();
+  }
+
+  fn largest_representable_offset(start: Instant) -> Duration {
+    let mut low = 0u128;
+    let mut high = Duration::MAX.as_nanos();
+    while low < high {
+      let span = high - low;
+      let middle = low + span / 2 + span % 2;
+      let offset = super::duration_from_nanos(middle).unwrap();
+      if start.checked_add(offset).is_some() {
+        low = middle;
+      } else {
+        high = middle - 1;
+      }
+    }
+    super::duration_from_nanos(low).unwrap()
+  }
+
+  #[test]
+  fn real_clock_saturation_freezes_at_last_instant_without_poisoning_state() {
+    let (driver, manual) = TimerDriver::new_paused(1).unwrap();
+    let handle = driver.handle();
+    let start = manual.now();
+    let largest = largest_representable_offset(start);
+    assert!(largest > MS);
+    let terminal = start.checked_add(largest).unwrap();
+    assert_eq!(manual.advance(largest).unwrap(), terminal);
+
+    handle.resume().unwrap();
+    thread::sleep(5 * MS);
+    let frozen = handle.now();
+    assert!(handle.is_clock_saturated());
+    assert_eq!(handle.mode(), ClockMode::PausedManual);
+    assert_eq!(frozen, terminal);
+    assert_eq!(handle.now(), frozen);
+    assert_eq!(handle.resume(), Err(TimerError::ClockSaturated));
+    assert_eq!(handle.sleep(MS).map(drop), Err(TimerError::Invalid));
+    assert_eq!(handle.registered(), 0);
+
+    let mut immediate = handle.sleep_until(frozen).unwrap();
+    assert_eq!(
+      poll_with(&mut immediate, Waker::noop()),
+      Poll::Ready(Ok(()))
+    );
+    driver.shutdown().unwrap();
+  }
+
+  #[test]
+  fn standalone_paused_driver_remains_manual_only() {
+    let (driver, clock) = TimerDriver::new_paused(1).unwrap();
+    let before = clock.now();
+    assert_eq!(
+      driver.handle().set_mode(ClockMode::PausedAuto),
+      Err(TimerError::Invalid)
+    );
+    assert_eq!(clock.now(), before);
+    assert_eq!(driver.handle().mode(), ClockMode::PausedManual);
+    driver.shutdown().unwrap();
+  }
+
+  #[test]
+  fn auto_advance_uses_the_live_reset_deadline_and_ignores_cancelled_sleeps() {
+    let coordinator = IdleCoordinator::new(None);
+    let driver =
+      TimerDriver::new_for_runtime(2, ClockMode::PausedAuto, true, Arc::clone(&coordinator))
+        .unwrap();
+    let handle = driver.handle();
+    let start = handle.now();
+    let mut sleep = handle.sleep(HOUR).unwrap();
+    sleep.reset(start + 2 * HOUR).unwrap();
+
+    let epoch = coordinator.epoch().unwrap();
+    let quiescent = coordinator.quiescent(epoch).unwrap();
+    assert!(matches!(
+      handle.auto_advance_if_idle(quiescent, false),
+      AutoAdvance::Advanced
+    ));
+    assert_eq!(handle.now(), start + 2 * HOUR);
+    assert!(sleep.is_elapsed());
+
+    drop(sleep);
+    let canceled = handle.sleep(HOUR).unwrap();
+    drop(canceled);
+    let before = handle.now();
+    let epoch = coordinator.epoch().unwrap();
+    let quiescent = coordinator.quiescent(epoch).unwrap();
+    assert!(matches!(
+      handle.auto_advance_if_idle(quiescent, false),
+      AutoAdvance::NoDeadline
+    ));
+    assert_eq!(handle.now(), before);
+    driver.shutdown().unwrap();
+  }
+
+  #[test]
+  fn a_timer_reset_announced_during_idle_invalidates_the_auto_advance_commit() {
+    let coordinator = IdleCoordinator::new(None);
+    let driver =
+      TimerDriver::new_for_runtime(1, ClockMode::PausedAuto, true, Arc::clone(&coordinator))
+        .unwrap();
+    let handle = driver.handle();
+    let start = handle.now();
+    let sleep = handle.sleep(HOUR).unwrap();
+    let expected = coordinator.epoch().unwrap();
+    let quiescent = coordinator.quiescent(expected).unwrap();
+    let (reset_tx, reset_rx) = mpsc::sync_channel(1);
+    let reset = thread::spawn(move || {
+      let mut sleep = sleep;
+      sleep.reset(start + 2 * HOUR).unwrap();
+      let _ = reset_tx.send(sleep);
+    });
+
+    let deadline = Instant::now() + WATCHDOG;
+    while coordinator.epoch() == Some(expected) {
+      assert!(Instant::now() < deadline, "timer reset was not announced");
+      thread::yield_now();
+    }
+    assert!(!quiescent.commit());
+    drop(quiescent);
+    reset
+      .join()
+      .unwrap_or_else(|_| panic!("timer reset thread panicked"));
+    let sleep = reset_rx
+      .recv_timeout(WATCHDOG)
+      .unwrap_or_else(|error| panic!("timer reset did not finish: {error}"));
+    assert_eq!(sleep.deadline(), start + 2 * HOUR);
+    assert_eq!(handle.now(), start);
+    drop(sleep);
+    driver.shutdown().unwrap();
+  }
+
+  #[test]
+  fn explicit_associated_work_guard_inhibits_auto_advance_until_drop() {
+    let coordinator = IdleCoordinator::new(None);
+    let driver =
+      TimerDriver::new_for_runtime(1, ClockMode::PausedAuto, true, Arc::clone(&coordinator))
+        .unwrap();
+    let handle = driver.handle();
+    let start = handle.now();
+    let sleep = handle.sleep(HOUR).unwrap();
+    let inhibit = handle.inhibit_auto_advance();
+    let epoch = coordinator.epoch().unwrap();
+    let quiescent = coordinator.quiescent(epoch).unwrap();
+    assert!(matches!(
+      handle.auto_advance_if_idle(quiescent, false),
+      AutoAdvance::Inhibited
+    ));
+    assert_eq!(handle.now(), start);
+
+    drop(inhibit);
+    let epoch = coordinator.epoch().unwrap();
+    let quiescent = coordinator.quiescent(epoch).unwrap();
+    assert!(matches!(
+      handle.auto_advance_if_idle(quiescent, false),
+      AutoAdvance::Advanced
+    ));
+    assert!(sleep.is_elapsed());
+    driver.shutdown().unwrap();
+  }
+
+  struct AdvanceAgain(TimerHandle);
+
+  impl Wake for AdvanceAgain {
+    fn wake(self: Arc<Self>) {
+      self.0.advance(MS).unwrap();
+    }
+  }
+
+  #[test]
+  fn automatic_advance_runs_wakers_outside_clock_locks() {
+    let coordinator = IdleCoordinator::new(None);
+    let driver =
+      TimerDriver::new_for_runtime(1, ClockMode::PausedAuto, true, Arc::clone(&coordinator))
+        .unwrap();
+    let handle = driver.handle();
+    let start = handle.now();
+    let mut sleep = handle.sleep(MS).unwrap();
+    let waker = Waker::from(Arc::new(AdvanceAgain(handle.clone())));
+    assert!(poll_with(&mut sleep, &waker).is_pending());
+    let epoch = coordinator.epoch().unwrap();
+    let quiescent = coordinator.quiescent(epoch).unwrap();
+    assert!(matches!(
+      handle.auto_advance_if_idle(quiescent, false),
+      AutoAdvance::Advanced
+    ));
+    assert_eq!(handle.now(), start + 2 * MS);
+    assert_eq!(poll_with(&mut sleep, Waker::noop()), Poll::Ready(Ok(())));
     driver.shutdown().unwrap();
   }
 
@@ -1801,6 +2607,41 @@ mod tests {
       sleeps.push(sleep);
     }
     clock.advance(MS).unwrap();
+    assert_eq!(*lock(&log), (0..129).collect::<Vec<_>>());
+    assert_eq!(handle.registered(), 0);
+    assert!(
+      sleeps
+        .iter_mut()
+        .all(|sleep| poll_with(sleep, Waker::noop()) == Poll::Ready(Ok(())))
+    );
+    driver.shutdown().unwrap();
+  }
+
+  #[test]
+  fn auto_advance_publishes_equal_deadlines_in_arming_order_across_batches() {
+    let coordinator = IdleCoordinator::new(None);
+    let driver =
+      TimerDriver::new_for_runtime(129, ClockMode::PausedAuto, true, Arc::clone(&coordinator))
+        .unwrap();
+    let handle = driver.handle();
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let mut sleeps = Vec::new();
+    for id in 0..129 {
+      let mut sleep = handle.sleep(MS).unwrap();
+      let waker = Waker::from(Arc::new(ManualOrder {
+        id,
+        log: Arc::clone(&log),
+      }));
+      assert!(poll_with(&mut sleep, &waker).is_pending());
+      sleeps.push(sleep);
+    }
+
+    let epoch = coordinator.epoch().unwrap();
+    let quiescent = coordinator.quiescent(epoch).unwrap();
+    assert!(matches!(
+      handle.auto_advance_if_idle(quiescent, false),
+      AutoAdvance::Advanced
+    ));
     assert_eq!(*lock(&log), (0..129).collect::<Vec<_>>());
     assert_eq!(handle.registered(), 0);
     assert!(

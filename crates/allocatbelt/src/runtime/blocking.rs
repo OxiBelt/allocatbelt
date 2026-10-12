@@ -13,6 +13,7 @@ use crate::runtime::job::{CancellationToken, Job};
 use crate::runtime::resources::Resources;
 use crate::runtime::scheduler::{Entry, Shared, Snapshot};
 use crate::runtime::task::drop_contained;
+use crate::runtime::time::TimerHandle;
 use crate::runtime::worker;
 
 /// A runtime's size and bounds.
@@ -89,6 +90,13 @@ impl Runtime {
   /// `u64::MAX - 2` runtimes, rather than reuse an id.
   pub fn new(config: Config) -> io::Result<Self> {
     Self::with_spawner(config, |builder, f| builder.spawn(f), |_| {})
+  }
+
+  /// Associates facade-owned blocking admissions with a paused-auto clock.
+  /// The facade calls this before exposing any blocking handle. Low-level
+  /// runtimes created with [`Runtime::new`] remain unassociated.
+  pub(crate) fn bind_clock(&mut self, timer: TimerHandle) {
+    self.shared.bind_clock(timer);
   }
 
   /// [`Runtime::new`] with the thread spawn replaceable and the shared

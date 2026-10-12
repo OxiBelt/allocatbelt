@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use crate::runtime::error::JoinError;
 use crate::runtime::job::{CancellationToken, Control, Packet};
+use crate::runtime::time::AutoAdvanceInhibitGuard;
 
 /// Returns a job's admission. The worker calls it again after the job if
 /// the job did not, so it releases exactly once.
@@ -33,11 +34,22 @@ pub(crate) struct Task<F, T> {
   pub(crate) f: F,
   control: Arc<Control>,
   packet: Arc<Packet<T>>,
+  auto_advance_inhibit: Option<AutoAdvanceInhibitGuard>,
 }
 
 impl<F, T> Task<F, T> {
-  pub(crate) fn new(f: F, control: Arc<Control>, packet: Arc<Packet<T>>) -> Self {
-    Self { f, control, packet }
+  pub(crate) fn new(
+    f: F,
+    control: Arc<Control>,
+    packet: Arc<Packet<T>>,
+    auto_advance_inhibit: Option<AutoAdvanceInhibitGuard>,
+  ) -> Self {
+    Self {
+      f,
+      control,
+      packet,
+      auto_advance_inhibit,
+    }
   }
 }
 
@@ -61,7 +73,13 @@ where
   }
 
   fn run(self: Box<Self>, release: &mut dyn Release) {
-    let Self { f, control, packet } = *self;
+    let Self {
+      f,
+      control,
+      packet,
+      auto_advance_inhibit,
+    } = *self;
+    let _auto_advance_inhibit = auto_advance_inhibit;
     let token = CancellationToken::new(control);
     let outcome =
       panic::catch_unwind(AssertUnwindSafe(move || f(token))).map_err(JoinError::Panicked);
@@ -72,7 +90,13 @@ where
   }
 
   fn abandon(self: Box<Self>, release: &mut dyn Release) {
-    let Self { f, control, packet } = *self;
+    let Self {
+      f,
+      control,
+      packet,
+      auto_advance_inhibit,
+    } = *self;
+    let _auto_advance_inhibit = auto_advance_inhibit;
     // A shutdown's take: the job may never start, whatever won before.
     let _ = control.start.try_cancel();
     drop_contained(f);

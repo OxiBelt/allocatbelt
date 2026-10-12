@@ -5,7 +5,7 @@
 use std::collections::VecDeque;
 use std::future::Future;
 use std::panic::{self, AssertUnwindSafe};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, Weak};
 use std::task::{Context, Wake, Waker};
 
@@ -13,8 +13,10 @@ use super::handoff;
 use super::handoff_protocol::{DispatchTurn, HandoffLoan, HelperLease, TurnCoordinator};
 use super::identity;
 use super::join::AsyncJob;
+use super::metrics::RuntimeMetrics;
 use super::protocol::{PollFinish, PollProtocol, PollQuota, ScopeProtocol};
 use super::task::{ErasedTask, PollResult, Task};
+use super::thread_options::{AsyncThreadContext, AsyncThreadOptions};
 use super::{AsyncConfig, AsyncError, AsyncSpawnError};
 use crate::runtime::cache;
 use crate::runtime::managed::ResourceScope;
@@ -65,6 +67,8 @@ struct State {
 pub(super) struct Shared {
   id: u64,
   max_handoffs: usize,
+  pub(super) metrics: RuntimeMetrics,
+  thread_options: AsyncThreadOptions,
   state: Mutex<State>,
   work: Condvar,
   /// Inactive helpers and restoring threads wait here; `work` waiters are
@@ -127,6 +131,8 @@ impl Shared {
     config: AsyncConfig,
     max_handoffs: usize,
     resources: Option<ResourceScope>,
+    thread_options: AsyncThreadOptions,
+    metrics: RuntimeMetrics,
   ) -> Result<(Arc<Self>, ScopeRef), AsyncError> {
     let mut tasks = Vec::new();
     tasks
@@ -178,6 +184,8 @@ impl Shared {
       Arc::new(Self {
         id,
         max_handoffs,
+        metrics,
+        thread_options,
         state: Mutex::new(State {
           closed: false,
           cancel_all: false,
@@ -197,6 +205,60 @@ impl Shared {
 
   fn lock(&self) -> MutexGuard<'_, State> {
     self.state.lock().unwrap_or_else(PoisonError::into_inner)
+  }
+
+  fn invoke_hook(
+    &self,
+    hook: Option<&Arc<dyn Fn(AsyncThreadContext) + Send + Sync>>,
+    context: AsyncThreadContext,
+  ) {
+    if let Some(hook) = hook
+      && let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| hook(context)))
+    {
+      self
+        .metrics
+        .inner()
+        .hook_panics
+        .fetch_add(1, Ordering::Relaxed);
+      super::task::drop_contained(payload);
+    }
+  }
+
+  fn thread_started(&self, context: AsyncThreadContext) {
+    if let Some(metrics) = self.metrics.inner().thread(context.physical_index) {
+      metrics.alive.store(true, Ordering::Relaxed);
+      metrics.starts.fetch_add(1, Ordering::Relaxed);
+    }
+    self.invoke_hook(self.thread_options.start_hook(), context);
+  }
+
+  fn thread_stopped(&self, context: AsyncThreadContext) {
+    self.invoke_hook(self.thread_options.stop_hook(), context);
+    if let Some(metrics) = self.metrics.inner().thread(context.physical_index) {
+      metrics.stops.fetch_add(1, Ordering::Relaxed);
+      metrics.alive.store(false, Ordering::Relaxed);
+    }
+  }
+
+  fn thread_park_attempted(&self, context: AsyncThreadContext) {
+    self.invoke_hook(self.thread_options.park_hook(), context);
+  }
+
+  fn thread_parked(&self, context: AsyncThreadContext) {
+    if let Some(metrics) = self.metrics.inner().thread(context.physical_index) {
+      metrics.parks.fetch_add(1, Ordering::Relaxed);
+    }
+  }
+
+  fn thread_unparked(&self, context: AsyncThreadContext) {
+    if let Some(metrics) = self.metrics.inner().thread(context.physical_index) {
+      metrics.unparks.fetch_add(1, Ordering::Relaxed);
+    }
+    self.invoke_hook(self.thread_options.unpark_hook(), context);
+  }
+
+  fn thread_unpark_callback(&self, context: AsyncThreadContext) {
+    self.invoke_hook(self.thread_options.unpark_hook(), context);
   }
 
   fn release_scope(&self, scope_ref: ScopeRef, cell: &ScopeCell) {
@@ -359,7 +421,12 @@ impl Shared {
     state.tasks[index].scope = Some(scope);
     state.tasks[index].task = Some(task);
     scope_cell.protocol.add_task();
-    schedule(&mut state, task_ref);
+    self
+      .metrics
+      .inner()
+      .alive_tasks
+      .fetch_add(1, Ordering::Relaxed);
+    schedule(&mut state, task_ref, &self.metrics.inner().queue_depth);
     drop(state);
     self.work.notify_one();
     Ok(job)
@@ -378,7 +445,7 @@ impl Shared {
             generation: state.tasks[index].protocol.generation(),
           };
           if inserted {
-            push_ready(&mut state, task_ref);
+            push_ready(&mut state, task_ref, &self.metrics.inner().queue_depth);
           }
           refresh_task_scope(&mut state, task_ref);
         }
@@ -407,7 +474,7 @@ impl Shared {
           generation: state.tasks[index].protocol.generation(),
         };
         if inserted {
-          push_ready(&mut state, task);
+          push_ready(&mut state, task, &self.metrics.inner().queue_depth);
         }
         refresh_task_scope(&mut state, task);
       }
@@ -444,7 +511,7 @@ impl Shared {
     }
     let inserted = task.protocol.wake();
     if inserted {
-      push_ready(&mut state, task_ref);
+      push_ready(&mut state, task_ref, &self.metrics.inner().queue_depth);
     }
     drop(state);
     if inserted {
@@ -462,7 +529,7 @@ impl Shared {
     }
     let inserted = slot.protocol.abort();
     if inserted {
-      push_ready(&mut state, task_ref);
+      push_ready(&mut state, task_ref, &self.metrics.inner().queue_depth);
     }
     refresh_task_scope(&mut state, task_ref);
     drop(state);
@@ -485,7 +552,7 @@ impl Shared {
 
   /// Waits, with priority over new turns, until the loan's thread holds a
   /// dispatcher permit again. Admission closure does not prevent this.
-  pub(super) fn restore(&self, loan: HandoffLoan) -> DispatchTurn {
+  pub(super) fn restore(&self, loan: HandoffLoan, context: AsyncThreadContext) -> DispatchTurn {
     let mut state = self.lock();
     let mut ticket = state.turns.begin_restore(loan);
     let mut flushed = false;
@@ -500,10 +567,26 @@ impl Shared {
         Err(waiting) => ticket = waiting,
       }
       if flushed {
+        drop(state);
+        self.thread_park_attempted(context);
+        state = self.lock();
+        match state.turns.try_restore(ticket) {
+          Ok(turn) => {
+            drop(state);
+            self.thread_unpark_callback(context);
+            self.work.notify_all();
+            return turn;
+          }
+          Err(waiting) => ticket = waiting,
+        }
+        self.thread_parked(context);
         state = self
           .handoff
           .wait(state)
           .unwrap_or_else(PoisonError::into_inner);
+        drop(state);
+        self.thread_unparked(context);
+        state = self.lock();
       } else {
         drop(state);
         cache::flush();
@@ -679,20 +762,20 @@ fn get_scope(state: &State, scope: ScopeRef) -> Option<&Arc<ScopeCell>> {
 }
 
 /// Adds an admitted task to the single bounded ready queue at most once.
-fn schedule(state: &mut State, task_ref: TaskRef) -> bool {
+fn schedule(state: &mut State, task_ref: TaskRef, queue_depth: &AtomicUsize) -> bool {
   let Some(slot) = state.tasks.get_mut(task_ref.index) else {
     return false;
   };
   if !slot.protocol.matches(task_ref.generation) || slot.task.is_none() || !slot.protocol.queue() {
     return false;
   }
-  push_ready(state, task_ref);
+  push_ready(state, task_ref, queue_depth);
   true
 }
 
 /// Publishes a queue token after `PollProtocol` has reserved the task's one
 /// ready position.
-fn push_ready(state: &mut State, task_ref: TaskRef) {
+fn push_ready(state: &mut State, task_ref: TaskRef, queue_depth: &AtomicUsize) {
   let Some(slot) = state.tasks.get(task_ref.index) else {
     return;
   };
@@ -700,6 +783,7 @@ fn push_ready(state: &mut State, task_ref: TaskRef) {
     return;
   };
   state.ready.push_back(task_ref);
+  queue_depth.fetch_add(1, Ordering::Relaxed);
   refresh_scope_schedule(state, scope_ref);
 }
 
@@ -836,6 +920,11 @@ fn dequeue(shared: &Arc<Shared>, state: &mut State) -> Option<Selected> {
         }
         continue;
       };
+      shared
+        .metrics
+        .inner()
+        .queue_depth
+        .fetch_sub(1, Ordering::Relaxed);
       let task = state.tasks[task_ref.index].task.as_ref().map(Arc::clone);
       let began = state.tasks[task_ref.index].protocol.begin_poll();
       if let (Some(task), Some(aborting)) = (task, began) {
@@ -874,6 +963,7 @@ fn dequeue(shared: &Arc<Shared>, state: &mut State) -> Option<Selected> {
 fn take_next(
   shared: &Arc<Shared>,
   shard: usize,
+  context: AsyncThreadContext,
   lease: &mut Option<HelperLease>,
   finished: Option<DispatchTurn>,
 ) -> Work {
@@ -912,10 +1002,25 @@ fn take_next(
     let excess = lease.is_some() && state.turns.helper_is_excess();
     let dispatchable = !state.round_robin.is_empty() && state.turns.can_begin_turn();
     if !excess && !dispatchable && !state.turns.may_exit(admission_empty(&state)) {
-      state = shared
-        .work
-        .wait(state)
-        .unwrap_or_else(PoisonError::into_inner);
+      drop(state);
+      shared.thread_park_attempted(context);
+      state = shared.lock();
+      let excess = lease.is_some() && state.turns.helper_is_excess();
+      let dispatchable = !state.round_robin.is_empty() && state.turns.can_begin_turn();
+      if !excess && !dispatchable && !state.turns.may_exit(admission_empty(&state)) {
+        shared.thread_parked(context);
+        state = shared
+          .work
+          .wait(state)
+          .unwrap_or_else(PoisonError::into_inner);
+        drop(state);
+        shared.thread_unparked(context);
+        state = shared.lock();
+      } else {
+        drop(state);
+        shared.thread_unpark_callback(context);
+        state = shared.lock();
+      }
     }
     state.idle = state.idle.saturating_sub(1);
     cache::set_shard(shard);
@@ -926,7 +1031,7 @@ fn take_next(
             index,
             generation: state.tasks[index].protocol.generation(),
           };
-          push_ready(&mut state, reference);
+          push_ready(&mut state, reference, &shared.metrics.inner().queue_depth);
         }
       }
     }
@@ -944,10 +1049,15 @@ enum Stop {
 
 /// Runs owned turns on an executor thread. Each turn's task, waker and
 /// published values are dropped before the turn's permit is released.
-fn run_turns(shared: &Arc<Shared>, shard: usize, lease: &mut Option<HelperLease>) -> Stop {
+fn run_turns(
+  shared: &Arc<Shared>,
+  shard: usize,
+  context: AsyncThreadContext,
+  lease: &mut Option<HelperLease>,
+) -> Stop {
   let mut finished = None;
   loop {
-    match take_next(shared, shard, lease, finished.take()) {
+    match take_next(shared, shard, context, lease, finished.take()) {
       Work::Poll(task_ref, task, permit, turn) => {
         handoff::enter_turn(turn);
         super::entry::reset_budget();
@@ -975,7 +1085,12 @@ fn run_turns(shared: &Arc<Shared>, shard: usize, lease: &mut Option<HelperLease>
 /// Marks this thread as one of the runtime's executor threads. The worker
 /// identity makes `shutdown` from any of its code, handed-off closures
 /// included, return `WouldDeadlock`.
-fn executor_thread<R>(shared: &Arc<Shared>, shard: usize, run: impl FnOnce() -> R) -> R {
+fn executor_thread<R>(
+  shared: &Arc<Shared>,
+  context: AsyncThreadContext,
+  run: impl FnOnce() -> R,
+) -> R {
+  let shard = context.physical_index;
   WORKER_RUNTIME.set(shared.id);
   cache::set_shard(shard);
   let _worker_context = super::entry::WorkerContextGuard::enter();
@@ -988,35 +1103,51 @@ fn executor_thread<R>(shared: &Arc<Shared>, shard: usize, run: impl FnOnce() -> 
     resources: shared.root_resources(),
   };
   let _runtime_context = super::entry::EnterGuard::enter(&worker_handle);
-  let _dispatcher = handoff::DispatcherGuard::install(shared);
+  let _dispatcher = handoff::DispatcherGuard::install(shared, context);
+  shared.thread_started(context);
+  struct StopGuard<'a> {
+    shared: &'a Shared,
+    context: AsyncThreadContext,
+  }
+  impl Drop for StopGuard<'_> {
+    fn drop(&mut self) {
+      self.shared.thread_stopped(self.context);
+    }
+  }
+  let _stop = StopGuard { shared, context };
   run()
 }
 
-pub(super) fn worker(shared: Arc<Shared>, index: usize) {
-  executor_thread(&shared, index, || {
-    let _ = run_turns(&shared, index, &mut None);
+pub(super) fn worker(shared: Arc<Shared>, context: AsyncThreadContext) {
+  executor_thread(&shared, context, || {
+    let _ = run_turns(&shared, context.physical_index, context, &mut None);
+    cache::flush();
   });
-  cache::flush();
 }
 
 /// A prestarted handoff helper with its own shard hint. It parks until a
 /// handoff loan leaves fewer dispatching threads than workers, dispatches
 /// turns while it is needed, and retires only between turns.
-pub(super) fn helper(shared: Arc<Shared>, shard: usize) {
-  executor_thread(&shared, shard, || {
-    while let Some(lease) = wait_for_activation(&shared, shard) {
+pub(super) fn helper(shared: Arc<Shared>, context: AsyncThreadContext) {
+  let shard = context.physical_index;
+  executor_thread(&shared, context, || {
+    while let Some(lease) = wait_for_activation(&shared, shard, context) {
       let mut lease = Some(lease);
-      let stop = run_turns(&shared, shard, &mut lease);
+      let stop = run_turns(&shared, shard, context, &mut lease);
       debug_assert!(lease.is_none());
       if stop == Stop::Exit {
         break;
       }
     }
+    cache::flush();
   });
-  cache::flush();
 }
 
-fn wait_for_activation(shared: &Arc<Shared>, shard: usize) -> Option<HelperLease> {
+fn wait_for_activation(
+  shared: &Arc<Shared>,
+  shard: usize,
+  context: AsyncThreadContext,
+) -> Option<HelperLease> {
   let mut state = shared.lock();
   loop {
     if let Some(lease) = state.turns.try_activate_helper() {
@@ -1031,10 +1162,23 @@ fn wait_for_activation(shared: &Arc<Shared>, shard: usize) -> Option<HelperLease
     cache::flush();
     state = shared.lock();
     if !state.turns.can_activate_helper() && !state.turns.may_exit(admission_empty(&state)) {
-      state = shared
-        .handoff
-        .wait(state)
-        .unwrap_or_else(PoisonError::into_inner);
+      drop(state);
+      shared.thread_park_attempted(context);
+      state = shared.lock();
+      if !state.turns.can_activate_helper() && !state.turns.may_exit(admission_empty(&state)) {
+        shared.thread_parked(context);
+        state = shared
+          .handoff
+          .wait(state)
+          .unwrap_or_else(PoisonError::into_inner);
+        drop(state);
+        shared.thread_unparked(context);
+        state = shared.lock();
+      } else {
+        drop(state);
+        shared.thread_unpark_callback(context);
+        state = shared.lock();
+      }
     }
   }
 }
@@ -1051,6 +1195,11 @@ fn finish_cancel(shared: &Arc<Shared>, task_ref: TaskRef, task: Arc<dyn ErasedTa
   let slot_task = slot.task.take();
   let scope_ref = slot.scope.take();
   slot.protocol.finish_cancel();
+  shared
+    .metrics
+    .inner()
+    .alive_tasks
+    .fetch_sub(1, Ordering::Relaxed);
   if let Some(scope_ref) = scope_ref
     && let Some(scope) = state.scopes.get(scope_ref.index)
     && scope.generation == scope_ref.generation
@@ -1083,6 +1232,11 @@ fn finish_poll(shared: &Arc<Shared>, task_ref: TaskRef, result: PollResult) {
     .finish_poll(matches!(result, PollResult::Ready), cancel_all);
   match finish {
     PollFinish::Complete => {
+      shared
+        .metrics
+        .inner()
+        .alive_tasks
+        .fetch_sub(1, Ordering::Relaxed);
       publish = slot.task.take();
       let scope_ref = slot.scope.take();
       if let Some(scope_ref) = scope_ref
@@ -1095,7 +1249,7 @@ fn finish_poll(shared: &Arc<Shared>, task_ref: TaskRef, result: PollResult) {
     PollFinish::CancelCleanup => {
       cancel = slot.task.as_ref().map(Arc::clone);
     }
-    PollFinish::Requeue => push_ready(&mut state, task_ref),
+    PollFinish::Requeue => push_ready(&mut state, task_ref, &shared.metrics.inner().queue_depth),
     PollFinish::Idle => {}
     PollFinish::Stale => return,
   }
@@ -1133,6 +1287,17 @@ mod tests {
       },
       0,
       None,
+      AsyncThreadOptions::default(),
+      RuntimeMetrics::try_new(
+        1,
+        [AsyncThreadContext {
+          role: super::super::thread_options::AsyncThreadRole::Worker,
+          index: 0,
+          physical_index: 0,
+        }],
+        1,
+      )
+      .unwrap_or_else(|error| panic!("metrics allocation failed: {error}")),
     )
     .unwrap_or_else(|error| panic!("shared construction failed: {error}"));
     let scope = shared

@@ -17,11 +17,13 @@
 use std::fmt;
 use std::future::Future;
 use std::io;
+use std::sync::Arc;
 
 use super::ShutdownMode;
 use super::asynchronous::{
-  AsyncConfig, AsyncError, AsyncHandle, AsyncRuntime, AsyncShutdown, HandoffConfig, LocalConfig,
-  LocalError, LocalHandle, LocalRuntime, LocalSendHandle, LocalTaskScope, OwnedTaskScope,
+  AsyncConfig, AsyncError, AsyncHandle, AsyncRuntime, AsyncShutdown, AsyncThreadOptions,
+  HandoffConfig, LocalConfig, LocalError, LocalHandle, LocalRuntime, LocalSendHandle,
+  LocalTaskScope, OwnedTaskScope, RuntimeMetrics,
 };
 use super::byte_rate::{ByteRateConfig, ByteRateError, ByteRateLimit};
 use super::fs::FsHandle;
@@ -29,7 +31,7 @@ use super::managed::{ResourceLimits, ResourceScope};
 use super::process::{ProcessBuildError, ProcessDriver, ProcessShutdownError, ProcessShutdownMode};
 use super::reactor::{Reactor, ReactorConfig, ReactorError, ReactorHandle};
 use super::signal::{SignalDriver, SignalError};
-use super::time::{TimerDriver, TimerError, TimerHandle};
+use super::time::{ClockMode, IdleCoordinator, TimerDriver, TimerError, TimerHandle};
 use super::{Config as BlockingConfig, Handle as BlockingHandle, Runtime as BlockingRuntime};
 
 /// A successful shutdown request is still waiting for some owned work.
@@ -188,6 +190,7 @@ impl Default for MultiShutdown {
 #[derive(Clone, Copy, Debug, Default)]
 struct ServiceOptions {
   timer_registrations: Option<usize>,
+  timer_mode: ClockMode,
   reactor: Option<ReactorConfig>,
   blocking: Option<BlockingConfig>,
   filesystem: bool,
@@ -202,6 +205,11 @@ impl ServiceOptions {
     if self.timer_registrations == Some(0) {
       return Err(DriverBuildError::InvalidConfiguration(
         "timer registrations must be nonzero",
+      ));
+    }
+    if self.timer_mode != ClockMode::Real && self.timer_registrations.is_none() {
+      return Err(DriverBuildError::InvalidConfiguration(
+        "a paused clock requires a timer registration bound",
       ));
     }
     if let Some(config) = self.reactor
@@ -263,12 +271,17 @@ impl ServiceOptions {
     &self,
     resources: &ResourceScope,
     startup: &mut StartupGuard,
+    coordinator: Arc<IdleCoordinator>,
+    current_thread: bool,
   ) -> Result<Option<FsHandle>, DriverBuildError> {
     if let Some(config) = self.blocking {
       startup.blocking = Some(BlockingRuntime::new(config).map_err(DriverBuildError::Blocking)?);
     }
     if let Some(max_registered) = self.timer_registrations {
-      startup.timer = Some(TimerDriver::new(max_registered).map_err(DriverBuildError::Timer)?);
+      startup.timer = Some(
+        TimerDriver::new_for_runtime(max_registered, self.timer_mode, current_thread, coordinator)
+          .map_err(DriverBuildError::Timer)?,
+      );
     }
     if let Some(config) = self.reactor {
       startup.reactor = Some(Reactor::new(config).map_err(DriverBuildError::Reactor)?);
@@ -300,6 +313,21 @@ macro_rules! service_builder_methods {
       /// Selects a bounded timer driver.
       pub fn timer(mut self, max_registered: usize) -> Self {
         self.services.timer_registrations = Some(max_registered);
+        self
+      }
+
+      /// Starts the owning timer clock in `mode` with a bounded registration
+      /// capacity. `PausedAuto` is accepted only by the current-thread
+      /// executor and advances only after its local queues are quiescent.
+      pub fn clock(mut self, mode: ClockMode, max_registered: usize) -> Self {
+        self.services.timer_registrations = Some(max_registered);
+        self.services.timer_mode = mode;
+        self
+      }
+
+      /// Selects the initial mode for a timer configured with [`Self::timer`].
+      pub fn timer_mode(mut self, mode: ClockMode) -> Self {
+        self.services.timer_mode = mode;
         self
       }
 
@@ -371,6 +399,7 @@ impl CurrentThreadBuilder {
       },
       services: ServiceOptions {
         timer_registrations: None,
+        timer_mode: ClockMode::Real,
         reactor: None,
         blocking: None,
         filesystem: false,
@@ -406,7 +435,24 @@ impl CurrentThreadBuilder {
       LocalRuntime::with_resources(self.config, resources.clone())
         .map_err(DriverBuildError::Local)?,
     );
-    let filesystem = self.services.build_services(&resources, &mut startup)?;
+    let coordinator = startup
+      .local
+      .as_ref()
+      .map(LocalRuntime::idle_coordinator)
+      .unwrap_or_else(|| IdleCoordinator::new(None));
+    let filesystem =
+      self
+        .services
+        .build_services(&resources, &mut startup, Arc::clone(&coordinator), true)?;
+    if let Some(timer) = startup.timer.as_ref().map(TimerDriver::handle) {
+      let blocking_handle = startup.blocking.as_ref().map(BlockingRuntime::handle);
+      if let Some(blocking) = startup.blocking.as_mut() {
+        blocking.bind_clock(timer.clone());
+      }
+      if let Some(local) = startup.local.as_mut() {
+        local.attach_idle_clock(timer, blocking_handle);
+      }
+    }
     Ok(CurrentThreadDriver {
       local: startup.local.take().unwrap_or_else(|| unreachable!()),
       resources,
@@ -430,10 +476,11 @@ impl CurrentThreadBuilder {
 service_builder_methods!(CurrentThreadBuilder);
 
 /// Builder for a multithreaded executor and its selected services.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct MultiThreadBuilder {
   config: AsyncConfig,
   handoffs: Option<HandoffConfig>,
+  thread_options: Option<AsyncThreadOptions>,
   resources: ResourceLimits,
   services: ServiceOptions,
 }
@@ -445,6 +492,7 @@ impl MultiThreadBuilder {
     Self {
       config,
       handoffs: None,
+      thread_options: None,
       resources: ResourceLimits {
         managed_memory: 0,
         disk_concurrent_ops: 0,
@@ -452,6 +500,7 @@ impl MultiThreadBuilder {
       },
       services: ServiceOptions {
         timer_registrations: None,
+        timer_mode: ClockMode::Real,
         reactor: None,
         blocking: None,
         filesystem: false,
@@ -466,6 +515,12 @@ impl MultiThreadBuilder {
   /// Prestarts bounded helper threads for [`super::asynchronous::try_block_in_place`].
   pub const fn with_handoffs(mut self, config: HandoffConfig) -> Self {
     self.handoffs = Some(config);
+    self
+  }
+
+  /// Applies names, stack sizes and lifecycle hooks to executor threads.
+  pub fn thread_options(mut self, options: AsyncThreadOptions) -> Self {
+    self.thread_options = Some(options);
     self
   }
 
@@ -497,20 +552,41 @@ impl MultiThreadBuilder {
         "handoff bound must be nonzero and fit the worker count",
       ));
     }
+    if self.services.timer_mode == ClockMode::PausedAuto {
+      return Err(DriverBuildError::InvalidConfiguration(
+        "paused automatic time requires the current-thread executor",
+      ));
+    }
     self.services.validate()?;
     let (upload_rate, download_rate) = self.services.build_rates()?;
     let resources = ResourceScope::new(self.resources);
     let mut startup = StartupGuard::default();
-    startup.asynchronous = Some(
-      match self.handoffs {
-        Some(handoffs) => {
-          AsyncRuntime::with_resources_and_handoffs(self.config, handoffs, resources.clone())
-        }
-        None => AsyncRuntime::with_resources(self.config, resources.clone()),
+    let asynchronous = match (self.handoffs, self.thread_options) {
+      (Some(handoffs), Some(options)) => AsyncRuntime::with_resources_handoffs_and_thread_options(
+        self.config,
+        handoffs,
+        resources.clone(),
+        options,
+      ),
+      (Some(handoffs), None) => {
+        AsyncRuntime::with_resources_and_handoffs(self.config, handoffs, resources.clone())
       }
-      .map_err(DriverBuildError::Async)?,
-    );
-    let filesystem = self.services.build_services(&resources, &mut startup)?;
+      (None, Some(options)) => {
+        AsyncRuntime::with_resources_and_thread_options(self.config, resources.clone(), options)
+      }
+      (None, None) => AsyncRuntime::with_resources(self.config, resources.clone()),
+    }
+    .map_err(DriverBuildError::Async)?;
+    startup.asynchronous = Some(asynchronous);
+    let filesystem =
+      self
+        .services
+        .build_services(&resources, &mut startup, IdleCoordinator::new(None), false)?;
+    if let Some(timer) = startup.timer.as_ref().map(TimerDriver::handle)
+      && let Some(blocking) = startup.blocking.as_mut()
+    {
+      blocking.bind_clock(timer);
+    }
     Ok(MultiThreadDriver {
       asynchronous: startup
         .asynchronous
@@ -622,6 +698,18 @@ impl CurrentThreadDriver {
   #[must_use]
   pub fn timer(&self) -> Option<TimerHandle> {
     self.timer.as_ref().map(TimerDriver::handle)
+  }
+
+  /// The current-thread runtime's owned clock, if a timer was selected.
+  #[must_use]
+  pub fn clock(&self) -> Option<TimerHandle> {
+    self.timer()
+  }
+
+  /// The selected clock's current mode, if this runtime owns a timer.
+  #[must_use]
+  pub fn clock_mode(&self) -> Option<ClockMode> {
+    self.clock().map(|clock| clock.mode())
   }
 
   /// A handle to the selected reactor, if present.
@@ -862,6 +950,12 @@ impl MultiThreadDriver {
   #[must_use]
   pub fn handle(&self) -> AsyncHandle {
     self.asynchronous.handle()
+  }
+
+  /// A cloneable diagnostic view that remains usable after runtime shutdown.
+  #[must_use]
+  pub fn metrics(&self) -> RuntimeMetrics {
+    self.asynchronous.metrics()
   }
 
   /// Polls a borrowed root future on the caller's thread.
@@ -1746,5 +1840,202 @@ mod tests {
       .err()
       .unwrap_or_else(|| panic!("filesystem without a pool unexpectedly built"));
     assert!(matches!(error, DriverBuildError::FilesystemNeedsBlocking));
+  }
+
+  #[test]
+  fn current_thread_paused_auto_advances_to_its_next_live_timer() {
+    let mut driver = CurrentThreadBuilder::new(local_config())
+      .clock(ClockMode::PausedAuto, 4)
+      .build()
+      .unwrap_or_else(|error| panic!("current-thread build failed: {error}"));
+    let clock = driver.clock().unwrap_or_else(|| panic!("clock is missing"));
+    let start = clock.now();
+    let completed_at = driver
+      .block_on(async {
+        clock.sleep(Duration::from_secs(7)).unwrap().await.unwrap();
+        clock.now()
+      })
+      .unwrap_or_else(|error| panic!("root block_on failed: {error}"));
+    assert_eq!(completed_at, start + Duration::from_secs(7));
+    assert_eq!(clock.mode(), ClockMode::PausedAuto);
+  }
+
+  #[test]
+  fn current_thread_ready_local_work_runs_before_paused_auto_advance() {
+    let mut driver = CurrentThreadBuilder::new(local_config())
+      .clock(ClockMode::PausedAuto, 4)
+      .build()
+      .unwrap_or_else(|error| panic!("current-thread build failed: {error}"));
+    let clock = driver.clock().unwrap_or_else(|| panic!("clock is missing"));
+    let start = clock.now();
+    let observed = std::sync::Arc::new(Mutex::new(None));
+    let task_observed = std::sync::Arc::clone(&observed);
+    let task_clock = clock.clone();
+    driver
+      .handle()
+      .spawn_local(async move {
+        *task_observed.lock().unwrap() = Some(task_clock.now());
+      })
+      .unwrap_or_else(|error| panic!("local task admission failed: {error}"));
+
+    driver
+      .block_on(async {
+        clock.sleep(Duration::from_secs(11)).unwrap().await.unwrap();
+      })
+      .unwrap_or_else(|error| panic!("root block_on failed: {error}"));
+    assert_eq!(*observed.lock().unwrap(), Some(start));
+    assert_eq!(clock.now(), start + Duration::from_secs(11));
+  }
+
+  #[test]
+  fn current_thread_paused_auto_imports_external_work_before_advancing() {
+    let mut driver = CurrentThreadBuilder::new(local_config())
+      .clock(ClockMode::PausedAuto, 4)
+      .build()
+      .unwrap_or_else(|error| panic!("current-thread build failed: {error}"));
+    let clock = driver.clock().unwrap_or_else(|| panic!("clock is missing"));
+    let start = clock.now();
+    let observed = std::sync::Arc::new(Mutex::new(None));
+    let task_observed = std::sync::Arc::clone(&observed);
+    let task_clock = clock.clone();
+    let job = driver
+      .send_handle()
+      .spawn(async move {
+        *task_observed.lock().unwrap() = Some(task_clock.now());
+      })
+      .unwrap_or_else(|error| panic!("external task admission failed: {error}"));
+
+    driver
+      .block_on(async {
+        clock.sleep(Duration::from_secs(13)).unwrap().await.unwrap();
+      })
+      .unwrap_or_else(|error| panic!("root block_on failed: {error}"));
+    assert_eq!(*observed.lock().unwrap(), Some(start));
+    assert_eq!(clock.now(), start + Duration::from_secs(13));
+    drop(job);
+  }
+
+  #[test]
+  fn paused_auto_is_rejected_by_the_multithread_builder() {
+    let error = MultiThreadBuilder::new(async_config())
+      .clock(ClockMode::PausedAuto, 2)
+      .build()
+      .err()
+      .unwrap_or_else(|| panic!("multithread paused-auto clock unexpectedly built"));
+    assert!(matches!(
+      error,
+      DriverBuildError::InvalidConfiguration(reason)
+        if reason.contains("current-thread")
+    ));
+  }
+
+  #[test]
+  fn multithread_facade_applies_thread_options_and_exposes_metrics() {
+    let (started_tx, started_rx) = mpsc::sync_channel(1);
+    let options = AsyncThreadOptions::new()
+      .thread_name_fn(|context| {
+        let role = match context.role {
+          super::super::asynchronous::AsyncThreadRole::Worker => "worker",
+          super::super::asynchronous::AsyncThreadRole::HandoffHelper => "handoff",
+        };
+        format!("allocatbelt-test-{role}-{}", context.index)
+      })
+      .on_thread_start(move |context| {
+        let _ = started_tx.send(context);
+      });
+    let driver = MultiThreadBuilder::new(async_config())
+      .thread_options(options)
+      .build()
+      .unwrap_or_else(|error| panic!("multithread build failed: {error}"));
+    let started = started_rx
+      .recv_timeout(Duration::from_secs(2))
+      .unwrap_or_else(|error| panic!("configured worker did not start: {error}"));
+    assert_eq!(
+      started.role,
+      super::super::asynchronous::AsyncThreadRole::Worker
+    );
+    assert_eq!(started.index, 0);
+    assert_eq!(started.physical_index, 0);
+
+    let metrics = driver.metrics();
+    let snapshot = metrics.snapshot();
+    assert_eq!(snapshot.num_workers, 1);
+    assert_eq!(snapshot.threads.len(), 1);
+    assert_eq!(snapshot.threads[0].context, started);
+    drop(driver);
+    assert_eq!(metrics.snapshot().num_workers, 1);
+  }
+
+  #[test]
+  fn facade_blocking_admission_inhibits_auto_advance_until_execution_finishes() {
+    let driver = CurrentThreadBuilder::new(local_config())
+      .clock(ClockMode::PausedAuto, 2)
+      .blocking(BlockingConfig {
+        workers: 1,
+        max_outstanding: 2,
+        capacity: Resources::ZERO,
+      })
+      .build()
+      .unwrap_or_else(|error| panic!("current-thread build failed: {error}"));
+    let clock = driver.clock().unwrap_or_else(|| panic!("clock is missing"));
+    let start = clock.now();
+    let mut sleep = clock.sleep(Duration::from_secs(3)).unwrap();
+    let blocking = driver
+      .blocking()
+      .unwrap_or_else(|| panic!("blocking pool is missing"));
+    let (started_tx, started_rx) = mpsc::sync_channel(1);
+    let (release_tx, release_rx) = mpsc::sync_channel(1);
+    let job = blocking
+      .try_spawn(Resources::ZERO, move |_| {
+        let _ = started_tx.send(());
+        let _ = release_rx.recv();
+      })
+      .unwrap_or_else(|error| panic!("blocking job admission failed: {error}"));
+    started_rx
+      .recv_timeout(Duration::from_secs(2))
+      .unwrap_or_else(|error| panic!("blocking job did not start: {error}"));
+
+    let coordinator = clock.coordinator().clone();
+    let epoch = coordinator.epoch().unwrap();
+    let quiescent = coordinator
+      .quiescent(epoch)
+      .unwrap_or_else(|| panic!("clock idle epoch changed unexpectedly"));
+    assert!(matches!(
+      clock.auto_advance_if_idle(quiescent, false),
+      super::super::time::AutoAdvance::Inhibited
+    ));
+    assert_eq!(clock.now(), start);
+
+    release_tx
+      .send(())
+      .unwrap_or_else(|error| panic!("blocking job release failed: {error}"));
+    job
+      .join()
+      .unwrap_or_else(|error| panic!("blocking job failed: {error}"));
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+      let epoch = coordinator.epoch().unwrap();
+      let Some(quiescent) = coordinator.quiescent(epoch) else {
+        std::thread::yield_now();
+        continue;
+      };
+      match clock.auto_advance_if_idle(quiescent, false) {
+        super::super::time::AutoAdvance::Advanced => break,
+        super::super::time::AutoAdvance::Inhibited => {
+          assert!(
+            Instant::now() < deadline,
+            "blocking inhibitor was not released"
+          );
+          std::thread::yield_now();
+        }
+        state => panic!("unexpected auto-advance state after job completion: {state:?}"),
+      }
+    }
+    assert_eq!(clock.now(), start + Duration::from_secs(3));
+    assert!(
+      Pin::new(&mut sleep)
+        .poll(&mut Context::from_waker(Waker::noop()))
+        .is_ready()
+    );
   }
 }

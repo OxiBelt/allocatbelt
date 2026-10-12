@@ -17,14 +17,16 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use std::task::{Context, Poll, Wake, Waker};
-use std::thread::{self, Thread, ThreadId};
+use std::thread::{self, ThreadId};
 
 use super::entry::{BlockOnGuard, LocalExecutionGuard, TaskContextGuard};
 use super::identity::{self, TaskId};
 use super::join::{AsyncJob, AsyncJoinError, JoinState};
 use super::protocol::{PollFinish, PollProtocol};
 use super::task::drop_contained;
+use crate::runtime::blocking::Handle as BlockingHandle;
 use crate::runtime::managed::ResourceScope;
+use crate::runtime::time::{AutoAdvance, IdleCoordinator, IdleSignal, TimerHandle};
 
 #[cfg(all(test, not(loom)))]
 #[path = "local_tests.rs"]
@@ -179,27 +181,29 @@ impl Drop for AdmissionPermit {
 }
 
 struct Notifier {
-  thread: Thread,
-  notified: AtomicBool,
+  signal: Arc<IdleSignal>,
+  coordinator: Arc<IdleCoordinator>,
 }
 
 impl Notifier {
-  fn new(thread: Thread) -> Arc<Self> {
+  fn new(signal: Arc<IdleSignal>, coordinator: Arc<IdleCoordinator>) -> Arc<Self> {
     Arc::new(Self {
-      thread,
-      notified: AtomicBool::new(false),
+      signal,
+      coordinator,
     })
   }
 
   fn notify(&self) {
-    self.notified.swap(true, Ordering::Release);
-    self.thread.unpark();
+    self.coordinator.signal();
+    self.unpark();
+  }
+
+  fn unpark(&self) {
+    self.signal.notify();
   }
 
   fn park(&self) {
-    while !self.notified.swap(false, Ordering::AcqRel) {
-      thread::park();
-    }
+    self.signal.park();
   }
 }
 
@@ -464,6 +468,10 @@ impl Control {
     None
   }
 
+  fn has_ready(&self) -> bool {
+    !self.lock().round_robin.is_empty()
+  }
+
   fn finish(&self, task_ref: TaskRef, ready: bool) -> PollFinish {
     let mut state = self.lock();
     let Some(task) = state.tasks.get_mut(task_ref.index) else {
@@ -542,10 +550,13 @@ impl Wake for LocalTaskWake {
   }
 
   fn wake_by_ref(self: &Arc<Self>) {
-    if let Some(control) = self.control.upgrade()
-      && control.wake(self.task)
-    {
-      self.notifier.notify();
+    if let Some(control) = self.control.upgrade() {
+      let changed = self.notifier.coordinator.changed();
+      let woke = control.wake(self.task);
+      drop(changed);
+      if woke {
+        self.notifier.unpark();
+      }
     }
   }
 }
@@ -611,6 +622,7 @@ struct LocalCore {
   tasks: RefCell<Vec<Option<LocalTaskSlot>>>,
   scopes: RefCell<Vec<Option<Rc<ScopeCell>>>>,
   notifier: Arc<Notifier>,
+  coordinator: Arc<IdleCoordinator>,
   _not_send: PhantomData<Rc<()>>,
 }
 
@@ -655,10 +667,13 @@ impl LocalCore {
     let control = Arc::downgrade(&self.control);
     let notifier = Arc::clone(&self.notifier);
     Arc::new(move || {
-      if let Some(control) = control.upgrade()
-        && control.abort(task_ref)
-      {
-        notifier.notify();
+      if let Some(control) = control.upgrade() {
+        let changed = notifier.coordinator.changed();
+        let aborted = control.abort(task_ref);
+        drop(changed);
+        if aborted {
+          notifier.unpark();
+        }
       }
     })
   }
@@ -922,9 +937,21 @@ pub struct LocalRuntime {
   sender: SyncSender<Box<dyn ExternalRequest>>,
   receiver: Receiver<Box<dyn ExternalRequest>>,
   root_scope: ScopeRef,
+  idle_clock: Option<IdleClock>,
   closed: bool,
   shutdown_complete: bool,
   _not_send: PhantomData<Rc<()>>,
+}
+
+struct IdleClock {
+  timer: TimerHandle,
+  blocking: Option<BlockingHandle>,
+}
+
+enum IdleStep {
+  Retry,
+  Park,
+  Advanced,
 }
 
 impl LocalRuntime {
@@ -963,7 +990,9 @@ impl LocalRuntime {
     let root = ScopeCell::new(root_scope, resources);
     scopes[0] = Some(Rc::clone(&root));
     let owner = thread::current();
-    let notifier = Notifier::new(owner.clone());
+    let signal = IdleSignal::new(owner.clone());
+    let coordinator = IdleCoordinator::new(Some(Arc::clone(&signal)));
+    let notifier = Notifier::new(signal, Arc::clone(&coordinator));
     Ok(Self {
       core: Rc::new(LocalCore {
         owner: owner.id(),
@@ -972,11 +1001,13 @@ impl LocalRuntime {
         tasks: RefCell::new(tasks),
         scopes: RefCell::new(scopes),
         notifier,
+        coordinator,
         _not_send: PhantomData,
       }),
       sender,
       receiver,
       root_scope,
+      idle_clock: None,
       closed: false,
       shutdown_complete: false,
       _not_send: PhantomData,
@@ -991,6 +1022,15 @@ impl LocalRuntime {
       scope: self.root_scope,
       _not_send: PhantomData,
     }
+  }
+
+  pub(crate) fn idle_coordinator(&self) -> Arc<IdleCoordinator> {
+    Arc::clone(&self.core.coordinator)
+  }
+
+  pub(crate) fn attach_idle_clock(&mut self, timer: TimerHandle, blocking: Option<BlockingHandle>) {
+    debug_assert!(Arc::ptr_eq(&self.core.coordinator, timer.coordinator()));
+    self.idle_clock = Some(IdleClock { timer, blocking });
   }
 
   /// Returns a cross-thread handle that accepts only `Send` futures and
@@ -1069,6 +1109,7 @@ impl LocalRuntime {
     let mut context = Context::from_waker(&root_waker);
     let mut future = Box::pin(future);
     loop {
+      let poll_epoch = self.core.coordinator.epoch();
       super::entry::reset_budget();
       let poll = {
         let _cooperative_poll = super::entry::CooperativePollGuard::enter();
@@ -1081,26 +1122,65 @@ impl LocalRuntime {
       if let Some((task_ref, aborting)) = self.core.control.take_ready() {
         self.run_task(task_ref, aborting);
       } else {
-        self.core.notifier.park();
+        match self.try_auto_advance(poll_epoch) {
+          IdleStep::Retry | IdleStep::Advanced => continue,
+          IdleStep::Park => self.core.notifier.park(),
+        }
       }
+    }
+  }
+
+  fn try_auto_advance(&mut self, poll_epoch: Option<u64>) -> IdleStep {
+    let (Some(expected), Some(idle_clock)) = (poll_epoch, self.idle_clock.as_ref()) else {
+      return IdleStep::Park;
+    };
+    let coordinator = Arc::clone(&self.core.coordinator);
+    let Some(quiescent) = coordinator.quiescent(expected) else {
+      return IdleStep::Retry;
+    };
+    if self.core.control.has_ready() {
+      return IdleStep::Retry;
+    }
+    match self.receiver.try_recv() {
+      Ok(request) => {
+        drop(quiescent);
+        self.import_request(request);
+        return IdleStep::Retry;
+      }
+      Err(TryRecvError::Disconnected) => return IdleStep::Retry,
+      Err(TryRecvError::Empty) => {}
+    }
+    let blocking_inhibited = idle_clock.blocking.as_ref().is_some_and(|blocking| {
+      let snapshot = blocking.snapshot();
+      snapshot.outstanding != 0 || snapshot.running != 0
+    });
+    match idle_clock
+      .timer
+      .auto_advance_if_idle(quiescent, blocking_inhibited)
+    {
+      AutoAdvance::Advanced => IdleStep::Advanced,
+      AutoAdvance::Raced => IdleStep::Retry,
+      AutoAdvance::Inactive | AutoAdvance::Inhibited | AutoAdvance::NoDeadline => IdleStep::Park,
     }
   }
 
   fn import_external(&mut self) {
     loop {
       match self.receiver.try_recv() {
-        Ok(request) => {
-          if let Some(scope) = self.core.scope_cell(self.root_scope) {
-            match self.core.control.admit(self.root_scope) {
-              Ok(task_ref) => request.import(&self.core, task_ref, scope),
-              Err(_) => request.cancel_on_owner(),
-            }
-          } else {
-            request.cancel_on_owner();
-          }
-        }
+        Ok(request) => self.import_request(request),
         Err(TryRecvError::Empty | TryRecvError::Disconnected) => return,
       }
+    }
+  }
+
+  fn import_request(&mut self, request: Box<dyn ExternalRequest>) {
+    if let Some(scope) = self.core.scope_cell(self.root_scope) {
+      match self.core.control.admit(self.root_scope) {
+        Ok(task_ref) => request.import(&self.core, task_ref, scope),
+        Err(_) => request.cancel_on_owner(),
+      }
+    } else {
+      request.cancel_on_owner();
     }
   }
 
@@ -1425,6 +1505,7 @@ impl LocalSendHandle {
     F: Future + Send + 'static,
     F::Output: Send + 'static,
   {
+    let changed = self.notifier.coordinator.changed();
     let mut gate = self.gate.lock();
     let admission = match self.gate.reserve_locked(&mut gate) {
       Ok(admission) => admission,
@@ -1454,6 +1535,7 @@ impl LocalSendHandle {
     let job = AsyncJob::new(
       join,
       Arc::new(move || {
+        let changed = notifier.coordinator.changed();
         job_abort.store(true, Ordering::Release);
         if let Some(task_ref) = *job_abort_target
           .lock()
@@ -1462,13 +1544,13 @@ impl LocalSendHandle {
         {
           let _ = control.abort(task_ref);
         }
-        notifier.notify();
+        drop(changed);
       }),
     );
     match self.sender.try_send(Box::new(request)) {
       Ok(()) => {
         drop(gate);
-        self.notifier.notify();
+        drop(changed);
         Ok(job)
       }
       Err(error) => {
@@ -1477,6 +1559,7 @@ impl LocalSendHandle {
           TrySendError::Disconnected(request) => (request, LocalError::Closed),
         };
         drop(gate);
+        drop(changed);
         drop(job);
         let recovered = request.reject();
         match recovered.downcast::<F>() {
