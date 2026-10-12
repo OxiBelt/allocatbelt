@@ -487,6 +487,21 @@ impl Shared {
       .and_then(|scope| scope.resources.clone())
   }
 
+  pub(super) fn context_tenant(
+    &self,
+    scope_ref: ScopeRef,
+    scope_owner: Option<&Arc<ScopeCell>>,
+    resources: Option<&ResourceScope>,
+  ) -> Option<TenantDomain> {
+    let scope_tenant = scope_owner
+      .and_then(|scope| scope.tenant.clone())
+      .or_else(|| {
+        let state = self.lock();
+        get_scope(&state, scope_ref).and_then(|scope| scope.tenant.clone())
+      });
+    scope_tenant.or_else(|| resources.and_then(ResourceScope::tenant_domain).cloned())
+  }
+
   pub(super) fn reserve_root_control(
     &self,
     scope_ref: ScopeRef,
@@ -1422,6 +1437,7 @@ fn run_turns(
 fn executor_thread<R>(
   shared: &Arc<Shared>,
   context: AsyncThreadContext,
+  context_control: ControlCharge,
   run: impl FnOnce() -> R,
 ) -> R {
   let shard = context.physical_index;
@@ -1437,7 +1453,8 @@ fn executor_thread<R>(
     resources: shared.root_resources(),
     _scope_owner: None,
   };
-  let _runtime_context = super::entry::EnterGuard::enter(&worker_handle);
+  let _runtime_context =
+    super::entry::EnterGuard::enter_with_control(&worker_handle, context_control);
   let _dispatcher = handoff::DispatcherGuard::install(shared, context);
   shared.thread_started(context);
   struct StopGuard<'a> {
@@ -1453,8 +1470,12 @@ fn executor_thread<R>(
   run()
 }
 
-pub(super) fn worker(shared: Arc<Shared>, context: AsyncThreadContext) {
-  executor_thread(&shared, context, || {
+pub(super) fn worker(
+  shared: Arc<Shared>,
+  context: AsyncThreadContext,
+  context_control: ControlCharge,
+) {
+  executor_thread(&shared, context, context_control, || {
     let _ = run_turns(&shared, context.physical_index, context, &mut None);
     cache::flush();
   });
@@ -1463,9 +1484,13 @@ pub(super) fn worker(shared: Arc<Shared>, context: AsyncThreadContext) {
 /// A prestarted handoff helper with its own shard hint. It parks until a
 /// handoff loan leaves fewer dispatching threads than workers, dispatches
 /// turns while it is needed, and retires only between turns.
-pub(super) fn helper(shared: Arc<Shared>, context: AsyncThreadContext) {
+pub(super) fn helper(
+  shared: Arc<Shared>,
+  context: AsyncThreadContext,
+  context_control: ControlCharge,
+) {
   let shard = context.physical_index;
-  executor_thread(&shared, context, || {
+  executor_thread(&shared, context, context_control, || {
     while let Some(lease) = wait_for_activation(&shared, shard, context) {
       let mut lease = Some(lease);
       let stop = run_turns(&shared, shard, context, &mut lease);

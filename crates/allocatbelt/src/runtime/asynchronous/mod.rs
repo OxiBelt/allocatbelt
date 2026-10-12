@@ -386,6 +386,8 @@ impl AsyncRuntime {
     if stack_size.is_some_and(|size| size == 0) {
       return Err(AsyncError::InvalidConfig);
     }
+    let mut prepared_contexts =
+      entry::PreparedContextNodes::new(tenant, threads).map_err(AsyncError::ResourceDomain)?;
     let mut prepared_joins =
       PreparedJoins::new(tenant, threads).map_err(AsyncError::ResourceDomain)?;
     let option_control = ControlCharge::try_new(tenant, options.control_name_capacity())
@@ -494,6 +496,16 @@ impl AsyncRuntime {
         }
         return Err(AsyncError::ResourceDomain(DomainError::Invalid));
       };
+      let Some(context_control) = prepared_contexts.pop() else {
+        shared.close(true);
+        drop(prepared_join);
+        for mut worker in workers {
+          if let Err(payload) = worker.join_blocking() {
+            drop_contained(payload);
+          }
+        }
+        return Err(AsyncError::ResourceDomain(DomainError::Invalid));
+      };
       let completion_owner = prepared_join.thread_owner();
       let thread_shared = Arc::clone(&shared);
       let thread_launch_control = launch_control.clone();
@@ -520,13 +532,13 @@ impl AsyncRuntime {
         builder.spawn(move || {
           completion_owner.retain_until_thread_exit();
           let _launch_control = thread_launch_control;
-          scheduler::worker(thread_shared, context)
+          scheduler::worker(thread_shared, context, context_control)
         })
       } else {
         builder.spawn(move || {
           completion_owner.retain_until_thread_exit();
           let _launch_control = thread_launch_control;
-          scheduler::helper(thread_shared, context)
+          scheduler::helper(thread_shared, context, context_control)
         })
       };
       match started {
@@ -544,6 +556,7 @@ impl AsyncRuntime {
       }
     }
     drop(prepared_joins);
+    drop(prepared_contexts);
     drop(names_control);
     Ok(Self {
       shared,
@@ -770,9 +783,18 @@ impl AsyncHandle {
   /// Enters this handle as the current runtime context on the calling thread.
   /// The current context is the most recently entered live guard. Dropping
   /// guards out of order removes only the dropped context.
+  ///
+  /// # Panics
+  ///
+  /// Panics when the bound tenant refuses the context node's Control charge.
   #[must_use]
   pub fn enter(&self) -> EnterGuard {
     EnterGuard::enter(self)
+  }
+
+  /// Tries to enter this handle as the current runtime context.
+  pub fn try_enter(&self) -> Result<EnterGuard, AsyncError> {
+    entry::EnterGuard::try_enter(self).map_err(AsyncError::ResourceDomain)
   }
 
   /// Returns the current entered handle, panicking when no context is active.
@@ -903,7 +925,7 @@ mod completion_tests {
   }
 
   #[test]
-  fn prepared_completion_control_exhaustion_precedes_name_and_start_callbacks() {
+  fn context_control_exhaustion_precedes_name_and_start_callbacks() {
     let ceiling = DomainResources::ZERO
       .with(DomainResource::Cpu, 2)
       .with(DomainResource::Tasks, 8)

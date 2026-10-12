@@ -853,6 +853,20 @@ impl LocalCore {
       .cloned()
   }
 
+  fn context_tenant(
+    &self,
+    scope_ref: ScopeRef,
+    scope_owner: Option<&Rc<ScopeCell>>,
+  ) -> Option<TenantDomain> {
+    scope_owner
+      .and_then(|scope| scope.tenant.clone())
+      .or_else(|| {
+        self
+          .scope_cell(scope_ref)
+          .and_then(|scope| scope.tenant.clone())
+      })
+  }
+
   fn insert_task(
     &self,
     task_ref: TaskRef,
@@ -962,6 +976,7 @@ struct LocalTaskAdmission {
   abort_flag_control: ControlCharge,
   abort_target_control: ControlCharge,
   request_control: ControlCharge,
+  context_control: ControlCharge,
 }
 
 fn reserve_local_task_admission<F, A>(
@@ -986,12 +1001,14 @@ where
   } else {
     0
   };
+  let context_control_bytes = std::mem::size_of::<LocalContextNode>();
   let all_control_bytes = task_control_bytes
     .checked_add(join_control_bytes)
     .and_then(|bytes| bytes.checked_add(abort_control_bytes))
     .and_then(|bytes| bytes.checked_add(finished_control_bytes))
     .and_then(|bytes| bytes.checked_add(abort_flag_control_bytes))
     .and_then(|bytes| bytes.checked_add(abort_target_control_bytes))
+    .and_then(|bytes| bytes.checked_add(context_control_bytes))
     .and_then(|bytes| bytes.checked_add(request_bytes))
     .ok_or(DomainError::Invalid)?;
   let (task, mut control) = if let Some(tenant) = tenant {
@@ -1013,6 +1030,7 @@ where
   let finished_control = control.split_off(finished_control_bytes)?;
   let abort_flag_control = control.split_off(abort_flag_control_bytes)?;
   let abort_target_control = control.split_off(abort_target_control_bytes)?;
+  let context_control = control.split_off(context_control_bytes)?;
   let request_control = control;
   Ok(LocalTaskAdmission {
     task,
@@ -1023,6 +1041,7 @@ where
     abort_flag_control,
     abort_target_control,
     request_control,
+    context_control,
   })
 }
 
@@ -1031,7 +1050,10 @@ trait LocalTask {
   fn cancel(&mut self);
   fn acquire_cpu(&mut self, waker: &Waker) -> DomainCpuAdmission;
   fn tenant_domain(&self) -> Option<&TenantDomain>;
+  /// The handle returned by `current` may outlive this scope's table entry.
+  fn context_scope_owner(&self) -> Rc<ScopeCell>;
   fn fail_resource(&mut self, error: DomainError);
+  fn take_context_control(&mut self) -> ControlCharge;
   fn release_admission(&mut self);
   fn complete_scope(&mut self, core: &LocalCore);
   fn publish(&mut self);
@@ -1050,6 +1072,7 @@ struct Task<F: Future + 'static> {
   resources: Option<ResourceScope>,
   _abort_metadata: Arc<dyn AbortMetadata>,
   task_control: Option<ControlCharge>,
+  context_control: ControlCharge,
 }
 
 impl<F: Future + 'static> Task<F> {
@@ -1143,6 +1166,10 @@ impl<F: Future + 'static> LocalTask for Task<F> {
     self.tenant.as_ref()
   }
 
+  fn context_scope_owner(&self) -> Rc<ScopeCell> {
+    Rc::clone(&self.scope)
+  }
+
   fn fail_resource(&mut self, error: DomainError) {
     let _task_context =
       TaskContextGuard::enter_with_resource(Some(self.id), self.resources.clone());
@@ -1154,6 +1181,10 @@ impl<F: Future + 'static> LocalTask for Task<F> {
     if let Some(waiter) = &self.waiter {
       waiter.cancel_wait();
     }
+  }
+
+  fn take_context_control(&mut self) -> ControlCharge {
+    std::mem::replace(&mut self.context_control, ControlCharge::unbounded(0))
   }
 
   fn release_admission(&mut self) {
@@ -1183,7 +1214,7 @@ impl<F: Future + 'static> LocalTask for Task<F> {
 
 trait ExternalRequest: Send {
   fn import(self: Box<Self>, core: &LocalCore, task_ref: TaskRef, scope: Rc<ScopeCell>);
-  fn cancel_on_owner(self: Box<Self>);
+  fn cancel_on_owner(self: Box<Self>, handle: &LocalHandle);
   fn reject(self: Box<Self>) -> Box<dyn Any + Send>;
 }
 
@@ -1202,6 +1233,7 @@ where
   waiter: Option<DomainWaiter>,
   task_admission: Option<DomainReservation>,
   task_control: ControlCharge,
+  context_control: ControlCharge,
   abort_metadata: Arc<dyn AbortMetadata>,
   _request_control: ControlCharge,
 }
@@ -1224,6 +1256,7 @@ where
       waiter,
       task_admission,
       task_control,
+      context_control,
       abort_metadata,
       _request_control,
     } = *self;
@@ -1240,6 +1273,7 @@ where
       scope: Rc::clone(&scope),
       _abort_metadata: abort_metadata,
       task_control: Some(task_control),
+      context_control,
     };
     drop(_request_control);
     core.insert_task(task_ref, scope, Arc::clone(&abort), Box::new(task));
@@ -1250,7 +1284,7 @@ where
     }
   }
 
-  fn cancel_on_owner(self: Box<Self>) {
+  fn cancel_on_owner(self: Box<Self>, handle: &LocalHandle) {
     let Self {
       future,
       id,
@@ -1263,9 +1297,11 @@ where
       waiter,
       task_admission,
       task_control,
+      context_control,
       abort_metadata: _,
       _request_control,
     } = *self;
+    let _local_context = LocalEnterGuard::enter_with_control(handle, context_control);
     let _task_context = TaskContextGuard::enter_with_resource(Some(id), resources);
     let outcome = match panic::catch_unwind(AssertUnwindSafe(|| drop(future))) {
       Ok(()) => Err(AsyncJoinError::Cancelled),
@@ -1293,6 +1329,7 @@ where
       waiter,
       task_admission,
       task_control,
+      context_control: _,
       abort_metadata: _,
       _request_control,
     } = *self;
@@ -1638,6 +1675,8 @@ impl LocalRuntime {
     let root_admission = self
       .core
       .root_admission(self.root_scope, std::mem::size_of::<F>())?;
+    let _context =
+      LocalEnterGuard::try_enter(&self.handle()).map_err(LocalError::ResourceDomain)?;
     let _local_execution = LocalExecutionGuard::enter();
     let root_resources = self
       .core
@@ -1647,7 +1686,6 @@ impl LocalRuntime {
       Some(resources) => TaskContextGuard::enter_with_resource(None, Some(resources)),
       None => TaskContextGuard::enter(None),
     };
-    let _context = LocalEnterGuard::enter(&self.handle());
     let root_waker = Waker::from(Arc::clone(&self.core.notifier));
     let mut context = Context::from_waker(&root_waker);
     let mut future = Box::pin(future);
@@ -1745,13 +1783,14 @@ impl LocalRuntime {
   }
 
   fn import_request(&mut self, request: Box<dyn ExternalRequest>) {
+    let root_handle = self.handle();
     if let Some(scope) = self.core.scope_cell(self.root_scope) {
       match self.core.control.admit(self.root_scope) {
         Ok(task_ref) => request.import(&self.core, task_ref, scope),
-        Err(_) => request.cancel_on_owner(),
+        Err(_) => request.cancel_on_owner(&root_handle),
       }
     } else {
-      request.cancel_on_owner();
+      request.cancel_on_owner(&root_handle);
     }
   }
 
@@ -1760,18 +1799,46 @@ impl LocalRuntime {
       self.core.control.abandon(task_ref);
       return;
     };
+    let scope_owner = slot.task.as_ref().map(|task| task.context_scope_owner());
     let task_handle = LocalHandle {
       core: Rc::clone(&self.core),
       scope: slot.scope,
-      _scope_owner: None,
+      _scope_owner: scope_owner,
       _not_send: PhantomData,
     };
-    let _task_context = LocalEnterGuard::enter(&task_handle);
     let aborting = aborting || slot.abort.load(Ordering::Acquire);
+    let mut context_error = None;
+    let context_guard = if let Some(task) = slot.task.as_mut() {
+      if aborting {
+        Some(LocalEnterGuard::enter_with_control(
+          &task_handle,
+          task.take_context_control(),
+        ))
+      } else {
+        match LocalEnterGuard::try_enter(&task_handle) {
+          Ok(guard) => Some(guard),
+          Err(error) => {
+            context_error = Some(error);
+            Some(LocalEnterGuard::enter_with_control(
+              &task_handle,
+              task.take_context_control(),
+            ))
+          }
+        }
+      }
+    } else {
+      None
+    };
+    let _task_context = context_guard;
     let task = slot.task.as_mut();
     let poll_result = if aborting {
       if let Some(task) = task {
         task.cancel();
+      }
+      Poll::Ready(())
+    } else if let Some(error) = context_error {
+      if let Some(task) = task {
+        task.fail_resource(error);
       }
       Poll::Ready(())
     } else if let Some(task) = task {
@@ -1903,8 +1970,7 @@ impl LocalRuntime {
 
     if let Ok(request) = self.receiver.try_recv() {
       let root_handle = self.handle();
-      let _root_context = LocalEnterGuard::enter(&root_handle);
-      request.cancel_on_owner();
+      request.cancel_on_owner(&root_handle);
       return Ok(false);
     }
 
@@ -1924,14 +1990,16 @@ impl LocalRuntime {
         continue;
       };
       if let Some(mut slot) = self.core.take_task(task_ref) {
+        let scope_owner = slot.task.as_ref().map(|task| task.context_scope_owner());
         let task_handle = LocalHandle {
           core: Rc::clone(&self.core),
           scope: slot.scope,
-          _scope_owner: None,
+          _scope_owner: scope_owner,
           _not_send: PhantomData,
         };
-        let _task_context = LocalEnterGuard::enter(&task_handle);
         if let Some(task) = slot.task.as_mut() {
+          let _task_context =
+            LocalEnterGuard::enter_with_control(&task_handle, task.take_context_control());
           task.cancel();
           self.core.control.abandon(task_ref);
           task.release_admission();
@@ -2070,6 +2138,8 @@ impl LocalHandle {
     let abort_flag_control =
       std::mem::replace(&mut domain.abort_flag_control, ControlCharge::unbounded(0));
     let task_control = std::mem::replace(&mut domain.task_control, ControlCharge::unbounded(0));
+    let context_control =
+      std::mem::replace(&mut domain.context_control, ControlCharge::unbounded(0));
     let task_admission = domain.task.take();
     let join = JoinState::with_id(id, join_control, finished_control);
     let abort_metadata = new_abort_metadata(
@@ -2091,6 +2161,7 @@ impl LocalHandle {
       scope: Rc::clone(&scope),
       _abort_metadata: Arc::clone(&abort_metadata),
       task_control: Some(task_control),
+      context_control,
     };
     self
       .core
@@ -2100,9 +2171,18 @@ impl LocalHandle {
   }
 
   /// Enters this local handle as the current local runtime context.
+  ///
+  /// # Panics
+  ///
+  /// Panics when the bound tenant refuses the context node's Control charge.
   #[must_use]
   pub fn enter(&self) -> LocalEnterGuard {
     LocalEnterGuard::enter(self)
+  }
+
+  /// Tries to enter this local handle as the current local runtime context.
+  pub fn try_enter(&self) -> Result<LocalEnterGuard, LocalError> {
+    LocalEnterGuard::try_enter(self).map_err(LocalError::ResourceDomain)
   }
 
   /// Returns the current local handle, panicking when no local context is
@@ -2244,6 +2324,8 @@ impl LocalSendHandle {
     );
     let request_control =
       std::mem::replace(&mut domain.request_control, ControlCharge::unbounded(0));
+    let context_control =
+      std::mem::replace(&mut domain.context_control, ControlCharge::unbounded(0));
     drop(domain);
     let join = JoinState::with_id(id, join_control, finished_control);
     let abort = Arc::new(LocalAbortFlag::new(abort_flag_control));
@@ -2271,6 +2353,7 @@ impl LocalSendHandle {
       waiter,
       task_admission,
       task_control,
+      context_control,
       _request_control: request_control,
     };
     let job = AsyncJob::new_with_metadata(join, abort_metadata);
@@ -2382,6 +2465,7 @@ struct LocalContextNode {
   handle: LocalHandle,
   parent: Option<Rc<LocalContextNode>>,
   active: Cell<bool>,
+  _control: ControlCharge,
 }
 
 thread_local! {
@@ -2397,6 +2481,20 @@ pub struct LocalEnterGuard {
 
 impl LocalEnterGuard {
   fn enter(handle: &LocalHandle) -> Self {
+    Self::try_enter(handle)
+      .unwrap_or_else(|error| panic!("local context Control reservation was refused: {error}"))
+  }
+
+  fn try_enter(handle: &LocalHandle) -> Result<Self, DomainError> {
+    let tenant = handle
+      .core
+      .context_tenant(handle.scope, handle._scope_owner.as_ref());
+    let control = ControlCharge::try_new(tenant.as_ref(), std::mem::size_of::<LocalContextNode>())?;
+    Ok(Self::enter_with_control(handle, control))
+  }
+
+  fn enter_with_control(handle: &LocalHandle, control: ControlCharge) -> Self {
+    debug_assert_eq!(control.bytes(), std::mem::size_of::<LocalContextNode>());
     let parent = LOCAL_CURRENT
       .try_with(|current| current.borrow().clone())
       .unwrap_or(None);
@@ -2404,6 +2502,7 @@ impl LocalEnterGuard {
       handle: handle.clone(),
       parent,
       active: Cell::new(true),
+      _control: control,
     });
     let replaced = LOCAL_CURRENT
       .try_with(|current| current.replace(Some(Rc::clone(&node))))
@@ -2529,7 +2628,8 @@ mod control_owner_tests {
       + std::mem::size_of::<JoinState<()>>()
       + abort_metadata_bytes::<LocalTaskAbort>()
       + finished_flag_bytes()
-      + std::mem::size_of::<LocalAbortFlag>();
+      + std::mem::size_of::<LocalAbortFlag>()
+      + std::mem::size_of::<LocalContextNode>();
     let local = reserve_local_task_admission::<F, LocalTaskAbort>(Some(&tenant), 0, false).unwrap();
     assert_eq!(
       domain.snapshot().used.get(DomainResource::Control),
@@ -2550,6 +2650,7 @@ mod control_owner_tests {
       + finished_flag_bytes()
       + std::mem::size_of::<LocalAbortFlag>()
       + std::mem::size_of::<LocalAbortTarget>()
+      + std::mem::size_of::<LocalContextNode>()
       + request_bytes;
     let send =
       reserve_local_task_admission::<F, LocalSendAbort>(Some(&tenant), request_bytes, true)
@@ -2573,6 +2674,410 @@ mod control_owner_tests {
       tenant_base
     );
     assert_eq!(domain.snapshot().used.get(DomainResource::Tasks), 0);
+  }
+
+  #[test]
+  fn local_context_denial_preserves_tls_and_out_of_order_guards_retain_parents() {
+    let ceiling = DomainResources::ZERO
+      .with(DomainResource::Cpu, 2)
+      .with(DomainResource::Tasks, 8)
+      .with(DomainResource::Control, 1 << 20);
+    let domain = ResourceDomain::with_waiters(ceiling, 1, 8).unwrap();
+    let tenant = domain.tenant(ceiling).unwrap();
+    let resources = ResourceScope::from_tenant(ResourceLimits::default(), tenant.clone());
+    let runtime = LocalRuntime::with_resources(
+      LocalConfig {
+        max_outstanding: 2,
+        max_scopes: 3,
+      },
+      resources,
+    )
+    .unwrap();
+    let root = runtime.handle();
+    let child = runtime.scope().unwrap();
+    let child_handle = child.handle();
+    let baseline = tenant.snapshot().unwrap().used.get(DomainResource::Control);
+    let node_bytes = std::mem::size_of::<LocalContextNode>();
+
+    let root_guard = root.try_enter().unwrap();
+    let child_guard = child_handle.try_enter().unwrap();
+    assert_eq!(
+      tenant.snapshot().unwrap().used.get(DomainResource::Control),
+      baseline + 2 * node_bytes
+    );
+    assert_eq!(
+      LocalHandle::try_current().map(|current| current.scope),
+      Some(child_handle.scope)
+    );
+
+    let snapshot = tenant.snapshot().unwrap();
+    let used = snapshot.used.get(DomainResource::Control);
+    tenant
+      .set_limits(snapshot.limit.with(DomainResource::Control, used))
+      .unwrap();
+    let error = match child_handle.try_enter() {
+      Ok(_) => panic!("context Control exhaustion was ignored"),
+      Err(error) => error,
+    };
+    assert!(matches!(
+      error,
+      LocalError::ResourceDomain(DomainError::Exhausted(DomainResource::Control))
+    ));
+    assert_eq!(
+      LocalHandle::try_current().map(|current| current.scope),
+      Some(child_handle.scope)
+    );
+    assert_eq!(
+      tenant.snapshot().unwrap().used.get(DomainResource::Control),
+      used
+    );
+    tenant.set_limits(snapshot.limit).unwrap();
+
+    drop(root_guard);
+    assert_eq!(
+      tenant.snapshot().unwrap().used.get(DomainResource::Control),
+      baseline + 2 * node_bytes
+    );
+    assert_eq!(
+      LocalHandle::try_current().map(|current| current.scope),
+      Some(child_handle.scope)
+    );
+    drop(child_guard);
+    assert_eq!(
+      LocalHandle::try_current().map(|current| current.scope),
+      None
+    );
+    assert_eq!(
+      tenant.snapshot().unwrap().used.get(DomainResource::Control),
+      baseline
+    );
+
+    drop(child);
+    drop(child_handle);
+    drop(root);
+    drop(runtime);
+  }
+
+  #[test]
+  fn task_returned_context_handle_retains_scope_tenant_after_reclamation() {
+    let ceiling = DomainResources::ZERO
+      .with(DomainResource::Cpu, 2)
+      .with(DomainResource::Tasks, 8)
+      .with(DomainResource::Control, 1 << 20);
+    let domain = ResourceDomain::with_waiters(ceiling, 1, 8).unwrap();
+    let tenant = domain.tenant(ceiling).unwrap();
+    let resources = ResourceScope::from_tenant(ResourceLimits::default(), tenant.clone());
+    let baseline = tenant.snapshot().unwrap().used.get(DomainResource::Control);
+    let mut runtime = LocalRuntime::with_resources(
+      LocalConfig {
+        max_outstanding: 2,
+        max_scopes: 3,
+      },
+      resources,
+    )
+    .unwrap();
+    let scope = runtime.scope().unwrap();
+    let scope_handle = scope.handle();
+    let returned = runtime
+      .block_on(
+        scope_handle
+          .spawn_local(std::future::poll_fn(
+            |_| Poll::Ready(LocalHandle::current()),
+          ))
+          .unwrap(),
+      )
+      .unwrap()
+      .unwrap();
+    let scope_ref = returned.scope;
+
+    runtime.block_on(scope.close()).unwrap();
+    assert!(runtime.core.scope_cell(scope_ref).is_none());
+
+    let before_entry = tenant.snapshot().unwrap().used.get(DomainResource::Control);
+    let guard = returned.try_enter().unwrap();
+    assert_eq!(
+      tenant.snapshot().unwrap().used.get(DomainResource::Control),
+      before_entry + std::mem::size_of::<LocalContextNode>()
+    );
+    drop(guard);
+    assert_eq!(
+      tenant.snapshot().unwrap().used.get(DomainResource::Control),
+      before_entry
+    );
+
+    tenant.close();
+    let closed_used = tenant.snapshot().unwrap().used.get(DomainResource::Control);
+    assert!(matches!(
+      returned.try_enter(),
+      Err(LocalError::ResourceDomain(DomainError::Closed))
+    ));
+    assert_eq!(
+      tenant.snapshot().unwrap().used.get(DomainResource::Control),
+      closed_used
+    );
+
+    drop(scope_handle);
+    drop(returned);
+    drop(runtime);
+    assert_eq!(
+      tenant.snapshot().unwrap().used.get(DomainResource::Control),
+      baseline
+    );
+  }
+
+  #[test]
+  fn local_root_entry_refusal_restores_previous_context_without_polling() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct CountPolls(Arc<AtomicUsize>);
+    impl Future for CountPolls {
+      type Output = ();
+
+      fn poll(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Self::Output> {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        Poll::Ready(())
+      }
+    }
+
+    let ceiling = DomainResources::ZERO
+      .with(DomainResource::Cpu, 2)
+      .with(DomainResource::Tasks, 8)
+      .with(DomainResource::Control, 1 << 20);
+    let domain = ResourceDomain::with_waiters(ceiling, 1, 8).unwrap();
+    let tenant = domain.tenant(ceiling).unwrap();
+    let resources = ResourceScope::from_tenant(ResourceLimits::default(), tenant.clone());
+    let baseline = tenant.snapshot().unwrap().used.get(DomainResource::Control);
+    let mut runtime = LocalRuntime::with_resources(
+      LocalConfig {
+        max_outstanding: 2,
+        max_scopes: 2,
+      },
+      resources,
+    )
+    .unwrap();
+    let handle = runtime.handle();
+    let outer = handle.try_enter().unwrap();
+    let snapshot = tenant.snapshot().unwrap();
+    let used = snapshot.used.get(DomainResource::Control);
+    let frame_bytes = std::mem::size_of::<CountPolls>() + std::mem::size_of::<LocalRootAdmission>();
+    tenant
+      .set_limits(
+        snapshot
+          .limit
+          .with(DomainResource::Control, used + frame_bytes),
+      )
+      .unwrap();
+
+    let polls = Arc::new(AtomicUsize::new(0));
+    assert!(matches!(
+      runtime.block_on(CountPolls(Arc::clone(&polls))),
+      Err(LocalError::ResourceDomain(DomainError::Exhausted(
+        DomainResource::Control
+      )))
+    ));
+    assert_eq!(polls.load(Ordering::SeqCst), 0);
+    assert_eq!(
+      LocalHandle::try_current().map(|current| current.scope),
+      Some(handle.scope)
+    );
+    assert_eq!(
+      tenant.snapshot().unwrap().used.get(DomainResource::Control),
+      used
+    );
+
+    tenant.set_limits(snapshot.limit).unwrap();
+    drop(outer);
+    drop(handle);
+    drop(runtime);
+    assert_eq!(
+      tenant.snapshot().unwrap().used.get(DomainResource::Control),
+      baseline
+    );
+  }
+
+  #[test]
+  fn local_poll_entry_denial_consumes_the_admitted_cleanup_node() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    struct DropProbe(Arc<AtomicBool>);
+    impl Future for DropProbe {
+      type Output = ();
+
+      fn poll(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Self::Output> {
+        Poll::Pending
+      }
+    }
+    impl Drop for DropProbe {
+      fn drop(&mut self) {
+        self
+          .0
+          .store(LocalHandle::try_current().is_some(), Ordering::SeqCst);
+      }
+    }
+
+    let ceiling = DomainResources::ZERO
+      .with(DomainResource::Cpu, 2)
+      .with(DomainResource::Tasks, 8)
+      .with(DomainResource::Control, 1 << 20);
+    let domain = ResourceDomain::with_waiters(ceiling, 1, 8).unwrap();
+    let tenant = domain.tenant(ceiling).unwrap();
+    let resources = ResourceScope::from_tenant(ResourceLimits::default(), tenant.clone());
+    let baseline = tenant.snapshot().unwrap().used.get(DomainResource::Control);
+    let mut runtime = LocalRuntime::with_resources(
+      LocalConfig {
+        max_outstanding: 2,
+        max_scopes: 2,
+      },
+      resources,
+    )
+    .unwrap();
+    let old_limit = tenant.snapshot().unwrap().limit;
+    let observed = Arc::new(AtomicBool::new(false));
+    let job = runtime
+      .handle()
+      .spawn_local(DropProbe(Arc::clone(&observed)))
+      .unwrap();
+    let mut first_root_poll = true;
+    let clamp_tenant = tenant.clone();
+    runtime
+      .block_on(std::future::poll_fn(move |_| {
+        if first_root_poll {
+          first_root_poll = false;
+          let used = clamp_tenant
+            .snapshot()
+            .unwrap()
+            .used
+            .get(DomainResource::Control);
+          clamp_tenant
+            .set_limits(old_limit.with(DomainResource::Control, used))
+            .unwrap();
+          Poll::Pending
+        } else {
+          Poll::Ready(())
+        }
+      }))
+      .unwrap();
+
+    assert!(observed.load(Ordering::SeqCst));
+    tenant.set_limits(old_limit).unwrap();
+    let outcome = runtime.block_on(job).unwrap();
+    assert!(matches!(
+      outcome,
+      Err(AsyncJoinError::ResourceDomain(DomainError::Exhausted(
+        DomainResource::Control
+      )))
+    ));
+    drop(runtime);
+    assert_eq!(
+      tenant.snapshot().unwrap().used.get(DomainResource::Control),
+      baseline
+    );
+  }
+
+  #[test]
+  fn local_task_cleanup_after_tenant_close_uses_its_precharged_context() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    struct DropProbe(Arc<AtomicBool>);
+    impl Future for DropProbe {
+      type Output = ();
+
+      fn poll(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Self::Output> {
+        Poll::Pending
+      }
+    }
+    impl Drop for DropProbe {
+      fn drop(&mut self) {
+        self
+          .0
+          .store(LocalHandle::try_current().is_some(), Ordering::SeqCst);
+      }
+    }
+
+    let ceiling = DomainResources::ZERO
+      .with(DomainResource::Cpu, 2)
+      .with(DomainResource::Tasks, 8)
+      .with(DomainResource::Control, 1 << 20);
+    let domain = ResourceDomain::with_waiters(ceiling, 1, 8).unwrap();
+    let tenant = domain.tenant(ceiling).unwrap();
+    let resources = ResourceScope::from_tenant(ResourceLimits::default(), tenant.clone());
+    let baseline = tenant.snapshot().unwrap().used.get(DomainResource::Control);
+    let runtime = LocalRuntime::with_resources(
+      LocalConfig {
+        max_outstanding: 2,
+        max_scopes: 2,
+      },
+      resources,
+    )
+    .unwrap();
+    let handle = runtime.handle();
+    let observed = Arc::new(AtomicBool::new(false));
+    let job = handle
+      .spawn_local(DropProbe(Arc::clone(&observed)))
+      .unwrap();
+    tenant.close();
+
+    drop(runtime);
+
+    assert!(observed.load(Ordering::SeqCst));
+    drop(job);
+    drop(handle);
+    assert_eq!(
+      tenant.snapshot().unwrap().used.get(DomainResource::Control),
+      baseline
+    );
+  }
+
+  #[test]
+  fn queued_send_cleanup_after_tenant_close_uses_request_context_charge() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    struct DropProbe(Arc<AtomicBool>);
+    impl Future for DropProbe {
+      type Output = ();
+
+      fn poll(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Self::Output> {
+        Poll::Pending
+      }
+    }
+    impl Drop for DropProbe {
+      fn drop(&mut self) {
+        self
+          .0
+          .store(LocalHandle::try_current().is_some(), Ordering::SeqCst);
+      }
+    }
+
+    let ceiling = DomainResources::ZERO
+      .with(DomainResource::Cpu, 2)
+      .with(DomainResource::Tasks, 8)
+      .with(DomainResource::Control, 1 << 20);
+    let domain = ResourceDomain::with_waiters(ceiling, 1, 8).unwrap();
+    let tenant = domain.tenant(ceiling).unwrap();
+    let resources = ResourceScope::from_tenant(ResourceLimits::default(), tenant.clone());
+    let baseline = tenant.snapshot().unwrap().used.get(DomainResource::Control);
+    let runtime = LocalRuntime::with_resources(
+      LocalConfig {
+        max_outstanding: 2,
+        max_scopes: 2,
+      },
+      resources,
+    )
+    .unwrap();
+    let send = runtime.send_handle();
+    let observed = Arc::new(AtomicBool::new(false));
+    let job = send.spawn(DropProbe(Arc::clone(&observed))).unwrap();
+    tenant.close();
+
+    drop(runtime);
+
+    assert!(observed.load(Ordering::SeqCst));
+    drop(job);
+    drop(send);
+    assert_eq!(
+      tenant.snapshot().unwrap().used.get(DomainResource::Control),
+      baseline
+    );
   }
 
   #[test]

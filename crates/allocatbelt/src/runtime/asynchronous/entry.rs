@@ -17,7 +17,9 @@ use super::identity::TaskId;
 use super::{AsyncError, AsyncHandle};
 use crate::runtime::cpu_execution::{CpuExecutionGuard, active_for_domain};
 use crate::runtime::managed::ResourceScope;
-use crate::runtime::resource_domain::{ControlCharge, DomainReservation};
+use crate::runtime::resource_domain::{
+  ControlCharge, DomainError, DomainReservation, TenantDomain, payload_bytes,
+};
 
 const DEFAULT_BUDGET: u16 = 64;
 
@@ -37,6 +39,48 @@ struct ContextNode {
   handle: AsyncHandle,
   parent: Option<Rc<ContextNode>>,
   active: Cell<bool>,
+  _control: ControlCharge,
+}
+
+/// Precharged context-node owners moved directly into executor thread-local
+/// roots before their first lifecycle callback.
+pub(super) struct PreparedContextNodes {
+  entries: Vec<ControlCharge>,
+  _control: ControlCharge,
+}
+
+impl PreparedContextNodes {
+  pub(super) fn new(tenant: Option<&TenantDomain>, count: usize) -> Result<Self, DomainError> {
+    if count == 0 {
+      return Err(DomainError::Invalid);
+    }
+    let node_bytes = payload_bytes::<ContextNode>(count)?;
+    let mut node_control = ControlCharge::try_new(tenant, node_bytes)?;
+    let requested_storage = std::mem::size_of::<Self>()
+      .checked_add(payload_bytes::<ControlCharge>(count)?)
+      .ok_or(DomainError::Invalid)?;
+    let mut storage_control = ControlCharge::try_new(tenant, requested_storage)?;
+    let mut entries = Vec::new();
+    entries
+      .try_reserve_exact(count)
+      .map_err(|_| DomainError::OutOfMemory)?;
+    let actual_storage = std::mem::size_of::<Self>()
+      .checked_add(payload_bytes::<ControlCharge>(entries.capacity())?)
+      .ok_or(DomainError::Invalid)?;
+    storage_control.try_resize(actual_storage)?;
+    for _ in 0..count {
+      entries.push(node_control.split_off(std::mem::size_of::<ContextNode>())?);
+    }
+    drop(node_control);
+    Ok(Self {
+      entries,
+      _control: storage_control,
+    })
+  }
+
+  pub(super) fn pop(&mut self) -> Option<ControlCharge> {
+    self.entries.pop()
+  }
 }
 
 /// A thread-affine entered runtime context. The current context is the most
@@ -63,6 +107,22 @@ pub struct EnterGuard {
 
 impl EnterGuard {
   pub(super) fn enter(handle: &AsyncHandle) -> Self {
+    Self::try_enter(handle)
+      .unwrap_or_else(|error| panic!("async context Control reservation was refused: {error}"))
+  }
+
+  pub(super) fn try_enter(handle: &AsyncHandle) -> Result<Self, DomainError> {
+    let tenant = handle.shared.context_tenant(
+      handle.scope,
+      handle._scope_owner.as_ref(),
+      handle.resources.as_ref(),
+    );
+    let control = ControlCharge::try_new(tenant.as_ref(), std::mem::size_of::<ContextNode>())?;
+    Ok(Self::enter_with_control(handle, control))
+  }
+
+  pub(super) fn enter_with_control(handle: &AsyncHandle, control: ControlCharge) -> Self {
+    debug_assert_eq!(control.bytes(), std::mem::size_of::<ContextNode>());
     let parent = CURRENT
       .try_with(|current| current.borrow().clone())
       .unwrap_or(None);
@@ -70,6 +130,7 @@ impl EnterGuard {
       handle: handle.clone(),
       parent,
       active: Cell::new(true),
+      _control: control,
     });
     let replaced = CURRENT
       .try_with(|current| current.replace(Some(Rc::clone(&node))))
@@ -498,8 +559,8 @@ pub(super) fn block_on<F: Future>(
   let root_admission = handle
     .shared
     .root_admission(handle.scope, handle.resources.as_ref())?;
+  let _context = EnterGuard::try_enter(handle).map_err(AsyncError::ResourceDomain)?;
   let _task_context = TaskContextGuard::enter_with_resource(None, handle.resources.clone());
-  let _context = EnterGuard::enter(handle);
   block_on_caller_thread_with_domain(
     future,
     root_admission.tenant.as_ref(),
@@ -878,7 +939,8 @@ mod tests {
     );
 
     let frame_bytes = std::mem::size_of::<CaptureWaker>()
-      + std::mem::size_of::<super::super::scheduler::RootAdmission>();
+      + std::mem::size_of::<super::super::scheduler::RootAdmission>()
+      + std::mem::size_of::<ContextNode>();
     let ceiling_with_root_frame = baseline + frame_bytes;
     let domain_before = domain.snapshot();
     let tenant_before = tenant
@@ -927,6 +989,144 @@ mod tests {
     runtime
       .shutdown(crate::runtime::asynchronous::AsyncShutdown::Drain)
       .unwrap_or_else(|error| panic!("async shutdown failed: {error}"));
+  }
+
+  #[test]
+  fn context_denial_preserves_the_previous_tls_guard_and_root_poll_state() {
+    use crate::runtime::asynchronous::{AsyncConfig, AsyncRuntime};
+    use crate::runtime::managed::{ResourceLimits, ResourceScope};
+    use crate::runtime::resource_domain::{
+      DomainError, DomainResource, DomainResources, ResourceDomain,
+    };
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct CountPolls(Arc<AtomicUsize>);
+    impl Future for CountPolls {
+      type Output = ();
+
+      fn poll(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Self::Output> {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        Poll::Ready(())
+      }
+    }
+
+    let ceiling = DomainResources::ZERO
+      .with(DomainResource::Cpu, 2)
+      .with(DomainResource::Tasks, 8)
+      .with(DomainResource::Control, 1 << 20);
+    let domain = ResourceDomain::with_waiters(ceiling, 1, 8).unwrap();
+    let tenant = domain.tenant(ceiling).unwrap();
+    let resources = ResourceScope::from_tenant(ResourceLimits::default(), tenant.clone());
+    let runtime = AsyncRuntime::with_resources(
+      AsyncConfig {
+        workers: 1,
+        max_outstanding: 2,
+        max_scopes: 2,
+      },
+      resources,
+    )
+    .unwrap();
+    let handle = runtime.handle();
+    let outer = handle.try_enter().unwrap();
+    let before = tenant.snapshot().unwrap();
+    let used = before.used.get(DomainResource::Control);
+    let frame = std::mem::size_of::<CountPolls>()
+      + std::mem::size_of::<super::super::scheduler::RootAdmission>();
+    tenant
+      .set_limits(before.limit.with(DomainResource::Control, used + frame))
+      .unwrap();
+
+    let polls = Arc::new(AtomicUsize::new(0));
+    assert!(matches!(
+      handle.block_on(CountPolls(Arc::clone(&polls))),
+      Err(AsyncError::ResourceDomain(DomainError::Exhausted(
+        DomainResource::Control
+      )))
+    ));
+    assert_eq!(polls.load(Ordering::SeqCst), 0);
+    assert_eq!(
+      AsyncHandle::try_current().map(|current| current.scope),
+      Some(handle.scope)
+    );
+    assert_eq!(
+      tenant.snapshot().unwrap().used.get(DomainResource::Control),
+      used
+    );
+
+    tenant.set_limits(before.limit).unwrap();
+    drop(outer);
+    assert_eq!(
+      tenant.snapshot().unwrap().used.get(DomainResource::Control),
+      used - std::mem::size_of::<ContextNode>()
+    );
+    runtime
+      .shutdown(crate::runtime::asynchronous::AsyncShutdown::Drain)
+      .unwrap();
+  }
+
+  #[test]
+  fn context_charges_follow_out_of_order_nested_parent_chains() {
+    use crate::runtime::asynchronous::{AsyncConfig, AsyncRuntime};
+    use crate::runtime::managed::{ResourceLimits, ResourceScope};
+    use crate::runtime::resource_domain::{DomainResource, DomainResources, ResourceDomain};
+
+    let ceiling = DomainResources::ZERO
+      .with(DomainResource::Cpu, 2)
+      .with(DomainResource::Tasks, 8)
+      .with(DomainResource::Control, 1 << 20);
+    let domain = ResourceDomain::with_waiters(ceiling, 1, 8).unwrap();
+    let tenant = domain.tenant(ceiling).unwrap();
+    let resources = ResourceScope::from_tenant(ResourceLimits::default(), tenant.clone());
+    let runtime = AsyncRuntime::with_resources(
+      AsyncConfig {
+        workers: 1,
+        max_outstanding: 2,
+        max_scopes: 3,
+      },
+      resources,
+    )
+    .unwrap();
+    let root = runtime.handle();
+    let child = runtime.scope().unwrap();
+    let child_handle = child.handle();
+    let baseline = tenant.snapshot().unwrap().used.get(DomainResource::Control);
+    let node_bytes = std::mem::size_of::<ContextNode>();
+
+    let root_guard = root.try_enter().unwrap();
+    let child_guard = child_handle.try_enter().unwrap();
+    assert_eq!(
+      tenant.snapshot().unwrap().used.get(DomainResource::Control),
+      baseline + 2 * node_bytes
+    );
+    assert_eq!(
+      AsyncHandle::try_current().map(|current| current.scope),
+      Some(child_handle.scope)
+    );
+
+    drop(root_guard);
+    assert_eq!(
+      tenant.snapshot().unwrap().used.get(DomainResource::Control),
+      baseline + 2 * node_bytes,
+      "the child node retains its inactive parent"
+    );
+    assert_eq!(
+      AsyncHandle::try_current().map(|current| current.scope),
+      Some(child_handle.scope)
+    );
+    drop(child_guard);
+    assert_eq!(
+      AsyncHandle::try_current().map(|current| current.scope),
+      None
+    );
+    assert_eq!(
+      tenant.snapshot().unwrap().used.get(DomainResource::Control),
+      baseline
+    );
+
+    drop(child);
+    runtime
+      .shutdown(crate::runtime::asynchronous::AsyncShutdown::Drain)
+      .unwrap();
   }
 
   #[test]

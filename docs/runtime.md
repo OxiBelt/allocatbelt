@@ -1002,6 +1002,19 @@ guard is dropped. Worker polls also enter the runtime's implicit root handle.
 `current` panics without an entered context, while `try_current` returns
 `None`.
 
+Tenant-bound async and local entry nodes reserve their declared payload before
+allocation or context installation. `AsyncHandle::try_enter` and
+`LocalHandle::try_enter` return typed admission errors; `enter` panics if that
+admission fails. Guard parent chains retain fees until their final owner drops,
+and scoped current handles retain their original tenant binding after scope
+closure. Borrowed-root entry failure preserves the prior context without
+polling the future.
+
+Worker and handoff-helper entry storage is reserved before naming callbacks
+or thread startup. Local task and external-request admission also reserves a
+cleanup node, so cancellation can restore its context after tenant closure or
+metadata exhaustion without requesting another charge.
+
 `yield_now` schedules one self-wake and completes on the next poll; it does not
 guarantee another task runs first. `consume_budget` is an opt-in checkpoint
 that consumes from the shared per-poll budget and yields when the combined
