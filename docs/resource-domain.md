@@ -4,11 +4,16 @@
 CPU, managed-memory, disk, network, task and control charges.
 `ResourceDomain::new` reserves its tenant-slot table before exposing the
 domain. `ResourceDomain::with_waiters(ceiling, max_tenants, max_waiters)` also
-reserves a fixed CPU-waiter table. Actual retained slot capacities are charged
-to `Control`; allocator rounding, `Arc` headers and waker payload allocations
+reserves a fixed CPU-waiter table. Actual retained slot capacities, the shared
+state payload and reserved tenant-owner payloads are charged to global
+`Control`; allocator rounding, `Arc` headers and waker payload allocations
 are not measured physical memory. The existing `new` constructor keeps a
 zero-waiter table for callers that only need synchronous reservations.
-The domain constructor charges its tenant and waiter tables. Tenant-bound
+Each tenant slot reserves one owner payload before the domain is exposed.
+Creating or cloning a tenant does not charge its own Control quota, so a
+zero-Control tenant can still be represented. This fixed owner reservation
+avoids a self-retaining ownership cycle and lasts with the domain tables.
+The domain constructor charges its state, owner storage and tables. Tenant-bound
 schedulers, scopes, task frames, queues, wake owners and selected service
 adapters also reserve their declared metadata payloads before admission or
 startup, retaining those fees with the final owners. Unbound lower-level

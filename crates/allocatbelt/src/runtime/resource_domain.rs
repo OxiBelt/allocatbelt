@@ -228,8 +228,10 @@ pub struct DomainSnapshot {
 
 impl ResourceDomain {
   /// Reserves every tenant slot before exposing the domain. Fixed slot
-  /// payload bytes are charged to `Control`; allocation/header overhead is
-  /// not represented as measured physical memory.
+  /// payload bytes, shared-state payload and a tenant-owner payload for each
+  /// slot are charged to global `Control`; allocation/header overhead is not
+  /// represented as measured physical memory. Owner storage is reserved by
+  /// the domain, so zero-Control tenant ceilings remain valid.
   pub fn new(ceiling: DomainResources, max_tenants: usize) -> Result<Self, DomainError> {
     Self::with_waiters(ceiling, max_tenants, 0)
   }
@@ -246,10 +248,23 @@ impl ResourceDomain {
     if max_tenants == 0 {
       return Err(DomainError::Invalid);
     }
+    let owner_bytes = max_tenants
+      .checked_mul(std::mem::size_of::<TenantOwner>())
+      .ok_or(DomainError::Invalid)?;
+    let fixed_bytes = std::mem::size_of::<Mutex<State>>()
+      .checked_add(owner_bytes)
+      .ok_or(DomainError::Invalid)?;
+    let requested_waiter_bytes = max_waiters
+      .checked_mul(std::mem::size_of::<WaiterSlot>())
+      .ok_or(DomainError::Invalid)?;
     let tenant_bytes = max_tenants
       .checked_mul(std::mem::size_of::<TenantSlot>())
+      .and_then(|bytes| bytes.checked_add(fixed_bytes))
       .ok_or(DomainError::Invalid)?;
-    if tenant_bytes > ceiling.get(DomainResource::Control) {
+    let requested_bytes = tenant_bytes
+      .checked_add(requested_waiter_bytes)
+      .ok_or(DomainError::Invalid)?;
+    if requested_bytes > ceiling.get(DomainResource::Control) {
       return Err(DomainError::Exhausted(DomainResource::Control));
     }
     let mut tenants = Vec::new();
@@ -259,8 +274,12 @@ impl ResourceDomain {
     let actual_bytes = tenants
       .capacity()
       .checked_mul(std::mem::size_of::<TenantSlot>())
+      .and_then(|bytes| bytes.checked_add(fixed_bytes))
       .ok_or(DomainError::Invalid)?;
-    if actual_bytes > ceiling.get(DomainResource::Control) {
+    let reconciled_request = actual_bytes
+      .checked_add(requested_waiter_bytes)
+      .ok_or(DomainError::Invalid)?;
+    if reconciled_request > ceiling.get(DomainResource::Control) {
       return Err(DomainError::Exhausted(DomainResource::Control));
     }
     tenants.resize_with(max_tenants, TenantSlot::empty);
@@ -1176,6 +1195,46 @@ mod tests {
   }
 
   #[test]
+  fn fixed_metadata_fee_covers_shared_state_tables_and_reserved_tenant_owners() {
+    let ceilings = limits(2, 32);
+    let domain = ResourceDomain::with_waiters(ceilings, 2, 3).unwrap();
+    let expected = {
+      let state = lock(&domain.state);
+      std::mem::size_of::<Mutex<State>>()
+        + state.tenants.len() * std::mem::size_of::<TenantOwner>()
+        + state.tenants.capacity() * std::mem::size_of::<TenantSlot>()
+        + state.waiters.capacity() * std::mem::size_of::<WaiterSlot>()
+    };
+    assert_eq!(
+      domain.snapshot().used.get(DomainResource::Control),
+      expected
+    );
+    let first = domain.tenant(DomainResources::ZERO).unwrap();
+    let retained = first.clone();
+    let second = domain.tenant(DomainResources::ZERO).unwrap();
+    assert_eq!(
+      domain.snapshot().used.get(DomainResource::Control),
+      expected
+    );
+    assert_eq!(first.snapshot().unwrap().used, DomainResources::ZERO);
+    drop(first);
+    assert_eq!(domain.snapshot().live_tenants, 2);
+    drop(retained);
+    drop(second);
+    assert_eq!(domain.snapshot().live_tenants, 0);
+    assert_eq!(
+      domain.snapshot().used.get(DomainResource::Control),
+      expected
+    );
+
+    let too_small = ceilings.with(DomainResource::Control, expected - 1);
+    assert!(matches!(
+      ResourceDomain::with_waiters(too_small, 2, 3),
+      Err(DomainError::Exhausted(DomainResource::Control))
+    ));
+  }
+
+  #[test]
   fn split_reservation_preserves_usage_and_releases_components_independently() {
     let limits = limits(1, 0);
     let domain = ResourceDomain::new(limits, 1).unwrap();
@@ -1640,14 +1699,16 @@ mod tests {
     let state = lock(&domain.state);
     let table_bytes = state.tenants.capacity() * std::mem::size_of::<TenantSlot>()
       + state.waiters.capacity() * std::mem::size_of::<WaiterSlot>();
+    let fixed_bytes = std::mem::size_of::<Mutex<State>>()
+      + state.tenants.len() * std::mem::size_of::<TenantOwner>();
     drop(state);
-    let expected = table_bytes + DomainWaitPool::control_payload_bytes();
+    let expected = fixed_bytes + table_bytes + DomainWaitPool::control_payload_bytes();
     assert_eq!(
       domain.snapshot().used.get(DomainResource::Control),
       expected
     );
 
-    let too_small = ceiling.with(DomainResource::Control, table_bytes - 1);
+    let too_small = ceiling.with(DomainResource::Control, fixed_bytes + table_bytes - 1);
     assert_eq!(
       ResourceDomain::with_waiters(too_small, 2, 4).unwrap_err(),
       DomainError::Exhausted(DomainResource::Control)
