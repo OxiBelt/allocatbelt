@@ -159,6 +159,43 @@ impl ByteRateLimit {
     self.reserve_at(bytes, Instant::now())
   }
 
+  /// Reserves available credit up to `maximum` for partial stream progress.
+  /// Refills under the lock before choosing the size. This deliberately
+  /// clamps to available credit rather than splitting an exact datagram;
+  /// datagrams must continue using [`try_reserve`](Self::try_reserve).
+  pub fn try_reserve_up_to(&self, maximum: usize) -> Result<ByteReservation, ByteRateError> {
+    if maximum == 0 {
+      return Ok(ByteReservation {
+        shared: None,
+        bytes: 0,
+      });
+    }
+    let mut state = self
+      .shared
+      .lock()
+      .unwrap_or_else(|error| error.into_inner());
+    if state.reservations == state.ceilings.max_reservations {
+      return Err(ByteRateError::ReservationsFull);
+    }
+    state.refill(Instant::now());
+    let bytes = maximum.min(state.available);
+    if bytes == 0 {
+      let needed = NANOS - u128::from(state.carry);
+      let nanos = needed.div_ceil(u128::from(state.rate));
+      return Err(ByteRateError::Insufficient(Duration::new(
+        (nanos / NANOS) as u64,
+        (nanos % NANOS) as u32,
+      )));
+    }
+    state.available -= bytes;
+    state.reserved += bytes;
+    state.reservations += 1;
+    Ok(ByteReservation {
+      shared: Some(Arc::clone(&self.shared)),
+      bytes,
+    })
+  }
+
   fn reserve_at(&self, bytes: usize, now: Instant) -> Result<ByteReservation, ByteRateError> {
     let mut state = self
       .shared
@@ -197,6 +234,30 @@ impl ByteRateLimit {
   /// construction-time ceilings. Increasing a burst never creates tokens.
   pub fn set_limits(&self, bytes_per_second: u64, burst_bytes: usize) -> Result<(), ByteRateError> {
     self.set_limits_at(bytes_per_second, burst_bytes, Instant::now())
+  }
+
+  /// Changes only the rate when it still matches `expected`, preserving the
+  /// current burst and outstanding reservations. A stale writer changes
+  /// nothing, including stored refill balances. Feedback uses this operation
+  /// to avoid overwriting a concurrent controller's rate or burst update.
+  pub fn compare_exchange_rate(&self, expected: u64, desired: u64) -> Result<bool, ByteRateError> {
+    let mut state = self
+      .shared
+      .lock()
+      .unwrap_or_else(|error| error.into_inner());
+    if state.rate != expected {
+      return Ok(false);
+    }
+    if desired == 0 {
+      return Err(ByteRateError::InvalidConfig);
+    }
+    if desired > state.ceilings.bytes_per_second {
+      return Err(ByteRateError::AboveCeiling);
+    }
+    state.refill(Instant::now());
+    state.rate = desired;
+    state.carry = 0;
+    Ok(true)
   }
 
   fn set_limits_at(&self, rate: u64, burst: usize, now: Instant) -> Result<(), ByteRateError> {
@@ -376,5 +437,63 @@ mod tests {
     reservation.commit(1).unwrap();
     assert_eq!(limit.snapshot().available_bytes, 9);
     assert_eq!(limit.snapshot().reserved_bytes, 0);
+  }
+
+  #[test]
+  fn rate_compare_exchange_preserves_burst_and_rejects_stale_writers() {
+    let limit = bucket(10, 100, 2);
+    limit.set_limits(5, 50).unwrap();
+    let before = limit.snapshot();
+    assert_eq!(limit.compare_exchange_rate(10, 9), Ok(false));
+    assert_eq!(limit.snapshot(), before);
+    assert_eq!(
+      limit.compare_exchange_rate(5, 11),
+      Err(ByteRateError::AboveCeiling)
+    );
+    assert_eq!(limit.snapshot(), before);
+    assert_eq!(
+      limit.compare_exchange_rate(5, 0),
+      Err(ByteRateError::InvalidConfig)
+    );
+    assert_eq!(limit.compare_exchange_rate(5, 7), Ok(true));
+    assert_eq!(limit.snapshot().bytes_per_second, 7);
+    assert_eq!(limit.snapshot().burst_bytes, 50);
+  }
+
+  #[test]
+  fn concurrent_rate_writers_have_one_winner() {
+    let limit = bucket(100, 10, 1);
+    let first = limit.clone();
+    let second = limit.clone();
+    let first = std::thread::spawn(move || first.compare_exchange_rate(100, 80).unwrap());
+    let second = std::thread::spawn(move || second.compare_exchange_rate(100, 90).unwrap());
+    assert_ne!(first.join().unwrap(), second.join().unwrap());
+    assert!(matches!(limit.snapshot().bytes_per_second, 80 | 90));
+    assert_eq!(limit.snapshot().available_bytes, 10);
+  }
+
+  #[test]
+  fn partial_stream_admission_clamps_to_available_credit_and_refunds_unused_bytes() {
+    let limit = bucket(1, 10, 2);
+    limit.try_reserve(7).unwrap().commit(7).unwrap();
+    let partial = limit.try_reserve_up_to(usize::MAX).unwrap();
+    assert_eq!(partial.bytes(), 3);
+    assert_eq!(limit.snapshot().available_bytes, 0);
+    partial.commit(1).unwrap();
+    assert_eq!(limit.snapshot().available_bytes, 2);
+    assert_eq!(limit.snapshot().reserved_bytes, 0);
+  }
+
+  #[test]
+  fn exhausted_stream_credit_reports_one_byte_wait_and_zero_uses_no_entry() {
+    let limit = bucket(1, 10, 1);
+    limit.try_reserve(10).unwrap().commit(10).unwrap();
+    let error = limit.try_reserve_up_to(4096).unwrap_err();
+    assert!(
+      matches!(error, ByteRateError::Insufficient(wait) if wait > Duration::ZERO && wait <= Duration::from_secs(1))
+    );
+    let zero = limit.try_reserve_up_to(0).unwrap();
+    assert_eq!(zero.bytes(), 0);
+    assert_eq!(limit.snapshot().reservations, 0);
   }
 }

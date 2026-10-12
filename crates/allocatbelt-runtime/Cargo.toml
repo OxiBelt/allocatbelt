@@ -7,6 +7,10 @@ rust-version.workspace = true
 license.workspace = true
 publish = false
 
+[features]
+runtime-io-uring = ["allocatbelt/runtime-io-uring"]
+resource-feedback = ["allocatbelt/resource-feedback"]
+
 # allocatbelt's core swaps its atomics for loom's under `--cfg loom` and does
 # not build there, so the loom models of this crate's protocols
 # (`../allocatbelt/src/runtime/model.rs`) compile without it and the cache hooks become no-ops.

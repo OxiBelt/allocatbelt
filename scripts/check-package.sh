@@ -138,6 +138,7 @@ default = ["allocatbelt-default"]
 allocatbelt-default = ["allocatbelt/default"]
 runtime = ["allocatbelt/runtime"]
 runtime-io-uring = ["runtime", "allocatbelt/runtime-io-uring"]
+resource-feedback = ["runtime", "allocatbelt/resource-feedback"]
 io-uring = ["allocatbelt/io-uring"]
 rseq = ["allocatbelt/experimental-rseq"]
 sve2 = ["allocatbelt/experimental-aarch64-sve2"]
@@ -257,8 +258,8 @@ run() {
   echo "ok: consumer builds and runs (${*:-default features})"
 }
 caps() {
-  # caps <maintenance> <scheduler> <io_uring> <rseq> [<sve> <sve2> <rvv> <runtime> <runtime_io_uring>]
-  echo "CompiledCapabilities { runtime: ${8:-false}, runtime_io_uring: ${9:-false}, maintenance: $1, scheduler: $2, io_uring: $3, rseq: $4," \
+  # caps <maintenance> <scheduler> <io_uring> <rseq> [<sve> <sve2> <rvv> <runtime> <runtime_io_uring> <resource_feedback>]
+  echo "CompiledCapabilities { runtime: ${8:-false}, resource_feedback: ${10:-false}, runtime_io_uring: ${9:-false}, maintenance: $1, scheduler: $2, io_uring: $3, rseq: $4," \
     "experimental_aarch64_sve: ${5:-false}, experimental_aarch64_sve2: ${6:-false}," \
     "experimental_riscv_rvv: ${7:-false} }"
 }
@@ -283,6 +284,9 @@ run "$(caps true true false false false false false true)" --features runtime
 run "$(caps false false false false false false false true true)" --no-default-features --features runtime-io-uring
 run "$(caps true true false false false false false true true)" --features runtime-io-uring
 run "$(caps true true true false false false false true true)" --features runtime-io-uring,io-uring
+run "$(caps false false false false false false false true false true)" --no-default-features --features resource-feedback
+run "$(caps true true false false false false false true false true)" --features resource-feedback
+run "$(caps true true false false false false false true true true)" --features resource-feedback,runtime-io-uring
 # Traverse only production edges from the unpacked package with every feature.
 (cd "${unpacked}" && cargo metadata --all-features --format-version 1) >"${work}/consumer-graph.json"
 python3 - "${work}/consumer-graph.json" <<'PYGRAPH'

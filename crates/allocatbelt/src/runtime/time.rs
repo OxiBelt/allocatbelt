@@ -341,6 +341,9 @@ pub enum TimerError {
   /// The clock is frozen at its last representable instant and must be
   /// switched to a paused mode before it can advance again.
   ClockSaturated,
+  /// This handle belongs to a fixed real-time driver, whose clock cannot be
+  /// paused or manually advanced.
+  FixedRealClock,
   /// Every registration is taken (or, never in practice, the 64-bit arming
   /// ids are exhausted).
   Full,
@@ -362,6 +365,7 @@ impl fmt::Display for TimerError {
     f.write_str(match self {
       Self::Invalid => "invalid timer bound, period or deadline",
       Self::ClockSaturated => "real timer clock reached the Instant range boundary",
+      Self::FixedRealClock => "fixed real-time clock cannot be paused or manually advanced",
       Self::Full => "timer registration bound reached",
       Self::OutOfMemory => "timer registration storage could not be reserved",
       Self::Closed => "timer driver is closed",
@@ -409,6 +413,7 @@ struct Shared {
   max_registered: usize,
   coordinator: Arc<IdleCoordinator>,
   auto_advance_enabled: bool,
+  fixed_real_clock: bool,
 }
 
 /// The registrations, under the driver lock.
@@ -964,6 +969,9 @@ impl Shared {
   }
 
   fn set_mode(&self, mode: ClockMode) -> Result<(), TimerError> {
+    if self.fixed_real_clock && mode != ClockMode::Real {
+      return Err(TimerError::FixedRealClock);
+    }
     if mode == ClockMode::PausedAuto && !self.auto_advance_enabled {
       return Err(TimerError::Invalid);
     }
@@ -1006,6 +1014,9 @@ impl Shared {
   }
 
   fn advance_paused(&self, duration: Duration) -> Result<Instant, TimerError> {
+    if self.fixed_real_clock {
+      return Err(TimerError::FixedRealClock);
+    }
     let target;
     {
       let _changed = self.coordinator.changed();
@@ -1259,6 +1270,29 @@ impl TimerDriver {
       ClockMode::Real,
       false,
       IdleCoordinator::new(None),
+      false,
+    )
+  }
+
+  /// Creates an immutable real-clock timer driver.
+  ///
+  /// Unlike [`TimerDriver::new`], its handle rejects pause and manual
+  /// advancement, so deadlines continue to use real monotonic time for the
+  /// lifetime of the driver. This is useful when timers govern real-time
+  /// bandwidth or readiness waits while another runtime clock is paused.
+  ///
+  /// # Errors
+  ///
+  /// `Invalid` when `max_registered` is zero, `OutOfMemory` when bounded
+  /// registration storage cannot be reserved, and `Spawn` when the thread
+  /// cannot be started.
+  pub fn new_realtime(max_registered: usize) -> Result<Self, TimerError> {
+    Self::build(
+      max_registered,
+      ClockMode::Real,
+      false,
+      IdleCoordinator::new(None),
+      true,
     )
   }
 
@@ -1273,6 +1307,7 @@ impl TimerDriver {
       ClockMode::PausedManual,
       false,
       IdleCoordinator::new(None),
+      false,
     )?;
     let clock = ManualClock {
       shared: Arc::clone(&driver.shared),
@@ -1286,7 +1321,13 @@ impl TimerDriver {
     auto_advance_enabled: bool,
     coordinator: Arc<IdleCoordinator>,
   ) -> Result<Self, TimerError> {
-    Self::build(max_registered, mode, auto_advance_enabled, coordinator)
+    Self::build(
+      max_registered,
+      mode,
+      auto_advance_enabled,
+      coordinator,
+      false,
+    )
   }
 
   fn build(
@@ -1294,6 +1335,7 @@ impl TimerDriver {
     mode: ClockMode,
     auto_advance_enabled: bool,
     coordinator: Arc<IdleCoordinator>,
+    fixed_real_clock: bool,
   ) -> Result<Self, TimerError> {
     if max_registered == 0 {
       return Err(TimerError::Invalid);
@@ -1321,6 +1363,7 @@ impl TimerDriver {
       max_registered,
       coordinator,
       auto_advance_enabled,
+      fixed_real_clock,
     });
     let mut panic_payloads = Vec::new();
     panic_payloads
@@ -1539,6 +1582,14 @@ impl TimerHandle {
     self.shared.now()
   }
 
+  /// Whether this is a fixed real-time clock created by
+  /// [`TimerDriver::new_realtime`]. This immutable policy check takes no clock
+  /// lock; a mutable driver in its current `Real` mode returns `false`.
+  #[must_use]
+  pub fn is_realtime(&self) -> bool {
+    self.shared.fixed_real_clock
+  }
+
   /// The current mode of this driver's clock.
   #[must_use]
   pub fn mode(&self) -> ClockMode {
@@ -1569,7 +1620,8 @@ impl TimerHandle {
   ///
   /// `Closed` when the driver has shut down, `Invalid` when paused-auto is not
   /// enabled for this driver, or `ClockSaturated` when real mode is requested
-  /// after the `Instant` range is exhausted.
+  /// after the `Instant` range is exhausted. A fixed real-time driver returns
+  /// `FixedRealClock` for either paused mode, even after driver close.
   pub fn set_mode(&self, mode: ClockMode) -> Result<(), TimerError> {
     self.shared.set_mode(mode)
   }
@@ -1588,6 +1640,12 @@ impl TimerHandle {
 
   /// Advances a paused clock and publishes due timers after releasing locks.
   /// The clock and arming/reset operations share one serialized update.
+  ///
+  /// # Errors
+  ///
+  /// `FixedRealClock` for a fixed real-time driver, `Closed` after shutdown,
+  /// and `Invalid` while an ordinary mutable clock is running or when the
+  /// requested instant cannot be represented.
   pub fn advance(&self, duration: Duration) -> Result<Instant, TimerError> {
     self.shared.advance_paused(duration)
   }
@@ -2344,6 +2402,7 @@ mod tests {
   fn dynamic_pause_resume_and_manual_advance_preserve_virtual_continuity() {
     let driver = TimerDriver::new(2).unwrap();
     let handle = driver.handle();
+    assert!(!handle.is_realtime());
     let start = handle.now();
     thread::sleep(4 * MS);
     handle.pause().unwrap();
@@ -2409,6 +2468,7 @@ mod tests {
   #[test]
   fn standalone_paused_driver_remains_manual_only() {
     let (driver, clock) = TimerDriver::new_paused(1).unwrap();
+    assert!(!driver.handle().is_realtime());
     let before = clock.now();
     assert_eq!(
       driver.handle().set_mode(ClockMode::PausedAuto),
@@ -2417,6 +2477,62 @@ mod tests {
     assert_eq!(clock.now(), before);
     assert_eq!(driver.handle().mode(), ClockMode::PausedManual);
     driver.shutdown().unwrap();
+  }
+
+  #[test]
+  fn fixed_real_clock_rejects_pause_and_manual_advance_through_cloned_handles() {
+    let driver = TimerDriver::new_realtime(2).unwrap();
+    let handle = driver.handle();
+    let alias = handle.clone();
+    assert!(handle.is_realtime());
+    assert!(alias.is_realtime());
+    assert_eq!(handle.mode(), ClockMode::Real);
+
+    let mut sleep = handle.sleep(HOUR).unwrap();
+    assert!(poll_with(&mut sleep, Waker::noop()).is_pending());
+    let deadline = sleep.deadline();
+    assert_eq!(alias.pause(), Err(TimerError::FixedRealClock));
+    assert_eq!(
+      handle.set_mode(ClockMode::PausedManual),
+      Err(TimerError::FixedRealClock)
+    );
+    assert_eq!(
+      alias.set_mode(ClockMode::PausedAuto),
+      Err(TimerError::FixedRealClock)
+    );
+    assert_eq!(alias.advance(MS), Err(TimerError::FixedRealClock));
+    assert_eq!(sleep.deadline(), deadline);
+    assert!(!sleep.is_elapsed());
+    assert_eq!(handle.registered(), 1);
+
+    let before_resume = handle.now();
+    assert_eq!(alias.set_mode(ClockMode::Real), Ok(()));
+    assert_eq!(handle.resume(), Ok(()));
+    assert!(handle.now() >= before_resume);
+    drop(sleep);
+    driver.shutdown().unwrap();
+  }
+
+  #[test]
+  fn fixed_real_timer_fires_while_a_manual_virtual_clock_stays_still() {
+    let (virtual_driver, virtual_clock) = TimerDriver::new_paused(1).unwrap();
+    let virtual_handle = virtual_driver.handle();
+    let virtual_start = virtual_clock.now();
+    let real_driver = TimerDriver::new_realtime(1).unwrap();
+    let real_handle = real_driver.handle();
+    let mut real_sleep = real_handle.sleep(5 * MS).unwrap();
+    assert!(poll_with(&mut real_sleep, Waker::noop()).is_pending());
+
+    thread::sleep(30 * MS);
+    assert_eq!(virtual_handle.now(), virtual_start);
+    assert_eq!(
+      poll_with(&mut real_sleep, Waker::noop()),
+      Poll::Ready(Ok(()))
+    );
+    assert!(real_handle.is_realtime());
+    assert!(!virtual_handle.is_realtime());
+    real_driver.shutdown().unwrap();
+    virtual_driver.shutdown().unwrap();
   }
 
   #[test]
@@ -2824,6 +2940,10 @@ mod tests {
     check::<Interval>();
     check::<Timeout<Ready<()>>>();
     assert_eq!(TimerDriver::new(0).map(drop), Err(TimerError::Invalid));
+    assert_eq!(
+      TimerDriver::new_realtime(0).map(drop),
+      Err(TimerError::Invalid)
+    );
     assert_eq!(
       TimerDriver::new(usize::MAX).map(drop),
       Err(TimerError::OutOfMemory)

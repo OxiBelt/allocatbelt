@@ -39,6 +39,8 @@ signal-hook-registry = { workspace = true, optional = true }
 default = ["maintenance", "scheduler"]
 # Safe runtime foundations and readiness; allocator-only defaults are unchanged.
 runtime = ["rustix/std", "rustix/event", "rustix/fs", "rustix/net", "rustix/param", "rustix/pipe", "rustix/process", "dep:signal-hook-registry"]
+# Autonomous real-clock feedback is compiled separately and starts only on request.
+resource-feedback = ["runtime"]
 # The background maintenance thread (`start_maintenance_thread`). Without
 # it, allocating threads run every housekeeping pass inline.
 maintenance = []

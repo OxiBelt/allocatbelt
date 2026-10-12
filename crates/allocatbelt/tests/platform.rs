@@ -41,6 +41,7 @@ fn dispatch_is_initialised_with_the_arena() {
 #[test]
 fn compiled_capabilities_follow_the_features() {
   let c = GLOBAL.compiled_capabilities();
+  assert_eq!(c.resource_feedback, cfg!(feature = "resource-feedback"));
   assert_eq!(c.runtime, cfg!(feature = "runtime"));
   assert_eq!(c.runtime_io_uring, cfg!(feature = "runtime-io-uring"));
   assert_eq!(c, allocatbelt::CompiledCapabilities::CURRENT);
@@ -69,6 +70,7 @@ fn compiled_capabilities_follow_the_features() {
   assert!(!c.scheduler || c.maintenance);
   assert!(!c.io_uring || c.maintenance);
   assert!(!c.runtime_io_uring || c.runtime);
+  assert!(!c.resource_feedback || c.runtime);
   assert!(!c.experimental_aarch64_sve2 || c.experimental_aarch64_sve);
 }
 

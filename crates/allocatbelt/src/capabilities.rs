@@ -18,6 +18,9 @@ use crate::Allocatbelt;
 pub struct CompiledCapabilities {
   /// Feature `runtime`: the safe bounded blocking worker runtime.
   pub runtime: bool,
+  /// Feature `resource-feedback`: opt-in real-clock sensor/actuator service.
+  /// It starts only when explicitly constructed with finite policy bounds.
+  pub resource_feedback: bool,
   /// Feature `runtime-io-uring`: bounded owned-buffer positional file I/O.
   /// A separate driver must start successfully before it accepts operations.
   pub runtime_io_uring: bool,
@@ -51,6 +54,7 @@ impl CompiledCapabilities {
   /// The capabilities of this build.
   pub const CURRENT: Self = Self {
     runtime: cfg!(feature = "runtime"),
+    resource_feedback: cfg!(feature = "resource-feedback"),
     runtime_io_uring: cfg!(feature = "runtime-io-uring"),
     maintenance: cfg!(feature = "maintenance"),
     scheduler: cfg!(feature = "scheduler"),

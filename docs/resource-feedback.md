@@ -35,3 +35,47 @@ quantization, ticket exhaustion, delayed samples, failed actuation and readback
 cooldowns. These are policy-correctness fixtures. Autonomous runtime sampling,
 enforcement and real-pressure performance qualification require their own
 integration and evidence.
+
+The additive `resource-feedback` Cargo feature compiles
+`runtime::resource_feedback::ResourceFeedbackService`. It starts only through
+an explicit constructor with owned sensor and actuator implementations. The
+worker uses real 100 ms deadlines, skips missed cycles and preserves per-control
+diagnostics. Startup verifies initial actuator readbacks. Before changing a
+limit it checks for external drift; every attempted write has a post-write
+readback, including when stop arrives during the attempt. Failed or ambiguous
+results remain latched until a bounded explicit reconciliation request completes.
+
+Sensor and actuator callbacks run outside the snapshot mutex. They may block;
+startup and explicit owner cleanup therefore have no wall-time guarantee.
+`request_stop` and `try_shutdown` retain unfinished thread ownership and report
+pending while callbacks and their payload cleanup remain active. Dropping the
+owner requests stop and detaches; the worker retains every callback and control
+it still needs. Finite status calls retain joined panic payloads rather than
+running their destructors. The service supplies scheduling and readback
+discipline; concrete runtime telemetry and actuator bindings have their own
+acceptance requirements.
+
+`ProcessCpuSensor` supplies bounded reads of Linux process CPU counters and
+checked utilization arithmetic relative to an explicit CPU capacity. Its first
+read establishes a baseline. It does not attribute CPU by tenant, measure PSI
+or provide disk/network signals; missing dimensions freeze independently.
+`RuntimeFeedbackActuator` changes a selected global or tenant CPU soft limit
+and selected disk/network application-byte buckets. Component compare-exchange
+rejects stale writers without clobbering other dimensions or burst limits.
+Use those buckets in the actual I/O path; actuator construction does not
+intercept arbitrary syscalls or establish a physical traffic limit.
+
+`runtime::rate_io::RateLimitedIo` adds directional stream admission around
+runtime-neutral read/write endpoints. It reserves available byte credit before
+polling the endpoint, commits reported progress synchronously, and refunds
+unused credit. Pending or failed operations retain their endpoint continuation;
+extracting the components cancels only the wrapper's rate timers. Vectored
+operations use the documented scalar fallback. Invalid endpoint counts fault
+the wrapper and settle credit conservatively. Datagram admission remains
+separate and must reserve the complete datagram.
+
+Rate waits require an immutable real-time timer from `TimerDriver::new_realtime`.
+Every alias rejects virtual-clock mode changes, while ordinary application
+timer constructors retain pause/resume support. These explicit wrappers are
+application ports; selecting buckets on a facade alone does not intercept
+lower-level endpoints.

@@ -115,6 +115,8 @@ pub mod process;
 #[path = "process/completion.rs"]
 mod process_completion;
 #[cfg(not(loom))]
+pub mod rate_io;
+#[cfg(not(loom))]
 pub mod reactor;
 mod reactor_release;
 #[cfg(not(loom))]
@@ -122,8 +124,14 @@ mod readiness_io;
 pub mod resource_domain;
 #[cfg(all(test, not(loom)))]
 mod resource_domain_runtime_tests;
+#[cfg(all(feature = "resource-feedback", not(loom)))]
+pub mod resource_feedback;
+#[cfg(all(feature = "resource-feedback", not(loom)))]
+pub mod resource_feedback_actuator;
 #[cfg(not(loom))]
 pub mod resource_feedback_policy;
+#[cfg(all(feature = "resource-feedback", not(loom)))]
+pub mod resource_feedback_sensor;
 mod resources;
 pub mod rwlock;
 mod scheduler;
