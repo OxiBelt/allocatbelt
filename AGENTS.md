@@ -22,6 +22,8 @@ the other workspace packages are development tools.
 - `crates/allocatbelt-runtime/`: unpublished façade and same-source Loom checker.
 - `crates/allocatbelt-tokio/`: development-only Tokio worker cache and shard hooks.
 - `crates/allocatbelt-app-ports/`: unpublished CPU, memory, TCP/HTTP and disk ports.
+- `crates/allocatbelt-qualification-tools/`: unpublished offline paired-trace
+  analysis for native application qualification.
 - `bench/`: allocator comparisons, resource profiling and SIMD candidates.
 - `fuzz/`: cargo-fuzz targets over the checking model.
 - `docs/`: design constraints, platform and API documentation, research and

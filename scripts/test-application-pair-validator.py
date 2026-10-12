@@ -4,10 +4,13 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import re
+import signal
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -90,6 +93,72 @@ class ApplicationPairValidatorTests(unittest.TestCase):
         )
         self.assertEqual(invalid_deadline.returncode, 2)
         self.assertIn("deadlines must be", invalid_deadline.stderr)
+
+    def test_allocator_pair_cli_requires_distinct_frozen_baseline_inputs(self) -> None:
+        base = [str(RUNNER), "/missing/candidate", "allocatbelt", "cpu", "capacity", "-", "0", "allocator-pair-1", str(self.directory), "5000", "300", "300", "60", "1200", "", "", "steady", "allocator-match"]
+        missing_baseline = subprocess.run([*base, "", "mimalloc-secure"], check=False, capture_output=True, text=True)
+        self.assertEqual(missing_baseline.returncode, 2)
+        self.assertIn("distinct baseline binary", missing_baseline.stderr)
+        with_baseline = [*base, "/missing/baseline", "mimalloc-secure", "", ""]
+        still_missing_binary = subprocess.run(with_baseline, check=False, capture_output=True, text=True)
+        self.assertEqual(still_missing_binary.returncode, 2)
+        self.assertIn("hard-disabled", still_missing_binary.stderr)
+
+    def test_external_pressure_pair_cli_is_hard_disabled_without_policy_readback(self) -> None:
+        arguments = [
+            str(RUNNER), "/missing/candidate", "allocatbelt", "cpu", "capacity", "-", "0",
+            "pressure-pair-1", str(self.directory), "5000", "300", "300", "60", "1200", "", "",
+            "steady", "pressure-matched",
+        ]
+        result = subprocess.run(arguments, check=False, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("external-pressure timing is hard-disabled", result.stderr)
+
+    def test_gnu_timeout_foreground_keeps_term_ignoring_binary_in_controller_group(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="application-timeout-group-") as temporary:
+            ready_path = Path(temporary) / "binary-ready"
+            child_code = (
+                "import os,signal,sys,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+                "open(sys.argv[1], 'w').write(str(os.getpid())); time.sleep(30)"
+            )
+            timeout_process = subprocess.Popen(
+                ["timeout", "--foreground", "--signal=TERM", "--kill-after=3s", "30s", sys.executable, "-c", child_code, str(ready_path)],
+                start_new_session=True,
+            )
+            binary_pid = None
+            try:
+                for _ in range(200):
+                    if ready_path.exists():
+                        break
+                    time.sleep(0.01)
+                self.assertTrue(ready_path.exists(), "timed binary did not install its TERM-ignoring handler")
+                binary_pid = int(ready_path.read_text(encoding="ascii"))
+                os.killpg(timeout_process.pid, signal.SIGTERM)
+                time.sleep(0.1)
+                os.killpg(timeout_process.pid, signal.SIGKILL)
+                timeout_process.wait(timeout=2)
+                for _ in range(100):
+                    try:
+                        state = Path(f"/proc/{binary_pid}/stat").read_text(encoding="ascii").split()[2]
+                    except FileNotFoundError:
+                        break
+                    if state == "Z":
+                        break
+                    time.sleep(0.01)
+                else:
+                    self.fail("timed benchmark binary escaped the controller process group")
+            finally:
+                try:
+                    os.killpg(timeout_process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                if timeout_process.poll() is None:
+                    timeout_process.wait(timeout=2)
+                if binary_pid is not None:
+                    try:
+                        os.kill(binary_pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
 
     def write_ids(self, records: list[tuple[int, str, int, int, str, int, int]], nonce: str | None = None) -> None:
         identity = (
@@ -389,8 +458,18 @@ class ApplicationPairValidatorTests(unittest.TestCase):
     def test_capacity_report_uses_the_actual_30_second_horizon(self) -> None:
         report = self.directory / "capacity.shutdown.tsv"
         report.write_text(
-            "kind\tname\tduration_ns\n"
+            "schema\tallocatbelt-app-phase-v1\t\n"
+            f"identity\treport_nonce\t{self.nonce}\n"
+            f"identity\trun_id\t{self.run_id}\n"
+            "identity\texecutor\tallocatbelt\n"
+            "identity\tallocator\tsystem\n"
+            "identity\tworkload\tcpu\n"
+            "identity\tprofile\tsteady\n"
+            f"identity\tsource_sha256\t{self.source_hash}\n"
+            f"identity\tbinary_sha256\t{self.binary_hash}\n"
             "phase\tproduction_trace\t30000000001\n"
+            "phase\tproduction_cpu_started_ns\t100\n"
+            "phase\tproduction_cpu_ended_ns\t300\n"
             "phase\tproduction_through_drain_cpu_ns\t200\n"
             "phase\tsuccessful_completions\t2\n"
             "phase\tcpu_ns_per_successful_completion\t100\n"
@@ -399,30 +478,84 @@ class ApplicationPairValidatorTests(unittest.TestCase):
         )
         program = embedded_validator("validate_shutdown_report")
         accepted = subprocess.run(
-            [sys.executable, "-c", program, str(report), "allocatbelt", "cpu", "31", "60", str(self.output)],
+            [sys.executable, "-c", program, str(report), "allocatbelt", "cpu", "31", "60", "1200", str(self.output), self.nonce, self.run_id, "system", "steady", self.source_hash, self.binary_hash],
             check=False,
             capture_output=True,
             text=True,
         )
         rejected_override = subprocess.run(
-            [sys.executable, "-c", program, str(report), "allocatbelt", "cpu", "10", "60", str(self.output)],
+            [sys.executable, "-c", program, str(report), "allocatbelt", "cpu", "10", "60", "1200", str(self.output), self.nonce, self.run_id, "system", "steady", self.source_hash, self.binary_hash],
             check=False,
             capture_output=True,
             text=True,
         )
         self.assertEqual(accepted.returncode, 0, accepted.stderr)
         self.assertNotEqual(rejected_override.returncode, 0)
+        report.write_text(report.read_text(encoding="utf-8").replace("identity\trun_id\tvalidator-1", "identity\trun_id\tvalidator-replay"), encoding="utf-8")
+        replayed = subprocess.run(
+            [sys.executable, "-c", program, str(report), "allocatbelt", "cpu", "31", "60", "1200", str(self.output), self.nonce, self.run_id, "system", "steady", self.source_hash, self.binary_hash],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertNotEqual(replayed.returncode, 0)
+        report.write_text(report.read_text(encoding="utf-8").replace("validator-replay", "validator-1"), encoding="utf-8")
         report.write_text(
             report.read_text(encoding="utf-8").replace("30000000001", "31000000001"),
             encoding="utf-8",
         )
         beyond_allowance = subprocess.run(
-            [sys.executable, "-c", program, str(report), "allocatbelt", "cpu", "31", "60", str(self.output)],
+            [sys.executable, "-c", program, str(report), "allocatbelt", "cpu", "31", "60", "1200", str(self.output), self.nonce, self.run_id, "system", "steady", self.source_hash, self.binary_hash],
             check=False,
             capture_output=True,
             text=True,
         )
         self.assertNotEqual(beyond_allowance.returncode, 0)
+        report.write_text(report.read_text(encoding="utf-8").replace("production_cpu_ended_ns\t300", "production_cpu_ended_ns\t299"), encoding="utf-8")
+        invalid_cpu_boundary = subprocess.run(
+            [sys.executable, "-c", program, str(report), "allocatbelt", "cpu", "31", "60", "1200", str(self.output), self.nonce, self.run_id, "system", "steady", self.source_hash, self.binary_hash],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertNotEqual(invalid_cpu_boundary.returncode, 0)
+
+    def test_mixed_capacity_family_counts_are_identity_bound_and_complete(self) -> None:
+        report = self.directory / "capacity-families.tsv"
+        report.write_text(
+            "schema\tallocatbelt-app-capacity-families-v1\t\n"
+            f"identity\treport_nonce\t{self.nonce}\n"
+            f"identity\trun_id\t{self.run_id}\n"
+            "identity\texecutor\tallocatbelt\n"
+            "identity\tallocator\tsystem\n"
+            "identity\tworkload\tmixed\n"
+            "identity\tprofile\tmixed\n"
+            f"identity\tsource_sha256\t{self.source_hash}\n"
+            f"identity\tbinary_sha256\t{self.binary_hash}\n"
+            "family\tcpu\t2\t2\n"
+            "family\tmemory\t2\t2\n"
+            "family\thttp\t2\t2\n"
+            "family\tdisk\t2\t2\n"
+            "phase\ttrace_seconds\t30\n"
+            "phase\tprofile\tmixed\n",
+            encoding="utf-8",
+        )
+        header = runner_header()
+        row = {column: "0" for column in header}
+        row.update(schema="2", allocator="system", executor="allocatbelt", workload="mixed", mode="capacity", attempted="8", admitted="8", completed_on_time="8")
+        self.output.write_text("\t".join(header) + "\n" + "\t".join(row[column] for column in header) + "\n", encoding="utf-8")
+        program = embedded_validator("validate_capacity_family_report")
+        args = [str(report), str(self.output), "allocatbelt", self.nonce, self.run_id, "system", "mixed", "mixed", self.source_hash, self.binary_hash]
+        accepted = subprocess.run([sys.executable, "-c", program, *args], check=False, capture_output=True, text=True)
+        self.assertEqual(accepted.returncode, 0, accepted.stderr)
+        original = report.read_text(encoding="utf-8")
+        report.write_text(original.replace(f"identity\trun_id\t{self.run_id}", "identity\trun_id\treplayed-run"), encoding="utf-8")
+        replayed = subprocess.run([sys.executable, "-c", program, *args], check=False, capture_output=True, text=True)
+        self.assertNotEqual(replayed.returncode, 0)
+        report.write_text(original, encoding="utf-8")
+        report.write_text(report.read_text(encoding="utf-8").replace("family\tdisk\t2\t2", "family\tdisk\t2\t1"), encoding="utf-8")
+        rejected = subprocess.run([sys.executable, "-c", program, *args], check=False, capture_output=True, text=True)
+        self.assertNotEqual(rejected.returncode, 0)
 
 
 if __name__ == "__main__":

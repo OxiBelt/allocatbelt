@@ -61,6 +61,10 @@ name = "allocatbelt-profile"
 version = "0.1.0"
 
 [[package]]
+name = "allocatbelt-qualification-tools"
+version = "0.1.0"
+
+[[package]]
 name = "allocatbelt-runtime"
 version = "0.1.0"
 dependencies = [

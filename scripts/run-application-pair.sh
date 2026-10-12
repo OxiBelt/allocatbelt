@@ -3,13 +3,15 @@
 # This harness is preparation only; keep raw timing evidence outside the source checkout.
 set -euo pipefail
 export LC_ALL=C
+qualification_runtime_readback_supported=0
+external_pressure_driver_supported=0
 
 usage() {
-  echo "usage: $0 BINARY ALLOCATOR WORKLOAD MODE RATE_OR_DASH CPU_SET RUN_ID OUTPUT_ROOT [ARRIVALS [TRACE_S DRAIN_S SHUTDOWN_S PROCESS_S [ORACLE_FILE ORACLE_SHA256 [PROFILE]]]]" >&2
+  echo "usage: $0 BINARY ALLOCATOR WORKLOAD MODE RATE_OR_DASH CPU_SET RUN_ID OUTPUT_ROOT [ARRIVALS TRACE_S DRAIN_S SHUTDOWN_S PROCESS_S ORACLE_FILE ORACLE_SHA256 PROFILE PAIR_KIND [BASELINE_BINARY BASELINE_ALLOCATOR BASELINE_ORACLE BASELINE_ORACLE_SHA256]]" >&2
   echo "  open_loop requires a precomputed oracle file and its SHA-256 digest." >&2
 }
 
-if [[ $# -lt 8 || $# -gt 16 ]]; then usage; exit 2; fi
+if [[ $# -lt 8 || $# -gt 21 ]]; then usage; exit 2; fi
 binary_arg=$1
 allocator=$2
 workload=$3
@@ -26,6 +28,11 @@ process_deadline=${13:-1200}
 oracle_file_arg=${14:-}
 oracle_digest_expected=${15:-}
 profile=${16:-steady}
+pair_kind=${17:-matched}
+baseline_binary_arg=${18:-}
+baseline_allocator=${19:-}
+baseline_oracle_arg=${20:-}
+baseline_oracle_digest_expected=${21:-}
 
 for deadline in "$trace_deadline" "$drain_deadline" "$shutdown_deadline" "$process_deadline"; do
   [[ "$deadline" =~ ^[1-9][0-9]*$ && ${#deadline} -le 4 ]] || { echo "deadlines must be positive finite integer seconds" >&2; exit 2; }
@@ -36,6 +43,16 @@ case "$allocator" in allocatbelt|mimalloc-secure|mimalloc-standard|system) ;; *)
 case "$workload" in cpu|memory|http|disk|mixed) ;; *) usage; exit 2 ;; esac
 case "$mode" in capacity|open_loop) ;; *) usage; exit 2 ;; esac
 case "$profile" in steady|mixed|burst|oversubscribed|safety_overload) ;; *) echo "unknown profile: $profile" >&2; exit 2 ;; esac
+case "$pair_kind" in matched|aa-bounded|aa-tokio|allocator-match|pressure-matched|pressure-allocator-match) ;; *) echo "PAIR_KIND is not a frozen matched comparison family" >&2; exit 2 ;; esac
+if [[ "$pair_kind" == pressure-matched || "$pair_kind" == pressure-allocator-match ]]; then
+  (( external_pressure_driver_supported == 1 )) || { echo "external-pressure timing is hard-disabled until the pinned feedback driver and runtime readbacks are implemented" >&2; exit 2; }
+fi
+if [[ "$pair_kind" == allocator-match || "$pair_kind" == pressure-allocator-match ]]; then
+  case "$baseline_allocator" in mimalloc-secure|mimalloc-standard|system) ;; *) echo "allocator-match requires a frozen baseline allocator" >&2; exit 2 ;; esac
+  [[ "$allocator" == allocatbelt && "$baseline_allocator" != "$allocator" && -n "$baseline_binary_arg" ]] || { echo "allocator-match requires allocatbelt candidate and a distinct baseline binary" >&2; exit 2; }
+else
+  [[ -z "$baseline_binary_arg" && -z "$baseline_allocator" && -z "$baseline_oracle_arg" && -z "$baseline_oracle_digest_expected" ]] || { echo "baseline arguments require allocator-match" >&2; exit 2; }
+fi
 if [[ "$workload" == mixed && "$profile" == steady ]]; then
   echo "mixed workload requires mixed, burst, oversubscribed, or safety_overload profile" >&2
   exit 2
@@ -87,8 +104,14 @@ if [[ "$mode" == open_loop ]]; then
     echo "open_loop requires ORACLE_FILE and its 64-character ORACLE_SHA256" >&2
     exit 2
   }
+  if [[ "$pair_kind" == allocator-match || "$pair_kind" == pressure-allocator-match ]]; then
+    [[ -n "$baseline_oracle_arg" && "$baseline_oracle_digest_expected" =~ ^[0-9a-f]{64}$ ]] || { echo "allocator-match open_loop requires its baseline oracle and digest" >&2; exit 2; }
+  fi
 elif [[ -n "$oracle_file_arg" || -n "$oracle_digest_expected" ]]; then
   echo "capacity mode does not accept an open-loop oracle" >&2
+  exit 2
+elif [[ -n "$baseline_oracle_arg" || -n "$baseline_oracle_digest_expected" ]]; then
+  echo "capacity mode does not accept a baseline oracle" >&2
   exit 2
 fi
 [[ "$run_id" =~ ^[A-Za-z0-9._-]+$ ]] || { echo "RUN_ID has unsupported characters" >&2; exit 2; }
@@ -101,20 +124,38 @@ for command in taskset timeout sha256sum awk rustc uname python3 od tr cmp; do
   command -v "$command" >/dev/null || { echo "missing required command: $command" >&2; exit 2; }
 done
 [[ -x /usr/bin/time ]] || { echo "GNU /usr/bin/time is required" >&2; exit 2; }
+(( qualification_runtime_readback_supported == 1 )) || { echo "qualification timing is hard-disabled until the binary provides verified runtime-domain, policy, and ceiling readback" >&2; exit 2; }
 
 if [[ "$mode" == open_loop ]]; then
   oracle_file=$(realpath "$oracle_file_arg") || exit 2
   [[ -f "$oracle_file" ]] || { echo "oracle file is missing: $oracle_file" >&2; exit 2; }
   oracle_digest_actual=$(sha256sum "$oracle_file" | awk '{print $1}') || exit 2
   [[ "$oracle_digest_actual" == "$oracle_digest_expected" ]] || { echo "oracle SHA-256 differs from its manifest value" >&2; exit 2; }
+  baseline_oracle_file=
+  baseline_oracle_digest_actual=
+  if [[ "$pair_kind" == allocator-match || "$pair_kind" == pressure-allocator-match ]]; then
+    baseline_oracle_file=$(realpath "$baseline_oracle_arg") || exit 2
+    [[ -f "$baseline_oracle_file" ]] || { echo "baseline oracle file is missing" >&2; exit 2; }
+    baseline_oracle_digest_actual=$(sha256sum "$baseline_oracle_file" | awk '{print $1}') || exit 2
+    [[ "$baseline_oracle_digest_actual" == "$baseline_oracle_digest_expected" ]] || { echo "baseline oracle SHA-256 differs from its manifest value" >&2; exit 2; }
+  fi
 else
   oracle_file=
   oracle_digest_actual=
+  baseline_oracle_file=
+  baseline_oracle_digest_actual=
 fi
 
 repo_root=$(git rev-parse --show-toplevel) || exit 2
 binary=$(realpath "$binary_arg") || exit 2
 [[ -x "$binary" ]] || { echo "binary is not executable: $binary" >&2; exit 2; }
+baseline_binary=
+baseline_binary_digest=
+if [[ "$pair_kind" == allocator-match || "$pair_kind" == pressure-allocator-match ]]; then
+  baseline_binary=$(realpath "$baseline_binary_arg") || exit 2
+  [[ -x "$baseline_binary" ]] || { echo "baseline binary is not executable: $baseline_binary" >&2; exit 2; }
+  baseline_binary_digest=$(sha256sum "$baseline_binary" | awk '{print $1}') || exit 2
+fi
 output_root=$(realpath -m "$output_root") || exit 2
 case "$output_root/" in
   "$repo_root/"*) echo "refusing to place raw benchmark evidence inside the source checkout" >&2; exit 2 ;;
@@ -141,13 +182,20 @@ head_commit=$(git -C "$repo_root" rev-parse HEAD) || exit 2
 rust_version=$(rustc -Vv | tr '\n' ';') || exit 2
 kernel=$(uname -srmo) || exit 2
 host=$(hostname -f 2>/dev/null || hostname)
+comparison_family=fixed_policy
+if [[ "$pair_kind" == pressure-matched || "$pair_kind" == pressure-allocator-match ]]; then
+  comparison_family=external_pressure
+fi
 
 {
   printf 'key\tvalue\n'
   printf 'run_id\t%s\n' "$run_id"
-  printf 'allocator\t%s\n' "$allocator"
+printf 'allocator\t%s\n' "$allocator"
+printf 'baseline_allocator\t%s\n' "$baseline_allocator"
   printf 'workload\t%s\n' "$workload"
   printf 'profile\t%s\n' "$profile"
+  printf 'pair_kind\t%s\n' "$pair_kind"
+  printf 'comparison_family\t%s\n' "$comparison_family"
   printf 'resource_scope_binding\t%s\n' 'local ResourceScope; no shared runtime ResourceDomain'
   printf 'policy_qualification_stage\t%s\n' 'profile harness; no global or tenant ResourceDomain binding'
   printf 'mode\t%s\n' "$mode"
@@ -176,8 +224,10 @@ host=$(hostname -f 2>/dev/null || hostname)
   printf 'cpu_set\t%s\n' "$cpu_set"
   printf 'source_head\t%s\n' "$head_commit"
   printf 'source_tree_sha256\t%s\n' "$source_digest"
-  printf 'binary_path\t%s\n' "$binary"
-  printf 'binary_sha256\t%s\n' "$binary_digest"
+printf 'binary_path\t%s\n' "$binary"
+printf 'binary_sha256\t%s\n' "$binary_digest"
+printf 'baseline_binary_path\t%s\n' "$baseline_binary"
+printf 'baseline_binary_sha256\t%s\n' "$baseline_binary_digest"
   printf 'host\t%s\n' "$host"
   printf 'kernel\t%s\n' "$kernel"
   printf 'rustc\t%s\n' "$rust_version"
@@ -188,11 +238,11 @@ host=$(hostname -f 2>/dev/null || hostname)
   printf 'argv_policy\t%s\n' 'one fresh process; external timeout is hard whole-process watchdog; binary process budget starts at setup; taskset applied to each process'
 } > "$cell_dir/metadata.tsv"
 
-printf 'pair\texecutor\texit_code\trow_validation\tp99_qualification\targv\tstdout\ttime_report\tids_sha256\n' > "$cell_dir/processes.tsv"
+printf 'pair\texecutor\tallocator\texit_code\trow_validation\tp99_qualification\targv\tstdout\ttime_report\tids_sha256\tshutdown_sha256\tcapacity_family_sha256\n' > "$cell_dir/processes.tsv"
 failed=0
 
 validate_output() {
-  local output=$1 expected_executor=$2 header
+  local output=$1 expected_executor=$2 expected_allocator=$3 header
   local expected_schema=2
   local expected_async=4
   [[ "$profile" == oversubscribed ]] && expected_async=2
@@ -232,7 +282,7 @@ validate_output() {
   [[ $(wc -l < "$output") -eq 2 ]] || return 1
   header=$(sed -n '1p' "$output")
   [[ "$header" == "$expected_header" ]] || return 1
-  python3 - "$output" "$expected_header" "$allocator" "$expected_executor" "$workload" "$mode" \
+  python3 - "$output" "$expected_header" "$expected_allocator" "$expected_executor" "$workload" "$mode" \
     "$rate" "$expected_blocking" "$expected_topology" "$expected_task_limit" \
     "$expected_retained" "$expected_managed" "$expected_disk" "$expected_network" \
     "$expected_schema" "$arrivals" "$process_deadline" "$drain_deadline" "$expected_async" <<'PY'
@@ -335,9 +385,9 @@ if errors or cancellations or unresolved:
     raise SystemExit(1)
 if any(int(row[field]) != 0 for field in ("final_managed_bytes", "final_disk_ops", "final_network_ops")):
     raise SystemExit(1)
-if int(row["max_observed_managed_bytes"]) > int(managed):
+if workload in ("memory", "http", "mixed") and int(row["max_observed_managed_bytes"]) > int(managed):
     raise SystemExit(1)
-if int(row["retained_managed_bytes"]) > int(managed):
+if workload in ("memory", "http", "mixed") and int(row["retained_managed_bytes"]) > int(managed):
     raise SystemExit(1)
 
 if mode == "capacity":
@@ -383,18 +433,27 @@ PY
 }
 
 validate_shutdown_report() {
-  local report=$1 expected_executor=$2 trace_seconds=$3 shutdown_seconds=$4 output=$5
-  python3 - "$report" "$expected_executor" "$workload" "$trace_seconds" "$shutdown_seconds" "$output" <<'PY'
+  local report=$1 expected_executor=$2 trace_seconds=$3 shutdown_seconds=$4 process_seconds=$5 output=$6 report_nonce=$7 run_id=$8 allocator=$9 profile=${10} source_hash=${11} binary_hash=${12}
+  python3 - "$report" "$expected_executor" "$workload" "$trace_seconds" "$shutdown_seconds" "$process_seconds" "$output" "$report_nonce" "$run_id" "$allocator" "$profile" "$source_hash" "$binary_hash" <<'PY'
 import re
 import sys
 from pathlib import Path
 
-path, executor, workload, trace_seconds, shutdown_seconds, output = sys.argv[1:]
+path, executor, workload, trace_seconds, shutdown_seconds, process_seconds, output, nonce, run_id, allocator, profile, source_hash, binary_hash = sys.argv[1:]
 try:
     lines = Path(path).read_text(encoding="utf-8").splitlines()
 except OSError:
     raise SystemExit(1)
-if not lines or lines[0] != "kind\tname\tduration_ns":
+if not lines or lines[0] != "schema\tallocatbelt-app-phase-v1\t":
+    raise SystemExit(1)
+identity = [line.split("\t") for line in lines[1:9]]
+expected_identity = [
+    ["identity", "report_nonce", nonce], ["identity", "run_id", run_id],
+    ["identity", "executor", executor], ["identity", "allocator", allocator],
+    ["identity", "workload", workload], ["identity", "profile", profile],
+    ["identity", "source_sha256", source_hash], ["identity", "binary_sha256", binary_hash],
+]
+if identity != expected_identity:
     raise SystemExit(1)
 if executor == "allocatbelt":
     drivers = ["allocatbelt HTTP async runtime", "allocatbelt connector pool", "allocatbelt reactor"] if workload in ("http", "mixed") else ["allocatbelt async runtime"]
@@ -402,19 +461,20 @@ if executor == "allocatbelt":
         drivers.append("allocatbelt filesystem runtime")
 else:
     drivers = ["Tokio HTTP runtime"] if workload in ("http", "mixed") else ["Tokio runtime"]
-if len(lines) != len(drivers) + 5:
+if len(lines) != len(drivers) + 15:
     raise SystemExit(1)
-phase_rows = [line.split("\t") for line in lines[1:5]]
-phase_names = ["production_trace", "production_through_drain_cpu_ns", "successful_completions", "cpu_ns_per_successful_completion"]
+phase_rows = [line.split("\t") for line in lines[9:15]]
+phase_names = ["production_trace", "production_cpu_started_ns", "production_cpu_ended_ns", "production_through_drain_cpu_ns", "successful_completions", "cpu_ns_per_successful_completion"]
 if any(len(row) != 3 or row[:2] != ["phase", name] for row, name in zip(phase_rows, phase_names, strict=True)):
     raise SystemExit(1)
 if any(not re.fullmatch(r"(?:0|[1-9][0-9]*)", row[2]) for row in phase_rows):
     raise SystemExit(1)
-if int(phase_rows[0][2]) > int(trace_seconds) * 1_000_000_000 or int(phase_rows[1][2]) > 7_200_000_000_000_000:
+if int(phase_rows[0][2]) > int(trace_seconds) * 1_000_000_000:
     raise SystemExit(1)
-successes = int(phase_rows[2][2])
-cpu_ns = int(phase_rows[1][2])
-if int(phase_rows[3][2]) != (cpu_ns // successes if successes else 0):
+started, ended, cpu_ns, successes = (int(phase_rows[index][2]) for index in (1, 2, 3, 4))
+if ended < started or ended - started != cpu_ns or cpu_ns > int(process_seconds) * 128 * 1_000_000_000:
+    raise SystemExit(1)
+if int(phase_rows[5][2]) != (cpu_ns // successes if successes else 0):
     raise SystemExit(1)
 try:
     output_rows = Path(output).read_text(encoding="utf-8").splitlines()
@@ -425,7 +485,7 @@ except (OSError, IndexError):
 expected_successes = int(output_row[output_header.index("completed_on_time")]) + int(output_row[output_header.index("completed_late")])
 if successes != expected_successes:
     raise SystemExit(1)
-for line, expected in zip(lines[5:], drivers, strict=True):
+for line, expected in zip(lines[15:], drivers, strict=True):
     row = line.split("\t")
     if len(row) != 3 or row[:2] != ["driver", expected]:
         raise SystemExit(1)
@@ -453,6 +513,7 @@ configs = {
     "http": "body_bytes=4096",
     "mixed": "interleave=cpu,memory,http,disk",
 }
+
 rate = int(expected_rate)
 count = int(expected_count)
 pulse_rate = rate * 4 if expected_profile == "burst" else rate
@@ -487,6 +548,67 @@ for expected_id, line in enumerate(lines[len(expected_header):]):
     if fields[1] != str(scheduled) or fields[2] != expected_family:
         raise SystemExit(1)
     if not re.fullmatch(r"(?:0|[1-9][0-9]*)", fields[3]) or int(fields[3]) >= (1 << 64):
+        raise SystemExit(1)
+PY
+}
+
+validate_capacity_family_report() {
+  local report=$1 output=$2 expected_executor=$3 report_nonce=$4 run_id=$5 allocator=$6 profile=$7 source_hash=$8 binary_hash=$9
+  python3 - "$report" "$output" "$expected_executor" "$report_nonce" "$run_id" "$allocator" "$workload" "$profile" "$source_hash" "$binary_hash" <<'PY'
+import re
+import sys
+from pathlib import Path
+
+path, output, executor, nonce, run_id, allocator, workload, profile, source_hash, binary_hash = sys.argv[1:]
+try:
+    lines = Path(path).read_text(encoding="utf-8").splitlines()
+    output_lines = Path(output).read_text(encoding="utf-8").splitlines()
+except OSError:
+    raise SystemExit(1)
+if not lines or lines[0] != "schema\tallocatbelt-app-capacity-families-v1\t":
+    raise SystemExit(1)
+expected = {
+    "report_nonce": nonce, "run_id": run_id, "executor": executor, "allocator": allocator,
+    "workload": workload, "profile": profile, "source_sha256": source_hash, "binary_sha256": binary_hash,
+}
+identity = {}
+families = {}
+phases = {}
+for line in lines[1:]:
+    row = line.split("\t")
+    if len(row) == 3 and row[0] == "identity":
+        if row[1] in identity:
+            raise SystemExit(1)
+        identity[row[1]] = row[2]
+    elif len(row) == 4 and row[0] == "family":
+        if row[1] in families:
+            raise SystemExit(1)
+        families[row[1]] = row[2:]
+    elif len(row) == 3 and row[0] == "phase":
+        if row[1] in phases:
+            raise SystemExit(1)
+        phases[row[1]] = row[2]
+    else:
+        raise SystemExit(1)
+if identity != expected or set(families) != {"cpu", "memory", "http", "disk"}:
+    raise SystemExit(1)
+if phases != {"trace_seconds": "30", "profile": profile}:
+    raise SystemExit(1)
+columns = output_lines[0].split("\t")
+row = output_lines[1].split("\t")
+counts = dict(zip(columns, row, strict=True))
+if counts["workload"] != "mixed" or counts["mode"] != "capacity":
+    raise SystemExit(1)
+attempted = int(counts["attempted"])
+completed_on_time = int(counts["completed_on_time"])
+if sum(int(values[0]) for values in families.values()) != attempted or sum(int(values[1]) for values in families.values()) != completed_on_time:
+    raise SystemExit(1)
+for index, family in enumerate(("cpu", "memory", "http", "disk")):
+    scheduled, successes = families[family]
+    if not re.fullmatch(r"(?:0|[1-9][0-9]*)", scheduled) or not re.fullmatch(r"(?:0|[1-9][0-9]*)", successes):
+        raise SystemExit(1)
+    expected_count = attempted // 4 + (1 if index < attempted % 4 else 0)
+    if int(scheduled) != expected_count or int(successes) > int(scheduled):
         raise SystemExit(1)
 PY
 }
@@ -603,7 +725,7 @@ PY
 
 if [[ "$mode" == open_loop ]]; then
   generated_oracle="$cell_dir/canonical-oracle.tsv"
-  if ! timeout --signal=KILL "${process_deadline}s" "$binary" --emit-oracle-only "$generated_oracle" \
+  if ! timeout --foreground --signal=TERM --kill-after=3s "${process_deadline}s" "$binary" --emit-oracle-only "$generated_oracle" \
     --source-sha256 "$source_digest" --binary-sha256 "$binary_digest" \
     --workload "$workload" --profile "$profile" --rate "$rate" --arrivals "$arrivals" \
     --trace-deadline-seconds "$trace_deadline" \
@@ -624,21 +746,40 @@ if [[ "$mode" == open_loop ]] && ! validate_oracle_file "$oracle_file" "$arrival
   printf 'pair_status\tfailed_or_invalid\n' > "$cell_dir/pair.failed"
   exit 1
 fi
+if [[ "$mode" == open_loop && ( "$pair_kind" == allocator-match || "$pair_kind" == pressure-allocator-match ) ]] && ! validate_oracle_file "$baseline_oracle_file" "$arrivals" "$rate" "$workload" "$profile" "$source_digest" "$baseline_binary_digest"; then
+  echo "baseline oracle content does not match its frozen binary and workload" >&2
+  printf 'pair_status\tfailed_or_invalid\n' > "$cell_dir/pair.failed"
+  exit 1
+fi
 
 run_one() {
-  local pair=$1 executor=$2
+  local pair=$1 executor=$2 process_allocator=$3 process_binary_arg=$4 process_oracle_arg=$5 process_oracle_sha_expected=$6
   local expected_executor=tokio-1.53.1
   [[ "$executor" == bounded ]] && expected_executor=allocatbelt
+  local process_binary
+  process_binary=$(realpath "$process_binary_arg") || { failed=1; return 1; }
+  [[ -x "$process_binary" ]] || { failed=1; return 1; }
+  local process_binary_sha
+  process_binary_sha=$(sha256sum "$process_binary" | awk '{print $1}') || { failed=1; return 1; }
+  local process_oracle_file= process_oracle_digest=
+  if [[ "$mode" == open_loop ]]; then
+    process_oracle_file=$(realpath "$process_oracle_arg") || { failed=1; return 1; }
+    [[ -f "$process_oracle_file" ]] || { failed=1; return 1; }
+    process_oracle_digest=$(sha256sum "$process_oracle_file" | awk '{print $1}') || { failed=1; return 1; }
+    [[ "$process_oracle_digest" == "$process_oracle_sha_expected" ]] || { failed=1; return 1; }
+    validate_oracle_file "$process_oracle_file" "$arrivals" "$rate" "$workload" "$profile" "$source_digest" "$process_binary_sha" || { failed=1; return 1; }
+  fi
   local stdout="$cell_dir/${pair}-${executor}.stdout.tsv"
   local shutdown_report="$cell_dir/${pair}-${executor}.shutdown.tsv"
   local ids_report="$cell_dir/${pair}-${executor}.ids.tsv"
+  local family_report="$cell_dir/${pair}-${executor}.capacity-families.tsv"
   local timing="$cell_dir/${pair}-${executor}.time.txt" status validation p99_qualification=not_applicable ids_sha256=not_applicable
   local -a args=(--executor "$executor" --workload "$workload" --profile "$profile" --mode "$mode" --trace-deadline-seconds "$trace_deadline" --drain-deadline-seconds "$drain_deadline" --shutdown-deadline-seconds "$shutdown_deadline" --process-deadline-seconds "$process_deadline")
   local report_nonce
   report_nonce=$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')
   [[ "$report_nonce" =~ ^[0-9a-f]{32}$ ]] || { failed=1; return 1; }
   if [[ "$mode" == open_loop ]]; then args+=(--rate "$rate" --arrivals "$arrivals"); fi
-  local -a command=(taskset -c "$cpu_set" /usr/bin/time -v -o "$timing" timeout --signal=KILL "${process_deadline}s" env "ALLOCATBELT_APP_SHUTDOWN_REPORT=$shutdown_report" "ALLOCATBELT_APP_ID_REPORT=$ids_report" "ALLOCATBELT_APP_REPORT_NONCE=$report_nonce" "ALLOCATBELT_APP_RUN_ID=$run_id" "ALLOCATBELT_APP_SOURCE_SHA256=$source_digest" "ALLOCATBELT_APP_BINARY_SHA256=$binary_digest" "ALLOCATBELT_APP_ORACLE_FILE=$oracle_file" "ALLOCATBELT_APP_ORACLE_SHA256=$oracle_digest_actual" "$binary" "${args[@]}")
+  local -a command=(taskset -c "$cpu_set" /usr/bin/time -v -o "$timing" timeout --foreground --signal=TERM --kill-after=3s "${process_deadline}s" env "ALLOCATBELT_APP_SHUTDOWN_REPORT=$shutdown_report" "ALLOCATBELT_APP_ID_REPORT=$ids_report" "ALLOCATBELT_APP_FAMILY_REPORT=$family_report" "ALLOCATBELT_APP_REPORT_NONCE=$report_nonce" "ALLOCATBELT_APP_RUN_ID=$run_id" "ALLOCATBELT_APP_EXECUTOR=$expected_executor" "ALLOCATBELT_APP_ALLOCATOR=$process_allocator" "ALLOCATBELT_APP_WORKLOAD=$workload" "ALLOCATBELT_APP_PROFILE=$profile" "ALLOCATBELT_APP_SOURCE_SHA256=$source_digest" "ALLOCATBELT_APP_BINARY_SHA256=$process_binary_sha" "ALLOCATBELT_APP_ORACLE_FILE=$process_oracle_file" "ALLOCATBELT_APP_ORACLE_SHA256=$process_oracle_digest" "$process_binary" "${args[@]}")
   local argv
   printf -v argv '%q ' "${command[@]}"
   set +e
@@ -647,9 +788,10 @@ run_one() {
   set -e
   validation=invalid
   if [[ $status -eq 0 && ! -s "$cell_dir/${pair}-${executor}.stderr.txt" ]] && \
-    validate_output "$stdout" "$expected_executor" && \
-    validate_shutdown_report "$shutdown_report" "$expected_executor" "$phase_trace_deadline" "$shutdown_deadline" "$stdout" && \
-    { [[ "$mode" != open_loop ]] || validate_id_report "$ids_report" "$arrivals" "$process_deadline" "$trace_deadline" "$rate" "$workload" "$profile" "$stdout" "$oracle_file" "$oracle_digest_actual" "$run_id" "$report_nonce" "$expected_executor" "$allocator" "$source_digest" "$binary_digest"; }; then
+    validate_output "$stdout" "$expected_executor" "$process_allocator" && \
+    validate_shutdown_report "$shutdown_report" "$expected_executor" "$phase_trace_deadline" "$shutdown_deadline" "$process_deadline" "$stdout" "$report_nonce" "$run_id" "$process_allocator" "$profile" "$source_digest" "$process_binary_sha" && \
+    { [[ "$mode:$workload" != capacity:mixed ]] || validate_capacity_family_report "$family_report" "$stdout" "$expected_executor" "$report_nonce" "$run_id" "$process_allocator" "$profile" "$source_digest" "$process_binary_sha"; } && \
+    { [[ "$mode" != open_loop ]] || validate_id_report "$ids_report" "$arrivals" "$process_deadline" "$trace_deadline" "$rate" "$workload" "$profile" "$stdout" "$process_oracle_file" "$process_oracle_digest" "$run_id" "$report_nonce" "$expected_executor" "$process_allocator" "$source_digest" "$process_binary_sha"; }; then
     validation=valid
     if [[ "$mode" == open_loop ]]; then
       ids_sha256=$(sha256sum "$ids_report" | awk '{print $1}')
@@ -680,47 +822,99 @@ run_one() {
     failed=1
     p99_qualification=invalid
   fi
-  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-    "$pair" "$executor" "$status" "$validation" "$p99_qualification" "$argv" "$(basename "$stdout")" "$(basename "$timing")" "$ids_sha256" \
+  local shutdown_sha256=not_applicable
+  if [[ -f "$shutdown_report" ]]; then
+    shutdown_sha256=$(sha256sum "$shutdown_report" | awk '{print $1}') || { failed=1; validation=invalid; shutdown_sha256=invalid; }
+  fi
+  local family_sha256=not_applicable
+  if [[ -f "$family_report" ]]; then
+    family_sha256=$(sha256sum "$family_report" | awk '{print $1}') || { failed=1; validation=invalid; family_sha256=invalid; }
+  fi
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "$pair" "$executor" "$process_allocator" "$status" "$validation" "$p99_qualification" "$argv" "$(basename "$stdout")" "$(basename "$timing")" "$ids_sha256" "$shutdown_sha256" "$family_sha256" \
     >> "$cell_dir/processes.tsv"
   printf 'report_nonce_%s_%s\t%s\n' "$pair" "$executor" "$report_nonce" >> "$cell_dir/metadata.tsv"
-  printf 'oracle_sha256_%s_%s\t%s\n' "$pair" "$executor" "$oracle_digest_actual" >> "$cell_dir/metadata.tsv"
+  printf 'oracle_sha256_%s_%s\t%s\n' "$pair" "$executor" "$process_oracle_digest" >> "$cell_dir/metadata.tsv"
   printf 'shutdown_report_%s_%s\t%s\n' "$pair" "$executor" "$(basename "$shutdown_report")" >> "$cell_dir/metadata.tsv"
   if [[ -f "$ids_report" ]]; then
     printf 'ids_sha256_%s_%s\t%s\n' "$pair" "$executor" "$(sha256sum "$ids_report" | awk '{print $1}')" >> "$cell_dir/metadata.tsv"
   fi
 }
 
-# Alternate the executor order across pairs so pair-level drift is not tied to
-# one executor. Each call starts a fresh process; failures are retained.
-if (( pair_ordinal % 2 == 0 )); then
-  run_one bounded bounded
-  run_one tokio tokio
-else
-  run_one tokio tokio
-  run_one bounded bounded
-fi
+# Alternate the executor order across matched pairs. A/A controls repeat the
+# same executable, allocator, workload, and executor in two fresh processes.
+case "$pair_kind" in
+  matched|pressure-matched)
+    if (( pair_ordinal % 2 == 0 )); then
+      run_one bounded bounded "$allocator" "$binary" "$oracle_file" "$oracle_digest_actual"
+      run_one tokio tokio "$allocator" "$binary" "$oracle_file" "$oracle_digest_actual"
+    else
+      run_one tokio tokio "$allocator" "$binary" "$oracle_file" "$oracle_digest_actual"
+      run_one bounded bounded "$allocator" "$binary" "$oracle_file" "$oracle_digest_actual"
+    fi
+    ;;
+  aa-bounded)
+    run_one bounded-a bounded "$allocator" "$binary" "$oracle_file" "$oracle_digest_actual"
+    run_one bounded-b bounded "$allocator" "$binary" "$oracle_file" "$oracle_digest_actual"
+    ;;
+  aa-tokio)
+    run_one tokio-a tokio "$allocator" "$binary" "$oracle_file" "$oracle_digest_actual"
+    run_one tokio-b tokio "$allocator" "$binary" "$oracle_file" "$oracle_digest_actual"
+    ;;
+  allocator-match|pressure-allocator-match)
+    if (( pair_ordinal % 2 == 0 )); then
+      run_one baseline bounded "$baseline_allocator" "$baseline_binary" "$baseline_oracle_file" "$baseline_oracle_digest_actual"
+      run_one candidate bounded "$allocator" "$binary" "$oracle_file" "$oracle_digest_actual"
+    else
+      run_one candidate bounded "$allocator" "$binary" "$oracle_file" "$oracle_digest_actual"
+      run_one baseline bounded "$baseline_allocator" "$baseline_binary" "$baseline_oracle_file" "$baseline_oracle_digest_actual"
+    fi
+    ;;
+esac
 
 source_digest_after=$(source_hash) || { failed=1; source_digest_after=unavailable; }
 binary_digest_after=$(sha256sum "$binary" | awk '{print $1}') || {
   failed=1
   binary_digest_after=unavailable
 }
+if [[ "$pair_kind" == allocator-match || "$pair_kind" == pressure-allocator-match ]]; then
+  baseline_binary_digest_after=$(sha256sum "$baseline_binary" | awk '{print $1}') || {
+    failed=1
+    baseline_binary_digest_after=unavailable
+  }
+  [[ "$baseline_binary_digest_after" == "$baseline_binary_digest" ]] || failed=1
+else
+  baseline_binary_digest_after=
+fi
 if [[ "$mode" == open_loop ]]; then
   oracle_digest_after=$(sha256sum "$oracle_file" | awk '{print $1}') || {
     failed=1
     oracle_digest_after=unavailable
   }
+  if [[ "$pair_kind" == allocator-match || "$pair_kind" == pressure-allocator-match ]]; then
+    baseline_oracle_digest_after=$(sha256sum "$baseline_oracle_file" | awk '{print $1}') || {
+      failed=1
+      baseline_oracle_digest_after=unavailable
+    }
+    [[ "$baseline_oracle_digest_after" == "$baseline_oracle_digest_expected" && "$baseline_oracle_digest_actual" == "$baseline_oracle_digest_expected" ]] || failed=1
+  else
+    baseline_oracle_digest_after=
+  fi
 else
   oracle_digest_after=
+  baseline_oracle_digest_after=
 fi
 {
   printf 'source_tree_sha256_before\t%s\n' "$source_digest"
   printf 'source_tree_sha256_after\t%s\n' "$source_digest_after"
   printf 'binary_sha256_before\t%s\n' "$binary_digest"
   printf 'binary_sha256_after\t%s\n' "$binary_digest_after"
+  printf 'baseline_binary_sha256_before\t%s\n' "$baseline_binary_digest"
+  printf 'baseline_binary_sha256_after\t%s\n' "$baseline_binary_digest_after"
   printf 'oracle_sha256_before\t%s\n' "$oracle_digest_actual"
   printf 'oracle_sha256_after\t%s\n' "$oracle_digest_after"
+  printf 'baseline_oracle_sha256_before\t%s\n' "$baseline_oracle_digest_actual"
+  printf 'baseline_oracle_sha256_after\t%s\n' "$baseline_oracle_digest_after"
 } >> "$cell_dir/metadata.tsv"
 [[ $(awk -F '\t' '$1=="source_tree_sha256_before"{b=$2} $1=="source_tree_sha256_after"{a=$2} END{print (b==a)?"same":"changed"}' "$cell_dir/metadata.tsv") == same ]] || failed=1
 [[ "$binary_digest" == "$binary_digest_after" ]] || failed=1
