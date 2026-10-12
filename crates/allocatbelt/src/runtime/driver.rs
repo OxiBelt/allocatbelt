@@ -25,6 +25,12 @@
 #[path = "driver_feedback.rs"]
 mod feedback;
 
+#[path = "driver_io.rs"]
+mod io_bindings;
+pub use io_bindings::IoBindings;
+#[cfg(not(loom))]
+pub use io_bindings::{DriverRateDatagramError, DriverRateDatagramFailure};
+
 #[cfg(feature = "resource-feedback")]
 use feedback::FeedbackMeters;
 #[cfg(feature = "resource-feedback")]
@@ -1376,6 +1382,25 @@ impl CurrentThreadDriver {
     self.download_rate.clone()
   }
 
+  /// Creates cloneable bindings for the configured resource and I/O policies.
+  ///
+  /// Move clones into owned tasks to wrap endpoints without retaining this
+  /// driver. The shared payload is charged to the bound tenant before it is
+  /// allocated. Driver shutdown still closes its rate timer. Stream adapters
+  /// limit bytes; logical operation permits use the returned binding's scope.
+  pub fn io_bindings(&self) -> Result<IoBindings, DomainError> {
+    let timer = self.rate_timer.as_ref().map(TimerDriver::handle);
+    IoBindings::new(
+      &self.resources,
+      self.disk_rate.as_ref(),
+      self.upload_rate.as_ref(),
+      self.download_rate.as_ref(),
+      timer.as_ref(),
+      #[cfg(feature = "resource-feedback")]
+      self.feedback_meters.clone(),
+    )
+  }
+
   /// Wraps an application stream with download/read and upload/write buckets.
   ///
   /// The adapter uses a private fixed real-clock timer, independently of this
@@ -1727,6 +1752,25 @@ impl MultiThreadDriver {
   #[must_use]
   pub fn download_rate(&self) -> Option<ByteRateLimit> {
     self.download_rate.clone()
+  }
+
+  /// Creates cloneable bindings for the configured resource and I/O policies.
+  ///
+  /// Move clones into owned tasks to wrap endpoints without retaining this
+  /// driver. The shared payload is charged to the bound tenant before it is
+  /// allocated. Driver shutdown still closes its rate timer. Stream adapters
+  /// limit bytes; logical operation permits use the returned binding's scope.
+  pub fn io_bindings(&self) -> Result<IoBindings, DomainError> {
+    let timer = self.rate_timer.as_ref().map(TimerDriver::handle);
+    IoBindings::new(
+      &self.resources,
+      self.disk_rate.as_ref(),
+      self.upload_rate.as_ref(),
+      self.download_rate.as_ref(),
+      timer.as_ref(),
+      #[cfg(feature = "resource-feedback")]
+      self.feedback_meters.clone(),
+    )
   }
 
   /// Wraps an application stream with download/read and upload/write buckets.
