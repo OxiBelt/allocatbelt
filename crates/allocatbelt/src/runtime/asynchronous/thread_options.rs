@@ -44,6 +44,10 @@ pub struct AsyncThreadOptions {
 }
 
 impl AsyncThreadOptions {
+  pub(super) fn control_name_capacity(&self) -> usize {
+    self.name.as_ref().map_or(0, String::capacity)
+  }
+
   /// Creates default options, preserving the executor's standard names.
   #[must_use]
   pub fn new() -> Self {

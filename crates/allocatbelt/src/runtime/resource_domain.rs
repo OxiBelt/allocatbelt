@@ -30,7 +30,7 @@ fn next_domain_identity() -> Result<DomainIdentity, DomainError> {
 }
 
 /// Independently admitted resources in a managed domain.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 #[repr(usize)]
 pub enum DomainResource {
   Cpu = 0,
@@ -74,7 +74,7 @@ impl DomainResources {
 }
 
 /// Why a domain operation was refused without partial admission.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 #[non_exhaustive]
 pub enum DomainError {
   Invalid,
@@ -543,6 +543,7 @@ impl TenantDomain {
     if count == 0 {
       return Err(DomainError::Invalid);
     }
+    let control = ControlCharge::try_new(Some(self), std::mem::size_of::<DomainWaitPoolInner>())?;
     let mut state = lock(&self.owner.domain.state);
     let key = self.owner.key;
     let Some(tenant) = state.tenants.get(key.index) else {
@@ -587,6 +588,7 @@ impl TenantDomain {
       inner: Arc::new(DomainWaitPoolInner {
         domain: self.owner.domain.clone(),
         id: pool_id,
+        _control: control,
       }),
     })
   }
@@ -643,9 +645,15 @@ pub(crate) struct DomainWaitPool {
 struct DomainWaitPoolInner {
   domain: ResourceDomain,
   id: u64,
+  _control: ControlCharge,
 }
 
 impl DomainWaitPool {
+  #[cfg(all(test, not(loom)))]
+  pub(crate) const fn control_payload_bytes() -> usize {
+    std::mem::size_of::<DomainWaitPoolInner>()
+  }
+
   pub(crate) fn try_lease(&self) -> Result<DomainWaiter, DomainError> {
     let mut state = lock(&self.inner.domain.state);
     let Some(index) = state.waiters.iter().position(|slot| {
@@ -930,6 +938,216 @@ impl DomainReservation {
   pub(crate) fn domain_identity(&self) -> DomainIdentity {
     self.domain.identity
   }
+
+  /// Splits a resource vector from this ticket without changing global or tenant usage.
+  ///
+  /// The tenant's outstanding-reservation count is incremented under the
+  /// domain lock. If that checked count cannot grow, this ticket and both
+  /// resource ledgers remain unchanged. This is used to admit task and
+  /// control resources atomically, then release the task portion separately
+  /// from retained completion metadata.
+  pub(crate) fn split_off(
+    &mut self,
+    part: DomainResources,
+  ) -> Result<DomainReservation, DomainError> {
+    let mut remaining = self.request;
+    for resource in RESOURCES {
+      let amount = part.get(resource);
+      let Some(left) = remaining.get(resource).checked_sub(amount) else {
+        return Err(DomainError::Invalid);
+      };
+      remaining.0[resource as usize] = left;
+    }
+    if part.empty() {
+      return Err(DomainError::Invalid);
+    }
+
+    let mut state = lock(&self.domain.state);
+    let slot = &state.tenants[self.key.index];
+    if !slot.occupied || slot.generation != self.key.generation {
+      return Err(DomainError::Closed);
+    }
+    let reservations = slot
+      .reservations
+      .checked_add(1)
+      .ok_or(DomainError::Exhausted(DomainResource::Control))?;
+    state.tenants[self.key.index].reservations = reservations;
+    drop(state);
+
+    self.request = remaining;
+    Ok(DomainReservation {
+      domain: self.domain.clone(),
+      key: self.key,
+      request: part,
+    })
+  }
+
+  /// Atomically adjusts this ticket against both the global and tenant
+  /// ledgers. Shrinks always return their released dimensions; growth is
+  /// admitted as a complete vector or changes neither ledger nor ticket.
+  pub(crate) fn try_resize(&mut self, target: DomainResources) -> Result<(), DomainError> {
+    if target == self.request {
+      return Ok(());
+    }
+
+    let mut increase = DomainResources::ZERO;
+    let mut decrease = DomainResources::ZERO;
+    for resource in RESOURCES {
+      let current = self.request.get(resource);
+      let desired = target.get(resource);
+      if desired > current {
+        increase.0[resource as usize] = desired - current;
+      } else {
+        decrease.0[resource as usize] = current - desired;
+      }
+    }
+
+    let mut state = lock(&self.domain.state);
+    let slot = &state.tenants[self.key.index];
+    if !slot.occupied || slot.generation != self.key.generation {
+      return Err(DomainError::Closed);
+    }
+    if slot.closed && !increase.empty() {
+      return Err(DomainError::Closed);
+    }
+    check_ceiling(target, slot.ceiling)?;
+    let global_after_growth = admitted(state.used, increase, state.limit)?;
+    let tenant_after_growth = admitted(slot.used, increase, slot.limit)?;
+    let mut global = global_after_growth;
+    let mut tenant = tenant_after_growth;
+    subtract(&mut global, decrease);
+    subtract(&mut tenant, decrease);
+    let cpu_released = decrease.get(DomainResource::Cpu) != 0;
+    state.used = global;
+    let slot = &mut state.tenants[self.key.index];
+    slot.used = tenant;
+    drop(state);
+
+    self.request = target;
+    if cpu_released {
+      self.domain.wake_waiters();
+    }
+    Ok(())
+  }
+}
+
+/// One bounded Control reservation owned by runtime metadata. Its optional
+/// tenant handle keeps zero-byte and temporarily empty charges tied to the
+/// same tenant generation. The reservation is dropped before the owner.
+#[must_use = "retain with the metadata whose Control bytes it accounts"]
+pub(crate) struct ControlCharge {
+  ticket: Option<DomainReservation>,
+  tenant: Option<TenantDomain>,
+  bytes: usize,
+}
+
+impl fmt::Debug for ControlCharge {
+  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    f.debug_struct("ControlCharge")
+      .field("bytes", &self.bytes)
+      .finish_non_exhaustive()
+  }
+}
+
+impl ControlCharge {
+  pub(crate) const fn unbounded(bytes: usize) -> Self {
+    Self {
+      ticket: None,
+      tenant: None,
+      bytes,
+    }
+  }
+
+  pub(crate) fn from_ticket(
+    tenant: Option<&TenantDomain>,
+    ticket: DomainReservation,
+    bytes: usize,
+  ) -> Self {
+    debug_assert_eq!(
+      ticket.resources(),
+      DomainResources::ZERO.with(DomainResource::Control, bytes)
+    );
+    Self {
+      ticket: Some(ticket),
+      tenant: tenant.cloned(),
+      bytes,
+    }
+  }
+
+  pub(crate) fn try_new(tenant: Option<&TenantDomain>, bytes: usize) -> Result<Self, DomainError> {
+    let tenant = tenant.cloned();
+    let ticket = match (&tenant, bytes) {
+      (Some(tenant), amount) if amount != 0 => {
+        Some(tenant.try_acquire(DomainResources::ZERO.with(DomainResource::Control, amount))?)
+      }
+      _ => None,
+    };
+    Ok(Self {
+      ticket,
+      tenant,
+      bytes,
+    })
+  }
+
+  pub(crate) fn bytes(&self) -> usize {
+    self.bytes
+  }
+
+  /// Reconciles a reservation to the exact retained payload size. The
+  /// Control resize takes the global and tenant dimensions under one lock.
+  pub(crate) fn try_resize(&mut self, bytes: usize) -> Result<(), DomainError> {
+    if bytes == self.bytes {
+      return Ok(());
+    }
+    if let Some(ticket) = &mut self.ticket {
+      ticket.try_resize(DomainResources::ZERO.with(DomainResource::Control, bytes))?;
+      if bytes == 0 {
+        // Drop a zero-vector ticket only after its domain lock has been
+        // released. The owner handle remains here for a possible regrowth.
+        drop(self.ticket.take());
+      }
+    } else if bytes != 0
+      && let Some(tenant) = &self.tenant
+    {
+      self.ticket =
+        Some(tenant.try_acquire(DomainResources::ZERO.with(DomainResource::Control, bytes))?);
+    }
+    self.bytes = bytes;
+    Ok(())
+  }
+
+  /// Transfers bytes of this charge to a second owner without increasing
+  /// global or tenant usage. Failed partitions leave this charge untouched.
+  pub(crate) fn split_off(&mut self, bytes: usize) -> Result<Self, DomainError> {
+    let Some(remaining) = self.bytes.checked_sub(bytes) else {
+      return Err(DomainError::Invalid);
+    };
+    let ticket = if bytes == 0 {
+      None
+    } else if let Some(ticket) = &mut self.ticket {
+      Some(ticket.split_off(DomainResources::ZERO.with(DomainResource::Control, bytes))?)
+    } else {
+      None
+    };
+    self.bytes = remaining;
+    if remaining == 0 {
+      // Avoid keeping a zero-resource reservation count after transferring
+      // the complete charge. The tenant handle still retains the generation.
+      drop(self.ticket.take());
+    }
+    Ok(Self {
+      ticket,
+      tenant: self.tenant.clone(),
+      bytes,
+    })
+  }
+}
+
+/// The bytes occupied by capacity slots of T, using checked arithmetic.
+pub(crate) fn payload_bytes<T>(capacity: usize) -> Result<usize, DomainError> {
+  capacity
+    .checked_mul(std::mem::size_of::<T>())
+    .ok_or(DomainError::Invalid)
 }
 
 #[cfg(all(test, not(loom)))]
@@ -946,6 +1164,226 @@ mod tests {
       .with(DomainResource::Network, 2)
       .with(DomainResource::Tasks, 4)
       .with(DomainResource::Control, 4096)
+  }
+
+  #[test]
+  fn split_reservation_preserves_usage_and_releases_components_independently() {
+    let limits = limits(1, 0);
+    let domain = ResourceDomain::new(limits, 1).unwrap();
+    let tenant = domain.tenant(limits).unwrap();
+    let baseline = domain.snapshot();
+    let request = DomainResources::ZERO
+      .with(DomainResource::Tasks, 1)
+      .with(DomainResource::Control, 128);
+    let mut combined = tenant.try_acquire(request).unwrap();
+    let before = domain.snapshot();
+
+    let task = combined
+      .split_off(DomainResources::ZERO.with(DomainResource::Tasks, 1))
+      .unwrap();
+    assert_eq!(domain.snapshot(), before);
+    assert_eq!(
+      task.resources(),
+      DomainResources::ZERO.with(DomainResource::Tasks, 1)
+    );
+    assert_eq!(
+      combined.resources(),
+      DomainResources::ZERO.with(DomainResource::Control, 128)
+    );
+    drop(task);
+    assert_eq!(domain.snapshot().used.get(DomainResource::Tasks), 0);
+    assert_eq!(
+      domain.snapshot().used.get(DomainResource::Control),
+      before.used.get(DomainResource::Control)
+    );
+    drop(combined);
+    assert_eq!(domain.snapshot().used, baseline.used);
+  }
+
+  #[test]
+  fn failed_split_at_reservation_count_limit_keeps_original_ticket() {
+    let limits = limits(1, 0);
+    let domain = ResourceDomain::new(limits, 1).unwrap();
+    let tenant = domain.tenant(limits).unwrap();
+    let mut ticket = tenant
+      .try_acquire(DomainResources::ZERO.with(DomainResource::Control, 32))
+      .unwrap();
+    let original = ticket.resources();
+    let used = domain.snapshot().used;
+    {
+      let mut state = lock(&domain.state);
+      state.tenants[tenant.owner.key.index].reservations = usize::MAX;
+    }
+
+    assert_eq!(
+      ticket
+        .split_off(DomainResources::ZERO.with(DomainResource::Control, 8))
+        .err(),
+      Some(DomainError::Exhausted(DomainResource::Control))
+    );
+    assert_eq!(ticket.resources(), original);
+    assert_eq!(domain.snapshot().used, used);
+    lock(&domain.state).tenants[tenant.owner.key.index].reservations = 1;
+  }
+
+  #[test]
+  fn resize_checks_only_positive_deltas_and_rolls_back_both_ledgers() {
+    let ceiling = limits(1, 0);
+    let domain = ResourceDomain::new(ceiling, 1).unwrap();
+    let tenant = domain.tenant(ceiling).unwrap();
+    let mut ticket = tenant
+      .try_acquire(
+        DomainResources::ZERO
+          .with(DomainResource::Cpu, 1)
+          .with(DomainResource::Control, 20),
+      )
+      .unwrap();
+
+    domain
+      .set_limits(ceiling.with(DomainResource::Cpu, 0))
+      .unwrap();
+    tenant
+      .set_limits(
+        ceiling
+          .with(DomainResource::Cpu, 0)
+          .with(DomainResource::Control, 25),
+      )
+      .unwrap();
+    let global_before = domain.snapshot().used;
+    let tenant_before = tenant.snapshot().unwrap().used;
+    let desired = DomainResources::ZERO
+      .with(DomainResource::Cpu, 1)
+      .with(DomainResource::Control, 40);
+    assert_eq!(
+      ticket.try_resize(desired),
+      Err(DomainError::Exhausted(DomainResource::Control))
+    );
+    assert_eq!(ticket.resources().get(DomainResource::Control), 20);
+    assert_eq!(domain.snapshot().used, global_before);
+    assert_eq!(tenant.snapshot().unwrap().used, tenant_before);
+
+    // Raising the tenant cap is not enough while the global soft cap still
+    // blocks the positive Control delta.
+    tenant
+      .set_limits(
+        ceiling
+          .with(DomainResource::Cpu, 0)
+          .with(DomainResource::Control, 40),
+      )
+      .unwrap();
+    let baseline = domain.snapshot().used.get(DomainResource::Control);
+    domain
+      .set_limits(
+        ceiling
+          .with(DomainResource::Cpu, 0)
+          .with(DomainResource::Control, baseline + 10),
+      )
+      .unwrap();
+    let global_before = domain.snapshot().used;
+    let tenant_before = tenant.snapshot().unwrap().used;
+    assert_eq!(
+      ticket.try_resize(desired),
+      Err(DomainError::Exhausted(DomainResource::Control))
+    );
+    assert_eq!(domain.snapshot().used, global_before);
+    assert_eq!(tenant.snapshot().unwrap().used, tenant_before);
+
+    domain
+      .set_limits(
+        ceiling
+          .with(DomainResource::Cpu, 0)
+          .with(DomainResource::Control, baseline + 40),
+      )
+      .unwrap();
+    ticket.try_resize(desired).unwrap();
+    assert_eq!(ticket.resources(), desired);
+    assert_eq!(
+      domain.snapshot().used.get(DomainResource::Control),
+      baseline + 20
+    );
+
+    tenant.close();
+    let smaller = desired.with(DomainResource::Control, 10);
+    ticket.try_resize(smaller).unwrap();
+    assert_eq!(
+      domain.snapshot().used.get(DomainResource::Control),
+      baseline - 10
+    );
+    assert_eq!(ticket.try_resize(desired), Err(DomainError::Closed));
+    assert_eq!(ticket.resources(), smaller);
+    drop(ticket);
+    assert_eq!(
+      domain.snapshot().used.get(DomainResource::Control),
+      baseline - 20
+    );
+  }
+
+  #[test]
+  fn control_charge_tracks_splits_and_reconciled_bytes() {
+    let limits = limits(1, 0);
+    let domain = ResourceDomain::new(limits, 1).unwrap();
+    let tenant = domain.tenant(limits).unwrap();
+    let baseline = domain.snapshot().used.get(DomainResource::Control);
+    let mut charge = ControlCharge::try_new(Some(&tenant), 32).unwrap();
+    let remainder = charge.split_off(12).unwrap();
+    assert_eq!(
+      domain.snapshot().used.get(DomainResource::Control),
+      baseline + 32
+    );
+    assert_eq!(charge.bytes(), 20);
+    assert_eq!(remainder.bytes(), 12);
+    charge.try_resize(24).unwrap();
+    assert_eq!(
+      domain.snapshot().used.get(DomainResource::Control),
+      baseline + 36
+    );
+    drop(remainder);
+    assert_eq!(
+      domain.snapshot().used.get(DomainResource::Control),
+      baseline + 24
+    );
+    charge.try_resize(0).unwrap();
+    assert_eq!(
+      domain.snapshot().used.get(DomainResource::Control),
+      baseline
+    );
+    assert_eq!(payload_bytes::<u64>(3), Ok(24));
+    assert_eq!(payload_bytes::<u64>(usize::MAX), Err(DomainError::Invalid));
+  }
+
+  #[test]
+  fn waiter_pool_control_owner_survives_until_last_waiter_after_close() {
+    let limits = limits(1, 0);
+    let domain = ResourceDomain::with_waiters(limits, 1, 1).unwrap();
+    let tenant = domain.tenant(limits).unwrap();
+    let baseline = domain.snapshot().used.get(DomainResource::Control);
+    let pool_bytes = DomainWaitPool::control_payload_bytes();
+    let pool = tenant.reserve_waiters(1).unwrap();
+    let waiter = pool.try_lease().unwrap();
+    let retained_pool = pool.clone();
+    assert_eq!(
+      domain.snapshot().used.get(DomainResource::Control),
+      baseline + pool_bytes
+    );
+
+    tenant.close();
+    drop(tenant);
+    drop(pool);
+    drop(retained_pool);
+    assert_eq!(domain.snapshot().live_tenants, 1);
+    assert_eq!(
+      domain.snapshot().used.get(DomainResource::Control),
+      baseline + pool_bytes
+    );
+    assert_eq!(domain.tenant(limits).unwrap_err(), DomainError::TenantsFull);
+
+    drop(waiter);
+    assert_eq!(domain.snapshot().live_tenants, 0);
+    assert_eq!(
+      domain.snapshot().used.get(DomainResource::Control),
+      baseline
+    );
+    assert!(domain.tenant(limits).is_ok());
   }
 
   #[test]
@@ -1191,15 +1629,16 @@ mod tests {
       DomainError::WaitersFull
     );
     let state = lock(&domain.state);
-    let expected = state.tenants.capacity() * std::mem::size_of::<TenantSlot>()
+    let table_bytes = state.tenants.capacity() * std::mem::size_of::<TenantSlot>()
       + state.waiters.capacity() * std::mem::size_of::<WaiterSlot>();
     drop(state);
+    let expected = table_bytes + DomainWaitPool::control_payload_bytes();
     assert_eq!(
       domain.snapshot().used.get(DomainResource::Control),
       expected
     );
 
-    let too_small = ceiling.with(DomainResource::Control, expected - 1);
+    let too_small = ceiling.with(DomainResource::Control, table_bytes - 1);
     assert_eq!(
       ResourceDomain::with_waiters(too_small, 2, 4).unwrap_err(),
       DomainError::Exhausted(DomainResource::Control)
@@ -1427,6 +1866,10 @@ mod tests {
   }
 }
 
+#[cfg(all(test, not(loom)))]
+#[path = "control_budget.rs"]
+mod control_budget_tests;
+
 #[cfg(all(test, loom))]
 mod model {
   use super::*;
@@ -1546,6 +1989,50 @@ mod model {
       drop(admitted);
       assert_eq!(new_wakes.load(Ordering::SeqCst), 0);
       assert_eq!(domain.snapshot().used.get(DomainResource::Cpu), 0);
+    });
+  }
+
+  #[test]
+  fn loom_task_control_partition_releases_tasks_before_retained_control() {
+    loom::model(|| {
+      let ceiling = DomainResources::ZERO
+        .with(DomainResource::Tasks, 1)
+        .with(DomainResource::Control, 4096);
+      let domain = ResourceDomain::new(ceiling, 2).unwrap();
+      let baseline = domain.snapshot().used.get(DomainResource::Control);
+      domain
+        .set_limits(ceiling.with(DomainResource::Control, baseline + 64))
+        .unwrap();
+      let left = domain.tenant(ceiling).unwrap();
+      let right = domain.tenant(ceiling).unwrap();
+      let request = DomainResources::ZERO
+        .with(DomainResource::Tasks, 1)
+        .with(DomainResource::Control, 64);
+
+      let acquire = move |tenant: TenantDomain| {
+        tenant.try_acquire(request).ok().map(|mut combined| {
+          let task = combined
+            .split_off(DomainResources::ZERO.with(DomainResource::Tasks, 1))
+            .unwrap();
+          drop(task);
+          combined
+        })
+      };
+      let left = loom::thread::spawn(move || acquire(left));
+      let right = loom::thread::spawn(move || acquire(right));
+      let left = left.join().unwrap();
+      let right = right.join().unwrap();
+      assert_ne!(left.is_some(), right.is_some());
+      let held = domain.snapshot().used;
+      assert_eq!(held.get(DomainResource::Tasks), 0);
+      assert_eq!(held.get(DomainResource::Control), baseline + 64);
+
+      drop(left);
+      drop(right);
+      assert_eq!(
+        domain.snapshot().used.get(DomainResource::Control),
+        baseline
+      );
     });
   }
 }

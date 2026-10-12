@@ -2,7 +2,6 @@
 //! shutdown.
 
 use std::any::Any;
-use std::collections::VecDeque;
 use std::io;
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -11,8 +10,9 @@ use std::thread::{self, JoinHandle};
 use crate::runtime::error::SubmitError;
 use crate::runtime::job::{CancellationToken, Job};
 use crate::runtime::managed::ResourceScope;
+use crate::runtime::resource_domain::{ControlCharge, DomainError, payload_bytes};
 use crate::runtime::resources::Resources;
-use crate::runtime::scheduler::{Entry, Shared, Snapshot};
+use crate::runtime::scheduler::{ClosedQueue, Shared, Snapshot, domain_build_error};
 use crate::runtime::task::drop_contained;
 use crate::runtime::time::TimerHandle;
 use crate::runtime::worker;
@@ -61,10 +61,12 @@ pub struct Runtime {
   shared: Arc<Shared>,
   workers: Vec<JoinHandle<()>>,
   panic_payloads: Mutex<Vec<Box<dyn Any + Send>>>,
-  shutdown_pending: Mutex<VecDeque<Entry>>,
+  shutdown_pending: Mutex<ClosedQueue>,
   shutdown_requested: bool,
   shutdown_complete: bool,
   shutdown_panicked: bool,
+  _control: ControlCharge,
+  launch_control: Option<Arc<ControlCharge>>,
 }
 
 /// A cloneable, thread-safe submission handle. Submissions after the
@@ -76,6 +78,27 @@ pub struct Handle {
 }
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+
+fn control_build_error(error: DomainError, bound: bool) -> io::Error {
+  if !bound && matches!(error, DomainError::Invalid) {
+    io::ErrorKind::OutOfMemory.into()
+  } else {
+    domain_build_error(error)
+  }
+}
+
+fn abandon_closed_queue(shared: &Shared, pending: ClosedQueue) {
+  let (entries, control) = pending.into_parts();
+  worker::abandon_all(shared, entries);
+  drop(control);
+}
+
+fn stop_started_workers(shared: &Shared, workers: &mut Vec<JoinHandle<()>>) {
+  abandon_closed_queue(shared, shared.close(true));
+  while let Some(worker) = workers.pop() {
+    let _ = worker.join();
+  }
+}
 
 impl Runtime {
   /// Starts `config.workers` worker threads.
@@ -136,6 +159,45 @@ impl Runtime {
       ));
     }
     let id = worker::next_id(&NEXT_ID).ok_or_else(|| io::Error::other("runtime ids exhausted"))?;
+    let tenant = resources
+      .as_ref()
+      .and_then(ResourceScope::tenant_domain)
+      .cloned();
+    let bound = tenant.is_some();
+    let name_bound = "allocatbelt-runtime-"
+      .len()
+      .checked_add(std::mem::size_of::<usize>() * 3)
+      .ok_or_else(|| control_build_error(DomainError::Invalid, bound))?;
+    let worker_bytes = payload_bytes::<JoinHandle<()>>(config.workers)
+      .map_err(|error| control_build_error(error, bound))?;
+    let panic_bytes = payload_bytes::<Box<dyn Any + Send>>(config.workers)
+      .map_err(|error| control_build_error(error, bound))?;
+    let persistent_bytes = std::mem::size_of::<Runtime>()
+      .checked_add(worker_bytes)
+      .and_then(|bytes| bytes.checked_add(panic_bytes))
+      .ok_or_else(|| control_build_error(DomainError::Invalid, bound))?;
+    let startup_bytes = name_bound
+      .checked_add(std::mem::size_of::<thread::Builder>())
+      .ok_or_else(|| control_build_error(DomainError::Invalid, bound))?;
+    let runtime_bytes = persistent_bytes
+      .checked_add(startup_bytes)
+      .ok_or_else(|| control_build_error(DomainError::Invalid, bound))?;
+    let mut runtime_control = ControlCharge::try_new(tenant.as_ref(), runtime_bytes)
+      .map_err(|error| control_build_error(error, bound))?;
+    let launch_control = if let Some(tenant) = tenant.as_ref() {
+      let launch_bytes = std::mem::size_of::<ControlCharge>()
+        .checked_add(
+          payload_bytes::<(Arc<Shared>, usize, Option<Arc<ControlCharge>>)>(config.workers)
+            .map_err(|error| control_build_error(error, bound))?,
+        )
+        .ok_or_else(|| control_build_error(DomainError::Invalid, bound))?;
+      Some(Arc::new(
+        ControlCharge::try_new(Some(tenant), launch_bytes)
+          .map_err(|error| control_build_error(error, bound))?,
+      ))
+    } else {
+      None
+    };
     let mut shared = Shared::new(
       id,
       config.workers,
@@ -153,32 +215,74 @@ impl Runtime {
     panic_payloads
       .try_reserve_exact(config.workers)
       .map_err(|_| io::Error::from(io::ErrorKind::OutOfMemory))?;
+    let actual_persistent_bytes = std::mem::size_of::<Runtime>()
+      .checked_add(
+        payload_bytes::<JoinHandle<()>>(workers.capacity())
+          .map_err(|error| control_build_error(error, bound))?,
+      )
+      .and_then(|bytes| {
+        payload_bytes::<Box<dyn Any + Send>>(panic_payloads.capacity())
+          .ok()
+          .and_then(|payload_bytes| bytes.checked_add(payload_bytes))
+      })
+      .ok_or_else(|| control_build_error(DomainError::Invalid, bound))?;
+    let actual_startup_bytes = name_bound
+      .checked_add(std::mem::size_of::<thread::Builder>())
+      .ok_or_else(|| control_build_error(DomainError::Invalid, bound))?;
+    runtime_control
+      .try_resize(
+        actual_persistent_bytes
+          .checked_add(actual_startup_bytes)
+          .ok_or_else(|| control_build_error(DomainError::Invalid, bound))?,
+      )
+      .map_err(|error| control_build_error(error, bound))?;
     for index in 0..config.workers {
       let worker_shared = Arc::clone(&shared);
+      let thread_launch_control = launch_control.clone();
+      let name = format!("allocatbelt-runtime-{index}");
+      let name_capacity = name.capacity();
+      if name_capacity > name_bound {
+        let actual = actual_persistent_bytes
+          .checked_add(name_capacity)
+          .and_then(|bytes| bytes.checked_add(std::mem::size_of::<thread::Builder>()))
+          .ok_or_else(|| control_build_error(DomainError::Invalid, bound))?;
+        if let Err(error) = runtime_control.try_resize(actual) {
+          drop(name);
+          stop_started_workers(&shared, &mut workers);
+          return Err(control_build_error(error, bound));
+        }
+      }
       let spawned = spawn(
-        thread::Builder::new().name(format!("allocatbelt-runtime-{index}")),
-        Box::new(move || worker::run(&worker_shared, index)),
+        thread::Builder::new().name(name),
+        Box::new(move || {
+          let _launch_control = thread_launch_control;
+          worker::run(&worker_shared, index);
+        }),
       );
       match spawned {
         Ok(handle) => workers.push(handle),
         Err(error) => {
-          // No job was admitted yet: the started workers are idle.
-          let _ = shared.close(true);
-          for handle in workers {
-            let _ = handle.join();
-          }
+          stop_started_workers(&shared, &mut workers);
           return Err(error);
         }
       }
     }
+    runtime_control
+      .try_resize(actual_persistent_bytes)
+      .map_err(|error| {
+        stop_started_workers(&shared, &mut workers);
+        control_build_error(error, bound)
+      })?;
     Ok(Self {
       shared,
       workers,
       panic_payloads: Mutex::new(panic_payloads),
-      shutdown_pending: Mutex::new(VecDeque::new()),
+      shutdown_pending: Mutex::new(ClosedQueue::empty()),
       shutdown_requested: false,
       shutdown_complete: false,
       shutdown_panicked: false,
+      _control: runtime_control,
+      launch_control,
     })
   }
 
@@ -227,8 +331,10 @@ impl Runtime {
   /// finished all the same.
   pub fn shutdown(&mut self, mode: ShutdownMode) -> io::Result<()> {
     if self.workers.is_empty() {
-      if !self.lock_shutdown_pending().is_empty() {
-        worker::abandon_all(&self.shared, self.take_shutdown_pending());
+      let pending = self.take_shutdown_pending();
+      let had_pending = !pending.is_empty();
+      abandon_closed_queue(&self.shared, pending);
+      if had_pending {
         self.shutdown_complete = true;
       }
       if !self.lock_panic_payloads().is_empty() {
@@ -245,18 +351,19 @@ impl Runtime {
         "shutdown called from one of the runtime's own workers",
       ));
     }
-    worker::abandon_all(
+    abandon_closed_queue(
       &self.shared,
       self.shared.close(mode == ShutdownMode::CancelPending),
     );
-    worker::abandon_all(&self.shared, self.take_shutdown_pending());
+    abandon_closed_queue(&self.shared, self.take_shutdown_pending());
     let mut panicked = false;
-    for handle in std::mem::take(&mut self.workers) {
+    while let Some(handle) = self.workers.pop() {
       if let Err(payload) = handle.join() {
         panicked = true;
         self.lock_panic_payloads().push(payload);
       }
     }
+    drop(self.launch_control.take());
     self.shutdown_requested = true;
     self.shutdown_complete = true;
     self.shutdown_panicked |= panicked;
@@ -281,7 +388,11 @@ impl Runtime {
       ));
     }
     let pending = self.shared.close(mode == ShutdownMode::CancelPending);
-    *self.lock_shutdown_pending() = pending;
+    let old = {
+      let mut slot = self.lock_shutdown_pending();
+      std::mem::replace(&mut *slot, pending)
+    };
+    drop(old);
     self.shutdown_requested = true;
     Ok(())
   }
@@ -336,12 +447,14 @@ impl Runtime {
     {
       return Ok(false);
     }
-    for worker in std::mem::take(&mut self.workers) {
+    while let Some(worker) = self.workers.pop() {
       if let Err(payload) = worker.join() {
         self.shutdown_panicked = true;
         self.lock_panic_payloads().push(payload);
       }
     }
+    drop(self.launch_control.take());
+    drop(self.take_shutdown_pending());
     self.shutdown_complete = true;
     if self.shutdown_panicked {
       Err(io::Error::other("a runtime worker panicked"))
@@ -354,23 +467,23 @@ impl Runtime {
     self.shutdown_complete
   }
 
-  fn lock_shutdown_pending(&self) -> MutexGuard<'_, VecDeque<Entry>> {
+  fn lock_shutdown_pending(&self) -> MutexGuard<'_, ClosedQueue> {
     self
       .shutdown_pending
       .lock()
       .unwrap_or_else(PoisonError::into_inner)
   }
 
-  fn take_shutdown_pending(&self) -> VecDeque<Entry> {
+  fn take_shutdown_pending(&self) -> ClosedQueue {
     std::mem::take(&mut *self.lock_shutdown_pending())
   }
 
-  fn take_panic_payloads(&self) -> Vec<Box<dyn Any + Send>> {
-    std::mem::take(&mut *self.lock_panic_payloads())
-  }
-
   fn drop_panic_payloads(&self) {
-    for payload in self.take_panic_payloads() {
+    loop {
+      let payload = self.lock_panic_payloads().pop();
+      let Some(payload) = payload else {
+        break;
+      };
       drop_contained(payload);
     }
   }
@@ -391,7 +504,9 @@ impl Handle {
   ///
   /// [`SubmitErrorKind`](crate::runtime::SubmitErrorKind): `Closed`, then
   /// `InvalidRequest` (exceeds the capacity), `Full` (the outstanding bound
-  /// is reached), `InsufficientResources` (does not fit what is free now).
+  /// is reached), `InsufficientResources` (declared task resources do not fit
+  /// what is free now), or `ResourceDomain` when the bound domain refuses the
+  /// task and Control admission.
   pub fn try_spawn<F, T>(&self, request: Resources, f: F) -> Result<Job<T>, SubmitError<F>>
   where
     F: FnOnce(CancellationToken) -> T + Send + 'static,
@@ -410,11 +525,11 @@ impl Handle {
 impl Drop for Runtime {
   fn drop(&mut self) {
     if !self.workers.is_empty() {
-      worker::abandon_all(&self.shared, self.shared.close(true));
+      abandon_closed_queue(&self.shared, self.shared.close(true));
       // Dropping the handles detaches the threads.
       self.workers.clear();
     }
-    worker::abandon_all(&self.shared, self.take_shutdown_pending());
+    abandon_closed_queue(&self.shared, self.take_shutdown_pending());
     self.drop_panic_payloads();
   }
 }
@@ -436,6 +551,10 @@ impl std::fmt::Debug for Handle {
 #[cfg(test)]
 mod tests {
   use super::*;
+  use crate::runtime::error::JoinError;
+  use crate::runtime::managed::{ResourceLimits, ResourceScope};
+  use crate::runtime::resource_domain::{DomainResource, DomainResources, ResourceDomain};
+  use std::sync::atomic::{AtomicUsize, Ordering};
   use std::sync::mpsc;
   use std::time::{Duration, Instant};
 
@@ -506,5 +625,157 @@ mod tests {
     cleanup_rx
       .recv_timeout(Duration::from_secs(2))
       .unwrap_or_else(|error| panic!("remaining payload cleanup did not run: {error}"));
+  }
+
+  #[test]
+  fn bound_startup_failure_joins_started_workers_and_releases_control() {
+    let ceiling = DomainResources::ZERO
+      .with(DomainResource::Cpu, 2)
+      .with(DomainResource::Tasks, 4)
+      .with(DomainResource::Control, 1 << 20);
+    let domain = ResourceDomain::with_waiters(ceiling, 1, 8)
+      .unwrap_or_else(|error| panic!("resource domain setup failed: {error}"));
+    let tenant = domain
+      .tenant(ceiling)
+      .unwrap_or_else(|error| panic!("tenant setup failed: {error}"));
+    let resources = ResourceScope::from_tenant(ResourceLimits::default(), tenant);
+    let control_before = domain.snapshot().used.get(DomainResource::Control);
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let active = Arc::new(AtomicUsize::new(0));
+    let spawn_attempts = Arc::clone(&attempts);
+    let active_workers = Arc::clone(&active);
+
+    let result = Runtime::with_spawner_and_resources(
+      Config {
+        workers: 2,
+        max_outstanding: 2,
+        capacity: Resources::ZERO,
+      },
+      Some(resources),
+      move |builder, worker| {
+        if spawn_attempts.fetch_add(1, Ordering::SeqCst) == 1 {
+          return Err(io::Error::other("injected worker start failure"));
+        }
+        let active = Arc::clone(&active_workers);
+        builder.spawn(move || {
+          active.fetch_add(1, Ordering::SeqCst);
+          struct ActiveWorker(Arc<AtomicUsize>);
+          impl Drop for ActiveWorker {
+            fn drop(&mut self) {
+              self.0.fetch_sub(1, Ordering::SeqCst);
+            }
+          }
+          let _active = ActiveWorker(active);
+          worker();
+        })
+      },
+      |_| {},
+    );
+
+    let error = result
+      .err()
+      .unwrap_or_else(|| panic!("injected startup failure was ignored"));
+    assert_eq!(error.to_string(), "injected worker start failure");
+    assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    assert_eq!(active.load(Ordering::SeqCst), 0);
+    assert_eq!(
+      domain.snapshot().used.get(DomainResource::Control),
+      control_before
+    );
+  }
+
+  #[test]
+  fn blocking_cpu_wait_waker_control_failure_keeps_closure_unrun() {
+    let ceiling = DomainResources::ZERO
+      .with(DomainResource::Cpu, 1)
+      .with(DomainResource::Tasks, 4)
+      .with(DomainResource::Control, 1 << 20);
+    let domain = ResourceDomain::with_waiters(ceiling, 1, 8)
+      .unwrap_or_else(|error| panic!("resource domain setup failed: {error}"));
+    let tenant = domain
+      .tenant(ceiling)
+      .unwrap_or_else(|error| panic!("tenant setup failed: {error}"));
+    let resources = ResourceScope::from_tenant(ResourceLimits::default(), tenant.clone());
+    let control_before = domain.snapshot().used.get(DomainResource::Control);
+    let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+    let (release_tx, release_rx) = mpsc::sync_channel(1);
+    let release_rx = Arc::new(Mutex::new(release_rx));
+    let mut runtime = Runtime::with_spawner_and_resources(
+      Config {
+        workers: 1,
+        max_outstanding: 2,
+        capacity: Resources::ZERO,
+      },
+      Some(resources),
+      move |builder, worker| {
+        let entered_tx = entered_tx.clone();
+        let release_rx = Arc::clone(&release_rx);
+        builder.spawn(move || {
+          entered_tx.send(()).unwrap();
+          release_rx
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .recv()
+            .unwrap();
+          worker();
+        })
+      },
+      |_| {},
+    )
+    .unwrap_or_else(|error| panic!("blocking runtime setup failed: {error}"));
+    entered_rx
+      .recv_timeout(Duration::from_secs(2))
+      .unwrap_or_else(|error| panic!("worker did not reach its gate: {error}"));
+    let ran = Arc::new(AtomicUsize::new(0));
+    let run_count = Arc::clone(&ran);
+    let job = runtime
+      .try_spawn(Resources::ZERO, move |_| {
+        run_count.fetch_add(1, Ordering::SeqCst);
+        5_usize
+      })
+      .unwrap_or_else(|error| panic!("job admission failed: {}", error.kind));
+
+    let global = domain.snapshot();
+    domain
+      .set_limits(global.limit.with(
+        DomainResource::Control,
+        global.used.get(DomainResource::Control),
+      ))
+      .unwrap_or_else(|error| panic!("global Control limit update failed: {error}"));
+    let tenant_snapshot = tenant
+      .snapshot()
+      .unwrap_or_else(|error| panic!("tenant snapshot failed: {error}"));
+    tenant
+      .set_limits(tenant_snapshot.limit.with(
+        DomainResource::Control,
+        tenant_snapshot.used.get(DomainResource::Control),
+      ))
+      .unwrap_or_else(|error| panic!("tenant Control limit update failed: {error}"));
+    release_tx
+      .send(())
+      .unwrap_or_else(|error| panic!("worker release failed: {error}"));
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while !job.is_finished() {
+      assert!(Instant::now() < deadline, "blocking job did not finish");
+      thread::yield_now();
+    }
+    assert!(matches!(
+      job.join(),
+      Err(JoinError::ResourceDomain(DomainError::Exhausted(
+        DomainResource::Control
+      )))
+    ));
+    assert_eq!(ran.load(Ordering::SeqCst), 0);
+    assert_eq!(domain.snapshot().used.get(DomainResource::Tasks), 0);
+    drop(job);
+    runtime
+      .shutdown(ShutdownMode::Drain)
+      .unwrap_or_else(|error| panic!("blocking shutdown failed: {error}"));
+    drop(runtime);
+    assert_eq!(
+      domain.snapshot().used.get(DomainResource::Control),
+      control_before
+    );
   }
 }

@@ -15,14 +15,16 @@ use super::identity;
 use super::join::AsyncJob;
 use super::metrics::RuntimeMetrics;
 use super::protocol::{PollFinish, PollProtocol, PollQuota, ScopeProtocol};
-use super::task::{DomainCpuAdmission, ErasedTask, PollResult, Task, TaskDomainAdmission};
-use super::thread_options::{AsyncThreadContext, AsyncThreadOptions};
+use super::task::{DomainCpuAdmission, ErasedTask, PollResult, Task};
+use super::thread_options::AsyncThreadContext;
+#[cfg(test)]
+use super::thread_options::AsyncThreadOptions;
 use super::{AsyncConfig, AsyncError, AsyncSpawnError};
 use crate::runtime::cache;
 use crate::runtime::managed::ResourceScope;
 use crate::runtime::resource_domain::{
-  DomainError, DomainIdentity, DomainReservation, DomainResource, DomainResources, DomainWaitPool,
-  DomainWaiter, TenantDomain,
+  ControlCharge, DomainError, DomainIdentity, DomainReservation, DomainResource, DomainResources,
+  DomainWaitPool, DomainWaiter, TenantDomain, payload_bytes,
 };
 
 thread_local! {
@@ -73,15 +75,16 @@ pub(super) struct Shared {
   max_handoffs: usize,
   workers: usize,
   pub(super) metrics: RuntimeMetrics,
-  thread_options: AsyncThreadOptions,
+  thread_options: super::ControlledThreadOptions,
   state: Mutex<State>,
   work: Condvar,
   /// Inactive helpers and restoring threads wait here; `work` waiters are
   /// dispatchers.
   handoff: Condvar,
+  _control: ControlCharge,
 }
 
-struct ScopeCell {
+pub(super) struct ScopeCell {
   reference: Option<ScopeRef>,
   shared: Option<Weak<Shared>>,
   max_active_polls: usize,
@@ -91,6 +94,7 @@ struct ScopeCell {
   root_waiters: Option<DomainWaitPool>,
   protocol: ScopeProtocol,
   completion: Mutex<Option<Waker>>,
+  _control: Option<ControlCharge>,
 }
 
 impl ScopeCell {
@@ -101,6 +105,7 @@ impl ScopeCell {
     resources: Option<ResourceScope>,
     task_waiters: Option<DomainWaitPool>,
     root_waiters: Option<DomainWaitPool>,
+    control: Option<ControlCharge>,
   ) -> Self {
     let tenant = resources
       .as_ref()
@@ -116,6 +121,7 @@ impl ScopeCell {
       root_waiters,
       protocol: ScopeProtocol::new(reference.is_none()),
       completion: Mutex::new(None),
+      _control: control,
     }
   }
 
@@ -148,9 +154,25 @@ impl Shared {
     config: AsyncConfig,
     max_handoffs: usize,
     resources: Option<ResourceScope>,
-    thread_options: AsyncThreadOptions,
+    thread_options: super::ControlledThreadOptions,
     metrics: RuntimeMetrics,
   ) -> Result<(Arc<Self>, ScopeRef), AsyncError> {
+    let tenant = resources.as_ref().and_then(ResourceScope::tenant_domain);
+    let mut requested_control = std::mem::size_of::<Shared>();
+    for bytes in [
+      payload_bytes::<TaskSlot>(config.max_outstanding).map_err(AsyncError::ResourceDomain)?,
+      payload_bytes::<TaskRef>(config.max_outstanding).map_err(AsyncError::ResourceDomain)?,
+      payload_bytes::<ScopeSlot>(config.max_scopes).map_err(AsyncError::ResourceDomain)?,
+      payload_bytes::<ScopeRef>(config.max_scopes).map_err(AsyncError::ResourceDomain)?,
+      std::mem::size_of::<ScopeCell>(),
+    ] {
+      requested_control = requested_control
+        .checked_add(bytes)
+        .ok_or(AsyncError::ResourceDomain(DomainError::Invalid))?;
+    }
+    let mut control =
+      ControlCharge::try_new(tenant, requested_control).map_err(AsyncError::ResourceDomain)?;
+
     let mut tasks = Vec::new();
     tasks
       .try_reserve_exact(config.max_outstanding)
@@ -185,21 +207,20 @@ impl Shared {
     else {
       return Err(AsyncError::InvalidConfig);
     };
-    let (task_waiters, root_waiters) =
-      if let Some(tenant) = resources.as_ref().and_then(ResourceScope::tenant_domain) {
-        tenant
-          .validate_cpu_execution()
-          .map_err(AsyncError::ResourceDomain)?;
-        let task_waiters = tenant
-          .reserve_waiters(config.max_outstanding)
-          .map_err(AsyncError::ResourceDomain)?;
-        let root_waiters = tenant
-          .reserve_waiters(config.workers)
-          .map_err(AsyncError::ResourceDomain)?;
-        (Some(task_waiters), Some(root_waiters))
-      } else {
-        (None, None)
-      };
+    let (task_waiters, root_waiters) = if let Some(tenant) = tenant {
+      tenant
+        .validate_cpu_execution()
+        .map_err(AsyncError::ResourceDomain)?;
+      let task_waiters = tenant
+        .reserve_waiters(config.max_outstanding)
+        .map_err(AsyncError::ResourceDomain)?;
+      let root_waiters = tenant
+        .reserve_waiters(config.workers)
+        .map_err(AsyncError::ResourceDomain)?;
+      (Some(task_waiters), Some(root_waiters))
+    } else {
+      (None, None)
+    };
     let root_scope = Arc::new(ScopeCell::new(
       None,
       None,
@@ -207,6 +228,7 @@ impl Shared {
       resources,
       task_waiters,
       root_waiters,
+      None,
     ));
     scopes[0] = ScopeSlot {
       generation: 1,
@@ -219,6 +241,21 @@ impl Shared {
       index: 0,
       generation: 1,
     };
+    let mut actual_control = std::mem::size_of::<Shared>();
+    for bytes in [
+      payload_bytes::<TaskSlot>(tasks.capacity()).map_err(AsyncError::ResourceDomain)?,
+      payload_bytes::<TaskRef>(ready.capacity()).map_err(AsyncError::ResourceDomain)?,
+      payload_bytes::<ScopeSlot>(scopes.capacity()).map_err(AsyncError::ResourceDomain)?,
+      payload_bytes::<ScopeRef>(round_robin.capacity()).map_err(AsyncError::ResourceDomain)?,
+      std::mem::size_of::<ScopeCell>(),
+    ] {
+      actual_control = actual_control
+        .checked_add(bytes)
+        .ok_or(AsyncError::ResourceDomain(DomainError::Invalid))?;
+    }
+    control
+      .try_resize(actual_control)
+      .map_err(AsyncError::ResourceDomain)?;
     Ok((
       Arc::new(Self {
         id,
@@ -238,6 +275,7 @@ impl Shared {
         }),
         work: Condvar::new(),
         handoff: Condvar::new(),
+        _control: control,
       }),
       root,
     ))
@@ -332,23 +370,26 @@ impl Shared {
     if max_active_polls == 0 {
       return Err(AsyncError::InvalidConfig);
     }
-    let mut state = self.lock();
-    if state.closed {
-      return Err(AsyncError::Closed);
-    }
-    let Some(index) = state.scopes.iter().position(|slot| slot.scope.is_none()) else {
-      return Err(AsyncError::TooManyScopes);
-    };
-    let Some(generation) = state.scopes[index].generation.checked_add(1) else {
-      return Err(AsyncError::TooManyScopes);
-    };
-    let Some(root_cell) = state
-      .scopes
-      .first()
-      .and_then(|slot| slot.scope.as_ref())
-      .cloned()
-    else {
-      return Err(AsyncError::Closed);
+    let (index, generation, root_cell, max_tasks) = {
+      let state = self.lock();
+      if state.closed {
+        return Err(AsyncError::Closed);
+      }
+      let Some(index) = state.scopes.iter().position(|slot| slot.scope.is_none()) else {
+        return Err(AsyncError::TooManyScopes);
+      };
+      let Some(generation) = state.scopes[index].generation.checked_add(1) else {
+        return Err(AsyncError::TooManyScopes);
+      };
+      let Some(root_cell) = state
+        .scopes
+        .first()
+        .and_then(|slot| slot.scope.as_ref())
+        .cloned()
+      else {
+        return Err(AsyncError::Closed);
+      };
+      (index, generation, root_cell, state.tasks.len())
     };
     let root_resources = root_cell.resources.clone();
     let root_tenant = root_cell.tenant.clone();
@@ -375,24 +416,27 @@ impl Shared {
           root_cell.root_waiters.clone(),
         )
       }
-      None => {
-        let (task_waiters, root_waiters) =
-          if let Some(tenant) = resources.as_ref().and_then(ResourceScope::tenant_domain) {
-            tenant
-              .validate_cpu_execution()
-              .map_err(AsyncError::ResourceDomain)?;
-            let task_waiters = tenant
-              .reserve_waiters(state.tasks.len())
-              .map_err(AsyncError::ResourceDomain)?;
-            let root_waiters = tenant
-              .reserve_waiters(self.workers)
-              .map_err(AsyncError::ResourceDomain)?;
-            (Some(task_waiters), Some(root_waiters))
-          } else {
-            (None, None)
-          };
-        (resources, task_waiters, root_waiters)
-      }
+      None => (resources, None, None),
+    };
+    let tenant = resources.as_ref().and_then(ResourceScope::tenant_domain);
+    let makes_wait_pools = root_cell.tenant.is_none() && tenant.is_some();
+    let scope_bytes = std::mem::size_of::<ScopeCell>();
+    let control =
+      ControlCharge::try_new(tenant, scope_bytes).map_err(AsyncError::ResourceDomain)?;
+    let (task_waiters, root_waiters) = if makes_wait_pools {
+      let tenant = tenant.ok_or(AsyncError::ResourceDomain(DomainError::Invalid))?;
+      tenant
+        .validate_cpu_execution()
+        .map_err(AsyncError::ResourceDomain)?;
+      let task_waiters = tenant
+        .reserve_waiters(max_tasks)
+        .map_err(AsyncError::ResourceDomain)?;
+      let root_waiters = tenant
+        .reserve_waiters(self.workers)
+        .map_err(AsyncError::ResourceDomain)?;
+      (Some(task_waiters), Some(root_waiters))
+    } else {
+      (task_waiters, root_waiters)
     };
     let scope_ref = ScopeRef { index, generation };
     let cell = Arc::new(ScopeCell::new(
@@ -402,7 +446,21 @@ impl Shared {
       resources,
       task_waiters,
       root_waiters,
+      Some(control),
     ));
+    let mut state = self.lock();
+    if state.closed {
+      drop(state);
+      drop(cell);
+      return Err(AsyncError::Closed);
+    }
+    if state.scopes[index].scope.is_some()
+      || state.scopes[index].generation.checked_add(1) != Some(generation)
+    {
+      drop(state);
+      drop(cell);
+      return Err(AsyncError::TooManyScopes);
+    }
     state.scopes[index].generation = generation;
     state.scopes[index].scope = Some(Arc::clone(&cell));
     state.scopes[index].ready = false;
@@ -427,6 +485,29 @@ impl Shared {
       .first()
       .and_then(|slot| slot.scope.as_ref())
       .and_then(|scope| scope.resources.clone())
+  }
+
+  pub(super) fn reserve_root_control(
+    &self,
+    scope_ref: ScopeRef,
+    resources: Option<&ResourceScope>,
+    frame_bytes: usize,
+  ) -> Result<ControlCharge, AsyncError> {
+    let default_tenant = {
+      let state = self.lock();
+      let Some(scope) = get_scope(&state, scope_ref) else {
+        return Err(AsyncError::Closed);
+      };
+      scope.tenant.clone()
+    };
+    let tenant = resources
+      .and_then(ResourceScope::tenant_domain)
+      .cloned()
+      .or(default_tenant);
+    let bytes = frame_bytes
+      .checked_add(std::mem::size_of::<RootAdmission>())
+      .ok_or(AsyncError::ResourceDomain(DomainError::Invalid))?;
+    ControlCharge::try_new(tenant.as_ref(), bytes).map_err(AsyncError::ResourceDomain)
   }
 
   pub(super) fn root_admission(
@@ -514,55 +595,49 @@ impl Shared {
     F: Future + Send + 'static,
     F::Output: Send + 'static,
   {
-    let mut state = self.lock();
-    if state.closed {
-      drop(state);
-      return Err(AsyncSpawnError::new(AsyncError::Closed, future));
+    let (index, generation, scope_cell) = {
+      let state = self.lock();
+      if state.closed {
+        return Err(AsyncSpawnError::new(AsyncError::Closed, future));
+      }
+      let Some(scope_cell) = get_scope(&state, scope).cloned() else {
+        return Err(AsyncSpawnError::new(AsyncError::Closed, future));
+      };
+      if scope_cell.protocol.is_closed() {
+        return Err(AsyncSpawnError::new(AsyncError::Closed, future));
+      }
+      let Some(index) = state
+        .tasks
+        .iter()
+        .position(|slot| slot.task.is_none() && !slot.protocol.admitted())
+      else {
+        return Err(AsyncSpawnError::new(AsyncError::Full, future));
+      };
+      let Some(generation) = state.tasks[index].protocol.next_generation() else {
+        return Err(AsyncSpawnError::new(AsyncError::Full, future));
+      };
+      (index, generation, scope_cell)
+    };
+
+    let tenant = scope_cell.tenant.as_ref();
+    if let Some(tenant) = tenant
+      && let Err(error) = tenant.validate_cpu_execution()
+    {
+      return Err(AsyncSpawnError::new(
+        AsyncError::ResourceDomain(error),
+        future,
+      ));
     }
-    let Some(scope_cell) = get_scope(&state, scope).cloned() else {
-      drop(state);
-      return Err(AsyncSpawnError::new(AsyncError::Closed, future));
-    };
-    if scope_cell.protocol.is_closed() {
-      drop(state);
-      return Err(AsyncSpawnError::new(AsyncError::Closed, future));
-    }
-    let Some(index) = state
-      .tasks
-      .iter()
-      .position(|slot| slot.task.is_none() && !slot.protocol.admitted())
-    else {
-      drop(state);
-      return Err(AsyncSpawnError::new(AsyncError::Full, future));
-    };
-    let Some(generation) = state.tasks[index].protocol.next_generation() else {
-      drop(state);
-      return Err(AsyncSpawnError::new(AsyncError::Full, future));
-    };
-    let Some(task_id) = identity::allocate() else {
-      drop(state);
-      return Err(AsyncSpawnError::new(AsyncError::TaskIdExhausted, future));
-    };
-    let tenant = scope_cell.tenant.clone();
-    let (task_admission, waiter) = if let Some(tenant) = &tenant {
-      if let Err(error) = tenant.validate_cpu_execution() {
-        drop(state);
+    let mut domain = match Task::<F>::reserve_domain_admission(tenant) {
+      Ok(domain) => domain,
+      Err(error) => {
         return Err(AsyncSpawnError::new(
           AsyncError::ResourceDomain(error),
           future,
         ));
       }
-      let request = DomainResources::ZERO.with(DomainResource::Tasks, 1);
-      let task_admission = match tenant.try_acquire(request) {
-        Ok(admission) => admission,
-        Err(error) => {
-          drop(state);
-          return Err(AsyncSpawnError::new(
-            AsyncError::ResourceDomain(error),
-            future,
-          ));
-        }
-      };
+    };
+    if tenant.is_some() {
       let waiter = match scope_cell
         .task_waiters
         .as_ref()
@@ -571,24 +646,44 @@ impl Shared {
       {
         Ok(waiter) => waiter,
         Err(error) => {
-          drop(state);
-          drop(task_admission);
+          drop(domain);
           return Err(AsyncSpawnError::new(
             AsyncError::ResourceDomain(error),
             future,
           ));
         }
       };
-      (Some(task_admission), Some(waiter))
-    } else {
-      (None, None)
-    };
-    let domain = TaskDomainAdmission {
-      tenant,
-      waiter,
-      task: task_admission,
+      domain.waiter = Some(waiter);
+    }
+    let Some(task_id) = identity::allocate() else {
+      drop(domain);
+      return Err(AsyncSpawnError::new(AsyncError::TaskIdExhausted, future));
     };
     let task_ref = TaskRef { index, generation };
+    let mut state = self.lock();
+    if state.closed {
+      drop(state);
+      drop(domain);
+      return Err(AsyncSpawnError::new(AsyncError::Closed, future));
+    }
+    let Some(current_scope) = get_scope(&state, scope) else {
+      drop(state);
+      drop(domain);
+      return Err(AsyncSpawnError::new(AsyncError::Closed, future));
+    };
+    if current_scope.protocol.is_closed() {
+      drop(state);
+      drop(domain);
+      return Err(AsyncSpawnError::new(AsyncError::Closed, future));
+    }
+    if !Arc::ptr_eq(current_scope, &scope_cell)
+      || state.tasks[index].task.is_some()
+      || state.tasks[index].protocol.next_generation() != Some(generation)
+    {
+      drop(state);
+      drop(domain);
+      return Err(AsyncSpawnError::new(AsyncError::Full, future));
+    }
     let (task, job) = Task::create(
       future,
       task_id,
@@ -826,6 +921,7 @@ impl OwnedTaskScope {
       shared: Arc::clone(&self.shared),
       scope: self.scope,
       resources: self.cell.resources.clone(),
+      _scope_owner: Some(Arc::clone(&self.cell)),
     }
   }
 
@@ -910,6 +1006,7 @@ impl Drop for ScopeClose {
 struct TaskWake {
   shared: Weak<Shared>,
   task: TaskRef,
+  _control: ControlCharge,
 }
 
 impl Wake for TaskWake {
@@ -926,11 +1023,17 @@ impl Wake for TaskWake {
 
 /// The admission-independent wake handle. It holds no task, future, or
 /// result, so a retained stale waker cannot keep completed user data alive.
-fn task_waker(shared: &Arc<Shared>, task: TaskRef) -> Waker {
-  Waker::from(Arc::new(TaskWake {
+fn task_waker(
+  shared: &Arc<Shared>,
+  task: TaskRef,
+  tenant: Option<&TenantDomain>,
+) -> Result<Waker, DomainError> {
+  let control = ControlCharge::try_new(tenant, std::mem::size_of::<TaskWake>())?;
+  Ok(Waker::from(Arc::new(TaskWake {
     shared: Arc::downgrade(shared),
     task,
-  }))
+    _control: control,
+  })))
 }
 
 fn get_scope(state: &State, scope: ScopeRef) -> Option<&Arc<ScopeCell>> {
@@ -1263,7 +1366,17 @@ fn run_turns(
       Work::Poll(task_ref, task, permit, turn) => {
         handoff::enter_turn(turn);
         super::entry::reset_budget();
-        let waker = task_waker(shared, task_ref);
+        let waker = match task_waker(shared, task_ref, task.tenant_domain()) {
+          Ok(waker) => waker,
+          Err(error) => {
+            task.fail_resource(error);
+            finish_poll(shared, task_ref, PollResult::Ready);
+            drop(permit);
+            drop(task);
+            finished = handoff::leave_turn();
+            continue;
+          }
+        };
         let mut context = Context::from_waker(&waker);
         match task.acquire_cpu(&waker) {
           DomainCpuAdmission::Unbounded => {
@@ -1322,6 +1435,7 @@ fn executor_thread<R>(
       generation: 1,
     },
     resources: shared.root_resources(),
+    _scope_owner: None,
   };
   let _runtime_context = super::entry::EnterGuard::enter(&worker_handle);
   let _dispatcher = handoff::DispatcherGuard::install(shared, context);
@@ -1496,6 +1610,8 @@ pub(super) fn is_worker(shared: &Shared) -> bool {
 #[cfg(all(test, not(loom)))]
 mod tests {
   use super::*;
+  use crate::runtime::managed::{ResourceLimits, ResourceScope};
+  use crate::runtime::resource_domain::{DomainResource, DomainResources, ResourceDomain};
   use std::future::Future;
 
   #[test]
@@ -1508,7 +1624,7 @@ mod tests {
       },
       0,
       None,
-      AsyncThreadOptions::default(),
+      super::super::ControlledThreadOptions::unbounded(AsyncThreadOptions::default()),
       RuntimeMetrics::try_new(
         1,
         [AsyncThreadContext {
@@ -1517,8 +1633,9 @@ mod tests {
           physical_index: 0,
         }],
         1,
+        None,
       )
-      .unwrap_or_else(|error| panic!("metrics allocation failed: {error}")),
+      .unwrap_or_else(|error| panic!("metrics allocation failed: {error:?}")),
     )
     .unwrap_or_else(|error| panic!("shared construction failed: {error}"));
     let scope = shared
@@ -1553,5 +1670,67 @@ mod tests {
     assert!(replacement.scope.generation > old_reference.generation);
     assert_eq!(replacement.snapshot().active_polls, 0);
     assert_eq!(replacement.snapshot().max_active_polls, 1);
+  }
+
+  #[test]
+  fn closed_scope_retains_inherited_waiter_pools_after_shared_drop_exactly() {
+    let ceiling = DomainResources::ZERO
+      .with(DomainResource::Cpu, 2)
+      .with(DomainResource::Tasks, 8)
+      .with(DomainResource::Control, 1 << 20);
+    let domain = ResourceDomain::with_waiters(ceiling, 1, 8).unwrap();
+    let tenant = domain.tenant(ceiling).unwrap();
+    let resources = ResourceScope::from_tenant(ResourceLimits::default(), tenant.clone());
+    let global_base = domain.snapshot().used.get(DomainResource::Control);
+    let tenant_base = tenant.snapshot().unwrap().used.get(DomainResource::Control);
+    let metrics = RuntimeMetrics::try_new(
+      1,
+      [AsyncThreadContext {
+        role: super::super::thread_options::AsyncThreadRole::Worker,
+        index: 0,
+        physical_index: 0,
+      }],
+      1,
+      Some(&tenant),
+    )
+    .unwrap();
+    let (shared, _) = Shared::new(
+      AsyncConfig {
+        workers: 1,
+        max_outstanding: 2,
+        max_scopes: 2,
+      },
+      0,
+      Some(resources),
+      super::super::ControlledThreadOptions::unbounded(
+        super::super::thread_options::AsyncThreadOptions::default(),
+      ),
+      metrics,
+    )
+    .unwrap();
+    let scope = shared.new_scope(1, None).unwrap();
+    let scope_bytes = scope.cell._control.as_ref().unwrap().bytes();
+    let pool_bytes = DomainWaitPool::control_payload_bytes();
+    let close = scope.close();
+    drop(shared);
+
+    let retained = global_base + scope_bytes + 2 * pool_bytes;
+    assert_eq!(
+      domain.snapshot().used.get(DomainResource::Control),
+      retained
+    );
+    assert_eq!(
+      tenant.snapshot().unwrap().used.get(DomainResource::Control),
+      tenant_base + scope_bytes + 2 * pool_bytes
+    );
+    drop(close);
+    assert_eq!(
+      domain.snapshot().used.get(DomainResource::Control),
+      global_base
+    );
+    assert_eq!(
+      tenant.snapshot().unwrap().used.get(DomainResource::Control),
+      tenant_base
+    );
   }
 }

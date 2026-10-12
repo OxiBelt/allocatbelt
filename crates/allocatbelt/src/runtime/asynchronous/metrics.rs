@@ -4,6 +4,13 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use super::thread_options::AsyncThreadContext;
+use crate::runtime::resource_domain::{ControlCharge, DomainError, TenantDomain, payload_bytes};
+
+#[derive(Debug)]
+pub(super) enum MetricsBuildError {
+  OutOfMemory,
+  ResourceDomain(DomainError),
+}
 
 pub(super) struct RuntimeMetricsInner {
   pub(super) workers: usize,
@@ -11,6 +18,7 @@ pub(super) struct RuntimeMetricsInner {
   pub(super) queue_depth: AtomicUsize,
   pub(super) hook_panics: AtomicUsize,
   pub(super) threads: Vec<ThreadMetrics>,
+  _control: ControlCharge,
 }
 
 pub(super) struct ThreadMetrics {
@@ -62,16 +70,36 @@ impl RuntimeMetrics {
     workers: usize,
     contexts: impl IntoIterator<Item = AsyncThreadContext>,
     capacity: usize,
-  ) -> Result<Self, std::collections::TryReserveError> {
+    tenant: Option<&TenantDomain>,
+  ) -> Result<Self, MetricsBuildError> {
+    let requested = std::mem::size_of::<RuntimeMetricsInner>()
+      .checked_add(
+        payload_bytes::<ThreadMetrics>(capacity).map_err(MetricsBuildError::ResourceDomain)?,
+      )
+      .ok_or(MetricsBuildError::ResourceDomain(DomainError::Invalid))?;
+    let mut control =
+      ControlCharge::try_new(tenant, requested).map_err(MetricsBuildError::ResourceDomain)?;
     let mut threads = Vec::new();
-    threads.try_reserve_exact(capacity)?;
+    threads
+      .try_reserve_exact(capacity)
+      .map_err(|_| MetricsBuildError::OutOfMemory)?;
     threads.extend(contexts.into_iter().map(ThreadMetrics::new));
+    let actual = std::mem::size_of::<RuntimeMetricsInner>()
+      .checked_add(
+        payload_bytes::<ThreadMetrics>(threads.capacity())
+          .map_err(MetricsBuildError::ResourceDomain)?,
+      )
+      .ok_or(MetricsBuildError::ResourceDomain(DomainError::Invalid))?;
+    control
+      .try_resize(actual)
+      .map_err(MetricsBuildError::ResourceDomain)?;
     Ok(Self(Arc::new(RuntimeMetricsInner {
       workers,
       alive_tasks: AtomicUsize::new(0),
       queue_depth: AtomicUsize::new(0),
       hook_panics: AtomicUsize::new(0),
       threads,
+      _control: control,
     })))
   }
 

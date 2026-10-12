@@ -17,7 +17,86 @@ use std::sync::{Mutex, MutexGuard};
 use std::task::{Context, Poll, Waker};
 
 use super::identity::TaskId;
-use crate::runtime::resource_domain::DomainError;
+use crate::runtime::resource_domain::{ControlCharge, DomainError};
+
+pub(super) trait AbortAction: Send + Sync {
+  fn abort(&self);
+}
+
+/// Shared completion and cancellation metadata retained by join and abort
+/// handles independently of the future and scheduler task slot.
+pub(super) trait AbortMetadata: Send + Sync {
+  fn abort(&self);
+  fn is_finished(&self) -> bool;
+}
+
+pub(super) struct FinishedFlag {
+  value: AtomicBool,
+  _control: ControlCharge,
+}
+
+impl FinishedFlag {
+  fn new(control: ControlCharge) -> Arc<Self> {
+    Arc::new(Self {
+      value: AtomicBool::new(false),
+      _control: control,
+    })
+  }
+
+  fn is_set(&self) -> bool {
+    self.value.load(Ordering::Acquire)
+  }
+
+  fn set(&self) {
+    self.value.store(true, Ordering::Release);
+  }
+}
+
+struct AbortOwner<A> {
+  action: A,
+  finished: Arc<FinishedFlag>,
+  _control: ControlCharge,
+}
+
+impl<A: AbortAction> AbortMetadata for AbortOwner<A> {
+  fn abort(&self) {
+    self.action.abort();
+  }
+
+  fn is_finished(&self) -> bool {
+    self.finished.is_set()
+  }
+}
+
+pub(super) fn abort_metadata_bytes<A>() -> usize {
+  std::mem::size_of::<AbortOwner<A>>()
+}
+
+pub(super) fn finished_flag_bytes() -> usize {
+  std::mem::size_of::<FinishedFlag>()
+}
+
+pub(super) fn new_abort_metadata<A: AbortAction + 'static>(
+  action: A,
+  finished: Arc<FinishedFlag>,
+  control: ControlCharge,
+) -> Arc<dyn AbortMetadata> {
+  Arc::new(AbortOwner {
+    action,
+    finished,
+    _control: control,
+  })
+}
+
+#[cfg(test)]
+struct CallbackAbort(Arc<dyn Fn() + Send + Sync>);
+
+#[cfg(test)]
+impl AbortAction for CallbackAbort {
+  fn abort(&self) {
+    (self.0)();
+  }
+}
 
 /// Why an async task did not produce its output.
 pub enum AsyncJoinError {
@@ -64,19 +143,25 @@ enum Slot<T> {
 
 pub(super) struct JoinState<T> {
   slot: Mutex<Slot<T>>,
-  finished: Arc<AtomicBool>,
+  finished: Arc<FinishedFlag>,
   id: TaskId,
+  _control: ControlCharge,
 }
 
 impl<T> JoinState<T> {
-  pub(super) fn with_id(id: TaskId) -> Arc<Self> {
+  pub(super) fn with_id(
+    id: TaskId,
+    control: ControlCharge,
+    finished_control: ControlCharge,
+  ) -> Arc<Self> {
     Arc::new(Self {
       slot: Mutex::new(Slot::Pending(PendingWakers {
         join: None,
         finished: None,
       })),
-      finished: Arc::new(AtomicBool::new(false)),
+      finished: FinishedFlag::new(finished_control),
       id,
+      _control: control,
     })
   }
 
@@ -84,7 +169,15 @@ impl<T> JoinState<T> {
   pub(super) fn new() -> Arc<Self> {
     // Synthetic jobs used by internal state-machine tests are not spawned
     // tasks and never escape those tests.
-    Self::with_id(TaskId::test_sentinel())
+    Self::with_id(
+      TaskId::test_sentinel(),
+      ControlCharge::unbounded(std::mem::size_of::<Self>()),
+      ControlCharge::unbounded(finished_flag_bytes()),
+    )
+  }
+
+  pub(super) fn finished_flag(&self) -> Arc<FinishedFlag> {
+    Arc::clone(&self.finished)
   }
 
   fn lock(&self) -> MutexGuard<'_, Slot<T>> {
@@ -101,7 +194,7 @@ impl<T> JoinState<T> {
     match std::mem::replace(&mut *slot, Slot::Taken) {
       Slot::Pending(wakers) => {
         *slot = Slot::Ready(Some(result));
-        self.finished.store(true, Ordering::Release);
+        self.finished.set();
         drop(slot);
         if let Some(waker) = wakers.finished
           && let Err(payload) = panic::catch_unwind(AssertUnwindSafe(|| waker.wake()))
@@ -122,7 +215,7 @@ impl<T> JoinState<T> {
       }
       Slot::Taken => {
         *slot = Slot::Taken;
-        self.finished.store(true, Ordering::Release);
+        self.finished.set();
         drop(slot);
         Some(result)
       }
@@ -142,12 +235,12 @@ fn drop_contained<T>(value: T) {
 /// task; call [`AsyncJob::abort`] to request cancellation.
 pub struct AsyncJob<T> {
   state: Arc<JoinState<T>>,
-  abort: Arc<dyn Fn() + Send + Sync>,
+  abort: Arc<dyn AbortMetadata>,
   finished: bool,
 }
 
 impl<T> AsyncJob<T> {
-  pub(super) fn new(state: Arc<JoinState<T>>, abort: Arc<dyn Fn() + Send + Sync>) -> Self {
+  pub(super) fn new_with_metadata(state: Arc<JoinState<T>>, abort: Arc<dyn AbortMetadata>) -> Self {
     Self {
       state,
       abort,
@@ -155,10 +248,20 @@ impl<T> AsyncJob<T> {
     }
   }
 
+  #[cfg(test)]
+  pub(super) fn new(state: Arc<JoinState<T>>, abort: Arc<dyn Fn() + Send + Sync>) -> Self {
+    let metadata = new_abort_metadata(
+      CallbackAbort(abort),
+      state.finished_flag(),
+      ControlCharge::unbounded(abort_metadata_bytes::<CallbackAbort>()),
+    );
+    Self::new_with_metadata(state, metadata)
+  }
+
   /// Requests cancellation. A running future is cancelled after its
   /// current poll returns; it is never preempted.
   pub fn abort(&self) {
-    (self.abort)();
+    self.abort.abort();
   }
 
   /// The process-wide identity assigned when this task was admitted.
@@ -173,7 +276,6 @@ impl<T> AsyncJob<T> {
   pub fn abort_handle(&self) -> AbortHandle {
     AbortHandle {
       abort: Arc::clone(&self.abort),
-      finished: Arc::clone(&self.state.finished),
       id: self.state.id,
     }
   }
@@ -181,7 +283,7 @@ impl<T> AsyncJob<T> {
   /// Whether the terminal join outcome has been published after task cleanup.
   #[must_use]
   pub fn is_finished(&self) -> bool {
-    self.state.finished.load(Ordering::Acquire)
+    self.state.finished.is_set()
   }
 
   /// Polls for terminal completion without taking the task's result.
@@ -190,7 +292,7 @@ impl<T> AsyncJob<T> {
   /// notification before they consume this join handle.
   pub fn poll_finished(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
     let this = self.get_mut();
-    if this.state.finished.load(Ordering::Acquire) {
+    if this.state.finished.is_set() {
       return Poll::Ready(());
     }
 
@@ -202,7 +304,7 @@ impl<T> AsyncJob<T> {
         drop(replacement);
         return Poll::Ready(());
       };
-      if this.state.finished.load(Ordering::Acquire) {
+      if this.state.finished.is_set() {
         drop(slot);
         drop(replacement);
         return Poll::Ready(());
@@ -216,7 +318,7 @@ impl<T> AsyncJob<T> {
   /// Takes an outcome already announced by `poll_finished`, without cloning a
   /// caller waker while consuming a completion notification.
   pub(super) fn take_finished(&mut self) -> Option<Result<T, AsyncJoinError>> {
-    if !self.state.finished.load(Ordering::Acquire) {
+    if !self.state.finished.is_set() {
       return None;
     }
     let outcome = {
@@ -239,8 +341,7 @@ impl<T> AsyncJob<T> {
 /// whose outputs are not `Send`. Dropping it neither cancels nor detaches work.
 #[derive(Clone)]
 pub struct AbortHandle {
-  abort: Arc<dyn Fn() + Send + Sync>,
-  finished: Arc<AtomicBool>,
+  abort: Arc<dyn AbortMetadata>,
   id: TaskId,
 }
 
@@ -248,7 +349,7 @@ impl AbortHandle {
   /// Requests cleanup after any current poll returns. This does not wait for
   /// cleanup and cannot preempt a running poll.
   pub fn abort(&self) {
-    (self.abort)();
+    self.abort.abort();
   }
 
   /// The process-wide identity of the task this handle can abort.
@@ -261,7 +362,7 @@ impl AbortHandle {
   /// alone does not make this true; actual task completion still must occur.
   #[must_use]
   pub fn is_finished(&self) -> bool {
-    self.finished.load(Ordering::Acquire)
+    self.abort.is_finished()
   }
 }
 
@@ -332,6 +433,9 @@ impl<T> fmt::Debug for AsyncJob<T> {
 #[cfg(all(test, not(loom)))]
 mod tests {
   use super::{AbortHandle, AsyncJob, JoinState};
+  use crate::runtime::resource_domain::{
+    ControlCharge, DomainResource, DomainResources, ResourceDomain,
+  };
   use std::future::Future;
   use std::pin::Pin;
   use std::rc::Rc;
@@ -431,6 +535,71 @@ mod tests {
     fn wake(self: Arc<Self>) {
       self.0.fetch_add(1, Ordering::SeqCst);
     }
+  }
+
+  struct TestAbort;
+
+  impl super::AbortAction for TestAbort {
+    fn abort(&self) {}
+  }
+
+  #[test]
+  fn final_abort_handle_retains_exact_finished_flag_control_owner() {
+    let ceiling = DomainResources::ZERO
+      .with(DomainResource::Tasks, 2)
+      .with(DomainResource::Control, 16 * 1024);
+    let domain = ResourceDomain::new(ceiling, 1)
+      .unwrap_or_else(|error| panic!("domain construction failed: {error}"));
+    let tenant = domain
+      .tenant(ceiling)
+      .unwrap_or_else(|error| panic!("tenant construction failed: {error}"));
+    let base_global = domain.snapshot().used.get(DomainResource::Control);
+    let base_tenant = tenant.snapshot().unwrap().used.get(DomainResource::Control);
+    let join_bytes = std::mem::size_of::<JoinState<usize>>();
+    let finished_bytes = super::finished_flag_bytes();
+    let abort_bytes = super::abort_metadata_bytes::<TestAbort>();
+    let join = JoinState::with_id(
+      super::TaskId::test_sentinel(),
+      ControlCharge::try_new(Some(&tenant), join_bytes).unwrap(),
+      ControlCharge::try_new(Some(&tenant), finished_bytes).unwrap(),
+    );
+    let metadata = super::new_abort_metadata(
+      TestAbort,
+      join.finished_flag(),
+      ControlCharge::try_new(Some(&tenant), abort_bytes).unwrap(),
+    );
+    let job = AsyncJob::new_with_metadata(Arc::clone(&join), metadata);
+    let abort = job.abort_handle();
+    assert!(join.publish(Ok(17)).is_none());
+    assert_eq!(
+      domain.snapshot().used.get(DomainResource::Control),
+      base_global + join_bytes + finished_bytes + abort_bytes
+    );
+    assert_eq!(
+      tenant.snapshot().unwrap().used.get(DomainResource::Control),
+      base_tenant + join_bytes + finished_bytes + abort_bytes
+    );
+
+    drop(job);
+    drop(join);
+    assert_eq!(
+      domain.snapshot().used.get(DomainResource::Control),
+      base_global + finished_bytes + abort_bytes
+    );
+    assert_eq!(
+      tenant.snapshot().unwrap().used.get(DomainResource::Control),
+      base_tenant + finished_bytes + abort_bytes
+    );
+    assert!(abort.is_finished());
+    drop(abort);
+    assert_eq!(
+      domain.snapshot().used.get(DomainResource::Control),
+      base_global
+    );
+    assert_eq!(
+      tenant.snapshot().unwrap().used.get(DomainResource::Control),
+      base_tenant
+    );
   }
 
   #[test]

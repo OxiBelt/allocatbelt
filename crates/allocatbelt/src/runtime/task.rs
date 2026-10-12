@@ -8,7 +8,9 @@ use std::thread::{self, Thread};
 use crate::runtime::cpu_execution::CpuExecutionGuard;
 use crate::runtime::error::JoinError;
 use crate::runtime::job::{CancellationToken, Control, Packet};
-use crate::runtime::resource_domain::{DomainError, DomainReservation, DomainWaiter, TenantDomain};
+use crate::runtime::resource_domain::{
+  ControlCharge, DomainError, DomainReservation, DomainWaiter, TenantDomain,
+};
 use crate::runtime::time::AutoAdvanceInhibitGuard;
 
 /// Returns a job's admission. The worker calls it again after the job if
@@ -38,6 +40,13 @@ pub(crate) trait Runnable: Send {
   fn fail_resource(self: Box<Self>, release: &mut dyn Release, error: DomainError);
 }
 
+pub(crate) struct TaskDomainAdmission {
+  pub(crate) tenant: Option<TenantDomain>,
+  pub(crate) waiter: Option<DomainWaiter>,
+  pub(crate) task_admission: Option<DomainReservation>,
+  pub(crate) task_control: ControlCharge,
+}
+
 pub(crate) struct Task<F, T> {
   pub(crate) f: F,
   control: Arc<Control>,
@@ -46,6 +55,7 @@ pub(crate) struct Task<F, T> {
   tenant: Option<TenantDomain>,
   waiter: Option<DomainWaiter>,
   task_admission: Option<DomainReservation>,
+  _control: ControlCharge,
 }
 
 impl<F, T> Task<F, T> {
@@ -54,10 +64,14 @@ impl<F, T> Task<F, T> {
     control: Arc<Control>,
     packet: Arc<Packet<T>>,
     auto_advance_inhibit: Option<AutoAdvanceInhibitGuard>,
-    tenant: Option<TenantDomain>,
-    waiter: Option<DomainWaiter>,
-    task_admission: Option<DomainReservation>,
+    domain: TaskDomainAdmission,
   ) -> Self {
+    let TaskDomainAdmission {
+      tenant,
+      waiter,
+      task_admission,
+      task_control,
+    } = domain;
     Self {
       f,
       control,
@@ -66,6 +80,7 @@ impl<F, T> Task<F, T> {
       tenant,
       waiter,
       task_admission,
+      _control: task_control,
     }
   }
 
@@ -77,7 +92,15 @@ impl<F, T> Task<F, T> {
       return CpuAdmission::Rejected(DomainError::WaitersFull);
     };
     let current = thread::current();
-    let waker = Waker::from(Arc::new(BlockingThreadWake(current.clone())));
+    let control =
+      match ControlCharge::try_new(Some(tenant), std::mem::size_of::<BlockingThreadWake>()) {
+        Ok(control) => control,
+        Err(error) => return CpuAdmission::Rejected(error),
+      };
+    let waker = Waker::from(Arc::new(BlockingThreadWake {
+      thread: current.clone(),
+      _control: control,
+    }));
     loop {
       if self.control.is_cancelled() {
         self.control.clear_waiting_thread();
@@ -113,15 +136,18 @@ enum CpuAdmission {
   Rejected(DomainError),
 }
 
-struct BlockingThreadWake(Thread);
+struct BlockingThreadWake {
+  thread: Thread,
+  _control: ControlCharge,
+}
 
 impl Wake for BlockingThreadWake {
   fn wake(self: Arc<Self>) {
-    self.0.unpark();
+    self.thread.unpark();
   }
 
   fn wake_by_ref(self: &Arc<Self>) {
-    self.0.unpark();
+    self.thread.unpark();
   }
 }
 
@@ -165,6 +191,7 @@ where
       tenant: _,
       waiter,
       task_admission,
+      _control: task_control,
     } = *self;
     let _auto_advance_inhibit = auto_advance_inhibit;
     let token = CancellationToken::new(control);
@@ -183,6 +210,7 @@ where
     if let Some(unclaimed) = packet.publish(outcome) {
       drop_contained(unclaimed);
     }
+    drop(task_control);
   }
 
   fn abandon(self: Box<Self>, release: &mut dyn Release) {
@@ -194,6 +222,7 @@ where
       tenant: _,
       waiter,
       task_admission,
+      _control: task_control,
     } = *self;
     let _auto_advance_inhibit = auto_advance_inhibit;
     // A shutdown's take: the job may never start, whatever won before.
@@ -207,6 +236,7 @@ where
     release.release();
     // `Cancelled` holds nothing of the user's, so this drops nothing.
     let _ = packet.publish(Err(JoinError::Cancelled));
+    drop(task_control);
   }
 
   fn fail_resource(self: Box<Self>, release: &mut dyn Release, error: DomainError) {
@@ -218,6 +248,7 @@ where
       tenant: _,
       waiter,
       task_admission,
+      _control: task_control,
     } = *self;
     let _auto_advance_inhibit = auto_advance_inhibit;
     let outcome = match panic::catch_unwind(AssertUnwindSafe(|| drop(f))) {
@@ -233,5 +264,6 @@ where
     if let Some(unclaimed) = packet.publish(outcome) {
       drop_contained(unclaimed);
     }
+    drop(task_control);
   }
 }

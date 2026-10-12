@@ -49,7 +49,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread::{self, JoinHandle};
 
 use crate::runtime::managed::ResourceScope;
-use crate::runtime::resource_domain::DomainError;
+use crate::runtime::resource_domain::{ControlCharge, DomainError, payload_bytes};
 use crate::runtime::task::drop_contained;
 use scheduler::{ScopeRef, Shared};
 
@@ -65,6 +65,7 @@ pub use local::{
   LocalConfig, LocalEnterGuard, LocalError, LocalHandle, LocalRuntime, LocalScopeClose,
   LocalSendHandle, LocalSpawnError, LocalTaskScope,
 };
+use metrics::MetricsBuildError;
 pub use metrics::{AsyncThreadMetrics, RuntimeMetrics, RuntimeMetricsSnapshot};
 pub use scheduler::{OwnedTaskScope, ScopeClose};
 pub use task_set::{JoinNext, SetTaskId, TaskSet, TaskSetError};
@@ -86,6 +87,29 @@ fn thread_contexts(workers: usize, handoffs: usize) -> impl Iterator<Item = Asyn
       }
     }
   })
+}
+
+struct ControlledThreadOptions {
+  options: AsyncThreadOptions,
+  _control: ControlCharge,
+}
+
+impl ControlledThreadOptions {
+  #[cfg(test)]
+  pub(super) fn unbounded(options: AsyncThreadOptions) -> Self {
+    Self {
+      options,
+      _control: ControlCharge::unbounded(0),
+    }
+  }
+}
+
+impl std::ops::Deref for ControlledThreadOptions {
+  type Target = AsyncThreadOptions;
+
+  fn deref(&self) -> &Self::Target {
+    &self.options
+  }
 }
 
 /// Fixed limits for an [`AsyncRuntime`].
@@ -224,6 +248,8 @@ pub struct AsyncRuntime {
   root: ScopeRef,
   shutdown_complete: bool,
   shutdown_panicked: bool,
+  _control: ControlCharge,
+  launch_control: Option<Arc<ControlCharge>>,
 }
 
 impl AsyncRuntime {
@@ -348,25 +374,55 @@ impl AsyncRuntime {
     let Some(threads) = config.workers.checked_add(max_handoffs) else {
       return Err(AsyncError::InvalidConfig);
     };
-    if options.stack_size().is_some_and(|size| size == 0) {
+    let tenant = resources.as_ref().and_then(ResourceScope::tenant_domain);
+    let option_control = ControlCharge::try_new(tenant, options.control_name_capacity())
+      .map_err(AsyncError::ResourceDomain)?;
+    let options = ControlledThreadOptions {
+      options,
+      _control: option_control,
+    };
+    let stack_size = options.stack_size();
+    if stack_size.is_some_and(|size| size == 0) {
       return Err(AsyncError::InvalidConfig);
     }
+    let tenant = resources.as_ref().and_then(ResourceScope::tenant_domain);
     let metrics = RuntimeMetrics::try_new(
       config.workers,
       thread_contexts(config.workers, max_handoffs),
       threads,
+      tenant,
     )
-    .map_err(|_| AsyncError::OutOfMemory)?;
+    .map_err(|error| match error {
+      MetricsBuildError::OutOfMemory => AsyncError::OutOfMemory,
+      MetricsBuildError::ResourceDomain(error) => AsyncError::ResourceDomain(error),
+    })?;
+    let mut names_control = ControlCharge::try_new(
+      tenant,
+      payload_bytes::<String>(threads).map_err(AsyncError::ResourceDomain)?,
+    )
+    .map_err(AsyncError::ResourceDomain)?;
     let mut names = Vec::new();
     names
       .try_reserve_exact(threads)
       .map_err(|_| AsyncError::OutOfMemory)?;
+    names_control
+      .try_resize(payload_bytes::<String>(names.capacity()).map_err(AsyncError::ResourceDomain)?)
+      .map_err(AsyncError::ResourceDomain)?;
     for context in thread_contexts(config.workers, max_handoffs) {
       let name = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         options.resolve_name(context)
       }));
       match name {
-        Ok(Ok(name)) => names.push(name),
+        Ok(Ok(name)) => {
+          let charged = names_control
+            .bytes()
+            .checked_add(name.capacity())
+            .ok_or(AsyncError::ResourceDomain(DomainError::Invalid))?;
+          names_control
+            .try_resize(charged)
+            .map_err(AsyncError::ResourceDomain)?;
+          names.push(name);
+        }
         Ok(Err(())) => return Err(AsyncError::InvalidConfig),
         Err(payload) => {
           crate::runtime::task::drop_contained(payload);
@@ -374,7 +430,30 @@ impl AsyncRuntime {
         }
       }
     }
-    let (shared, root) = Shared::new(config, max_handoffs, resources, options.clone(), metrics)?;
+    let runtime_control_bytes = std::mem::size_of::<AsyncRuntime>()
+      .checked_add(payload_bytes::<JoinHandle<()>>(threads).map_err(AsyncError::ResourceDomain)?)
+      .and_then(|bytes| {
+        payload_bytes::<Box<dyn Any + Send>>(threads)
+          .ok()
+          .and_then(|payload_bytes| bytes.checked_add(payload_bytes))
+      })
+      .ok_or(AsyncError::ResourceDomain(DomainError::Invalid))?;
+    let mut runtime_control =
+      ControlCharge::try_new(tenant, runtime_control_bytes).map_err(AsyncError::ResourceDomain)?;
+    let launch_control = if let Some(tenant) = tenant {
+      let launch_payload =
+        payload_bytes::<(Arc<Shared>, AsyncThreadContext, Option<Arc<ControlCharge>>)>(threads)
+          .map_err(AsyncError::ResourceDomain)?;
+      let launch_bytes = std::mem::size_of::<ControlCharge>()
+        .checked_add(launch_payload)
+        .ok_or(AsyncError::ResourceDomain(DomainError::Invalid))?;
+      Some(Arc::new(
+        ControlCharge::try_new(Some(tenant), launch_bytes).map_err(AsyncError::ResourceDomain)?,
+      ))
+    } else {
+      None
+    };
+    let (shared, root) = Shared::new(config, max_handoffs, resources, options, metrics)?;
     let mut workers = Vec::new();
     workers
       .try_reserve_exact(threads)
@@ -383,8 +462,22 @@ impl AsyncRuntime {
     panic_payloads
       .try_reserve_exact(threads)
       .map_err(|_| AsyncError::OutOfMemory)?;
+    let actual_runtime_control = std::mem::size_of::<AsyncRuntime>()
+      .checked_add(
+        payload_bytes::<JoinHandle<()>>(workers.capacity()).map_err(AsyncError::ResourceDomain)?,
+      )
+      .and_then(|bytes| {
+        payload_bytes::<Box<dyn Any + Send>>(panic_payloads.capacity())
+          .ok()
+          .and_then(|payload_bytes| bytes.checked_add(payload_bytes))
+      })
+      .ok_or(AsyncError::ResourceDomain(DomainError::Invalid))?;
+    runtime_control
+      .try_resize(actual_runtime_control)
+      .map_err(AsyncError::ResourceDomain)?;
     for (index, name) in names.into_iter().enumerate() {
       let thread_shared = Arc::clone(&shared);
+      let thread_launch_control = launch_control.clone();
       let context = if index < config.workers {
         thread_options::AsyncThreadContext {
           role: thread_options::AsyncThreadRole::Worker,
@@ -399,15 +492,21 @@ impl AsyncRuntime {
         }
       };
       let builder = thread::Builder::new().name(name);
-      let builder = if let Some(size) = options.stack_size() {
+      let builder = if let Some(size) = stack_size {
         builder.stack_size(size)
       } else {
         builder
       };
       let started = if context.role == thread_options::AsyncThreadRole::Worker {
-        builder.spawn(move || scheduler::worker(thread_shared, context))
+        builder.spawn(move || {
+          let _launch_control = thread_launch_control;
+          scheduler::worker(thread_shared, context)
+        })
       } else {
-        builder.spawn(move || scheduler::helper(thread_shared, context))
+        builder.spawn(move || {
+          let _launch_control = thread_launch_control;
+          scheduler::helper(thread_shared, context)
+        })
       };
       match started {
         Ok(worker) => workers.push(worker),
@@ -420,6 +519,7 @@ impl AsyncRuntime {
         }
       }
     }
+    drop(names_control);
     Ok(Self {
       shared,
       workers,
@@ -427,6 +527,8 @@ impl AsyncRuntime {
       root,
       shutdown_complete: false,
       shutdown_panicked: false,
+      _control: runtime_control,
+      launch_control,
     })
   }
 
@@ -437,6 +539,7 @@ impl AsyncRuntime {
       shared: Arc::clone(&self.shared),
       scope: self.root,
       resources: self.shared.root_resources(),
+      _scope_owner: None,
     }
   }
 
@@ -508,12 +611,13 @@ impl AsyncRuntime {
     }
     self.shared.close(mode == AsyncShutdown::CancelPending);
     let mut panicked = false;
-    for worker in std::mem::take(&mut self.workers) {
+    while let Some(worker) = self.workers.pop() {
       if let Err(payload) = worker.join() {
         panicked = true;
         self.lock_panic_payloads().push(payload);
       }
     }
+    drop(self.launch_control.take());
     let result = if panicked || self.shutdown_panicked {
       Err(AsyncError::WorkerPanicked)
     } else {
@@ -546,12 +650,13 @@ impl AsyncRuntime {
     if self.workers.iter().any(|worker| !worker.is_finished()) {
       return Ok(false);
     }
-    for worker in std::mem::take(&mut self.workers) {
+    while let Some(worker) = self.workers.pop() {
       if let Err(payload) = worker.join() {
         self.shutdown_panicked = true;
         self.lock_panic_payloads().push(payload);
       }
     }
+    drop(self.launch_control.take());
     self.shutdown_complete = true;
     if self.shutdown_panicked {
       Err(AsyncError::WorkerPanicked)
@@ -571,12 +676,12 @@ impl AsyncRuntime {
       .unwrap_or_else(PoisonError::into_inner)
   }
 
-  fn take_panic_payloads(&self) -> Vec<Box<dyn Any + Send>> {
-    std::mem::take(&mut *self.lock_panic_payloads())
-  }
-
   fn drop_panic_payloads(&self) {
-    for payload in self.take_panic_payloads() {
+    loop {
+      let payload = self.lock_panic_payloads().pop();
+      let Some(payload) = payload else {
+        break;
+      };
       drop_contained(payload);
     }
   }
@@ -597,6 +702,7 @@ pub struct AsyncHandle {
   shared: Arc<Shared>,
   scope: ScopeRef,
   resources: Option<ResourceScope>,
+  _scope_owner: Option<Arc<scheduler::ScopeCell>>,
 }
 
 impl AsyncHandle {
@@ -611,7 +717,14 @@ impl AsyncHandle {
   /// for the duration of the poll. See [`AsyncRuntime::block_on`] for the
   /// root-future and reentrancy contract.
   pub fn block_on<F: std::future::Future>(&self, future: F) -> Result<F::Output, AsyncError> {
-    entry::block_on(self, future)
+    let control = self.shared.reserve_root_control(
+      self.scope,
+      self.resources.as_ref(),
+      std::mem::size_of::<F>(),
+    )?;
+    let result = entry::block_on(self, future);
+    drop(control);
+    result
   }
 
   /// Enters this handle as the current runtime context on the calling thread.

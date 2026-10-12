@@ -11,7 +11,7 @@ use std::task::{Context, Poll, Waker};
 use std::thread::Thread;
 
 use crate::runtime::error::JoinError;
-use crate::runtime::resource_domain::DomainIdentity;
+use crate::runtime::resource_domain::{ControlCharge, DomainIdentity};
 use crate::runtime::state::StartState;
 use crate::runtime::worker::{self, Ident};
 
@@ -27,16 +27,38 @@ pub(crate) struct Control {
   waiting_thread: Mutex<Option<Thread>>,
   runtime: Arc<Ident>,
   pub(crate) domain_identity: Option<DomainIdentity>,
+  _runtime_control: Arc<ControlCharge>,
+  _control: ControlCharge,
 }
 
 impl Control {
+  #[cfg(test)]
   pub(crate) fn new(runtime: Arc<Ident>, domain_identity: Option<DomainIdentity>) -> Arc<Self> {
+    let runtime_control = Arc::new(ControlCharge::unbounded(
+      std::mem::size_of::<ControlCharge>(),
+    ));
+    Self::with_control(
+      runtime,
+      domain_identity,
+      runtime_control,
+      ControlCharge::unbounded(std::mem::size_of::<Self>()),
+    )
+  }
+
+  pub(crate) fn with_control(
+    runtime: Arc<Ident>,
+    domain_identity: Option<DomainIdentity>,
+    runtime_control: Arc<ControlCharge>,
+    control: ControlCharge,
+  ) -> Arc<Self> {
     Arc::new(Self {
       start: StartState::new(),
       cancelled: AtomicBool::new(false),
       waiting_thread: Mutex::new(None),
       runtime,
       domain_identity,
+      _runtime_control: runtime_control,
+      _control: control,
     })
   }
 
@@ -122,13 +144,20 @@ enum Slot<T> {
 pub(crate) struct Packet<T> {
   slot: Mutex<Slot<T>>,
   ready: Condvar,
+  _control: ControlCharge,
 }
 
 impl<T> Packet<T> {
+  #[cfg(test)]
   pub(crate) fn new() -> Arc<Self> {
+    Self::with_control(ControlCharge::unbounded(std::mem::size_of::<Self>()))
+  }
+
+  pub(crate) fn with_control(control: ControlCharge) -> Arc<Self> {
     Arc::new(Self {
       slot: Mutex::new(Slot::Pending(None)),
       ready: Condvar::new(),
+      _control: control,
     })
   }
 

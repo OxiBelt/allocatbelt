@@ -17,16 +17,20 @@ pub enum SubmitErrorKind {
   /// The request exceeds the capacity in some component and can never be
   /// admitted.
   InvalidRequest,
+  /// The bound global or tenant resource domain refused admission. This
+  /// retains the specific domain cause, including Control budget exhaustion.
+  ResourceDomain(DomainError),
 }
 
 impl fmt::Display for SubmitErrorKind {
   fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-    f.write_str(match self {
-      Self::Closed => "runtime is closed",
-      Self::Full => "outstanding job bound reached",
-      Self::InsufficientResources => "not enough free resources",
-      Self::InvalidRequest => "request exceeds the runtime's capacity",
-    })
+    match self {
+      Self::Closed => f.write_str("runtime is closed"),
+      Self::Full => f.write_str("outstanding job bound reached"),
+      Self::InsufficientResources => f.write_str("not enough free resources"),
+      Self::InvalidRequest => f.write_str("request exceeds the runtime's capacity"),
+      Self::ResourceDomain(error) => write!(f, "resource domain refused admission: {error}"),
+    }
   }
 }
 

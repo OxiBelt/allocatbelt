@@ -720,6 +720,7 @@ fn submission_error(error: FsSubmissionErrorKind) -> io::Error {
       crate::runtime::error::SubmitErrorKind::Full
       | crate::runtime::error::SubmitErrorKind::InsufficientResources,
     )
+    | FsSubmissionErrorKind::Runtime(crate::runtime::error::SubmitErrorKind::ResourceDomain(_))
     | FsSubmissionErrorKind::Resource(
       ResourceError::Exhausted(_) | ResourceError::DomainControlExhausted,
     ) => io::ErrorKind::WouldBlock,

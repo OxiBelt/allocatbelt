@@ -12,10 +12,11 @@ use crate::runtime::error::{SubmitError, SubmitErrorKind};
 use crate::runtime::job::{CancellationToken, Control, Job, Packet};
 use crate::runtime::managed::ResourceScope;
 use crate::runtime::resource_domain::{
-  DomainError, DomainResource, DomainResources, DomainWaitPool, TenantDomain,
+  ControlCharge, DomainError, DomainReservation, DomainResource, DomainResources, DomainWaitPool,
+  DomainWaiter, TenantDomain, payload_bytes,
 };
 use crate::runtime::resources::Resources;
-use crate::runtime::task::{Runnable, Task};
+use crate::runtime::task::{Runnable, Task, TaskDomainAdmission};
 use crate::runtime::time::TimerHandle;
 use crate::runtime::worker::Ident;
 
@@ -23,6 +24,38 @@ use crate::runtime::worker::Ident;
 pub(crate) struct Entry {
   pub(crate) request: Resources,
   pub(crate) task: Box<dyn Runnable>,
+}
+
+pub(crate) struct ClosedQueue {
+  pub(crate) entries: VecDeque<Entry>,
+  _control: Option<ControlCharge>,
+}
+
+impl ClosedQueue {
+  pub(crate) fn empty() -> Self {
+    Self {
+      entries: VecDeque::new(),
+      _control: None,
+    }
+  }
+
+  pub(crate) fn is_empty(&self) -> bool {
+    self.entries.is_empty()
+  }
+
+  pub(crate) fn pop_front(&mut self) -> Option<Entry> {
+    self.entries.pop_front()
+  }
+
+  pub(crate) fn into_parts(self) -> (VecDeque<Entry>, Option<ControlCharge>) {
+    (self.entries, self._control)
+  }
+}
+
+impl Default for ClosedQueue {
+  fn default() -> Self {
+    Self::empty()
+  }
 }
 
 pub(crate) struct State {
@@ -50,6 +83,9 @@ pub(crate) struct Shared {
   clock: Mutex<Option<TimerHandle>>,
   tenant: Option<TenantDomain>,
   domain_waiters: Option<DomainWaitPool>,
+  runtime_identity_control: Arc<ControlCharge>,
+  queue_control: Mutex<Option<ControlCharge>>,
+  _control: ControlCharge,
   pub(crate) work: Condvar,
   #[cfg(test)]
   pub(crate) park_hook: Option<ParkHook>,
@@ -86,6 +122,21 @@ impl Shared {
     capacity: Resources,
     resources: Option<ResourceScope>,
   ) -> io::Result<Self> {
+    let tenant = resources.as_ref().and_then(ResourceScope::tenant_domain);
+    let shared_bytes = std::mem::size_of::<Shared>()
+      .checked_add(payload_bytes::<Option<Arc<Control>>>(workers).map_err(domain_build_error)?)
+      .ok_or_else(|| domain_build_error(DomainError::Invalid))?;
+    let mut shared_control =
+      ControlCharge::try_new(tenant, shared_bytes).map_err(domain_build_error)?;
+    let queue_bytes = payload_bytes::<Entry>(max_outstanding).map_err(domain_build_error)?;
+    let mut queue_control =
+      ControlCharge::try_new(tenant, queue_bytes).map_err(domain_build_error)?;
+    let identity_bytes = std::mem::size_of::<Ident>()
+      .checked_add(std::mem::size_of::<ControlCharge>())
+      .ok_or_else(|| domain_build_error(DomainError::Invalid))?;
+    let identity_control =
+      Arc::new(ControlCharge::try_new(tenant, identity_bytes).map_err(domain_build_error)?);
+
     let mut queue = VecDeque::new();
     queue
       .try_reserve_exact(max_outstanding)
@@ -95,18 +146,28 @@ impl Shared {
       .try_reserve_exact(workers)
       .map_err(reservation_error)?;
     running.resize_with(workers, || None);
-    let (tenant, domain_waiters) =
-      if let Some(tenant) = resources.as_ref().and_then(ResourceScope::tenant_domain) {
-        tenant
-          .validate_cpu_execution()
-          .map_err(domain_build_error)?;
-        let waiters = tenant
-          .reserve_waiters(max_outstanding)
-          .map_err(domain_build_error)?;
-        (Some(tenant.clone()), Some(waiters))
-      } else {
-        (None, None)
-      };
+    let (tenant, domain_waiters) = if let Some(tenant) = tenant {
+      tenant
+        .validate_cpu_execution()
+        .map_err(domain_build_error)?;
+      let waiters = tenant
+        .reserve_waiters(max_outstanding)
+        .map_err(domain_build_error)?;
+      (Some(tenant.clone()), Some(waiters))
+    } else {
+      (None, None)
+    };
+    let actual_shared_bytes = std::mem::size_of::<Shared>()
+      .checked_add(
+        payload_bytes::<Option<Arc<Control>>>(running.capacity()).map_err(domain_build_error)?,
+      )
+      .ok_or_else(|| domain_build_error(DomainError::Invalid))?;
+    shared_control
+      .try_resize(actual_shared_bytes)
+      .map_err(domain_build_error)?;
+    queue_control
+      .try_resize(payload_bytes::<Entry>(queue.capacity()).map_err(domain_build_error)?)
+      .map_err(domain_build_error)?;
     Ok(Self {
       ident: Ident::new(id),
       state: Mutex::new(State {
@@ -121,6 +182,9 @@ impl Shared {
       clock: Mutex::new(None),
       tenant,
       domain_waiters,
+      runtime_identity_control: identity_control,
+      queue_control: Mutex::new(Some(queue_control)),
+      _control: shared_control,
       work: Condvar::new(),
       #[cfg(test)]
       park_hook: None,
@@ -144,42 +208,24 @@ impl Shared {
     F: FnOnce(CancellationToken) -> T + Send + 'static,
     T: Send + 'static,
   {
-    let (tenant, task_admission, waiter) = if let Some(tenant) = &self.tenant {
-      if let Err(error) = tenant.validate_cpu_execution() {
-        return Err(SubmitError {
-          kind: domain_submit_kind(error),
-          job: f,
-        });
-      }
-      let task_admission =
-        match tenant.try_acquire(DomainResources::ZERO.with(DomainResource::Tasks, 1)) {
-          Ok(admission) => admission,
-          Err(error) => {
-            return Err(SubmitError {
-              kind: domain_submit_kind(error),
-              job: f,
-            });
-          }
-        };
-      let waiter = match self
-        .domain_waiters
-        .as_ref()
-        .ok_or(DomainError::WaitersFull)
-        .and_then(DomainWaitPool::try_lease)
-      {
-        Ok(waiter) => waiter,
+    let domain =
+      match reserve_job_admission::<F, T>(self.tenant.as_ref(), self.domain_waiters.as_ref()) {
+        Ok(domain) => domain,
         Err(error) => {
-          drop(task_admission);
           return Err(SubmitError {
             kind: domain_submit_kind(error),
             job: f,
           });
         }
       };
-      (Some(tenant.clone()), Some(task_admission), Some(waiter))
-    } else {
-      (None, None, None)
-    };
+    let JobDomainAdmission {
+      tenant,
+      task: task_admission,
+      waiter,
+      task_control,
+      control: control_control,
+      packet: packet_control,
+    } = domain;
     let clock = self
       .clock
       .lock()
@@ -187,16 +233,25 @@ impl Shared {
       .clone();
     let auto_advance_inhibit = clock.map(|timer| timer.inhibit_auto_advance());
     let domain_identity = tenant.as_ref().map(TenantDomain::domain_identity);
-    let control = Control::new(Arc::clone(&self.ident), domain_identity);
-    let packet = Packet::new();
+    let task_domain = TaskDomainAdmission {
+      tenant,
+      waiter,
+      task_admission,
+      task_control,
+    };
+    let control = Control::with_control(
+      Arc::clone(&self.ident),
+      domain_identity,
+      Arc::clone(&self.runtime_identity_control),
+      control_control,
+    );
+    let packet = Packet::with_control(packet_control);
     let task = Box::new(Task::new(
       f,
       Arc::clone(&control),
       Arc::clone(&packet),
       auto_advance_inhibit,
-      tenant,
-      waiter,
-      task_admission,
+      task_domain,
     ));
     let mut state = self.lock();
     let admitted = if state.closed {
@@ -235,7 +290,7 @@ impl Shared {
   /// already released) and takes the queue. The taken jobs stay admitted,
   /// counted as cancelling, until the caller abandons them outside the
   /// lock ([`crate::runtime::worker::abandon`]).
-  pub(crate) fn close(&self, cancel: bool) -> VecDeque<Entry> {
+  pub(crate) fn close(&self, cancel: bool) -> ClosedQueue {
     let mut state = self.lock();
     state.closed = true;
     let pending = if cancel {
@@ -252,12 +307,24 @@ impl Shared {
       VecDeque::new()
     };
     drop(state);
+    let queue_control = if cancel {
+      self
+        .queue_control
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .take()
+    } else {
+      None
+    };
     self.work.notify_all();
-    pending
+    ClosedQueue {
+      entries: pending,
+      _control: queue_control,
+    }
   }
 }
 
-fn domain_build_error(error: DomainError) -> io::Error {
+pub(crate) fn domain_build_error(error: DomainError) -> io::Error {
   let kind = match error {
     DomainError::OutOfMemory => io::ErrorKind::OutOfMemory,
     DomainError::Invalid | DomainError::AboveCeiling(_) | DomainError::Closed => {
@@ -271,8 +338,64 @@ fn domain_build_error(error: DomainError) -> io::Error {
   io::Error::new(kind, error)
 }
 
+struct JobDomainAdmission {
+  tenant: Option<TenantDomain>,
+  task: Option<DomainReservation>,
+  waiter: Option<DomainWaiter>,
+  task_control: ControlCharge,
+  control: ControlCharge,
+  packet: ControlCharge,
+}
+
+fn reserve_job_admission<F, T>(
+  tenant: Option<&TenantDomain>,
+  waiters: Option<&DomainWaitPool>,
+) -> Result<JobDomainAdmission, DomainError> {
+  let task_bytes = std::mem::size_of::<Task<F, T>>();
+  let control_bytes = std::mem::size_of::<Control>();
+  let packet_bytes = std::mem::size_of::<Packet<T>>();
+  let all_control_bytes = task_bytes
+    .checked_add(control_bytes)
+    .and_then(|bytes| bytes.checked_add(packet_bytes))
+    .ok_or(DomainError::Invalid)?;
+
+  let (task, mut control) = if let Some(tenant) = tenant {
+    tenant.validate_cpu_execution()?;
+    let mut combined = tenant.try_acquire(
+      DomainResources::ZERO
+        .with(DomainResource::Tasks, 1)
+        .with(DomainResource::Control, all_control_bytes),
+    )?;
+    let task = combined.split_off(DomainResources::ZERO.with(DomainResource::Tasks, 1))?;
+    (
+      Some(task),
+      ControlCharge::from_ticket(Some(tenant), combined, all_control_bytes),
+    )
+  } else {
+    (None, ControlCharge::unbounded(all_control_bytes))
+  };
+  let task_control = control.split_off(task_bytes)?;
+  let control_control = control.split_off(control_bytes)?;
+  let packet_control = control;
+  let waiter = if tenant.is_some() {
+    Some(waiters.ok_or(DomainError::WaitersFull)?.try_lease()?)
+  } else {
+    None
+  };
+  Ok(JobDomainAdmission {
+    tenant: tenant.cloned(),
+    task,
+    waiter,
+    task_control,
+    control: control_control,
+    packet: packet_control,
+  })
+}
+
 fn domain_submit_kind(error: DomainError) -> SubmitErrorKind {
   match error {
+    DomainError::Exhausted(DomainResource::Control)
+    | DomainError::AboveCeiling(DomainResource::Control) => SubmitErrorKind::ResourceDomain(error),
     DomainError::Closed => SubmitErrorKind::Closed,
     DomainError::AboveCeiling(DomainResource::Tasks | DomainResource::Cpu)
     | DomainError::Invalid => SubmitErrorKind::InvalidRequest,
