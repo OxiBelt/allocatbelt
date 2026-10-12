@@ -49,6 +49,11 @@
 //! free-index storage at construction; reservation failure returns
 //! `TimerError::OutOfMemory`. Each sleep still allocates shared state through
 //! the global allocator. Completion batches use fixed-size stack storage.
+//! Tenant-aware constructors charge the declared Shared/Slot payloads, the
+//! actual queue-vector capacities, and bounded thread-completion owners to
+//! Control. Arc allocator headers, OS/provider metadata and stacks, and
+//! application-owned waker/panic payload allocations remain outside this
+//! metadata charge.
 //!
 //! # Deadlines
 //!
@@ -122,13 +127,17 @@ use loom::sync::atomic::{AtomicBool, AtomicU64, Ordering as EpochOrdering};
 #[cfg(not(loom))]
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as EpochOrdering};
 
-use super::thread_completion::DeferredJoin;
+use super::thread_completion::{DeferredJoin, PreparedJoin, PreparedJoins};
 use crate::runtime::asynchronous::{poll_cooperative, poll_cooperative_composed};
+use crate::runtime::resource_domain::{ControlCharge, DomainError, TenantDomain, payload_bytes};
 use crate::runtime::task::drop_contained;
 
 /// Registrations taken off the queue per driver lock acquisition, by the
 /// service thread or a close. Their wakers run after the lock is released.
 const BATCH: usize = 64;
+const SERVICE_THREAD_NAME: &str = "allocatbelt-timer";
+const CLOSE_THREAD_NAME: &str = "allocatbelt-timer-close";
+const PANIC_PAYLOAD_CAPACITY: usize = 2;
 
 /// The clock used by an owning runtime.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -215,14 +224,28 @@ pub(crate) struct IdleCoordinator {
   epoch: IdleEpoch,
   transition: Mutex<()>,
   owner: Option<Arc<IdleSignal>>,
+  _control: ControlCharge,
 }
 
 impl IdleCoordinator {
   pub(crate) fn new(owner: Option<Arc<IdleSignal>>) -> Arc<Self> {
+    Self::with_control(owner, ControlCharge::unbounded(std::mem::size_of::<Self>()))
+  }
+
+  pub(crate) fn new_in_tenant(
+    owner: Option<Arc<IdleSignal>>,
+    tenant: &TenantDomain,
+  ) -> Result<Arc<Self>, DomainError> {
+    let control = ControlCharge::try_new(Some(tenant), std::mem::size_of::<Self>())?;
+    Ok(Self::with_control(owner, control))
+  }
+
+  fn with_control(owner: Option<Arc<IdleSignal>>, control: ControlCharge) -> Arc<Self> {
     Arc::new(Self {
       epoch: IdleEpoch::new(),
       transition: Mutex::new(()),
       owner,
+      _control: control,
     })
   }
 
@@ -271,13 +294,30 @@ impl IdleCoordinator {
 pub(crate) struct IdleSignal {
   thread: Thread,
   notified: std::sync::atomic::AtomicBool,
+  _control: ControlCharge,
 }
 
 impl IdleSignal {
   pub(crate) fn new(thread: Thread) -> Arc<Self> {
+    Self::with_control(
+      thread,
+      ControlCharge::unbounded(std::mem::size_of::<Self>()),
+    )
+  }
+
+  pub(crate) fn new_in_tenant(
+    thread: Thread,
+    tenant: &TenantDomain,
+  ) -> Result<Arc<Self>, DomainError> {
+    let control = ControlCharge::try_new(Some(tenant), std::mem::size_of::<Self>())?;
+    Ok(Self::with_control(thread, control))
+  }
+
+  fn with_control(thread: Thread, control: ControlCharge) -> Arc<Self> {
     Arc::new(Self {
       thread,
       notified: std::sync::atomic::AtomicBool::new(false),
+      _control: control,
     })
   }
 
@@ -362,6 +402,8 @@ pub enum TimerError {
   WouldDeadlock,
   /// The service thread panicked.
   DriverPanicked,
+  /// The tenant domain refused bounded timer metadata.
+  Domain(DomainError),
 }
 
 impl fmt::Display for TimerError {
@@ -377,11 +419,19 @@ impl fmt::Display for TimerError {
       Self::JoinMonitorSpawn => "timer shutdown join monitor could not be started",
       Self::WouldDeadlock => "timer shutdown from one of its own threads would deadlock",
       Self::DriverPanicked => "timer service thread panicked",
+      Self::Domain(_) => "timer metadata was refused by the resource domain",
     })
   }
 }
 
-impl std::error::Error for TimerError {}
+impl std::error::Error for TimerError {
+  fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+    match self {
+      Self::Domain(error) => Some(error),
+      _ => None,
+    }
+  }
+}
 
 /// Why a [`Timeout`] completed without its inner future's output.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -419,6 +469,10 @@ struct Shared {
   coordinator: Arc<IdleCoordinator>,
   auto_advance_enabled: bool,
   fixed_real_clock: bool,
+  tenant: Option<TenantDomain>,
+  // Includes this payload, the actual queue capacities and two bounded
+  // service/close Arc capture slots. The ticket outlives every handle/sleep.
+  _control: ControlCharge,
 }
 
 /// The registrations, under the driver lock.
@@ -480,6 +534,32 @@ struct Entry {
 }
 
 impl RegistrationQueue {
+  fn requested_storage_bytes(capacity: usize) -> Result<usize, DomainError> {
+    Self::storage_bytes(capacity, capacity, capacity)
+  }
+
+  fn storage_bytes(
+    entries_capacity: usize,
+    free_capacity: usize,
+    heap_capacity: usize,
+  ) -> Result<usize, DomainError> {
+    let entries = payload_bytes::<Option<Entry>>(entries_capacity)?;
+    let free = payload_bytes::<usize>(free_capacity)?;
+    let heap = payload_bytes::<usize>(heap_capacity)?;
+    entries
+      .checked_add(free)
+      .and_then(|bytes| bytes.checked_add(heap))
+      .ok_or(DomainError::Invalid)
+  }
+
+  fn actual_storage_bytes(&self) -> Result<usize, DomainError> {
+    Self::storage_bytes(
+      self.entries.capacity(),
+      self.free.capacity(),
+      self.heap.capacity(),
+    )
+  }
+
   fn new(capacity: usize) -> Result<Self, TimerError> {
     let mut entries = Vec::new();
     entries
@@ -686,6 +766,7 @@ impl RegistrationQueue {
 /// One sleep's completion state, shared with the queue by a `Weak`.
 struct Slot {
   state: Mutex<SlotState>,
+  _control: ControlCharge,
 }
 
 /// Invariant: while its sleep lives and after it was first armed, exactly
@@ -1256,11 +1337,75 @@ pub struct TimerDriver {
   shared: Arc<Shared>,
   thread: Option<DeferredJoin>,
   close_worker: Option<DeferredJoin>,
+  prepared_joins: Option<PreparedJoins>,
+  pending_close_join: Option<PreparedJoin>,
+  _service_thread_name: String,
+  close_thread_name: String,
   panic_payloads: Mutex<Vec<Box<dyn Any + Send>>>,
   shutdown_panicked: bool,
+  _owner_control: ControlCharge,
 }
 
 impl TimerDriver {
+  /// Inline timer owner bytes a containing driver may exclude from its own
+  /// facade charge. Timer-owned vector/name backing is charged separately.
+  pub(crate) const fn owner_payload_bytes() -> usize {
+    std::mem::size_of::<Self>()
+  }
+
+  fn shared_control_bytes(queue_bytes: usize) -> Result<usize, DomainError> {
+    std::mem::size_of::<Shared>()
+      .checked_add(queue_bytes)
+      // The timer-service and one close-worker closure each retain one Arc to
+      // Shared. Their pointer payloads follow Shared through final handles.
+      .and_then(|bytes| {
+        std::mem::size_of::<Arc<Shared>>()
+          .checked_mul(2)
+          .and_then(|captures| bytes.checked_add(captures))
+      })
+      .ok_or(DomainError::Invalid)
+  }
+
+  fn owner_control_bytes(
+    service_template_capacity: usize,
+    close_template_capacity: usize,
+    service_attempt_capacity: usize,
+    close_attempt_capacity: usize,
+    panic_capacity: usize,
+  ) -> Result<usize, DomainError> {
+    let names = service_template_capacity
+      .checked_add(close_template_capacity)
+      .and_then(|bytes| bytes.checked_add(service_attempt_capacity))
+      .and_then(|bytes| bytes.checked_add(close_attempt_capacity))
+      .ok_or(DomainError::Invalid)?;
+    let panic_storage = payload_bytes::<Box<dyn Any + Send>>(panic_capacity)?;
+    let builders = std::mem::size_of::<thread::Builder>()
+      .checked_mul(2)
+      .ok_or(DomainError::Invalid)?;
+    std::mem::size_of::<Self>()
+      .checked_add(names)
+      .and_then(|bytes| bytes.checked_add(panic_storage))
+      .and_then(|bytes| bytes.checked_add(builders))
+      .ok_or(DomainError::Invalid)
+  }
+
+  fn thread_name(name: &str) -> Result<String, TimerError> {
+    let mut value = String::new();
+    value
+      .try_reserve_exact(name.len())
+      .map_err(|_| TimerError::OutOfMemory)?;
+    value.push_str(name);
+    Ok(value)
+  }
+
+  fn map_domain_error(error: DomainError) -> TimerError {
+    match error {
+      DomainError::Invalid => TimerError::Invalid,
+      DomainError::OutOfMemory => TimerError::OutOfMemory,
+      other => TimerError::Domain(other),
+    }
+  }
+
   /// Reserves storage for at most `max_registered` outstanding registrations
   /// and starts the service thread.
   ///
@@ -1268,7 +1413,8 @@ impl TimerDriver {
   ///
   /// `Invalid` when `max_registered` is zero, `OutOfMemory` when bounded
   /// registration storage cannot be reserved, and `Spawn` when the thread
-  /// cannot be started.
+  /// cannot be started. On tenant-aware construction, `Domain` reports a
+  /// Control limit or admission failure.
   pub fn new(max_registered: usize) -> Result<Self, TimerError> {
     Self::build(
       max_registered,
@@ -1276,6 +1422,31 @@ impl TimerDriver {
       false,
       IdleCoordinator::new(None),
       false,
+      None,
+    )
+  }
+
+  /// Creates a mutable real-time timer whose shared state and bounded
+  /// metadata are charged to `tenant`.
+  ///
+  /// # Errors
+  ///
+  /// `Invalid` for a zero registration bound, `OutOfMemory` when bounded
+  /// storage cannot be reserved, `Spawn` when the service thread cannot
+  /// start, or `Domain` when Control cannot admit the declared metadata.
+  pub fn new_in_tenant(max_registered: usize, tenant: &TenantDomain) -> Result<Self, TimerError> {
+    if max_registered == 0 {
+      return Err(TimerError::Invalid);
+    }
+    let coordinator =
+      IdleCoordinator::new_in_tenant(None, tenant).map_err(Self::map_domain_error)?;
+    Self::build(
+      max_registered,
+      ClockMode::Real,
+      false,
+      coordinator,
+      false,
+      Some(tenant),
     )
   }
 
@@ -1298,6 +1469,34 @@ impl TimerDriver {
       false,
       IdleCoordinator::new(None),
       true,
+      None,
+    )
+  }
+
+  /// Creates a fixed real-clock timer whose shared state and bounded
+  /// metadata are charged to `tenant`.
+  ///
+  /// # Errors
+  ///
+  /// `Invalid` for a zero registration bound, `OutOfMemory` when bounded
+  /// storage cannot be reserved, `Spawn` when the service thread cannot
+  /// start, or `Domain` when Control cannot admit the declared metadata.
+  pub fn new_realtime_in_tenant(
+    max_registered: usize,
+    tenant: &TenantDomain,
+  ) -> Result<Self, TimerError> {
+    if max_registered == 0 {
+      return Err(TimerError::Invalid);
+    }
+    let coordinator =
+      IdleCoordinator::new_in_tenant(None, tenant).map_err(Self::map_domain_error)?;
+    Self::build(
+      max_registered,
+      ClockMode::Real,
+      false,
+      coordinator,
+      true,
+      Some(tenant),
     )
   }
 
@@ -1313,6 +1512,7 @@ impl TimerDriver {
       false,
       IdleCoordinator::new(None),
       false,
+      None,
     )?;
     let clock = ManualClock {
       shared: Arc::clone(&driver.shared),
@@ -1325,6 +1525,7 @@ impl TimerDriver {
     mode: ClockMode,
     auto_advance_enabled: bool,
     coordinator: Arc<IdleCoordinator>,
+    tenant: Option<&TenantDomain>,
   ) -> Result<Self, TimerError> {
     Self::build(
       max_registered,
@@ -1332,6 +1533,7 @@ impl TimerDriver {
       auto_advance_enabled,
       coordinator,
       false,
+      tenant,
     )
   }
 
@@ -1341,6 +1543,7 @@ impl TimerDriver {
     auto_advance_enabled: bool,
     coordinator: Arc<IdleCoordinator>,
     fixed_real_clock: bool,
+    tenant: Option<&TenantDomain>,
   ) -> Result<Self, TimerError> {
     if max_registered == 0 {
       return Err(TimerError::Invalid);
@@ -1348,6 +1551,59 @@ impl TimerDriver {
     if mode == ClockMode::PausedAuto && !auto_advance_enabled {
       return Err(TimerError::Invalid);
     }
+
+    let requested_queue_bytes = RegistrationQueue::requested_storage_bytes(max_registered)
+      .map_err(|_| TimerError::OutOfMemory)?;
+    let requested_shared_bytes =
+      Self::shared_control_bytes(requested_queue_bytes).map_err(|_| TimerError::OutOfMemory)?;
+    let mut shared_control =
+      ControlCharge::try_new(tenant, requested_shared_bytes).map_err(Self::map_domain_error)?;
+    let queue = RegistrationQueue::new(max_registered)?;
+    let actual_queue_bytes = queue
+      .actual_storage_bytes()
+      .map_err(|_| TimerError::OutOfMemory)?;
+    let actual_shared_bytes =
+      Self::shared_control_bytes(actual_queue_bytes).map_err(|_| TimerError::OutOfMemory)?;
+    shared_control
+      .try_resize(actual_shared_bytes)
+      .map_err(Self::map_domain_error)?;
+
+    let requested_owner_bytes = Self::owner_control_bytes(
+      SERVICE_THREAD_NAME.len(),
+      CLOSE_THREAD_NAME.len(),
+      SERVICE_THREAD_NAME.len(),
+      CLOSE_THREAD_NAME.len(),
+      PANIC_PAYLOAD_CAPACITY,
+    )
+    .map_err(Self::map_domain_error)?;
+    let mut owner_control =
+      ControlCharge::try_new(tenant, requested_owner_bytes).map_err(Self::map_domain_error)?;
+    let service_thread_name = Self::thread_name(SERVICE_THREAD_NAME)?;
+    let close_thread_name = Self::thread_name(CLOSE_THREAD_NAME)?;
+    let service_attempt_name = service_thread_name.clone();
+    let close_attempt_name = close_thread_name.clone();
+    let mut panic_payloads = Vec::new();
+    panic_payloads
+      .try_reserve_exact(PANIC_PAYLOAD_CAPACITY)
+      .map_err(|_| TimerError::OutOfMemory)?;
+    let actual_owner_bytes = Self::owner_control_bytes(
+      service_thread_name.capacity(),
+      close_thread_name.capacity(),
+      service_attempt_name.capacity(),
+      close_attempt_name.capacity(),
+      panic_payloads.capacity(),
+    )
+    .map_err(Self::map_domain_error)?;
+    owner_control
+      .try_resize(actual_owner_bytes)
+      .map_err(Self::map_domain_error)?;
+
+    // Reserve both exact completion owners before either timer thread exists.
+    let mut prepared_joins =
+      PreparedJoins::new_embedded(tenant, 2).map_err(Self::map_domain_error)?;
+    let service_join = prepared_joins.pop().ok_or(TimerError::Invalid)?;
+    let service_thread_owner = service_join.thread_owner();
+
     let base = Instant::now();
     let shared = Arc::new(Shared {
       state: Mutex::new(State {
@@ -1362,29 +1618,35 @@ impl TimerDriver {
         real_time_saturated: false,
         auto_advance_inhibit: 0,
         auto_advance_inhibit_overflowed: false,
-        queue: RegistrationQueue::new(max_registered)?,
+        queue,
       }),
       wakeup: Condvar::new(),
       max_registered,
       coordinator,
       auto_advance_enabled,
       fixed_real_clock,
+      tenant: tenant.cloned(),
+      _control: shared_control,
     });
-    let mut panic_payloads = Vec::new();
-    panic_payloads
-      .try_reserve_exact(2)
-      .map_err(|_| TimerError::OutOfMemory)?;
     let worker = Arc::clone(&shared);
     let thread = thread::Builder::new()
-      .name("allocatbelt-timer".into())
-      .spawn(move || drive(&worker))
+      .name(service_attempt_name)
+      .spawn(move || {
+        service_thread_owner.retain_until_thread_exit();
+        drive(&worker);
+      })
       .map_err(|_| TimerError::Spawn)?;
     Ok(Self {
       shared,
-      thread: Some(DeferredJoin::new(thread)),
+      thread: Some(service_join.attach(thread)),
       close_worker: None,
+      prepared_joins: Some(prepared_joins),
+      pending_close_join: None,
+      _service_thread_name: service_thread_name,
+      close_thread_name,
       panic_payloads: Mutex::new(panic_payloads),
       shutdown_panicked: false,
+      _owner_control: owner_control,
     })
   }
 
@@ -1403,12 +1665,35 @@ impl TimerDriver {
     if self.close_worker.is_some() || self.shared.close_complete() {
       return Ok(());
     }
+    let prepared = match self.pending_close_join.take() {
+      Some(prepared) => prepared,
+      None => self
+        .prepared_joins
+        .as_mut()
+        .and_then(PreparedJoins::pop)
+        .ok_or_else(|| {
+          std::io::Error::other("timer close completion owner was not preallocated")
+        })?,
+    };
+    let thread_owner = prepared.thread_owner();
     let shared = Arc::clone(&self.shared);
-    let close_worker = thread::Builder::new()
-      .name("allocatbelt-timer-close".into())
-      .spawn(move || shared.close(false))?;
-    self.close_worker = Some(DeferredJoin::new(close_worker));
-    Ok(())
+    let result = thread::Builder::new()
+      .name(self.close_thread_name.clone())
+      .spawn(move || {
+        thread_owner.retain_until_thread_exit();
+        shared.close(false);
+      });
+    match result {
+      Ok(close_worker) => {
+        self.close_worker = Some(prepared.attach(close_worker));
+        Ok(())
+      }
+      Err(error) => {
+        // Keep the exact prepared owner and retry with it on a later request.
+        self.pending_close_join = Some(prepared);
+        Err(error)
+      }
+    }
   }
 
   /// Returns `Pending` until close callbacks and the service thread have
@@ -1691,15 +1976,19 @@ impl TimerHandle {
   ///
   /// # Errors
   ///
-  /// As [`TimerHandle::sleep_until`], and `Invalid` when the deadline
-  /// cannot be represented.
+  /// As [`TimerHandle::sleep_until`], including a Control refusal for the
+  /// declared Slot payload, and `Invalid` when the deadline cannot be
+  /// represented.
   pub fn sleep(&self, duration: Duration) -> Result<Sleep, TimerError> {
+    let control = ControlCharge::try_new(self.shared.tenant.as_ref(), std::mem::size_of::<Slot>())
+      .map_err(TimerDriver::map_domain_error)?;
     let slot = Arc::new(Slot {
       state: Mutex::new(SlotState {
         key: None,
         outcome: None,
         waker: None,
       }),
+      _control: control,
     });
     let (deadline, armed) = self.shared.arm_after_locked(&slot, duration)?;
     self.shared.finish(armed);
@@ -1716,14 +2005,18 @@ impl TimerHandle {
   /// # Errors
   ///
   /// `Closed` once the driver closed; `Full` when the deadline is in the
-  /// future and every registration is taken.
+  /// future and every registration is taken; `Domain` when Control cannot
+  /// admit the declared Slot payload.
   pub fn sleep_until(&self, deadline: Instant) -> Result<Sleep, TimerError> {
+    let control = ControlCharge::try_new(self.shared.tenant.as_ref(), std::mem::size_of::<Slot>())
+      .map_err(TimerDriver::map_domain_error)?;
     let slot = Arc::new(Slot {
       state: Mutex::new(SlotState {
         key: None,
         outcome: None,
         waker: None,
       }),
+      _control: control,
     });
     let armed = self.shared.arm_locked(&slot, deadline)?;
     self.shared.finish(armed);
@@ -2378,6 +2671,10 @@ mod loom_tests {
 }
 
 #[cfg(all(test, not(loom)))]
+#[path = "newtime_control_tests.rs"]
+mod tenant_control_tests;
+
+#[cfg(all(test, not(loom)))]
 mod tests {
   use std::future::{Future, Ready, ready};
   use std::pin::{Pin, pin};
@@ -2554,9 +2851,14 @@ mod tests {
   #[test]
   fn auto_advance_uses_the_live_reset_deadline_and_ignores_cancelled_sleeps() {
     let coordinator = IdleCoordinator::new(None);
-    let driver =
-      TimerDriver::new_for_runtime(2, ClockMode::PausedAuto, true, Arc::clone(&coordinator))
-        .unwrap();
+    let driver = TimerDriver::new_for_runtime(
+      2,
+      ClockMode::PausedAuto,
+      true,
+      Arc::clone(&coordinator),
+      None,
+    )
+    .unwrap();
     let handle = driver.handle();
     let start = handle.now();
     let mut sleep = handle.sleep(HOUR).unwrap();
@@ -2588,9 +2890,14 @@ mod tests {
   #[test]
   fn a_timer_reset_announced_during_idle_invalidates_the_auto_advance_commit() {
     let coordinator = IdleCoordinator::new(None);
-    let driver =
-      TimerDriver::new_for_runtime(1, ClockMode::PausedAuto, true, Arc::clone(&coordinator))
-        .unwrap();
+    let driver = TimerDriver::new_for_runtime(
+      1,
+      ClockMode::PausedAuto,
+      true,
+      Arc::clone(&coordinator),
+      None,
+    )
+    .unwrap();
     let handle = driver.handle();
     let start = handle.now();
     let sleep = handle.sleep(HOUR).unwrap();
@@ -2625,9 +2932,14 @@ mod tests {
   #[test]
   fn explicit_associated_work_guard_inhibits_auto_advance_until_drop() {
     let coordinator = IdleCoordinator::new(None);
-    let driver =
-      TimerDriver::new_for_runtime(1, ClockMode::PausedAuto, true, Arc::clone(&coordinator))
-        .unwrap();
+    let driver = TimerDriver::new_for_runtime(
+      1,
+      ClockMode::PausedAuto,
+      true,
+      Arc::clone(&coordinator),
+      None,
+    )
+    .unwrap();
     let handle = driver.handle();
     let start = handle.now();
     let sleep = handle.sleep(HOUR).unwrap();
@@ -2662,9 +2974,14 @@ mod tests {
   #[test]
   fn automatic_advance_runs_wakers_outside_clock_locks() {
     let coordinator = IdleCoordinator::new(None);
-    let driver =
-      TimerDriver::new_for_runtime(1, ClockMode::PausedAuto, true, Arc::clone(&coordinator))
-        .unwrap();
+    let driver = TimerDriver::new_for_runtime(
+      1,
+      ClockMode::PausedAuto,
+      true,
+      Arc::clone(&coordinator),
+      None,
+    )
+    .unwrap();
     let handle = driver.handle();
     let start = handle.now();
     let mut sleep = handle.sleep(MS).unwrap();
@@ -2752,9 +3069,14 @@ mod tests {
   #[test]
   fn auto_advance_publishes_equal_deadlines_in_arming_order_across_batches() {
     let coordinator = IdleCoordinator::new(None);
-    let driver =
-      TimerDriver::new_for_runtime(129, ClockMode::PausedAuto, true, Arc::clone(&coordinator))
-        .unwrap();
+    let driver = TimerDriver::new_for_runtime(
+      129,
+      ClockMode::PausedAuto,
+      true,
+      Arc::clone(&coordinator),
+      None,
+    )
+    .unwrap();
     let handle = driver.handle();
     let log = Arc::new(Mutex::new(Vec::new()));
     let mut sleeps = Vec::new();

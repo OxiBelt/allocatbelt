@@ -1359,41 +1359,45 @@ impl LocalRuntime {
     if config.max_outstanding == 0 || config.max_scopes == 0 {
       return Err(LocalError::InvalidConfig);
     }
-    let tenant = resources.as_ref().and_then(ResourceScope::tenant_domain);
+    let tenant = resources
+      .as_ref()
+      .and_then(ResourceScope::tenant_domain)
+      .cloned();
     let bound = tenant.is_some();
-    if let Some(tenant) = tenant {
+    if let Some(tenant) = tenant.as_ref() {
       tenant
         .validate_cpu_execution()
         .map_err(LocalError::ResourceDomain)?;
     }
 
-    let runtime_control = ControlCharge::try_new(tenant, std::mem::size_of::<LocalRuntime>())
-      .map_err(|error| control_error(error, bound))?;
+    let runtime_control =
+      ControlCharge::try_new(tenant.as_ref(), std::mem::size_of::<LocalRuntime>())
+        .map_err(|error| control_error(error, bound))?;
     let channel_payload = payload_bytes::<Box<dyn ExternalRequest>>(config.max_outstanding)
       .map_err(|error| control_error(error, bound))?;
     let channel_bytes = std::mem::size_of::<ControlCharge>()
       .checked_add(channel_payload)
       .ok_or_else(|| control_error(DomainError::Invalid, bound))?;
     let channel_control = Arc::new(
-      ControlCharge::try_new(tenant, channel_bytes).map_err(|error| control_error(error, bound))?,
+      ControlCharge::try_new(tenant.as_ref(), channel_bytes)
+        .map_err(|error| control_error(error, bound))?,
     );
     let support_bytes = [
       std::mem::size_of::<ControlCharge>(),
       std::mem::size_of::<AdmissionGate>(),
       std::mem::size_of::<Notifier>(),
-      std::mem::size_of::<IdleSignal>(),
-      std::mem::size_of::<IdleCoordinator>(),
     ]
     .into_iter()
     .try_fold(0_usize, usize::checked_add)
     .ok_or_else(|| control_error(DomainError::Invalid, bound))?;
     let support_control = Arc::new(
-      ControlCharge::try_new(tenant, support_bytes).map_err(|error| control_error(error, bound))?,
+      ControlCharge::try_new(tenant.as_ref(), support_bytes)
+        .map_err(|error| control_error(error, bound))?,
     );
     let scope_bytes = std::mem::size_of::<ScopeCell>();
-    let root_scope_control =
-      ControlCharge::try_new(tenant, scope_bytes).map_err(|error| control_error(error, bound))?;
-    let (task_waiters, root_waiters) = if let Some(tenant) = tenant {
+    let root_scope_control = ControlCharge::try_new(tenant.as_ref(), scope_bytes)
+      .map_err(|error| control_error(error, bound))?;
+    let (task_waiters, root_waiters) = if let Some(tenant) = tenant.as_ref() {
       let task_waiters = tenant
         .reserve_waiters(config.max_outstanding)
         .map_err(LocalError::ResourceDomain)?;
@@ -1404,7 +1408,8 @@ impl LocalRuntime {
     } else {
       (None, None)
     };
-    let (control, root_scope) = Control::new(config.max_outstanding, config.max_scopes, tenant)?;
+    let (control, root_scope) =
+      Control::new(config.max_outstanding, config.max_scopes, tenant.as_ref())?;
     let gate = AdmissionGate::new(config.max_outstanding);
     let (sender, receiver) = mpsc::sync_channel(config.max_outstanding);
     let mut core_bytes = std::mem::size_of::<LocalCore>();
@@ -1418,8 +1423,8 @@ impl LocalRuntime {
         .checked_add(bytes)
         .ok_or_else(|| control_error(DomainError::Invalid, bound))?;
     }
-    let mut core_control =
-      ControlCharge::try_new(tenant, core_bytes).map_err(|error| control_error(error, bound))?;
+    let mut core_control = ControlCharge::try_new(tenant.as_ref(), core_bytes)
+      .map_err(|error| control_error(error, bound))?;
     let mut tasks = Vec::new();
     tasks
       .try_reserve_exact(config.max_outstanding)
@@ -1453,8 +1458,17 @@ impl LocalRuntime {
     );
     scopes[0] = Some(Rc::clone(&root));
     let owner = thread::current();
-    let signal = IdleSignal::new(owner.clone());
-    let coordinator = IdleCoordinator::new(Some(Arc::clone(&signal)));
+    let signal = match tenant.as_ref() {
+      Some(tenant) => {
+        IdleSignal::new_in_tenant(owner.clone(), tenant).map_err(LocalError::ResourceDomain)?
+      }
+      None => IdleSignal::new(owner.clone()),
+    };
+    let coordinator = match tenant.as_ref() {
+      Some(tenant) => IdleCoordinator::new_in_tenant(Some(Arc::clone(&signal)), tenant)
+        .map_err(LocalError::ResourceDomain)?,
+      None => IdleCoordinator::new(Some(Arc::clone(&signal))),
+    };
     let notifier = Notifier::new(
       signal,
       Arc::clone(&coordinator),
@@ -2644,6 +2658,8 @@ mod control_owner_tests {
     drop(send);
     drop(runtime);
     let retained = support_bytes
+      + std::mem::size_of::<IdleSignal>()
+      + std::mem::size_of::<IdleCoordinator>()
       + abort_metadata_bytes::<LocalSendAbort>()
       + finished_flag_bytes()
       + std::mem::size_of::<LocalAbortFlag>()

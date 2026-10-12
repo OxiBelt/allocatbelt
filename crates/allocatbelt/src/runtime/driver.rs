@@ -498,6 +498,7 @@ impl ServiceOptions {
     tenant: Option<&TenantDomain>,
     owner_bytes: usize,
     executor_bytes: usize,
+    max_outstanding: usize,
   ) -> Result<ControlCharge, DriverBuildError> {
     // Executor and active blocking/service values already own their exact
     // inline charges. The containing facade accounts their surrounding fields
@@ -513,6 +514,15 @@ impl ServiceOptions {
         .checked_sub(std::mem::size_of::<BlockingRuntime>())
         .ok_or(DriverBuildError::InvalidConfiguration(
           "blocking metadata exceeds its facade",
+        ))?;
+    }
+    if tenant.is_some() {
+      let timers = usize::from(self.timer_registrations.is_some())
+        + usize::from(self.rate_timer_capacity(max_outstanding)?.is_some());
+      bytes = bytes
+        .checked_sub(timers * TimerDriver::owner_payload_bytes())
+        .ok_or(DriverBuildError::InvalidConfiguration(
+          "timer metadata exceeds its facade",
         ))?;
     }
     #[cfg(feature = "resource-feedback")]
@@ -670,13 +680,24 @@ impl ServiceOptions {
     }
     if let Some(max_registered) = self.timer_registrations {
       startup.timer = Some(
-        TimerDriver::new_for_runtime(max_registered, self.timer_mode, current_thread, coordinator)
-          .map_err(DriverBuildError::Timer)?,
+        TimerDriver::new_for_runtime(
+          max_registered,
+          self.timer_mode,
+          current_thread,
+          coordinator,
+          resources.tenant_domain(),
+        )
+        .map_err(DriverBuildError::Timer)?,
       );
     }
     if let Some(max_registered) = self.rate_timer_capacity(max_outstanding)? {
-      startup.rate_timer =
-        Some(TimerDriver::new_realtime(max_registered).map_err(DriverBuildError::Timer)?);
+      startup.rate_timer = Some(
+        match resources.tenant_domain() {
+          Some(tenant) => TimerDriver::new_realtime_in_tenant(max_registered, tenant),
+          None => TimerDriver::new_realtime(max_registered),
+        }
+        .map_err(DriverBuildError::Timer)?,
+      );
     }
     if let Some(config) = self.reactor {
       startup.reactor = Some(Reactor::new(config).map_err(DriverBuildError::Reactor)?);
@@ -899,6 +920,7 @@ impl CurrentThreadBuilder {
       resources.tenant_domain(),
       std::mem::size_of::<CurrentThreadDriver>(),
       std::mem::size_of::<LocalRuntime>(),
+      self.config.max_outstanding,
     )?;
     let ByteRateLimits {
       disk: disk_rate,
@@ -1102,6 +1124,7 @@ impl MultiThreadBuilder {
       resources.tenant_domain(),
       std::mem::size_of::<MultiThreadDriver>(),
       std::mem::size_of::<AsyncRuntime>(),
+      self.config.max_outstanding,
     )?;
     let ByteRateLimits {
       disk: disk_rate,
@@ -1140,7 +1163,12 @@ impl MultiThreadBuilder {
     let filesystem = self.services.build_services(
       &resources,
       &mut startup,
-      IdleCoordinator::new(None),
+      match resources.tenant_domain() {
+        Some(tenant) => {
+          IdleCoordinator::new_in_tenant(None, tenant).map_err(DriverBuildError::ResourceDomain)?
+        }
+        None => IdleCoordinator::new(None),
+      },
       false,
       self.config.max_outstanding,
     )?;
@@ -3705,6 +3733,7 @@ mod tests {
       std::mem::size_of::<MultiThreadDriver>()
         - std::mem::size_of::<AsyncRuntime>()
         - ResourceFeedbackService::owner_payload_bytes()
+        - TimerDriver::owner_payload_bytes()
     );
     let ledger = driver.resources().clone();
     let buffer = ledger.try_alloc_zeroed(1).unwrap();

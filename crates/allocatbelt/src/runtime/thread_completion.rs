@@ -16,6 +16,8 @@
 //! allocations. The reserved monitor-name and Arc-capture capacity is one
 //! helper attempt per original worker, including when that attempt is lazy or
 //! must be retried.
+//! [`PreparedJoins::new_embedded`] charges only its vector backing when the
+//! containing owner already charges the inline `PreparedJoins` payload.
 
 #![forbid(unsafe_code)]
 #![cfg_attr(not(test), deny(clippy::expect_used, clippy::unwrap_used))]
@@ -25,7 +27,7 @@ use std::io;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread::{self, JoinHandle, ThreadId};
 
-use crate::runtime::resource_domain::{payload_bytes, ControlCharge, DomainError, TenantDomain};
+use crate::runtime::resource_domain::{ControlCharge, DomainError, TenantDomain, payload_bytes};
 
 use super::task::drop_contained;
 
@@ -101,12 +103,37 @@ impl Drop for CompletionTlsOwner {
 
 impl PreparedJoins {
   /// Precharges the actual vector capacity and every per-worker Shared owner
-  /// before any worker or lifecycle callback can start.
+  /// before any worker or lifecycle callback can start. The reservation
+  /// includes this value's declared inline payload and is for owners that
+  /// store `PreparedJoins` separately.
   pub(crate) fn new(tenant: Option<&TenantDomain>, count: usize) -> Result<Self, DomainError> {
+    Self::new_with_layout(tenant, count, true)
+  }
+
+  /// Prepares join owners when this value is embedded in a larger owner whose
+  /// Control fee already covers `size_of::<PreparedJoins>()`. The vector
+  /// backing and every per-worker Shared owner remain independently charged.
+  pub(crate) fn new_embedded(
+    tenant: Option<&TenantDomain>,
+    count: usize,
+  ) -> Result<Self, DomainError> {
+    Self::new_with_layout(tenant, count, false)
+  }
+
+  fn new_with_layout(
+    tenant: Option<&TenantDomain>,
+    count: usize,
+    include_inline: bool,
+  ) -> Result<Self, DomainError> {
     if count == 0 {
       return Err(DomainError::Invalid);
     }
-    let requested = std::mem::size_of::<Self>()
+    let inline_bytes = if include_inline {
+      std::mem::size_of::<Self>()
+    } else {
+      0
+    };
+    let requested = inline_bytes
       .checked_add(payload_bytes::<PreparedJoin>(count)?)
       .ok_or(DomainError::Invalid)?;
     let mut control = ControlCharge::try_new(tenant, requested)?;
@@ -114,7 +141,7 @@ impl PreparedJoins {
     entries
       .try_reserve_exact(count)
       .map_err(|_| DomainError::OutOfMemory)?;
-    let actual = std::mem::size_of::<Self>()
+    let actual = inline_bytes
       .checked_add(payload_bytes::<PreparedJoin>(entries.capacity())?)
       .ok_or(DomainError::Invalid)?;
     control.try_resize(actual)?;
@@ -124,6 +151,25 @@ impl PreparedJoins {
     Ok(Self {
       entries,
       _control: control,
+    })
+  }
+
+  #[cfg(all(test, not(loom)))]
+  pub(crate) fn control_bytes(&self) -> usize {
+    self._control.bytes()
+  }
+
+  #[cfg(all(test, not(loom)))]
+  pub(crate) fn entries_capacity(&self) -> usize {
+    self.entries.capacity()
+  }
+
+  #[cfg(all(test, not(loom)))]
+  pub(crate) fn prepared_shared_control_bytes(&self) -> Result<usize, DomainError> {
+    self.entries.iter().try_fold(0_usize, |total, prepared| {
+      total
+        .checked_add(prepared.shared._control.bytes())
+        .ok_or(DomainError::Invalid)
     })
   }
 
@@ -239,6 +285,11 @@ impl DeferredJoin {
   /// Whether the original thread is the current thread.
   pub(crate) fn is_current_thread(&self) -> bool {
     self.thread_id == thread::current().id()
+  }
+
+  #[cfg(all(test, not(loom)))]
+  pub(crate) fn control_bytes(&self) -> usize {
+    self.shared._control.bytes()
   }
 
   /// Starts the helper once, then takes a result if the original thread has
@@ -393,9 +444,9 @@ fn lock(state: &Mutex<State>) -> MutexGuard<'_, State> {
 
 #[cfg(all(test, not(loom)))]
 mod tests {
-  use super::{fail_next_monitor_for_test, DeferredJoin, JoinResult, PreparedJoin, PreparedJoins};
+  use super::{DeferredJoin, JoinResult, PreparedJoin, PreparedJoins, fail_next_monitor_for_test};
   use crate::runtime::resource_domain::{
-    payload_bytes, DomainResource, DomainResources, ResourceDomain, TenantDomain,
+    DomainResource, DomainResources, ResourceDomain, TenantDomain, payload_bytes,
   };
   use std::cell::RefCell;
   use std::sync::mpsc::{self, Receiver, Sender};
@@ -644,10 +695,12 @@ mod tests {
     assert_eq!(global_control(&domain) - global_baseline, shared_bytes);
     assert_eq!(tenant_control(&tenant) - tenant_baseline, shared_bytes);
 
-    assert!(join
-      .try_join()
-      .expect("monitor retry should start")
-      .is_none());
+    assert!(
+      join
+        .try_join()
+        .expect("monitor retry should start")
+        .is_none()
+    );
     drop(join);
     assert_eq!(global_control(&domain) - global_baseline, shared_bytes);
     release_tx.send(()).expect("release nested TLS destructor");
