@@ -116,6 +116,8 @@ mod reactor_release;
 #[cfg(not(loom))]
 mod readiness_io;
 pub mod resource_domain;
+#[cfg(not(loom))]
+pub mod resource_feedback_policy;
 mod resources;
 pub mod rwlock;
 mod scheduler;
