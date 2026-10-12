@@ -2318,7 +2318,6 @@ mod tests {
     }
   }
 
-  #[cfg(feature = "resource-feedback")]
   fn shutdown_multi_driver(driver: &mut MultiThreadDriver) {
     driver.request_shutdown(MultiShutdown::default()).unwrap();
     let deadline = Instant::now() + Duration::from_secs(3);
@@ -3729,6 +3728,8 @@ mod tests {
 
   #[test]
   fn both_bound_facades_reap_selected_processes_and_release_provider_metadata() {
+    use crate::runtime::resource_domain::{DomainResource, DomainResources};
+
     let ceilings = DomainResources::ZERO
       .with(DomainResource::Cpu, 4)
       .with(DomainResource::Memory, 1024)
