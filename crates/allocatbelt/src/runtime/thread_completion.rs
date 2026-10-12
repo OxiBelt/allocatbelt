@@ -17,6 +17,17 @@ use super::task::drop_contained;
 
 type JoinResult = thread::Result<()>;
 
+#[cfg(all(test, not(loom)))]
+thread_local! {
+  static FAIL_NEXT_MONITOR: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Deterministically fail one launch on this test's polling thread only.
+#[cfg(all(test, not(loom)))]
+pub(crate) fn fail_next_monitor_for_test() {
+  FAIL_NEXT_MONITOR.set(true);
+}
+
 /// One original thread and at most one helper that joins it off-caller.
 pub(crate) struct DeferredJoin {
   shared: Arc<Shared>,
@@ -80,6 +91,15 @@ impl DeferredJoin {
   /// fully joined. A pending return retains either the original handle in
   /// shared state or the helper handle that owns it.
   pub(crate) fn try_join(&mut self) -> Result<Option<JoinResult>, MonitorSpawnError> {
+    #[cfg(all(test, not(loom)))]
+    if FAIL_NEXT_MONITOR.replace(false) {
+      return self.try_join_with(|_| {
+        Err(io::Error::new(
+          io::ErrorKind::WouldBlock,
+          "injected monitor startup refusal",
+        ))
+      });
+    }
     self.try_join_with(|shared| {
       thread::Builder::new()
         .name("allocatbelt-join-monitor".to_owned())

@@ -14,7 +14,10 @@
 //! not start a runtime or restrict paths. Its recursive walk has
 //! explicit entry, depth, and path-length ceilings; ordinary directory
 //! iteration still yields one entry per submitted call. Neither API imposes
-//! disk-space, IOPS, or byte-rate limits.
+//! disk-space or IOPS limits. An optional shared application-byte bucket
+//! covers owned sequential and positional reads/writes and both directions of
+//! a managed-buffer copy. Metadata remains outside that byte contract. Direct
+//! standard-library calls bypass it.
 //! Returned standard-library `DirEntry` values can perform further blocking
 //! I/O when their methods are called directly; those calls bypass the pool
 //! and its disk permits.
@@ -36,12 +39,36 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::os::unix::fs::FileExt;
 
 use crate::runtime::blocking::Handle;
+#[cfg(not(loom))]
+use crate::runtime::byte_rate::ByteRateLimit;
 use crate::runtime::error::SubmitErrorKind;
 use crate::runtime::job::{CancellationToken, Job};
 use crate::runtime::managed::{
   ManagedBuf, OperationPermit, OperationRequest, ResourceError, ResourceScope,
 };
+#[cfg(not(loom))]
+use crate::runtime::resource_domain::DomainError;
+#[cfg(all(feature = "resource-feedback", not(loom)))]
+use crate::runtime::resource_feedback_meter::IoFeedbackMeter;
 use crate::runtime::resources::Resources;
+
+#[cfg(not(loom))]
+#[path = "fs_rate.rs"]
+mod fs_rate;
+#[cfg(not(loom))]
+use fs_rate::{FsRateControl, limited_io};
+
+// The checking configuration excludes real-time byte buckets and syscall I/O.
+// Preserve the existing filesystem source without claiming to model rates.
+#[cfg(loom)]
+fn limited_io(
+  _rate: Option<&()>,
+  maximum: usize,
+  _token: &CancellationToken,
+  operation: impl FnOnce(usize) -> io::Result<usize>,
+) -> io::Result<usize> {
+  operation(maximum)
+}
 
 const IO_CHUNK: usize = 64 * 1024;
 
@@ -205,13 +232,56 @@ pub struct DirectoryEntryOutcome {
 pub struct FsHandle {
   blocking: Handle,
   scope: ResourceScope,
+  #[cfg(not(loom))]
+  byte_rate: Option<FsRateControl>,
 }
 
 impl FsHandle {
   /// Uses the explicitly supplied blocking pool and resource ledger.
   #[must_use]
   pub fn new(blocking: Handle, scope: ResourceScope) -> Self {
-    Self { blocking, scope }
+    Self {
+      blocking,
+      scope,
+      #[cfg(not(loom))]
+      byte_rate: None,
+    }
+  }
+
+  /// Clones this front end with a shared application-byte bucket for owned
+  /// read/write and positional read/write calls. Each syscall reserves credit
+  /// first; waits use real time and observe cancellation. Copies charge reads
+  /// and writes separately and reserve bounded managed scratch space. Metadata
+  /// is outside this byte contract. The original front end is unchanged.
+  #[cfg(not(loom))]
+  pub fn with_byte_rate(&self, bucket: &ByteRateLimit) -> Result<Self, DomainError> {
+    let byte_rate = FsRateControl::new(
+      bucket,
+      self.scope.tenant_domain(),
+      #[cfg(feature = "resource-feedback")]
+      None,
+    )?;
+    Ok(Self {
+      blocking: self.blocking.clone(),
+      scope: self.scope.clone(),
+      byte_rate: Some(byte_rate),
+    })
+  }
+
+  /// Configures the same byte admission plus one meter shared by all clones
+  /// and admitted operations. Only committed application bytes are measured.
+  #[cfg(all(feature = "resource-feedback", not(loom)))]
+  pub fn with_metered_byte_rate(
+    &self,
+    bucket: &ByteRateLimit,
+    meter: &IoFeedbackMeter,
+  ) -> Result<Self, DomainError> {
+    let byte_rate = FsRateControl::new(bucket, self.scope.tenant_domain(), Some(meter))?;
+    Ok(Self {
+      blocking: self.blocking.clone(),
+      scope: self.scope.clone(),
+      byte_rate: Some(byte_rate),
+    })
   }
 
   /// Opens `path` using the caller's standard-library policy.
@@ -241,7 +311,11 @@ impl FsHandle {
         input: (file, buffer),
       });
     }
-    self.submit((file, buffer), |(mut file, mut buffer), token| {
+    #[cfg(not(loom))]
+    let byte_rate = self.byte_rate.clone();
+    #[cfg(loom)]
+    let byte_rate: Option<()> = None;
+    self.submit((file, buffer), move |(mut file, mut buffer), token| {
       let mut bytes: usize = 0;
       let mut error = None;
       if let Some(storage) = buffer.get_mut() {
@@ -254,7 +328,9 @@ impl FsHandle {
             break;
           }
           let end = storage.len().min(bytes.saturating_add(IO_CHUNK));
-          match file.file.read(&mut storage[bytes..end]) {
+          match limited_io(byte_rate.as_ref(), end - bytes, &token, |offered| {
+            file.file.read(&mut storage[bytes..bytes + offered])
+          }) {
             Ok(0) => break,
             Ok(read) => bytes += read,
             Err(read_error) => {
@@ -283,7 +359,11 @@ impl FsHandle {
     file: OwnedFile,
     buffer: ManagedBuf,
   ) -> Result<Job<FileIoOutcome>, FsSubmissionError<(OwnedFile, ManagedBuf)>> {
-    self.submit((file, buffer), |(mut file, buffer), token| {
+    #[cfg(not(loom))]
+    let byte_rate = self.byte_rate.clone();
+    #[cfg(loom)]
+    let byte_rate: Option<()> = None;
+    self.submit((file, buffer), move |(mut file, buffer), token| {
       let mut bytes = 0;
       let mut error = None;
       while bytes < buffer.len() {
@@ -295,7 +375,9 @@ impl FsHandle {
           break;
         }
         let end = buffer.len().min(bytes.saturating_add(IO_CHUNK));
-        match file.file.write(&buffer[bytes..end]) {
+        match limited_io(byte_rate.as_ref(), end - bytes, &token, |offered| {
+          file.file.write(&buffer[bytes..bytes + offered])
+        }) {
           Ok(0) => {
             error = Some(io::Error::new(
               io::ErrorKind::WriteZero,
@@ -333,9 +415,13 @@ impl FsHandle {
         input: (file, buffer, offset),
       });
     }
+    #[cfg(not(loom))]
+    let byte_rate = self.byte_rate.clone();
+    #[cfg(loom)]
+    let byte_rate: Option<()> = None;
     self.submit(
       (file, buffer, offset),
-      |(file, mut buffer, offset), token| {
+      move |(file, mut buffer, offset), token| {
         let mut bytes: usize = 0;
         let mut error = None;
         if let Some(storage) = buffer.get_mut() {
@@ -355,7 +441,11 @@ impl FsHandle {
               ));
               break;
             };
-            match file.file.read_at(&mut storage[bytes..end], position) {
+            match limited_io(byte_rate.as_ref(), end - bytes, &token, |offered| {
+              file
+                .file
+                .read_at(&mut storage[bytes..bytes + offered], position)
+            }) {
               Ok(0) => break,
               Ok(read) => bytes += read,
               Err(read_error) => {
@@ -388,47 +478,58 @@ impl FsHandle {
     buffer: ManagedBuf,
     offset: u64,
   ) -> Result<Job<FileIoOutcome>, FsSubmissionError<(OwnedFile, ManagedBuf, u64)>> {
-    self.submit((file, buffer, offset), |(file, buffer, offset), token| {
-      let mut bytes: usize = 0;
-      let mut error = None;
-      while bytes < buffer.len() {
-        if token.is_cancelled() {
-          error = Some(io::Error::new(
-            io::ErrorKind::Interrupted,
-            "filesystem operation cancelled",
-          ));
-          break;
-        }
-        let end = buffer.len().min(bytes.saturating_add(IO_CHUNK));
-        let Some(position) = offset.checked_add(bytes as u64) else {
-          error = Some(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "file offset overflow",
-          ));
-          break;
-        };
-        match file.file.write_at(&buffer[bytes..end], position) {
-          Ok(0) => {
+    #[cfg(not(loom))]
+    let byte_rate = self.byte_rate.clone();
+    #[cfg(loom)]
+    let byte_rate: Option<()> = None;
+    self.submit(
+      (file, buffer, offset),
+      move |(file, buffer, offset), token| {
+        let mut bytes: usize = 0;
+        let mut error = None;
+        while bytes < buffer.len() {
+          if token.is_cancelled() {
             error = Some(io::Error::new(
-              io::ErrorKind::WriteZero,
-              "failed to write the complete managed buffer",
+              io::ErrorKind::Interrupted,
+              "filesystem operation cancelled",
             ));
             break;
           }
-          Ok(written) => bytes += written,
-          Err(write_error) => {
-            error = Some(write_error);
+          let end = buffer.len().min(bytes.saturating_add(IO_CHUNK));
+          let Some(position) = offset.checked_add(bytes as u64) else {
+            error = Some(io::Error::new(
+              io::ErrorKind::InvalidInput,
+              "file offset overflow",
+            ));
             break;
+          };
+          match limited_io(byte_rate.as_ref(), end - bytes, &token, |offered| {
+            file
+              .file
+              .write_at(&buffer[bytes..bytes + offered], position)
+          }) {
+            Ok(0) => {
+              error = Some(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "failed to write the complete managed buffer",
+              ));
+              break;
+            }
+            Ok(written) => bytes += written,
+            Err(write_error) => {
+              error = Some(write_error);
+              break;
+            }
           }
         }
-      }
-      FileIoOutcome {
-        file,
-        buffer,
-        bytes,
-        error,
-      }
-    })
+        FileIoOutcome {
+          file,
+          buffer,
+          bytes,
+          error,
+        }
+      },
+    )
   }
 
   /// Flushes buffered file state and returns the owned file on either result.
@@ -615,11 +716,50 @@ impl FsHandle {
   /// copy from starting. Once the copy starts, dropping or cancelling its job
   /// cannot interrupt or roll back filesystem changes; the disk permit and both
   /// paths remain owned until the blocking call completes.
+  ///
+  /// With a byte bucket, copying uses managed scratch of at most 64 KiB,
+  /// charges both reads and writes, and observes cancellation between calls.
+  /// The scope must admit nonempty scratch storage; refusal recovers both
+  /// paths before any filesystem change. Cancellation does not roll back a
+  /// destination already opened or written.
   pub fn copy(
     &self,
     from: PathBuf,
     to: PathBuf,
   ) -> Result<Job<io::Result<u64>>, FsSubmissionError<(PathBuf, PathBuf)>> {
+    #[cfg(not(loom))]
+    {
+      let Some(rate) = self.byte_rate.clone() else {
+        return self.submit((from, to), |(from, to), _token| fs::copy(from, to));
+      };
+      let scratch_size = self.scope.limits().managed_memory.clamp(1, IO_CHUNK);
+      let scratch = match self.scope.try_alloc_zeroed(scratch_size) {
+        Ok(scratch) => scratch,
+        Err(error) => {
+          return Err(FsSubmissionError {
+            kind: FsSubmissionErrorKind::Resource(error),
+            input: (from, to),
+          });
+        }
+      };
+      self
+        .submit(
+          ((from, to), scratch),
+          move |((from, to), mut scratch), token| match scratch.get_mut() {
+            Some(storage) => fs_rate::copy_file(&from, &to, storage, &rate, &token),
+            None => Err(io::Error::other("copy scratch became shared")),
+          },
+        )
+        .map_err(|error| {
+          let (input, scratch) = error.input;
+          drop(scratch);
+          FsSubmissionError {
+            kind: error.kind,
+            input,
+          }
+        })
+    }
+    #[cfg(loom)]
     self.submit((from, to), |(from, to), _token| fs::copy(from, to))
   }
 

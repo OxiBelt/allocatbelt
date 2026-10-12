@@ -48,7 +48,7 @@ use super::process::{ProcessBuildError, ProcessDriver, ProcessShutdownError, Pro
 #[cfg(not(loom))]
 use super::rate_io::{RateIoFailure, RateLimitedIo};
 use super::reactor::{Reactor, ReactorConfig, ReactorError, ReactorHandle};
-use super::resource_domain::TenantDomain;
+use super::resource_domain::{DomainError, TenantDomain};
 #[cfg(feature = "resource-feedback")]
 use super::resource_feedback::{
   FeedbackMetricsHandle, FeedbackShutdownError, FeedbackShutdownProgress, ResourceFeedbackService,
@@ -98,6 +98,35 @@ pub enum DriverShutdownError {
   Feedback(FeedbackShutdownError),
 }
 
+impl DriverShutdownError {
+  /// Whether retrying the same shutdown request can resume completion.
+  /// A failed helper launch retains the original owner and is not latched
+  /// as a worker failure.
+  #[must_use]
+  pub const fn is_retryable(self) -> bool {
+    matches!(
+      self,
+      Self::CloseThread(_)
+        | Self::Async(AsyncError::JoinMonitorSpawnFailed)
+        | Self::Blocking(io::ErrorKind::WouldBlock)
+        | Self::Process(ProcessShutdownError::JoinMonitorSpawn)
+        | Self::Timer(TimerError::JoinMonitorSpawn)
+        | Self::Reactor(ReactorError::JoinMonitorSpawn)
+    )
+  }
+}
+
+fn remember_shutdown_failure(
+  stored: &mut Option<DriverShutdownError>,
+  error: DriverShutdownError,
+) -> DriverShutdownError {
+  if error.is_retryable() {
+    stored.unwrap_or(error)
+  } else {
+    *stored.get_or_insert(error)
+  }
+}
+
 impl fmt::Display for DriverShutdownError {
   fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
     match self {
@@ -142,6 +171,8 @@ pub enum DriverBuildError {
   Signal(SignalError),
   /// A directional application-byte bucket has invalid bounds.
   ByteRate(ByteRateError),
+  /// A selected provider could not reserve global and tenant metadata.
+  ResourceDomain(DomainError),
   /// An opt-in feedback factory or its service failed during startup.
   #[cfg(feature = "resource-feedback")]
   Feedback(FeedbackFactoryError),
@@ -162,6 +193,7 @@ impl fmt::Display for DriverBuildError {
       Self::Process(error) => error.fmt(f),
       Self::Signal(error) => error.fmt(f),
       Self::ByteRate(error) => error.fmt(f),
+      Self::ResourceDomain(error) => error.fmt(f),
       #[cfg(feature = "resource-feedback")]
       Self::Feedback(error) => error.fmt(f),
     }
@@ -178,11 +210,36 @@ impl std::error::Error for DriverBuildError {
       Self::Signal(error) => Some(error),
       Self::Timer(error) => Some(error),
       Self::ByteRate(error) => Some(error),
+      Self::ResourceDomain(error) => Some(error),
       #[cfg(feature = "resource-feedback")]
       Self::Feedback(error) => Some(error),
       Self::InvalidConfiguration(_) | Self::FilesystemNeedsBlocking => None,
     }
   }
+}
+
+fn bind_filesystem_rate(
+  filesystem: Option<FsHandle>,
+  disk_rate: Option<&ByteRateLimit>,
+  #[cfg(feature = "resource-feedback")] feedback_meters: Option<&FeedbackMeters>,
+) -> Result<Option<FsHandle>, DriverBuildError> {
+  let Some(filesystem) = filesystem else {
+    return Ok(None);
+  };
+  let Some(disk_rate) = disk_rate else {
+    return Ok(Some(filesystem));
+  };
+  #[cfg(feature = "resource-feedback")]
+  if let Some(meters) = feedback_meters {
+    return filesystem
+      .with_metered_byte_rate(disk_rate, &meters.disk)
+      .map(Some)
+      .map_err(DriverBuildError::ResourceDomain);
+  }
+  filesystem
+    .with_byte_rate(disk_rate)
+    .map(Some)
+    .map_err(DriverBuildError::ResourceDomain)
 }
 
 /// Why a facade could not construct a rate-limited stream.
@@ -690,9 +747,10 @@ macro_rules! service_builder_methods {
         self
       }
 
-      /// Selects one disk application-byte bucket. This exposes a shared
-      /// bucket for explicit disk adapters; it does not intercept filesystem
-      /// operations by itself.
+      /// Selects one disk application-byte bucket for the owning filesystem
+      /// handle and explicit disk stream adapters. Copies charge their read
+      /// and write directions separately. Direct standard-library calls remain
+      /// outside this application-byte contract.
       pub fn disk_rate(mut self, config: ByteRateConfig) -> Self {
         self.services.disk_rate = Some(config);
         self
@@ -815,6 +873,12 @@ impl CurrentThreadBuilder {
       Arc::clone(&coordinator),
       true,
       self.config.max_outstanding,
+    )?;
+    let filesystem = bind_filesystem_rate(
+      filesystem,
+      disk_rate.as_ref(),
+      #[cfg(feature = "resource-feedback")]
+      feedback_meters.as_ref(),
     )?;
     #[cfg(feature = "resource-feedback")]
     if self.services.feedback.is_some() {
@@ -1008,6 +1072,12 @@ impl MultiThreadBuilder {
       IdleCoordinator::new(None),
       false,
       self.config.max_outstanding,
+    )?;
+    let filesystem = bind_filesystem_rate(
+      filesystem,
+      disk_rate.as_ref(),
+      #[cfg(feature = "resource-feedback")]
+      feedback_meters.as_ref(),
     )?;
     #[cfg(feature = "resource-feedback")]
     let runtime_metrics = startup.asynchronous.as_ref().map(AsyncRuntime::metrics);
@@ -1438,7 +1508,7 @@ impl CurrentThreadDriver {
       }
     }
     if let Some(error) = failure {
-      self.shutdown_failure.get_or_insert(error);
+      return Err(remember_shutdown_failure(&mut self.shutdown_failure, error));
     }
     if let Some(error) = self.shutdown_failure {
       return Err(error);
@@ -1460,9 +1530,10 @@ impl CurrentThreadDriver {
       return Err(DriverShutdownError::NotRequested);
     }
     if let Err(error) = self.local.drive_shutdown_step() {
-      self
-        .shutdown_failure
-        .get_or_insert(DriverShutdownError::Local(error));
+      remember_shutdown_failure(
+        &mut self.shutdown_failure,
+        DriverShutdownError::Local(error),
+      );
     }
     if self.local.shutdown_complete()
       && let Some(policy) = self.shutdown
@@ -1473,9 +1544,10 @@ impl CurrentThreadDriver {
       && self.blocking_shutdown_requested
       && let Err(error) = blocking.drive_shutdown_step()
     {
-      self
-        .shutdown_failure
-        .get_or_insert(DriverShutdownError::Blocking(error.kind()));
+      remember_shutdown_failure(
+        &mut self.shutdown_failure,
+        DriverShutdownError::Blocking(error.kind()),
+      );
     }
     self.try_shutdown()
   }
@@ -1787,7 +1859,7 @@ impl MultiThreadDriver {
       }
     }
     if let Some(error) = failure {
-      self.shutdown_failure.get_or_insert(error);
+      return Err(remember_shutdown_failure(&mut self.shutdown_failure, error));
     }
     if let Some(error) = self.shutdown_failure {
       return Err(error);
@@ -1812,9 +1884,10 @@ impl MultiThreadDriver {
       && let Some(blocking) = self.blocking.as_mut()
       && let Err(error) = blocking.drive_shutdown_step()
     {
-      self
-        .shutdown_failure
-        .get_or_insert(DriverShutdownError::Blocking(error.kind()));
+      remember_shutdown_failure(
+        &mut self.shutdown_failure,
+        DriverShutdownError::Blocking(error.kind()),
+      );
     }
     self.try_shutdown()
   }
@@ -3195,21 +3268,17 @@ mod tests {
       let network_limit = driver.download_rate().unwrap().snapshot().bytes_per_second;
       if cpu_limit < 16 && disk_limit < 1000 && network_limit < 1000 {
         let metrics = driver.feedback_metrics().unwrap().snapshot();
-        assert_eq!(
-          metrics
-            .control(FeedbackResource::CpuConcurrency)
-            .current_limit,
-          cpu_limit as u64
-        );
-        assert_eq!(
-          metrics.control(FeedbackResource::DiskRate).current_limit,
-          disk_limit
-        );
-        assert_eq!(
-          metrics.control(FeedbackResource::NetworkRate).current_limit,
-          network_limit
-        );
-        break;
+        // Actuation and its subsequent readback acknowledgement are separate
+        // operations. Require both rather than racing the metrics publication.
+        if metrics
+          .control(FeedbackResource::CpuConcurrency)
+          .current_limit
+          == cpu_limit as u64
+          && metrics.control(FeedbackResource::DiskRate).current_limit == disk_limit
+          && metrics.control(FeedbackResource::NetworkRate).current_limit == network_limit
+        {
+          break;
+        }
       }
       assert!(
         Instant::now() < deadline,
@@ -3299,5 +3368,197 @@ mod tests {
       domain.snapshot().used.get(DomainResource::Control),
       control_before
     );
+  }
+
+  fn exercise_owned_filesystem_rate(
+    filesystem: FsHandle,
+    resources: &ResourceScope,
+    rate: ByteRateLimit,
+  ) {
+    let path = std::env::temp_dir().join(format!(
+      "allocatbelt-driver-fs-rate-{}-{}",
+      std::process::id(),
+      NEXT_FILE.fetch_add(1, Ordering::Relaxed),
+    ));
+    let standard = std::fs::OpenOptions::new()
+      .create_new(true)
+      .read(true)
+      .write(true)
+      .open(&path)
+      .unwrap();
+    std::fs::remove_file(path).unwrap();
+    let file = crate::runtime::fs::OwnedFile::from_std(standard);
+    let mut buffer = resources.try_alloc_zeroed(8).unwrap();
+    buffer.get_mut().unwrap().copy_from_slice(b"abcdefgh");
+    let outcome = filesystem.write(file, buffer).unwrap().join().unwrap();
+    assert!(outcome.error.is_none());
+    assert_eq!(outcome.bytes, 8);
+    assert_eq!(rate.snapshot().reserved_bytes, 0);
+    assert!(rate.snapshot().available_bytes < 32);
+    drop(outcome);
+    assert_eq!(resources.snapshot().managed_memory, 0);
+    assert_eq!(resources.snapshot().disk_ops, 0);
+  }
+
+  #[test]
+  fn both_owning_builders_bind_disk_rate_to_actual_filesystem_calls() {
+    let rate = ByteRateConfig {
+      bytes_per_second: 1,
+      burst_bytes: 32,
+      max_reservations: 4,
+    };
+    let blocking = BlockingConfig {
+      workers: 1,
+      max_outstanding: 4,
+      capacity: Resources::ZERO,
+    };
+    let mut local = CurrentThreadBuilder::new(local_config())
+      .resources(limits(64))
+      .blocking(blocking)
+      .filesystem()
+      .disk_rate(rate)
+      .build()
+      .unwrap();
+    exercise_owned_filesystem_rate(
+      local.filesystem().unwrap(),
+      local.resources(),
+      local.disk_rate().unwrap(),
+    );
+    shutdown_current_driver(&mut local);
+    let mut multi = MultiThreadBuilder::new(async_config())
+      .resources(limits(64))
+      .blocking(blocking)
+      .filesystem()
+      .disk_rate(rate)
+      .build()
+      .unwrap();
+    exercise_owned_filesystem_rate(
+      multi.filesystem().unwrap(),
+      multi.resources(),
+      multi.disk_rate().unwrap(),
+    );
+    multi.request_shutdown(MultiShutdown::default()).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while multi.try_shutdown().unwrap() != ShutdownProgress::Complete {
+      assert!(
+        Instant::now() < deadline,
+        "filesystem-bound multithread driver did not stop"
+      );
+      std::thread::yield_now();
+    }
+  }
+
+  #[cfg(feature = "resource-feedback")]
+  #[test]
+  fn owning_filesystem_uses_the_feedback_context_disk_meter() {
+    let (_, tenant) = feedback_domain();
+    let seen = Arc::new(Mutex::new(None));
+    let observed = seen.clone();
+    let factory = feedback_sources(feedback_policy(), move |context| {
+      *observed.lock().unwrap() = Some(context.disk_meter.clone());
+      Ok((
+        MissingFeedbackSensor,
+        TestFeedbackActuator {
+          limits: [16, 1000, 1000],
+        },
+      ))
+    });
+    let mut driver = CurrentThreadBuilder::new(local_config())
+      .resources(limits(64))
+      .resource_domain(tenant)
+      .blocking(BlockingConfig {
+        workers: 1,
+        max_outstanding: 4,
+        capacity: Resources::ZERO,
+      })
+      .filesystem()
+      .disk_rate(feedback_rate_config())
+      .feedback_sources(factory)
+      .build()
+      .unwrap();
+    let meter = seen.lock().unwrap().as_ref().unwrap().clone();
+    assert_eq!(meter.snapshot().attached_sources, 1);
+    let path = std::env::temp_dir().join(format!(
+      "allocatbelt-driver-fs-meter-{}-{}",
+      std::process::id(),
+      NEXT_FILE.fetch_add(1, Ordering::Relaxed),
+    ));
+    let standard = std::fs::OpenOptions::new()
+      .create_new(true)
+      .read(true)
+      .write(true)
+      .open(&path)
+      .unwrap();
+    std::fs::remove_file(path).unwrap();
+    let mut buffer = driver.resources().try_alloc_zeroed(3).unwrap();
+    buffer.get_mut().unwrap().copy_from_slice(b"abc");
+    let outcome = driver
+      .filesystem()
+      .unwrap()
+      .write(crate::runtime::fs::OwnedFile::from_std(standard), buffer)
+      .unwrap()
+      .join()
+      .unwrap();
+    assert!(outcome.error.is_none());
+    assert_eq!(outcome.bytes, 3);
+    assert_eq!(meter.snapshot().committed_bytes, 3);
+    drop(outcome);
+    shutdown_current_driver(&mut driver);
+    drop(driver);
+    assert_eq!(meter.snapshot().attached_sources, 0);
+  }
+
+  #[test]
+  fn retryable_join_monitor_failure_does_not_latch_facade_shutdown() {
+    use crate::runtime::thread_completion::fail_next_monitor_for_test;
+    let mut current = CurrentThreadBuilder::new(local_config())
+      .timer(4)
+      .build()
+      .unwrap();
+    current
+      .request_shutdown(CurrentShutdown::default())
+      .unwrap();
+    fail_next_monitor_for_test();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let error = loop {
+      match current.drive_shutdown_step() {
+        Err(error) => break error,
+        Ok(ShutdownProgress::Pending) => {
+          assert!(
+            Instant::now() < deadline,
+            "injected timer monitor failure was not reached"
+          );
+          std::thread::yield_now();
+        }
+        Ok(ShutdownProgress::Complete) => panic!("timer monitor injection was skipped"),
+      }
+    };
+    assert_eq!(
+      error,
+      DriverShutdownError::Timer(TimerError::JoinMonitorSpawn)
+    );
+    assert!(error.is_retryable());
+    assert!(current.shutdown_failure.is_none());
+    assert!(current.timer.is_some());
+    shutdown_current_driver(&mut current);
+
+    let mut multi = MultiThreadBuilder::new(async_config()).build().unwrap();
+    multi.request_shutdown(MultiShutdown::default()).unwrap();
+    fail_next_monitor_for_test();
+    let error = multi.try_shutdown().unwrap_err();
+    assert_eq!(
+      error,
+      DriverShutdownError::Async(AsyncError::JoinMonitorSpawnFailed)
+    );
+    assert!(error.is_retryable());
+    assert!(multi.shutdown_failure.is_none());
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while multi.try_shutdown().unwrap() != ShutdownProgress::Complete {
+      assert!(
+        Instant::now() < deadline,
+        "retried async shutdown did not complete"
+      );
+      std::thread::yield_now();
+    }
   }
 }
