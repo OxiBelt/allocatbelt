@@ -1,11 +1,22 @@
 #!/usr/bin/env bash
-# Launch one continuous mixed-load soak through the dedicated bench-runtime-soak binary.
+# Run one fixed-policy mixed soak from a parent-pinned recipe. The campaign
+# controller does not yet generate this recipe; until it does, this runner
+# refuses to launch instead of inferring missing source/oracle expectations.
 set -euo pipefail
 export LC_ALL=C
-qualification_runtime_readback_supported=0
+umask 077
 
 usage() {
-  echo "usage: $0 BINARY ALLOCATOR EXECUTOR PROFILE CPU_SET CAMPAIGN_ID HOST_ID RUN_ID OUTPUT_DIR SOURCE_SHA256 BINARY_SHA256 RESOURCE_CEILING_SHA256" >&2
+  cat >&2 <<'USAGE'
+usage: run-application-soak.sh BINARY ALLOCATOR EXECUTOR PROFILE CPU_SET CAMPAIGN_ID HOST_ID RUN_ID OUTPUT_DIR SOURCE_SHA256 BINARY_SHA256 RESOURCE_CEILING_SHA256
+
+Required environment:
+  ALLOCATBELT_SOAK_PARENT_RECIPE
+  ALLOCATBELT_SOAK_PARENT_RECIPE_SHA256
+Optional mode:
+  ALLOCATBELT_SOAK_MODE=qualified|functional (default qualified)
+  ALLOCATBELT_SOAK_DURATION_SECONDS (qualified is exactly 10800; functional is shorter)
+USAGE
 }
 
 if [[ $# -ne 12 ]]; then usage; exit 2; fi
@@ -22,57 +33,131 @@ source_sha=${10}
 binary_sha=${11}
 ceiling_sha=${12}
 
-case "$allocator" in allocatbelt|mimalloc-secure|mimalloc-standard|system) ;; *) usage; exit 2 ;; esac
-case "$executor" in bounded|tokio) ;; *) usage; exit 2 ;; esac
+case "$allocator" in allocatbelt) ;; *) echo "soak readback supports only allocator=allocatbelt" >&2; exit 2 ;; esac
+case "$executor" in bounded) ;; *) echo "soak readback supports only executor=bounded" >&2; exit 2 ;; esac
 case "$profile" in mixed|burst|oversubscribed) ;; *) usage; exit 2 ;; esac
 [[ "$run_id" =~ ^[A-Za-z0-9._-]+$ ]] || { echo "RUN_ID has unsupported characters" >&2; exit 2; }
+[[ "$campaign_id" =~ ^[A-Za-z0-9._-]+$ && "$host_id" =~ ^[A-Za-z0-9._-]+$ ]] || { echo "campaign/host IDs have unsupported characters" >&2; exit 2; }
+[[ "$cpu_set" =~ ^[0-9,-]+$ ]] || { echo "CPU_SET must be a numeric CPU affinity list" >&2; exit 2; }
 for digest in "$source_sha" "$binary_sha" "$ceiling_sha"; do
-  [[ "$digest" =~ ^[0-9a-f]{64}$ ]] || { echo "source, binary and ceiling pins must be lowercase SHA-256 values" >&2; exit 2; }
+  [[ "$digest" =~ ^[0-9a-f]{64}$ ]] || { echo "source, binary, and resource-ceiling pins must be lowercase SHA-256 values" >&2; exit 2; }
 done
-for command in taskset timeout sha256sum; do
+
+recipe=${ALLOCATBELT_SOAK_PARENT_RECIPE:-}
+recipe_sha=${ALLOCATBELT_SOAK_PARENT_RECIPE_SHA256:-}
+[[ -n "$recipe" && "$recipe_sha" =~ ^[0-9a-f]{64}$ ]] || {
+  echo "missing SHA-pinned parent soak recipe; controller recipe generation is not integrated yet" >&2
+  exit 2
+}
+mode=${ALLOCATBELT_SOAK_MODE:-qualified}
+duration=${ALLOCATBELT_SOAK_DURATION_SECONDS:-10800}
+case "$mode" in qualified|functional) ;; *) echo "ALLOCATBELT_SOAK_MODE must be qualified or functional" >&2; exit 2 ;; esac
+[[ "$duration" =~ ^[1-9][0-9]{0,4}$ ]] && (( duration <= 10800 )) || { echo "duration must be in 1..=10800 seconds" >&2; exit 2; }
+if [[ "$mode" == qualified ]]; then
+  (( duration == 10800 )) || { echo "qualified mode requires the exact 10800-second horizon" >&2; exit 2; }
+else
+  (( duration < 10800 )) || { echo "functional mode requires a short horizon and is never qualification eligible" >&2; exit 2; }
+fi
+if [[ "${ALLOCATBELT_APP_COMPARISON_FAMILY:-fixed_policy}" != fixed_policy ]]; then
+  echo "external-pressure and unknown comparison families are unsupported by this fixed-policy soak runner" >&2
+  exit 2
+fi
+
+for command in python3 sha256sum realpath taskset; do
   command -v "$command" >/dev/null || { echo "missing required command: $command" >&2; exit 2; }
 done
-[[ -x /usr/bin/time ]] || { echo "GNU /usr/bin/time is required" >&2; exit 2; }
-(( qualification_runtime_readback_supported == 1 )) || { echo "soak qualification is hard-disabled until the binary provides verified runtime-domain, policy, and ceiling readback" >&2; exit 2; }
 
-binary=$(realpath "$binary_arg") || exit 2
-[[ -x "$binary" ]] || { echo "soak binary is not executable" >&2; exit 2; }
-[[ $(sha256sum "$binary" | awk '{print $1}') == "$binary_sha" ]] || { echo "soak binary hash differs from frozen manifest" >&2; exit 2; }
-output_dir=$(realpath -m "$output_dir_arg") || exit 2
-mkdir -m 700 -- "$output_dir"
-report="$output_dir/soak-receipt.json"
+binary=$(realpath -- "$binary_arg") || exit 2
+[[ -f "$binary" && -x "$binary" && ! -L "$binary" ]] || { echo "soak binary must be an executable regular non-symlink file" >&2; exit 2; }
+[[ $(sha256sum -- "$binary" | awk '{print $1}') == "$binary_sha" ]] || { echo "soak binary hash differs from the frozen manifest" >&2; exit 2; }
+[[ $(sha256sum -- "$recipe" | awk '{print $1}') == "$recipe_sha" ]] || { echo "parent recipe hash differs from its frozen pin" >&2; exit 2; }
+
+raw_output_dir=$(realpath -m -- "$output_dir_arg") || exit 2
+[[ ! -e "$raw_output_dir" && ! -L "$raw_output_dir" ]] || { echo "refusing to replace existing soak output directory" >&2; exit 2; }
+mkdir -m 700 -- "$raw_output_dir"
+output_dir=$(realpath -- "$raw_output_dir") || exit 2
+chmod 700 -- "$output_dir"
+
+runner_path=$(realpath -- "$0") || exit 2
+readback_script=$(realpath -- "$(dirname -- "$runner_path")/application-soak-readback.py") || exit 2
+preflight="$output_dir/soak-preflight.json"
+preflight_json=$(python3 -B "$readback_script" preflight \
+  --recipe "$recipe" \
+  --recipe-sha256 "$recipe_sha" \
+  --binary "$binary" \
+  --output-dir "$output_dir" \
+  --runner-path "$runner_path" \
+  --cpu-set "$cpu_set" \
+  --campaign-id "$campaign_id" \
+  --host-id "$host_id" \
+  --run-id "$run_id" \
+  --allocator "$allocator" \
+  --executor "$executor" \
+  --profile "$profile" \
+  --source-sha256 "$source_sha" \
+  --binary-sha256 "$binary_sha" \
+  --resource-ceiling-sha256 "$ceiling_sha" \
+  --mode "$mode" \
+  --duration-seconds "$duration") || exit 2
+reference_ring=$(python3 -B -c 'import json,sys; print(json.load(sys.stdin)["reference_ring_path"])' <<<"$preflight_json")
+reference_ring_sha=$(python3 -B -c 'import json,sys; print(json.load(sys.stdin)["reference_ring_sha256"])' <<<"$preflight_json")
+
 terminal="$output_dir/terminal-records.tsv"
 samples="$output_dir/resource-samples.tsv"
-timing="$output_dir/time.txt"
-stderr="$output_dir/stderr.txt"
 
-# One process owns the complete horizon. It must stream per-ID outcomes and
-# 100ms samples; the controller independently validates their hashes/counts.
-taskset -c "$cpu_set" /usr/bin/time -v -o "$timing" \
-  timeout --signal=TERM --kill-after=10s 12000s \
-  env \
-    "ALLOCATBELT_SOAK_REPORT=$report" \
-    "ALLOCATBELT_SOAK_TERMINALS=$terminal" \
-    "ALLOCATBELT_SOAK_SAMPLES=$samples" \
-    "ALLOCATBELT_SOAK_RUN_ID=$run_id" \
-    "ALLOCATBELT_SOAK_CAMPAIGN_ID=$campaign_id" \
-    "ALLOCATBELT_SOAK_HOST_ID=$host_id" \
-    "ALLOCATBELT_SOAK_ALLOCATOR=$allocator" \
-    "ALLOCATBELT_SOAK_EXECUTOR=$executor" \
-    "ALLOCATBELT_SOAK_PROFILE=$profile" \
-    "ALLOCATBELT_SOAK_DURATION_SECONDS=10800" \
-    "ALLOCATBELT_SOAK_SAMPLE_INTERVAL_MS=100" \
-    "ALLOCATBELT_SOAK_SOURCE_SHA256=$source_sha" \
-    "ALLOCATBELT_SOAK_BINARY_SHA256=$binary_sha" \
-    "ALLOCATBELT_SOAK_RESOURCE_CEILING_SHA256=$ceiling_sha" \
-    "$binary" \
-    --executor "$executor" \
-    --workload mixed \
-    --profile "$profile" \
-    --duration-seconds 10800 \
-    --sample-interval-ms 100 \
-    --resource-ceiling-sha256 "$ceiling_sha" \
-    2>"$stderr"
+runner_outer_seconds=$((duration + 1200))
+set +e
+python3 -B "$readback_script" launch \
+  --recipe "$recipe" \
+  --recipe-sha256 "$recipe_sha" \
+  --binary "$binary" \
+  --output-dir "$output_dir" \
+  --runner-path "$runner_path" \
+  --cpu-set "$cpu_set" \
+  --preflight "$preflight" \
+  --timeout-seconds "$runner_outer_seconds" \
+  --term-grace-seconds 1.5 \
+  --terminal-path "$terminal" \
+  --samples-path "$samples" \
+  -- \
+  "$binary" \
+  --executor bounded \
+  --workload mixed \
+  --profile "$profile" \
+  --duration-seconds "$duration" \
+  --sample-interval-ms 100 \
+  --resource-ceiling-sha256 "$ceiling_sha" \
+  --reference-ring "$reference_ring" \
+  --reference-ring-sha256 "$reference_ring_sha" \
+  --output-dir "$output_dir"
+child_status=$?
+set -e
 
-[[ -s "$report" && -s "$terminal" && -s "$samples" ]] || { echo "soak binary omitted required streamed output" >&2; exit 1; }
-[[ $(sha256sum "$binary" | awk '{print $1}') == "$binary_sha" ]] || { echo "soak binary changed during run" >&2; exit 1; }
+set +e
+python3 -B "$readback_script" verify-inputs \
+  --recipe "$recipe" \
+  --recipe-sha256 "$recipe_sha" \
+  --binary "$binary" \
+  --output-dir "$output_dir" \
+  --runner-path "$runner_path" \
+  --cpu-set "$cpu_set" >/dev/null
+input_status=$?
+set -e
+if (( input_status != 0 )); then
+  echo "soak inputs changed or postflight verification failed; private artifacts retained at $output_dir" >&2
+  exit 1
+fi
+if (( child_status != 0 )); then
+  echo "soak process exited $child_status; private failure artifacts retained at $output_dir" >&2
+  exit "$child_status"
+fi
+
+python3 -B "$readback_script" validate \
+  --recipe "$recipe" \
+  --recipe-sha256 "$recipe_sha" \
+  --binary "$binary" \
+  --output-dir "$output_dir" \
+  --runner-path "$runner_path" \
+  --cpu-set "$cpu_set"
+[[ $(sha256sum -- "$binary" | awk '{print $1}') == "$binary_sha" ]] || { echo "soak binary changed during validation" >&2; exit 1; }
+[[ $(sha256sum -- "$recipe" | awk '{print $1}') == "$recipe_sha" ]] || { echo "parent recipe changed during validation" >&2; exit 1; }
