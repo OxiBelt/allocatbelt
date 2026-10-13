@@ -557,8 +557,7 @@ def source_manifest(args: argparse.Namespace) -> dict[str, Any]:
         require(label not in soak_artifacts, f"duplicate soak binary binding: {label}")
         artifact_rel, artifact = safe_relative_artifact(root, path, f"{label} soak binary")
         soak_artifacts[label] = {"path": artifact_rel.as_posix(), "sha256": hashlib.sha256(artifact.read_bytes()).hexdigest()}
-    require(set(soak_artifacts) == set(ALLOCATORS), f"all four dedicated soak binaries required; got {sorted(soak_artifacts)}")
-    require(len({item["path"] for item in soak_artifacts.values()}) == len(ALLOCATORS), "dedicated soak binaries must have distinct frozen paths")
+    verify_soak_artifact_bindings(soak_artifacts)
     analyzer_relative, analyzer_path = safe_relative_artifact(root, args.analysis_binary, "analysis binary")
     require(analyzer_relative.as_posix() not in {item["path"] for item in artifacts.values()} | {item["path"] for item in soak_artifacts.values()}, "analysis binary must be a distinct pinned build artifact")
     calibration_binary_relative, calibration_binary_path = safe_relative_artifact(
@@ -636,6 +635,20 @@ def source_manifest(args: argparse.Namespace) -> dict[str, Any]:
     return manifest
 
 
+def verify_soak_artifact_bindings(value: Any) -> None:
+    require(type(value) is dict and "allocatbelt" in value and set(value).issubset(ALLOCATORS), "soak artifacts require the candidate and only known allocator labels")
+    paths: set[str] = set()
+    for label, record in value.items():
+        artifact = exact_keys(record, {"path", "sha256"}, f"soak artifact {label}")
+        path_text = artifact["path"]
+        require(type(path_text) is str and path_text and "\\" not in path_text, "soak artifact path is malformed")
+        path = Path(path_text)
+        require(not path.is_absolute() and ".." not in path.parts and path != Path("."), "soak artifact path must be portable and relative")
+        require(is_sha256(artifact["sha256"]), "soak artifact digest is malformed")
+        require(path_text not in paths, "dedicated soak binaries must have distinct frozen paths")
+        paths.add(path_text)
+
+
 def verify_source_manifest(
     manifest: dict[str, Any], source_root: Path | None = None, verify_artifacts: bool = True,
     timeout_seconds: float = 120.0,
@@ -653,12 +666,11 @@ def verify_source_manifest(
     require(build["rustc_release"] == "1.99.0" and build["target_triple"] == "x86_64-unknown-linux-gnu" and build["target_cpu"] == "x86-64-v3" and build["profile"] == "release", "amd64-v3 build identity is unfrozen")
     require(is_sha256(build["features_sha256"]) and is_sha256(build["build_inputs_sha256"]), "build controls are not pinned")
     exact_keys(manifest["artifacts"], set(ALLOCATORS), "source manifest artifacts")
-    exact_keys(manifest["soak_artifacts"], set(ALLOCATORS), "source manifest soak artifacts")
+    verify_soak_artifact_bindings(manifest["soak_artifacts"])
     exact_keys(manifest["analysis_artifact"], {"path", "sha256"}, "source manifest analyzer artifact")
     analysis_path = Path(manifest["analysis_artifact"]["path"])
     require(not analysis_path.is_absolute() and ".." not in analysis_path.parts and is_sha256(manifest["analysis_artifact"]["sha256"]), "source manifest analyzer path/digest is malformed")
     require(len({item.get("path") for item in manifest["artifacts"].values()}) == len(ALLOCATORS), "source manifest aliases allocator binary paths")
-    require(len({item.get("path") for item in manifest["soak_artifacts"].values()}) == len(ALLOCATORS), "source manifest aliases dedicated soak binary paths")
     require(manifest["analysis_artifact"].get("path") not in {item.get("path") for item in manifest["artifacts"].values()} | {item.get("path") for item in manifest["soak_artifacts"].values()}, "source manifest reuses a treatment binary for analysis")
     require(isinstance(source["files"], list) and source["files"], "source file inventory is missing")
     file_paths: set[str] = set()

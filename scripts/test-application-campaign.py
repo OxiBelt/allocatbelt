@@ -363,6 +363,31 @@ class ApplicationCampaignTests(unittest.TestCase):
             with self.assertRaises(campaign.CampaignError):
                 campaign.verify_source_manifest(damaged, verify_artifacts=False)
 
+    def test_source_manifest_requires_candidate_soak_and_validates_every_declared_binding(self) -> None:
+        source = source_for("host-1")
+        source["soak_artifacts"] = {"allocatbelt": source["soak_artifacts"]["allocatbelt"]}
+        source["manifest_sha256"] = campaign.digest_object(source)
+        campaign.verify_source_manifest(source, verify_artifacts=False)
+        for bindings in (
+            {},
+            {"system": {"path": "bin/soak-system", "sha256": "a" * 64}},
+            {"allocatbelt": {"path": "../escape", "sha256": "a" * 64}},
+            {"allocatbelt": {"path": "bin/soak", "sha256": "not-a-digest"}},
+            {"allocatbelt": {"path": "bin/soak", "sha256": "a" * 64}, "unknown": {"path": "bin/extra", "sha256": "b" * 64}},
+            {"allocatbelt": {"path": "bin/soak", "sha256": "a" * 64}, "system": {"path": "bin/extra", "sha256": "invalid"}},
+            {"allocatbelt": {"path": "bin/soak", "sha256": "a" * 64}, "system": {"path": "bin/soak", "sha256": "b" * 64}},
+        ):
+            damaged = copy.deepcopy(source)
+            damaged["soak_artifacts"] = bindings
+            damaged["manifest_sha256"] = campaign.digest_object(damaged)
+            with self.subTest(bindings=bindings), self.assertRaises(campaign.CampaignError):
+                campaign.verify_source_manifest(damaged, verify_artifacts=False)
+        missing_allocator = copy.deepcopy(source)
+        del missing_allocator["artifacts"]["mimalloc-standard"]
+        missing_allocator["manifest_sha256"] = campaign.digest_object(missing_allocator)
+        with self.assertRaises(campaign.CampaignError):
+            campaign.verify_source_manifest(missing_allocator, verify_artifacts=False)
+
     def test_rehashed_numeric_policy_rejects_float_bool_and_negative_values(self) -> None:
         mutations = (
             lambda policy: policy["workloads"]["cpu"]["domain_ceiling"].update(memory=0.0),
