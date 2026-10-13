@@ -31,10 +31,15 @@ use allocatbelt_app_ports::memory::{self, MemoryConfig, MemoryOutput};
 
 #[path = "application/disk_lane.rs"]
 pub(crate) mod disk_lane;
+#[cfg(feature = "resource-feedback")]
+#[path = "application/feedback_trace.rs"]
+mod feedback_trace;
 #[path = "application/http.rs"]
 mod http;
 #[path = "application/runtime_bindings.rs"]
 pub(crate) mod runtime_bindings;
+#[cfg(feature = "resource-feedback")]
+use feedback_trace::{FeedbackTraceCollector, FeedbackTracePhase};
 pub(super) use runtime_bindings::{
   APPLICATION_TASK_CEILING, ApplicationDomain, ApplicationIoBindings, ApplicationMode,
   ApplicationRunBindings, ApplicationTaskAdmission,
@@ -1129,6 +1134,8 @@ fn run_with_plan(
   };
   let domain =
     ApplicationDomain::new_for_profile(options.workload, plan.async_workers, plan.profile.label())?;
+  #[cfg(feature = "resource-feedback")]
+  let mut feedback_trace;
   let (submitter, observer, scope, runtime, resources, mut run_bindings) = match options.executor {
     Executor::Bounded => {
       let async_config = AsyncConfig {
@@ -1163,6 +1170,10 @@ fn run_with_plan(
         .build()
         .map_err(|error| format!("allocatbelt application driver start failed: {error}"))?;
       let run_bindings = domain.for_native(&driver)?;
+      #[cfg(feature = "resource-feedback")]
+      {
+        feedback_trace = run_bindings.start_feedback_trace(options.mode)?;
+      }
       let resources = run_bindings.resources();
       let scope = driver
         .scope()
@@ -1191,6 +1202,10 @@ fn run_with_plan(
     }
     Executor::Tokio => {
       let run_bindings = domain.for_tokio()?;
+      #[cfg(feature = "resource-feedback")]
+      {
+        feedback_trace = run_bindings.start_feedback_trace(options.mode)?;
+      }
       let resources = run_bindings.resources();
       let runtime_built = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(plan.async_workers)
@@ -1288,6 +1303,14 @@ fn run_with_plan(
 
   let timer_pair_median_ns = measure_timer_pair_median_ns();
   let rss_before = sample_process_memory()?;
+  #[cfg(feature = "resource-feedback")]
+  if let Some(trace) = feedback_trace.as_ref() {
+    trace.mark_phase(
+      FeedbackTracePhase::RssBefore,
+      Instant::now(),
+      Some(rss_before),
+    )?;
+  }
   if setup_started.elapsed() > SETUP_DEADLINE {
     return Err("application setup exceeded its 120 second finite deadline".into());
   }
@@ -1320,6 +1343,19 @@ fn run_with_plan(
   producer_thread
     .join()
     .map_err(|_| "application producer panicked".to_owned())?;
+  #[cfg(feature = "resource-feedback")]
+  if let Some(trace) = feedback_trace.as_ref() {
+    trace.mark_phase(
+      FeedbackTracePhase::ProductionStart,
+      producer.started_at,
+      None,
+    )?;
+    trace.mark_phase(
+      FeedbackTracePhase::ProductionEnd,
+      producer.production_end,
+      None,
+    )?;
+  }
   let process_deadline = setup_started + execution_deadlines().process;
   let drain_deadline =
     (producer.production_end + execution_deadlines().drain).min(process_deadline);
@@ -1330,13 +1366,29 @@ fn run_with_plan(
   observer_thread
     .join()
     .map_err(|_| "application observer panicked".to_owned())?;
+  #[cfg(feature = "resource-feedback")]
+  let collector_task_lease_count = usize::from(feedback_trace.is_some());
+  #[cfg(not(feature = "resource-feedback"))]
+  let collector_task_lease_count = 0;
+  #[cfg(feature = "resource-feedback")]
+  if let Some(trace) = feedback_trace.as_ref() {
+    trace.mark_phase(FeedbackTracePhase::DrainEnd, Instant::now(), None)?;
+  }
   let production_cpu_ended_ns = process_cpu_time_ns();
   let drain_readback = runtime_readback.as_mut().map_or(Ok(()), |readback| {
-    readback.capture("after_drain", &run_bindings)
+    readback.capture_after_drain(&run_bindings, collector_task_lease_count)
   });
   let feedback_drain_health = run_bindings.validate_feedback_health("after_drain");
   drain_readback?;
   let rss_after_drain = sample_after_checkpoint_delay()?;
+  #[cfg(feature = "resource-feedback")]
+  if let Some(trace) = feedback_trace.as_ref() {
+    trace.mark_phase(
+      FeedbackTracePhase::RssAfterDrain,
+      Instant::now(),
+      Some(rss_after_drain),
+    )?;
+  }
   let expected_checksum = expected_digest(
     options,
     &observer_report,
@@ -1412,6 +1464,15 @@ fn run_with_plan(
     shutdown_timings.push(("Tokio resource feedback", feedback_shutdown_ns));
   }
   let timer_shutdown = run_bindings.shutdown_auxiliary_timer();
+  #[cfg(feature = "resource-feedback")]
+  if let Some(trace) = feedback_trace.as_ref() {
+    trace.mark_phase(FeedbackTracePhase::ShutdownEnd, Instant::now(), None)?;
+  }
+  #[cfg(feature = "resource-feedback")]
+  let trace_finalizer = feedback_trace
+    .take()
+    .map(FeedbackTraceCollector::stop_for_finalization)
+    .transpose()?;
   let shutdown_readback = runtime_readback.as_mut().map_or(Ok(()), |readback| {
     readback.capture("after_shutdown", &run_bindings)
   });
@@ -1466,10 +1527,22 @@ fn run_with_plan(
   drop(run_bindings);
   drop(resources);
   drop(domain);
+  let rss_after_shutdown = sample_after_checkpoint_delay()?;
+  #[cfg(feature = "resource-feedback")]
+  if let Some(finalizer) = trace_finalizer.as_ref() {
+    finalizer.mark_phase(
+      FeedbackTracePhase::RssAfterShutdown,
+      Instant::now(),
+      Some(rss_after_shutdown),
+    )?;
+  }
+  #[cfg(feature = "resource-feedback")]
+  if let Some(finalizer) = trace_finalizer {
+    finalizer.finish()?;
+  }
   if let Some(readback) = runtime_readback {
     readback.finish(&readback_domain, fixed_control_baseline)?;
   }
-  let rss_after_shutdown = sample_after_checkpoint_delay()?;
   if let Some(error) = feedback_health_error {
     return Err(error);
   }
@@ -1835,6 +1908,27 @@ impl RuntimeBindingWriter {
     stage: &str,
     bindings: &ApplicationRunBindings,
   ) -> Result<(), String> {
+    self.capture_with_collector_task_lease(stage, bindings, 0)
+  }
+
+  pub(super) fn capture_after_drain(
+    &mut self,
+    bindings: &ApplicationRunBindings,
+    collector_task_lease_count: usize,
+  ) -> Result<(), String> {
+    self.capture_with_collector_task_lease("after_drain", bindings, collector_task_lease_count)
+  }
+
+  fn capture_with_collector_task_lease(
+    &mut self,
+    stage: &str,
+    bindings: &ApplicationRunBindings,
+    collector_task_lease_count: usize,
+  ) -> Result<(), String> {
+    if collector_task_lease_count > 1 || (stage != "after_drain" && collector_task_lease_count != 0)
+    {
+      return Err("runtime readback received an invalid collector Task lease allowance".into());
+    }
     let rows = bindings.runtime_rows(stage)?;
     if matches!(stage, "after_drain" | "after_shutdown") {
       let required_zero = [
@@ -1842,12 +1936,10 @@ impl RuntimeBindingWriter {
         ".global.used.memory",
         ".global.used.disk",
         ".global.used.network",
-        ".global.used.tasks",
         ".tenant.used.cpu",
         ".tenant.used.memory",
         ".tenant.used.disk",
         ".tenant.used.network",
-        ".tenant.used.tasks",
         ".scope.managed_memory_used",
         ".scope.disk_operations_used",
         ".scope.network_operations_used",
@@ -1865,6 +1957,32 @@ impl RuntimeBindingWriter {
           ));
         }
       }
+      for owner in ["global", "tenant"] {
+        let key = format!("{stage}.{owner}.used.tasks");
+        let actual = rows
+          .iter()
+          .find(|(candidate, _)| candidate == &key)
+          .map(|(_, value)| value.as_str())
+          .ok_or_else(|| format!("runtime readback omitted {key}"))?
+          .parse::<usize>()
+          .map_err(|_| format!("runtime readback has a malformed Task count at {key}"))?;
+        let application_work = actual
+          .checked_sub(collector_task_lease_count)
+          .ok_or_else(|| format!("runtime readback is below the collector lease at {key}"))?;
+        if application_work != 0 {
+          return Err(format!(
+            "runtime readback found application Task work at {stage}.{owner}: {application_work}"
+          ));
+        }
+        self.add(
+          format!("{stage}.{owner}.application_work_tasks"),
+          application_work.to_string(),
+        )?;
+      }
+      self.add(
+        format!("{stage}.collector_task_lease_count"),
+        collector_task_lease_count.to_string(),
+      )?;
     }
     for (key, value) in rows {
       self.add(key, value)?;

@@ -11,9 +11,9 @@ use allocatbelt::runtime::resource_domain::{
   DomainReservation, DomainResource, DomainResources, ResourceDomain, TenantDomain,
 };
 #[cfg(feature = "resource-feedback")]
-use allocatbelt::runtime::resource_feedback::FeedbackMetricsHandle;
-#[cfg(feature = "resource-feedback")]
 use allocatbelt::runtime::resource_feedback::ResourceFeedbackService;
+#[cfg(feature = "resource-feedback")]
+use allocatbelt::runtime::resource_feedback::{FeedbackHistoryConfig, FeedbackMetricsHandle};
 #[cfg(feature = "resource-feedback")]
 use allocatbelt::runtime::resource_feedback_actuator::{
   CpuFeedbackTarget, RuntimeFeedbackActuator,
@@ -32,7 +32,7 @@ use allocatbelt::runtime::resource_feedback_sensor::{
 };
 use allocatbelt::runtime::time::TimerDriver;
 #[cfg(feature = "resource-feedback")]
-use std::num::{NonZeroU32, NonZeroU64};
+use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
 #[cfg(feature = "resource-feedback")]
 use std::ops::Range;
 #[cfg(feature = "resource-feedback")]
@@ -61,6 +61,13 @@ const FEEDBACK_RATE_FLOOR: u64 = 64 * 1024 * 1024;
 const FEEDBACK_LOW_UTILIZATION_BPS: u16 = 3_000;
 #[cfg(feature = "resource-feedback")]
 const FEEDBACK_HIGH_UTILIZATION_BPS: u16 = 8_000;
+
+#[cfg(feature = "resource-feedback")]
+fn feedback_history_config() -> Result<FeedbackHistoryConfig, String> {
+  NonZeroUsize::new(super::feedback_trace::TRACE_HISTORY_CAPACITY)
+    .map(FeedbackHistoryConfig::new)
+    .ok_or_else(|| "feedback history capacity must be nonzero".to_owned())
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ApplicationMode {
@@ -193,6 +200,9 @@ impl FeedbackCalibrations {
     selected_profile: &str,
   ) -> Result<Self, String> {
     let pressure_qualification = pressure_qualification_requested()?;
+    if pressure_qualification && std::env::var_os("ALLOCATBELT_APP_FEEDBACK_TRACE_DIR").is_none() {
+      return Err("pressure qualification requires ALLOCATBELT_APP_FEEDBACK_TRACE_DIR".into());
+    }
     if !super::is_token(selected_profile) {
       return Err("selected workload profile is malformed for capacity calibration".into());
     }
@@ -745,80 +755,89 @@ impl ApplicationDomain {
     let disk_capacity = self.feedback_calibrations.disk_capacity();
     let download_capacity = self.feedback_calibrations.download_capacity();
     let policy = feedback_policy(self.workers);
-    Ok(Some(allocatbelt::runtime::driver::feedback_sources(
-      policy,
-      move |context| {
-        if context.resources.limits() != expected_limits {
-          return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "feedback scope limits differ from the application workload",
-          ));
-        }
-        let tenant = context.resources.tenant_domain().cloned().ok_or_else(|| {
-          std::io::Error::new(std::io::ErrorKind::InvalidInput, "feedback tenant missing")
-        })?;
-        if !tenant.same_account(&expected_tenant) {
-          return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "feedback service was bound to a different tenant account",
-          ));
-        }
-        let disk_rate = context.disk_rate.clone().ok_or_else(|| {
-          std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "feedback disk rate missing",
-          )
-        })?;
-        let download_rate = context.download_rate.clone().ok_or_else(|| {
-          std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "feedback download rate missing",
-          )
-        })?;
-        let upload_rate = context.upload_rate.as_ref().ok_or_else(|| {
-          std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "feedback upload bucket missing from matched runtime",
-          )
-        })?;
-        validate_initial_feedback_rates(&disk_rate, &download_rate)?;
-        if upload_rate.snapshot().bytes_per_second != APPLICATION_RATE_CEILING_BYTES_PER_SECOND {
-          return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "upload rate differs from the matched fixed bucket",
-          ));
-        }
-        let sensor = RuntimeFeedbackSensor::new(
-          ProcessCpuSensor::new(workers)?,
-          disk_capacity.map(|capacity| IoFeedbackSource::new(context.disk_meter.clone(), capacity)),
-          download_capacity
-            .map(|capacity| IoFeedbackSource::new(context.download_meter.clone(), capacity)),
-          NonZeroU32::new(1).ok_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::InvalidInput, "zero density threshold")
-          })?,
-        );
-        let meters = FeedbackMeters {
-          disk: context.disk_meter,
-          upload: context.upload_meter,
-          download: context.download_meter,
-        };
-        let mut slot = capture
-          .meters
-          .lock()
-          .unwrap_or_else(PoisonError::into_inner);
-        if slot.is_some() {
-          return Err(std::io::Error::new(
-            std::io::ErrorKind::AlreadyExists,
-            "feedback context was initialized more than once",
-          ));
-        }
-        *slot = Some(meters);
-        Ok((
-          sensor,
-          RuntimeFeedbackActuator::new(CpuFeedbackTarget::Tenant(tenant), disk_rate, download_rate),
-        ))
-      },
-    )))
+    let history = feedback_history_config()?;
+    Ok(Some(
+      allocatbelt::runtime::driver::feedback_sources_with_history(
+        policy,
+        history,
+        move |context| {
+          if context.resources.limits() != expected_limits {
+            return Err(std::io::Error::new(
+              std::io::ErrorKind::InvalidInput,
+              "feedback scope limits differ from the application workload",
+            ));
+          }
+          let tenant = context.resources.tenant_domain().cloned().ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "feedback tenant missing")
+          })?;
+          if !tenant.same_account(&expected_tenant) {
+            return Err(std::io::Error::new(
+              std::io::ErrorKind::InvalidInput,
+              "feedback service was bound to a different tenant account",
+            ));
+          }
+          let disk_rate = context.disk_rate.clone().ok_or_else(|| {
+            std::io::Error::new(
+              std::io::ErrorKind::InvalidInput,
+              "feedback disk rate missing",
+            )
+          })?;
+          let download_rate = context.download_rate.clone().ok_or_else(|| {
+            std::io::Error::new(
+              std::io::ErrorKind::InvalidInput,
+              "feedback download rate missing",
+            )
+          })?;
+          let upload_rate = context.upload_rate.as_ref().ok_or_else(|| {
+            std::io::Error::new(
+              std::io::ErrorKind::InvalidInput,
+              "feedback upload bucket missing from matched runtime",
+            )
+          })?;
+          validate_initial_feedback_rates(&disk_rate, &download_rate)?;
+          if upload_rate.snapshot().bytes_per_second != APPLICATION_RATE_CEILING_BYTES_PER_SECOND {
+            return Err(std::io::Error::new(
+              std::io::ErrorKind::InvalidInput,
+              "upload rate differs from the matched fixed bucket",
+            ));
+          }
+          let sensor = RuntimeFeedbackSensor::new(
+            ProcessCpuSensor::new(workers)?,
+            disk_capacity
+              .map(|capacity| IoFeedbackSource::new(context.disk_meter.clone(), capacity)),
+            download_capacity
+              .map(|capacity| IoFeedbackSource::new(context.download_meter.clone(), capacity)),
+            NonZeroU32::new(1).ok_or_else(|| {
+              std::io::Error::new(std::io::ErrorKind::InvalidInput, "zero density threshold")
+            })?,
+          );
+          let meters = FeedbackMeters {
+            disk: context.disk_meter,
+            upload: context.upload_meter,
+            download: context.download_meter,
+          };
+          let mut slot = capture
+            .meters
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+          if slot.is_some() {
+            return Err(std::io::Error::new(
+              std::io::ErrorKind::AlreadyExists,
+              "feedback context was initialized more than once",
+            ));
+          }
+          *slot = Some(meters);
+          Ok((
+            sensor,
+            RuntimeFeedbackActuator::new(
+              CpuFeedbackTarget::Tenant(tenant),
+              disk_rate,
+              download_rate,
+            ),
+          ))
+        },
+      ),
+    ))
   }
 
   pub(crate) fn tenant(&self) -> TenantDomain {
@@ -981,7 +1000,7 @@ impl ApplicationDomain {
     let feedback_service = if let Some(meters) = meters.as_ref() {
       let sensor = feedback_sensor(self.workers, meters, &self.feedback_calibrations)?;
       Some(
-        ResourceFeedbackService::start_in_tenant(
+        ResourceFeedbackService::start_in_tenant_with_history(
           feedback_policy(self.workers),
           sensor,
           RuntimeFeedbackActuator::new(
@@ -990,6 +1009,7 @@ impl ApplicationDomain {
             download.clone(),
           ),
           &self.tenant,
+          feedback_history_config()?,
         )
         .map_err(|error| format!("Tokio external-pressure service startup failed: {error}"))?,
       )
@@ -1182,6 +1202,73 @@ impl ApplicationRunBindings {
     {
       false
     }
+  }
+
+  #[cfg(feature = "resource-feedback")]
+  pub(super) fn start_feedback_trace(
+    &self,
+    run_mode: super::Mode,
+  ) -> Result<Option<super::feedback_trace::FeedbackTraceCollector>, String> {
+    let trace_directory = std::env::var_os("ALLOCATBELT_APP_FEEDBACK_TRACE_DIR");
+    if !self.mode().feedback_enabled() {
+      return if trace_directory.is_some() {
+        Err("feedback trace output is only supported for external-pressure runs".into())
+      } else {
+        Ok(None)
+      };
+    }
+    let pressure_qualification = self.feedback.calibrations.pressure_qualification;
+    let Some(trace_directory) = trace_directory else {
+      return if pressure_qualification {
+        Err("pressure qualification requires ALLOCATBELT_APP_FEEDBACK_TRACE_DIR".into())
+      } else {
+        Ok(None)
+      };
+    };
+
+    // Reserve the collector's fixed payload and task slot before cloning any
+    // service, ledger, bucket, or meter handle into its long-lived owner.
+    let control = self
+      .tenant
+      .try_acquire(DomainResources::ZERO.with(
+        DomainResource::Control,
+        super::feedback_trace::control_charge_bytes(),
+      ))
+      .map_err(|error| format!("feedback trace Control reservation failed: {error:?}"))?;
+    let task = self.reserve_task()?;
+    let admission = super::feedback_trace::FeedbackTraceAdmission::new(control, task);
+    let metrics = self
+      .feedback
+      .metrics
+      .as_ref()
+      .cloned()
+      .ok_or_else(|| "external-pressure feedback metrics handle is missing".to_owned())?;
+    let meters = self
+      .io
+      .meters
+      .as_ref()
+      .ok_or_else(|| "external-pressure feedback meters are missing".to_owned())?;
+    let inputs = super::feedback_trace::FeedbackTraceInputs {
+      metrics,
+      domain: self.domain.clone(),
+      tenant: self.tenant.clone(),
+      resources: self.resources.clone(),
+      disk_rate: self.io.disk_rate.clone(),
+      upload_rate: self.io.upload_rate.clone(),
+      download_rate: self.io.download_rate.clone(),
+      disk_meter: meters.disk.clone(),
+      upload_meter: meters.upload.clone(),
+      download_meter: meters.download.clone(),
+      fixed_global_control_baseline: self.fixed_global_control_baseline,
+    };
+    super::feedback_trace::FeedbackTraceCollector::start(
+      trace_directory,
+      pressure_qualification,
+      run_mode.label(),
+      inputs,
+      admission,
+    )
+    .map(Some)
   }
 
   pub(crate) fn policy_rows(&self) -> Vec<(String, String)> {
@@ -1611,6 +1698,11 @@ pub(crate) struct ApplicationTaskAdmission {
 }
 
 impl ApplicationTaskAdmission {
+  #[cfg(test)]
+  pub(super) fn for_tenant(tenant: TenantDomain) -> Self {
+    Self { tenant }
+  }
+
   pub(crate) fn reserve(&self) -> Result<ApplicationTaskLease, String> {
     self
       .tenant
@@ -1992,7 +2084,7 @@ mod capacity_artifact_hash {
     String::from_utf8_lossy(&sha256_ascii(bytes)).into_owned()
   }
 
-  struct Sha256 {
+  pub(super) struct Sha256 {
     state: [u32; 8],
     block: [u8; 64],
     used: usize,
@@ -2000,7 +2092,7 @@ mod capacity_artifact_hash {
   }
 
   impl Sha256 {
-    const fn new() -> Self {
+    pub(super) const fn new() -> Self {
       Self {
         state: [
           0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
@@ -2012,7 +2104,7 @@ mod capacity_artifact_hash {
       }
     }
 
-    fn update(&mut self, mut input: &[u8]) {
+    pub(super) fn update(&mut self, mut input: &[u8]) {
       self.length = self.length.wrapping_add(input.len() as u64);
       while !input.is_empty() {
         let count = (64 - self.used).min(input.len());
@@ -2026,7 +2118,7 @@ mod capacity_artifact_hash {
       }
     }
 
-    fn finish(mut self) -> [u8; 32] {
+    pub(super) fn finish(mut self) -> [u8; 32] {
       let bit_length = self.length.wrapping_mul(8);
       self.block[self.used] = 0x80;
       self.used += 1;
@@ -2154,5 +2246,30 @@ mod capacity_artifact_hash {
         assert_eq!(sha256_hex(input), expected);
       }
     }
+  }
+}
+
+#[cfg(feature = "resource-feedback")]
+pub(super) struct FeedbackTraceHasher(capacity_artifact_hash::Sha256);
+
+#[cfg(feature = "resource-feedback")]
+impl FeedbackTraceHasher {
+  pub(super) const fn new() -> Self {
+    Self(capacity_artifact_hash::Sha256::new())
+  }
+
+  pub(super) fn update(&mut self, bytes: &[u8]) {
+    self.0.update(bytes);
+  }
+
+  pub(super) fn finish_hex(self) -> [u8; 64] {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let digest = self.0.finish();
+    let mut output = [0; 64];
+    for (index, byte) in digest.into_iter().enumerate() {
+      output[index * 2] = HEX[(byte >> 4) as usize];
+      output[index * 2 + 1] = HEX[(byte & 0x0f) as usize];
+    }
+    output
   }
 }

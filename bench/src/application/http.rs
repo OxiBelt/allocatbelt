@@ -37,6 +37,8 @@ use tokio::io::{AsyncRead as TokioAsyncRead, AsyncWrite as TokioAsyncWrite};
 
 #[cfg(test)]
 use super::Profile;
+#[cfg(feature = "resource-feedback")]
+use super::feedback_trace::{FeedbackTraceCollector, FeedbackTracePhase};
 use super::{
   ApplicationDomain, ApplicationIoBindings, ApplicationRunBindings, ApplicationTaskAdmission,
   ArrivalPlan, Executor, Mode, Observer, ObserverEventSender, ObserverWake, Options,
@@ -401,6 +403,8 @@ fn run_bounded(options: Options, settings: Settings, plan: ArrivalPlan) -> Resul
   let expected_oracle = build_expected_oracle(options, settings, plan)?;
   let domain =
     ApplicationDomain::new_for_profile(options.workload, plan.async_workers, plan.profile.label())?;
+  #[cfg(feature = "resource-feedback")]
+  let mut feedback_trace;
   let local_limits = domain.local_limits();
   let rate_config = domain.rate_config();
   let blocking_workers = if options.workload == Workload::Mixed {
@@ -452,6 +456,10 @@ fn run_bounded(options: Options, settings: Settings, plan: ArrivalPlan) -> Resul
     .build()
     .map_err(|error| format!("allocatbelt owning HTTP runtime start failed: {error}"))?;
   let mut run_bindings = domain.for_native(&async_runtime)?;
+  #[cfg(feature = "resource-feedback")]
+  {
+    feedback_trace = run_bindings.start_feedback_trace(options.mode)?;
+  }
   let mut runtime_readback = RuntimeBindingWriter::begin(options, plan, &run_bindings)?;
   let resources = run_bindings.resources();
   let io_bindings = run_bindings.io();
@@ -567,6 +575,14 @@ fn run_bounded(options: Options, settings: Settings, plan: ArrivalPlan) -> Resul
 
   let timer_pair_median_ns = super::measure_timer_pair_median_ns();
   let rss_before = super::sample_process_memory()?;
+  #[cfg(feature = "resource-feedback")]
+  if let Some(trace) = feedback_trace.as_ref() {
+    trace.mark_phase(
+      FeedbackTracePhase::RssBefore,
+      Instant::now(),
+      Some(rss_before),
+    )?;
+  }
   if setup_started.elapsed() > super::SETUP_DEADLINE {
     return Err("HTTP setup exceeded its 120 second finite deadline".into());
   }
@@ -602,6 +618,19 @@ fn run_bounded(options: Options, settings: Settings, plan: ArrivalPlan) -> Resul
     .join()
     .map_err(|_| "HTTP producer panicked".to_owned())?;
   let producer = producer_result?;
+  #[cfg(feature = "resource-feedback")]
+  if let Some(trace) = feedback_trace.as_ref() {
+    trace.mark_phase(
+      FeedbackTracePhase::ProductionStart,
+      producer.started_at,
+      None,
+    )?;
+    trace.mark_phase(
+      FeedbackTracePhase::ProductionEnd,
+      producer.production_end,
+      None,
+    )?;
+  }
   let process_deadline = setup_started + super::execution_deadlines().process;
   let drain_deadline =
     (producer.production_end + super::execution_deadlines().drain).min(process_deadline);
@@ -617,9 +646,17 @@ fn run_bounded(options: Options, settings: Settings, plan: ArrivalPlan) -> Resul
     .map_err(|error| format!("allocatbelt accept task join failed: {error}"))?
     .map_err(|error| format!("allocatbelt accept task output join failed: {error}"))?
     .map_err(|error| format!("allocatbelt accept task failed: {error}"))?;
+  #[cfg(feature = "resource-feedback")]
+  if let Some(trace) = feedback_trace.as_ref() {
+    trace.mark_phase(FeedbackTracePhase::DrainEnd, Instant::now(), None)?;
+  }
+  #[cfg(feature = "resource-feedback")]
+  let collector_task_lease_count = usize::from(feedback_trace.is_some());
+  #[cfg(not(feature = "resource-feedback"))]
+  let collector_task_lease_count = 0;
   let production_cpu_ended_ns = super::process_cpu_time_ns();
   let drain_readback = runtime_readback.as_mut().map_or(Ok(()), |readback| {
-    readback.capture("after_drain", &run_bindings)
+    readback.capture_after_drain(&run_bindings, collector_task_lease_count)
   });
   let feedback_drain_health = run_bindings.validate_feedback_health("after_drain");
   drain_readback?;
@@ -639,6 +676,14 @@ fn run_bounded(options: Options, settings: Settings, plan: ArrivalPlan) -> Resul
     return Err("HTTP transaction drain exceeded its finite deadline".into());
   }
   let rss_after_drain = super::sample_after_checkpoint_delay()?;
+  #[cfg(feature = "resource-feedback")]
+  if let Some(trace) = feedback_trace.as_ref() {
+    trace.mark_phase(
+      FeedbackTracePhase::RssAfterDrain,
+      Instant::now(),
+      Some(rss_after_drain),
+    )?;
+  }
 
   let shutdown_started = Instant::now();
   let mut shutdown_timings = Vec::with_capacity(3);
@@ -672,6 +717,15 @@ fn run_bounded(options: Options, settings: Settings, plan: ArrivalPlan) -> Resul
     })?;
   shutdown_timings.push(("allocatbelt owning HTTP runtime", elapsed_ns));
   let feedback_shutdown = run_bindings.shutdown_feedback(super::execution_deadlines().shutdown);
+  #[cfg(feature = "resource-feedback")]
+  if let Some(trace) = feedback_trace.as_ref() {
+    trace.mark_phase(FeedbackTracePhase::ShutdownEnd, Instant::now(), None)?;
+  }
+  #[cfg(feature = "resource-feedback")]
+  let trace_finalizer = feedback_trace
+    .take()
+    .map(FeedbackTraceCollector::stop_for_finalization)
+    .transpose()?;
   let shutdown_readback = runtime_readback.as_mut().map_or(Ok(()), |readback| {
     readback.capture("after_shutdown", &run_bindings)
   });
@@ -709,10 +763,22 @@ fn run_bounded(options: Options, settings: Settings, plan: ArrivalPlan) -> Resul
   drop(run_bindings);
   drop(resources);
   drop(domain);
+  let rss_after_shutdown = super::sample_after_checkpoint_delay()?;
+  #[cfg(feature = "resource-feedback")]
+  if let Some(finalizer) = trace_finalizer.as_ref() {
+    finalizer.mark_phase(
+      FeedbackTracePhase::RssAfterShutdown,
+      Instant::now(),
+      Some(rss_after_shutdown),
+    )?;
+  }
+  #[cfg(feature = "resource-feedback")]
+  if let Some(finalizer) = trace_finalizer {
+    finalizer.finish()?;
+  }
   if let Some(readback) = runtime_readback {
     readback.finish(&readback_domain, fixed_control_baseline)?;
   }
-  let rss_after_shutdown = super::sample_after_checkpoint_delay()?;
   shutdown_report?;
   if let Some(error) = feedback_health_error {
     return Err(error);
@@ -755,6 +821,8 @@ fn run_tokio(options: Options, settings: Settings, plan: ArrivalPlan) -> Result<
   let domain =
     ApplicationDomain::new_for_profile(options.workload, plan.async_workers, plan.profile.label())?;
   let mut run_bindings = domain.for_tokio()?;
+  #[cfg(feature = "resource-feedback")]
+  let mut feedback_trace = run_bindings.start_feedback_trace(options.mode)?;
   let mut runtime_readback = RuntimeBindingWriter::begin(options, plan, &run_bindings)?;
   let resources = run_bindings.resources();
   let io_bindings = run_bindings.io();
@@ -888,6 +956,14 @@ fn run_tokio(options: Options, settings: Settings, plan: ArrivalPlan) -> Result<
   }
   let timer_pair_median_ns = super::measure_timer_pair_median_ns();
   let rss_before = super::sample_process_memory()?;
+  #[cfg(feature = "resource-feedback")]
+  if let Some(trace) = feedback_trace.as_ref() {
+    trace.mark_phase(
+      FeedbackTracePhase::RssBefore,
+      Instant::now(),
+      Some(rss_before),
+    )?;
+  }
   if setup_started.elapsed() > super::SETUP_DEADLINE {
     return Err("HTTP setup exceeded its 120 second finite deadline".into());
   }
@@ -926,6 +1002,19 @@ fn run_tokio(options: Options, settings: Settings, plan: ArrivalPlan) -> Result<
     .join()
     .map_err(|_| "HTTP producer panicked".to_owned())?;
   let producer = producer_result?;
+  #[cfg(feature = "resource-feedback")]
+  if let Some(trace) = feedback_trace.as_ref() {
+    trace.mark_phase(
+      FeedbackTracePhase::ProductionStart,
+      producer.started_at,
+      None,
+    )?;
+    trace.mark_phase(
+      FeedbackTracePhase::ProductionEnd,
+      producer.production_end,
+      None,
+    )?;
+  }
   let process_deadline = setup_started + super::execution_deadlines().process;
   let drain_deadline =
     (producer.production_end + super::execution_deadlines().drain).min(process_deadline);
@@ -940,9 +1029,17 @@ fn run_tokio(options: Options, settings: Settings, plan: ArrivalPlan) -> Result<
     .block_on(accept_task)
     .map_err(|error| format!("Tokio accept task join failed: {error}"))?
     .map_err(|error| format!("Tokio accept task failed: {error}"))?;
+  #[cfg(feature = "resource-feedback")]
+  if let Some(trace) = feedback_trace.as_ref() {
+    trace.mark_phase(FeedbackTracePhase::DrainEnd, Instant::now(), None)?;
+  }
+  #[cfg(feature = "resource-feedback")]
+  let collector_task_lease_count = usize::from(feedback_trace.is_some());
+  #[cfg(not(feature = "resource-feedback"))]
+  let collector_task_lease_count = 0;
   let production_cpu_ended_ns = super::process_cpu_time_ns();
   let drain_readback = runtime_readback.as_mut().map_or(Ok(()), |readback| {
-    readback.capture("after_drain", &run_bindings)
+    readback.capture_after_drain(&run_bindings, collector_task_lease_count)
   });
   let feedback_drain_health = run_bindings.validate_feedback_health("after_drain");
   drain_readback?;
@@ -962,6 +1059,14 @@ fn run_tokio(options: Options, settings: Settings, plan: ArrivalPlan) -> Result<
     return Err("HTTP transaction drain exceeded its finite deadline".into());
   }
   let rss_after_drain = super::sample_after_checkpoint_delay()?;
+  #[cfg(feature = "resource-feedback")]
+  if let Some(trace) = feedback_trace.as_ref() {
+    trace.mark_phase(
+      FeedbackTracePhase::RssAfterDrain,
+      Instant::now(),
+      Some(rss_after_drain),
+    )?;
+  }
 
   let shutdown_started = Instant::now();
   let elapsed_ns = super::run_shutdown_with_timeout("Tokio HTTP runtime", move || {
@@ -979,6 +1084,16 @@ fn run_tokio(options: Options, settings: Settings, plan: ArrivalPlan) -> Result<
     shutdown_timings.push(("Tokio resource feedback", feedback_shutdown_ns));
   }
   shutdown_timings.push(("Tokio fixed rate timer", rate_timer_shutdown_ns));
+  #[cfg(feature = "resource-feedback")]
+  if let Some(trace) = feedback_trace.as_ref() {
+    trace.mark_phase(FeedbackTracePhase::ShutdownEnd, Instant::now(), None)?;
+  }
+  timer_shutdown?;
+  #[cfg(feature = "resource-feedback")]
+  let trace_finalizer = feedback_trace
+    .take()
+    .map(FeedbackTraceCollector::stop_for_finalization)
+    .transpose()?;
   let shutdown_readback = runtime_readback.as_mut().map_or(Ok(()), |readback| {
     readback.capture("after_shutdown", &run_bindings)
   });
@@ -1002,7 +1117,6 @@ fn run_tokio(options: Options, settings: Settings, plan: ArrivalPlan) -> Result<
     observed.on_time + observed.late,
     &shutdown_timings,
   );
-  timer_shutdown?;
   shutdown_readback?;
   let (final_global_domain, final_tenant_domain, final_resources) =
     validate_domain_receipt(&run_bindings, "Tokio HTTP")?;
@@ -1017,10 +1131,22 @@ fn run_tokio(options: Options, settings: Settings, plan: ArrivalPlan) -> Result<
   drop(run_bindings);
   drop(resources);
   drop(domain);
+  let rss_after_shutdown = super::sample_after_checkpoint_delay()?;
+  #[cfg(feature = "resource-feedback")]
+  if let Some(finalizer) = trace_finalizer.as_ref() {
+    finalizer.mark_phase(
+      FeedbackTracePhase::RssAfterShutdown,
+      Instant::now(),
+      Some(rss_after_shutdown),
+    )?;
+  }
+  #[cfg(feature = "resource-feedback")]
+  if let Some(finalizer) = trace_finalizer {
+    finalizer.finish()?;
+  }
   if let Some(readback) = runtime_readback {
     readback.finish(&readback_domain, fixed_control_baseline)?;
   }
-  let rss_after_shutdown = super::sample_after_checkpoint_delay()?;
   shutdown_report?;
   if let Some(error) = feedback_health_error {
     return Err(error);
