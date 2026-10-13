@@ -39,6 +39,26 @@ and stderr concurrently beyond pipe capacity and cover vectored partial reads,
 EOF, stdin shutdown and waiter cancellation. These component contracts are the
 starting point for the remaining application migrations.
 
+### Opt-in resource feedback history
+
+`ResourceFeedbackService::start` and `start_in_tenant` keep history disabled.
+Tenant-bound callers can opt in with `start_in_tenant_with_history` or a
+driver's `feedback_sources_with_history`, which reserves Control for a fixed
+ring before startup readbacks or worker creation. `FeedbackMetricsHandle`
+copies typed `Copy` events into caller-provided slots without allocating or
+calling the sensor/actuator. Records include startup readbacks, raw and
+sanitized sample decisions, per-control plans, callback start/return times,
+mandatory post-write readbacks, acknowledgements, reconciliation, stop,
+failure and joined shutdown. Reads report the retained sequence window;
+overwritten cursors and sequence exhaustion are explicit errors. The sticky
+`truncated` flag reports that the retention window has wrapped; a caught-up
+streaming reader can continue when each read has no gap, while a reader that
+needs the full trace from startup must reject any gap. The ring charge stays
+with shared history while metrics-handle clones remain alive. Native tests
+cover ordering, caught-up wrap continuation, stale-cursor gaps, overflow,
+preflight budget refusal, and retained-clone lifetime; no concurrency
+primitive beyond the service's existing shared state mutex was added.
+
 ### SourceSchemaV4 functional integration mode
 
 `scripts/test-application-pair-functional-e2e.py` retains the legacy signed

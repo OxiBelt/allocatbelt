@@ -32,9 +32,14 @@ pub use io_bindings::IoBindings;
 pub use io_bindings::{DriverRateDatagramError, DriverRateDatagramFailure};
 
 #[cfg(feature = "resource-feedback")]
+pub use super::resource_feedback::FeedbackHistoryConfig;
+#[cfg(feature = "resource-feedback")]
 use feedback::FeedbackMeters;
 #[cfg(feature = "resource-feedback")]
-pub use feedback::{FeedbackContext, FeedbackFactory, FeedbackFactoryError, feedback_sources};
+pub use feedback::{
+  FeedbackContext, FeedbackFactory, FeedbackFactoryError, feedback_sources,
+  feedback_sources_with_history,
+};
 
 use std::fmt;
 use std::future::Future;

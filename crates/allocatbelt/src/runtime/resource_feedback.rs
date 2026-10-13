@@ -26,7 +26,10 @@
 #![cfg_attr(not(test), deny(clippy::expect_used, clippy::unwrap_used))]
 
 use std::any::Any;
+use std::collections::TryReserveError;
 use std::fmt;
+use std::marker::PhantomData;
+use std::num::NonZeroUsize;
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, mpsc};
 use std::thread::{self, JoinHandle};
@@ -250,6 +253,411 @@ impl FeedbackMetricsSnapshot {
   }
 }
 
+/// Fixed capacity for an opt-in, charged history of feedback decisions.
+///
+/// History is disabled by the existing service constructors. Its ring is
+/// allocated once during `start_in_tenant_with_history` and remains owned by
+/// the shared service state until the last worker, monitor, service, and
+/// metrics-handle reference is dropped.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FeedbackHistoryConfig {
+  /// Maximum number of events retained before the oldest event is overwritten.
+  pub capacity: NonZeroUsize,
+}
+
+impl FeedbackHistoryConfig {
+  /// Creates a history configuration with a fixed nonzero ring capacity.
+  pub const fn new(capacity: NonZeroUsize) -> Self {
+    Self { capacity }
+  }
+}
+
+/// Outcome of one source callback captured in feedback history.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FeedbackSensorOutcome {
+  /// The callback returned a sample.
+  Sampled,
+  /// The callback returned a typed sensor error.
+  Failed(FeedbackSensorError),
+  /// The callback panicked; its payload is not retained in history.
+  Panicked,
+}
+
+/// Outcome of an actuator readback callback captured in history.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FeedbackReadbackOutcome {
+  /// The callback returned the actual limit.
+  Value(u64),
+  /// The callback returned a typed actuator error.
+  Failed(FeedbackActuatorError),
+  /// The callback panicked; its payload is not retained in history.
+  Panicked,
+}
+
+/// Outcome of an actuator write callback captured in history.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FeedbackApplyOutcome {
+  /// The write callback reported success.
+  Applied,
+  /// The callback returned a typed actuator error.
+  Failed(FeedbackActuatorError),
+  /// The callback panicked; its payload is not retained in history.
+  Panicked,
+}
+
+/// One fixed-size feedback history record.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FeedbackEvent {
+  /// Strictly increasing service-local sequence, starting at one.
+  pub sequence: u64,
+  /// Monotonic time at which this event was published to history.
+  pub at: Instant,
+  /// Typed event details. Callback start and return times are carried by the
+  /// callback-specific variants below.
+  pub kind: FeedbackEventKind,
+}
+
+/// Fixed-size event payload covering startup, samples, plans, actuation, and
+/// joined shutdown. No event contains user-owned values or heap allocations.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum FeedbackEventKind {
+  /// One synchronous startup readback, captured before either worker starts.
+  StartupReadback {
+    /// Control read by the actuator.
+    resource: FeedbackResource,
+    /// Configured initial limit checked by startup.
+    expected_limit: u64,
+    /// Time immediately before the callback.
+    started_at: Instant,
+    /// Time immediately after the callback returned or panicked.
+    completed_at: Instant,
+    /// Actual value, typed error, or panic outcome.
+    outcome: FeedbackReadbackOutcome,
+  },
+  /// All three startup readbacks matched and service worker startup proceeded.
+  ServiceStarted,
+  /// One sensor callback and its raw return value.
+  SensorCallback {
+    /// Time immediately before the callback.
+    started_at: Instant,
+    /// Time immediately after the callback returned or panicked.
+    completed_at: Instant,
+    /// Typed callback outcome.
+    outcome: FeedbackSensorOutcome,
+    /// Raw caller-provided sample, before utilization sanitization.
+    raw_sample: Option<FeedbackSample>,
+  },
+  /// Result of submitting the sanitized sample to the policy.
+  SampleDecision {
+    /// Sample timestamp used by the policy, including the missing-sample
+    /// timestamp used after a failed sensor callback.
+    sample_at: Instant,
+    /// Sanitized values supplied to the policy.
+    sample: FeedbackSample,
+    /// Whether the policy accepted the sample.
+    accepted: bool,
+    /// Rejection from policy observation, if any.
+    rejection: Option<PolicyError>,
+    /// Planning timestamp when planning followed this accepted sample.
+    planned_at: Option<Instant>,
+  },
+  /// One complete plan, including each control's telemetry, no-change reason,
+  /// or ticket generation/from/to values.
+  Plan(PolicyPlan),
+  /// Policy could not construct a plan after accepting the sample.
+  PlanRejected(PolicyError),
+  /// Actual limit observed immediately before a ticket write.
+  PreApplyReadback {
+    /// Immutable planned request being checked.
+    ticket: PlanTicket,
+    /// Time immediately before the callback.
+    started_at: Instant,
+    /// Time immediately after the callback returned or panicked.
+    completed_at: Instant,
+    /// Actual callback result.
+    outcome: FeedbackReadbackOutcome,
+    /// Whether the observed value matched the ticket's `from_limit`.
+    matches_ticket: bool,
+  },
+  /// One attempted ticket write and its exact callback timing/result.
+  Apply {
+    /// Immutable planned request applied by the callback.
+    ticket: PlanTicket,
+    /// Time immediately before the callback.
+    started_at: Instant,
+    /// Time immediately after the callback returned or panicked.
+    completed_at: Instant,
+    /// Callback result.
+    outcome: FeedbackApplyOutcome,
+  },
+  /// Mandatory readback after every attempted write.
+  PostApplyReadback {
+    /// Immutable planned request whose target was read back.
+    ticket: PlanTicket,
+    /// Time immediately before the callback.
+    started_at: Instant,
+    /// Time immediately after the callback returned or panicked.
+    completed_at: Instant,
+    /// Actual callback result.
+    outcome: FeedbackReadbackOutcome,
+  },
+  /// Policy acknowledgement after the write/readback pair or a pre-write
+  /// failure. The snapshot fields expose pending/fault state after the ack.
+  Acknowledgement {
+    /// Immutable planned request acknowledged by the policy.
+    ticket: PlanTicket,
+    /// Policy result derived from the write and mandatory readback.
+    result: ActuationResult,
+    /// Whether the policy accepted this acknowledgement.
+    accepted: bool,
+    /// Limit retained by policy after acknowledgement.
+    current_limit: u64,
+    /// Still-pending generation, if any.
+    pending_generation: Option<u64>,
+    /// Whether explicit reconciliation is now required.
+    faulted: bool,
+  },
+  /// Owner queued one explicit reconciliation request.
+  ReconciliationRequested {
+    /// Faulted control selected by the owner.
+    resource: FeedbackResource,
+  },
+  /// Worker began the queued reconciliation callback.
+  ReconciliationStarted {
+    /// Control being reconciled.
+    resource: FeedbackResource,
+  },
+  /// Actual readback used for explicit reconciliation.
+  ReconciliationReadback {
+    /// Control being reconciled.
+    resource: FeedbackResource,
+    /// Time immediately before the callback.
+    started_at: Instant,
+    /// Time immediately after the callback returned or panicked.
+    completed_at: Instant,
+    /// Actual callback result.
+    outcome: FeedbackReadbackOutcome,
+  },
+  /// Policy reconciliation outcome and resulting control state.
+  ReconciliationFinished {
+    /// Control reconciled by the policy.
+    resource: FeedbackResource,
+    /// Actual readback value, if the callback returned one.
+    actual_limit: Option<u64>,
+    /// Whether policy accepted the readback.
+    accepted: bool,
+    /// Typed policy refusal, if any.
+    rejection: Option<PolicyError>,
+    /// Limit retained after reconciliation.
+    current_limit: u64,
+    /// Pending generation after reconciliation.
+    pending_generation: Option<u64>,
+    /// Fault latch after reconciliation.
+    faulted: bool,
+  },
+  /// First owner request that transitions this service into stopping.
+  StopRequested,
+  /// Worker stopped after an internal failure.
+  WorkerFailure(FeedbackWorkerFailure),
+  /// Join monitor published that the worker and its thread-local destructors
+  /// have completed.
+  WorkerJoined {
+    /// Whether `JoinHandle::join` observed a panic.
+    panicked: bool,
+  },
+}
+
+/// One bounded read from the feedback event ring.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FeedbackHistoryRead {
+  /// Oldest event still available, or `None` before the first event.
+  pub oldest_sequence: Option<u64>,
+  /// Newest event recorded, or `None` before the first event.
+  pub newest_sequence: Option<u64>,
+  /// Number of `Some` events written to the caller's output slice.
+  pub written: usize,
+  /// Sequence cursor to pass to the next read.
+  pub next_sequence: u64,
+  /// Whether more events were available than fit in the output slice.
+  pub more_available: bool,
+  /// Whether the ring has overwritten any event since service startup.
+  ///
+  /// This is a sticky retention-window indicator. A consumer that already
+  /// streamed every event can continue from its caught-up cursor after wrap;
+  /// a consumer that needs the complete trace must start at sequence zero and
+  /// treat any [`FeedbackHistoryError::Gap`] as incomplete history.
+  pub truncated: bool,
+}
+
+/// Why a history read cannot return a complete interval from its cursor.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum FeedbackHistoryError {
+  /// The service was constructed without opt-in history.
+  Disabled,
+  /// The requested cursor predates the oldest retained event.
+  Gap {
+    /// Oldest retained sequence.
+    oldest_sequence: u64,
+    /// Newest recorded sequence.
+    newest_sequence: u64,
+  },
+  /// The requested cursor is newer than the current history.
+  CursorAhead {
+    /// Newest recorded sequence, if one exists.
+    newest_sequence: Option<u64>,
+  },
+  /// Sequence space was exhausted and at least one subsequent event could not
+  /// be represented without wrapping.
+  SequenceOverflow {
+    /// Oldest retained event.
+    oldest_sequence: Option<u64>,
+    /// Newest retained event.
+    newest_sequence: Option<u64>,
+  },
+}
+
+impl fmt::Display for FeedbackHistoryError {
+  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    write!(f, "resource feedback history read failed: {self:?}")
+  }
+}
+
+impl std::error::Error for FeedbackHistoryError {}
+
+struct FeedbackHistoryRing {
+  events: Box<[Option<FeedbackEvent>]>,
+  next_sequence: Option<u64>,
+  oldest_sequence: Option<u64>,
+  newest_sequence: Option<u64>,
+  truncated: bool,
+  sequence_overflowed: bool,
+}
+
+impl FeedbackHistoryRing {
+  fn new(config: FeedbackHistoryConfig) -> Result<Self, TryReserveError> {
+    let capacity = config.capacity.get();
+    let mut events = Vec::new();
+    events.try_reserve_exact(capacity)?;
+    events.resize(capacity, None);
+    Ok(Self {
+      events: events.into_boxed_slice(),
+      next_sequence: Some(1),
+      oldest_sequence: None,
+      newest_sequence: None,
+      truncated: false,
+      sequence_overflowed: false,
+    })
+  }
+
+  fn push(&mut self, at: Instant, kind: FeedbackEventKind) {
+    let Some(sequence) = self.next_sequence else {
+      self.sequence_overflowed = true;
+      return;
+    };
+    let capacity = self.events.len() as u64;
+    let index = ((sequence - 1) % capacity) as usize;
+    self.events[index] = Some(FeedbackEvent { sequence, at, kind });
+    self.newest_sequence = Some(sequence);
+    let first_in_window = sequence.saturating_sub(capacity - 1).max(1);
+    if self.oldest_sequence.is_none() && first_in_window != 1 {
+      self.truncated = true;
+    }
+    if self
+      .oldest_sequence
+      .is_some_and(|oldest| first_in_window > oldest)
+    {
+      self.truncated = true;
+    }
+    self.oldest_sequence = Some(first_in_window);
+    self.next_sequence = sequence.checked_add(1);
+  }
+
+  fn read_after(
+    &self,
+    after_sequence: u64,
+    output: &mut [Option<FeedbackEvent>],
+  ) -> Result<FeedbackHistoryRead, FeedbackHistoryError> {
+    output.fill(None);
+    if self.sequence_overflowed {
+      return Err(FeedbackHistoryError::SequenceOverflow {
+        oldest_sequence: self.oldest_sequence,
+        newest_sequence: self.newest_sequence,
+      });
+    }
+    if let Some(newest_sequence) = self.newest_sequence {
+      if after_sequence > newest_sequence {
+        return Err(FeedbackHistoryError::CursorAhead {
+          newest_sequence: Some(newest_sequence),
+        });
+      }
+    } else if after_sequence != 0 {
+      return Err(FeedbackHistoryError::CursorAhead {
+        newest_sequence: None,
+      });
+    }
+    if let (Some(oldest_sequence), Some(newest_sequence)) =
+      (self.oldest_sequence, self.newest_sequence)
+      && after_sequence < oldest_sequence.saturating_sub(1)
+    {
+      return Err(FeedbackHistoryError::Gap {
+        oldest_sequence,
+        newest_sequence,
+      });
+    }
+
+    let mut cursor = after_sequence;
+    let mut written = 0;
+    for index_in_output in 0..output.len() {
+      let Some(sequence) = cursor.checked_add(1) else {
+        break;
+      };
+      let Some(newest_sequence) = self.newest_sequence else {
+        break;
+      };
+      if sequence > newest_sequence {
+        break;
+      }
+      let capacity = self.events.len() as u64;
+      let index = ((sequence - 1) % capacity) as usize;
+      let Some(event) = self.events[index] else {
+        output.fill(None);
+        return Err(FeedbackHistoryError::Gap {
+          oldest_sequence: self.oldest_sequence.unwrap_or(sequence),
+          newest_sequence,
+        });
+      };
+      if event.sequence != sequence {
+        output.fill(None);
+        return Err(FeedbackHistoryError::Gap {
+          oldest_sequence: self.oldest_sequence.unwrap_or(sequence),
+          newest_sequence,
+        });
+      }
+      output[index_in_output] = Some(event);
+      cursor = sequence;
+      written += 1;
+    }
+    let newest_sequence = self.newest_sequence;
+    Ok(FeedbackHistoryRead {
+      oldest_sequence: self.oldest_sequence,
+      newest_sequence,
+      written,
+      next_sequence: cursor,
+      more_available: newest_sequence.is_some_and(|newest| cursor < newest),
+      truncated: self.truncated,
+    })
+  }
+}
+
+fn history_storage_bytes(config: FeedbackHistoryConfig) -> Option<usize> {
+  config
+    .capacity
+    .get()
+    .checked_mul(std::mem::size_of::<Option<FeedbackEvent>>())
+}
+
 struct SharedState {
   stop_requested: bool,
   reconciliation_pending: Option<FeedbackResource>,
@@ -259,12 +667,15 @@ struct SharedState {
   worker_panic_payload: Option<Box<dyn Any + Send>>,
   owner_attached: bool,
   metrics: FeedbackMetricsSnapshot,
+  history: Option<FeedbackHistoryRing>,
 }
 
 struct Shared {
   state: Mutex<SharedState>,
   wakeup: Condvar,
   _control: ControlCharge,
+  _history_control: Option<ControlCharge>,
+  history_enabled: bool,
 }
 
 impl Drop for Shared {
@@ -307,6 +718,71 @@ struct ServiceControlShares {
   owner: ControlCharge,
 }
 
+/// Startup admission held while an owning driver constructs source callbacks.
+/// It reserves every fixed service charge and allocates history before the
+/// callback can run; consuming it transfers those exact resources to the
+/// service without another reservation or ring allocation.
+pub(crate) struct PreparedFeedbackStartup<S, A> {
+  policy: ResourceFeedbackPolicy,
+  limits: [u64; RESOURCE_COUNT],
+  // Fields drop in declaration order: release backing before its admission,
+  // including source-construction failure and unwinding before service start.
+  history: Option<FeedbackHistoryRing>,
+  shared_control: ControlCharge,
+  worker_control: ControlCharge,
+  monitor_control: ControlCharge,
+  owner_control: ControlCharge,
+  history_control: Option<ControlCharge>,
+  _callback_types: PhantomData<fn(S, A)>,
+}
+
+impl<S, A> PreparedFeedbackStartup<S, A>
+where
+  S: FeedbackSensor,
+  A: FeedbackActuator,
+{
+  fn new(
+    config: ResourceFeedbackPolicyConfig,
+    tenant: Option<&TenantDomain>,
+    history_config: Option<FeedbackHistoryConfig>,
+  ) -> Result<Self, FeedbackStartError> {
+    let policy = ResourceFeedbackPolicy::new(config).map_err(FeedbackStartError::Policy)?;
+    let limits = policy.current_limits();
+    let ServiceControlShares {
+      shared: shared_control,
+      worker: worker_control,
+      monitor: monitor_control,
+      owner: owner_control,
+    } = service_control_shares::<S, A>(tenant).map_err(FeedbackStartError::Domain)?;
+    // Admit the dynamic ring backing before allocating it. If either operation
+    // fails, every base share is dropped before a source callback can run.
+    let history_control = match history_config {
+      Some(config) => {
+        let bytes =
+          history_storage_bytes(config).ok_or(FeedbackStartError::Domain(DomainError::Invalid))?;
+        Some(ControlCharge::try_new(tenant, bytes).map_err(FeedbackStartError::Domain)?)
+      }
+      None => None,
+    };
+    let history = history_config
+      .map(FeedbackHistoryRing::new)
+      .transpose()
+      .map_err(FeedbackStartError::HistoryAllocation)?;
+
+    Ok(Self {
+      policy,
+      limits,
+      shared_control,
+      worker_control,
+      monitor_control,
+      owner_control,
+      history_control,
+      history,
+      _callback_types: PhantomData,
+    })
+  }
+}
+
 fn service_control_shares<S, A>(
   tenant: Option<&TenantDomain>,
 ) -> Result<ServiceControlShares, DomainError> {
@@ -345,6 +821,27 @@ fn lock_state(shared: &Shared) -> MutexGuard<'_, SharedState> {
   shared.state.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
+fn push_history(state: &mut SharedState, kind: FeedbackEventKind) {
+  if let Some(history) = &mut state.history {
+    // Sequence assignment and the public publication timestamp share this
+    // mutex, so `at` is monotonic with event order even when callback return
+    // timestamps race with a concurrent stop or reconciliation request.
+    history.push(Instant::now(), kind);
+  }
+}
+
+fn record_history(shared: &Shared, kind: FeedbackEventKind) {
+  if !shared.history_enabled {
+    return;
+  }
+  let mut state = lock_state(shared);
+  push_history(&mut state, kind);
+}
+
+fn record_history_now(shared: &Shared, kind: FeedbackEventKind) {
+  record_history(shared, kind);
+}
+
 /// Cloneable read-only view of fixed service metrics.
 #[derive(Clone)]
 pub struct FeedbackMetricsHandle {
@@ -356,6 +853,32 @@ impl FeedbackMetricsHandle {
   #[must_use]
   pub fn snapshot(&self) -> FeedbackMetricsSnapshot {
     lock_state(&self.shared).metrics
+  }
+
+  /// Copies events after `sequence` into caller-owned fixed storage.
+  ///
+  /// The method does not allocate or invoke callbacks. Every output slot is
+  /// cleared before any returned events are copied. A cursor older than the
+  /// ring's oldest retained event returns [`FeedbackHistoryError::Gap`]; use
+  /// the reported oldest sequence minus one only when intentionally resuming
+  /// from the retained suffix. The sticky `truncated` flag reports that the
+  /// ring has overwritten an event; a consumer that already streamed every
+  /// event may continue from its caught-up cursor after wrap. A consumer that
+  /// requires a complete trace from startup must treat any gap as incomplete.
+  /// Sequence exhaustion is sticky and invalidates further reads rather than
+  /// wrapping.
+  pub fn read_history_after(
+    &self,
+    sequence: u64,
+    output: &mut [Option<FeedbackEvent>],
+  ) -> Result<FeedbackHistoryRead, FeedbackHistoryError> {
+    output.fill(None);
+    let state = lock_state(&self.shared);
+    state
+      .history
+      .as_ref()
+      .ok_or(FeedbackHistoryError::Disabled)?
+      .read_after(sequence, output)
   }
 }
 
@@ -395,6 +918,9 @@ pub enum FeedbackStartError {
   ThreadSpawn(std::io::Error),
   /// The tenant domain refused bounded feedback metadata.
   Domain(DomainError),
+  /// The precharged fixed history ring could not be allocated before callbacks
+  /// or worker startup.
+  HistoryAllocation(TryReserveError),
 }
 
 impl fmt::Display for FeedbackStartError {
@@ -409,6 +935,7 @@ impl std::error::Error for FeedbackStartError {
       Self::Policy(error) => Some(error),
       Self::ThreadSpawn(error) => Some(error),
       Self::Domain(error) => Some(error),
+      Self::HistoryAllocation(error) => Some(error),
       Self::InitialReadback { .. }
       | Self::InitialReadbackPanicked(_)
       | Self::InitialLimitMismatch { .. } => None,
@@ -524,7 +1051,7 @@ impl ResourceFeedbackService {
     S: FeedbackSensor,
     A: FeedbackActuator,
   {
-    Self::start_with_tenant(config, sensor, actuator, None)
+    Self::start_with_tenant(config, sensor, actuator, None, None)
   }
 
   /// Starts the service after reserving its declared shared and thread
@@ -540,7 +1067,56 @@ impl ResourceFeedbackService {
     S: FeedbackSensor,
     A: FeedbackActuator,
   {
-    Self::start_with_tenant(config, sensor, actuator, Some(tenant))
+    Self::start_with_tenant(config, sensor, actuator, Some(tenant), None)
+  }
+
+  /// Starts feedback with a fixed event ring charged to the selected tenant.
+  ///
+  /// The ring's Control reservation and backing storage are prepared before
+  /// startup readbacks or worker threads. The history stays charged while any
+  /// worker, join monitor, service owner, or metrics handle retains shared
+  /// state. Existing constructors leave history disabled.
+  pub fn start_in_tenant_with_history<S, A>(
+    config: ResourceFeedbackPolicyConfig,
+    sensor: S,
+    actuator: A,
+    tenant: &TenantDomain,
+    history: FeedbackHistoryConfig,
+  ) -> Result<Self, FeedbackStartError>
+  where
+    S: FeedbackSensor,
+    A: FeedbackActuator,
+  {
+    let prepared = Self::prepare_in_tenant_with_history::<S, A>(config, tenant, history)?;
+    Self::start_with_prepared_history(sensor, actuator, prepared)
+  }
+
+  /// Reserves all fixed service and history charges before an owning driver
+  /// invokes its source factory.
+  pub(crate) fn prepare_in_tenant_with_history<S, A>(
+    config: ResourceFeedbackPolicyConfig,
+    tenant: &TenantDomain,
+    history: FeedbackHistoryConfig,
+  ) -> Result<PreparedFeedbackStartup<S, A>, FeedbackStartError>
+  where
+    S: FeedbackSensor,
+    A: FeedbackActuator,
+  {
+    PreparedFeedbackStartup::new(config, Some(tenant), Some(history))
+  }
+
+  /// Starts from previously reserved history admission without a second
+  /// Control reservation or ring allocation.
+  pub(crate) fn start_with_prepared_history<S, A>(
+    sensor: S,
+    actuator: A,
+    prepared: PreparedFeedbackStartup<S, A>,
+  ) -> Result<Self, FeedbackStartError>
+  where
+    S: FeedbackSensor,
+    A: FeedbackActuator,
+  {
+    Self::start_prepared(sensor, actuator, prepared)
   }
 
   fn start_with_tenant<S, A>(
@@ -548,19 +1124,36 @@ impl ResourceFeedbackService {
     sensor: S,
     actuator: A,
     tenant: Option<&TenantDomain>,
+    history_config: Option<FeedbackHistoryConfig>,
   ) -> Result<Self, FeedbackStartError>
   where
     S: FeedbackSensor,
     A: FeedbackActuator,
   {
-    let policy = ResourceFeedbackPolicy::new(config).map_err(FeedbackStartError::Policy)?;
-    let limits = policy.current_limits();
-    let ServiceControlShares {
-      shared: shared_control,
-      worker: worker_control,
-      monitor: monitor_control,
-      owner: owner_control,
-    } = service_control_shares::<S, A>(tenant).map_err(FeedbackStartError::Domain)?;
+    let prepared = PreparedFeedbackStartup::<S, A>::new(config, tenant, history_config)?;
+    Self::start_prepared(sensor, actuator, prepared)
+  }
+
+  fn start_prepared<S, A>(
+    sensor: S,
+    actuator: A,
+    prepared: PreparedFeedbackStartup<S, A>,
+  ) -> Result<Self, FeedbackStartError>
+  where
+    S: FeedbackSensor,
+    A: FeedbackActuator,
+  {
+    let PreparedFeedbackStartup {
+      policy,
+      limits,
+      shared_control,
+      worker_control,
+      monitor_control,
+      owner_control,
+      history_control,
+      mut history,
+      _callback_types: _,
+    } = prepared;
     let mut worker_payload = WorkerPayload {
       policy,
       sensor,
@@ -569,31 +1162,92 @@ impl ResourceFeedbackService {
       _control: worker_control,
     };
     for resource in RESOURCES {
+      let started_at = history.as_ref().map(|_| Instant::now());
       let result = panic::catch_unwind(AssertUnwindSafe(|| {
         worker_payload.actuator.readback(resource)
       }));
+      let completed_at = history.as_ref().map(|_| Instant::now());
       let actual = match result {
         Ok(Ok(actual)) => actual,
         Ok(Err(error)) => {
+          if let (Some(history), Some(started_at), Some(completed_at)) =
+            (&mut history, started_at, completed_at)
+          {
+            history.push(
+              Instant::now(),
+              FeedbackEventKind::StartupReadback {
+                resource,
+                expected_limit: limits[resource as usize],
+                started_at,
+                completed_at,
+                outcome: FeedbackReadbackOutcome::Failed(error),
+              },
+            );
+          }
           return Err(FeedbackStartError::InitialReadback { resource, error });
         }
         Err(payload) => {
+          if let (Some(history), Some(started_at), Some(completed_at)) =
+            (&mut history, started_at, completed_at)
+          {
+            history.push(
+              Instant::now(),
+              FeedbackEventKind::StartupReadback {
+                resource,
+                expected_limit: limits[resource as usize],
+                started_at,
+                completed_at,
+                outcome: FeedbackReadbackOutcome::Panicked,
+              },
+            );
+          }
           discard_worker_payload(payload);
           return Err(FeedbackStartError::InitialReadbackPanicked(resource));
         }
       };
       let expected = limits[resource as usize];
       if actual != expected {
+        if let (Some(history), Some(started_at), Some(completed_at)) =
+          (&mut history, started_at, completed_at)
+        {
+          history.push(
+            Instant::now(),
+            FeedbackEventKind::StartupReadback {
+              resource,
+              expected_limit: expected,
+              started_at,
+              completed_at,
+              outcome: FeedbackReadbackOutcome::Value(actual),
+            },
+          );
+        }
         return Err(FeedbackStartError::InitialLimitMismatch {
           resource,
           expected,
           actual,
         });
+      } else if let (Some(history), Some(started_at), Some(completed_at)) =
+        (&mut history, started_at, completed_at)
+      {
+        history.push(
+          Instant::now(),
+          FeedbackEventKind::StartupReadback {
+            resource,
+            expected_limit: expected,
+            started_at,
+            completed_at,
+            outcome: FeedbackReadbackOutcome::Value(actual),
+          },
+        );
       }
     }
 
     let started_at = Instant::now();
+    if let Some(history) = &mut history {
+      history.push(Instant::now(), FeedbackEventKind::ServiceStarted);
+    }
     let metrics = FeedbackMetricsSnapshot::new(started_at, limits);
+    let history_enabled = history.is_some();
     let shared = Arc::new(Shared {
       state: Mutex::new(SharedState {
         stop_requested: false,
@@ -604,9 +1258,12 @@ impl ResourceFeedbackService {
         worker_panic_payload: None,
         owner_attached: true,
         metrics,
+        history,
       }),
       wakeup: Condvar::new(),
       _control: shared_control,
+      _history_control: history_control,
+      history_enabled,
     });
     worker_payload.shared = Some(Arc::clone(&shared));
     let (join_sender, join_receiver) = mpsc::sync_channel(1);
@@ -720,8 +1377,13 @@ impl ResourceFeedbackService {
   pub fn request_stop(&self) {
     {
       let mut state = lock_state(&self.shared);
-      state.stop_requested = true;
-      state.metrics.stop_requested = true;
+      if !state.stop_requested {
+        state.stop_requested = true;
+        state.metrics.stop_requested = true;
+        if self.shared.history_enabled {
+          push_history(&mut state, FeedbackEventKind::StopRequested);
+        }
+      }
     }
     self.shared.wakeup.notify_all();
   }
@@ -743,6 +1405,12 @@ impl ResourceFeedbackService {
     }
     state.reconciliation_pending = Some(resource);
     state.metrics.reconciliation_pending = Some(resource);
+    if self.shared.history_enabled {
+      push_history(
+        &mut state,
+        FeedbackEventKind::ReconciliationRequested { resource },
+      );
+    }
     drop(state);
     self.shared.wakeup.notify_one();
     Ok(())
@@ -845,6 +1513,7 @@ impl Drop for ResourceFeedbackService {
 
 fn publish_worker_join(shared: &Shared, result: thread::Result<()>) {
   let mut cleanup_payload = None;
+  let panicked = result.is_err();
   {
     let mut state = lock_state(shared);
     if let Err(payload) = result {
@@ -859,10 +1528,19 @@ fn publish_worker_join(shared: &Shared, result: thread::Result<()>) {
       } else {
         cleanup_payload = Some(payload);
       }
+      if shared.history_enabled {
+        push_history(
+          &mut state,
+          FeedbackEventKind::WorkerFailure(FeedbackWorkerFailure::Panicked),
+        );
+      }
     }
     if cleanup_payload.is_none() {
       state.worker_joined = true;
       state.metrics.shutdown_complete = true;
+      if shared.history_enabled {
+        push_history(&mut state, FeedbackEventKind::WorkerJoined { panicked });
+      }
     }
   }
   if let Some(payload) = cleanup_payload {
@@ -872,6 +1550,9 @@ fn publish_worker_join(shared: &Shared, result: thread::Result<()>) {
     let mut state = lock_state(shared);
     state.worker_joined = true;
     state.metrics.shutdown_complete = true;
+    if shared.history_enabled {
+      push_history(&mut state, FeedbackEventKind::WorkerJoined { panicked });
+    }
   }
   shared.wakeup.notify_all();
 }
@@ -935,6 +1616,12 @@ fn wait_for_work(shared: &Shared, deadline: Instant) -> Work {
       state.reconciliation_in_flight = Some(resource);
       state.metrics.reconciliation_pending = None;
       state.metrics.reconciliation_in_flight = Some(resource);
+      if shared.history_enabled {
+        push_history(
+          &mut state,
+          FeedbackEventKind::ReconciliationStarted { resource },
+        );
+      }
       return Work::Reconcile(resource);
     }
     if state.stop_requested {
@@ -965,24 +1652,71 @@ where
   if stop_requested(shared) {
     return None;
   }
-  let sensed = catch_callback(|| sensor.sample());
-  let sample = match sensed {
-    Ok(Ok(sample)) => sanitize_sample(shared, sample),
-    Ok(Err(error)) => {
-      record_all_diagnostics(shared, FeedbackDiagnostic::SensorFailed(error));
-      missing_sample()
+  let callback_started_at = shared.history_enabled.then(Instant::now);
+  let sensed = catch_callback_raw(|| sensor.sample());
+  let callback_completed_at = shared.history_enabled.then(Instant::now);
+  let (outcome, raw_sample, sensor_error, panic_payload) = match sensed {
+    CallbackOutcome::Returned(Ok(sample)) => {
+      (FeedbackSensorOutcome::Sampled, Some(sample), None, None)
     }
-    Err(()) => {
-      record_all_diagnostics(shared, FeedbackDiagnostic::SensorPanicked);
-      missing_sample()
+    CallbackOutcome::Returned(Err(error)) => (
+      FeedbackSensorOutcome::Failed(error),
+      None,
+      Some(error),
+      None,
+    ),
+    CallbackOutcome::Panicked(payload) => {
+      (FeedbackSensorOutcome::Panicked, None, None, Some(payload))
     }
   };
+  if let (Some(started_at), Some(completed_at)) = (callback_started_at, callback_completed_at) {
+    record_history(
+      shared,
+      FeedbackEventKind::SensorCallback {
+        started_at,
+        completed_at,
+        outcome,
+        raw_sample,
+      },
+    );
+  }
+  if let Some(error) = sensor_error {
+    record_all_diagnostics(shared, FeedbackDiagnostic::SensorFailed(error));
+  }
+  if let Some(payload) = panic_payload {
+    record_all_diagnostics(shared, FeedbackDiagnostic::SensorPanicked);
+    discard_worker_payload(payload);
+  }
+  let sample = match raw_sample {
+    Some(sample) => sanitize_sample(shared, sample),
+    None => missing_sample(),
+  };
   if stop_requested(shared) {
+    record_history_now(
+      shared,
+      FeedbackEventKind::SampleDecision {
+        sample_at: sample.at,
+        sample,
+        accepted: false,
+        rejection: None,
+        planned_at: None,
+      },
+    );
     return None;
   }
   let sample_at = sample.at;
   if let Err(error) = policy.observe(sample) {
     record_all_diagnostics(shared, FeedbackDiagnostic::SampleRejected(error));
+    record_history_now(
+      shared,
+      FeedbackEventKind::SampleDecision {
+        sample_at,
+        sample,
+        accepted: false,
+        rejection: Some(error),
+        planned_at: None,
+      },
+    );
     return None;
   }
   {
@@ -994,9 +1728,30 @@ where
     Ok(plan) => plan,
     Err(error) => {
       record_all_diagnostics(shared, FeedbackDiagnostic::PlanRejected(error));
+      record_history_now(
+        shared,
+        FeedbackEventKind::SampleDecision {
+          sample_at,
+          sample,
+          accepted: true,
+          rejection: None,
+          planned_at: None,
+        },
+      );
+      record_history_now(shared, FeedbackEventKind::PlanRejected(error));
       return Some(sample_at);
     }
   };
+  record_history(
+    shared,
+    FeedbackEventKind::SampleDecision {
+      sample_at,
+      sample,
+      accepted: true,
+      rejection: None,
+      planned_at: Some(plan.at),
+    },
+  );
   publish_plan(shared, policy, plan);
   for resource in RESOURCES {
     let decision = plan.decision(resource);
@@ -1074,6 +1829,59 @@ fn publish_plan(shared: &Shared, policy: &ResourceFeedbackPolicy, plan: PolicyPl
       control.last_diagnostic = Some(FeedbackDiagnostic::TelemetryUnavailable(decision.telemetry));
     }
   }
+  push_history(&mut state, FeedbackEventKind::Plan(plan));
+}
+
+fn readback_history_outcome(
+  outcome: &CallbackOutcome<Result<u64, FeedbackActuatorError>>,
+) -> FeedbackReadbackOutcome {
+  match outcome {
+    CallbackOutcome::Returned(Ok(actual)) => FeedbackReadbackOutcome::Value(*actual),
+    CallbackOutcome::Returned(Err(error)) => FeedbackReadbackOutcome::Failed(*error),
+    CallbackOutcome::Panicked(_) => FeedbackReadbackOutcome::Panicked,
+  }
+}
+
+fn apply_history_outcome(
+  outcome: &CallbackOutcome<Result<(), FeedbackActuatorError>>,
+) -> FeedbackApplyOutcome {
+  match outcome {
+    CallbackOutcome::Returned(Ok(())) => FeedbackApplyOutcome::Applied,
+    CallbackOutcome::Returned(Err(error)) => FeedbackApplyOutcome::Failed(*error),
+    CallbackOutcome::Panicked(_) => FeedbackApplyOutcome::Panicked,
+  }
+}
+
+fn record_acknowledgement(
+  shared: &Shared,
+  policy: &ResourceFeedbackPolicy,
+  ticket: PlanTicket,
+  result: ActuationResult,
+  accepted: bool,
+) {
+  let resource = ticket.resource();
+  let index = resource as usize;
+  let current_limit = policy.current_limits()[index];
+  let pending_generation = policy.pending_tickets()[index].map(PlanTicket::generation);
+  let faulted = policy.faults()[index];
+  let mut state = lock_state(shared);
+  let control = &mut state.metrics.controls[index];
+  control.current_limit = current_limit;
+  control.pending_generation = pending_generation;
+  control.policy_faulted = faulted;
+  if shared.history_enabled {
+    push_history(
+      &mut state,
+      FeedbackEventKind::Acknowledgement {
+        ticket,
+        result,
+        accepted,
+        current_limit,
+        pending_generation,
+        faulted,
+      },
+    );
+  }
 }
 
 fn process_ticket<A: FeedbackActuator>(
@@ -1083,7 +1891,27 @@ fn process_ticket<A: FeedbackActuator>(
   ticket: PlanTicket,
 ) {
   let resource = ticket.resource();
-  match catch_callback_raw(|| actuator.readback(resource)) {
+  let pre_started_at = shared.history_enabled.then(Instant::now);
+  let pre_readback = catch_callback_raw(|| actuator.readback(resource));
+  let pre_completed_at = shared.history_enabled.then(Instant::now);
+  if let (Some(started_at), Some(completed_at)) = (pre_started_at, pre_completed_at) {
+    let pre_outcome = readback_history_outcome(&pre_readback);
+    let pre_matches_ticket = matches!(
+      &pre_readback,
+      CallbackOutcome::Returned(Ok(actual)) if *actual == ticket.from_limit()
+    );
+    record_history(
+      shared,
+      FeedbackEventKind::PreApplyReadback {
+        ticket,
+        started_at,
+        completed_at,
+        outcome: pre_outcome,
+        matches_ticket: pre_matches_ticket,
+      },
+    );
+  }
+  match pre_readback {
     CallbackOutcome::Returned(Ok(actual)) if actual == ticket.from_limit() => {}
     CallbackOutcome::Returned(Ok(actual)) => {
       fail_ticket(
@@ -1124,11 +1952,38 @@ fn process_ticket<A: FeedbackActuator>(
     return;
   }
 
+  let apply_started_at = shared.history_enabled.then(Instant::now);
   let applied = catch_callback_raw(|| actuator.apply(ticket));
   // This is captured immediately after the apply callback returns or panics.
   // The mandatory readback may block, but it must not move the cooldown start.
   let applied_at = Instant::now();
+  if let Some(started_at) = apply_started_at {
+    let apply_outcome = apply_history_outcome(&applied);
+    record_history(
+      shared,
+      FeedbackEventKind::Apply {
+        ticket,
+        started_at,
+        completed_at: applied_at,
+        outcome: apply_outcome,
+      },
+    );
+  }
+  let post_started_at = shared.history_enabled.then(Instant::now);
   let actual = catch_callback_raw(|| actuator.readback(resource));
+  let post_completed_at = shared.history_enabled.then(Instant::now);
+  if let (Some(started_at), Some(completed_at)) = (post_started_at, post_completed_at) {
+    let post_outcome = readback_history_outcome(&actual);
+    record_history(
+      shared,
+      FeedbackEventKind::PostApplyReadback {
+        ticket,
+        started_at,
+        completed_at,
+        outcome: post_outcome,
+      },
+    );
+  }
   let apply_succeeded = matches!(&applied, CallbackOutcome::Returned(Ok(())));
   let reached_target = matches!(
     &actual,
@@ -1139,14 +1994,15 @@ fn process_ticket<A: FeedbackActuator>(
   } else {
     ActuationResult::Failed
   };
-  if let Err(error) = policy.acknowledge(ticket, result, applied_at) {
+  let acknowledgement = policy.acknowledge(ticket, result, applied_at);
+  record_acknowledgement(shared, policy, ticket, result, acknowledgement.is_ok());
+  if let Err(error) = acknowledgement {
     record_control_diagnostic(
       shared,
       resource,
       FeedbackDiagnostic::PolicyOperationRejected(error),
     );
   }
-  sync_policy_control(shared, policy, resource);
 
   match &applied {
     CallbackOutcome::Panicked(_) => record_control_diagnostic(
@@ -1208,14 +2064,21 @@ fn fail_ticket(
   diagnostic: FeedbackDiagnostic,
 ) {
   let at = Instant::now();
-  if let Err(error) = policy.acknowledge(ticket, ActuationResult::Failed, at) {
+  let acknowledgement = policy.acknowledge(ticket, ActuationResult::Failed, at);
+  record_acknowledgement(
+    shared,
+    policy,
+    ticket,
+    ActuationResult::Failed,
+    acknowledgement.is_ok(),
+  );
+  if let Err(error) = acknowledgement {
     record_control_diagnostic(
       shared,
       ticket.resource(),
       FeedbackDiagnostic::PolicyOperationRejected(error),
     );
   }
-  sync_policy_control(shared, policy, ticket.resource());
   record_control_diagnostic(shared, ticket.resource(), diagnostic);
 }
 
@@ -1225,25 +2088,47 @@ fn run_reconciliation<A: FeedbackActuator>(
   actuator: &mut A,
   resource: FeedbackResource,
 ) {
+  let started_at = shared.history_enabled.then(Instant::now);
   let result = catch_callback_raw(|| actuator.readback(resource));
+  let completed_at = shared.history_enabled.then(Instant::now);
+  if let (Some(started_at), Some(completed_at)) = (started_at, completed_at) {
+    let readback_outcome = readback_history_outcome(&result);
+    record_history(
+      shared,
+      FeedbackEventKind::ReconciliationReadback {
+        resource,
+        started_at,
+        completed_at,
+        outcome: readback_outcome,
+      },
+    );
+  }
+  let mut actual_limit = None;
+  let mut accepted = false;
+  let mut rejection = None;
   match &result {
-    CallbackOutcome::Returned(Ok(actual)) => match policy.reconcile(resource, *actual) {
-      Ok(()) => {
-        sync_policy_control(shared, policy, resource);
-        let mut state = lock_state(shared);
-        let control = &mut state.metrics.controls[resource as usize];
-        control.telemetry = TelemetryStatus::Missing;
-        control.utilization_basis_points = None;
-        control.no_change = Some(NoChangeReason::TelemetryUnavailable);
+    CallbackOutcome::Returned(Ok(actual)) => {
+      actual_limit = Some(*actual);
+      match policy.reconcile(resource, *actual) {
+        Ok(()) => {
+          accepted = true;
+          sync_policy_control(shared, policy, resource);
+          let mut state = lock_state(shared);
+          let control = &mut state.metrics.controls[resource as usize];
+          control.telemetry = TelemetryStatus::Missing;
+          control.utilization_basis_points = None;
+          control.no_change = Some(NoChangeReason::TelemetryUnavailable);
+        }
+        Err(error) => {
+          rejection = Some(error);
+          record_control_diagnostic(
+            shared,
+            resource,
+            FeedbackDiagnostic::ReconciliationRejected(error),
+          );
+        }
       }
-      Err(error) => {
-        record_control_diagnostic(
-          shared,
-          resource,
-          FeedbackDiagnostic::ReconciliationRejected(error),
-        );
-      }
-    },
+    }
     CallbackOutcome::Returned(Err(error)) => record_control_diagnostic(
       shared,
       resource,
@@ -1265,6 +2150,24 @@ fn run_reconciliation<A: FeedbackActuator>(
     let mut state = lock_state(shared);
     state.reconciliation_in_flight = None;
     state.metrics.reconciliation_in_flight = None;
+    let index = resource as usize;
+    let current_limit = policy.current_limits()[index];
+    let pending_generation = policy.pending_tickets()[index].map(PlanTicket::generation);
+    let faulted = policy.faults()[index];
+    if shared.history_enabled {
+      push_history(
+        &mut state,
+        FeedbackEventKind::ReconciliationFinished {
+          resource,
+          actual_limit,
+          accepted,
+          rejection,
+          current_limit,
+          pending_generation,
+          faulted,
+        },
+      );
+    }
   }
   shared.wakeup.notify_all();
 }
@@ -1312,6 +2215,9 @@ fn record_worker_failure(shared: &Shared, failure: FeedbackWorkerFailure) {
   for control in &mut state.metrics.controls {
     control.last_diagnostic = Some(diagnostic);
   }
+  if shared.history_enabled {
+    push_history(&mut state, FeedbackEventKind::WorkerFailure(failure));
+  }
 }
 
 fn stop_requested(shared: &Shared) -> bool {
@@ -1331,16 +2237,6 @@ fn catch_callback_raw<T>(callback: impl FnOnce() -> T) -> CallbackOutcome<T> {
   match panic::catch_unwind(AssertUnwindSafe(callback)) {
     Ok(value) => CallbackOutcome::Returned(value),
     Err(payload) => CallbackOutcome::Panicked(payload),
-  }
-}
-
-fn catch_callback<T>(callback: impl FnOnce() -> T) -> Result<T, ()> {
-  match catch_callback_raw(callback) {
-    CallbackOutcome::Returned(value) => Ok(value),
-    CallbackOutcome::Panicked(payload) => {
-      discard_worker_payload(payload);
-      Err(())
-    }
   }
 }
 
@@ -1779,6 +2675,10 @@ mod tests {
     assert!(stopped, "feedback worker did not stop promptly");
   }
 
+  fn history_config(capacity: usize) -> FeedbackHistoryConfig {
+    FeedbackHistoryConfig::new(NonZeroUsize::new(capacity).unwrap())
+  }
+
   fn new_flag() -> Flag {
     Arc::new((Mutex::new(false), Condvar::new()))
   }
@@ -1811,6 +2711,353 @@ mod tests {
   fn feedback_service_remains_send_and_sync() {
     fn assert_send_sync<T: Send + Sync>() {}
     assert_send_sync::<ResourceFeedbackService>();
+  }
+
+  #[test]
+  fn history_ring_reports_gaps_wrap_and_bounded_cursors() {
+    let mut history = FeedbackHistoryRing::new(history_config(2)).unwrap();
+    let at = Instant::now();
+    history.push(at, FeedbackEventKind::ServiceStarted);
+    history.push(at, FeedbackEventKind::StopRequested);
+    history.push(at, FeedbackEventKind::WorkerJoined { panicked: false });
+
+    let stale_event = Some(FeedbackEvent {
+      sequence: 99,
+      at,
+      kind: FeedbackEventKind::ServiceStarted,
+    });
+    let mut events = [stale_event; 2];
+    assert_eq!(
+      history.read_after(0, &mut events),
+      Err(FeedbackHistoryError::Gap {
+        oldest_sequence: 2,
+        newest_sequence: 3,
+      })
+    );
+    assert_eq!(
+      events, [None; 2],
+      "gap refusal must not expose a partial read"
+    );
+
+    let read = history.read_after(1, &mut events).unwrap();
+    assert_eq!(read.oldest_sequence, Some(2));
+    assert_eq!(read.newest_sequence, Some(3));
+    assert_eq!(read.written, 2);
+    assert_eq!(read.next_sequence, 3);
+    assert!(!read.more_available);
+    assert!(read.truncated);
+    assert_eq!(events[0].unwrap().sequence, 2);
+    assert_eq!(events[1].unwrap().sequence, 3);
+
+    // A consumer that drained through sequence 3 before overwrite can resume
+    // continuously after a later wrap even though `truncated` stays sticky.
+    history.push(at, FeedbackEventKind::ServiceStarted);
+    history.push(at, FeedbackEventKind::StopRequested);
+    let caught_up = history.read_after(3, &mut events).unwrap();
+    assert_eq!(caught_up.oldest_sequence, Some(4));
+    assert_eq!(caught_up.newest_sequence, Some(5));
+    assert_eq!(caught_up.written, 2);
+    assert_eq!(caught_up.next_sequence, 5);
+    assert!(caught_up.truncated);
+    assert_eq!(events[0].unwrap().sequence, 4);
+    assert_eq!(events[1].unwrap().sequence, 5);
+    assert_eq!(
+      history.read_after(1, &mut events),
+      Err(FeedbackHistoryError::Gap {
+        oldest_sequence: 4,
+        newest_sequence: 5,
+      })
+    );
+    assert_eq!(events, [None; 2]);
+
+    let mut one = [None];
+    assert_eq!(
+      history.read_after(6, &mut one),
+      Err(FeedbackHistoryError::CursorAhead {
+        newest_sequence: Some(5),
+      })
+    );
+  }
+
+  #[test]
+  fn history_sequence_exhaustion_never_wraps_or_returns_a_valid_suffix() {
+    let mut history = FeedbackHistoryRing::new(history_config(3)).unwrap();
+    history.next_sequence = Some(u64::MAX);
+    history.push(Instant::now(), FeedbackEventKind::ServiceStarted);
+    let mut events = [None; 1];
+    let read = history.read_after(u64::MAX - 1, &mut events).unwrap();
+    assert_eq!(read.newest_sequence, Some(u64::MAX));
+    assert_eq!(events[0].unwrap().sequence, u64::MAX);
+
+    history.push(Instant::now(), FeedbackEventKind::StopRequested);
+    assert_eq!(
+      history.read_after(u64::MAX - 1, &mut events),
+      Err(FeedbackHistoryError::SequenceOverflow {
+        oldest_sequence: Some(u64::MAX - 2),
+        newest_sequence: Some(u64::MAX),
+      })
+    );
+    assert_eq!(events, [None]);
+  }
+
+  #[test]
+  fn existing_constructors_keep_history_disabled() {
+    let mut service = start(Signal::Neutral, ActuatorState::new([100, 100, 100]));
+    let metrics = service.metrics_handle();
+    let at = Instant::now();
+    let mut output = [Some(FeedbackEvent {
+      sequence: 1,
+      at,
+      kind: FeedbackEventKind::ServiceStarted,
+    })];
+    assert_eq!(
+      metrics.read_history_after(0, &mut output),
+      Err(FeedbackHistoryError::Disabled)
+    );
+    assert_eq!(output, [None]);
+    stop_and_join(&mut service);
+    drop(metrics);
+    drop(service);
+  }
+
+  #[test]
+  fn history_charge_refusal_precedes_startup_callbacks() {
+    let history = history_config(8);
+    let history_bytes = history_storage_bytes(history).unwrap();
+    let service_bytes = std::mem::size_of::<Shared>()
+      + std::mem::size_of::<WorkerPayload<TestSensor, TestActuator>>()
+      + std::mem::size_of::<JoinMonitorPayload>()
+      + std::mem::size_of::<JoinCommand>()
+      + ResourceFeedbackService::owner_payload_bytes();
+    let budget = service_bytes.checked_add(history_bytes).unwrap() - 1;
+    let ceiling = DomainResources::ZERO.with(DomainResource::Control, 1 << 20);
+    let domain = ResourceDomain::with_waiters(ceiling, 1, 0).unwrap();
+    let tenant = domain.tenant(ceiling).unwrap();
+    let global_before = domain.snapshot().used.get(DomainResource::Control);
+    let tenant_before = tenant.snapshot().unwrap().used.get(DomainResource::Control);
+    domain
+      .set_limits(DomainResources::ZERO.with(DomainResource::Control, global_before + budget))
+      .unwrap();
+    tenant
+      .set_limits(DomainResources::ZERO.with(DomainResource::Control, tenant_before + budget))
+      .unwrap();
+    let state = ActuatorState::new([100, 100, 100]);
+    let (sensor, sensor_calls) = TestSensor::new(Signal::Neutral);
+
+    assert!(matches!(
+      ResourceFeedbackService::start_in_tenant_with_history(
+        config(),
+        sensor,
+        TestActuator::new(Arc::clone(&state)),
+        &tenant,
+        history,
+      ),
+      Err(FeedbackStartError::Domain(DomainError::Exhausted(
+        DomainResource::Control
+      )))
+    ));
+    assert_eq!(sensor_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(
+      state
+        .readbacks
+        .iter()
+        .map(|count| count.load(Ordering::SeqCst))
+        .sum::<usize>(),
+      0
+    );
+    assert_eq!(
+      domain.snapshot().used.get(DomainResource::Control),
+      global_before
+    );
+  }
+
+  #[test]
+  fn history_records_startup_sample_plan_write_readback_stop_and_join_and_retains_charge() {
+    let ceiling = DomainResources::ZERO.with(DomainResource::Control, 1 << 20);
+    let domain = ResourceDomain::with_waiters(ceiling, 1, 0).unwrap();
+    let tenant = domain.tenant(ceiling).unwrap();
+    let before = domain.snapshot().used.get(DomainResource::Control);
+    let state = ActuatorState::new([100, 100, 100]);
+    let (sensor, _) = TestSensor::new(Signal::CpuPressure);
+    let mut service = ResourceFeedbackService::start_in_tenant_with_history(
+      config(),
+      sensor,
+      TestActuator::new(Arc::clone(&state)),
+      &tenant,
+      history_config(64),
+    )
+    .unwrap();
+    let metrics = service.metrics_handle();
+    let retained_metrics = metrics.clone();
+    assert!(wait_until(Duration::from_secs(2), || {
+      state.actual(FeedbackResource::CpuConcurrency) == 90
+    }));
+    stop_and_join(&mut service);
+    drop(service);
+
+    let mut output = [None; 64];
+    let read = metrics.read_history_after(0, &mut output).unwrap();
+    assert_eq!(read.oldest_sequence, Some(1));
+    assert!(!read.truncated);
+    assert!(!read.more_available);
+    assert_eq!(read.written as u64, read.newest_sequence.unwrap());
+    let events = &output[..read.written];
+    assert!(matches!(
+      events[0].unwrap().kind,
+      FeedbackEventKind::StartupReadback { .. }
+    ));
+    assert!(matches!(
+      events[1].unwrap().kind,
+      FeedbackEventKind::StartupReadback { .. }
+    ));
+    assert!(matches!(
+      events[2].unwrap().kind,
+      FeedbackEventKind::StartupReadback { .. }
+    ));
+    assert!(matches!(
+      events[3].unwrap().kind,
+      FeedbackEventKind::ServiceStarted
+    ));
+    assert!(events.iter().all(Option::is_some));
+    assert!(
+      events
+        .windows(2)
+        .all(|pair| pair[0].unwrap().at <= pair[1].unwrap().at)
+    );
+
+    let sensor_event = events
+      .iter()
+      .find_map(|event| match event.as_ref()?.kind {
+        FeedbackEventKind::SensorCallback {
+          outcome: FeedbackSensorOutcome::Sampled,
+          raw_sample: Some(sample),
+          ..
+        } => Some(sample),
+        _ => None,
+      })
+      .expect("sensor event should retain the raw sample values");
+    assert_eq!(sensor_event.cpu_utilization_basis_points, Some(9_000));
+    assert_eq!(sensor_event.disk_utilization_basis_points, Some(7_000));
+    let sample_decision = events
+      .iter()
+      .find_map(|event| match event.as_ref()?.kind {
+        FeedbackEventKind::SampleDecision {
+          accepted: true,
+          planned_at: Some(planned_at),
+          ..
+        } => Some(planned_at),
+        _ => None,
+      })
+      .expect("accepted sample event should record its planning time");
+    let ticket = events
+      .iter()
+      .find_map(|event| match event.as_ref()?.kind {
+        FeedbackEventKind::Plan(plan) => {
+          match plan.decision(FeedbackResource::CpuConcurrency).status {
+            DecisionStatus::Planned(ticket) => Some((ticket, plan.at)),
+            DecisionStatus::NoChange(_) => None,
+          }
+        }
+        _ => None,
+      })
+      .map(|(ticket, _)| ticket)
+      .expect("CPU pressure should produce one bounded ticket");
+    assert!(events.iter().any(|event| matches!(
+      event.unwrap().kind,
+      FeedbackEventKind::Plan(plan) if plan.at == sample_decision
+    )));
+    let pre_index = events
+      .iter()
+      .position(|event| {
+        matches!(
+          event.unwrap().kind,
+          FeedbackEventKind::PreApplyReadback { ticket: found, matches_ticket: true, .. }
+            if found == ticket
+        )
+      })
+      .expect("pre-write readback event");
+    let apply_index = events
+      .iter()
+      .position(|event| {
+        matches!(
+          event.unwrap().kind,
+          FeedbackEventKind::Apply { ticket: found, outcome: FeedbackApplyOutcome::Applied, .. }
+            if found == ticket
+        )
+      })
+      .expect("write event");
+    let post_index = events.iter().position(|event| matches!(
+      event.unwrap().kind,
+      FeedbackEventKind::PostApplyReadback { ticket: found, outcome: FeedbackReadbackOutcome::Value(90), .. }
+        if found == ticket
+    )).expect("mandatory post-write readback event");
+    let acknowledgement_index = events
+      .iter()
+      .position(|event| {
+        matches!(
+          event.unwrap().kind,
+          FeedbackEventKind::Acknowledgement {
+            ticket: found,
+            result: ActuationResult::Applied,
+            accepted: true,
+            current_limit: 90,
+            pending_generation: None,
+            faulted: false,
+          } if found == ticket
+        )
+      })
+      .expect("policy acknowledgement event");
+    assert!(
+      pre_index < apply_index && apply_index < post_index && post_index < acknowledgement_index
+    );
+    let pre_completed = match events[pre_index].unwrap().kind {
+      FeedbackEventKind::PreApplyReadback { completed_at, .. } => completed_at,
+      _ => unreachable!(),
+    };
+    let apply_started = match events[apply_index].unwrap().kind {
+      FeedbackEventKind::Apply { started_at, .. } => started_at,
+      _ => unreachable!(),
+    };
+    let apply_completed = match events[apply_index].unwrap().kind {
+      FeedbackEventKind::Apply { completed_at, .. } => completed_at,
+      _ => unreachable!(),
+    };
+    let post_started = match events[post_index].unwrap().kind {
+      FeedbackEventKind::PostApplyReadback { started_at, .. } => started_at,
+      _ => unreachable!(),
+    };
+    assert!(pre_completed <= apply_started);
+    assert!(apply_completed <= post_started);
+    let stop_index = events
+      .iter()
+      .position(|event| matches!(event.unwrap().kind, FeedbackEventKind::StopRequested))
+      .expect("service stop marker");
+    let joined_index = events
+      .iter()
+      .position(|event| {
+        matches!(
+          event.unwrap().kind,
+          FeedbackEventKind::WorkerJoined { panicked: false }
+        )
+      })
+      .expect("joined shutdown marker");
+    assert!(stop_index < joined_index);
+    assert_eq!(joined_index, read.written - 1);
+
+    let retained = domain.snapshot().used.get(DomainResource::Control);
+    assert!(
+      retained > before,
+      "metrics handles must retain history and its charge"
+    );
+    drop(metrics);
+    assert_eq!(
+      domain.snapshot().used.get(DomainResource::Control),
+      retained
+    );
+    drop(retained_metrics);
+    assert!(wait_until(Duration::from_secs(2), || {
+      domain.snapshot().used.get(DomainResource::Control) == before
+    }));
   }
 
   #[test]
@@ -2182,6 +3429,148 @@ mod tests {
     assert_eq!(state.actual(FeedbackResource::DiskRate), 105);
     assert_eq!(state.applies.load(Ordering::SeqCst), 1);
     stop_and_join(&mut service);
+  }
+
+  #[test]
+  fn history_orders_failed_write_mandatory_readback_ack_and_reconciliation() {
+    let ceiling = DomainResources::ZERO.with(DomainResource::Control, 1 << 20);
+    let domain = ResourceDomain::with_waiters(ceiling, 1, 0).unwrap();
+    let tenant = domain.tenant(ceiling).unwrap();
+    let state = ActuatorState::new([100, 100, 100]);
+    let (sensor, _) = TestSensor::new(Signal::DiskHealthy);
+    let mut service = ResourceFeedbackService::start_in_tenant_with_history(
+      config(),
+      sensor,
+      TestActuator::with_disk_mode(Arc::clone(&state), DiskApplyMode::PartialThenError),
+      &tenant,
+      history_config(128),
+    )
+    .unwrap();
+    let metrics = service.metrics_handle();
+    assert!(wait_until(Duration::from_secs(2), || {
+      service
+        .metrics()
+        .control(FeedbackResource::DiskRate)
+        .policy_faulted
+    }));
+    service
+      .request_reconcile(FeedbackResource::DiskRate)
+      .unwrap();
+    assert!(wait_until(Duration::from_secs(2), || {
+      let control = service.metrics().control(FeedbackResource::DiskRate);
+      !control.policy_faulted
+        && control.current_limit == 105
+        && service.metrics().reconciliation_in_flight.is_none()
+    }));
+    stop_and_join(&mut service);
+
+    let mut output = [None; 128];
+    let read = metrics.read_history_after(0, &mut output).unwrap();
+    assert!(!read.truncated);
+    let events = &output[..read.written];
+    let apply_index = events
+      .iter()
+      .position(|event| {
+        matches!(
+          event.unwrap().kind,
+          FeedbackEventKind::Apply {
+            ticket,
+            outcome: FeedbackApplyOutcome::Failed(FeedbackActuatorError::OperationFailed),
+            ..
+          } if ticket.resource() == FeedbackResource::DiskRate
+        )
+      })
+      .expect("failed disk write must be recorded");
+    let post_index = events
+      .iter()
+      .position(|event| {
+        matches!(
+          event.unwrap().kind,
+          FeedbackEventKind::PostApplyReadback {
+            ticket,
+            outcome: FeedbackReadbackOutcome::Value(105),
+            ..
+          } if ticket.resource() == FeedbackResource::DiskRate
+        )
+      })
+      .expect("mandatory partial-limit readback must be recorded");
+    let acknowledgement_index = events
+      .iter()
+      .position(|event| {
+        matches!(
+          event.unwrap().kind,
+          FeedbackEventKind::Acknowledgement {
+            ticket,
+            result: ActuationResult::Failed,
+            accepted: true,
+            current_limit: 100,
+            faulted: true,
+            ..
+          } if ticket.resource() == FeedbackResource::DiskRate
+        )
+      })
+      .expect("fault-latching acknowledgement must be recorded");
+    let requested_index = events
+      .iter()
+      .position(|event| {
+        matches!(
+          event.unwrap().kind,
+          FeedbackEventKind::ReconciliationRequested {
+            resource: FeedbackResource::DiskRate
+          }
+        )
+      })
+      .expect("owner reconciliation request must be recorded");
+    let started_index = events
+      .iter()
+      .position(|event| {
+        matches!(
+          event.unwrap().kind,
+          FeedbackEventKind::ReconciliationStarted {
+            resource: FeedbackResource::DiskRate
+          }
+        )
+      })
+      .expect("worker reconciliation start must be recorded");
+    let readback_index = events
+      .iter()
+      .position(|event| {
+        matches!(
+          event.unwrap().kind,
+          FeedbackEventKind::ReconciliationReadback {
+            resource: FeedbackResource::DiskRate,
+            outcome: FeedbackReadbackOutcome::Value(105),
+            ..
+          }
+        )
+      })
+      .expect("reconciliation readback must be recorded");
+    let finished_index = events
+      .iter()
+      .position(|event| {
+        matches!(
+          event.unwrap().kind,
+          FeedbackEventKind::ReconciliationFinished {
+            resource: FeedbackResource::DiskRate,
+            actual_limit: Some(105),
+            accepted: true,
+            current_limit: 105,
+            faulted: false,
+            ..
+          }
+        )
+      })
+      .expect("policy reconciliation result must be recorded");
+    assert!(apply_index < post_index);
+    assert!(post_index < acknowledgement_index);
+    assert!(acknowledgement_index < requested_index);
+    assert!(requested_index < started_index);
+    assert!(started_index < readback_index);
+    assert!(readback_index < finished_index);
+    assert_eq!(
+      events[read.written - 1].unwrap().kind,
+      FeedbackEventKind::WorkerJoined { panicked: false }
+    );
   }
 
   #[test]

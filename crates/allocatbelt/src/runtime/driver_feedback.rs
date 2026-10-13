@@ -12,7 +12,8 @@ use super::super::byte_rate::ByteRateLimit;
 use super::super::managed::ResourceScope;
 use super::super::resource_domain::{DomainError, TenantDomain};
 use super::super::resource_feedback::{
-  FeedbackActuator, FeedbackSensor, FeedbackStartError, ResourceFeedbackService,
+  FeedbackActuator, FeedbackHistoryConfig, FeedbackSensor, FeedbackStartError,
+  ResourceFeedbackService,
 };
 use super::super::resource_feedback_meter::IoFeedbackMeter;
 use super::super::resource_feedback_policy::{
@@ -109,6 +110,9 @@ pub enum FeedbackFactoryError {
   Sources(io::Error),
   /// Sensor, actuator, or feedback worker startup failed.
   Service(FeedbackStartError),
+  /// History-enabled feedback requires a tenant whose Control ledger can
+  /// charge the retained ring.
+  HistoryRequiresTenant,
 }
 
 impl fmt::Display for FeedbackFactoryError {
@@ -117,6 +121,9 @@ impl fmt::Display for FeedbackFactoryError {
       Self::InvalidPolicy(error) => write!(f, "invalid feedback policy: {error}"),
       Self::Sources(error) => write!(f, "feedback source construction failed: {error}"),
       Self::Service(error) => error.fmt(f),
+      Self::HistoryRequiresTenant => {
+        f.write_str("feedback history requires a tenant Control ledger")
+      }
     }
   }
 }
@@ -127,6 +134,7 @@ impl std::error::Error for FeedbackFactoryError {
       Self::InvalidPolicy(error) => Some(error),
       Self::Sources(error) => Some(error),
       Self::Service(error) => Some(error),
+      Self::HistoryRequiresTenant => None,
     }
   }
 }
@@ -187,15 +195,57 @@ where
   S: FeedbackSensor,
   A: FeedbackActuator,
 {
+  feedback_sources_inner(policy, None, sources)
+}
+
+/// Creates a reusable feedback source factory with charged bounded history.
+///
+/// Every driver build must provide a tenant-bound resource scope. History is
+/// reserved from that tenant's Control ledger before source callbacks or
+/// actuator readbacks run; ordinary [`feedback_sources`] remains history-off.
+pub fn feedback_sources_with_history<F, S, A>(
+  policy: ResourceFeedbackPolicyConfig,
+  history: FeedbackHistoryConfig,
+  sources: F,
+) -> FeedbackFactory
+where
+  F: Fn(FeedbackContext) -> io::Result<(S, A)> + Send + Sync + 'static,
+  S: FeedbackSensor,
+  A: FeedbackActuator,
+{
+  feedback_sources_inner(policy, Some(history), sources)
+}
+
+fn feedback_sources_inner<F, S, A>(
+  policy: ResourceFeedbackPolicyConfig,
+  history: Option<FeedbackHistoryConfig>,
+  sources: F,
+) -> FeedbackFactory
+where
+  F: Fn(FeedbackContext) -> io::Result<(S, A)> + Send + Sync + 'static,
+  S: FeedbackSensor,
+  A: FeedbackActuator,
+{
   let invalid_policy = ResourceFeedbackPolicy::new(policy).err();
   let build = Arc::new(move |context: FeedbackContext| {
     let tenant = context.resources.tenant_domain().cloned();
-    let (sensor, actuator) = sources(context).map_err(FeedbackFactoryError::Sources)?;
-    match tenant {
-      Some(tenant) => ResourceFeedbackService::start_in_tenant(policy, sensor, actuator, &tenant),
-      None => ResourceFeedbackService::start(policy, sensor, actuator),
-    }
-    .map_err(FeedbackFactoryError::Service)
+    let service = if let Some(history) = history {
+      let Some(tenant) = tenant else {
+        return Err(FeedbackFactoryError::HistoryRequiresTenant);
+      };
+      let prepared =
+        ResourceFeedbackService::prepare_in_tenant_with_history::<S, A>(policy, &tenant, history)
+          .map_err(FeedbackFactoryError::Service)?;
+      let (sensor, actuator) = sources(context).map_err(FeedbackFactoryError::Sources)?;
+      ResourceFeedbackService::start_with_prepared_history(sensor, actuator, prepared)
+    } else {
+      let (sensor, actuator) = sources(context).map_err(FeedbackFactoryError::Sources)?;
+      match tenant {
+        Some(tenant) => ResourceFeedbackService::start_in_tenant(policy, sensor, actuator, &tenant),
+        None => ResourceFeedbackService::start(policy, sensor, actuator),
+      }
+    };
+    service.map_err(FeedbackFactoryError::Service)
   });
   FeedbackFactory {
     build,
@@ -206,13 +256,14 @@ where
 #[cfg(test)]
 mod tests {
   use super::*;
+  use std::num::NonZeroUsize;
   use std::sync::atomic::{AtomicU64, Ordering};
   use std::time::{Duration, Instant};
 
   use crate::runtime::managed::ResourceLimits;
   use crate::runtime::resource_domain::{DomainResource, DomainResources, ResourceDomain};
   use crate::runtime::resource_feedback::{
-    FeedbackActuatorError, FeedbackSensorError, FeedbackShutdownProgress,
+    FeedbackActuatorError, FeedbackEventKind, FeedbackSensorError, FeedbackShutdownProgress,
   };
   use crate::runtime::resource_feedback_policy::{
     FeedbackControlConfig, FeedbackResource, FeedbackSample, PlanTicket,
@@ -314,6 +365,178 @@ mod tests {
     let retained = stable_control_usage(&domain, Duration::from_secs(2));
     assert!(retained > before);
     drop(metrics);
+    assert_eq!(
+      stable_control_usage(&domain, Duration::from_secs(2)),
+      before
+    );
+  }
+
+  #[test]
+  fn history_feedback_factory_requires_a_tenant_before_source_construction() {
+    let called = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let source_called = Arc::clone(&called);
+    let factory = feedback_sources_with_history(
+      policy(),
+      FeedbackHistoryConfig::new(NonZeroUsize::new(8).unwrap()),
+      move |_| {
+        source_called.fetch_add(1, Ordering::SeqCst);
+        Ok((QuietSensor, FixedActuator::new()))
+      },
+    );
+    let context = FeedbackContext {
+      resources: ResourceScope::new(ResourceLimits::default()),
+      disk_rate: None,
+      upload_rate: None,
+      download_rate: None,
+      disk_meter: IoFeedbackMeter::new(),
+      upload_meter: IoFeedbackMeter::new(),
+      download_meter: IoFeedbackMeter::new(),
+      runtime_metrics: None,
+    };
+    assert!(matches!(
+      factory.build(context),
+      Err(FeedbackFactoryError::HistoryRequiresTenant)
+    ));
+    assert_eq!(called.load(Ordering::SeqCst), 0);
+  }
+
+  #[test]
+  fn history_feedback_factory_reserves_control_before_source_construction() {
+    let ceiling = DomainResources::ZERO.with(DomainResource::Control, 1 << 20);
+    let domain = ResourceDomain::with_waiters(ceiling, 1, 0).unwrap();
+    let tenant = domain.tenant(ceiling).unwrap();
+    tenant
+      .set_limits(DomainResources::ZERO.with(DomainResource::Control, 0))
+      .unwrap();
+    let source_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let observed_calls = Arc::clone(&source_calls);
+    let factory = feedback_sources_with_history(
+      policy(),
+      FeedbackHistoryConfig::new(NonZeroUsize::new(8).unwrap()),
+      move |_| {
+        observed_calls.fetch_add(1, Ordering::SeqCst);
+        Ok((QuietSensor, FixedActuator::new()))
+      },
+    );
+    let context = FeedbackContext {
+      resources: ResourceScope::from_tenant(ResourceLimits::default(), tenant),
+      disk_rate: None,
+      upload_rate: None,
+      download_rate: None,
+      disk_meter: IoFeedbackMeter::new(),
+      upload_meter: IoFeedbackMeter::new(),
+      download_meter: IoFeedbackMeter::new(),
+      runtime_metrics: None,
+    };
+
+    assert!(matches!(
+      factory.build(context),
+      Err(FeedbackFactoryError::Service(FeedbackStartError::Domain(
+        DomainError::Exhausted(DomainResource::Control)
+      )))
+    ));
+    assert_eq!(source_calls.load(Ordering::SeqCst), 0);
+  }
+
+  #[test]
+  fn history_feedback_factory_releases_precharge_when_source_creation_fails() {
+    let ceiling = DomainResources::ZERO.with(DomainResource::Control, 1 << 20);
+    let domain = Arc::new(ResourceDomain::with_waiters(ceiling, 1, 0).unwrap());
+    let tenant = domain.tenant(ceiling).unwrap();
+    let before = domain.snapshot().used.get(DomainResource::Control);
+    let observed_domain = Arc::clone(&domain);
+    let saw_precharge = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let source_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let observed_precharge = Arc::clone(&saw_precharge);
+    let observed_calls = Arc::clone(&source_calls);
+    let factory = feedback_sources_with_history(
+      policy(),
+      FeedbackHistoryConfig::new(NonZeroUsize::new(8).unwrap()),
+      move |_| -> io::Result<(QuietSensor, FixedActuator)> {
+        observed_calls.fetch_add(1, Ordering::SeqCst);
+        observed_precharge.store(
+          observed_domain.snapshot().used.get(DomainResource::Control) > before,
+          Ordering::SeqCst,
+        );
+        Err(io::Error::other("intentional source construction refusal"))
+      },
+    );
+    let context = FeedbackContext {
+      resources: ResourceScope::from_tenant(ResourceLimits::default(), tenant),
+      disk_rate: None,
+      upload_rate: None,
+      download_rate: None,
+      disk_meter: IoFeedbackMeter::new(),
+      upload_meter: IoFeedbackMeter::new(),
+      download_meter: IoFeedbackMeter::new(),
+      runtime_metrics: None,
+    };
+
+    assert!(matches!(
+      factory.build(context),
+      Err(FeedbackFactoryError::Sources(_))
+    ));
+    assert_eq!(source_calls.load(Ordering::SeqCst), 1);
+    assert!(saw_precharge.load(Ordering::SeqCst));
+    assert_eq!(
+      stable_control_usage(&domain, Duration::from_secs(2)),
+      before
+    );
+  }
+
+  #[test]
+  fn history_feedback_factory_records_joined_shutdown_and_retains_charge_with_handle() {
+    let ceiling = DomainResources::ZERO.with(DomainResource::Control, 1 << 20);
+    let domain = ResourceDomain::with_waiters(ceiling, 1, 0).unwrap();
+    let tenant = domain.tenant(ceiling).unwrap();
+    let before = domain.snapshot().used.get(DomainResource::Control);
+    let context = FeedbackContext {
+      resources: ResourceScope::from_tenant(ResourceLimits::default(), tenant),
+      disk_rate: None,
+      upload_rate: None,
+      download_rate: None,
+      disk_meter: IoFeedbackMeter::new(),
+      upload_meter: IoFeedbackMeter::new(),
+      download_meter: IoFeedbackMeter::new(),
+      runtime_metrics: None,
+    };
+    let factory = feedback_sources_with_history(
+      policy(),
+      FeedbackHistoryConfig::new(NonZeroUsize::new(32).unwrap()),
+      |_| Ok((QuietSensor, FixedActuator::new())),
+    );
+    let mut service = factory.build(context).unwrap();
+    let metrics = service.metrics_handle();
+    let retained_metrics = metrics.clone();
+    assert!(domain.snapshot().used.get(DomainResource::Control) > before);
+
+    service.request_stop();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+      match service.try_shutdown() {
+        Ok(FeedbackShutdownProgress::Complete) => break,
+        Ok(FeedbackShutdownProgress::Pending) => {
+          assert!(Instant::now() < deadline, "history service did not join");
+          std::thread::yield_now();
+        }
+        Err(error) => panic!("history service failed to join: {error}"),
+      }
+    }
+    let mut events = [None; 8];
+    let read = metrics.read_history_after(0, &mut events).unwrap();
+    assert!(events[..read.written].iter().any(|event| matches!(
+      event.unwrap().kind,
+      FeedbackEventKind::WorkerJoined { panicked: false }
+    )));
+    drop(service);
+    let retained = stable_control_usage(&domain, Duration::from_secs(2));
+    assert!(retained > before);
+    drop(metrics);
+    assert_eq!(
+      stable_control_usage(&domain, Duration::from_secs(2)),
+      retained
+    );
+    drop(retained_metrics);
     assert_eq!(
       stable_control_usage(&domain, Duration::from_secs(2)),
       before
