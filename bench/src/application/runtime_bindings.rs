@@ -285,13 +285,22 @@ impl FeedbackCalibrations {
       return Err("capacity calibration run identity is malformed".into());
     }
     let parsed = parse_capacity_calibration(&bytes, identity)?;
-    if identity.pressure_qualification
-      && (parsed.disk.bytes_per_second.is_none() || parsed.download.bytes_per_second.is_none())
-    {
-      return Err(
-        "pressure qualification requires calibrated disk and download application-byte capacities"
-          .into(),
-      );
+    if identity.pressure_qualification {
+      let (needs_disk, needs_download) = match identity.workload {
+        "cpu" | "memory" => (false, false),
+        "disk" => (true, false),
+        "http" => (false, true),
+        "mixed" => (true, true),
+        _ => return Err("pressure calibration names an unsupported workload".into()),
+      };
+      if (needs_disk && parsed.disk.bytes_per_second.is_none())
+        || (needs_download && parsed.download.bytes_per_second.is_none())
+      {
+        return Err(
+          "pressure qualification requires capacities for the workload's application-byte sources"
+            .into(),
+        );
+      }
     }
     let payload = String::from_utf8(bytes)
       .map_err(|_| "capacity calibration artifact is not UTF-8".to_owned())?;

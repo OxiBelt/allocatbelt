@@ -302,7 +302,7 @@ fn capacity_artifact_binds_candidate_host_context_and_rejects_profile_mismatch()
 
 #[cfg(feature = "resource-feedback")]
 #[test]
-fn capacity_artifact_hash_covers_exact_bytes_and_qualification_requires_both_directions() {
+fn capacity_artifact_hash_covers_exact_bytes_and_qualification_requires_applicable_sources() {
   let bytes = capacity_artifact("5000000", APPLICATION_BYTE_CALIBRATION_UNITS);
   let hash = capacity_artifact_hash::sha256_hex(&bytes);
   let path = write_calibration_test_file(&bytes);
@@ -367,17 +367,17 @@ fn capacity_artifact_hash_covers_exact_bytes_and_qualification_requires_both_dir
   let missing_hash = capacity_artifact_hash::sha256_hex(&missing_download);
   let missing_path = write_calibration_test_file(&missing_download);
   let before_missing = domain.snapshot().used.get(DomainResource::Control);
-  assert!(
-    load_capacity_test_file(
-      &tenant,
-      &missing_path,
-      &missing_hash,
-      "steady",
-      &source_sha,
-      true,
-    )
-    .is_err()
-  );
+  let disk_only = load_capacity_test_file(
+    &tenant,
+    &missing_path,
+    &missing_hash,
+    "steady",
+    &source_sha,
+    true,
+  )
+  .expect("disk workload does not require a download denominator");
+  assert_eq!(disk_only.download_capacity(), None);
+  drop(disk_only);
   assert_eq!(
     domain.snapshot().used.get(DomainResource::Control),
     before_missing
@@ -386,6 +386,79 @@ fn capacity_artifact_hash_covers_exact_bytes_and_qualification_requires_both_dir
   drop(domain);
   for artifact_path in [path, tampered_path, missing_path] {
     std::fs::remove_file(artifact_path).expect("remove calibration test artifact");
+  }
+}
+
+#[cfg(feature = "resource-feedback")]
+#[test]
+fn pressure_capacity_requirements_follow_the_actual_workload() {
+  let control = DomainResources::ZERO.with(DomainResource::Control, 1024 * 1024);
+  let domain = ResourceDomain::new(control, 1).expect("calibration domain");
+  let tenant = domain.tenant(control).expect("calibration tenant");
+  let source = "a".repeat(64);
+  for (workload, disk, download, expected) in [
+    ("cpu", false, false, true),
+    ("memory", false, false, true),
+    ("disk", true, false, true),
+    ("http", false, true, true),
+    ("mixed", true, true, true),
+    ("disk", false, true, false),
+    ("http", true, false, false),
+    ("mixed", true, false, false),
+    ("mixed", false, true, false),
+  ] {
+    let mut text = String::from_utf8(capacity_artifact(
+      if download { "5000000" } else { "missing" },
+      if download {
+        APPLICATION_BYTE_CALIBRATION_UNITS
+      } else {
+        "missing"
+      },
+    ))
+    .expect("artifact UTF-8")
+    .replace("workload\tdisk", &format!("workload\t{workload}"));
+    if !disk {
+      text = text
+        .replace(
+          "disk.bytes_per_second\t1000000",
+          "disk.bytes_per_second\tmissing",
+        )
+        .replace(
+          &format!("disk.units\t{APPLICATION_BYTE_CALIBRATION_UNITS}"),
+          "disk.units\tmissing",
+        );
+    }
+    let bytes = text.into_bytes();
+    let hash = capacity_artifact_hash::sha256_hex(&bytes);
+    let identity = CalibrationRunIdentity {
+      workload,
+      ..capacity_test_identity("steady", &source, true)
+    };
+    let baseline = tenant
+      .snapshot()
+      .expect("baseline")
+      .used
+      .get(DomainResource::Control);
+    let charge = tenant
+      .try_acquire(
+        DomainResources::ZERO.with(DomainResource::Control, CALIBRATION_ARTIFACT_CONTROL_CHARGE),
+      )
+      .expect("calibration charge");
+    let result = FeedbackCalibrations::from_bytes_with_charge(bytes, &hash, &identity, charge);
+    assert_eq!(
+      result.is_ok(),
+      expected,
+      "workload={workload} disk={disk} download={download}"
+    );
+    drop(result);
+    assert_eq!(
+      tenant
+        .snapshot()
+        .expect("released")
+        .used
+        .get(DomainResource::Control),
+      baseline
+    );
   }
 }
 
