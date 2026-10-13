@@ -17,20 +17,78 @@
 #    that expose less (or more) than the host, as a guest would: only what
 #    the process sees is detected.
 #
-# Needs docker, qemu-user and the `$(uname -m)-unknown-linux-musl` Rust
-# target. On a GitHub-hosted runner, which is itself a VM, (1) and (2) are
-# Docker in a VM.
+# Process tests also need static Bash and BusyBox (cat, head, sleep and yes).
+# Set ALLOCATBELT_SANDBOX_BASH and ALLOCATBELT_SANDBOX_BUSYBOX to select
+# explicit executable paths. The fixture image contains only those tools.
+# Needs docker, qemu-user, readelf and the
+# `$(uname -m)-unknown-linux-musl` Rust target. On a GitHub-hosted runner,
+# which is itself a VM, (1) and (2) are Docker in a VM.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
 arch="$(uname -m)"
 target="${arch}-unknown-linux-musl"
-image=allocatbelt-empty
+bash_fixture="${ALLOCATBELT_SANDBOX_BASH:-/bin/bash-static}"
+busybox_fixture="${ALLOCATBELT_SANDBOX_BUSYBOX:-/bin/busybox}"
+build_work="$(mktemp -d)"
+chmod 0700 "${build_work}"
+trap 'rm -rf -- "${build_work}"' EXIT
+freeze_fixture() {
+  local path="$1" destination="$2"
+  [[ -f "${path}" && -x "${path}" ]] ||
+    { echo "FAIL: missing executable static fixture: ${path}" >&2; exit 1; }
+  install -m 0555 "${path}" "${destination}"
+}
+freeze_fixture "${bash_fixture}" "${build_work}/bash"
+freeze_fixture "${busybox_fixture}" "${build_work}/busybox"
+bash_fixture="${build_work}/bash"
+busybox_fixture="${build_work}/busybox"
+
+static_fixture() {
+  local path="$1" header machine
+  [[ -f "${path}" && -x "${path}" ]] ||
+    { echo "FAIL: missing executable static fixture: ${path}" >&2; exit 1; }
+  header="$(LC_ALL=C readelf -h -- "${path}")" ||
+    { echo "FAIL: fixture is not an ELF executable: ${path}" >&2; exit 1; }
+  case "${arch}" in
+    x86_64) machine='Advanced Micro Devices X86-64' ;;
+    aarch64) machine='AArch64' ;;
+    riscv64) machine='RISC-V' ;;
+    *) echo "FAIL: unsupported fixture architecture: ${arch}" >&2; exit 1 ;;
+  esac
+  if ! grep -Eq 'Class:[[:space:]]+ELF64$' <<<"${header}" ||
+    ! grep -Eq 'Data:.*little endian$' <<<"${header}" ||
+    ! grep -Eq "Machine:[[:space:]]+${machine}$" <<<"${header}"; then
+    echo "FAIL: fixture must be a native 64-bit little-endian ELF: ${path}" >&2
+    exit 1
+  fi
+  local segments dynamic
+  segments="$(LC_ALL=C readelf -l -- "${path}")" || exit 1
+  dynamic="$(LC_ALL=C readelf -d -- "${path}")" || exit 1
+  if grep -Eq '(^|[[:space:]])INTERP([[:space:]]|$)' <<<"${segments}" ||
+    grep -q '(NEEDED)' <<<"${dynamic}"; then
+    echo "FAIL: fixture must be statically linked: ${path}" >&2
+    exit 1
+  fi
+}
+static_fixture "${bash_fixture}"
+static_fixture "${busybox_fixture}"
+# Paths and host metadata do not enter the identity. The version fixes the
+# layout, permissions and canonical tar metadata used below.
+fixture_id="$(
+  {
+    printf '%s\n' 'allocatbelt-sandbox-static-fixtures-v1' \
+      'bin/bash' 'bin/busybox' 'bin/sh->bash' \
+      'bin/cat->busybox' 'bin/head->busybox' 'bin/sleep->busybox' 'bin/yes->busybox'
+    sha256sum -- "${bash_fixture}" "${busybox_fixture}" | awk '{print $1}'
+  } | sha256sum | awk '{print $1}'
+)"
+bash_hash="$(sha256sum -- "${bash_fixture}" | awk '{print $1}')"
+busybox_hash="$(sha256sum -- "${busybox_fixture}" | awk '{print $1}')"
+image="allocatbelt-sandbox-fixtures:${fixture_id}"
 
 echo "== building static test binaries (${target})"
 # Test binaries only: `cargo test` also builds the examples, elsewhere.
-build_work="$(mktemp -d)"
-trap 'rm -rf -- "${build_work}"' EXIT
 if ! cargo test --release --locked -p allocatbelt --features io-uring,runtime \
   --target "${target}" --no-run --message-format=json >"${build_work}/artifacts.jsonl"; then
   cat "${build_work}/artifacts.jsonl" >&2
@@ -52,23 +110,51 @@ for b in "${bins[@]}"; do
 done
 [[ -n "${sandbox}" ]] || { echo "FAIL: no sandbox test binary" >&2; exit 1; }
 
-# An empty image: the binaries are static and mounted read-only.
+# Only static process-test fixtures are added; the tests remain mounted
+# read-only and every container keeps the same hardening restrictions.
 if ! docker image inspect "${image}" >/dev/null 2>&1; then
-  tar -cf - --files-from /dev/null | docker import - "${image}" >/dev/null
+  fixture_root="${build_work}/fixture"
+  install -d -m 0755 "${fixture_root}/bin"
+  install -m 0555 "${bash_fixture}" "${fixture_root}/bin/bash"
+  install -m 0555 "${busybox_fixture}" "${fixture_root}/bin/busybox"
+  ln -s bash "${fixture_root}/bin/sh"
+  for applet in cat head sleep yes; do
+    ln -s busybox "${fixture_root}/bin/${applet}"
+  done
+  chmod 0755 "${fixture_root}"
+  tar --sort=name --mtime=@0 --owner=0 --group=0 --numeric-owner \
+    -C "${fixture_root}" -cf - . | docker import - "${image}" >/dev/null
 fi
+image_id="$(docker image inspect --format '{{.Id}}' "${image}")"
+[[ "${image_id}" =~ ^sha256:[0-9a-f]{64}$ ]] ||
+  { echo 'FAIL: fixture image has no immutable Docker identity' >&2; exit 1; }
+echo "== static process fixtures (${image})"
 hardened=(
   --rm --network none --user 10001:10001 --cap-drop ALL --read-only
   --tmpfs '/tmp:rw,nosuid,nodev,size=64m,mode=1777'
   --security-opt no-new-privileges:true -v "${dir}:/t:ro"
 )
+fixture_hashes="$(docker run "${hardened[@]}" "${image_id}" \
+  /bin/busybox sha256sum /bin/bash /bin/busybox)"
+expected_hashes="$(printf '%s  /bin/bash\n%s  /bin/busybox' "${bash_hash}" "${busybox_hash}")"
+[[ "${fixture_hashes}" == "${expected_hashes}" ]] ||
+  { echo 'FAIL: fixture image executable hashes differ from validated inputs' >&2; exit 1; }
 
 echo "== every test binary in a hardened container"
 for b in "${bins[@]}"; do
   name="$(basename "$b")"
   echo "-- ${name}"
   # The sources are not in the container; that check runs outside.
-  docker run "${hardened[@]}" "${image}" "/t/${name}" --test-threads=1 -q \
-    --skip no_hidden_host_probes | grep -E '^test result'
+  binary_log="${build_work}/${name}.log"
+  status=0
+  docker run "${hardened[@]}" "${image_id}" "/t/${name}" --test-threads=1 -q \
+    --skip no_hidden_host_probes >"${binary_log}" 2>&1 || status=$?
+  if [[ "${status}" -ne 0 ]]; then
+    cat "${binary_log}" >&2
+    echo "FAIL: ${name} container exited ${status}" >&2
+    exit "${status}"
+  fi
+  grep -E '^test result' "${binary_log}"
 done
 
 scenario() {
@@ -76,12 +162,12 @@ scenario() {
   local env="$1" profile="$2" test="maintenance::$3" opts=()
   [[ -n "${profile}" ]] && opts=(--security-opt "seccomp=scripts/seccomp/${profile}.json")
   echo "-- ${test} (${env}${profile:+, seccomp ${profile}})"
-  docker run "${hardened[@]}" "${opts[@]}" -e "ALLOCATBELT_SANDBOX=${env}" "${image}" \
+  docker run "${hardened[@]}" "${opts[@]}" -e "ALLOCATBELT_SANDBOX=${env}" "${image_id}" \
     "/t/${sandbox}" --exact "${test}" --nocapture --test-threads=1 2>&1 |
     grep -E '^(test |io_uring:|scheduler:|maintenance:)' || true
   # Require the exact test to run; a misspelled filter otherwise succeeds
   # with zero tests, even when the container's exit status is zero.
-  docker run "${hardened[@]}" "${opts[@]}" -e "ALLOCATBELT_SANDBOX=${env}" "${image}" \
+  docker run "${hardened[@]}" "${opts[@]}" -e "ALLOCATBELT_SANDBOX=${env}" "${image_id}" \
     "/t/${sandbox}" --exact "${test}" --test-threads=1 -q |
     grep -E '^test result: ok\. 1 passed; 0 failed; 0 ignored;' >/dev/null
 }

@@ -277,10 +277,10 @@ jobs:
           rustup toolchain install 1.99.0 --profile minimal --target "$(uname -m)-unknown-linux-musl"
           rustup default 1.99.0
 
-      - name: Install qemu-user
+      - name: Install qemu-user and static process fixtures
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends qemu-user
+          sudo apt-get install -y --no-install-recommends qemu-user bash-static busybox-static binutils
           docker version --format '{{.Server.Version}}'
           uname -r
 

@@ -51,7 +51,14 @@ Inside a VM (or a VM inside a VM), the allocator uses the guest's view and nothi
 
 ## How it is checked
 
-`scripts/check-sandbox.sh` (CI job "Sandbox and virtualization" on x86_64 and arm64; needs docker, qemu-user and the musl target). GitHub's hosted runners are VMs, so the container runs there are Docker in a VM.
+`scripts/check-sandbox.sh` (CI job "Sandbox and virtualization" on x86_64 and arm64; needs Docker, qemu-user, binutils, static Bash, static BusyBox and the musl target). GitHub's hosted runners are VMs, so the container runs there are Docker in a VM.
+
+Process fixtures use Bash and the `cat`, `head`, `sleep` and `yes` BusyBox
+applets. The script builds a minimal fixture image after checking native static
+ELF executables; it preserves the same container restrictions for every test.
+Use `ALLOCATBELT_SANDBOX_BASH` and `ALLOCATBELT_SANDBOX_BUSYBOX` to select
+explicit fixture executable paths. The image identity binds fixture contents
+and layout, and runs use its resolved immutable image ID.
 
 The static test binaries include the optional runtime. Runtime filesystem and
 Unix-socket tests use a writable `/tmp` tmpfs limited to 64 MiB, with mode 1777,
