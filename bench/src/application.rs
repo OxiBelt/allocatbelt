@@ -32,6 +32,9 @@ use allocatbelt_app_ports::memory::{self, MemoryConfig, MemoryOutput};
 #[path = "application/disk_lane.rs"]
 pub(crate) mod disk_lane;
 #[cfg(feature = "resource-feedback")]
+#[path = "application/feedback_policy_probe.rs"]
+mod feedback_policy_probe;
+#[cfg(feature = "resource-feedback")]
 #[path = "application/feedback_trace.rs"]
 mod feedback_trace;
 #[path = "application/http.rs"]
@@ -3150,6 +3153,26 @@ pub fn main(allocator: &'static str) -> ExitCode {
   let args = env::args().skip(1).collect::<Vec<_>>();
   if args
     .first()
+    .is_some_and(|argument| argument == "--emit-feedback-policy-only")
+  {
+    #[cfg(feature = "resource-feedback")]
+    {
+      return match feedback_policy_probe::emit(args.into_iter()) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+          eprintln!("application feedback policy probe invalid: {error}");
+          ExitCode::from(2)
+        }
+      };
+    }
+    #[cfg(not(feature = "resource-feedback"))]
+    {
+      eprintln!("--emit-feedback-policy-only requires the resource-feedback feature");
+      return ExitCode::from(2);
+    }
+  }
+  if args
+    .first()
     .is_some_and(|argument| argument == "--emit-oracle-only")
   {
     return match emit_oracle_only(args.into_iter()) {
@@ -3374,7 +3397,7 @@ fn validate_arrivals(arrivals: usize) -> Result<(), String> {
 }
 
 fn usage() -> &'static str {
-  "usage: bench-application-* --executor bounded|tokio --workload cpu|memory|http|disk --mode capacity|open_loop [--rate ARRIVALS_PER_SECOND] [--arrivals N] [--trace-deadline-seconds S --drain-deadline-seconds S --shutdown-deadline-seconds S --process-deadline-seconds S]; or --emit-oracle-only PATH --workload cpu|memory|http|disk --rate N --arrivals N"
+  "usage: bench-application-* --executor bounded|tokio --workload cpu|memory|http|disk --mode capacity|open_loop [--rate ARRIVALS_PER_SECOND] [--arrivals N] [--trace-deadline-seconds S --drain-deadline-seconds S --shutdown-deadline-seconds S --process-deadline-seconds S]; or --emit-oracle-only PATH --workload cpu|memory|http|disk --rate N --arrivals N; or --emit-feedback-policy-only --workload cpu|memory|http|disk|mixed --profile steady|mixed|burst|oversubscribed"
 }
 
 fn print_row(allocator: &str, options: Options, counts: &Counts) {

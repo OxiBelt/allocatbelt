@@ -48,6 +48,8 @@ use super::{Workload, resource_limits};
 pub(crate) const APPLICATION_TASK_CEILING: usize = 64;
 pub(crate) const RUNTIME_BINDING_RECEIPT_SCHEMA_V2: &str =
   "allocatbelt.application-runtime-binding.v2";
+#[cfg(feature = "resource-feedback")]
+pub(crate) const FEEDBACK_MINIMUM_DENSE_OBSERVATIONS: u32 = 1;
 pub(crate) const CPU_WAITER_CEILING: usize = APPLICATION_TASK_CEILING;
 // CPU-gate waiter leases consume 64 fixed slots. The remaining 192 slots
 // cover the owning async pool, filesystem pool, and bounded service roles.
@@ -589,12 +591,50 @@ impl FeedbackMeterCaptureOwner {
   }
 }
 
-fn fixed_rate_config() -> ByteRateConfig {
+pub(crate) fn fixed_rate_config() -> ByteRateConfig {
   ByteRateConfig {
     bytes_per_second: APPLICATION_RATE_CEILING_BYTES_PER_SECOND,
     burst_bytes: RATE_BURST_BYTES,
     max_reservations: RATE_RESERVATIONS,
   }
+}
+
+pub(crate) fn application_domain_limits(
+  local_limits: ResourceLimits,
+  workers: usize,
+) -> Result<DomainResources, String> {
+  if workers == 0 || workers > 4 {
+    return Err("feedback policy probe requires a two- or four-worker bound".into());
+  }
+  Ok(
+    DomainResources::ZERO
+      .with(DomainResource::Cpu, workers)
+      .with(DomainResource::Memory, local_limits.managed_memory)
+      .with(DomainResource::Disk, local_limits.disk_concurrent_ops)
+      .with(DomainResource::Network, local_limits.network_concurrent_ops)
+      .with(DomainResource::Tasks, APPLICATION_TASK_CEILING)
+      .with(DomainResource::Control, DOMAIN_CONTROL_CEILING),
+  )
+}
+
+#[cfg(feature = "resource-feedback")]
+pub(crate) fn construction_global_control_baseline(
+  domain_limits: DomainResources,
+) -> Result<usize, String> {
+  let domain = ResourceDomain::with_waiters(domain_limits, 1, DOMAIN_WAITER_CEILING)
+    .map_err(|error| format!("feedback policy baseline construction failed: {error:?}"))?;
+  let snapshot = domain.snapshot();
+  if snapshot.live_tenants != 0 {
+    return Err("feedback policy baseline construction unexpectedly created a tenant".into());
+  }
+  let baseline = snapshot.used.get(DomainResource::Control);
+  drop(domain);
+  Ok(baseline)
+}
+
+#[cfg(feature = "resource-feedback")]
+pub(crate) fn feedback_policy_control_config(workers: usize) -> ResourceFeedbackPolicyConfig {
+  feedback_policy(workers)
 }
 
 /// Pre-runtime owner shared by both executor variants.
@@ -682,13 +722,7 @@ impl ApplicationDomain {
       return Err("application runtime requires a frozen two- or four-worker bound".into());
     }
     let local_limits = resource_limits(workload);
-    let domain_limits = DomainResources::ZERO
-      .with(DomainResource::Cpu, workers)
-      .with(DomainResource::Memory, local_limits.managed_memory)
-      .with(DomainResource::Disk, local_limits.disk_concurrent_ops)
-      .with(DomainResource::Network, local_limits.network_concurrent_ops)
-      .with(DomainResource::Tasks, APPLICATION_TASK_CEILING)
-      .with(DomainResource::Control, DOMAIN_CONTROL_CEILING);
+    let domain_limits = application_domain_limits(local_limits, workers)?;
     let domain = ResourceDomain::with_waiters(domain_limits, 1, DOMAIN_WAITER_CEILING)
       .map_err(|error| format!("application resource-domain startup failed: {error:?}"))?;
     let fixed_global_control_baseline = domain.snapshot().used.get(DomainResource::Control);
@@ -818,7 +852,7 @@ impl ApplicationDomain {
               .map(|capacity| IoFeedbackSource::new(context.disk_meter.clone(), capacity)),
             download_capacity
               .map(|capacity| IoFeedbackSource::new(context.download_meter.clone(), capacity)),
-            NonZeroU32::new(1).ok_or_else(|| {
+            NonZeroU32::new(FEEDBACK_MINIMUM_DENSE_OBSERVATIONS).ok_or_else(|| {
               std::io::Error::new(std::io::ErrorKind::InvalidInput, "zero density threshold")
             })?,
           );
@@ -1066,7 +1100,7 @@ impl ApplicationDomain {
 }
 
 #[cfg(feature = "resource-feedback")]
-fn feedback_policy(workers: usize) -> ResourceFeedbackPolicyConfig {
+pub(crate) fn feedback_policy(workers: usize) -> ResourceFeedbackPolicyConfig {
   let cpu = workers as u64;
   ResourceFeedbackPolicyConfig {
     cpu_concurrency: FeedbackControlConfig::new(
@@ -1118,7 +1152,8 @@ fn feedback_sensor(
   let cpu_capacity =
     NonZeroU32::new(u32::try_from(workers).map_err(|_| "feedback CPU capacity does not fit u32")?)
       .ok_or("feedback CPU capacity must be positive")?;
-  let density = NonZeroU32::new(1).ok_or("feedback density threshold must be positive")?;
+  let density = NonZeroU32::new(FEEDBACK_MINIMUM_DENSE_OBSERVATIONS)
+    .ok_or("feedback density threshold must be positive")?;
   Ok(RuntimeFeedbackSensor::new(
     ProcessCpuSensor::new(cpu_capacity)
       .map_err(|error| format!("process CPU sensor startup failed: {error}"))?,
@@ -1908,7 +1943,7 @@ fn feedback_policy_rows(
     ),
     (
       "feedback.minimum_dense_observations".to_owned(),
-      "1".to_owned(),
+      FEEDBACK_MINIMUM_DENSE_OBSERVATIONS.to_string(),
     ),
     (
       "feedback.cpu_reduction_rule".to_owned(),
