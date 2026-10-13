@@ -1009,12 +1009,15 @@ def _stable_file_sha256(path: Path, label: str, maximum: int) -> tuple[str, int,
 
 def _leader_exit_status_unreaped(process: subprocess.Popen[bytes]) -> Any | None:
     """Observe child exit without releasing the PID that anchors its new session."""
+    require(signal.getsignal(signal.SIGCHLD) == signal.SIG_DFL, "probe cleanup requires the default SIGCHLD disposition to preserve child ownership")
+    require(callable(getattr(os, "waitid", None)) and hasattr(os, "WNOWAIT"), "probe cleanup requires waitid(WNOWAIT) to preserve child ownership")
     require(process.returncode is None, "probe leader was reaped before process-group cleanup completed")
     try:
         result = os.waitid(os.P_PID, process.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
     except ChildProcessError as error:
         raise ValidationError("probe leader ownership was lost before its process group was verified") from error
-    if result is not None and result.si_pid == process.pid:
+    if result is not None:
+        require(result.si_pid == process.pid, "waitid observed a different probe leader")
         return result
     return None
 
@@ -1068,12 +1071,28 @@ def _signal_unreaped_owned_group(process: subprocess.Popen[bytes], signum: int) 
     group_members, _escaped_members = _owned_session_members(process.pid)
     if not group_members:
         return
+    # Recheck immediately before the numeric PGID operation. In particular, a
+    # procfs scan does not preserve child wait ownership if SIGCHLD changed.
+    _leader_exit_status_unreaped(process)
     try:
         os.killpg(process.pid, signum)
     except ProcessLookupError:
         return
     except OSError as error:
         raise ValidationError(f"cannot signal the unreaped probe process group: {error}") from error
+
+
+def _signal_unreaped_group_without_scan(process: subprocess.Popen[bytes], signum: int) -> None:
+    """Emergency signal under verified wait semantics when procfs is unavailable."""
+    # Popen used start_new_session=True, so its still-owned, unreaped child
+    # reserves the fresh session's numeric PGID even if procfs cannot be read.
+    _leader_exit_status_unreaped(process)
+    try:
+        os.killpg(process.pid, signum)
+    except ProcessLookupError:
+        return
+    except OSError as error:
+        raise ValidationError(f"cannot emergency-signal the unreaped probe process group: {error}") from error
 
 
 def _wait_owned_group_quiescent(process: subprocess.Popen[bytes], timeout_seconds: float) -> bool:
@@ -1089,28 +1108,125 @@ def _wait_owned_group_quiescent(process: subprocess.Popen[bytes], timeout_second
         time.sleep(min(PROBE_POLL_INTERVAL_SECONDS, remaining))
 
 
-def _cleanup_owned_process_group(process: subprocess.Popen[bytes]) -> None:
-    """Boundedly clean an isolated group while its unreaped leader reserves the PGID."""
-    _leader_exit_status_unreaped(process)
-    cleanup_deadline = time.monotonic() + PROBE_CLEANUP_TOTAL_SECONDS
-    _signal_unreaped_owned_group(process, signal.SIGTERM)
-    term_budget = min(PROBE_TERM_GRACE_SECONDS, max(0.0, cleanup_deadline - time.monotonic()))
-    group_quiescent = _wait_owned_group_quiescent(process, term_budget)
-    if not group_quiescent:
-        _signal_unreaped_owned_group(process, signal.SIGKILL)
-        kill_budget = min(PROBE_KILL_GRACE_SECONDS, max(0.0, cleanup_deadline - time.monotonic()))
-        group_quiescent = _wait_owned_group_quiescent(process, kill_budget)
-    _leader_exit_status_unreaped(process)
-    _group_members, escaped_members = _owned_session_members(process.pid)
-    remaining = cleanup_deadline - time.monotonic()
-    require(remaining > 0, "probe cleanup exhausted its total deadline before leader reaping")
+def _observed_owned_exit_code(process: subprocess.Popen[bytes], observation: Any) -> int:
+    """Translate the exit already observed while WNOWAIT retained its status."""
+    require(observation is not None and observation.si_pid == process.pid, "waitid did not observe the owned probe leader")
+    if observation.si_code == getattr(os, "CLD_EXITED", None):
+        return observation.si_status
+    if observation.si_code in {
+        getattr(os, "CLD_KILLED", None), getattr(os, "CLD_DUMPED", None),
+    }:
+        return -observation.si_status
+    raise ValidationError("waitid returned an unsupported probe-leader exit condition")
+
+
+def _wait_owned_leader(process: subprocess.Popen[bytes], timeout_seconds: float, label: str) -> int:
+    """Reap only after WNOWAIT proves the exit under this capture's sole-waiter ownership.
+
+    The Popen is private to this capture path. Callers must not poll or wait on
+    it concurrently; all earlier exit observations retain status with WNOWAIT.
+    """
+    deadline = time.monotonic() + timeout_seconds
+    observation = _leader_exit_status_unreaped(process)
+    while observation is None:
+        remaining = deadline - time.monotonic()
+        require(remaining > 0, f"{label} leader did not exit within its bounded wait")
+        time.sleep(min(PROBE_POLL_INTERVAL_SECONDS, remaining))
+        observation = _leader_exit_status_unreaped(process)
+    expected_exit_code = _observed_owned_exit_code(process, observation)
+
+    # Recheck default SIGCHLD, WNOWAIT, and ownership immediately before the
+    # one actual wait. A scanner may have lost that ownership since an earlier
+    # observation; Popen.wait can otherwise turn ECHILD into a synthetic zero.
+    final_observation = _leader_exit_status_unreaped(process)
+    require(final_observation is not None, "probe leader exit status disappeared before its bounded reap")
+    require(
+        _observed_owned_exit_code(process, final_observation) == expected_exit_code,
+        "probe leader exit status changed before its bounded reap",
+    )
+    remaining = max(0.0, deadline - time.monotonic())
     try:
-        process.wait(timeout=min(PROBE_REAP_GRACE_SECONDS, remaining))
+        exit_code = process.wait(timeout=remaining)
     except subprocess.TimeoutExpired as error:
-        raise ValidationError("probe leader could not be reaped within its cleanup bound") from error
-    # The leader PID/PGID is reusable after wait(); never signal or inspect it again.
-    require(group_quiescent, "probe process group remained after bounded TERM/KILL cleanup")
-    require(not escaped_members, "probe left live descendants outside its owned process group")
+        raise ValidationError(f"{label} leader could not be reaped within its bounded wait") from error
+    require(signal.getsignal(signal.SIGCHLD) == signal.SIG_DFL, f"{label} SIGCHLD disposition changed during leader reaping")
+    require(exit_code == expected_exit_code, f"{label} Popen status differs from its WNOWAIT exit observation")
+    require(process.returncode == expected_exit_code, f"{label} Popen return code differs from its WNOWAIT exit observation")
+    return exit_code
+
+
+def _cleanup_owned_process_group(process: subprocess.Popen[bytes]) -> None:
+    """Boundedly clean and reap an isolated group without losing its PGID anchor."""
+    require(process.returncode is None, "probe leader was already reaped before process-group cleanup")
+    cleanup_deadline = time.monotonic() + PROBE_CLEANUP_TOTAL_SECONDS
+    reap_reserve = min(PROBE_REAP_GRACE_SECONDS, PROBE_CLEANUP_TOTAL_SECONDS)
+    signal_deadline = cleanup_deadline - reap_reserve
+    cleanup_trigger: BaseException | None = None
+    emergency_errors: list[BaseException] = []
+    verified_cleanup_error: BaseException | None = None
+    group_quiescent = False
+    escaped_members: list[int] = []
+    group_members: list[int] = []
+    try:
+        _leader_exit_status_unreaped(process)
+        _signal_unreaped_owned_group(process, signal.SIGTERM)
+        term_budget = min(PROBE_TERM_GRACE_SECONDS, max(0.0, signal_deadline - time.monotonic()))
+        group_quiescent = _wait_owned_group_quiescent(process, term_budget)
+        if not group_quiescent:
+            require(time.monotonic() < signal_deadline, "probe cleanup exhausted its signal deadline before SIGKILL")
+            _signal_unreaped_owned_group(process, signal.SIGKILL)
+            kill_budget = min(PROBE_KILL_GRACE_SECONDS, max(0.0, signal_deadline - time.monotonic()))
+            group_quiescent = _wait_owned_group_quiescent(process, kill_budget)
+        _leader_exit_status_unreaped(process)
+        group_members, escaped_members = _owned_session_members(process.pid)
+        _leader_exit_status_unreaped(process)
+        if group_members:
+            verified_cleanup_error = ValidationError("probe process group remained after bounded TERM/KILL cleanup")
+            try:
+                _signal_unreaped_group_without_scan(process, signal.SIGKILL)
+            except BaseException as emergency_error:
+                emergency_errors.append(emergency_error)
+        elif escaped_members:
+            verified_cleanup_error = ValidationError("probe left live descendants outside its owned process group")
+    except BaseException as error:
+        # A failed inspection, ownership check or signal cannot establish that
+        # the group is empty. Retain the unreaped leader and make bounded
+        # emergency attempts without procfs; cleanup remains an error even if
+        # these signals stop the children.
+        cleanup_trigger = error
+        for signum in (signal.SIGTERM, signal.SIGKILL):
+            try:
+                _signal_unreaped_group_without_scan(process, signum)
+            except BaseException as emergency_error:
+                emergency_errors.append(emergency_error)
+
+    reap_error: BaseException | None = None
+    try:
+        remaining = max(0.0, cleanup_deadline - time.monotonic())
+        _wait_owned_leader(process, min(PROBE_REAP_GRACE_SECONDS, remaining), "probe cleanup")
+    except BaseException as error:
+        reap_error = error
+
+    # wait() may release the PID/PGID. No scan, signal, poll or wait is allowed
+    # after this point. Even a successful emergency attempt is unverified.
+    if reap_error is not None:
+        if cleanup_trigger is not None:
+            message = f"probe process-group cleanup is unverified after cleanup failure: {cleanup_trigger}; bounded leader wait failed: {reap_error}"
+        else:
+            message = f"probe leader could not be reaped within its cleanup bound: {reap_error}"
+        if emergency_errors:
+            message += "; emergency signaling failed: " + "; ".join(str(item) for item in emergency_errors)
+        raise ValidationError(message) from reap_error
+    if cleanup_trigger is not None:
+        message = f"probe process-group cleanup is unverified after cleanup failure: {cleanup_trigger}"
+        if emergency_errors:
+            message += "; emergency signaling failed: " + "; ".join(str(item) for item in emergency_errors)
+        raise ValidationError(message) from cleanup_trigger
+    if verified_cleanup_error is not None:
+        message = str(verified_cleanup_error)
+        if emergency_errors:
+            message += "; emergency signaling failed: " + "; ".join(str(item) for item in emergency_errors)
+        raise ValidationError(message) from verified_cleanup_error
 
 
 def _capture_bounded_process(
@@ -1127,14 +1243,17 @@ def _capture_bounded_process(
         )
     except OSError as error:
         raise ValidationError(f"cannot execute {label}: {error}") from error
-    assert process.stdout is not None and process.stderr is not None
-    stdout_fd = process.stdout.fileno()
-    stderr_fd = process.stderr.fileno()
-    selector = selectors.DefaultSelector()
-    output = {stdout_fd: bytearray(), stderr_fd: bytearray()}
-    streams = {stdout_fd: process.stdout, stderr_fd: process.stderr}
-    cleanup_completed = False
+    selector: Any | None = None
+    output: dict[int, bytearray] = {}
+    streams: dict[int, Any] = {}
+    cleanup_attempted = False
     try:
+        require(process.stdout is not None and process.stderr is not None, f"{label} did not receive captured output pipes")
+        stdout_fd = process.stdout.fileno()
+        stderr_fd = process.stderr.fileno()
+        streams = {stdout_fd: process.stdout, stderr_fd: process.stderr}
+        output = {stdout_fd: bytearray(), stderr_fd: bytearray()}
+        selector = selectors.DefaultSelector()
         for fd, stream in streams.items():
             os.set_blocking(fd, False)
             selector.register(stream, selectors.EVENT_READ, fd)
@@ -1159,15 +1278,18 @@ def _capture_bounded_process(
             time.sleep(min(PROBE_POLL_INTERVAL_SECONDS, remaining))
         group_members, escaped_members = _owned_session_members(process.pid)
         if group_members or escaped_members:
-            cleanup_completed = True
+            cleanup_attempted = True
             _cleanup_owned_process_group(process)
             raise ValidationError(f"{label} exited while owned descendant processes remained")
         remaining = deadline - time.monotonic()
         require(remaining > 0, f"{label} exceeded its {timeout_seconds:g}-second deadline")
-        exit_code = process.wait(timeout=min(PROBE_REAP_GRACE_SECONDS, remaining))
+        exit_code = _wait_owned_leader(
+            process, min(PROBE_REAP_GRACE_SECONDS, remaining), label,
+        )
         return exit_code, bytes(output[stdout_fd]), bytes(output[stderr_fd])
     except BaseException as error:
-        if not cleanup_completed:
+        if not cleanup_attempted and process.returncode is None:
+            cleanup_attempted = True
             try:
                 _cleanup_owned_process_group(process)
             except BaseException as cleanup_error:
@@ -1176,12 +1298,19 @@ def _capture_bounded_process(
             raise ValidationError(f"{label} exceeded its {timeout_seconds:g}-second deadline") from error
         raise
     finally:
-        selector.close()
-        for stream in streams.values():
-            try:
-                stream.close()
-            except OSError:
-                pass
+        try:
+            if selector is not None:
+                selector.close()
+        except OSError:
+            pass
+        finally:
+            for stream in (process.stdout, process.stderr):
+                if stream is None:
+                    continue
+                try:
+                    stream.close()
+                except OSError:
+                    pass
 
 
 def _run_feedback_probe(binary: Path, source_root: Path, identity: dict[str, Any], capacity_path: Path, capacity_sha: str) -> bytes:
