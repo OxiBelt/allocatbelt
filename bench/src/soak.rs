@@ -1355,10 +1355,12 @@ fn run_soak(args: SoakArgs, identity: SoakIdentity) -> Result<(), String> {
   } else {
     4
   };
-  let application_domain = crate::application::runtime_bindings::ApplicationDomain::new(
-    crate::application::Workload::Mixed,
-    workers,
-  )?;
+  let application_domain =
+    crate::application::runtime_bindings::ApplicationDomain::new_for_profile(
+      crate::application::Workload::Mixed,
+      workers,
+      &args.profile,
+    )?;
   let tenant = application_domain.tenant();
   let mut charged_ring = load_reference_ring(
     &args.reference_path,

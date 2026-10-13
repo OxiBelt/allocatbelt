@@ -36,8 +36,8 @@ mod http;
 #[path = "application/runtime_bindings.rs"]
 pub(crate) mod runtime_bindings;
 pub(super) use runtime_bindings::{
-  APPLICATION_TASK_CEILING, ApplicationDomain, ApplicationIoBindings, ApplicationRunBindings,
-  ApplicationTaskAdmission,
+  APPLICATION_TASK_CEILING, ApplicationDomain, ApplicationIoBindings, ApplicationMode,
+  ApplicationRunBindings, ApplicationTaskAdmission,
 };
 
 const WORKERS: usize = 4;
@@ -1127,7 +1127,8 @@ fn run_with_plan(
   } else {
     None
   };
-  let domain = ApplicationDomain::new(options.workload, plan.async_workers)?;
+  let domain =
+    ApplicationDomain::new_for_profile(options.workload, plan.async_workers, plan.profile.label())?;
   let (submitter, observer, scope, runtime, resources, mut run_bindings) = match options.executor {
     Executor::Bounded => {
       let async_config = AsyncConfig {
@@ -1142,6 +1143,10 @@ fn run_with_plan(
         .disk_rate(domain.rate_config())
         .upload_rate(domain.rate_config())
         .download_rate(domain.rate_config());
+      #[cfg(feature = "resource-feedback")]
+      if let Some(factory) = domain.feedback_factory()? {
+        builder = builder.feedback_sources(factory);
+      }
       if matches!(options.workload, Workload::Disk | Workload::Mixed) {
         builder = builder
           .blocking(BlockingConfig {
@@ -1326,9 +1331,11 @@ fn run_with_plan(
     .join()
     .map_err(|_| "application observer panicked".to_owned())?;
   let production_cpu_ended_ns = process_cpu_time_ns();
-  if let Some(readback) = runtime_readback.as_mut() {
-    readback.capture("after_drain", &run_bindings)?;
-  }
+  let drain_readback = runtime_readback.as_mut().map_or(Ok(()), |readback| {
+    readback.capture("after_drain", &run_bindings)
+  });
+  let feedback_drain_health = run_bindings.validate_feedback_health("after_drain");
+  drain_readback?;
   let rss_after_drain = sample_after_checkpoint_delay()?;
   let expected_checksum = expected_digest(
     options,
@@ -1354,7 +1361,7 @@ fn run_with_plan(
   }
 
   let shutdown_started = Instant::now();
-  let mut shutdown_timings = Vec::with_capacity(2);
+  let mut shutdown_timings = Vec::with_capacity(3);
   match (options.executor, runtime) {
     (Executor::Bounded, ExecutorRuntime::Bounded(mut runtime)) => {
       let scope = scope_keepalive
@@ -1398,12 +1405,27 @@ fn run_with_plan(
     }
     _ => return Err("executor runtime ownership mismatch".into()),
   }
-  run_bindings.shutdown_auxiliary_timer()?;
-  if let Some(readback) = runtime_readback.as_mut() {
-    readback.capture("after_shutdown", &run_bindings)?;
+  let feedback_shutdown_started = Instant::now();
+  let feedback_shutdown = run_bindings.shutdown_feedback(execution_deadlines().shutdown);
+  let feedback_shutdown_ns = feedback_shutdown_started.elapsed().as_nanos();
+  if options.executor == Executor::Tokio && run_bindings.feedback_started() {
+    shutdown_timings.push(("Tokio resource feedback", feedback_shutdown_ns));
   }
+  let timer_shutdown = run_bindings.shutdown_auxiliary_timer();
+  let shutdown_readback = runtime_readback.as_mut().map_or(Ok(()), |readback| {
+    readback.capture("after_shutdown", &run_bindings)
+  });
+  let feedback_shutdown_health = run_bindings.validate_feedback_health("after_shutdown");
+  let feedback_health_error = [
+    feedback_drain_health.err(),
+    feedback_shutdown.err(),
+    feedback_shutdown_health.err(),
+  ]
+  .into_iter()
+  .flatten()
+  .next();
   let driver_shutdown_ns = shutdown_started.elapsed().as_nanos();
-  write_shutdown_report(
+  let shutdown_report = write_shutdown_report(
     producer
       .production_end
       .saturating_duration_since(producer.started_at)
@@ -1412,7 +1434,10 @@ fn run_with_plan(
     production_cpu_ended_ns,
     observer_report.completed_on_time + observer_report.completed_late,
     &shutdown_timings,
-  )?;
+  );
+  timer_shutdown?;
+  shutdown_readback?;
+  shutdown_report?;
   let final_resources = resources.snapshot();
   if final_resources.managed_memory != 0
     || final_resources.disk_ops != 0
@@ -1445,6 +1470,9 @@ fn run_with_plan(
     readback.finish(&readback_domain, fixed_control_baseline)?;
   }
   let rss_after_shutdown = sample_after_checkpoint_delay()?;
+  if let Some(error) = feedback_health_error {
+    return Err(error);
+  }
   if producer.trace_overrun {
     return Err("open-loop producer exceeded its finite trace deadline".into());
   }
@@ -1613,8 +1641,13 @@ impl RuntimeBindingWriter {
     if executor != expected_executor {
       return Err("runtime readback executor differs from the selected executor".into());
     }
-    if comparison_family != "fixed_policy" {
-      return Err("external-pressure runtime policy is unavailable in this binary".into());
+    if comparison_family != bindings.mode().comparison_family() {
+      return Err(
+        "runtime readback comparison family differs from the selected runtime mode".into(),
+      );
+    }
+    if bindings.mode() == ApplicationMode::ExternalPressure && !bindings.feedback_started() {
+      return Err("external-pressure comparison started without its feedback service".into());
     }
     for (key, value) in [
       ("identity.profile", profile),
@@ -1658,15 +1691,6 @@ impl RuntimeBindingWriter {
       (
         "configuration.task_ceiling",
         APPLICATION_TASK_CEILING.to_string(),
-      ),
-      (
-        "configuration.resource_policy",
-        "fixed_primary_v1".to_owned(),
-      ),
-      ("configuration.feedback_enabled", "false".to_owned()),
-      (
-        "configuration.network_direction",
-        "upload_and_download".to_owned(),
       ),
       (
         "accounting.cpu",
@@ -1721,6 +1745,9 @@ impl RuntimeBindingWriter {
       ),
     ] {
       writer.add(key.to_owned(), value)?;
+    }
+    for (key, value) in bindings.policy_rows() {
+      writer.add(key, value)?;
     }
     let lane = LaneConfig::default();
     for (key, value) in [
@@ -3145,7 +3172,14 @@ fn parse_args(
   } else {
     ArrivalPlan::new(profile, options.workload, OPEN_LOOP_ARRIVALS, 1)?
   };
-  validate_deadline_budget(deadlines, plan, options.executor, options.mode)?;
+  let application_mode = selected_application_mode()?;
+  validate_deadline_budget(
+    deadlines,
+    plan,
+    options.executor,
+    options.mode,
+    application_mode,
+  )?;
   Ok((options, plan, deadlines))
 }
 
@@ -3159,11 +3193,29 @@ fn parse_deadline(value: &str, name: &str) -> Result<Duration, String> {
   Ok(Duration::from_secs(seconds))
 }
 
+fn selected_application_mode() -> Result<ApplicationMode, String> {
+  application_mode_from_environment_value(env::var("ALLOCATBELT_APP_COMPARISON_FAMILY"))
+}
+
+fn application_mode_from_environment_value(
+  value: Result<String, env::VarError>,
+) -> Result<ApplicationMode, String> {
+  let comparison_family = match value {
+    Ok(value) => Some(value),
+    Err(env::VarError::NotPresent) => None,
+    Err(env::VarError::NotUnicode(_)) => {
+      return Err("ALLOCATBELT_APP_COMPARISON_FAMILY is not valid Unicode".into());
+    }
+  };
+  ApplicationMode::from_comparison_family(comparison_family.as_deref())
+}
+
 fn validate_deadline_budget(
   deadlines: ExecutionDeadlines,
   plan: ArrivalPlan,
   executor: Executor,
   mode: Mode,
+  application_mode: ApplicationMode,
 ) -> Result<(), String> {
   let caps = [3600, 3600, 600, 7200];
   let seconds = [
@@ -3182,12 +3234,21 @@ fn validate_deadline_budget(
     // allowance to observe that horizon and publish production completion.
     CAPACITY_HORIZON.as_secs() + 1
   };
-  let shutdown_units = match (plan.workload, executor) {
+  let base_shutdown_units: u64 = match (plan.workload, executor) {
     (Workload::Mixed, Executor::Bounded) => 4,
     (Workload::Http, Executor::Bounded) => 3,
     (Workload::Disk, Executor::Bounded) => 2,
     _ => 1,
   };
+  let feedback_shutdown_units =
+    if executor == Executor::Tokio && application_mode == ApplicationMode::ExternalPressure {
+      1
+    } else {
+      0
+    };
+  let shutdown_units = base_shutdown_units
+    .checked_add(feedback_shutdown_units)
+    .ok_or_else(|| "deadline budget arithmetic overflow".to_owned())?;
   let required = SETUP_DEADLINE
     .as_secs()
     .checked_add(trace_seconds)
@@ -3340,10 +3401,11 @@ fn percentile(samples: &[u64], percentile: usize) -> u64 {
 #[cfg(test)]
 mod tests {
   use super::{
-    AsyncConfig, AsyncShutdown, DiskReport, Executor, IdState, Job, LaneConfig, Mode, Observer,
-    ObserverEvent, ObserverEventSender, ObserverReport, Options, ProducerReport, Profile,
-    WorkOutput, Workload, accept_capacity_id, observe, resource_limits, run_with_limits,
-    validate_output,
+    ApplicationMode, AsyncConfig, AsyncShutdown, DiskReport, ExecutionDeadlines, Executor, IdState,
+    Job, LaneConfig, Mode, Observer, ObserverEvent, ObserverEventSender, ObserverReport, Options,
+    ProducerReport, Profile, SETUP_DEADLINE, WorkOutput, Workload, accept_capacity_id,
+    application_mode_from_environment_value, observe, resource_limits, run_with_limits,
+    validate_deadline_budget, validate_output,
   };
   use allocatbelt::runtime::asynchronous::AsyncRuntime;
   use allocatbelt::runtime::managed::{ResourceLimits, ResourceScope};
@@ -3667,6 +3729,83 @@ mod tests {
     let expired = Instant::now() - super::execution_deadlines().process - Duration::from_secs(1);
     assert_eq!(super::remaining_process_deadline(expired), Duration::ZERO);
     assert!(super::remaining_process_deadline(Instant::now()) > Duration::ZERO);
+  }
+
+  #[test]
+  fn deadline_budget_counts_only_the_tokio_external_feedback_shutdown_unit() {
+    let shutdown = Duration::from_secs(11);
+    let drain = Duration::from_secs(7);
+    let plan = super::ArrivalPlan::new(Profile::Steady, Workload::Cpu, 1, 1)
+      .expect("CPU deadline test plan");
+    let prior_exact = SETUP_DEADLINE.as_secs()
+      + super::CAPACITY_HORIZON.as_secs()
+      + 1
+      + drain.as_secs()
+      + shutdown.as_secs();
+    let external_exact = prior_exact + shutdown.as_secs();
+    let deadlines = |process_seconds| ExecutionDeadlines {
+      trace: Duration::from_secs(1),
+      drain,
+      shutdown,
+      process: Duration::from_secs(process_seconds),
+    };
+
+    assert!(
+      validate_deadline_budget(
+        deadlines(prior_exact),
+        plan,
+        Executor::Tokio,
+        Mode::Capacity,
+        ApplicationMode::ExternalPressure,
+      )
+      .is_err()
+    );
+    assert!(
+      validate_deadline_budget(
+        deadlines(external_exact),
+        plan,
+        Executor::Tokio,
+        Mode::Capacity,
+        ApplicationMode::ExternalPressure,
+      )
+      .is_ok()
+    );
+    assert!(
+      validate_deadline_budget(
+        deadlines(prior_exact),
+        plan,
+        Executor::Tokio,
+        Mode::Capacity,
+        ApplicationMode::Fixed,
+      )
+      .is_ok()
+    );
+    assert!(
+      validate_deadline_budget(
+        deadlines(prior_exact),
+        plan,
+        Executor::Bounded,
+        Mode::Capacity,
+        ApplicationMode::ExternalPressure,
+      )
+      .is_ok()
+    );
+  }
+
+  #[test]
+  fn selected_application_mode_rejects_unknown_and_nonunicode_environment_values() {
+    assert_eq!(
+      application_mode_from_environment_value(Err(std::env::VarError::NotPresent))
+        .expect("unset mode selects fixed policy"),
+      ApplicationMode::Fixed
+    );
+    assert!(application_mode_from_environment_value(Ok("unknown".to_owned())).is_err());
+    assert!(
+      application_mode_from_environment_value(Err(std::env::VarError::NotUnicode(
+        std::ffi::OsString::from("external_pressure"),
+      )))
+      .is_err()
+    );
   }
 
   #[test]

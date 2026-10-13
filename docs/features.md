@@ -21,6 +21,14 @@ Each packaged runtime consumer also recovers a shared managed buffer, transfers 
 
 ## Run-time policy
 
+The unpublished application benchmark packages also expose a
+`resource-feedback` feature that forwards to the allocator feature above.
+Application feedback is selected explicitly with
+`ALLOCATBELT_APP_COMPARISON_FAMILY=external_pressure`; the default application
+policy remains fixed. Byte-rate feedback requires an independently pinned
+[application-capacity calibration](research/resource-runtime-plan.md#application-feedback-calibration).
+These benchmark controls do not enable campaign qualification.
+
 `Allocatbelt::configure(Policy)` selects, within what a build contains, what a process uses; `Policy` has one `FeaturePolicy` per capability:
 
 | `FeaturePolicy` | Meaning |

@@ -399,7 +399,8 @@ fn std_listener() -> Result<(StdTcpListener, SocketAddrV4), String> {
 fn run_bounded(options: Options, settings: Settings, plan: ArrivalPlan) -> Result<Report, String> {
   let setup_started = Instant::now();
   let expected_oracle = build_expected_oracle(options, settings, plan)?;
-  let domain = ApplicationDomain::new(options.workload, plan.async_workers)?;
+  let domain =
+    ApplicationDomain::new_for_profile(options.workload, plan.async_workers, plan.profile.label())?;
   let local_limits = domain.local_limits();
   let rate_config = domain.rate_config();
   let blocking_workers = if options.workload == Workload::Mixed {
@@ -439,13 +440,18 @@ fn run_bounded(options: Options, settings: Settings, plan: ArrivalPlan) -> Resul
   } else {
     builder
   };
+  #[cfg(feature = "resource-feedback")]
+  let builder = match domain.feedback_factory()? {
+    Some(factory) => builder.feedback_sources(factory),
+    None => builder,
+  };
   let mut async_runtime = builder
     .disk_rate(rate_config)
     .upload_rate(rate_config)
     .download_rate(rate_config)
     .build()
     .map_err(|error| format!("allocatbelt owning HTTP runtime start failed: {error}"))?;
-  let run_bindings = domain.for_native(&async_runtime)?;
+  let mut run_bindings = domain.for_native(&async_runtime)?;
   let mut runtime_readback = RuntimeBindingWriter::begin(options, plan, &run_bindings)?;
   let resources = run_bindings.resources();
   let io_bindings = run_bindings.io();
@@ -612,9 +618,11 @@ fn run_bounded(options: Options, settings: Settings, plan: ArrivalPlan) -> Resul
     .map_err(|error| format!("allocatbelt accept task output join failed: {error}"))?
     .map_err(|error| format!("allocatbelt accept task failed: {error}"))?;
   let production_cpu_ended_ns = super::process_cpu_time_ns();
-  if let Some(readback) = runtime_readback.as_mut() {
-    readback.capture("after_drain", &run_bindings)?;
-  }
+  let drain_readback = runtime_readback.as_mut().map_or(Ok(()), |readback| {
+    readback.capture("after_drain", &run_bindings)
+  });
+  let feedback_drain_health = run_bindings.validate_feedback_health("after_drain");
+  drain_readback?;
   validate_pair_counts(
     options.mode,
     settings.arrivals,
@@ -663,8 +671,21 @@ fn run_bounded(options: Options, settings: Settings, plan: ArrivalPlan) -> Resul
       }
     })?;
   shutdown_timings.push(("allocatbelt owning HTTP runtime", elapsed_ns));
+  let feedback_shutdown = run_bindings.shutdown_feedback(super::execution_deadlines().shutdown);
+  let shutdown_readback = runtime_readback.as_mut().map_or(Ok(()), |readback| {
+    readback.capture("after_shutdown", &run_bindings)
+  });
+  let feedback_shutdown_health = run_bindings.validate_feedback_health("after_shutdown");
+  let feedback_health_error = [
+    feedback_drain_health.err(),
+    feedback_shutdown.err(),
+    feedback_shutdown_health.err(),
+  ]
+  .into_iter()
+  .flatten()
+  .next();
   let shutdown_ns = shutdown_started.elapsed().as_nanos();
-  super::write_shutdown_report(
+  let shutdown_report = super::write_shutdown_report(
     producer
       .production_end
       .saturating_duration_since(producer.started_at)
@@ -673,10 +694,8 @@ fn run_bounded(options: Options, settings: Settings, plan: ArrivalPlan) -> Resul
     production_cpu_ended_ns,
     observed.on_time + observed.late,
     &shutdown_timings,
-  )?;
-  if let Some(readback) = runtime_readback.as_mut() {
-    readback.capture("after_shutdown", &run_bindings)?;
-  }
+  );
+  shutdown_readback?;
   let (final_global_domain, final_tenant_domain, final_resources) =
     validate_domain_receipt(&run_bindings, "HTTP")?;
   if producer.trace_overrun {
@@ -694,6 +713,10 @@ fn run_bounded(options: Options, settings: Settings, plan: ArrivalPlan) -> Resul
     readback.finish(&readback_domain, fixed_control_baseline)?;
   }
   let rss_after_shutdown = super::sample_after_checkpoint_delay()?;
+  shutdown_report?;
+  if let Some(error) = feedback_health_error {
+    return Err(error);
+  }
   Ok(build_report(
     super::ProcessCheckpoints {
       setup_started,
@@ -729,7 +752,8 @@ fn run_bounded(options: Options, settings: Settings, plan: ArrivalPlan) -> Resul
 fn run_tokio(options: Options, settings: Settings, plan: ArrivalPlan) -> Result<Report, String> {
   let setup_started = Instant::now();
   let expected_oracle = build_expected_oracle(options, settings, plan)?;
-  let domain = ApplicationDomain::new(options.workload, plan.async_workers)?;
+  let domain =
+    ApplicationDomain::new_for_profile(options.workload, plan.async_workers, plan.profile.label())?;
   let mut run_bindings = domain.for_tokio()?;
   let mut runtime_readback = RuntimeBindingWriter::begin(options, plan, &run_bindings)?;
   let resources = run_bindings.resources();
@@ -917,9 +941,11 @@ fn run_tokio(options: Options, settings: Settings, plan: ArrivalPlan) -> Result<
     .map_err(|error| format!("Tokio accept task join failed: {error}"))?
     .map_err(|error| format!("Tokio accept task failed: {error}"))?;
   let production_cpu_ended_ns = super::process_cpu_time_ns();
-  if let Some(readback) = runtime_readback.as_mut() {
-    readback.capture("after_drain", &run_bindings)?;
-  }
+  let drain_readback = runtime_readback.as_mut().map_or(Ok(()), |readback| {
+    readback.capture("after_drain", &run_bindings)
+  });
+  let feedback_drain_health = run_bindings.validate_feedback_health("after_drain");
+  drain_readback?;
   validate_pair_counts(
     options.mode,
     settings.arrivals,
@@ -942,15 +968,31 @@ fn run_tokio(options: Options, settings: Settings, plan: ArrivalPlan) -> Result<
     runtime.shutdown_timeout(super::execution_deadlines().shutdown);
     Ok(())
   })?;
+  let feedback_shutdown_started = Instant::now();
+  let feedback_shutdown = run_bindings.shutdown_feedback(super::execution_deadlines().shutdown);
+  let feedback_shutdown_ns = feedback_shutdown_started.elapsed().as_nanos();
   let rate_timer_started = Instant::now();
-  run_bindings.shutdown_auxiliary_timer()?;
+  let timer_shutdown = run_bindings.shutdown_auxiliary_timer();
   let rate_timer_shutdown_ns = rate_timer_started.elapsed().as_nanos();
-  let shutdown_timings = [
-    ("Tokio HTTP runtime", elapsed_ns),
-    ("Tokio fixed rate timer", rate_timer_shutdown_ns),
-  ];
+  let mut shutdown_timings = vec![("Tokio HTTP runtime", elapsed_ns)];
+  if run_bindings.feedback_started() {
+    shutdown_timings.push(("Tokio resource feedback", feedback_shutdown_ns));
+  }
+  shutdown_timings.push(("Tokio fixed rate timer", rate_timer_shutdown_ns));
+  let shutdown_readback = runtime_readback.as_mut().map_or(Ok(()), |readback| {
+    readback.capture("after_shutdown", &run_bindings)
+  });
+  let feedback_shutdown_health = run_bindings.validate_feedback_health("after_shutdown");
+  let feedback_health_error = [
+    feedback_drain_health.err(),
+    feedback_shutdown.err(),
+    feedback_shutdown_health.err(),
+  ]
+  .into_iter()
+  .flatten()
+  .next();
   let shutdown_ns = shutdown_started.elapsed().as_nanos();
-  super::write_shutdown_report(
+  let shutdown_report = super::write_shutdown_report(
     producer
       .production_end
       .saturating_duration_since(producer.started_at)
@@ -959,10 +1001,9 @@ fn run_tokio(options: Options, settings: Settings, plan: ArrivalPlan) -> Result<
     production_cpu_ended_ns,
     observed.on_time + observed.late,
     &shutdown_timings,
-  )?;
-  if let Some(readback) = runtime_readback.as_mut() {
-    readback.capture("after_shutdown", &run_bindings)?;
-  }
+  );
+  timer_shutdown?;
+  shutdown_readback?;
   let (final_global_domain, final_tenant_domain, final_resources) =
     validate_domain_receipt(&run_bindings, "Tokio HTTP")?;
   if producer.trace_overrun {
@@ -980,6 +1021,10 @@ fn run_tokio(options: Options, settings: Settings, plan: ArrivalPlan) -> Result<
     readback.finish(&readback_domain, fixed_control_baseline)?;
   }
   let rss_after_shutdown = super::sample_after_checkpoint_delay()?;
+  shutdown_report?;
+  if let Some(error) = feedback_health_error {
+    return Err(error);
+  }
   Ok(build_report(
     super::ProcessCheckpoints {
       setup_started,

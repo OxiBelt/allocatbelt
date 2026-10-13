@@ -7,6 +7,9 @@ rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
 
+[features]
+resource-feedback = ["allocatbelt/resource-feedback"]
+
 [dependencies]
 allocatbelt = { workspace = true, features = ["io-uring", "runtime"] }
 allocatbelt-profile.workspace = true
@@ -14,7 +17,7 @@ allocatbelt-runtime.workspace = true
 allocatbelt-app-ports.workspace = true
 mimalloc.workspace = true
 tokio.workspace = true
-rustix = { workspace = true, features = ["time"] }
+rustix = { workspace = true, features = ["fs", "time"] }
 
 [lints]
 workspace = true

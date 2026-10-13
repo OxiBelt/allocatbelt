@@ -10,6 +10,9 @@ publish = false
 # workspace's secure mimalloc feature into the standard baseline.
 [workspace]
 
+[features]
+resource-feedback = ["allocatbelt/resource-feedback"]
+
 [dependencies]
 allocatbelt = { path = "../../crates/allocatbelt", features = ["io-uring", "runtime"] }
 allocatbelt-app-ports = { path = "../../crates/allocatbelt-app-ports" }

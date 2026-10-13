@@ -49,6 +49,58 @@ policy. Tokio's unstable io_uring, tracing, taskdump and scheduler-latency APIs
 are outside the stable baseline; owned-buffer runtime io_uring is an additional
 goal, independent of allocator purge io_uring.
 
+## Application feedback calibration
+
+The development application comparators compile feedback with their
+`resource-feedback` feature and select it explicitly with
+`ALLOCATBELT_APP_COMPARISON_FAMILY=external_pressure`. The fixed application
+policy remains the default. Both executor adapters use the same tenant CPU
+limit, disk byte bucket and download byte bucket; upload accounting remains
+separate. The CPU reduction rule remains at most ten percent per actuation.
+At two or four slots, a reduction is quantized away and reported as
+`ReductionQuantized`.
+
+Set `ALLOCATBELT_APP_CAPACITY_CALIBRATION_FILE` and
+`ALLOCATBELT_APP_CAPACITY_CALIBRATION_SHA256` together to supply one immutable
+application-byte capacity artifact. The digest covers its exact bytes. The
+loader accepts a regular nonsymlink file of at most 4096 bytes, with UTF-8 TSV
+rows, LF endings and a final LF. Unknown, duplicate and missing fields are
+errors. The required fields are:
+
+| Field | Value |
+|---|---|
+| `schema` | `allocatbelt.app-byte-capacity.v1` |
+| `calibration_id` | Portable token identifying the independent calibration |
+| `host_id` | Exact `ALLOCATBELT_APP_HOST_ID` |
+| `profile` | Actual selected application profile |
+| `workload` | Actual selected application workload |
+| `source_sha256` | Candidate source-tree digest from `ALLOCATBELT_APP_SOURCE_SHA256` |
+| `disk.bytes_per_second`, `download.bytes_per_second` | Positive integer capacity, or `missing` |
+| `disk.units`, `download.units` | `application_bytes_per_second`, or `missing` for a missing capacity |
+| `disk.provenance`, `download.provenance` | Nonempty descriptions of how each capacity was established |
+
+If supplied, `ALLOCATBELT_APP_PROFILE` and `ALLOCATBELT_APP_WORKLOAD` must also
+agree with the selected execution options. Omitting both artifact variables
+freezes the byte dimensions. An explicitly missing capacity freezes its own
+dimension; a malformed supplied artifact fails startup.
+`ALLOCATBELT_APP_PRESSURE_QUALIFICATION=true` additionally requires positive
+disk and download capacities. That flag requests a context and does not prove
+qualification eligibility.
+
+Calibration storage and retained meter captures are charged to the owning
+domain. Service factories share the immutable calibration through its charged
+owner or capture only numeric capacities. The reservation survives retained
+clones and is released after their storage. Receipts identify the artifact,
+units, provenance, sampling/planning times, pending decisions and diagnostic
+state through the latest per-control snapshot. They do not provide a complete
+decision history. Worker and policy faults are checked even when receipt output is
+disabled; Tokio reports active feedback shutdown separately.
+
+These byte signals measure application progress. External physical contention
+requires independent evidence and a validated pressure driver. Campaign
+qualification remains disabled until the corresponding driver and readback
+contracts are independently verified.
+
 ## Performance gates
 
 Preregister workloads, equal geometric-mean weights, arrival rates, worker

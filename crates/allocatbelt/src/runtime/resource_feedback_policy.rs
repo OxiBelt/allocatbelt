@@ -31,6 +31,8 @@ pub const TELEMETRY_FRESHNESS: Duration = Duration::from_millis(500);
 pub const REQUIRED_BREACH_SAMPLES: u8 = 3;
 /// Minimum time between changes to the same control after success or readback.
 pub const ACTUATION_COOLDOWN: Duration = Duration::from_secs(1);
+/// Version bound into benchmark receipts for the original 10-percent CPU rule.
+pub const FEEDBACK_POLICY_VERSION: &str = "runtime-feedback-policy-v1";
 
 const RESOURCE_COUNT: usize = 3;
 const RESOURCES: [FeedbackResource; RESOURCE_COUNT] = [
@@ -1558,6 +1560,156 @@ mod tests {
     assert_eq!(
       status(plan, FeedbackResource::NetworkRate),
       DecisionStatus::NoChange(NoChangeReason::RecoveryQuantized)
+    );
+  }
+
+  #[test]
+  fn cpu_reduction_is_quantized_below_ten_and_respects_its_floor() {
+    for initial in [2, 4, 1] {
+      let mut policy = ResourceFeedbackPolicy::new(config(
+        control(1, initial, 4, 4_000, 8_000),
+        control(1, 100, 100, 4_000, 8_000),
+        control(1, 100, 100, 4_000, 8_000),
+      ))
+      .unwrap();
+      let base = Instant::now();
+      let mut plan = None;
+      for index in 0..REQUIRED_BREACH_SAMPLES {
+        let at = base + Duration::from_millis(u64::from(index) * 100);
+        observe_at(
+          &mut policy,
+          at,
+          at + Duration::from_millis(1),
+          Some(9_000),
+          Some(7_000),
+          Some(7_000),
+        )
+        .unwrap();
+        plan = Some(policy.plan_at(at + Duration::from_millis(2)).unwrap());
+      }
+      assert_eq!(
+        status(plan.unwrap(), FeedbackResource::CpuConcurrency),
+        DecisionStatus::NoChange(NoChangeReason::ReductionQuantized)
+      );
+    }
+  }
+
+  #[test]
+  fn cpu_reduction_at_ten_slots_is_exactly_ten_percent() {
+    let mut policy = ResourceFeedbackPolicy::new(config(
+      control(1, 10, 10, 4_000, 8_000),
+      control(1, 100, 100, 4_000, 8_000),
+      control(1, 100, 100, 4_000, 8_000),
+    ))
+    .unwrap();
+    let base = Instant::now();
+    let mut plan = None;
+    for index in 0..REQUIRED_BREACH_SAMPLES {
+      let at = base + Duration::from_millis(u64::from(index) * 100);
+      observe_at(
+        &mut policy,
+        at,
+        at + Duration::from_millis(1),
+        Some(9_000),
+        Some(7_000),
+        Some(7_000),
+      )
+      .unwrap();
+      plan = Some(policy.plan_at(at + Duration::from_millis(2)).unwrap());
+    }
+    let ticket = match status(plan.unwrap(), FeedbackResource::CpuConcurrency) {
+      DecisionStatus::Planned(ticket) => ticket,
+      other => panic!("expected the exact 10-percent CPU reduction, found {other:?}"),
+    };
+    assert_eq!((ticket.from_limit(), ticket.to_limit()), (10, 9));
+  }
+
+  #[test]
+  fn cpu_recovers_one_slot_after_cooldown_without_crossing_its_ceiling() {
+    let mut policy = ResourceFeedbackPolicy::new(config(
+      control(1, 1, 4, 4_000, 8_000),
+      control(1, 100, 100, 4_000, 8_000),
+      control(1, 100, 100, 4_000, 8_000),
+    ))
+    .unwrap();
+    let base = Instant::now();
+    observe_at(
+      &mut policy,
+      base,
+      base + Duration::from_millis(1),
+      Some(1_000),
+      Some(5_000),
+      Some(5_000),
+    )
+    .unwrap();
+    let recovery = policy.plan_at(base + Duration::from_millis(2)).unwrap();
+    let ticket = match status(recovery, FeedbackResource::CpuConcurrency) {
+      DecisionStatus::Planned(ticket) => ticket,
+      other => panic!("expected one-slot CPU recovery, found {other:?}"),
+    };
+    assert_eq!(ticket.from_limit(), 1);
+    assert_eq!(ticket.to_limit(), 2);
+    policy
+      .acknowledge_at(
+        ticket,
+        ActuationResult::Applied,
+        base + Duration::from_millis(3),
+        base + Duration::from_millis(4),
+      )
+      .unwrap();
+    assert_eq!(policy.current_limits()[0], 2);
+
+    let mut next = None;
+    for index in 1..=12_u64 {
+      let at = base + Duration::from_millis(index * 100);
+      observe_at(
+        &mut policy,
+        at,
+        at + Duration::from_millis(1),
+        Some(1_000),
+        Some(5_000),
+        Some(5_000),
+      )
+      .unwrap();
+      let plan = policy.plan_at(at + Duration::from_millis(2)).unwrap();
+      let status = status(plan, FeedbackResource::CpuConcurrency);
+      if matches!(status, DecisionStatus::Planned(_)) {
+        next = Some(status);
+        break;
+      }
+    }
+    let cpu_status = next.unwrap_or_else(|| panic!("CPU never recovered after cooldown"));
+    assert!(
+      matches!(
+        cpu_status,
+        DecisionStatus::Planned(ticket) if ticket.from_limit() == 2 && ticket.to_limit() == 3
+      ),
+      "unexpected CPU recovery at the ceiling: {cpu_status:?}"
+    );
+  }
+
+  #[test]
+  fn cpu_recovery_holds_at_the_configured_ceiling() {
+    let mut policy = ResourceFeedbackPolicy::new(config(
+      control(1, 4, 4, 4_000, 8_000),
+      control(1, 100, 100, 4_000, 8_000),
+      control(1, 100, 100, 4_000, 8_000),
+    ))
+    .unwrap();
+    let at = Instant::now();
+    observe_at(
+      &mut policy,
+      at,
+      at + Duration::from_millis(1),
+      Some(1_000),
+      Some(5_000),
+      Some(5_000),
+    )
+    .unwrap();
+    let plan = policy.plan_at(at + Duration::from_millis(2)).unwrap();
+    assert_eq!(
+      status(plan, FeedbackResource::CpuConcurrency),
+      DecisionStatus::NoChange(NoChangeReason::AtCeiling)
     );
   }
 
