@@ -12,12 +12,17 @@ from __future__ import annotations
 import argparse
 from array import array
 from bisect import bisect_right
+import copy
 import hashlib
 import json
 import os
 import re
+import selectors
+import signal
 import stat
+import subprocess
 import sys
+import time
 from pathlib import Path, PurePosixPath
 from typing import Any, BinaryIO, Callable, Iterator
 
@@ -26,6 +31,7 @@ EXPECTATION_SCHEMA_V1 = "allocatbelt.application-feedback-expectation.v1"
 EXPECTATION_SCHEMA_V2 = "allocatbelt.application-feedback-expectation.v2"
 EXPECTATION_SCHEMA_V3 = "allocatbelt.application-feedback-expectation.v3"
 EXPECTATION_SCHEMA_V4 = "allocatbelt.application-feedback-expectation.v4"
+EXPECTATION_SCHEMA_V5 = "allocatbelt.application-feedback-expectation.v5"
 EXPECTATION_SCHEMA = EXPECTATION_SCHEMA_V2
 CONSTRUCTION_PROBE_SCHEMA = "allocatbelt.application-feedback-policy-probe.v1"
 TRACE_MANIFEST_SCHEMA = "allocatbelt.application-feedback-trace-manifest.v1"
@@ -42,6 +48,8 @@ RUNTIME_BINDING_SCHEMA_V1 = "allocatbelt.application-runtime-binding.v1"
 RUNTIME_BINDING_SCHEMA_V2 = "allocatbelt.application-runtime-binding.v2"
 RUNTIME_SOAK_SCHEMA_V2 = "allocatbelt.runtime-soak.v2"
 SOAK_READBACK_SCHEMA_V2 = "allocatbelt.application-soak-readback.v2"
+APPLICATION_ALLOCATOR_LABELS = ("allocatbelt", "mimalloc-secure", "mimalloc-standard", "system")
+V5_EXECUTOR_LABELS = ("allocatbelt", "tokio-1.53.1")
 
 SOAK_PARENT_IDENTITY_FIELDS = {
     "campaign_id", "host_id", "run_id", "nonce", "allocator", "executor", "workload",
@@ -88,6 +96,15 @@ MAX_PRESSURE_PROOF_BYTES = 256 * 1024
 MAX_RUNTIME_BINDING_BYTES = 4 * 1024 * 1024
 MAX_SOAK_BINDING_BYTES = 256 * 1024
 MAX_CONSTRUCTION_PROBE_BYTES = 512 * 1024
+MAX_PROBE_OUTPUT_BYTES = 512 * 1024
+MAX_APP_BINARY_BYTES = 512 * 1024 * 1024
+PROBE_TERM_GRACE_SECONDS = 0.2
+PROBE_KILL_GRACE_SECONDS = 1.0
+PROBE_REAP_GRACE_SECONDS = 0.25
+PROBE_POLL_INTERVAL_SECONDS = 0.01
+PROBE_CLEANUP_TOTAL_SECONDS = (
+    PROBE_TERM_GRACE_SECONDS + PROBE_KILL_GRACE_SECONDS + PROBE_REAP_GRACE_SECONDS
+)
 MAX_MANIFEST_BYTES = 64 * 1024
 MAX_EVENT_FILE_BYTES = 1024 * 1024 * 1024
 MAX_SAMPLE_FILE_BYTES = 1024 * 1024 * 1024
@@ -371,12 +388,13 @@ def _validate_expectation_body(value: object) -> dict[str, Any]:
     require(type(value) is dict, "feedback expectation must be one JSON object")
     schema = value.get("schema")
     require(
-        schema in (EXPECTATION_SCHEMA_V1, EXPECTATION_SCHEMA_V2, EXPECTATION_SCHEMA_V3, EXPECTATION_SCHEMA_V4),
+        schema in (EXPECTATION_SCHEMA_V1, EXPECTATION_SCHEMA_V2, EXPECTATION_SCHEMA_V3, EXPECTATION_SCHEMA_V4, EXPECTATION_SCHEMA_V5),
         "unsupported feedback expectation schema",
     )
-    expectation_v2 = schema in (EXPECTATION_SCHEMA_V2, EXPECTATION_SCHEMA_V3, EXPECTATION_SCHEMA_V4)
+    expectation_v2 = schema in (EXPECTATION_SCHEMA_V2, EXPECTATION_SCHEMA_V3, EXPECTATION_SCHEMA_V4, EXPECTATION_SCHEMA_V5)
     expectation_v3 = schema == EXPECTATION_SCHEMA_V3
     expectation_v4 = schema == EXPECTATION_SCHEMA_V4
+    expectation_v5 = schema == EXPECTATION_SCHEMA_V5
     recipe_keys = {
         "schema", "mode", "identity", "policy", "app_capacity_artifact_sha256",
         "host_binding", "external_pressure_proof", "final_runtime_binding",
@@ -386,11 +404,15 @@ def _validate_expectation_body(value: object) -> dict[str, Any]:
         recipe_keys.add("construction_probe")
     if expectation_v3:
         recipe_keys.add("external_soak_identity")
+    if expectation_v5:
+        recipe_keys.add("app_capacity_artifact")
     recipe = exact(value, recipe_keys, "feedback expectation")
     if expectation_v3:
         require(recipe["mode"] == "pressure_soak_validation", "expectation v3 requires pressure_soak_validation mode")
     elif expectation_v4:
         require(recipe["mode"] == "capacity_calibration", "expectation v4 requires capacity_calibration mode")
+    elif expectation_v5:
+        require(recipe["mode"] == "pressure_validation", "expectation v5 requires pressure_validation mode")
     else:
         require(recipe["mode"] in ("capacity_calibration", "pressure_validation"), "unsupported expectation mode")
     identity = exact(recipe["identity"], {
@@ -405,6 +427,9 @@ def _validate_expectation_body(value: object) -> dict[str, Any]:
     digest(identity["source_sha256"], "identity.source_sha256")
     digest(identity["binary_sha256"], "identity.binary_sha256")
     require(type(identity["pressure_qualification"]) is bool, "identity.pressure_qualification must be boolean")
+    if expectation_v5:
+        require(identity["allocator"] in APPLICATION_ALLOCATOR_LABELS, "expectation v5 allocator is outside the original application artifact set")
+        require(identity["executor"] in V5_EXECUTOR_LABELS, "expectation v5 executor is outside the original native/Tokio role set")
     if expectation_v2:
         _validate_v2_workload_profile(identity["workload"], identity["profile"])
         construction_probe = exact(recipe["construction_probe"], {
@@ -476,7 +501,10 @@ def _validate_expectation_body(value: object) -> dict[str, Any]:
     )
     buckets = exact(policy["rate_buckets"], set(RATE_DIRECTIONS), "rate bucket set")
     for direction, item in buckets.items():
-        item = exact(item, {"ceiling_bytes_per_second", "ceiling_burst_bytes", "max_reservations"}, f"{direction} bucket")
+        bucket_keys = {"ceiling_bytes_per_second", "ceiling_burst_bytes", "max_reservations"}
+        if expectation_v5:
+            bucket_keys.add("initial_bytes_per_second")
+        item = exact(item, bucket_keys, f"{direction} bucket")
         for name in item:
             uint(item[name], f"{direction}.{name}", positive=True)
     if expectation_v2:
@@ -493,6 +521,11 @@ def _validate_expectation_body(value: object) -> dict[str, Any]:
     uint(collector["expected_global_control_baseline"], "global Control baseline")
 
     app_capacity = recipe["app_capacity_artifact_sha256"]
+    if expectation_v5:
+        capacity_pin = exact(recipe["app_capacity_artifact"], {"path", "raw_sha256"}, "V5 application capacity artifact pin")
+        absolute_path(capacity_pin["path"], "V5 application capacity artifact path")
+        digest(capacity_pin["raw_sha256"], "V5 application capacity artifact raw SHA-256")
+        require(app_capacity == capacity_pin["raw_sha256"], "V5 capacity artifact digest fields disagree")
     if recipe["mode"] == "capacity_calibration":
         require(app_capacity is None, "capacity calibration must not depend on app-byte denominators")
         require(capacity_sources == {"disk": False, "download": False}, "capacity calibration must freeze missing application-byte denominators")
@@ -593,12 +626,11 @@ def _validate_meter_source_bounds(
     return validated
 
 
-def _validate_v4_policy_source_projection(
+def _source_v5_base_feedback_policy(
     recipe: dict[str, Any], source_manifest_value: dict[str, Any], probe: dict[str, Any],
-) -> None:
-    """Bind V4 expectations to SourceV5 policy artifacts after full source verification."""
+) -> tuple[dict[str, Any], dict[str, Any], int]:
+    """Derive static controls and accounting from the verified SourceV5 inputs."""
     identity = recipe["identity"]
-    policy = recipe["policy"]
     feedback_artifact = exact(
         source_manifest_value["feedback_policy"],
         {"schema", "policy", "policy_sha256"},
@@ -683,7 +715,7 @@ def _validate_v4_policy_source_projection(
             "sample_interval_ns", "max_dense_gap_ns", "telemetry_freshness_ns",
             "required_breach_samples", "actuation_cooldown_ns", "minimum_dense_observations",
         }, "SourceV5 feedback reader contract"),
-        "controls": context["controls"],
+        "controls": copy.deepcopy(context["controls"]),
         "capacity_sources": {"disk": False, "download": False},
         "global_ceilings": global_ceilings,
         "tenant_ceilings": tenant_ceilings,
@@ -692,10 +724,601 @@ def _validate_v4_policy_source_projection(
         "meter_source_bounds": meter_bounds,
         "collector": collector,
     }
+    require(context["minimum_dense_observations"] == expected["minimum_dense_observations"], "SourceV5 context density differs from its numeric reader contract")
+    require(feedback_body["algorithm"] == probe["rust_control_context"]["algorithm"], "SourceV5 feedback algorithm differs from the construction probe")
+    return expected, copy.deepcopy(feedback_body["algorithm"]), workers
+
+
+def _validate_v4_policy_source_projection(
+    recipe: dict[str, Any], source_manifest_value: dict[str, Any], probe: dict[str, Any],
+) -> None:
+    """Bind V4 expectations to SourceV5 policy artifacts after full source verification."""
+    expected, _algorithm, _workers = _source_v5_base_feedback_policy(recipe, source_manifest_value, probe)
+    policy = recipe["policy"]
     for key, projected in expected.items():
         require(policy[key] == projected, f"V4 expectation policy {key} differs from verified SourceV5 inputs")
-    require(context["minimum_dense_observations"] == policy["minimum_dense_observations"], "SourceV5 V4 density differs from the feedback expectation")
-    require(feedback_body["algorithm"] == probe["rust_control_context"]["algorithm"], "SourceV5 V4 algorithm differs from the construction probe")
+
+
+CAPACITY_RESOLUTION_RULE = "clip_relevant_initial_and_ceiling_to_raw_capacity"
+CAPACITY_RESOLUTION_VERSION = "application-feedback-capacity-resolution-v1"
+CAPACITY_RATE_ROOF = 16 * 1024**3
+CAPACITY_RATE_FLOOR = 64 * 1024**2
+CAPACITY_ARTIFACT_FIELDS = {
+    "schema", "calibration_id", "host_id", "profile", "workload", "source_sha256",
+    "disk.bytes_per_second", "disk.units", "disk.provenance",
+    "download.bytes_per_second", "download.units", "download.provenance",
+}
+
+
+def _read_capacity_artifact_v5(pin: object) -> tuple[dict[str, str], str]:
+    artifact_pin = exact(pin, {"path", "raw_sha256"}, "V5 application capacity artifact pin")
+    path = absolute_path(artifact_pin["path"], "V5 application capacity artifact path")
+    expected_sha = digest(artifact_pin["raw_sha256"], "V5 application capacity artifact raw SHA-256")
+    raw, actual_sha = read_stable(path, "V5 application capacity artifact", 4096)
+    require(actual_sha == expected_sha, "V5 application capacity artifact raw SHA-256 differs from its pin")
+    require(raw.endswith(b"\n") and b"\r" not in raw and b"\x00" not in raw, "V5 capacity artifact has invalid LF framing")
+    try:
+        lines = raw.decode("ascii").splitlines()
+    except UnicodeError as error:
+        raise ValidationError("V5 application capacity artifact is not ASCII") from error
+    fields: dict[str, str] = {}
+    names: list[str] = []
+    for line in lines:
+        parts = line.split("\t")
+        require(len(parts) == 2 and all(parts), "V5 capacity artifact row is malformed")
+        name, value = parts
+        require(name not in fields and not any(ord(char) < 32 or ord(char) == 127 for char in name + value), "V5 capacity artifact has duplicate or invalid fields")
+        fields[name] = value
+        names.append(name)
+    require(set(fields) == CAPACITY_ARTIFACT_FIELDS, "V5 capacity artifact has an unexpected field set")
+    require(names == sorted(names, key=lambda name: name.encode("ascii")), "V5 capacity artifact rows are not canonically sorted")
+    require(fields["schema"] == "allocatbelt.app-byte-capacity.v1", "unsupported V5 application capacity artifact schema")
+    require(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,95}", fields["calibration_id"]) is not None, "V5 calibration ID is malformed")
+    digest(fields["source_sha256"], "V5 capacity source SHA-256")
+    for direction in ("disk", "download"):
+        rate = fields[f"{direction}.bytes_per_second"]
+        units = fields[f"{direction}.units"]
+        provenance = fields[f"{direction}.provenance"]
+        require(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,255}", provenance) is not None, f"V5 {direction} provenance is malformed")
+        if rate == "missing":
+            require(units == "missing", f"missing V5 {direction} capacity must use missing units")
+        else:
+            require(re.fullmatch(r"[1-9][0-9]{0,19}", rate) is not None, f"V5 {direction} capacity is not a canonical positive integer")
+            require(int(rate) <= U64_MAX and units == "application_bytes_per_second", f"V5 {direction} capacity units/value are invalid")
+    return fields, actual_sha
+
+
+def _validate_v2_collector(value: object, label: str = "V2 construction probe collector") -> dict[str, int]:
+    """Validate all four V2 collector fields without conflating owner charges."""
+    actual_collector = exact(value, {
+        "control_charge_bytes", "task_lease_count", "tenant_control_used_with_admission",
+        "tenant_tasks_used_with_admission",
+    }, label)
+    control_charge = uint(actual_collector["control_charge_bytes"], "V2 collector Control charge", positive=True)
+    task_lease = uint(actual_collector["task_lease_count"], "V2 collector Task lease", positive=True)
+    tenant_control = uint(actual_collector["tenant_control_used_with_admission"], "V2 tenant Control with collector", positive=True)
+    tenant_tasks = uint(actual_collector["tenant_tasks_used_with_admission"], "V2 tenant Tasks with collector", positive=True)
+    require(task_lease == 1 and tenant_tasks == 1, "V2 collector must own exactly one Task lease")
+    require(tenant_control >= control_charge, "V2 tenant Control observation omits the actual collector charge")
+    return {
+        "control_charge_bytes": control_charge,
+        "task_lease_count": task_lease,
+        "tenant_control_used_with_admission": tenant_control,
+        "tenant_tasks_used_with_admission": tenant_tasks,
+    }
+
+
+def _static_policy_from_source_v5(
+    source_manifest: dict[str, Any], identity: dict[str, Any], collector: object, algorithm: object,
+) -> tuple[dict[str, Any], dict[str, Any], int]:
+    """Project calibrated-probe V2 observations into the shared static policy."""
+    actual_collector = _validate_v2_collector(collector)
+    # The V4 projection deliberately remains a two-field exact contract. V2's
+    # extra constructor observations are checked above and in the V2 evidence
+    # validator, then only the shared collector facts are projected here.
+    probe = {
+        "collector": {
+            "control_charge_bytes": actual_collector["control_charge_bytes"],
+            "task_lease_count": actual_collector["task_lease_count"],
+        },
+        "rust_control_context": {"algorithm": algorithm},
+    }
+    recipe = {"identity": identity, "policy": {}}
+    policy, actual_algorithm, workers = _source_v5_base_feedback_policy(recipe, source_manifest, probe)
+    return policy, actual_algorithm, workers
+
+
+def resolve_calibrated_feedback_policy_v5(
+    source_manifest: dict[str, Any], probe: dict[str, Any], capacity_artifact_pin: object,
+    identity: dict[str, Any],
+) -> dict[str, Any]:
+    """Resolve only the relevant application-byte rates against SourceV5 limits."""
+    require(type(source_manifest) is dict and source_manifest.get("schema") == SOURCE_MANIFEST_SCHEMA_V5, "calibrated feedback resolution requires SourceV5")
+    require(type(identity) is dict, "calibrated feedback identity must be an object")
+    for name in ("host_id", "workload", "profile", "allocator"):
+        require(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", text(identity.get(name), f"calibrated identity.{name}")) is not None, f"calibrated identity.{name} is not a canonical token")
+    require(identity["allocator"] in APPLICATION_ALLOCATOR_LABELS, "calibrated feedback resolver allocator is outside the original application artifact set")
+    digest(identity.get("source_sha256"), "calibrated identity source SHA-256")
+    digest(identity.get("binary_sha256"), "calibrated identity binary SHA-256")
+    _verify_source_manifest_v5(source_manifest, {
+        "schema": EXPECTATION_SCHEMA_V5, "mode": "pressure_validation", "identity": identity,
+    })
+    require(source_manifest["build"]["host_id"] == identity["host_id"], "calibrated identity host differs from SourceV5 build")
+    require(source_manifest["source"]["source_tree_sha256"] == identity["source_sha256"], "calibrated identity source differs from SourceV5 tree")
+    app_artifact = exact(source_manifest["artifacts"].get(identity["allocator"]), {"path", "sha256"}, "SourceV5 calibrated APP artifact")
+    require(digest(app_artifact["sha256"], "SourceV5 calibrated APP artifact SHA-256") == identity["binary_sha256"], "calibrated identity binary differs from SourceV5 APP artifact")
+    _validate_v2_workload_profile(identity.get("workload"), identity.get("profile"))
+    exact(probe, {
+        "schema", "context", "reader_context", "rust_control_context", "collector", "baseline",
+        "capacity_calibration", "construction", "after_release", "meter_source_bounds",
+        "meter_source_model", "source_references",
+    }, "calibrated construction probe v2")
+    require(probe["schema"] == "allocatbelt.application-feedback-policy-probe.v2", "unsupported calibrated construction probe schema")
+    context = exact(probe["context"], {"workload", "profile", "workers"}, "calibrated probe context")
+    require(context["workload"] == identity["workload"] and context["profile"] == identity["profile"], "calibrated probe context differs from feedback identity")
+    workers = uint(context["workers"], "calibrated probe workers", positive=True, maximum=4)
+    require(workers == (2 if identity["profile"] == "oversubscribed" else 4), "calibrated probe workers differ from the profile")
+    reader_context = exact(probe["reader_context"], {
+        "version", "sample_interval_ns", "max_dense_gap_ns", "telemetry_freshness_ns",
+        "required_breach_samples", "actuation_cooldown_ns", "minimum_dense_observations",
+    }, "calibrated probe reader context")
+    require(reader_context["version"] == "runtime-feedback-policy-v1", "unsupported calibrated reader policy version")
+    reader_numeric = {
+        "sample_interval_ns": 100_000_000, "max_dense_gap_ns": 200_000_000,
+        "telemetry_freshness_ns": 500_000_000, "required_breach_samples": 3,
+        "actuation_cooldown_ns": NSEC, "minimum_dense_observations": 1,
+    }
+    for name, expected in reader_numeric.items():
+        require(uint(reader_context[name], f"calibrated reader {name}", positive=True) == expected, f"calibrated reader {name} differs from the SourceV5 contract")
+
+    rust_context = exact(probe["rust_control_context"], {
+        "algorithm", "controls", "global_ceilings", "tenant_ceilings", "scope_limits",
+        "rate_buckets", "required_byte_sources",
+    }, "calibrated Rust control context")
+    algorithm = exact(rust_context["algorithm"], {
+        "cpu_reduction_rule", "cpu_recovery_increment", "network_sensor_source", "upload_controlled",
+    }, "calibrated feedback algorithm")
+    require(type(algorithm["upload_controlled"]) is bool, "calibrated upload-control flag must be boolean")
+    require(uint(algorithm["cpu_recovery_increment"], "calibrated CPU recovery increment", positive=True) == 1, "calibrated CPU recovery increment differs from contract")
+    require(algorithm == {
+        "cpu_reduction_rule": "floor_current_limit_over_10_zero_is_quantized",
+        "cpu_recovery_increment": 1,
+        "network_sensor_source": "download_application_bytes_only",
+        "upload_controlled": False,
+    }, "calibrated feedback algorithm differs from SourceV5")
+
+    capacity, capacity_sha = _read_capacity_artifact_v5(capacity_artifact_pin)
+    calibration = exact(probe["capacity_calibration"], {
+        "artifact_sha256", "calibration_id", "disk", "download", "hash_scope", "host_id",
+        "identity", "profile", "resolution", "schema", "source_sha256", "verification_scope", "workload",
+    }, "calibrated capacity context")
+    require(calibration["schema"] == "allocatbelt.app-byte-capacity.v1", "calibrated capacity schema differs")
+    require(digest(calibration["artifact_sha256"], "probe capacity artifact SHA") == capacity_sha, "probe capacity artifact SHA differs from the pinned raw bytes")
+    require(calibration["calibration_id"] == capacity["calibration_id"], "probe calibration ID differs from the capacity artifact")
+    require(calibration["host_id"] == capacity["host_id"] == identity["host_id"], "capacity host differs from the SourceV5 feedback identity")
+    require(calibration["profile"] == capacity["profile"] == identity["profile"], "capacity profile differs from the SourceV5 feedback identity")
+    require(calibration["workload"] == capacity["workload"] == identity["workload"], "capacity workload differs from the SourceV5 feedback identity")
+    require(calibration["source_sha256"] == capacity["source_sha256"] == identity["source_sha256"], "capacity source differs from the SourceV5 feedback identity")
+    capacity_identity = exact(calibration["identity"], {"host_id", "profile", "source_sha256", "workload"}, "probe capacity identity")
+    require(capacity_identity == {name: calibration[name] for name in capacity_identity}, "probe capacity identity projection differs")
+    require(calibration["hash_scope"] == "exact_bounded_artifact_bytes", "probe capacity hash scope differs")
+    require(calibration["verification_scope"] == "exact_artifact_hash_and_run_identity_only;producer_and_measurement_chronology_unverified", "probe capacity scope must retain its chronology limitation")
+    relevant = {
+        "disk": identity["workload"] in ("disk", "mixed"),
+        "download": identity["workload"] in ("http", "mixed"),
+    }
+    for direction in ("disk", "download"):
+        direction_value = exact(calibration[direction], {"bytes_per_second", "direction", "provenance", "units"}, f"probe {direction} calibration")
+        require(direction_value["direction"] == direction, f"probe {direction} direction label differs")
+        require(direction_value["provenance"] == capacity[f"{direction}.provenance"], f"probe {direction} provenance differs from raw artifact")
+        rate = capacity[f"{direction}.bytes_per_second"]
+        if rate == "missing":
+            require(direction_value["bytes_per_second"] is None and direction_value["units"] == "missing", f"probe missing {direction} calibration differs from artifact")
+        else:
+            require(uint(direction_value["bytes_per_second"], f"probe {direction} bytes per second", positive=True) == int(rate), f"probe {direction} calibration differs from raw artifact")
+            require(direction_value["units"] == "application_bytes_per_second", f"probe {direction} units differ from raw artifact")
+        if relevant[direction]:
+            require(rate != "missing", f"required application-byte capacity source is missing: {direction}")
+            require(int(rate) >= CAPACITY_RATE_FLOOR, f"{direction} application-byte capacity is below the feedback floor")
+        else:
+            require(rate == "missing", f"irrelevant {direction} capacity source must remain missing")
+
+    expected, expected_algorithm, expected_workers = _static_policy_from_source_v5(
+        source_manifest, identity, probe["collector"], algorithm,
+    )
+    require(expected_algorithm == algorithm and expected_workers == workers, "calibrated algorithm or worker count differs from SourceV5")
+    expected["capacity_sources"] = {"disk": relevant["disk"], "download": relevant["download"]}
+    expected["rate_buckets"] = {
+        direction: {
+            "initial_bytes_per_second": expected["rate_buckets"][direction]["ceiling_bytes_per_second"],
+            **expected["rate_buckets"][direction],
+        }
+        for direction in RATE_DIRECTIONS
+    }
+    expected_controls = expected["controls"]
+    for direction, resource in (("disk", "disk"), ("download", "download")):
+        if relevant[direction]:
+            resolved = min(int(capacity[f"{direction}.bytes_per_second"]), CAPACITY_RATE_ROOF)
+            expected_controls[resource]["initial"] = resolved
+            expected_controls[resource]["ceiling"] = resolved
+            expected["rate_buckets"][direction]["initial_bytes_per_second"] = resolved
+            expected["rate_buckets"][direction]["ceiling_bytes_per_second"] = resolved
+
+    resolution = exact(calibration["resolution"], {
+        "controls", "rate_buckets", "rule", "rule_version", "static_rate_roof_bytes_per_second", "upload_controlled",
+    }, "calibrated capacity resolution")
+    require(resolution["rule"] == CAPACITY_RESOLUTION_RULE and resolution["rule_version"] == CAPACITY_RESOLUTION_VERSION, "calibrated capacity resolution version/rule differs")
+    require(uint(resolution["static_rate_roof_bytes_per_second"], "calibrated static rate roof", positive=True) == CAPACITY_RATE_ROOF, "calibrated static rate roof differs")
+    require(type(resolution["upload_controlled"]) is bool and resolution["upload_controlled"] is False, "calibrated resolution changes upload control")
+    resolution_controls = exact(resolution["controls"], set(RESOURCES), "calibrated resolution controls")
+    for resource in RESOURCES:
+        item = exact(resolution_controls[resource], {"floor", "initial", "ceiling", "low_bps", "high_bps"}, f"calibrated resolution {resource} control")
+        for field, number in item.items():
+            uint(number, f"calibrated resolution {resource}.{field}")
+    resolution_buckets = exact(resolution["rate_buckets"], set(RATE_DIRECTIONS), "calibrated resolution rate buckets")
+    for direction in RATE_DIRECTIONS:
+        item = exact(resolution_buckets[direction], {
+            "initial_bytes_per_second", "ceiling_bytes_per_second", "ceiling_burst_bytes", "max_reservations",
+        }, f"calibrated resolution {direction} rate bucket")
+        for field, number in item.items():
+            uint(number, f"calibrated resolution {direction}.{field}", positive=True)
+    require(resolution["controls"] == rust_context["controls"], "capacity resolution controls differ from the Rust control context")
+    require(resolution["rate_buckets"] == rust_context["rate_buckets"], "capacity resolution buckets differ from the Rust control context")
+    controls = exact(rust_context["controls"], set(RESOURCES), "calibrated Rust controls")
+    for resource in RESOURCES:
+        observed = exact(controls[resource], {"floor", "initial", "ceiling", "low_bps", "high_bps"}, f"calibrated {resource} control")
+        for key, item in observed.items():
+            uint(item, f"calibrated {resource}.{key}")
+        require(observed == expected_controls[resource], f"calibrated {resource} control differs from independent resolution")
+    required_sources = exact(rust_context["required_byte_sources"], {"disk", "download"}, "calibrated required byte sources")
+    require(required_sources == relevant, "calibrated required byte sources differ from workload")
+    for owner in ("global_ceilings", "tenant_ceilings"):
+        require(_uint_map(rust_context[owner], set(DOMAIN), f"calibrated {owner}") == expected[owner], f"calibrated {owner} differs from SourceV5")
+    require(_uint_map(rust_context["scope_limits"], {"managed_memory", "disk_operations", "network_operations"}, "calibrated scope limits") == expected["scope_limits"], "calibrated scope limits differ from SourceV5")
+    require(rust_context["rate_buckets"] == expected["rate_buckets"], "calibrated Rust rate buckets differ from independent capacity resolution")
+    return expected
+
+
+def _stable_file_sha256(path: Path, label: str, maximum: int) -> tuple[str, int, int]:
+    try:
+        require(path.resolve(strict=True) == path, f"{label} traverses a symlink or alias")
+        before_path = path.lstat()
+        require(stat.S_ISREG(before_path.st_mode), f"{label} must be a regular nonsymlink file")
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
+    except OSError as error:
+        raise ValidationError(f"cannot safely open {label}: {error}") from error
+    try:
+        before = os.fstat(fd)
+        require(stat.S_ISREG(before.st_mode) and _stat_key(before) == _stat_key(before_path), f"{label} changed while opening")
+        require(0 <= before.st_size <= maximum, f"{label} exceeds its hard size bound")
+        hasher = hashlib.sha256()
+        count = 0
+        while True:
+            block = os.read(fd, 1024 * 1024)
+            if not block:
+                break
+            count += len(block)
+            require(count <= maximum, f"{label} exceeded its hard size bound")
+            hasher.update(block)
+        after_fd, after_path = os.fstat(fd), path.lstat()
+        require(count == before.st_size and _stat_key(before) == _stat_key(after_fd) == _stat_key(after_path), f"{label} changed during hashing")
+        return hasher.hexdigest(), count, before.st_mode
+    finally:
+        os.close(fd)
+
+
+def _leader_exit_status_unreaped(process: subprocess.Popen[bytes]) -> Any | None:
+    """Observe child exit without releasing the PID that anchors its new session."""
+    require(process.returncode is None, "probe leader was reaped before process-group cleanup completed")
+    try:
+        result = os.waitid(os.P_PID, process.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+    except ChildProcessError as error:
+        raise ValidationError("probe leader ownership was lost before its process group was verified") from error
+    if result is not None and result.si_pid == process.pid:
+        return result
+    return None
+
+
+def _owned_session_members(session_id: int) -> tuple[list[int], list[int]]:
+    """Return live PIDs in the owned PGID and live PIDs that escaped to another PGID."""
+    group_members: list[int] = []
+    escaped_members: list[int] = []
+    try:
+        entries = list(os.scandir("/proc"))
+    except OSError as error:
+        raise ValidationError(f"cannot inspect process ownership for probe cleanup: {error}") from error
+    saw_leader = False
+    for entry in entries:
+        if not entry.name.isdecimal():
+            continue
+        pid = int(entry.name)
+        try:
+            with open(f"/proc/{entry.name}/stat", encoding="ascii") as stat_file:
+                stat_line = stat_file.read(8192)
+        except FileNotFoundError:
+            continue
+        except OSError as error:
+            raise ValidationError(f"cannot inspect process {pid} during probe cleanup: {error}") from error
+        closing = stat_line.rfind(")")
+        require(closing >= 0, f"cannot parse process {pid} during probe cleanup")
+        fields = stat_line[closing + 1 :].split()
+        require(len(fields) >= 4, f"cannot parse process identity for {pid} during probe cleanup")
+        state = fields[0]
+        try:
+            process_group_id = int(fields[2])
+            observed_session_id = int(fields[3])
+        except ValueError as error:
+            raise ValidationError(f"cannot parse process group for {pid} during probe cleanup") from error
+        if pid == session_id:
+            require(process_group_id == session_id and observed_session_id == session_id, "probe leader no longer anchors its original session")
+            saw_leader = True
+        if observed_session_id != session_id or state in {"Z", "X"}:
+            continue
+        if process_group_id == session_id:
+            group_members.append(pid)
+        else:
+            escaped_members.append(pid)
+    require(saw_leader, "probe session leader disappeared before it was safely reaped")
+    return group_members, escaped_members
+
+
+def _signal_unreaped_owned_group(process: subprocess.Popen[bytes], signum: int) -> None:
+    """Signal only the fresh PGID while its unreaped session leader pins that ID."""
+    _leader_exit_status_unreaped(process)
+    group_members, _escaped_members = _owned_session_members(process.pid)
+    if not group_members:
+        return
+    try:
+        os.killpg(process.pid, signum)
+    except ProcessLookupError:
+        return
+    except OSError as error:
+        raise ValidationError(f"cannot signal the unreaped probe process group: {error}") from error
+
+
+def _wait_owned_group_quiescent(process: subprocess.Popen[bytes], timeout_seconds: float) -> bool:
+    deadline = time.monotonic() + timeout_seconds
+    while True:
+        _leader_exit_status_unreaped(process)
+        group_members, _escaped_members = _owned_session_members(process.pid)
+        if not group_members:
+            return True
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        time.sleep(min(PROBE_POLL_INTERVAL_SECONDS, remaining))
+
+
+def _cleanup_owned_process_group(process: subprocess.Popen[bytes]) -> None:
+    """Boundedly clean an isolated group while its unreaped leader reserves the PGID."""
+    _leader_exit_status_unreaped(process)
+    cleanup_deadline = time.monotonic() + PROBE_CLEANUP_TOTAL_SECONDS
+    _signal_unreaped_owned_group(process, signal.SIGTERM)
+    term_budget = min(PROBE_TERM_GRACE_SECONDS, max(0.0, cleanup_deadline - time.monotonic()))
+    group_quiescent = _wait_owned_group_quiescent(process, term_budget)
+    if not group_quiescent:
+        _signal_unreaped_owned_group(process, signal.SIGKILL)
+        kill_budget = min(PROBE_KILL_GRACE_SECONDS, max(0.0, cleanup_deadline - time.monotonic()))
+        group_quiescent = _wait_owned_group_quiescent(process, kill_budget)
+    _leader_exit_status_unreaped(process)
+    _group_members, escaped_members = _owned_session_members(process.pid)
+    remaining = cleanup_deadline - time.monotonic()
+    require(remaining > 0, "probe cleanup exhausted its total deadline before leader reaping")
+    try:
+        process.wait(timeout=min(PROBE_REAP_GRACE_SECONDS, remaining))
+    except subprocess.TimeoutExpired as error:
+        raise ValidationError("probe leader could not be reaped within its cleanup bound") from error
+    # The leader PID/PGID is reusable after wait(); never signal or inspect it again.
+    require(group_quiescent, "probe process group remained after bounded TERM/KILL cleanup")
+    require(not escaped_members, "probe left live descendants outside its owned process group")
+
+
+def _capture_bounded_process(
+    argv: list[str], cwd: Path, label: str, *, timeout_seconds: float = 30.0,
+    maximum_output_bytes: int = MAX_PROBE_OUTPUT_BYTES,
+) -> tuple[int, bytes, bytes]:
+    require(timeout_seconds > 0 and maximum_output_bytes > 0, f"{label} bounds must be positive")
+    require(signal.getsignal(signal.SIGCHLD) == signal.SIG_DFL, f"{label} requires the default SIGCHLD disposition to preserve child ownership")
+    require(callable(getattr(os, "waitid", None)) and hasattr(os, "WNOWAIT"), f"{label} requires waitid(WNOWAIT) for owned process-group cleanup")
+    try:
+        process = subprocess.Popen(
+            argv, cwd=cwd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, close_fds=True, start_new_session=True, bufsize=0,
+        )
+    except OSError as error:
+        raise ValidationError(f"cannot execute {label}: {error}") from error
+    assert process.stdout is not None and process.stderr is not None
+    stdout_fd = process.stdout.fileno()
+    stderr_fd = process.stderr.fileno()
+    selector = selectors.DefaultSelector()
+    output = {stdout_fd: bytearray(), stderr_fd: bytearray()}
+    streams = {stdout_fd: process.stdout, stderr_fd: process.stderr}
+    cleanup_completed = False
+    try:
+        for fd, stream in streams.items():
+            os.set_blocking(fd, False)
+            selector.register(stream, selectors.EVENT_READ, fd)
+        deadline = time.monotonic() + timeout_seconds
+        while selector.get_map():
+            remaining = deadline - time.monotonic()
+            require(remaining > 0, f"{label} exceeded its {timeout_seconds:g}-second deadline")
+            for key, _mask in selector.select(min(0.1, remaining)):
+                fd = key.data
+                block = os.read(fd, 64 * 1024)
+                if not block:
+                    selector.unregister(key.fileobj)
+                    key.fileobj.close()
+                    continue
+                output[fd].extend(block)
+                require(sum(len(data) for data in output.values()) <= maximum_output_bytes, f"{label} output exceeds its {maximum_output_bytes}-byte bound")
+        remaining = deadline - time.monotonic()
+        require(remaining > 0, f"{label} exceeded its {timeout_seconds:g}-second deadline")
+        while _leader_exit_status_unreaped(process) is None:
+            remaining = deadline - time.monotonic()
+            require(remaining > 0, f"{label} exceeded its {timeout_seconds:g}-second deadline")
+            time.sleep(min(PROBE_POLL_INTERVAL_SECONDS, remaining))
+        group_members, escaped_members = _owned_session_members(process.pid)
+        if group_members or escaped_members:
+            cleanup_completed = True
+            _cleanup_owned_process_group(process)
+            raise ValidationError(f"{label} exited while owned descendant processes remained")
+        remaining = deadline - time.monotonic()
+        require(remaining > 0, f"{label} exceeded its {timeout_seconds:g}-second deadline")
+        exit_code = process.wait(timeout=min(PROBE_REAP_GRACE_SECONDS, remaining))
+        return exit_code, bytes(output[stdout_fd]), bytes(output[stderr_fd])
+    except BaseException as error:
+        if not cleanup_completed:
+            try:
+                _cleanup_owned_process_group(process)
+            except BaseException as cleanup_error:
+                raise cleanup_error from error
+        if isinstance(error, subprocess.TimeoutExpired):
+            raise ValidationError(f"{label} exceeded its {timeout_seconds:g}-second deadline") from error
+        raise
+    finally:
+        selector.close()
+        for stream in streams.values():
+            try:
+                stream.close()
+            except OSError:
+                pass
+
+
+def _run_feedback_probe(binary: Path, source_root: Path, identity: dict[str, Any], capacity_path: Path, capacity_sha: str) -> bytes:
+    argv = [
+        str(binary), "--emit-feedback-policy-only", "--workload", identity["workload"],
+        "--profile", identity["profile"], "--capacity-calibration-file", str(capacity_path),
+        "--capacity-calibration-sha256", capacity_sha, "--host-id", identity["host_id"],
+        "--source-sha256", identity["source_sha256"],
+    ]
+    exit_code, stdout, stderr = _capture_bounded_process(
+        argv, source_root, "pinned SourceV5 APP probe",
+    )
+    require(exit_code == 0, f"pinned SourceV5 APP probe exited with status {exit_code}: {stderr[:1024]!r}")
+    require(not stderr, "pinned SourceV5 APP probe wrote unexpected stderr")
+    return stdout
+
+
+def validate_calibrated_construction_probe_v2(
+    probe_pin: object, source_manifest: dict[str, Any], capacity_artifact_pin: object,
+    identity: dict[str, Any], expected_policy: dict[str, Any] | None = None,
+) -> str:
+    """Fully verify SourceV5 and rerun its exact APP binary's calibrated probe."""
+    require(source_manifest.get("schema") == SOURCE_MANIFEST_SCHEMA_V5, "calibrated construction probe requires SourceV5")
+    pin = exact(probe_pin, {"path", "raw_sha256", "allocator", "binary_sha256"}, "calibrated construction probe pin")
+    absolute_path(pin["path"], "calibrated construction probe path")
+    digest(pin["raw_sha256"], "calibrated construction probe raw SHA-256")
+    require(pin["allocator"] in APPLICATION_ALLOCATOR_LABELS and pin["allocator"] == identity["allocator"], "calibrated probe allocator differs from the selected application artifact")
+    digest(pin["binary_sha256"], "calibrated probe binary SHA-256")
+    require(pin["binary_sha256"] == identity["binary_sha256"], "calibrated probe binary differs from feedback identity")
+    probe, probe_sha = read_canonical(Path(pin["path"]), "calibrated construction probe v2", MAX_CONSTRUCTION_PROBE_BYTES, pin["raw_sha256"])
+    resolved_policy = resolve_calibrated_feedback_policy_v5(source_manifest, probe, capacity_artifact_pin, identity)
+    if expected_policy is not None:
+        require(expected_policy == resolved_policy, "V5 feedback expectation differs from independently resolved SourceV5/capacity policy")
+    source = source_manifest.get("source")
+    require(source_manifest["build"]["host_id"] == identity["host_id"], "calibrated probe SourceV5 host differs from feedback identity")
+    require(source["source_tree_sha256"] == identity["source_sha256"], "calibrated probe SourceV5 tree differs from feedback identity")
+    artifact = exact(source_manifest["artifacts"].get(identity["allocator"]), {"path", "sha256"}, "calibrated SourceV5 APP artifact")
+    require(digest(artifact["sha256"], "calibrated SourceV5 APP artifact SHA-256") == pin["binary_sha256"], "calibrated probe binary differs from SourceV5 APP artifact")
+    source_root = Path(__file__).resolve().parent.parent
+    relative = PurePosixPath(text(artifact["path"], "SourceV5 APP artifact relative path", 4096))
+    require(not relative.is_absolute() and ".." not in relative.parts and relative.as_posix() == artifact["path"], "SourceV5 APP artifact path is not portable")
+    binary = source_root.joinpath(*relative.parts)
+    binary_sha, _size, binary_mode = _stable_file_sha256(binary, "SourceV5 APP artifact", MAX_APP_BINARY_BYTES)
+    require(stat.S_IMODE(binary_mode) & 0o111 and binary_sha == artifact["sha256"], "SourceV5 APP artifact bytes or executable mode differ from the manifest")
+    _fields, capacity_sha = _read_capacity_artifact_v5(capacity_artifact_pin)
+    _validate_calibrated_construction_evidence(source_manifest, probe, identity)
+    capacity_path = absolute_path(exact(capacity_artifact_pin, {"path", "raw_sha256"}, "V5 capacity artifact pin")["path"], "V5 capacity artifact path")
+    rerun = _run_feedback_probe(binary, source_root, identity, capacity_path, capacity_sha)
+    require(rerun == canonical_bytes(probe), "pinned construction probe bytes differ from stdout from the exact SourceV5 APP artifact")
+    return probe_sha
+
+
+def _validate_calibrated_construction_evidence(
+    source_manifest: dict[str, Any], probe: dict[str, Any], identity: dict[str, Any],
+) -> None:
+    expected_bounds = _validate_meter_source_bounds(probe["meter_source_bounds"], identity["workload"], "calibrated probe meter source bounds")
+    require(probe["meter_source_bounds"] == meter_source_bounds_for_workload(identity["workload"]), "calibrated meter bounds differ from the workload source model")
+    model = exact(probe["meter_source_model"], set(CONSTRUCTION_PROBE_METER_SOURCE_MODEL) | {"http_client_window", "http_handler_window"}, "calibrated meter source model")
+    for key, value in CONSTRUCTION_PROBE_METER_SOURCE_MODEL.items():
+        require(model[key] == value, f"calibrated meter source model differs at {key}")
+    require(uint(model["http_client_window"], "calibrated HTTP client window", positive=True) == 8, "calibrated HTTP client window differs")
+    require(uint(model["http_handler_window"], "calibrated HTTP handler window", positive=True) == 8, "calibrated HTTP handler window differs")
+    if identity["workload"] in ("http", "mixed"):
+        require(expected_bounds["upload"]["maximum_live"] == 16 and expected_bounds["download"]["maximum_live"] == 16, "calibrated endpoint windows do not explain meter bounds")
+
+    source = exact(source_manifest["source"], {"git_commit", "source_tree_sha256", "cargo_lock_sha256", "files"}, "calibrated SourceV5 source inventory")
+    records = source["files"]
+    require(type(records) is list, "calibrated SourceV5 source inventory is not a list")
+    by_path = {item.get("path"): item for item in records if type(item) is dict}
+    require(len(by_path) == len(records), "calibrated SourceV5 source inventory has malformed or duplicate paths")
+    references = exact(probe["source_references"], set(CONSTRUCTION_PROBE_SOURCE_REFERENCES), "calibrated probe source references")
+    for name, relative in CONSTRUCTION_PROBE_SOURCE_REFERENCES.items():
+        require(references[name] == relative, f"calibrated probe source reference differs at {name}")
+        record = exact(by_path.get(relative), {"path", "kind", "mode", "sha256", "size"}, f"calibrated source reference {name}")
+        require(record["path"] == relative and record["kind"] == "file" and record["mode"] in ("100644", "100755"), f"calibrated source reference is not an exact regular inventory entry: {name}")
+        digest(record["sha256"], f"calibrated source reference SHA {name}")
+        uint(record["size"], f"calibrated source reference size {name}")
+
+    policy, _algorithm, _workers = _static_policy_from_source_v5(source_manifest, identity, probe["collector"], probe["rust_control_context"]["algorithm"])
+    baseline = policy["collector"]["expected_global_control_baseline"]
+    calibration = exact(source_manifest["resource_domain_calibration"], {
+        "binary", "output", "record", "source", "build", "build_sha256",
+    }, "calibrated SourceV5 resource-domain calibration")
+    calibration_record = exact(calibration["record"], {
+        "schema", "architecture", "max_tenants", "max_waiters", "control_ceiling",
+        "fixed_global_control_baseline", "tenant_owner_control_bytes", "final_live_tenants",
+        "final_global_control_bytes",
+    }, "calibrated SourceV5 resource-domain calibration record")
+    baseline_probe = exact(probe["baseline"], {"expected_global_control_baseline"}, "calibrated probe baseline")
+    require(uint(baseline_probe["expected_global_control_baseline"], "calibrated expected global Control baseline", positive=True) == baseline, "calibrated probe baseline differs from SourceV5")
+
+    collector = _validate_v2_collector(probe["collector"], "calibrated V2 probe collector")
+    control_charge = uint(collector["control_charge_bytes"], "calibrated collector Control charge", positive=True)
+    require(uint(collector["task_lease_count"], "calibrated collector task lease", positive=True) == 1, "calibrated probe collector must own one Task lease")
+    construction = exact(probe["construction"], {"collector", "global_control_used_with_owners", "meters", "rate_buckets", "tenant_live_with_owners"}, "calibrated construction evidence")
+    actual_collector = _validate_v2_collector(construction["collector"], "calibrated constructed collector evidence")
+    require(uint(actual_collector["control_charge_bytes"], "actual collector Control charge", positive=True) == control_charge, "construction Control charge differs from the top-level collector")
+    require(uint(actual_collector["task_lease_count"], "actual collector Task lease", positive=True) == 1, "construction Task lease differs from the contract")
+    tenant_control_with_admission = uint(actual_collector["tenant_control_used_with_admission"], "actual tenant collector Control use", positive=True)
+    require(actual_collector == collector, "constructed collector observations differ from the top-level V2 collector")
+    require(tenant_control_with_admission >= control_charge, "constructed tenant Control use omits the observed collector charge")
+    require(uint(actual_collector["tenant_tasks_used_with_admission"], "actual tenant collector Task use", positive=True) == 1, "constructed collector Task use differs")
+    require(uint(construction["global_control_used_with_owners"], "actual global Control use", positive=True) == baseline + tenant_control_with_admission, "construction global Control does not include calibrated tenant and collector charges")
+    require(uint(construction["tenant_live_with_owners"], "constructed live tenant count", positive=True) == 1, "construction probe did not observe exactly one live tenant")
+
+    actual_buckets = exact(construction["rate_buckets"], set(RATE_DIRECTIONS), "constructed rate bucket set")
+    expected_buckets = probe["rust_control_context"]["rate_buckets"]
+    for direction in RATE_DIRECTIONS:
+        actual = exact(actual_buckets[direction], {
+            "bytes_per_second", "ceiling_bytes_per_second", "burst_bytes", "ceiling_burst_bytes", "max_reservations", "reservations",
+        }, f"constructed {direction} rate bucket")
+        expected = exact(expected_buckets[direction], {
+            "initial_bytes_per_second", "ceiling_bytes_per_second", "ceiling_burst_bytes", "max_reservations",
+        }, f"resolved {direction} rate bucket")
+        require(uint(actual["bytes_per_second"], f"constructed {direction} initial rate", positive=True) == expected["initial_bytes_per_second"], f"constructed {direction} initial rate differs from resolution")
+        require(uint(actual["ceiling_bytes_per_second"], f"constructed {direction} rate ceiling", positive=True) == expected["ceiling_bytes_per_second"], f"constructed {direction} rate ceiling differs from resolution")
+        require(uint(actual["burst_bytes"], f"constructed {direction} burst", positive=True) == expected["ceiling_burst_bytes"], f"constructed {direction} burst differs from source policy")
+        require(uint(actual["ceiling_burst_bytes"], f"constructed {direction} burst ceiling", positive=True) == expected["ceiling_burst_bytes"], f"constructed {direction} burst ceiling differs from source policy")
+        require(uint(actual["max_reservations"], f"constructed {direction} reservation cap", positive=True) == expected["max_reservations"], f"constructed {direction} reservation cap differs from source policy")
+        require(uint(actual["reservations"], f"constructed {direction} reservations") == 0, f"constructed {direction} bucket has a live reservation")
+
+    meters = exact(construction["meters"], set(RATE_DIRECTIONS), "constructed meter set")
+    for direction in RATE_DIRECTIONS:
+        meter = exact(meters[direction], {"attached_sources", "committed_bytes", "completions", "diagnostics_clear", "generation"}, f"constructed {direction} meter")
+        for key in ("attached_sources", "committed_bytes", "completions", "generation"):
+            require(uint(meter[key], f"constructed {direction} meter {key}") == 0, f"constructed {direction} meter {key} is nonzero")
+        require(type(meter["diagnostics_clear"]) is bool and meter["diagnostics_clear"] is True, f"constructed {direction} meter diagnostics are not clear")
+
+    after = exact(probe["after_release"], {
+        "control_used", "control_matches_fixed_baseline", "expected_global_control_baseline", "live_tenants", "zero_dimensions",
+    }, "calibrated owner-release evidence")
+    require(uint(after["control_used"], "after-release Control use") == baseline, "after-release Control use differs from SourceV5 baseline")
+    require(after["control_matches_fixed_baseline"] is True, "after-release Control baseline check did not pass")
+    require(uint(after["expected_global_control_baseline"], "after-release expected baseline", positive=True) == baseline, "after-release expected baseline differs from SourceV5")
+    require(uint(after["live_tenants"], "after-release live tenants") == 0, "after-release probe retains a live tenant")
+    zeros = _uint_map(after["zero_dimensions"], {"cpu", "memory", "disk", "network", "tasks"}, "after-release zero dimensions")
+    require(all(value == 0 for value in zeros.values()), "after-release probe retains resource usage")
 
 
 def validate_construction_probe(
@@ -934,8 +1557,10 @@ def _verify_source_manifest_v5(value: dict[str, Any], recipe: dict[str, Any]) ->
         require(recipe.get("mode") == "pressure_soak_validation", "SourceV5 expectation v3 requires pressure-soak validation mode")
     elif recipe.get("schema") == EXPECTATION_SCHEMA_V4:
         require(recipe.get("mode") == "capacity_calibration", "SourceV5 expectation v4 requires capacity calibration mode")
+    elif recipe.get("schema") == EXPECTATION_SCHEMA_V5:
+        require(recipe.get("mode") == "pressure_validation", "SourceV5 expectation v5 requires pressure validation mode")
     else:
-        require(False, "SourceV5 verification requires feedback expectation v3 or v4")
+        require(False, "SourceV5 verification requires feedback expectation v3, v4, or v5")
     source = value.get("source")
     controller_record = _source_v5_regular_record(source, SOURCE_V5_CONTROLLER_PATH, "campaign controller")
     # The captured controller's V5 verifier validates this regular entry and
@@ -2421,7 +3046,12 @@ def verify_feedback(
     recipe = _validate_expectation_body({key: value for key, value in expectation.items() if key != "recipe_sha256"})
     require(digest(expectation.get("recipe_sha256"), "expectation self digest") == digest_object(recipe), "feedback expectation self digest is invalid")
     source_manifest = _verify_source_manifest(recipe)
-    if recipe["schema"] in (EXPECTATION_SCHEMA_V2, EXPECTATION_SCHEMA_V3, EXPECTATION_SCHEMA_V4):
+    if recipe["schema"] == EXPECTATION_SCHEMA_V5:
+        validate_calibrated_construction_probe_v2(
+            recipe["construction_probe"], source_manifest["value"],
+            recipe["app_capacity_artifact"], recipe["identity"], recipe["policy"],
+        )
+    elif recipe["schema"] in (EXPECTATION_SCHEMA_V2, EXPECTATION_SCHEMA_V3, EXPECTATION_SCHEMA_V4):
         validate_construction_probe(recipe, source_manifest["value"])
     artifact_pins = {
         "feedback-trace-manifest.tsv": digest(expected_artifact_sha256.get("manifest"), "expected manifest raw SHA-256"),
@@ -2480,7 +3110,7 @@ def verify_feedback(
         else:
             runtime_ok, runtime_sha, release_complete = _verify_runtime_binding(recipe, event_info["final_state"], model.sample_count)
     source_value = source_manifest["value"]
-    if recipe["schema"] in (EXPECTATION_SCHEMA_V3, EXPECTATION_SCHEMA_V4):
+    if recipe["schema"] in (EXPECTATION_SCHEMA_V3, EXPECTATION_SCHEMA_V4, EXPECTATION_SCHEMA_V5):
         feedback_record = _source_v5_regular_record(
             source_value.get("source"),
             "scripts/application-feedback-readback.py",
