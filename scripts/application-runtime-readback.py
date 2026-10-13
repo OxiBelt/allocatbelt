@@ -3,8 +3,10 @@
 
 An expectation is built from the controller's frozen run recipe and an
 independently audited build-specific Control baseline. Receipt values never
-contribute to expectation construction. This schema validates fixed-policy
-receipts; external-pressure receipts require a separate implemented contract.
+contribute to expectation construction. Fresh receipts use schema v2 and carry
+the final global application-resource snapshot; the reader retains exact-key
+support for historical v1 fixed-policy receipts. External-pressure receipts
+require a separate implemented contract.
 """
 from __future__ import annotations
 
@@ -15,7 +17,9 @@ import re
 from pathlib import Path
 from typing import Any
 
-SCHEMA = "allocatbelt.application-runtime-binding.v1"
+SCHEMA_V1 = "allocatbelt.application-runtime-binding.v1"
+SCHEMA_V2 = "allocatbelt.application-runtime-binding.v2"
+SCHEMA = SCHEMA_V2
 RECIPE_SCHEMA = "allocatbelt.application-runtime-recipe.v1"
 EXPECTATION_SCHEMA = "allocatbelt.application-runtime-expectation.v2"
 MAX_ARTIFACT_BYTES = 128 * 1024
@@ -365,7 +369,7 @@ def build_fixed_expectation(recipe: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def read_receipt(path: Path) -> dict[str, str]:
+def read_receipt_versioned(path: Path) -> tuple[str, dict[str, str]]:
     try:
         with path.open("rb") as stream:
             raw = stream.read(MAX_RECEIPT_BYTES + 1)
@@ -378,7 +382,9 @@ def read_receipt(path: Path) -> dict[str, str]:
         raise ReadbackError("runtime receipt is not UTF-8") from error
     require(text.endswith("\n") and "\r" not in text, "runtime receipt framing is incomplete")
     lines = text.splitlines()
-    require(lines and lines[0] == f"schema\t{SCHEMA}", "unknown runtime receipt schema")
+    require(lines and lines[0].startswith("schema\t"), "unknown runtime receipt schema")
+    schema = lines[0].split("\t", 1)[1]
+    require(schema in (SCHEMA_V1, SCHEMA_V2), "unknown runtime receipt schema")
     require(0 < len(lines) - 1 <= MAX_FIELDS, "runtime receipt field count is invalid")
     fields: dict[str, str] = {}
     for line in lines[1:]:
@@ -390,7 +396,12 @@ def read_receipt(path: Path) -> dict[str, str]:
         require(value and all(ord(char) >= 32 and ord(char) != 127 for char in value), f"unframed runtime value: {key}")
         fields[key] = value
     require(list(fields) == sorted(fields), "runtime receipt fields are not canonical")
-    return fields
+    return schema, fields
+
+
+def read_receipt(path: Path) -> dict[str, str]:
+    """Read a supported receipt while preserving the legacy fields-only API."""
+    return read_receipt_versioned(path)[1]
 
 
 def _flatten(prefix: str, value: dict[str, Any]) -> dict[str, str]:
@@ -424,14 +435,19 @@ def integer(fields: dict[str, str], key: str) -> int:
     return result
 
 
-def validate_runtime_readback(fields: dict[str, str], expected: dict[str, Any]) -> dict[str, Any]:
+def validate_runtime_readback(
+    fields: dict[str, str], expected: dict[str, Any], receipt_schema: str | None = None
+) -> dict[str, Any]:
     """Validate every emitted binding and runtime snapshot against v2 recipe."""
     require(type(fields) is dict, "runtime receipt fields must be an object")
+    if receipt_schema is None:
+        receipt_schema = SCHEMA_V2
     require(
         all(type(key) is str and type(value) is str for key, value in fields.items()),
         "runtime receipt fields must contain only string keys and values",
     )
     require(type(expected) is dict, "runtime expectation must be an object")
+    require(receipt_schema in (SCHEMA_V1, SCHEMA_V2), "unknown runtime receipt schema")
     require(
         set(expected) == {"schema", "recipe", "contract"},
         "runtime expectation keys differ from the versioned contract",
@@ -579,6 +595,11 @@ def validate_runtime_readback(fields: dict[str, str], expected: dict[str, Any]) 
         "after_release.expected_global_control_baseline": str(baseline),
         "after_release.control_matches_fixed_baseline": "true",
     }
+    if receipt_schema == SCHEMA_V2:
+        final_fields.update({
+            f"after_release.global.used.{dimension}": "0"
+            for dimension in APP_DIMENSIONS
+        })
     for key, value in final_fields.items():
         expected_keys.add(key)
         require(fields.get(key) == value, f"final owner cleanup mismatch: {key}")
@@ -618,9 +639,9 @@ def main() -> int:
         else:
             require(args.receipt is not None and args.expected is not None, "validation requires --receipt and --expected")
             require(args.output is None, "--output is only valid when building an expectation")
-            fields = read_receipt(args.receipt)
+            receipt_schema, fields = read_receipt_versioned(args.receipt)
             expected = _read_json_object(args.expected, "runtime expectation")
-            result = validate_runtime_readback(fields, expected)
+            result = validate_runtime_readback(fields, expected, receipt_schema)
         print(json.dumps(result, sort_keys=True))
     except (OSError, ValueError, TypeError, KeyError) as error:
         parser.exit(1, f"runtime readback refused: {error}\n")

@@ -1331,8 +1331,8 @@ def validate_functional_pair(
         _validation_path, validation_raw, validation_sha = _CAMPAIGN.process_artifact_bytes(pair_dir, row, "runtime_validation", "runtime_validation_sha256")
         expected = module.build_fixed_expectation(binding["recipe"])
         require(expectation_sha == binding["expectation_sha256"] and expectation_raw == module.canonical_bytes(expected), "functional expectation differs from the controller recipe")
-        fields = module.read_receipt(BytesArtifactPath(receipt_raw))
-        validation = module.validate_runtime_readback(fields, expected)
+        receipt_schema, fields = module.read_receipt_versioned(BytesArtifactPath(receipt_raw))
+        validation = module.validate_runtime_readback(fields, expected, receipt_schema)
         stored_validation = _CAMPAIGN.parse_json_object_bytes(validation_raw, "functional runtime validation output", _CAMPAIGN.MAX_READBACK_ARTIFACT_BYTES)
         require(_CAMPAIGN.canonical_bytes(stored_validation) == _CAMPAIGN.canonical_bytes(validation), "functional CLI validation output differs from independent receipt validation")
         require(validation["validated"] is True and validation["expectation_sha256"] == binding["expectation_sha256"], "functional receipt was not independently validated")
@@ -2347,8 +2347,8 @@ def validate_v4_process_ledger(
         require(expectation_sha256 == binding["expectation_sha256"]
                 and expectation_raw == module.canonical_bytes(expected),
                 "source-pinned runtime expectation differs from the direct functional recipe")
-        fields = module.read_receipt(BytesArtifactPath(receipt_raw))
-        validation = module.validate_runtime_readback(fields, expected)
+        receipt_schema, fields = module.read_receipt_versioned(BytesArtifactPath(receipt_raw))
+        validation = module.validate_runtime_readback(fields, expected, receipt_schema)
         stored_validation = _CAMPAIGN.parse_json_object_bytes(validation_raw, "functional v4 receipt validation", _CAMPAIGN.MAX_READBACK_ARTIFACT_BYTES)
         _CAMPAIGN.exact_keys(stored_validation, {"schema", "validated", "expectation_sha256", "field_count"}, "functional receipt validation")
         require(_CAMPAIGN.canonical_bytes(stored_validation) == _CAMPAIGN.canonical_bytes(validation)

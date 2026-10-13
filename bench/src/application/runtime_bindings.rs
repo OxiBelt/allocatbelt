@@ -8,7 +8,7 @@ use allocatbelt::runtime::io::{AsyncRead, AsyncWrite};
 use allocatbelt::runtime::managed::{ResourceLimits, ResourceScope};
 use allocatbelt::runtime::rate_io::RateLimitedIo;
 use allocatbelt::runtime::resource_domain::{
-  DomainReservation, DomainResource, DomainResources, ResourceDomain, TenantDomain,
+  DomainReservation, DomainResource, DomainResources, DomainSnapshot, ResourceDomain, TenantDomain,
 };
 #[cfg(feature = "resource-feedback")]
 use allocatbelt::runtime::resource_feedback::ResourceFeedbackService;
@@ -46,6 +46,8 @@ use std::{fs::OpenOptions, io::Read, os::unix::fs::OpenOptionsExt, path::PathBuf
 use super::{Workload, resource_limits};
 
 pub(crate) const APPLICATION_TASK_CEILING: usize = 64;
+pub(crate) const RUNTIME_BINDING_RECEIPT_SCHEMA_V2: &str =
+  "allocatbelt.application-runtime-binding.v2";
 pub(crate) const CPU_WAITER_CEILING: usize = APPLICATION_TASK_CEILING;
 // CPU-gate waiter leases consume 64 fixed slots. The remaining 192 slots
 // cover the owning async pool, filesystem pool, and bounded service roles.
@@ -1692,6 +1694,61 @@ struct FeedbackOwner {
 
 #[must_use = "retain through the lifetime of the task, producer or observer owner"]
 pub(crate) struct ApplicationTaskLease(DomainReservation);
+
+/// Build the final global rows from the snapshot taken after application-owner release.
+pub(crate) fn after_release_global_snapshot_rows(
+  snapshot: &DomainSnapshot,
+  fixed_global_control_baseline: usize,
+) -> Result<Vec<(String, String)>, String> {
+  let mut rows = Vec::with_capacity(9);
+  rows.push((
+    "after_release.global.live_tenants".to_owned(),
+    snapshot.live_tenants.to_string(),
+  ));
+  for (name, resource) in [
+    ("cpu", DomainResource::Cpu),
+    ("memory", DomainResource::Memory),
+    ("disk", DomainResource::Disk),
+    ("network", DomainResource::Network),
+    ("tasks", DomainResource::Tasks),
+  ] {
+    let used = snapshot.used.get(resource);
+    if used != 0 {
+      return Err(format!(
+        "application binding cleanup retained global {name} usage: {used}"
+      ));
+    }
+    rows.push((
+      format!("after_release.global.used.{name}"),
+      used.to_string(),
+    ));
+  }
+  let control = snapshot.used.get(DomainResource::Control);
+  rows.push((
+    "after_release.global.used.control".to_owned(),
+    control.to_string(),
+  ));
+  rows.push((
+    "after_release.expected_global_control_baseline".to_owned(),
+    fixed_global_control_baseline.to_string(),
+  ));
+  rows.push((
+    "after_release.control_matches_fixed_baseline".to_owned(),
+    (control == fixed_global_control_baseline && snapshot.live_tenants == 0).to_string(),
+  ));
+  if snapshot.live_tenants != 0 {
+    return Err(format!(
+      "application binding cleanup retained {} global tenants",
+      snapshot.live_tenants
+    ));
+  }
+  if control != fixed_global_control_baseline {
+    return Err(format!(
+      "application binding cleanup retained global Control {control}, expected {fixed_global_control_baseline}"
+    ));
+  }
+  Ok(rows)
+}
 
 impl std::fmt::Debug for ApplicationTaskLease {
   fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

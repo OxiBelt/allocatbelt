@@ -78,6 +78,76 @@ fn fixed_domain_bounds_cpu_waiters_tasks_and_managed_resources() {
 }
 
 #[test]
+fn after_release_global_snapshot_rows_report_actual_application_dimensions() {
+  assert_eq!(
+    RUNTIME_BINDING_RECEIPT_SCHEMA_V2,
+    "allocatbelt.application-runtime-binding.v2"
+  );
+  let domain = ApplicationDomain::new(Workload::Memory, 2).expect("application domain");
+  let readback_domain = domain.readback_domain();
+  let baseline = domain.fixed_global_control_baseline();
+  let tenant = domain.tenant();
+  let memory_charge = tenant
+    .try_acquire(DomainResources::ZERO.with(DomainResource::Memory, 1))
+    .expect("memory resource charge");
+  let live = readback_domain.snapshot();
+  assert_eq!(live.used.get(DomainResource::Memory), 1);
+  assert!(
+    after_release_global_snapshot_rows(&live, baseline)
+      .expect_err("live memory cannot be a final snapshot")
+      .contains("global memory usage: 1")
+  );
+  drop(memory_charge);
+  drop(tenant);
+  drop(domain);
+
+  let released = readback_domain.snapshot();
+  let rows = after_release_global_snapshot_rows(&released, baseline)
+    .expect("captured final global snapshot");
+  assert_eq!(rows.len(), 9);
+  for (name, resource) in [
+    ("cpu", DomainResource::Cpu),
+    ("memory", DomainResource::Memory),
+    ("disk", DomainResource::Disk),
+    ("network", DomainResource::Network),
+    ("tasks", DomainResource::Tasks),
+  ] {
+    let key = format!("after_release.global.used.{name}");
+    let value = rows
+      .iter()
+      .find(|(candidate, _)| candidate == &key)
+      .map(|(_, value)| value.as_str())
+      .expect("final application resource dimension");
+    assert_eq!(value, released.used.get(resource).to_string());
+    assert_eq!(value, "0");
+  }
+  assert_eq!(released.live_tenants, 0);
+  assert_eq!(
+    rows
+      .iter()
+      .find(|(key, _)| key == "after_release.global.live_tenants")
+      .map(|(_, value)| value.as_str()),
+    Some("0")
+  );
+  assert_eq!(
+    rows
+      .iter()
+      .find(|(key, _)| key == "after_release.global.used.control")
+      .map(|(_, value)| value.clone())
+      .expect("actual final Control snapshot"),
+    released.used.get(DomainResource::Control).to_string()
+  );
+  assert_eq!(
+    rows
+      .iter()
+      .find(|(key, _)| key == "after_release.expected_global_control_baseline")
+      .map(|(_, value)| value.clone())
+      .expect("expected final Control baseline"),
+    baseline.to_string()
+  );
+}
+
+#[test]
 fn managed_payload_is_admitted_and_released_in_global_tenant_and_scope_ledgers() {
   let domain = ApplicationDomain::new(Workload::Memory, 2).expect("memory application domain");
   let mut bindings = domain.for_tokio().expect("Tokio memory bindings");

@@ -2008,30 +2008,11 @@ impl RuntimeBindingWriter {
     fixed_global_control_baseline: usize,
   ) -> Result<(), String> {
     let released = readback_domain.snapshot();
-    self.add(
-      "after_release.global.live_tenants".to_owned(),
-      released.live_tenants.to_string(),
-    )?;
-    self.add(
-      "after_release.global.used.control".to_owned(),
-      released.used.get(DomainResource::Control).to_string(),
-    )?;
-    self.add(
-      "after_release.expected_global_control_baseline".to_owned(),
-      fixed_global_control_baseline.to_string(),
-    )?;
-    self.add(
-      "after_release.control_matches_fixed_baseline".to_owned(),
-      (released.used.get(DomainResource::Control) == fixed_global_control_baseline
-        && released.live_tenants == 0)
-        .to_string(),
-    )?;
-    if released.used.get(DomainResource::Control) != fixed_global_control_baseline
-      || released.live_tenants != 0
-    {
-      return Err(
-        "application binding cleanup did not return Control to its fixed domain baseline".into(),
-      );
+    for (key, value) in runtime_bindings::after_release_global_snapshot_rows(
+      &released,
+      fixed_global_control_baseline,
+    )? {
+      self.add(key, value)?;
     }
     self.rows.sort_by(|left, right| left.0.cmp(&right.0));
     let mut options = OpenOptions::new();
@@ -2044,8 +2025,12 @@ impl RuntimeBindingWriter {
     let mut file = options
       .open(&self.path)
       .map_err(|error| format!("runtime readback create failed: {error}"))?;
-    writeln!(file, "schema\tallocatbelt.application-runtime-binding.v1")
-      .map_err(|error| format!("runtime readback schema write failed: {error}"))?;
+    writeln!(
+      file,
+      "schema\t{}",
+      runtime_bindings::RUNTIME_BINDING_RECEIPT_SCHEMA_V2
+    )
+    .map_err(|error| format!("runtime readback schema write failed: {error}"))?;
     for (key, value) in self.rows {
       writeln!(file, "{key}\t{value}")
         .map_err(|error| format!("runtime readback field write failed: {error}"))?;

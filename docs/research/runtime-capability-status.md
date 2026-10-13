@@ -99,10 +99,13 @@ physical-disk performance measurement.
 
 The helper rechecks runner argv, per-process nonce, source and executable
 hashes, calibration pins and all six resource dimensions plus the directional
-disk/upload/download byte buckets. It requires final application charges to
-be zero and global Control to return to the independently measured baseline.
-Reports and runner ledgers remain `functional_only`; qualification and
-external-pressure guards remain zero. This mode provides finite functional
+disk/upload/download byte buckets. Runtime-binding receipt v2 includes a
+post-release snapshot of global CPU, memory, disk, network, and Task usage,
+requires every value to be zero, and retains the independently measured global
+Control baseline check. The reader also accepts historical v1 receipts using
+their exact legacy field set. Reports and runner ledgers remain
+`functional_only`; qualification and external-pressure guards remain zero.
+This mode provides finite functional
 integration evidence, not performance, p99 or release qualification.
 
 The finite command shape is:

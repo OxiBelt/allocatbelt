@@ -2725,9 +2725,9 @@ def validate_runtime_process_artifacts(
     require(process_row.get("calibration_output_sha256") == calibration["output"]["sha256"], "process ledger calibration output hash differs from its source manifest")
     require(process_row.get("source_manifest_sha256") == source["manifest_sha256"], "process ledger source-manifest hash differs from the frozen host input")
     require(process_row.get("runtime_expectation_sha256") == binding["expectation_sha256"], "process ledger expectation hash differs from its controller recipe")
-    fields = module.read_receipt(_BytesArtifactPath(receipt_raw))
+    receipt_schema, fields = module.read_receipt_versioned(_BytesArtifactPath(receipt_raw))
     try:
-        validation = module.validate_runtime_readback(fields, expected)
+        validation = module.validate_runtime_readback(fields, expected, receipt_schema)
     except (TypeError, ValueError, KeyError) as error:
         raise CampaignError(f"runtime readback validation failed for {job['run_id']}/{binding['pair']}: {error}") from error
     stored_validation = parse_json_object_bytes(validation_raw, "runtime validation output", MAX_READBACK_ARTIFACT_BYTES)

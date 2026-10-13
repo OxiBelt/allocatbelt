@@ -50,7 +50,10 @@ def recipe(
     }
 
 
-def fixture(*, executor="allocatbelt", workload="cpu", profile="steady", mode="open_loop"):
+def fixture(
+    *, executor="allocatbelt", workload="cpu", profile="steady", mode="open_loop",
+    receipt_schema=module.SCHEMA,
+):
     run_recipe = recipe(
         executor=executor,
         workload=workload,
@@ -104,12 +107,15 @@ def fixture(*, executor="allocatbelt", workload="cpu", profile="steady", mode="o
             "after_release.control_matches_fixed_baseline": "true",
         }
     )
+    if receipt_schema == module.SCHEMA_V2:
+        for dimension in module.APP_DIMENSIONS:
+            fields[f"after_release.global.used.{dimension}"] = "0"
     return fields, expected
 
 
-def receipt_text(fields):
+def receipt_text(fields, schema=module.SCHEMA):
     return (
-        f"schema\t{module.SCHEMA}\n"
+        f"schema\t{schema}\n"
         + "".join(f"{key}\t{value}\n" for key, value in sorted(fields.items()))
     )
 
@@ -146,6 +152,37 @@ class ReadbackTests(unittest.TestCase):
                     expected["contract"]["configuration"]["blocking_disk_adapter_constructed"],
                     "true" if executor == "tokio-1.53.1" else "false",
                 )
+
+    def test_v1_historical_receipt_remains_valid_with_its_exact_legacy_keys(self):
+        fields, expected = fixture(receipt_schema=module.SCHEMA_V1)
+        result = module.validate_runtime_readback(fields, expected, module.SCHEMA_V1)
+        self.assertTrue(result["validated"])
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "v1.tsv"
+            path.write_text(receipt_text(fields, module.SCHEMA_V1))
+            schema, parsed = module.read_receipt_versioned(path)
+            self.assertEqual(schema, module.SCHEMA_V1)
+            self.assertEqual(parsed, fields)
+            self.assertEqual(module.read_receipt(path), fields)
+            self.assertTrue(module.validate_runtime_readback(parsed, expected, schema)["validated"])
+            with self.assertRaisesRegex(module.ReadbackError, "final owner cleanup mismatch"):
+                module.validate_runtime_readback(dict(parsed), expected)
+        fields["after_release.global.used.cpu"] = "0"
+        with self.assertRaisesRegex(module.ReadbackError, "unexpected fields"):
+            module.validate_runtime_readback(fields, expected, module.SCHEMA_V1)
+
+    def test_v2_requires_an_actual_zero_snapshot_for_every_global_application_dimension(self):
+        fields, expected = fixture(receipt_schema=module.SCHEMA_V2)
+        self.assertTrue(module.validate_runtime_readback(fields, expected, module.SCHEMA_V2)["validated"])
+        for dimension in module.APP_DIMENSIONS:
+            damaged = dict(fields)
+            damaged[f"after_release.global.used.{dimension}"] = "1"
+            with self.subTest(dimension=dimension), self.assertRaises(module.ReadbackError):
+                module.validate_runtime_readback(damaged, expected, module.SCHEMA_V2)
+        missing = dict(fields)
+        del missing["after_release.global.used.tasks"]
+        with self.assertRaisesRegex(module.ReadbackError, "final owner cleanup mismatch"):
+            module.validate_runtime_readback(missing, expected, module.SCHEMA_V2)
 
     def test_emitter_static_registry_is_exact_and_complete(self):
         fields, expected = fixture()
