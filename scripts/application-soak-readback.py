@@ -5566,8 +5566,12 @@ def _adapt_soak_v2_launch(
     return pressure_info, app_descriptor
 
 
-def command_launch_v2(args: argparse.Namespace, audit: dict[str, Any], preflight: dict[str, Any], output_dir: Path) -> int:
-    """Adapt the shared pressure-first supervisor to the established soak V2 receipt."""
+def launch_soak_v2_application(
+    args: argparse.Namespace, audit: dict[str, Any], preflight: dict[str, Any],
+    output_dir: Path, on_started: Any, on_cleanup: Any,
+) -> dict[str, Any]:
+    """Expose the owned Soak V2 lifetime and its complete supervisor receipt."""
+    require(callable(on_started) and callable(on_cleanup), "Soak V2 lifecycle callbacks must be callable")
     descriptor = audit["launch_descriptor"]
     def on_interrupted(record: dict[str, Any]) -> int:
         exit_code = 128 + record["signal"]
@@ -5600,8 +5604,8 @@ def command_launch_v2(args: argparse.Namespace, audit: dict[str, Any], preflight
     app_descriptor["on_interrupted"] = on_interrupted
     receipt = supervise_pressure_application(
         app_descriptor, pressure_info, output_dir,
-        on_started=lambda _attestation: None,
-        on_cleanup=lambda _cleanup: None,
+        on_started=on_started,
+        on_cleanup=on_cleanup,
     )
     details = receipt["details"]
     if type(details) is dict:
@@ -5618,6 +5622,16 @@ def command_launch_v2(args: argparse.Namespace, audit: dict[str, Any], preflight
                 "pressure_ready_sha256": receipt["pressure_ready_sha256"],
                 "launch_enabled": True,
             }, sort_keys=True))
+    return receipt
+
+
+def command_launch_v2(args: argparse.Namespace, audit: dict[str, Any], preflight: dict[str, Any], output_dir: Path) -> int:
+    """Preserve the established Soak V2 CLI status and receipt outputs."""
+    receipt = launch_soak_v2_application(
+        args, audit, preflight, output_dir,
+        on_started=lambda _attestation: None,
+        on_cleanup=lambda _cleanup: None,
+    )
     return receipt["status"]
 
 

@@ -1114,6 +1114,15 @@ class SoakReadbackTests(unittest.TestCase):
             with self.assertRaisesRegex(module.SoakReadbackError, "refusing to replace"):
                 module._atomic_json_publish(launch_path, {"schema": "test.v1", "pid": 124})
 
+    def test_soak_v2_callback_api_rejects_invalid_callbacks_before_adapting_or_launching(self):
+        with mock.patch.object(module, "_adapt_soak_v2_launch") as adapt, \
+             mock.patch.object(module, "supervise_pressure_application") as supervise:
+            for started, cleanup in ((None, lambda _value: None), (lambda _value: None, None)):
+                with self.assertRaisesRegex(module.SoakReadbackError, "callbacks must be callable"):
+                    module.launch_soak_v2_application(None, {}, {}, Path("/unused"), started, cleanup)
+            adapt.assert_not_called()
+            supervise.assert_not_called()
+
     def test_external_launch_waits_for_pressure_readiness_before_app_popen(self):
         with tempfile.TemporaryDirectory(prefix="allocatbelt-pressure-first-launch-") as temporary:
             root = Path(temporary)
@@ -1203,13 +1212,21 @@ class SoakReadbackTests(unittest.TestCase):
                  mock.patch.object(module, "launch_process", side_effect=fake_launch), \
                  mock.patch.object(module, "_launch_receipt_value", return_value={"schema": "launch.v1"}), \
                  mock.patch.object(module, "_validate_pressure_proof", side_effect=lambda *_args: (events.append("pressure_proof") or {"raw_sha256": "2" * 64})):
-                status = module.command_launch_v2(
+                callbacks = []
+                receipt = module.launch_soak_v2_application(
                     args,
                     audit,
                     {"terminal_budget_bytes": 1024, "sample_budget_bytes": 1024},
                     output,
+                    on_started=lambda value: callbacks.append(("started", value)),
+                    on_cleanup=lambda value: callbacks.append(("cleanup", value)),
                 )
-            self.assertEqual(status, 0)
+            self.assertEqual(receipt["status"], 0)
+            self.assertFalse(receipt["interrupted"])
+            self.assertEqual([kind for kind, _value in callbacks], ["started", "cleanup"])
+            self.assertEqual(callbacks[0][1], {"schema": "attestation.fixture.v1"})
+            self.assertEqual(callbacks[1][1]["pid"], 700)
+            self.assertEqual(callbacks[1][1], receipt["application_cleanup"])
             self.assertEqual(events, ["pressure_start", "ready", "app_popen", "pressure_exit", "pressure_proof"])
 
     def test_pressure_supervisor_rejects_environment_over_frozen_byte_bound_before_popen(self):
@@ -1609,13 +1626,23 @@ class SoakReadbackTests(unittest.TestCase):
                                     output,
                                 )
                         else:
-                            status = module.command_launch_v2(
+                            callback_records = []
+                            supervisor_receipt = module.launch_soak_v2_application(
                                 args, audit,
                                 {"terminal_budget_bytes": 1024, "sample_budget_bytes": 1024},
                                 output,
+                                on_started=lambda value: callback_records.append(("started", value)),
+                                on_cleanup=lambda value: callback_records.append(("cleanup", value)),
                             )
+                            status = supervisor_receipt["status"]
                     if not fail_reap:
                         self.assertEqual(status, 128 + signum)
+                        self.assertTrue(supervisor_receipt["interrupted"])
+                        self.assertEqual(supervisor_receipt["received_signal"], signum)
+                        self.assertEqual([kind for kind, _value in callback_records], ["started", "cleanup"])
+                        self.assertEqual(callback_records[1][1], supervisor_receipt["application_cleanup"])
+                        self.assertEqual(callback_records[1][1]["pid"], app_identity["pid"])
+                        self.assertEqual(callback_records[1][1]["status"], "verified")
                     else:
                         app_reap_probe.assert_called()
                         self.assertTrue(injected_app_reaps, "reap failure must target the actual APP child")
