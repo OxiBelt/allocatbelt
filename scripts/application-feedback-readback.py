@@ -1658,7 +1658,11 @@ def _validate_event_stream(
             require(event["accepted"] is True and planned is not None, "feedback sample was rejected or lacks its policy plan")
             if expectation["mode"] == "capacity_calibration":
                 require(readings["disk"] is None and readings["download"] is None, "capacity calibration emitted app-byte telemetry before denominators existed")
-                require(readings["cpu"] is not None, "capacity calibration CPU telemetry is missing")
+                if readings["cpu"] is None:
+                    require(
+                        expectation["schema"] == EXPECTATION_SCHEMA_V2,
+                        "legacy capacity calibration CPU telemetry is missing",
+                    )
             model.observe(sample_at[0], readings)
             model.accepted_sample_times.append(sample_at[0])
             model.sample_decision_record_times.append(at[0])

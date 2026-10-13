@@ -401,6 +401,66 @@ def _force_all_meter_sources_zero(fixture: Fixture) -> None:
     fixture.repin("samples", ("\n".join(rows) + "\n").encode("ascii"))
 
 
+def _mark_cpu_samples_missing(fixture: Fixture, ordinals: set[int]) -> None:
+    events = [json.loads(line) for line in fixture.events_path.read_text(encoding="ascii").splitlines()]
+    decisions = [index for index, event in enumerate(events) if event["kind"] == "sample_decision"]
+    if not ordinals.issubset(set(range(len(decisions)))):
+        raise AssertionError("missing CPU test sample ordinal is outside the fixture")
+    for ordinal, event_index in enumerate(decisions):
+        decision = events[event_index]
+        sample_at = decision["sample_at"]
+        if ordinal in ordinals:
+            decision["sample"]["cpu_basis_points"] = None
+            sensor = next(
+                event for event in events[:event_index]
+                if event["kind"] == "sensor_callback" and event["raw_sample"]["at"] == sample_at
+            )
+            sensor["raw_sample"]["cpu_basis_points"] = None
+        plan = events[event_index + 1]
+        if plan["kind"] != "plan":
+            raise AssertionError("sample decision fixture has no immediately following plan")
+        cpu = next(control for control in plan["controls"] if control["resource"] == "cpu")
+        if ordinal in ordinals:
+            cpu["utilization_basis_points"] = None
+            cpu["telemetry"] = "Missing"
+            cpu["no_change"] = {"reason": "telemetry_unavailable"}
+        else:
+            previous_missing = max((missed for missed in ordinals if missed < ordinal), default=-1)
+            streak = ordinal - previous_missing
+            cpu["utilization_basis_points"] = 9000
+            cpu["telemetry"] = "Fresh"
+            cpu["no_change"] = (
+                {"reason": "breach_samples_remaining", "observed": streak, "required": 3}
+                if streak < 3 else {"reason": "reduction_quantized"}
+            )
+    fixture.repin("events", b"".join(_json_line(event) for event in events))
+
+    rows = fixture.samples_path.read_text(encoding="ascii").splitlines()
+    header = rows[1].split("\t")
+    sample_count_column = header.index("feedback_sample_count")
+    for row_index in range(2, len(rows)):
+        fields = rows[row_index].split("\t")
+        count = int(fields[sample_count_column])
+        if count == 0:
+            continue
+        last_ordinal = count - 1
+        if last_ordinal in ordinals:
+            fields[header.index("cpu_utilization_basis_points")] = "none"
+            fields[header.index("cpu_telemetry")] = "Missing"
+            fields[header.index("cpu_no_change")] = "Some(TelemetryUnavailable)"
+        else:
+            previous_missing = max((missed for missed in ordinals if missed < last_ordinal), default=-1)
+            streak = last_ordinal - previous_missing
+            fields[header.index("cpu_utilization_basis_points")] = "9000"
+            fields[header.index("cpu_telemetry")] = "Fresh"
+            if streak < 3:
+                fields[header.index("cpu_no_change")] = f"Some(BreachSamplesRemaining {{ observed: {streak}, required: 3 }})"
+            else:
+                fields[header.index("cpu_no_change")] = "Some(ReductionQuantized)"
+        rows[row_index] = "\t".join(fields)
+    fixture.repin("samples", ("\n".join(rows) + "\n").encode("ascii"))
+
+
 def _freeze_fixture_expectation(fixture: Fixture, body: dict[str, Any]) -> None:
     raw, raw_sha = reader.build_pressure_expectation_recipe(body)
     fixture.expectation_bytes = raw
@@ -499,6 +559,23 @@ class FeedbackReadbackTests(unittest.TestCase):
         self.assertEqual(result["identity"], self.fixture.identity)
         self.assertEqual(result["final_runtime_binding"], {"raw_sha256": None, "validated": False})
         self.assertEqual(result["raw_artifact_sha256"]["events"], self.fixture.hashes["events"])
+
+    def test_v2_capacity_calibration_accepts_first_missing_cpu_priming_sample(self) -> None:
+        _mark_cpu_samples_missing(self.fixture, {0})
+        result = self.fixture.verify()
+        self.assertTrue(result["validated"])
+        self.assertFalse(result["qualification_eligible"])
+
+    def test_v2_capacity_calibration_freezes_on_later_missing_cpu_sample(self) -> None:
+        _mark_cpu_samples_missing(self.fixture, {1})
+        result = self.fixture.verify()
+        self.assertTrue(result["validated"])
+        self.assertFalse(result["qualification_eligible"])
+
+    def test_v2_capacity_calibration_requires_dense_cpu_overlap(self) -> None:
+        _mark_cpu_samples_missing(self.fixture, set(range(14)))
+        with self.assertRaisesRegex(reader.ValidationError, "capacity calibration has insufficient dense CPU observations during production/drain"):
+            self.fixture.verify()
 
     def test_archived_v1_pressure_receipt_validates_but_never_qualifies(self) -> None:
         self.fixture.identity["pressure_qualification"] = True
