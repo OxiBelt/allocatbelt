@@ -39,6 +39,73 @@ and stderr concurrently beyond pipe capacity and cover vectored partial reads,
 EOF, stdin shutdown and waiter cancellation. These component contracts are the
 starting point for the remaining application migrations.
 
+### SourceSchemaV4 functional integration mode
+
+`scripts/test-application-pair-functional-e2e.py` retains the legacy signed
+9290 overlay mode and has a separate SourceSchemaV4 mode. The latter requires
+the exact raw manifest SHA-256, a caller-frozen full uppercase OpenPGP signer
+fingerprint and signed source root. Before executing checkout code, the helper
+authenticates the canonical raw-pinned manifest, checks the source root and
+worktree against the signed commit with bounded Git/GPG capture, requires one
+`VALIDSIG` whose signing or primary fingerprint exactly matches the caller pin,
+and captures the campaign controller only after its mode and bytes match the
+blob at that commit. The pre-exec snapshot uses raw file reads and inert Git
+listings rather than checkout filters. The verification environment pins
+Git/GPG and disables replacement objects, repository hooks and fsmonitor; it is
+restored after verification. The authenticated controller then verifies the
+manifest and all four
+allocator binaries, candidate soak binary, analysis engine, calibration binary
+and recorded calibration output. It selects one of the original 15
+workload/profile contexts, one fixed-policy matched or A/A pair, or a candidate
+comparison against the actual secure, standard or system manifest artifact.
+It creates direct functional runtime bindings from the pinned policy and
+validator; it does not construct a production spec, plan, pilot rate or
+qualification phase.
+
+Open-loop cases are capped at 1,000 arrivals and 1,000 arrivals per second.
+Functional capacity cases keep the runner's exact 30-second horizon and its
+fixed 5,000-arrival sentinel; the 5,000 value is not a capacity target. A
+capacity receipt must report a real 30-to-31-second trace, at least one on-time
+completion, and successful participation from CPU, memory, HTTP and disk in a
+mixed case. The runner caps each functional child's regular-file writes at an
+exact 16 MiB soft and hard `RLIMIT_FSIZE`. A live output-tree watchdog caps one
+case at 512 files, 128 directories, 1,024 total entries and 256 MiB, while
+preserving a 256 MiB free-space reserve. Each process gets a fresh private
+`TMPDIR` under the external output root. The helper and runner record its
+mount, device, filesystem type and free space, and refuse tmpfs/ramfs or a
+filesystem different from the output root. These storage observations are
+correctness context only; a KVM root filesystem or guest tmpfs is not a
+physical-disk performance measurement.
+
+The helper rechecks runner argv, per-process nonce, source and executable
+hashes, calibration pins and all six resource dimensions plus the directional
+disk/upload/download byte buckets. It requires final application charges to
+be zero and global Control to return to the independently measured baseline.
+Reports and runner ledgers remain `functional_only`; qualification and
+external-pressure guards remain zero. This mode provides finite functional
+integration evidence, not performance, p99 or release qualification.
+
+The finite command shape is:
+
+```sh
+python3 scripts/test-application-pair-functional-e2e.py \
+  --source-root "$SIGNED_SOURCE_ROOT" \
+  --source-manifest "$SOURCE_MANIFEST" \
+  --source-manifest-sha256 "$SOURCE_MANIFEST_FILE_SHA256" \
+  --signer-fingerprint "$SOURCE_SIGNER_FINGERPRINT" \
+  --pair-runner "$SIGNED_SOURCE_ROOT/scripts/run-application-pair.sh" \
+  --output-root "$PRIVATE_OUTPUT_ROOT/functional-case" \
+  --cpu-set "$PINNED_CPU_SET" --attempt-id "$FRESH_ATTEMPT_ID" \
+  --workload mixed --profile mixed --mode open_loop \
+  --pair-kind matched --rate-per-second 100 --arrivals 1000
+```
+
+Use `--mode capacity` without a rate and with the 30-second trace deadline for
+capacity checks. For `--pair-kind allocator-match`, also pass
+`--baseline-allocator mimalloc-secure`, `mimalloc-standard`, or `system`.
+Archive each selected case before starting another; the helper refuses to
+reuse an output directory.
+
 ## Qualification still required
 
 The direct child-pipe and cached buffered accounting changes passed a

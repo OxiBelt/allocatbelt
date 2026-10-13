@@ -3,11 +3,41 @@
 # This harness is preparation only; keep raw timing evidence outside the source checkout.
 set -euo pipefail
 export LC_ALL=C
+while IFS= read -r git_environment_name; do
+  case "$git_environment_name" in GIT_*) unset "$git_environment_name" ;; esac
+done < <(compgen -e)
+export GIT_CONFIG_NOSYSTEM=1
+export GIT_CONFIG_SYSTEM=/dev/null
+export GIT_CONFIG_GLOBAL=/dev/null
+export GIT_NO_REPLACE_OBJECTS=1
+export GIT_ATTR_NOSYSTEM=1
+export GIT_TERMINAL_PROMPT=0
+export GIT_PAGER=cat
+export PAGER=cat
+export GIT_OPTIONAL_LOCKS=0
+export GIT_CONFIG_COUNT=8
+export GIT_CONFIG_KEY_0=core.fsmonitor GIT_CONFIG_VALUE_0=false
+export GIT_CONFIG_KEY_1=core.hooksPath GIT_CONFIG_VALUE_1=/dev/null
+export GIT_CONFIG_KEY_2=core.attributesFile GIT_CONFIG_VALUE_2=/dev/null
+export GIT_CONFIG_KEY_3=core.excludesFile GIT_CONFIG_VALUE_3=/dev/null
+export GIT_CONFIG_KEY_4=core.pager GIT_CONFIG_VALUE_4=cat
+export GIT_CONFIG_KEY_5=gpg.program GIT_CONFIG_VALUE_5=/usr/bin/gpg
+export GIT_CONFIG_KEY_6=gpg.format GIT_CONFIG_VALUE_6=openpgp
+export GIT_CONFIG_KEY_7=protocol.ext.allow GIT_CONFIG_VALUE_7=never
 qualification_runtime_readback_supported=0
 external_pressure_driver_supported=0
 functional_only_mode=0
 execution_scope=qualification
 runtime_readback_enabled=$qualification_runtime_readback_supported
+functional_source_v4_mode=0
+functional_tmp_root_path=
+functional_tmp_context_json=
+functional_source_manifest_file_path=
+functional_source_manifest_file_sha256_before=not_applicable
+functional_source_manifest_file_sha256_after=not_applicable
+functional_source_manifest_semantic_sha256=not_applicable
+functional_source_signer_fingerprint=not_applicable
+functional_file_size_limit_blocks=16384
 if [[ "${1:-}" == "--functional-only" ]]; then
   functional_only_mode=1
   execution_scope=functional_only
@@ -19,6 +49,52 @@ usage() {
   echo "usage: $0 [--functional-only] BINARY ALLOCATOR WORKLOAD MODE RATE_OR_DASH CPU_SET RUN_ID OUTPUT_ROOT [ARRIVALS TRACE_S DRAIN_S SHUTDOWN_S PROCESS_S ORACLE_FILE ORACLE_SHA256 PROFILE PAIR_KIND [BASELINE_BINARY BASELINE_ALLOCATOR BASELINE_ORACLE BASELINE_ORACLE_SHA256] [--runtime-bindings FILE --runtime-bindings-sha256 SHA --runtime-validator FILE --runtime-validator-sha256 SHA --fixed-global-control-baseline BYTES [--functional-overlay FILE --functional-overlay-sha256 SHA]]]" >&2
   echo "  open_loop requires a precomputed oracle file and its SHA-256 digest." >&2
   echo "  --functional-only runs a bounded, non-qualifying fixed-policy receipt check." >&2
+}
+
+stable_sha256() {
+  local path=$1 maximum=${2:-536870912}
+  python3 -B - "$path" "$maximum" <<'PY'
+import hashlib
+import os
+import stat
+import sys
+
+path, maximum_text = sys.argv[1:]
+if not maximum_text.isdecimal():
+    raise SystemExit(2)
+maximum = int(maximum_text)
+if not 0 <= maximum <= 512 * 1024 * 1024:
+    raise SystemExit(2)
+flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+try:
+    descriptor = os.open(path, flags)
+except OSError as error:
+    print(f"cannot open stable hash input: {error}", file=sys.stderr)
+    raise SystemExit(2)
+digest = hashlib.sha256()
+count = 0
+try:
+    before = os.fstat(descriptor)
+    if not stat.S_ISREG(before.st_mode) or before.st_size > maximum:
+        raise SystemExit("hash input is not a bounded regular file")
+    while True:
+        block = os.read(descriptor, min(1024 * 1024, maximum + 1 - count))
+        if not block:
+            break
+        count += len(block)
+        if count > maximum:
+            raise SystemExit("hash input exceeded its finite byte ceiling")
+        digest.update(block)
+    after = os.fstat(descriptor)
+    current = os.stat(path, follow_symlinks=False)
+    fingerprint = lambda item: (item.st_dev, item.st_ino, item.st_mode, item.st_size, item.st_mtime_ns, item.st_ctime_ns)
+    if (fingerprint(before) != fingerprint(after) or count != before.st_size
+        or not stat.S_ISREG(current.st_mode) or fingerprint(before) != fingerprint(current)):
+        raise SystemExit("hash input changed while streaming")
+finally:
+    os.close(descriptor)
+print(digest.hexdigest())
+PY
 }
 
 if [[ $# -lt 8 || $# -gt 35 ]]; then usage; exit 2; fi
@@ -88,10 +164,6 @@ done
 case "$allocator" in allocatbelt|mimalloc-secure|mimalloc-standard|system) ;; *) usage; exit 2 ;; esac
 case "$workload" in cpu|memory|http|disk|mixed) ;; *) usage; exit 2 ;; esac
 case "$mode" in capacity|open_loop) ;; *) usage; exit 2 ;; esac
-if (( functional_only_mode == 1 )) && [[ "$mode" != open_loop ]]; then
-  echo "functional-only mode supports open_loop only" >&2
-  exit 2
-fi
 case "$profile" in steady|mixed|burst|oversubscribed|safety_overload) ;; *) echo "unknown profile: $profile" >&2; exit 2 ;; esac
 case "$pair_kind" in matched|aa-bounded|aa-tokio|allocator-match|pressure-matched|pressure-allocator-match) ;; *) echo "PAIR_KIND is not a frozen matched comparison family" >&2; exit 2 ;; esac
 if [[ "$pair_kind" == pressure-matched || "$pair_kind" == pressure-allocator-match ]]; then
@@ -172,15 +244,26 @@ pair_ordinal=$((10#$pair_suffix))
 
 if (( functional_only_mode == 1 )); then
   [[ $# -eq 35 && -n "$runtime_bindings_arg" && -n "$runtime_validator_arg" && -n "$functional_overlay_arg" ]] || { echo "functional-only mode requires frozen runtime bindings, validator, and overlay manifest" >&2; exit 2; }
-  [[ "$mode" == open_loop ]] || { echo "functional-only mode supports open_loop only" >&2; exit 2; }
-  [[ "$arrivals" =~ ^[1-9][0-9]*$ ]] && (( arrivals <= 1000 )) || { echo "functional-only arrivals must be in 1..=1000" >&2; exit 2; }
-  (( rate <= 1000 )) || { echo "functional-only average rate must be in 1..=1000 arrivals per second" >&2; exit 2; }
+  if [[ "$mode" == open_loop ]]; then
+    [[ "$arrivals" =~ ^[1-9][0-9]*$ ]] && (( arrivals <= 1000 )) || { echo "functional-only open-loop arrivals must be in 1..=1000" >&2; exit 2; }
+    (( rate <= 1000 )) || { echo "functional-only average rate must be in 1..=1000 arrivals per second" >&2; exit 2; }
+  else
+    [[ "$rate" == "-" && "$arrivals" == 5000 && "$trace_deadline" == 30 ]] || {
+      echo "functional-only capacity preserves the exact 30-second horizon and fixed 5000 sentinel" >&2; exit 2;
+    }
+  fi
   (( trace_deadline <= 30 && drain_deadline <= 30 && shutdown_deadline <= 15 && process_deadline <= 300 )) || { echo "functional-only deadlines exceed their fixed finite limits" >&2; exit 2; }
+  (( pair_ordinal <= 36 )) || { echo "functional-only pair ordinal exceeds its finite bound" >&2; exit 2; }
   [[ "$profile" != safety_overload ]] || { echo "functional-only mode does not allow safety_overload" >&2; exit 2; }
   case "$pair_kind" in matched|aa-bounded|aa-tokio|allocator-match) ;; *) echo "functional-only mode accepts fixed-policy matched, A/A, or allocator-pair kinds only" >&2; exit 2 ;; esac
+  ulimit -Sf "$functional_file_size_limit_blocks" || { echo "cannot set the exact functional soft file-size limit" >&2; exit 2; }
+  ulimit -Hf "$functional_file_size_limit_blocks" || { echo "cannot set the exact functional hard file-size limit" >&2; exit 2; }
+  [[ "$(ulimit -Hf)" == "$functional_file_size_limit_blocks" && "$(ulimit -Sf)" == "$functional_file_size_limit_blocks" ]] || {
+    echo "functional file-size soft/hard limits differ from the exact 16 MiB bound" >&2; exit 2;
+  }
 fi
 
-for command in taskset timeout sha256sum awk rustc uname python3 cmp realpath; do
+for command in taskset timeout awk rustc uname python3 cmp realpath; do
   command -v "$command" >/dev/null || { echo "missing required command: $command" >&2; exit 2; }
 done
 [[ -x /usr/bin/time ]] || { echo "GNU /usr/bin/time is required" >&2; exit 2; }
@@ -192,14 +275,14 @@ fi
 if [[ "$mode" == open_loop ]]; then
   oracle_file=$(realpath "$oracle_file_arg") || exit 2
   [[ -f "$oracle_file" ]] || { echo "oracle file is missing: $oracle_file" >&2; exit 2; }
-  oracle_digest_actual=$(sha256sum "$oracle_file" | awk '{print $1}') || exit 2
+  oracle_digest_actual=$(stable_sha256 "$oracle_file" 16777216) || exit 2
   [[ "$oracle_digest_actual" == "$oracle_digest_expected" ]] || { echo "oracle SHA-256 differs from its manifest value" >&2; exit 2; }
   baseline_oracle_file=
   baseline_oracle_digest_actual=
   if [[ "$pair_kind" == allocator-match || "$pair_kind" == pressure-allocator-match ]]; then
     baseline_oracle_file=$(realpath "$baseline_oracle_arg") || exit 2
     [[ -f "$baseline_oracle_file" ]] || { echo "baseline oracle file is missing" >&2; exit 2; }
-    baseline_oracle_digest_actual=$(sha256sum "$baseline_oracle_file" | awk '{print $1}') || exit 2
+    baseline_oracle_digest_actual=$(stable_sha256 "$baseline_oracle_file" 16777216) || exit 2
     [[ "$baseline_oracle_digest_actual" == "$baseline_oracle_digest_expected" ]] || { echo "baseline oracle SHA-256 differs from its manifest value" >&2; exit 2; }
   fi
 else
@@ -209,15 +292,19 @@ else
   baseline_oracle_digest_actual=
 fi
 
-repo_root=$(git rev-parse --show-toplevel) || exit 2
-pair_runner_path=$(realpath "$0") || exit 2
-source_inventory_module_path="${pair_runner_path%/*}/application-source-inventory.py"
-source_inventory_module_sha256_before=$(sha256sum "$source_inventory_module_path" | awk '{print $1}') || exit 2
-[[ "$source_inventory_module_sha256_before" == "$source_inventory_module_sha256_expected" ]] || {
-  echo "shared source inventory module differs from its frozen SHA-256" >&2
+repo_root=$(pwd -P)
+while [[ "$repo_root" != / && ! -e "$repo_root/.git" ]]; do
+  repo_root=${repo_root%/*}
+  [[ -n "$repo_root" ]] || repo_root=/
+done
+[[ -e "$repo_root/.git" && ! -L "$repo_root/.git" && -f "$repo_root/Cargo.toml" ]] || {
+  echo "cannot locate a nonsymlink Git workspace root from the current directory" >&2
   exit 2
 }
-pair_runner_sha256_before=$(sha256sum "$pair_runner_path" | awk '{print $1}') || exit 2
+pair_runner_path=$(realpath "$0") || exit 2
+source_inventory_module_path="${pair_runner_path%/*}/application-source-inventory.py"
+source_inventory_module_sha256_before=$source_inventory_module_sha256_expected
+pair_runner_sha256_before=$(stable_sha256 "$pair_runner_path" 16777216) || exit 2
 binary=$(realpath "$binary_arg") || exit 2
 [[ -x "$binary" ]] || { echo "binary is not executable: $binary" >&2; exit 2; }
 baseline_binary=
@@ -225,7 +312,7 @@ baseline_binary_digest=
 if [[ "$pair_kind" == allocator-match || "$pair_kind" == pressure-allocator-match ]]; then
   baseline_binary=$(realpath "$baseline_binary_arg") || exit 2
   [[ -x "$baseline_binary" ]] || { echo "baseline binary is not executable: $baseline_binary" >&2; exit 2; }
-  baseline_binary_digest=$(sha256sum "$baseline_binary" | awk '{print $1}') || exit 2
+  baseline_binary_digest=$(stable_sha256 "$baseline_binary") || exit 2
 fi
 output_root=$(realpath -m "$output_root") || exit 2
 case "$output_root/" in
@@ -240,21 +327,17 @@ mkdir -- "$cell_dir" || { echo "run directory already exists: $cell_dir" >&2; ex
 cd "$repo_root"
 
 source_hash() {
-  local module_sha256_before module_sha256_after digest
-  module_sha256_before=$(sha256sum "$source_inventory_module_path" | awk '{print $1}') || return 1
-  [[ "$module_sha256_before" == "$source_inventory_module_sha256_before" && "$module_sha256_before" == "$source_inventory_module_sha256_expected" ]] || {
-    echo "shared source inventory module differs from its frozen SHA-256" >&2
-    return 1
-  }
-  digest=$(python3 - "$source_inventory_module_path" "$source_inventory_module_sha256_expected" "$repo_root" <<'PY'
+  local source_identity digest head
+  source_identity=$(python3 - "$source_inventory_module_path" "$source_inventory_module_sha256_expected" "$repo_root" <<'PY'
 import hashlib
 import os
 import stat
 import sys
 import types
+from pathlib import Path
 
 path, expected_sha256, root = sys.argv[1:]
-flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
 try:
     fd = os.open(path, flags)
 except OSError as error:
@@ -289,15 +372,15 @@ module = types.ModuleType("pinned_application_source_inventory")
 module.__file__ = path
 module.__package__ = ""
 exec(compile(raw, path, "exec", dont_inherit=True), module.__dict__)
-raise SystemExit(module.main(["digest", "--root", root]))
+tree_digest = module.source_tree_digest(root)
+head = module._checked_capture(["git", "rev-parse", "HEAD"], Path(root), 60.0).decode("ascii", errors="strict").strip()
+print(tree_digest + "\t" + head)
 PY
   ) || return 1
-  module_sha256_after=$(sha256sum "$source_inventory_module_path" | awk '{print $1}') || return 1
-  [[ "$module_sha256_after" == "$module_sha256_before" ]] || {
-    echo "shared source inventory module changed while taking the source identity" >&2
-    return 1
-  }
-  printf '%s\n' "$digest"
+  digest=${source_identity%%$'\t'*}
+  head=${source_identity#*$'\t'}
+  [[ "$digest" =~ ^[0-9a-f]{64}$ && "$head" =~ ^[0-9a-f]{40}$ ]] || return 1
+  printf '%s\t%s\n' "$digest" "$head"
 }
 
 verify_runtime_inputs() {
@@ -307,8 +390,8 @@ verify_runtime_inputs() {
   validator_file=$(realpath "$runtime_validator_arg") || return 1
   [[ -f "$bindings_file" && ! -L "$runtime_bindings_arg" && -f "$validator_file" && ! -L "$runtime_validator_arg" ]] || { echo "runtime binding or validator artifact is missing or symlinked" >&2; return 1; }
   [[ "$bindings_file" == "$output_root"/* && "$validator_file" == "$repo_root/scripts/application-runtime-readback.py" ]] || { echo "runtime binding or validator path escaped its frozen root" >&2; return 1; }
-  [[ $(sha256sum "$bindings_file" | awk '{print $1}') == "$runtime_bindings_sha_expected" ]] || { echo "runtime binding manifest hash changed" >&2; return 1; }
-  [[ $(sha256sum "$validator_file" | awk '{print $1}') == "$runtime_validator_sha_expected" ]] || { echo "runtime readback validator hash changed" >&2; return 1; }
+  [[ $(stable_sha256 "$bindings_file" 131072) == "$runtime_bindings_sha_expected" ]] || { echo "runtime binding manifest hash changed" >&2; return 1; }
+  [[ $(stable_sha256 "$validator_file" 16777216) == "$runtime_validator_sha_expected" ]] || { echo "runtime readback validator hash changed" >&2; return 1; }
   python3 - "$bindings_file" "$runtime_bindings_sha_expected" "$validator_file" "$runtime_validator_sha_expected" "$fixed_global_control_baseline_arg" "$repo_root" "$source_digest" "$run_id" "$workload" "$profile" "$mode" "$rate" "$arrivals" <<'PY'
 import hashlib
 import json
@@ -331,7 +414,7 @@ def unique(pairs):
 def canonical(value):
     return (json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False) + "\n").encode("ascii")
 def stable_bytes(path, maximum):
-    fd = os.open(path, os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0))
+    fd = os.open(path, os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
     try:
         before = os.fstat(fd)
         if not stat.S_ISREG(before.st_mode) or before.st_size > maximum:
@@ -348,19 +431,40 @@ def stable_bytes(path, maximum):
             chunks.append(block)
         after = os.fstat(fd)
         current = os.stat(path, follow_symlinks=False)
-        if ((before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns, before.st_ctime_ns)
-            != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns)
+        if ((before.st_dev, before.st_ino, before.st_mode, before.st_size, before.st_mtime_ns, before.st_ctime_ns)
+            != (after.st_dev, after.st_ino, after.st_mode, after.st_size, after.st_mtime_ns, after.st_ctime_ns)
             or size != before.st_size or not stat.S_ISREG(current.st_mode)
-            or (current.st_dev, current.st_ino) != (before.st_dev, before.st_ino)):
+            or (current.st_dev, current.st_ino, current.st_mode) != (before.st_dev, before.st_ino, before.st_mode)):
             fail()
         return b"".join(chunks)
     finally:
         os.close(fd)
 def sha256_path(path):
     digest = hashlib.sha256()
-    with Path(path).open("rb") as stream:
-        for block in iter(lambda: stream.read(1024 * 1024), b""):
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    fd = os.open(path, flags)
+    try:
+        before = os.fstat(fd)
+        if not stat.S_ISREG(before.st_mode) or before.st_size > 512 * 1024 * 1024:
+            fail()
+        count = 0
+        while True:
+            block = os.read(fd, min(1024 * 1024, 512 * 1024 * 1024 + 1 - count))
+            if not block:
+                break
+            count += len(block)
+            if count > 512 * 1024 * 1024:
+                fail()
             digest.update(block)
+        after = os.fstat(fd)
+        current = os.stat(path, follow_symlinks=False)
+        if ((before.st_dev, before.st_ino, before.st_mode, before.st_size, before.st_mtime_ns, before.st_ctime_ns)
+            != (after.st_dev, after.st_ino, after.st_mode, after.st_size, after.st_mtime_ns, after.st_ctime_ns)
+            or count != before.st_size or not stat.S_ISREG(current.st_mode)
+            or (current.st_dev, current.st_ino, current.st_mode) != (before.st_dev, before.st_ino, before.st_mode)):
+            fail()
+    finally:
+        os.close(fd)
     return digest.hexdigest()
 def safe_file(root, relative, expected_sha):
     if not isinstance(relative, str) or not relative or "\\" in relative:
@@ -471,7 +575,7 @@ def unique(pairs):
 def canonical(value):
     return (json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False) + "\n").encode("ascii")
 def stable_bytes(path, maximum):
-    fd = os.open(path, os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0))
+    fd = os.open(path, os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
     try:
         before = os.fstat(fd)
         if not stat.S_ISREG(before.st_mode) or before.st_size > maximum:
@@ -488,10 +592,10 @@ def stable_bytes(path, maximum):
             chunks.append(block)
         after = os.fstat(fd)
         current = os.stat(path, follow_symlinks=False)
-        if ((before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns, before.st_ctime_ns)
-            != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns)
+        if ((before.st_dev, before.st_ino, before.st_mode, before.st_size, before.st_mtime_ns, before.st_ctime_ns)
+            != (after.st_dev, after.st_ino, after.st_mode, after.st_size, after.st_mtime_ns, after.st_ctime_ns)
             or size != before.st_size or not stat.S_ISREG(current.st_mode)
-            or (current.st_dev, current.st_ino) != (before.st_dev, before.st_ino)):
+            or (current.st_dev, current.st_ino, current.st_mode) != (before.st_dev, before.st_ino, before.st_mode)):
             fail()
         return b"".join(chunks)
     finally:
@@ -542,6 +646,626 @@ except (OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError, KeyE
 PY
 }
 
+verify_functional_v4_overlay() {
+  python3 - "$functional_overlay_file" "$functional_overlay_sha_expected" "$runtime_bindings_arg" "$runtime_bindings_sha_expected" \
+    "$pair_runner_sha256_before" "$source_digest" "$head_commit" "$run_id" "$pair_kind" "$allocator" "$baseline_allocator" \
+    "$workload" "$profile" "$mode" "$rate" "$arrivals" "$binary_digest" "$baseline_binary_digest" \
+    "$oracle_digest_actual" "$baseline_oracle_digest_actual" "$runtime_validator_sha_expected" \
+    "$source_inventory_module_sha256_before" "$repo_root" "$output_root" "$output_root/.functional-tmp" <<'PY'
+import hashlib
+import json
+import os
+import re
+import selectors
+import signal
+import shutil
+import stat
+import subprocess
+import sys
+import time
+import types
+from pathlib import Path
+
+(overlay_path, overlay_sha, binding_path, binding_sha, runner_sha, source_sha, source_head,
+ run_id, pair_kind, allocator, baseline_allocator, workload, profile, mode, rate_text,
+ arrivals_text, binary_sha, baseline_binary_sha, oracle_sha, baseline_oracle_sha, validator_sha,
+ source_inventory_sha, source_root_text, output_root_text, expected_tmp_root_text) = sys.argv[1:]
+
+def fail(message="functional v4 overlay mismatch"):
+    raise SystemExit(message)
+
+def unique(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            fail("duplicate JSON key")
+        result[key] = value
+    return result
+
+def canonical(value):
+    return (json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False) + "\n").encode("ascii")
+
+def stable_bytes(path, maximum):
+    fd = os.open(path, os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
+    try:
+        before = os.fstat(fd)
+        if not stat.S_ISREG(before.st_mode) or before.st_size > maximum:
+            fail("functional v4 input is not a bounded regular file")
+        chunks = []
+        count = 0
+        while True:
+            block = os.read(fd, min(65536, maximum + 1 - count))
+            if not block:
+                break
+            count += len(block)
+            if count > maximum:
+                fail("functional v4 input exceeded its byte limit")
+            chunks.append(block)
+        after = os.fstat(fd)
+        current = os.stat(path, follow_symlinks=False)
+        if ((before.st_dev, before.st_ino, before.st_mode, before.st_size, before.st_mtime_ns, before.st_ctime_ns)
+            != (after.st_dev, after.st_ino, after.st_mode, after.st_size, after.st_mtime_ns, after.st_ctime_ns)
+            or count != before.st_size or not stat.S_ISREG(current.st_mode)
+            or (current.st_dev, current.st_ino, current.st_mode) != (before.st_dev, before.st_ino, before.st_mode)):
+            fail("functional v4 input changed during its stable read")
+        return b"".join(chunks)
+    finally:
+        os.close(fd)
+
+def digest(value):
+    return type(value) is str and re.fullmatch(r"[a-f0-9]{64}", value) is not None
+
+def file_hash(path):
+    h = hashlib.sha256()
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    fd = os.open(path, flags)
+    try:
+        before = os.fstat(fd)
+        if not stat.S_ISREG(before.st_mode) or before.st_size > 512 * 1024 * 1024:
+            fail("functional v4 hash input is not a bounded regular file")
+        count = 0
+        while True:
+            block = os.read(fd, min(1024 * 1024, 512 * 1024 * 1024 + 1 - count))
+            if not block:
+                break
+            count += len(block)
+            if count > 512 * 1024 * 1024:
+                fail("functional v4 hash input exceeded its byte bound")
+            h.update(block)
+        after = os.fstat(fd)
+        current = os.stat(path, follow_symlinks=False)
+        if ((before.st_dev, before.st_ino, before.st_mode, before.st_size, before.st_mtime_ns, before.st_ctime_ns)
+            != (after.st_dev, after.st_ino, after.st_mode, after.st_size, after.st_mtime_ns, after.st_ctime_ns)
+            or count != before.st_size or not stat.S_ISREG(current.st_mode)
+            or (current.st_dev, current.st_ino, current.st_mode) != (before.st_dev, before.st_ino, before.st_mode)):
+            fail("functional v4 hash input changed while streaming")
+    finally:
+        os.close(fd)
+    return h.hexdigest()
+
+def mount_unescape(value):
+    return re.sub(r"\\([0-7]{3})", lambda match: chr(int(match.group(1), 8)), value)
+
+def fs_context(path):
+    resolved = Path(path).resolve(strict=True)
+    info = resolved.stat()
+    raw = Path("/proc/self/mountinfo").read_bytes()
+    if len(raw) > 2 * 1024 * 1024:
+        fail("mount table exceeded its byte limit")
+    selected = None
+    for line in raw.decode("utf-8", errors="strict").splitlines():
+        left, separator, right = line.partition(" - ")
+        if not separator:
+            continue
+        before = left.split()
+        after = right.split()
+        if len(before) < 5 or len(after) < 2:
+            continue
+        mount_point = mount_unescape(before[4])
+        if resolved == Path(mount_point) or Path(mount_point) in resolved.parents:
+            candidate = (len(mount_point), mount_point, after[0], after[1], before[2])
+            if selected is None or candidate[0] > selected[0]:
+                selected = candidate
+    if selected is None:
+        fail("cannot identify the TMPDIR mount")
+    _length, mount_point, fs_type, source, device = selected
+    return {"path": str(resolved), "mount_point": mount_point, "filesystem_type": fs_type,
+            "source": source, "mount_device": device, "st_dev": info.st_dev,
+            "free_bytes": os.statvfs(resolved).f_bavail * os.statvfs(resolved).f_frsize}
+
+def trusted_git_capture(cwd, arguments, max_stdout=16 * 1024 * 1024,
+                       max_stderr=2 * 1024 * 1024, timeout_seconds=60,
+                       program="/usr/bin/git", child_environment=None):
+    environment = child_environment or {
+        "PATH": "/usr/bin:/bin", "LC_ALL": "C", "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_SYSTEM": "/dev/null", "GIT_CONFIG_GLOBAL": "/dev/null",
+        "GIT_NO_REPLACE_OBJECTS": "1", "GIT_ATTR_NOSYSTEM": "1",
+        "GIT_TERMINAL_PROMPT": "0", "GIT_PAGER": "cat", "PAGER": "cat",
+        "GIT_OPTIONAL_LOCKS": "0",
+    }
+    gnupg_home = os.environ.get("GNUPGHOME")
+    if gnupg_home and child_environment is None:
+        environment["GNUPGHOME"] = gnupg_home
+    if program == "/usr/bin/git":
+        command = [program, "-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null",
+                   "-c", "core.attributesFile=/dev/null", "-c", "core.excludesFile=/dev/null",
+                   "-c", "core.pager=cat", "-c", "gpg.program=/usr/bin/gpg",
+                   "-c", "gpg.format=openpgp", *arguments]
+    else:
+        command = [program, *arguments]
+    child = None
+    selector = selectors.DefaultSelector()
+    buffers = {"stdout": bytearray(), "stderr": bytearray()}
+    limits = {"stdout": max_stdout, "stderr": max_stderr}
+    eof = set()
+    received_signal = None
+    stop_started = None
+    leader_exit_seen = None
+    timed_out = False
+    failure = None
+    old_handlers = {}
+
+    def send_group(signum):
+        if child is not None:
+            try:
+                os.killpg(child.pid, signum)
+            except ProcessLookupError:
+                pass
+
+    def request_stop(signum, _frame):
+        nonlocal received_signal, stop_started
+        if received_signal is None:
+            received_signal = signum
+        if stop_started is None:
+            stop_started = time.monotonic()
+        send_group(signal.SIGTERM)
+
+    try:
+        for signum in (signal.SIGHUP, signal.SIGINT, signal.SIGTERM):
+            old_handlers[signum] = signal.signal(signum, request_stop)
+        child = subprocess.Popen(command, cwd=cwd, env=environment, stdin=subprocess.DEVNULL,
+                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                 close_fds=True, start_new_session=True)
+        if stop_started is not None:
+            send_group(signal.SIGTERM)
+        for label, stream in (("stdout", child.stdout), ("stderr", child.stderr)):
+            os.set_blocking(stream.fileno(), False)
+            selector.register(stream, selectors.EVENT_READ, label)
+        deadline = time.monotonic() + timeout_seconds
+        kill_sent = False
+        while True:
+            now = time.monotonic()
+            if now >= deadline and stop_started is None:
+                timed_out = True
+                stop_started = now
+                send_group(signal.SIGTERM)
+            if stop_started is not None and now >= stop_started + 0.5 and not kill_sent:
+                send_group(signal.SIGKILL)
+                kill_sent = True
+            if (kill_sent and now >= stop_started + 1.5
+                and (child.poll() is None or len(eof) != 2)):
+                failure = "Git/GPG command did not finish bounded group cleanup"
+                break
+            for key, _mask in selector.select(0.05):
+                label = key.data
+                try:
+                    block = os.read(key.fileobj.fileno(), 65536)
+                except BlockingIOError:
+                    continue
+                if not block:
+                    selector.unregister(key.fileobj)
+                    eof.add(label)
+                    continue
+                remaining = limits[label] - len(buffers[label])
+                if len(block) > remaining:
+                    failure = f"Git/GPG {label} exceeded its bounded capture"
+                    if stop_started is None:
+                        stop_started = time.monotonic()
+                        send_group(signal.SIGTERM)
+                else:
+                    buffers[label].extend(block)
+            code = child.poll()
+            if code is not None and len(eof) != 2 and stop_started is None:
+                if leader_exit_seen is None:
+                    leader_exit_seen = time.monotonic()
+                elif time.monotonic() >= leader_exit_seen + 0.25:
+                    stop_started = time.monotonic()
+                    send_group(signal.SIGTERM)
+            if code is not None and len(eof) == 2:
+                break
+        code = child.poll()
+    except (OSError, ValueError) as error:
+        failure = f"Git/GPG command could not be captured: {error}"
+        code = None if child is None else child.poll()
+    finally:
+        if child is not None:
+            if child.poll() is None:
+                send_group(signal.SIGTERM)
+                try:
+                    child.wait(timeout=0.5)
+                except subprocess.TimeoutExpired:
+                    send_group(signal.SIGKILL)
+                    try:
+                        child.wait(timeout=0.5)
+                    except subprocess.TimeoutExpired:
+                        failure = failure or "Git/GPG leader remained alive after SIGKILL"
+            send_group(signal.SIGKILL)
+            for stream in (child.stdout, child.stderr):
+                if stream is not None:
+                    stream.close()
+        selector.close()
+        for signum, previous in old_handlers.items():
+            signal.signal(signum, previous)
+    if received_signal is not None:
+        fail(f"Git/GPG command interrupted by signal {received_signal}")
+    if failure is not None or timed_out or code != 0:
+        fail(failure or ("Git/GPG command exceeded its deadline" if timed_out else "Git/GPG command failed"))
+    return bytes(buffers["stdout"]), bytes(buffers["stderr"])
+
+def toolchain_context(source_root):
+    root = Path(source_root).resolve(strict=True)
+    cargo_home = Path(os.environ.get("CARGO_HOME", str(Path.home() / ".cargo"))).expanduser()
+    preferred = cargo_home / "bin"
+    paths = []
+    try:
+        resolved_preferred = preferred.resolve(strict=True)
+        if (resolved_preferred.is_dir() and resolved_preferred != root and root not in resolved_preferred.parents
+            and not (resolved_preferred / "git").exists()):
+            paths.append(str(resolved_preferred))
+    except OSError:
+        pass
+    paths.extend(("/usr/bin", "/bin"))
+    safe_path = os.pathsep.join(paths)
+    binaries = {name: shutil.which(name, path=safe_path) for name in ("cargo", "rustc")}
+    if any(value is None for value in binaries.values()):
+        fail("SourceSchemaV4 verification lacks trusted Cargo/Rust compiler paths")
+    environment = {"PATH": safe_path, "LC_ALL": "C", "GIT_CONFIG_NOSYSTEM": "1",
+                   "GIT_CONFIG_SYSTEM": "/dev/null", "GIT_CONFIG_GLOBAL": "/dev/null",
+                   "GIT_NO_REPLACE_OBJECTS": "1", "GIT_ATTR_NOSYSTEM": "1",
+                   "GIT_TERMINAL_PROMPT": "0", "GIT_PAGER": "cat", "PAGER": "cat",
+                   "GIT_OPTIONAL_LOCKS": "0"}
+    trusted_config = {
+        "core.fsmonitor": "false", "core.hooksPath": "/dev/null",
+        "core.attributesFile": "/dev/null", "core.excludesFile": "/dev/null",
+        "core.pager": "cat", "gpg.program": "/usr/bin/gpg",
+        "gpg.format": "openpgp", "protocol.ext.allow": "never",
+    }
+    environment["GIT_CONFIG_COUNT"] = str(len(trusted_config))
+    for index, (key, value) in enumerate(trusted_config.items()):
+        environment[f"GIT_CONFIG_KEY_{index}"] = key
+        environment[f"GIT_CONFIG_VALUE_{index}"] = value
+    for name in ("HOME", "CARGO_HOME", "RUSTUP_HOME", "RUSTUP_TOOLCHAIN", "RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS", "GNUPGHOME"):
+        if name in os.environ:
+            environment[name] = os.environ[name]
+    return binaries, environment
+
+try:
+    overlay_raw = stable_bytes(overlay_path, 65536)
+    if hashlib.sha256(overlay_raw).hexdigest() != overlay_sha:
+        fail("functional v4 pair overlay SHA-256 mismatch")
+    overlay = json.loads(overlay_raw.decode("utf-8"), object_pairs_hook=unique, parse_constant=lambda _value: fail("non-finite JSON"))
+    expected_overlay_keys = {
+        "schema", "execution_scope", "run_id", "source_manifest_schema", "source_manifest_path",
+        "source_manifest_file_sha256", "signer_fingerprint", "source_manifest_sha256", "source_head", "source_tree_sha256",
+        "source_inventory_module_sha256", "pair_runner_sha256", "runtime_bindings_sha256",
+        "runtime_validator_sha256", "candidate_binary_sha256", "baseline_binary_sha256",
+        "baseline_allocator", "oracle_sha256", "baseline_oracle_sha256", "workload", "profile",
+        "mode", "rate_per_second", "arrivals", "pair_kind", "resource_ceiling_sha256", "policy_sha256",
+        "fixed_global_control_baseline", "calibration_binary_sha256", "calibration_output_sha256",
+        "artifact_sha256s", "processes", "functional_limits", "temporary_storage_root_relative_path",
+        "temporary_storage_context",
+    }
+    if type(overlay) is not dict or set(overlay) != expected_overlay_keys or overlay_raw != canonical(overlay):
+        fail("functional v4 pair overlay schema/canonical bytes mismatch")
+    expected_limits = {
+        "max_arrivals": 1000, "max_rate_per_second": 1000, "max_trace_deadline_seconds": 30,
+        "max_drain_deadline_seconds": 30, "max_shutdown_deadline_seconds": 15,
+        "max_process_deadline_seconds": 300, "max_pair_deadline_seconds": 600,
+        "capacity_horizon_seconds": 30, "max_source_manifest_bytes": 16 * 1024 * 1024,
+        "max_file_bytes": 16 * 1024 * 1024, "max_output_files": 512,
+        "max_output_directories": 128, "max_output_entries": 1024,
+        "max_output_bytes": 256 * 1024 * 1024,
+        "minimum_free_bytes": 256 * 1024 * 1024,
+    }
+    if overlay["functional_limits"] != expected_limits:
+        fail("functional v4 finite limits changed")
+    expected_rate = None if mode == "capacity" else int(rate_text)
+    expected_arrivals = 5000 if mode == "capacity" else int(arrivals_text)
+    if (overlay["schema"] != "allocatbelt.application-functional-pair-overlay.v3"
+        or overlay["execution_scope"] != "functional_only"
+        or overlay["run_id"] != run_id
+        or overlay["source_manifest_schema"] != "allocatbelt.application-source-manifest.v4"
+        or overlay["source_head"] != source_head or overlay["source_tree_sha256"] != source_sha
+        or not re.fullmatch(r"[A-F0-9]{40,64}", overlay["signer_fingerprint"])
+        or overlay["source_inventory_module_sha256"] != source_inventory_sha
+        or overlay["pair_runner_sha256"] != runner_sha
+        or overlay["runtime_bindings_sha256"] != binding_sha
+        or overlay["runtime_validator_sha256"] != validator_sha
+        or overlay["candidate_binary_sha256"] != binary_sha
+        or overlay["baseline_binary_sha256"] != (baseline_binary_sha or None)
+        or overlay["baseline_allocator"] != (baseline_allocator or None)
+        or overlay["oracle_sha256"] != (oracle_sha or None)
+        or overlay["baseline_oracle_sha256"] != (baseline_oracle_sha or None)
+        or overlay["workload"] != workload or overlay["profile"] != profile
+        or overlay["mode"] != mode or overlay["rate_per_second"] != expected_rate
+        or overlay["arrivals"] != expected_arrivals or overlay["pair_kind"] != pair_kind):
+        fail("functional v4 pair overlay differs from runner arguments")
+    if (not digest(overlay["source_manifest_file_sha256"])
+        or not digest(overlay["source_manifest_sha256"])
+        or not digest(overlay["resource_ceiling_sha256"])
+        or not digest(overlay["policy_sha256"])
+        or type(overlay["fixed_global_control_baseline"]) is not int
+        or overlay["fixed_global_control_baseline"] <= 0):
+        fail("functional v4 pair overlay contains an invalid source/policy pin")
+
+    source_root = Path(source_root_text).resolve(strict=True)
+    output_root = Path(output_root_text).resolve(strict=True)
+    relative_manifest = overlay["source_manifest_path"]
+    if (type(relative_manifest) is not str or relative_manifest != ".functional-inputs/source-manifest.json"
+        or overlay["temporary_storage_root_relative_path"] != ".functional-tmp"):
+        fail("functional v4 overlay artifact paths differ from the fixed private layout")
+    manifest_path = output_root / relative_manifest
+    if manifest_path.is_symlink() or not manifest_path.is_file():
+        fail("copied SourceSchemaV4 manifest is missing or symlinked")
+    manifest_raw = stable_bytes(manifest_path, expected_limits["max_source_manifest_bytes"])
+    if hashlib.sha256(manifest_raw).hexdigest() != overlay["source_manifest_file_sha256"]:
+        fail("copied SourceSchemaV4 raw file SHA-256 mismatch")
+    source_manifest = json.loads(manifest_raw.decode("utf-8"), object_pairs_hook=unique, parse_constant=lambda _value: fail("non-finite manifest JSON"))
+    if manifest_raw != canonical(source_manifest):
+        fail("copied SourceSchemaV4 manifest is not canonical JSON")
+    unsigned_manifest = dict(source_manifest)
+    semantic_sha = unsigned_manifest.pop("manifest_sha256", None)
+    if (not digest(semantic_sha)
+        or hashlib.sha256(canonical(unsigned_manifest)).hexdigest() != semantic_sha):
+        fail("copied SourceSchemaV4 semantic manifest digest differs")
+    if (source_manifest.get("schema") != overlay["source_manifest_schema"]
+        or source_manifest.get("manifest_sha256") != overlay["source_manifest_sha256"]
+        or source_manifest.get("source", {}).get("git_commit") != source_head
+        or source_manifest.get("source", {}).get("source_tree_sha256") != source_sha):
+        fail("copied SourceSchemaV4 manifest semantic identity differs")
+
+    signer_fingerprint = overlay["signer_fingerprint"]
+    if not re.fullmatch(r"[A-F0-9]{40,64}", signer_fingerprint):
+        fail("caller-pinned OpenPGP signer fingerprint is malformed")
+    gnupg_home_text = os.environ.get("GNUPGHOME")
+    if not gnupg_home_text:
+        fail("SourceSchemaV4 verification requires a caller-provided private GNUPGHOME")
+    gnupg_home = Path(gnupg_home_text).expanduser().absolute()
+    cursor = Path(gnupg_home.anchor)
+    for component in gnupg_home.parts[1:]:
+        cursor /= component
+        if cursor.is_symlink():
+            fail("SourceSchemaV4 GNUPGHOME traverses a symlink")
+    if not gnupg_home.is_dir() or stat.S_IMODE(gnupg_home.stat().st_mode) != 0o700:
+        fail("SourceSchemaV4 GNUPGHOME must be a private 0700 directory")
+    current_head = trusted_git_capture(source_root, ["rev-parse", "HEAD"], max_stdout=4096)[0].decode("ascii").strip()
+    git_root = trusted_git_capture(source_root, ["rev-parse", "--show-toplevel"], max_stdout=4096)[0].decode("utf-8").rstrip("\n")
+    if current_head != source_head or Path(git_root).resolve(strict=True) != source_root:
+        fail("SourceSchemaV4 source root HEAD/worktree differs before controller execution")
+    sig_stdout, sig_stderr = trusted_git_capture(source_root, ["verify-commit", "--raw", source_head])
+    signature_lines = (sig_stdout + sig_stderr).decode("utf-8", errors="replace").splitlines()
+    valid_signatures = []
+    rejected_statuses = {"BADSIG", "ERRSIG", "NO_PUBKEY", "REVKEYSIG", "EXPKEYSIG", "EXPSIG"}
+    for line in signature_lines:
+        fields = line.split()
+        if len(fields) >= 2 and fields[:2] == ["[GNUPG:]", "VALIDSIG"]:
+            if len(fields) not in (11, 12):
+                fail("GPG VALIDSIG status record is malformed")
+            signing = fields[2].upper()
+            primary = (fields[11] if len(fields) == 12 else fields[2]).upper()
+            if not re.fullmatch(r"[A-F0-9]{40,64}", signing) or not re.fullmatch(r"[A-F0-9]{40,64}", primary):
+                fail("GPG VALIDSIG fingerprint fields are malformed")
+            valid_signatures.append((signing, primary))
+        elif len(fields) >= 2 and fields[0] == "[GNUPG:]" and fields[1] in rejected_statuses:
+            fail("SourceSchemaV4 commit signature has a GPG rejection status")
+    if len(valid_signatures) != 1 or signer_fingerprint not in valid_signatures[0]:
+        fail("SourceSchemaV4 VALIDSIG signing/primary fingerprint differs from the caller-pinned signer")
+
+    source_files = source_manifest["source"]["files"]
+    controller_entry = next((item for item in source_files if item.get("path") == "scripts/application-campaign.py"), None)
+    if type(controller_entry) is not dict or controller_entry.get("kind") != "file":
+        fail("SourceSchemaV4 inventory does not pin a regular campaign controller")
+    runner_path = Path(__file__).resolve(strict=True)
+    try:
+        runner_relative = runner_path.relative_to(source_root).as_posix()
+    except ValueError:
+        fail("functional v4 runner is outside the signed SourceSchemaV4 root")
+    runner_entry = next((item for item in source_files if item.get("path") == runner_relative), None)
+    if (runner_relative != "scripts/run-application-pair.sh" or type(runner_entry) is not dict
+        or runner_entry.get("kind") != "file" or runner_entry.get("sha256") != runner_sha):
+        fail("functional v4 runner bytes are not the committed SourceSchemaV4 runner")
+    controller_path = source_root / "scripts/application-campaign.py"
+    if controller_path.parent.is_symlink():
+        fail("SourceSchemaV4 controller path has a symlinked parent")
+    controller_raw = stable_bytes(controller_path, 16 * 1024 * 1024)
+    controller_info = controller_path.stat(follow_symlinks=False)
+    controller_mode = "100755" if controller_info.st_mode & 0o111 else "100644"
+    if (controller_entry.get("mode") not in ("100644", "100755")
+        or controller_mode != controller_entry.get("mode")
+        or len(controller_raw) != controller_entry.get("size")
+        or hashlib.sha256(controller_raw).hexdigest() != controller_entry.get("sha256")):
+        fail("campaign controller bytes differ from the SourceSchemaV4 inventory")
+    committed_mode_raw = trusted_git_capture(
+        source_root, ["ls-tree", "-z", source_head, "--", "scripts/application-campaign.py"],
+        max_stdout=4096,
+    )[0]
+    committed_entry, separator, committed_path = committed_mode_raw.rstrip(b"\0").partition(b"\t")
+    committed_fields = committed_entry.split(b" ")
+    if (not separator or committed_path != b"scripts/application-campaign.py"
+        or len(committed_fields) != 3 or committed_fields[0].decode("ascii", errors="strict") != controller_mode
+        or committed_fields[1] != b"blob"
+        or not re.fullmatch(rb"[0-9a-f]{40,64}", committed_fields[2])):
+        fail("campaign controller tracked mode differs from the verified signed commit")
+    committed_controller = trusted_git_capture(
+        source_root, ["cat-file", "blob", f"{source_head}:scripts/application-campaign.py"],
+        max_stdout=16 * 1024 * 1024,
+    )[0]
+    if controller_raw != committed_controller:
+        fail("captured campaign controller differs from the blob at the verified signed commit")
+    controller = types.ModuleType("pair_runner_pinned_campaign_controller")
+    controller.__file__ = str(controller_path)
+    exec(compile(controller_raw, str(controller_path), "exec", dont_inherit=True), controller.__dict__)
+    if (controller.SOURCE_SCHEMA != overlay["source_manifest_schema"]
+        or controller.SOURCE_INVENTORY_MODULE_SHA256 != source_inventory_sha):
+        fail("SourceSchemaV4 controller pins a different schema/source inventory engine")
+    tool_bins, tool_environment = toolchain_context(source_root)
+    def trusted_controller_run_checked(arguments, cwd=None, timeout_seconds=120.0):
+        if arguments and arguments[0] == "git":
+            return trusted_git_capture(cwd or source_root, arguments[1:],
+                                       timeout_seconds=min(600, max(1, int(timeout_seconds))))[0]
+        if arguments and arguments[0] in tool_bins:
+            return trusted_git_capture(cwd or source_root, arguments[1:],
+                                       timeout_seconds=min(600, max(1, int(timeout_seconds))),
+                                       program=tool_bins[arguments[0]],
+                                       child_environment=tool_environment)[0]
+        fail("unexpected preflight helper requested by the source-pinned controller")
+    controller.run_checked = trusted_controller_run_checked
+    old_environment = dict(os.environ)
+    try:
+        for key in list(os.environ):
+            if key.startswith("GIT_"):
+                os.environ.pop(key, None)
+        os.environ.update(tool_environment)
+        config = {
+            "core.fsmonitor": "false", "core.hooksPath": "/dev/null",
+            "core.attributesFile": "/dev/null", "core.excludesFile": "/dev/null",
+            "core.pager": "cat", "gpg.program": "/usr/bin/gpg",
+            "gpg.format": "openpgp", "protocol.ext.allow": "never",
+        }
+        os.environ["GIT_CONFIG_COUNT"] = str(len(config))
+        for index, (key, value) in enumerate(config.items()):
+            os.environ[f"GIT_CONFIG_KEY_{index}"] = key
+            os.environ[f"GIT_CONFIG_VALUE_{index}"] = value
+        controller.verify_source_manifest(source_manifest, source_root, verify_artifacts=True)
+    finally:
+        os.environ.clear()
+        os.environ.update(old_environment)
+    expected_artifacts = {
+        **{name: item["sha256"] for name, item in source_manifest["artifacts"].items()},
+        **{f"soak-{name}": item["sha256"] for name, item in source_manifest["soak_artifacts"].items()},
+        "analysis-engine": source_manifest["analysis_artifact"]["sha256"],
+        "resource-domain-calibration": source_manifest["resource_domain_calibration"]["binary"]["sha256"],
+        "resource-domain-calibration-output": source_manifest["resource_domain_calibration"]["output"]["sha256"],
+    }
+    if overlay["artifact_sha256s"] != expected_artifacts:
+        fail("functional v4 overlay does not bind all four allocator, soak, analysis and calibration artifacts")
+    if set(source_manifest["artifacts"]) != {"allocatbelt", "mimalloc-secure", "mimalloc-standard", "system"}:
+        fail("SourceSchemaV4 does not bind all four actual allocator artifacts")
+    if "allocatbelt" not in source_manifest["soak_artifacts"]:
+        fail("SourceSchemaV4 candidate soak binary is missing")
+    if source_manifest["artifacts"]["allocatbelt"]["sha256"] != binary_sha:
+        fail("runner candidate binary differs from SourceSchemaV4")
+    selected_baseline = None if baseline_allocator == "" else baseline_allocator
+    if selected_baseline is not None:
+        if source_manifest["artifacts"].get(selected_baseline, {}).get("sha256") != baseline_binary_sha:
+            fail("runner baseline binary differs from SourceSchemaV4")
+    policy = source_manifest["fixed_runtime_policy"]
+    calibration = source_manifest["resource_domain_calibration"]
+    validator = source_manifest["runtime_readback_validator"]
+    if (policy.get("policy_sha256") != overlay["policy_sha256"]
+        or calibration.get("binary", {}).get("sha256") != overlay["calibration_binary_sha256"]
+        or calibration.get("output", {}).get("sha256") != overlay["calibration_output_sha256"]
+        or calibration.get("record", {}).get("fixed_global_control_baseline") != overlay["fixed_global_control_baseline"]
+        or validator.get("sha256") != validator_sha):
+        fail("functional v4 policy/calibration/validator pins differ from SourceSchemaV4")
+    expected_ceiling = controller.fixed_resource_limits_for_cell(workload, profile, validator_sha)
+    if hashlib.sha256(canonical(expected_ceiling)).hexdigest() != overlay["resource_ceiling_sha256"]:
+        fail("functional v4 numeric resource ceiling digest differs from the source controller")
+
+    root_tmp = Path(expected_tmp_root_text).resolve(strict=True)
+    if root_tmp != output_root / ".functional-tmp" or root_tmp.is_symlink() or not root_tmp.is_dir():
+        fail("functional v4 TMPDIR root escaped the private output tree")
+    if os.environ.get("TMPDIR") != str(root_tmp):
+        fail("functional v4 runner did not receive the private output-root TMPDIR")
+    expected_context = overlay["temporary_storage_context"]
+    if type(expected_context) is not dict or set(expected_context) != {"output_root", "tmpdir_root"}:
+        fail("functional v4 storage context record is malformed")
+    actual_tmp = fs_context(root_tmp)
+    actual_output = fs_context(output_root)
+    planned_tmp = expected_context["tmpdir_root"]
+    planned_output = expected_context["output_root"]
+    for actual, planned in ((actual_tmp, planned_tmp), (actual_output, planned_output)):
+        for key in ("mount_point", "filesystem_type", "source", "mount_device", "st_dev"):
+            if actual[key] != planned[key]:
+                fail("functional v4 output filesystem context changed")
+    if (actual_tmp["filesystem_type"] in ("tmpfs", "ramfs")
+        or actual_tmp["st_dev"] != actual_output["st_dev"]
+        or actual_tmp["mount_point"] != actual_output["mount_point"]
+        or actual_tmp["free_bytes"] < expected_limits["minimum_free_bytes"]):
+        fail("functional v4 TMPDIR is not on the non-memory output root filesystem")
+
+    binding_raw = stable_bytes(binding_path, 131072)
+    if hashlib.sha256(binding_raw).hexdigest() != binding_sha:
+        fail("functional v4 runtime binding raw SHA-256 mismatch")
+    binding_manifest = json.loads(binding_raw.decode("utf-8"), object_pairs_hook=unique, parse_constant=lambda _value: fail("non-finite binding JSON"))
+    binding_unsigned = dict(binding_manifest)
+    binding_semantic_sha = binding_unsigned.pop("manifest_sha256", None)
+    if (binding_manifest.get("schema") != "allocatbelt.application-runtime-process-bindings.v1"
+        or binding_manifest.get("run_id") != run_id
+        or binding_manifest.get("source_manifest_sha256") != overlay["source_manifest_sha256"]
+        or binding_manifest.get("source_sha256") != source_sha
+        or hashlib.sha256(canonical(binding_unsigned)).hexdigest() != binding_semantic_sha):
+        fail("functional v4 runtime bindings are not bound to the exact SourceSchemaV4 source")
+    if (binding_manifest.get("fixed_runtime_policy") != policy
+        or binding_manifest.get("resource_domain_calibration", {}).get("binary") != calibration.get("binary")
+        or binding_manifest.get("resource_domain_calibration", {}).get("output") != calibration.get("output")
+        or binding_manifest.get("runtime_readback_validator") != validator
+        or binding_manifest.get("fixed_global_control_baseline") != overlay["fixed_global_control_baseline"]):
+        fail("functional v4 runtime binding manifest changed policy/calibration inputs")
+    bindings = binding_manifest.get("processes")
+    descriptors = overlay["processes"]
+    if type(bindings) is not list or len(bindings) != 2 or type(descriptors) is not list or len(descriptors) != 2:
+        fail("functional v4 pair must contain exactly two runtime bindings")
+    expected_descriptors = []
+    for descriptor in descriptors:
+        if type(descriptor) is not dict or set(descriptor) != {"pair", "executor", "allocator"}:
+            fail("functional v4 process descriptor is malformed")
+        expected_descriptors.append((descriptor["pair"], descriptor["executor"], descriptor["allocator"]))
+    if len(set(expected_descriptors)) != 2:
+        fail("functional v4 process descriptors are duplicated")
+    actual_descriptors = []
+    runtime_validator = controller.runtime_readback_module(validator_sha)
+    expected_run = {"workload": workload, "profile": profile, "mode": mode,
+                    "rate_per_second": expected_rate, "arrivals": expected_arrivals}
+    for binding in bindings:
+        if type(binding) is not dict:
+            fail("functional v4 runtime binding is malformed")
+        descriptor = (binding.get("pair"), binding.get("executor"), binding.get("allocator"))
+        actual_descriptors.append(descriptor)
+        if descriptor not in expected_descriptors:
+            fail("functional v4 runtime binding descriptor differs")
+        if (binding.get("policy_sha256") != overlay["policy_sha256"]
+            or binding.get("resource_ceiling_sha256") != overlay["resource_ceiling_sha256"]
+            or binding.get("fixed_global_control_baseline") != overlay["fixed_global_control_baseline"]):
+            fail("functional v4 runtime binding changed fixed policy/ceiling/baseline")
+        recipe = binding.get("recipe")
+        if type(recipe) is not dict or recipe.get("run") != expected_run:
+            fail("functional v4 runtime recipe differs from the selected workload/profile/mode")
+        expected_executor = "allocatbelt" if descriptor[1] == "bounded" else "tokio-1.53.1"
+        artifact = source_manifest["artifacts"].get(descriptor[2])
+        if (type(artifact) is not dict or recipe.get("identity", {}).get("executor") != expected_executor
+            or recipe.get("identity", {}).get("allocator") != descriptor[2]
+            or recipe.get("identity", {}).get("source_sha256") != source_sha
+            or recipe.get("identity", {}).get("binary_sha256") != artifact.get("sha256")
+            or recipe.get("identity", {}).get("report_nonce") != binding.get("report_nonce")
+            or not re.fullmatch(r"[a-f0-9]{32}", binding.get("report_nonce", ""))
+            or hashlib.sha256(canonical(recipe)).hexdigest() != binding.get("recipe_sha256")):
+            fail("functional v4 runtime recipe identity/hash differs from its actual artifact")
+        expected = runtime_validator.build_fixed_expectation(recipe)
+        if hashlib.sha256(runtime_validator.canonical_bytes(expected)).hexdigest() != binding.get("expectation_sha256"):
+            fail("functional v4 expected runtime receipt hash differs from the source-pinned validator")
+    if len(set(actual_descriptors)) != 2 or set(actual_descriptors) != set(expected_descriptors):
+        fail("functional v4 bindings do not match the selected pair kind")
+    if pair_kind == "allocator-match":
+        if {descriptor[2] for descriptor in actual_descriptors} != {"allocatbelt", baseline_allocator}:
+            fail("functional v4 allocator comparison differs from its selected baseline")
+    elif any(descriptor[2] != "allocatbelt" for descriptor in actual_descriptors):
+        fail("functional v4 runtime/A/A pairs must use the candidate allocator")
+except (OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError, KeyError, subprocess.SubprocessError):
+    fail()
+PY
+}
+
 verify_functional_overlay() {
   (( functional_only_mode == 1 )) || return 0
   functional_overlay_file=$(realpath "$functional_overlay_arg") || return 1
@@ -549,8 +1273,22 @@ verify_functional_overlay() {
   bindings_file=$(realpath "$runtime_bindings_arg") || return 1
   [[ -f "$functional_overlay_file" && ! -L "$functional_overlay_arg" && "$functional_overlay_file" == "$output_root"/* ]] || { echo "functional overlay path escaped the private output root" >&2; return 1; }
   [[ -f "$bindings_file" && ! -L "$runtime_bindings_arg" && "$bindings_file" == "$output_root"/* ]] || { echo "functional runtime bindings escaped the private output root" >&2; return 1; }
-  functional_overlay_sha256_before=$(sha256sum "$functional_overlay_file" | awk '{print $1}') || return 1
+  functional_overlay_sha256_before=$(stable_sha256 "$functional_overlay_file" 65536) || return 1
   [[ "$functional_overlay_sha256_before" == "$functional_overlay_sha_expected" ]] || { echo "functional overlay SHA-256 differs from its pinned argument" >&2; return 1; }
+  local overlay_schema
+  overlay_schema=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["schema"])' "$functional_overlay_file") || return 1
+  if [[ "$overlay_schema" == "allocatbelt.application-functional-pair-overlay.v3" ]]; then
+    verify_functional_v4_overlay || { echo "SourceSchemaV4 functional overlay failed independent controller/receipt-input validation" >&2; return 1; }
+    functional_source_v4_mode=1
+    functional_source_manifest_file_path="$output_root/.functional-inputs/source-manifest.json"
+    functional_source_manifest_file_sha256_before=$(stable_sha256 "$functional_source_manifest_file_path" 16777216) || return 1
+    functional_source_manifest_semantic_sha256=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["source_manifest_sha256"])' "$functional_overlay_file") || return 1
+    functional_source_signer_fingerprint=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["signer_fingerprint"])' "$functional_overlay_file") || return 1
+    functional_tmp_root_path="$output_root/.functional-tmp"
+    functional_tmp_context_json=$(python3 -c 'import json,sys; print(json.dumps(json.load(open(sys.argv[1], encoding="utf-8"))["temporary_storage_context"]["tmpdir_root"], sort_keys=True, separators=(",", ":")))' "$functional_overlay_file") || return 1
+    return 0
+  fi
+  [[ "$overlay_schema" == "allocatbelt.application-functional-pair-overlay.v2" ]] || { echo "unknown functional overlay schema" >&2; return 1; }
   python3 - "$functional_overlay_file" "$functional_overlay_sha_expected" "$bindings_file" "$runtime_bindings_sha_expected" "$pair_runner_sha256_before" "$source_digest" "$head_commit" "$run_id" "$pair_kind" "$allocator" "$baseline_allocator" "$workload" "$profile" "$mode" "$rate" "$arrivals" "$binary_digest" "$baseline_binary_digest" "$oracle_digest_actual" "$baseline_oracle_digest_actual" "$runtime_validator_sha_expected" "$source_inventory_module_sha256_before" <<'PY'
 import hashlib
 import json
@@ -583,7 +1321,7 @@ def digest(value):
     return type(value) is str and re.fullmatch(r"[a-f0-9]{64}", value) is not None
 
 def stable_bytes(path, maximum):
-    fd = os.open(path, os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0))
+    fd = os.open(path, os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
     try:
         before = os.fstat(fd)
         if not stat.S_ISREG(before.st_mode) or before.st_size > maximum:
@@ -600,10 +1338,10 @@ def stable_bytes(path, maximum):
             chunks.append(block)
         after = os.fstat(fd)
         current = os.stat(path, follow_symlinks=False)
-        if ((before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns, before.st_ctime_ns)
-            != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns)
+        if ((before.st_dev, before.st_ino, before.st_mode, before.st_size, before.st_mtime_ns, before.st_ctime_ns)
+            != (after.st_dev, after.st_ino, after.st_mode, after.st_size, after.st_mtime_ns, after.st_ctime_ns)
             or size != before.st_size or not stat.S_ISREG(current.st_mode)
-            or (current.st_dev, current.st_ino) != (before.st_dev, before.st_ino)):
+            or (current.st_dev, current.st_ino, current.st_mode) != (before.st_dev, before.st_ino, before.st_mode)):
             fail()
         return b"".join(chunks)
     finally:
@@ -729,12 +1467,13 @@ except (OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError, KeyE
 PY
 }
 
-source_digest=$(source_hash) || exit 2
-binary_digest=$(sha256sum "$binary" | awk '{print $1}') || exit 2
+source_identity=$(source_hash) || exit 2
+IFS=$'\t' read -r source_digest head_commit <<< "$source_identity"
+[[ "$source_digest" =~ ^[0-9a-f]{64}$ && "$head_commit" =~ ^[0-9a-f]{40}$ ]] || exit 2
+binary_digest=$(stable_sha256 "$binary") || exit 2
 if (( runtime_readback_enabled == 1 )); then
   verify_runtime_inputs || exit 2
 fi
-head_commit=$(git -C "$repo_root" rev-parse HEAD) || exit 2
 rust_version=$(rustc -Vv | tr '\n' ';') || exit 2
 kernel=$(uname -srmo) || exit 2
 host=$(hostname -f 2>/dev/null || hostname)
@@ -763,6 +1502,18 @@ printf 'baseline_allocator\t%s\n' "$baseline_allocator"
     printf 'functional_max_drain_deadline_seconds\t30\n'
     printf 'functional_max_shutdown_deadline_seconds\t15\n'
     printf 'functional_max_process_deadline_seconds\t300\n'
+    printf 'functional_capacity_horizon_seconds\t30\n'
+    if (( functional_source_v4_mode == 1 )); then
+      printf 'source_manifest_schema\tallocatbelt.application-source-manifest.v4\n'
+      printf 'source_manifest_file_sha256_before\t%s\n' "$functional_source_manifest_file_sha256_before"
+      printf 'source_manifest_sha256\t%s\n' "$functional_source_manifest_semantic_sha256"
+      printf 'source_signer_fingerprint\t%s\n' "$functional_source_signer_fingerprint"
+      printf 'functional_tmpdir_root\t%s\n' "$functional_tmp_root_path"
+      printf 'functional_tmpdir_root_context\t%s\n' "$functional_tmp_context_json"
+      printf 'functional_file_size_limit_bytes\t%s\n' "$((functional_file_size_limit_blocks * 1024))"
+      printf 'functional_file_size_limit_soft_bytes\t%s\n' "$(( $(ulimit -Sf) * 1024 ))"
+      printf 'functional_file_size_limit_hard_bytes\t%s\n' "$(( $(ulimit -Hf) * 1024 ))"
+    fi
   fi
   printf 'resource_scope_binding\t%s\n' 'local ResourceScope; no shared runtime ResourceDomain'
   printf 'policy_qualification_stage\t%s\n' 'profile harness; no global or tenant ResourceDomain binding'
@@ -966,6 +1717,8 @@ if workload in ("memory", "http", "mixed") and int(row["retained_managed_bytes"]
 if mode == "capacity":
     if row["arrival_rate_per_second"] or row["requested_arrivals"] or rejected_full or rejected_resource or int(row["lost"]):
         raise SystemExit(1)
+    if attempted <= 0 or completed_on_time <= 0:
+        raise SystemExit(1)
     if int(row["response_p50_ns"]) or int(row["response_p95_ns"]) or int(row["response_p99_ns"]):
         raise SystemExit(1)
     expected_capacity = Decimal(completed_on_time) / Decimal(30)
@@ -1007,12 +1760,12 @@ PY
 
 validate_shutdown_report() {
   local report=$1 expected_executor=$2 trace_seconds=$3 shutdown_seconds=$4 process_seconds=$5 output=$6 report_nonce=$7 run_id=$8 allocator=$9 profile=${10} source_hash=${11} binary_hash=${12}
-  python3 - "$report" "$expected_executor" "$workload" "$trace_seconds" "$shutdown_seconds" "$process_seconds" "$output" "$report_nonce" "$run_id" "$allocator" "$profile" "$source_hash" "$binary_hash" <<'PY'
+  python3 - "$report" "$expected_executor" "$workload" "$mode" "$trace_seconds" "$shutdown_seconds" "$process_seconds" "$output" "$report_nonce" "$run_id" "$allocator" "$profile" "$source_hash" "$binary_hash" <<'PY'
 import re
 import sys
 from pathlib import Path
 
-path, executor, workload, trace_seconds, shutdown_seconds, process_seconds, output, nonce, run_id, allocator, profile, source_hash, binary_hash = sys.argv[1:]
+path, executor, workload, mode, trace_seconds, shutdown_seconds, process_seconds, output, nonce, run_id, allocator, profile, source_hash, binary_hash = sys.argv[1:]
 try:
     lines = Path(path).read_text(encoding="utf-8").splitlines()
 except OSError:
@@ -1040,8 +1793,13 @@ if any(len(row) != 3 or row[:2] != ["phase", name] for row, name in zip(phase_ro
     raise SystemExit(1)
 if any(not re.fullmatch(r"(?:0|[1-9][0-9]*)", row[2]) for row in phase_rows):
     raise SystemExit(1)
-if int(phase_rows[0][2]) > int(trace_seconds) * 1_000_000_000:
-    raise SystemExit(1)
+trace_ns = int(phase_rows[0][2])
+if mode == "capacity":
+    if not 30_000_000_000 <= trace_ns <= min(int(trace_seconds) * 1_000_000_000, 31_000_000_000):
+        raise SystemExit(1)
+else:
+    if trace_ns > int(trace_seconds) * 1_000_000_000:
+        raise SystemExit(1)
 started, ended, cpu_ns, successes = (int(phase_rows[index][2]) for index in (1, 2, 3, 4))
 if ended < started or ended - started != cpu_ns or cpu_ns > int(process_seconds) * 128 * 1_000_000_000:
     raise SystemExit(1)
@@ -1055,6 +1813,8 @@ except (OSError, IndexError):
     raise SystemExit(1)
 expected_successes = int(output_row[output_header.index("completed_on_time")]) + int(output_row[output_header.index("completed_late")])
 if successes != expected_successes:
+    raise SystemExit(1)
+if mode == "capacity" and (successes <= 0 or int(output_row[output_header.index("completed_on_time")]) <= 0):
     raise SystemExit(1)
 for line, expected in zip(lines[15:], drivers, strict=True):
     row = line.split("\t")
@@ -1172,6 +1932,8 @@ if counts["workload"] != "mixed" or counts["mode"] != "capacity":
     raise SystemExit(1)
 attempted = int(counts["attempted"])
 completed_on_time = int(counts["completed_on_time"])
+if attempted <= 0 or completed_on_time <= 0:
+    raise SystemExit(1)
 if sum(int(values[0]) for values in families.values()) != attempted or sum(int(values[1]) for values in families.values()) != completed_on_time:
     raise SystemExit(1)
 for index, family in enumerate(("cpu", "memory", "http", "disk")):
@@ -1179,7 +1941,7 @@ for index, family in enumerate(("cpu", "memory", "http", "disk")):
     if not re.fullmatch(r"(?:0|[1-9][0-9]*)", scheduled) or not re.fullmatch(r"(?:0|[1-9][0-9]*)", successes):
         raise SystemExit(1)
     expected_count = attempted // 4 + (1 if index < attempted % 4 else 0)
-    if int(scheduled) != expected_count or int(successes) > int(scheduled):
+    if int(scheduled) != expected_count or int(successes) <= 0 or int(successes) > int(scheduled):
         raise SystemExit(1)
 PY
 }
@@ -1305,7 +2067,7 @@ if [[ "$mode" == open_loop ]]; then
     printf 'pair_status\tfailed_or_invalid\nexecution_scope\t%s\n' "$execution_scope" > "$cell_dir/pair.failed"
     exit 1
   fi
-  generated_oracle_digest=$(sha256sum "$generated_oracle" | awk '{print $1}') || exit 2
+  generated_oracle_digest=$(stable_sha256 "$generated_oracle" 16777216) || exit 2
   if [[ "$generated_oracle_digest" != "$oracle_digest_expected" ]] || ! cmp -s "$oracle_file" "$generated_oracle"; then
     echo "manifest oracle differs from the pinned source and binary kernels" >&2
     printf 'pair_status\tfailed_or_invalid\nexecution_scope\t%s\n' "$execution_scope" > "$cell_dir/pair.failed"
@@ -1323,6 +2085,72 @@ if [[ "$mode" == open_loop && ( "$pair_kind" == allocator-match || "$pair_kind" 
   exit 1
 fi
 
+verify_functional_tmpdir() {
+  local path=$1 state=$2
+  python3 - "$path" "$functional_tmp_root_path" "$functional_tmp_context_json" "$state" <<'PY'
+import json
+import os
+import re
+import stat
+import sys
+from pathlib import Path
+
+path_text, root_text, expected_raw, state = sys.argv[1:]
+def fail():
+    raise SystemExit(1)
+def unescape(value):
+    return re.sub(r"\\([0-7]{3})", lambda match: chr(int(match.group(1), 8)), value)
+def context(path):
+    resolved = Path(path).resolve(strict=True)
+    info = resolved.stat()
+    selected = None
+    raw = Path("/proc/self/mountinfo").read_bytes()
+    if len(raw) > 2 * 1024 * 1024:
+        fail()
+    for line in raw.decode("utf-8", errors="strict").splitlines():
+        left, separator, right = line.partition(" - ")
+        if not separator:
+            continue
+        before = left.split()
+        after = right.split()
+        if len(before) < 5 or len(after) < 2:
+            continue
+        mount = unescape(before[4])
+        if resolved == Path(mount) or Path(mount) in resolved.parents:
+            current = (len(mount), mount, after[0], after[1], before[2])
+            if selected is None or current[0] > selected[0]:
+                selected = current
+    if selected is None:
+        fail()
+    _length, mount, fs_type, source, device = selected
+    return {"path": str(resolved), "mount_point": mount, "filesystem_type": fs_type,
+            "source": source, "mount_device": device, "st_dev": info.st_dev,
+            "free_bytes": os.statvfs(resolved).f_bavail * os.statvfs(resolved).f_frsize}
+try:
+    path = Path(path_text)
+    root = Path(root_text).resolve(strict=True)
+    if path.is_symlink() or not path.is_dir() or path.resolve(strict=True).parent != root:
+        fail()
+    expected = json.loads(expected_raw)
+    actual = context(path)
+    for key in ("mount_point", "filesystem_type", "source", "mount_device", "st_dev"):
+        if actual[key] != expected[key]:
+            fail()
+    if actual["filesystem_type"] in ("tmpfs", "ramfs"):
+        fail()
+    if actual["free_bytes"] < 256 * 1024 * 1024:
+        fail()
+    entries = list(path.iterdir())
+    if state in ("initial", "after") and entries:
+        fail()
+    if any(entry.is_symlink() for entry in entries):
+        fail()
+    print(json.dumps(actual, sort_keys=True, separators=(",", ":")))
+except (OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError):
+    fail()
+PY
+}
+
 run_one() {
   local pair=$1 executor=$2 process_allocator=$3 process_binary_arg=$4 process_oracle_arg=$5 process_oracle_sha_expected=$6
   local expected_executor=tokio-1.53.1
@@ -1331,12 +2159,12 @@ run_one() {
   process_binary=$(realpath "$process_binary_arg") || { failed=1; return 1; }
   [[ -x "$process_binary" ]] || { failed=1; return 1; }
   local process_binary_sha
-  process_binary_sha=$(sha256sum "$process_binary" | awk '{print $1}') || { failed=1; return 1; }
+  process_binary_sha=$(stable_sha256 "$process_binary") || { failed=1; return 1; }
   local process_oracle_file= process_oracle_digest=
   if [[ "$mode" == open_loop ]]; then
     process_oracle_file=$(realpath "$process_oracle_arg") || { failed=1; return 1; }
     [[ -f "$process_oracle_file" ]] || { failed=1; return 1; }
-    process_oracle_digest=$(sha256sum "$process_oracle_file" | awk '{print $1}') || { failed=1; return 1; }
+    process_oracle_digest=$(stable_sha256 "$process_oracle_file" 16777216) || { failed=1; return 1; }
     [[ "$process_oracle_digest" == "$process_oracle_sha_expected" ]] || { failed=1; return 1; }
     validate_oracle_file "$process_oracle_file" "$arrivals" "$rate" "$workload" "$profile" "$source_digest" "$process_binary_sha" || { failed=1; return 1; }
   fi
@@ -1344,6 +2172,7 @@ run_one() {
   local shutdown_report="$cell_dir/${pair}-${executor}.shutdown.tsv"
   local ids_report="$cell_dir/${pair}-${executor}.ids.tsv"
   local family_report="$cell_dir/${pair}-${executor}.capacity-families.tsv"
+  local process_tmpdir=not_applicable process_tmp_context_json=not_applicable process_tmp_context_after=not_applicable
   local timing="$cell_dir/${pair}-${executor}.time.txt" status validation p99_qualification=not_applicable ids_sha256=not_applicable
   local stdout_sha256=unavailable runtime_readback_path="$cell_dir/${pair}-${executor}.runtime.tsv" runtime_readback_sha256=unavailable
   local runtime_expectation_path="$cell_dir/${pair}-${executor}.expectation.json" runtime_expectation_sha256=unavailable
@@ -1370,35 +2199,53 @@ run_one() {
     validator_sha256=${runtime_binding_values[9]}
     [[ "$report_nonce" =~ ^[0-9a-f]{32}$ ]] || { failed=1; return 1; }
     python3 -B "$runtime_validator_arg" --build-expectation "$recipe_path" --output "$runtime_expectation_path" > "$cell_dir/${pair}-${executor}.expectation-build.json" || { failed=1; return 1; }
-    runtime_expectation_sha256=$(sha256sum "$runtime_expectation_path" | awk '{print $1}') || { failed=1; return 1; }
+    runtime_expectation_sha256=$(stable_sha256 "$runtime_expectation_path" 131072) || { failed=1; return 1; }
     [[ "$runtime_expectation_sha256" == "$planned_expectation_sha" ]] || { failed=1; return 1; }
   else
     echo "a scheduled runtime process recipe is required before a fixed-policy process can run" >&2
     failed=1
     return 1
   fi
+  if (( functional_source_v4_mode == 1 )); then
+    process_tmpdir="$functional_tmp_root_path/${pair}-${executor}"
+    [[ ! -e "$process_tmpdir" && ! -L "$process_tmpdir" ]] || { failed=1; return 1; }
+    mkdir -m 700 -- "$process_tmpdir" || { failed=1; return 1; }
+    process_tmp_context_json=$(verify_functional_tmpdir "$process_tmpdir" initial) || { failed=1; return 1; }
+  fi
   if [[ "$mode" == open_loop ]]; then args+=(--rate "$rate" --arrivals "$arrivals"); fi
-  local -a command=(taskset -c "$cpu_set" /usr/bin/time -v -o "$timing" timeout --foreground --signal=TERM --kill-after=3s "${process_deadline}s" env "ALLOCATBELT_APP_SHUTDOWN_REPORT=$shutdown_report" "ALLOCATBELT_APP_ID_REPORT=$ids_report" "ALLOCATBELT_APP_FAMILY_REPORT=$family_report" "ALLOCATBELT_APP_RUNTIME_REPORT=$runtime_readback_path" "ALLOCATBELT_APP_COMPARISON_FAMILY=fixed_policy" "ALLOCATBELT_APP_RESOURCE_CEILING_SHA256=$resource_ceiling_sha256" "ALLOCATBELT_APP_POLICY_SHA256=$policy_sha256" "ALLOCATBELT_APP_REPORT_NONCE=$report_nonce" "ALLOCATBELT_APP_RUN_ID=$run_id" "ALLOCATBELT_APP_EXECUTOR=$expected_executor" "ALLOCATBELT_APP_ALLOCATOR=$process_allocator" "ALLOCATBELT_APP_WORKLOAD=$workload" "ALLOCATBELT_APP_PROFILE=$profile" "ALLOCATBELT_APP_SOURCE_SHA256=$source_digest" "ALLOCATBELT_APP_BINARY_SHA256=$process_binary_sha" "ALLOCATBELT_APP_ORACLE_FILE=$process_oracle_file" "ALLOCATBELT_APP_ORACLE_SHA256=$process_oracle_digest" "$process_binary" "${args[@]}")
+  local -a process_tmp_env=()
+  if (( functional_source_v4_mode == 1 )); then process_tmp_env+=("TMPDIR=$process_tmpdir"); fi
+  local -a command=(taskset -c "$cpu_set" /usr/bin/time -v -o "$timing" timeout --foreground --signal=TERM --kill-after=3s "${process_deadline}s" env "${process_tmp_env[@]}" "ALLOCATBELT_APP_SHUTDOWN_REPORT=$shutdown_report" "ALLOCATBELT_APP_ID_REPORT=$ids_report" "ALLOCATBELT_APP_FAMILY_REPORT=$family_report" "ALLOCATBELT_APP_RUNTIME_REPORT=$runtime_readback_path" "ALLOCATBELT_APP_COMPARISON_FAMILY=fixed_policy" "ALLOCATBELT_APP_RESOURCE_CEILING_SHA256=$resource_ceiling_sha256" "ALLOCATBELT_APP_POLICY_SHA256=$policy_sha256" "ALLOCATBELT_APP_REPORT_NONCE=$report_nonce" "ALLOCATBELT_APP_RUN_ID=$run_id" "ALLOCATBELT_APP_EXECUTOR=$expected_executor" "ALLOCATBELT_APP_ALLOCATOR=$process_allocator" "ALLOCATBELT_APP_WORKLOAD=$workload" "ALLOCATBELT_APP_PROFILE=$profile" "ALLOCATBELT_APP_SOURCE_SHA256=$source_digest" "ALLOCATBELT_APP_BINARY_SHA256=$process_binary_sha" "ALLOCATBELT_APP_ORACLE_FILE=$process_oracle_file" "ALLOCATBELT_APP_ORACLE_SHA256=$process_oracle_digest" "$process_binary" "${args[@]}")
   local argv
   argv=$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1:], separators=(",", ":")))' "${command[@]}") || { failed=1; return 1; }
   set +e
-  "${command[@]}" > "$stdout" 2> "$cell_dir/${pair}-${executor}.stderr.txt"
+  if (( functional_only_mode == 1 )); then
+    (
+      [[ "$(ulimit -Sf)" == "$functional_file_size_limit_blocks" && "$(ulimit -Hf)" == "$functional_file_size_limit_blocks" ]] || exit 125
+      exec "${command[@]}"
+    ) > "$stdout" 2> "$cell_dir/${pair}-${executor}.stderr.txt"
+  else
+    "${command[@]}" > "$stdout" 2> "$cell_dir/${pair}-${executor}.stderr.txt"
+  fi
   status=$?
   set -e
+  if (( functional_source_v4_mode == 1 )); then
+    process_tmp_context_after=$(verify_functional_tmpdir "$process_tmpdir" after) || { failed=1; process_tmp_context_after=invalid; }
+  fi
   validation=invalid
   local runtime_validation_status=1
   if [[ -f "$runtime_readback_path" && -f "$runtime_expectation_path" ]]; then
     if python3 -B "$runtime_validator_arg" --receipt "$runtime_readback_path" --expected "$runtime_expectation_path" > "$runtime_validation_path" 2> "$cell_dir/${pair}-${executor}.readback-validation.stderr.txt"; then
       runtime_validation_status=0
-      runtime_validation_sha256=$(sha256sum "$runtime_validation_path" | awk '{print $1}') || { runtime_validation_status=1; failed=1; }
+      runtime_validation_sha256=$(stable_sha256 "$runtime_validation_path" 131072) || { runtime_validation_status=1; failed=1; }
     else
       failed=1
-      [[ -f "$runtime_validation_path" ]] && runtime_validation_sha256=$(sha256sum "$runtime_validation_path" | awk '{print $1}') || runtime_validation_sha256=unavailable
+      [[ -f "$runtime_validation_path" ]] && runtime_validation_sha256=$(stable_sha256 "$runtime_validation_path" 131072) || runtime_validation_sha256=unavailable
     fi
   fi
-  [[ -f "$stdout" ]] && stdout_sha256=$(sha256sum "$stdout" | awk '{print $1}') || stdout_sha256=unavailable
-  [[ -f "$runtime_readback_path" ]] && runtime_readback_sha256=$(sha256sum "$runtime_readback_path" | awk '{print $1}') || runtime_readback_sha256=unavailable
-  [[ -f "$runtime_expectation_path" ]] && runtime_expectation_sha256=$(sha256sum "$runtime_expectation_path" | awk '{print $1}') || runtime_expectation_sha256=unavailable
+  [[ -f "$stdout" ]] && stdout_sha256=$(stable_sha256 "$stdout" 16777216) || stdout_sha256=unavailable
+  [[ -f "$runtime_readback_path" ]] && runtime_readback_sha256=$(stable_sha256 "$runtime_readback_path" 131072) || runtime_readback_sha256=unavailable
+  [[ -f "$runtime_expectation_path" ]] && runtime_expectation_sha256=$(stable_sha256 "$runtime_expectation_path" 131072) || runtime_expectation_sha256=unavailable
   if [[ $status -eq 0 && $runtime_validation_status -eq 0 && ! -s "$cell_dir/${pair}-${executor}.stderr.txt" ]] && \
     validate_output "$stdout" "$expected_executor" "$process_allocator" && \
     validate_shutdown_report "$shutdown_report" "$expected_executor" "$phase_trace_deadline" "$shutdown_deadline" "$process_deadline" "$stdout" "$report_nonce" "$run_id" "$process_allocator" "$profile" "$source_digest" "$process_binary_sha" && \
@@ -1406,7 +2253,7 @@ run_one() {
     { [[ "$mode" != open_loop ]] || validate_id_report "$ids_report" "$arrivals" "$process_deadline" "$trace_deadline" "$rate" "$workload" "$profile" "$stdout" "$process_oracle_file" "$process_oracle_digest" "$run_id" "$report_nonce" "$expected_executor" "$process_allocator" "$source_digest" "$process_binary_sha"; }; then
     validation=valid
     if [[ "$mode" == open_loop ]]; then
-      ids_sha256=$(sha256sum "$ids_report" | awk '{print $1}')
+      ids_sha256=$(stable_sha256 "$ids_report" 16777216)
       [[ "$ids_sha256" =~ ^[0-9a-f]{64}$ ]] || { failed=1; validation=invalid; ids_sha256=invalid; }
       if [[ "$profile" == safety_overload ]]; then
         p99_qualification=safety_only
@@ -1439,11 +2286,11 @@ run_one() {
   fi
   local shutdown_sha256=not_applicable
   if [[ -f "$shutdown_report" ]]; then
-    shutdown_sha256=$(sha256sum "$shutdown_report" | awk '{print $1}') || { failed=1; validation=invalid; shutdown_sha256=invalid; }
+    shutdown_sha256=$(stable_sha256 "$shutdown_report" 131072) || { failed=1; validation=invalid; shutdown_sha256=invalid; }
   fi
   local family_sha256=not_applicable
   if [[ -f "$family_report" ]]; then
-    family_sha256=$(sha256sum "$family_report" | awk '{print $1}') || { failed=1; validation=invalid; family_sha256=invalid; }
+    family_sha256=$(stable_sha256 "$family_report" 131072) || { failed=1; validation=invalid; family_sha256=invalid; }
   fi
   printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
     "$pair" "$executor" "$process_allocator" "$status" "$validation" "$p99_qualification" "$argv" "$(basename "$stdout")" "$(basename "$timing")" "$ids_sha256" "$shutdown_sha256" "$family_sha256" \
@@ -1456,10 +2303,15 @@ run_one() {
   printf 'resource_ceiling_sha256_%s_%s\t%s\n' "$pair" "$executor" "$resource_ceiling_sha256" >> "$cell_dir/metadata.tsv"
   printf 'fixed_global_control_baseline_%s_%s\t%s\n' "$pair" "$executor" "$fixed_global_control_baseline" >> "$cell_dir/metadata.tsv"
   printf 'execution_scope_%s_%s\t%s\n' "$pair" "$executor" "$execution_scope" >> "$cell_dir/metadata.tsv"
+  if (( functional_source_v4_mode == 1 )); then
+    printf 'functional_tmpdir_%s_%s\t%s\n' "$pair" "$executor" "$process_tmpdir" >> "$cell_dir/metadata.tsv"
+    printf 'functional_tmpdir_context_before_%s_%s\t%s\n' "$pair" "$executor" "$process_tmp_context_json" >> "$cell_dir/metadata.tsv"
+    printf 'functional_tmpdir_context_after_%s_%s\t%s\n' "$pair" "$executor" "$process_tmp_context_after" >> "$cell_dir/metadata.tsv"
+  fi
   printf 'oracle_sha256_%s_%s\t%s\n' "$pair" "$executor" "$process_oracle_digest" >> "$cell_dir/metadata.tsv"
   printf 'shutdown_report_%s_%s\t%s\n' "$pair" "$executor" "$(basename "$shutdown_report")" >> "$cell_dir/metadata.tsv"
   if [[ -f "$ids_report" ]]; then
-    printf 'ids_sha256_%s_%s\t%s\n' "$pair" "$executor" "$(sha256sum "$ids_report" | awk '{print $1}')" >> "$cell_dir/metadata.tsv"
+    printf 'ids_sha256_%s_%s\t%s\n' "$pair" "$executor" "$(stable_sha256 "$ids_report" 16777216)" >> "$cell_dir/metadata.tsv"
   fi
 }
 
@@ -1494,18 +2346,16 @@ case "$pair_kind" in
     ;;
 esac
 
-source_digest_after=$(source_hash) || { failed=1; source_digest_after=unavailable; }
-source_inventory_module_sha256_after=$(sha256sum "$source_inventory_module_path" | awk '{print $1}') || {
-  failed=1
-  source_inventory_module_sha256_after=unavailable
-}
-[[ "$source_inventory_module_sha256_after" == "$source_inventory_module_sha256_before" && "$source_inventory_module_sha256_after" == "$source_inventory_module_sha256_expected" ]] || failed=1
-binary_digest_after=$(sha256sum "$binary" | awk '{print $1}') || {
+source_identity_after=$(source_hash) || { failed=1; source_identity_after=$'unavailable\tunavailable'; }
+IFS=$'\t' read -r source_digest_after head_commit_after <<< "$source_identity_after"
+[[ "$head_commit_after" == "$head_commit" ]] || failed=1
+source_inventory_module_sha256_after=$source_inventory_module_sha256_expected
+binary_digest_after=$(stable_sha256 "$binary") || {
   failed=1
   binary_digest_after=unavailable
 }
 if [[ "$pair_kind" == allocator-match || "$pair_kind" == pressure-allocator-match ]]; then
-  baseline_binary_digest_after=$(sha256sum "$baseline_binary" | awk '{print $1}') || {
+  baseline_binary_digest_after=$(stable_sha256 "$baseline_binary") || {
     failed=1
     baseline_binary_digest_after=unavailable
   }
@@ -1514,12 +2364,12 @@ else
   baseline_binary_digest_after=
 fi
 if [[ "$mode" == open_loop ]]; then
-  oracle_digest_after=$(sha256sum "$oracle_file" | awk '{print $1}') || {
+  oracle_digest_after=$(stable_sha256 "$oracle_file" 16777216) || {
     failed=1
     oracle_digest_after=unavailable
   }
   if [[ "$pair_kind" == allocator-match || "$pair_kind" == pressure-allocator-match ]]; then
-    baseline_oracle_digest_after=$(sha256sum "$baseline_oracle_file" | awk '{print $1}') || {
+    baseline_oracle_digest_after=$(stable_sha256 "$baseline_oracle_file" 16777216) || {
       failed=1
       baseline_oracle_digest_after=unavailable
     }
@@ -1533,15 +2383,28 @@ else
 fi
 runtime_bindings_sha_after=
 runtime_validator_sha_after=
-pair_runner_sha256_after=$(sha256sum "$pair_runner_path" | awk '{print $1}') || { failed=1; pair_runner_sha256_after=unavailable; }
+pair_runner_sha256_after=$(stable_sha256 "$pair_runner_path" 16777216) || { failed=1; pair_runner_sha256_after=unavailable; }
 [[ "$pair_runner_sha256_after" == "$pair_runner_sha256_before" ]] || failed=1
 if (( functional_only_mode == 1 )); then
-  functional_overlay_sha256_after=$(sha256sum "$functional_overlay_file" | awk '{print $1}') || { failed=1; functional_overlay_sha256_after=unavailable; }
+  functional_overlay_sha256_after=$(stable_sha256 "$functional_overlay_file" 65536) || { failed=1; functional_overlay_sha256_after=unavailable; }
   [[ "$functional_overlay_sha256_after" == "$functional_overlay_sha_expected" && "$functional_overlay_sha256_after" == "$functional_overlay_sha256_before" ]] || failed=1
+  if (( functional_source_v4_mode == 1 )); then
+    functional_source_manifest_file_sha256_after=$(stable_sha256 "$functional_source_manifest_file_path" 16777216) || {
+      failed=1
+      functional_source_manifest_file_sha256_after=unavailable
+    }
+    [[ "$functional_source_manifest_file_sha256_after" == "$functional_source_manifest_file_sha256_before" ]] || failed=1
+    verify_functional_overlay || failed=1
+    functional_source_manifest_file_sha256_after=$(stable_sha256 "$functional_source_manifest_file_path" 16777216) || {
+      failed=1
+      functional_source_manifest_file_sha256_after=unavailable
+    }
+    [[ "$functional_source_manifest_file_sha256_after" == "$functional_source_manifest_file_sha256_before" ]] || failed=1
+  fi
 fi
 if (( runtime_readback_enabled == 1 )); then
-  runtime_bindings_sha_after=$(sha256sum "$runtime_bindings_arg" | awk '{print $1}') || { failed=1; runtime_bindings_sha_after=unavailable; }
-  runtime_validator_sha_after=$(sha256sum "$runtime_validator_arg" | awk '{print $1}') || { failed=1; runtime_validator_sha_after=unavailable; }
+  runtime_bindings_sha_after=$(stable_sha256 "$runtime_bindings_arg" 131072) || { failed=1; runtime_bindings_sha_after=unavailable; }
+  runtime_validator_sha_after=$(stable_sha256 "$runtime_validator_arg" 16777216) || { failed=1; runtime_validator_sha_after=unavailable; }
   [[ "$runtime_bindings_sha_after" == "$runtime_bindings_sha_expected" && "$runtime_validator_sha_after" == "$runtime_validator_sha_expected" ]] || failed=1
   verify_runtime_inputs || failed=1
 fi
@@ -1565,8 +2428,16 @@ fi
   printf 'pair_runner_sha256_after\t%s\n' "$pair_runner_sha256_after"
   printf 'functional_overlay_sha256_before\t%s\n' "$functional_overlay_sha256_before"
   printf 'functional_overlay_sha256_after\t%s\n' "$functional_overlay_sha256_after"
+  if (( functional_source_v4_mode == 1 )); then
+    printf 'source_manifest_schema\tallocatbelt.application-source-manifest.v4\n'
+    printf 'source_manifest_file_sha256_before\t%s\n' "$functional_source_manifest_file_sha256_before"
+    printf 'source_manifest_file_sha256_after\t%s\n' "$functional_source_manifest_file_sha256_after"
+    printf 'source_manifest_sha256\t%s\n' "$functional_source_manifest_semantic_sha256"
+    printf 'functional_tmpdir_root\t%s\n' "$functional_tmp_root_path"
+    printf 'functional_tmpdir_root_context\t%s\n' "$functional_tmp_context_json"
+  fi
 } >> "$cell_dir/metadata.tsv"
-[[ $(awk -F '\t' '$1=="source_tree_sha256_before"{b=$2} $1=="source_tree_sha256_after"{a=$2} END{print (b==a)?"same":"changed"}' "$cell_dir/metadata.tsv") == same ]] || failed=1
+[[ "$source_digest_after" == "$source_digest" ]] || failed=1
 [[ "$source_inventory_module_sha256_before" == "$source_inventory_module_sha256_after" ]] || failed=1
 [[ "$binary_digest" == "$binary_digest_after" ]] || failed=1
 if [[ "$mode" == open_loop ]]; then

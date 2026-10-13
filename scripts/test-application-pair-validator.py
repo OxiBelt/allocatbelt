@@ -58,6 +58,9 @@ class ApplicationPairValidatorTests(unittest.TestCase):
         self.oracle = self.directory / "oracle.tsv"
         self.ids = self.directory / "result.ids.tsv"
         self.output = self.directory / "result.tsv"
+        self.non_executable_binary = self.directory / "non-executable-binary"
+        self.non_executable_binary.write_bytes(b"not an executable")
+        self.non_executable_binary.chmod(0o600)
         self.nonce = "a" * 32
         self.run_id = "validator-1"
         self.source_hash = "b" * 64
@@ -105,7 +108,8 @@ class ApplicationPairValidatorTests(unittest.TestCase):
             'python3 - "$source_inventory_module_path" "$source_inventory_module_sha256_expected" "$repo_root" <<\'PY\'',
             runner,
         )
-        self.assertIn('module.main(["digest", "--root", root])', runner)
+        self.assertIn("module.source_tree_digest(root)", runner)
+        self.assertIn('module._checked_capture(["git", "rev-parse", "HEAD"]', runner)
         self.assertLess(
             runner.index('hashlib.sha256(raw).hexdigest() != expected_sha256'),
             runner.index('exec(compile(raw, path, "exec", dont_inherit=True), module.__dict__)'),
@@ -178,18 +182,18 @@ class ApplicationPairValidatorTests(unittest.TestCase):
             ],
         )
 
-    def test_functional_only_entry_is_explicit_open_loop_and_finitely_bounded(self) -> None:
+    def test_functional_only_entry_supports_bounded_open_loop_and_exact_capacity_horizon(self) -> None:
         source = RUNNER.read_text(encoding="utf-8")
         self.assertIn("qualification_runtime_readback_supported=0", source)
         self.assertIn("external_pressure_driver_supported=0", source)
         self.assertIn("execution_scope=qualification", source)
         self.assertIn("p99_qualification=functional_only", source)
 
-        def invoke(*, mode: str, rate: str, arrivals: str, trace: str = "10") -> subprocess.CompletedProcess[str]:
+        def invoke(*, mode: str, rate: str, arrivals: str, trace: str = "10", oracle: bool = True) -> subprocess.CompletedProcess[str]:
             args = [
-                str(RUNNER), "--functional-only", "/missing/benchmark", "allocatbelt", "cpu", mode,
+                str(RUNNER), "--functional-only", str(self.non_executable_binary), "allocatbelt", "cpu", mode,
                 rate, "0", "functional-1", str(self.directory), arrivals, trace, "10", "5", "240",
-                str(self.oracle), self.oracle_digest, "steady", "matched", "", "", "", "",
+                str(self.oracle) if oracle else "", self.oracle_digest if oracle else "", "steady", "matched", "", "", "", "",
                 "--runtime-bindings", str(self.directory / "bindings.json"),
                 "--runtime-bindings-sha256", "a" * 64,
                 "--runtime-validator", str(RUNNER.parent / "application-runtime-readback.py"),
@@ -200,9 +204,12 @@ class ApplicationPairValidatorTests(unittest.TestCase):
             ]
             return subprocess.run(args, check=False, capture_output=True, text=True)
 
-        capacity = invoke(mode="capacity", rate="-", arrivals="5000")
+        capacity = invoke(mode="capacity", rate="-", arrivals="5000", trace="30", oracle=False)
         self.assertEqual(capacity.returncode, 2)
-        self.assertIn("functional-only mode supports open_loop only", capacity.stderr)
+        self.assertIn("binary is not executable", capacity.stderr)
+        shortened_capacity = invoke(mode="capacity", rate="-", arrivals="5000", trace="29", oracle=False)
+        self.assertEqual(shortened_capacity.returncode, 2)
+        self.assertIn("capacity preserves the exact 30-second horizon", shortened_capacity.stderr)
         too_many = invoke(mode="open_loop", rate="100", arrivals="1001", trace="30")
         self.assertEqual(too_many.returncode, 2)
         self.assertIn("arrivals must be in 1..=1000", too_many.stderr)
@@ -212,6 +219,49 @@ class ApplicationPairValidatorTests(unittest.TestCase):
         too_long = invoke(mode="open_loop", rate="1", arrivals="1", trace="31")
         self.assertEqual(too_long.returncode, 2)
         self.assertIn("deadlines exceed their fixed finite limits", too_long.stderr)
+
+    def test_source_v4_functional_path_is_separate_and_finitely_stored(self) -> None:
+        helper = FUNCTIONAL_HELPER.read_text(encoding="utf-8")
+        runner = RUNNER.read_text(encoding="utf-8")
+        self.assertIn('SIGNED_SOURCE_COMMIT = "9290a2b194a667aba8816020214230d111ab80a3"', helper)
+        self.assertIn('SOURCE_MANIFEST_SCHEMA_V4 = "allocatbelt.application-source-manifest.v4"', helper)
+        self.assertIn('parser.add_argument("--signer-fingerprint")', helper)
+        self.assertIn('"signer_fingerprint": args.signer_fingerprint', helper)
+        self.assertIn(
+            '_CAMPAIGN.verify_source_manifest(authorized["manifest"], source_root, verify_artifacts=True)',
+            helper,
+        )
+        self.assertIn('"capacity_horizon_seconds": 30', helper)
+        self.assertIn('"max_file_bytes": 16 * 1024 * 1024', helper)
+        self.assertIn('"max_output_bytes": 256 * 1024 * 1024', helper)
+        self.assertIn('["filesystem_type"] not in ("tmpfs", "ramfs")', helper)
+        self.assertIn('def authorize_source_v4_manifest(', helper)
+        self.assertIn('verify_source_tree_before_controller_exec(source_root, source, commit)', helper)
+        self.assertIn('"verify-commit", "--raw", commit', helper)
+        self.assertIn('"[GNUPG:]", "VALIDSIG"', helper)
+        self.assertIn('def run_capture_bounded(', helper)
+        self.assertIn('watch_root=output_root', helper)
+        self.assertIn('"ls-tree", "-z", source_head, "--", "scripts/application-campaign.py"', runner)
+        self.assertIn('"cat-file", "blob", f"{source_head}:scripts/application-campaign.py"', runner)
+        self.assertIn('campaign controller tracked mode differs from the verified signed commit', runner)
+        self.assertIn('captured campaign controller differs from the blob at the verified signed commit', runner)
+        self.assertIn('and (child.poll() is None or len(eof) != 2)', runner)
+        self.assertIn('GIT_CONFIG_COUNT', runner)
+        self.assertIn('verify_functional_v4_overlay()', runner)
+        self.assertIn('functional_source_manifest_file_sha256_after', runner)
+        self.assertIn('functional_file_size_limit_blocks=16384', runner)
+        self.assertIn('ulimit -Hf "$functional_file_size_limit_blocks"', runner)
+        self.assertIn('ulimit -Sf "$functional_file_size_limit_blocks"', runner)
+        self.assertLess(
+            runner.index('ulimit -Sf "$functional_file_size_limit_blocks"'),
+            runner.index('ulimit -Hf "$functional_file_size_limit_blocks"'),
+        )
+        self.assertIn('max_output_directories', runner)
+        self.assertIn('max_output_entries', runner)
+        self.assertIn('minimum_free_bytes', runner)
+        self.assertIn('O_NONBLOCK', runner)
+        self.assertIn('stable_sha256', runner)
+        self.assertIn('functional_source_v4_mode=0', runner)
 
     def test_gnu_timeout_foreground_keeps_term_ignoring_binary_in_controller_group(self) -> None:
         with tempfile.TemporaryDirectory(prefix="application-timeout-group-") as temporary:
@@ -577,13 +627,13 @@ class ApplicationPairValidatorTests(unittest.TestCase):
         )
         program = embedded_validator("validate_shutdown_report")
         accepted = subprocess.run(
-            [sys.executable, "-c", program, str(report), "allocatbelt", "cpu", "31", "60", "1200", str(self.output), self.nonce, self.run_id, "system", "steady", self.source_hash, self.binary_hash],
+            [sys.executable, "-c", program, str(report), "allocatbelt", "cpu", "capacity", "31", "60", "1200", str(self.output), self.nonce, self.run_id, "system", "steady", self.source_hash, self.binary_hash],
             check=False,
             capture_output=True,
             text=True,
         )
         rejected_override = subprocess.run(
-            [sys.executable, "-c", program, str(report), "allocatbelt", "cpu", "10", "60", "1200", str(self.output), self.nonce, self.run_id, "system", "steady", self.source_hash, self.binary_hash],
+            [sys.executable, "-c", program, str(report), "allocatbelt", "cpu", "capacity", "10", "60", "1200", str(self.output), self.nonce, self.run_id, "system", "steady", self.source_hash, self.binary_hash],
             check=False,
             capture_output=True,
             text=True,
@@ -592,7 +642,7 @@ class ApplicationPairValidatorTests(unittest.TestCase):
         self.assertNotEqual(rejected_override.returncode, 0)
         report.write_text(report.read_text(encoding="utf-8").replace("identity\trun_id\tvalidator-1", "identity\trun_id\tvalidator-replay"), encoding="utf-8")
         replayed = subprocess.run(
-            [sys.executable, "-c", program, str(report), "allocatbelt", "cpu", "31", "60", "1200", str(self.output), self.nonce, self.run_id, "system", "steady", self.source_hash, self.binary_hash],
+            [sys.executable, "-c", program, str(report), "allocatbelt", "cpu", "capacity", "31", "60", "1200", str(self.output), self.nonce, self.run_id, "system", "steady", self.source_hash, self.binary_hash],
             check=False,
             capture_output=True,
             text=True,
@@ -604,7 +654,7 @@ class ApplicationPairValidatorTests(unittest.TestCase):
             encoding="utf-8",
         )
         beyond_allowance = subprocess.run(
-            [sys.executable, "-c", program, str(report), "allocatbelt", "cpu", "31", "60", "1200", str(self.output), self.nonce, self.run_id, "system", "steady", self.source_hash, self.binary_hash],
+            [sys.executable, "-c", program, str(report), "allocatbelt", "cpu", "capacity", "31", "60", "1200", str(self.output), self.nonce, self.run_id, "system", "steady", self.source_hash, self.binary_hash],
             check=False,
             capture_output=True,
             text=True,
@@ -612,12 +662,24 @@ class ApplicationPairValidatorTests(unittest.TestCase):
         self.assertNotEqual(beyond_allowance.returncode, 0)
         report.write_text(report.read_text(encoding="utf-8").replace("production_cpu_ended_ns\t300", "production_cpu_ended_ns\t299"), encoding="utf-8")
         invalid_cpu_boundary = subprocess.run(
-            [sys.executable, "-c", program, str(report), "allocatbelt", "cpu", "31", "60", "1200", str(self.output), self.nonce, self.run_id, "system", "steady", self.source_hash, self.binary_hash],
+            [sys.executable, "-c", program, str(report), "allocatbelt", "cpu", "capacity", "31", "60", "1200", str(self.output), self.nonce, self.run_id, "system", "steady", self.source_hash, self.binary_hash],
             check=False,
             capture_output=True,
             text=True,
         )
         self.assertNotEqual(invalid_cpu_boundary.returncode, 0)
+        report.write_text(
+            report.read_text(encoding="utf-8").replace("31000000001", "29999999999")
+            .replace("production_cpu_ended_ns\t299", "production_cpu_ended_ns\t300"),
+            encoding="utf-8",
+        )
+        short_capacity = subprocess.run(
+            [sys.executable, "-c", program, str(report), "allocatbelt", "cpu", "capacity", "31", "60", "1200", str(self.output), self.nonce, self.run_id, "system", "steady", self.source_hash, self.binary_hash],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertNotEqual(short_capacity.returncode, 0)
 
     def test_mixed_capacity_family_counts_are_identity_bound_and_complete(self) -> None:
         report = self.directory / "capacity-families.tsv"
@@ -655,6 +717,9 @@ class ApplicationPairValidatorTests(unittest.TestCase):
         report.write_text(report.read_text(encoding="utf-8").replace("family\tdisk\t2\t2", "family\tdisk\t2\t1"), encoding="utf-8")
         rejected = subprocess.run([sys.executable, "-c", program, *args], check=False, capture_output=True, text=True)
         self.assertNotEqual(rejected.returncode, 0)
+        report.write_text(original.replace("family\tdisk\t2\t2", "family\tdisk\t2\t0"), encoding="utf-8")
+        empty_family = subprocess.run([sys.executable, "-c", program, *args], check=False, capture_output=True, text=True)
+        self.assertNotEqual(empty_family.returncode, 0)
 
 
 class FunctionalHelperSafetyTests(unittest.TestCase):
