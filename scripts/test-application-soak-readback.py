@@ -11,6 +11,7 @@ import json
 import os
 from pathlib import Path
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -47,6 +48,22 @@ pressure_reader = importlib.util.module_from_spec(pressure_spec)
 pressure_loader.exec_module(pressure_reader)
 
 
+class FakeOwnedProcessGroup(module._OwnedProcessGroup):
+    """Valid owner fixture for tests that replace the process launcher."""
+
+    def __init__(self, process):
+        self.process = process
+
+    def observe(self):
+        return None
+
+
+def fake_owned_app_process(pid: int):
+    process = SimpleNamespace(pid=pid)
+    process._allocatbelt_owned_group = FakeOwnedProcessGroup(process)
+    return process
+
+
 def canon(value):
     return module.canonical_bytes(value)
 
@@ -67,6 +84,273 @@ def write_private(path: Path, data: bytes, mode: int = 0o600) -> None:
 
 def hash_file(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def source_v5_pressure_fixture(
+    root: Path, output: Path, binary: Path, driver: Path, cpu_set: str,
+    timeout_seconds: int, run_id: str,
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+    """Build a closed SourceV5 parent/pressure audit for the shared supervisor."""
+    if type(timeout_seconds) is not int:
+        raise AssertionError("SourceV5 fixture timeout must match its frozen unsigned integer field")
+    cpu_ids = sorted(module._parse_cpu_set(cpu_set))
+    root = root.resolve(strict=True)
+    output = output.resolve(strict=True)
+    tmpdir = root / "application-tmp"
+    tmpdir.mkdir(mode=0o700)
+    app_sha = hash_file(binary)
+    driver_sha = hash_file(driver)
+    nonce = hashlib.sha256(run_id.encode("utf-8")).hexdigest()[:32]
+    condition_id = "condition-v2-fixture"
+
+    def pinned_file(name: str, content: bytes) -> dict[str, Any]:
+        path = root / name
+        write_private(path, content)
+        return {"path": str(path), "raw_sha256": hash_file(path)}
+
+    manifest = pinned_file("source-manifest.json", b"SourceV5 fixture manifest\n")
+    policy = pinned_file("pressure-policy.json", b"shared numeric policy fixture\n")
+    capacity = pinned_file("capacity-calibration.json", b"capacity fixture\n")
+    calibration = pinned_file("pressure-calibration.json", b"pressure calibration fixture\n")
+    backing_chain = [{
+        "device": "259:2", "name": "nvme0n1p2", "sysfs_path": "/sys/devices/example",
+    }]
+    mount = {
+        "mount_id": 1, "parent_mount_id": 1, "device": "259:2", "root": "/",
+        "mountpoint": str(root), "mount_options": ["rw"], "filesystem": "ext4",
+        "source": "/dev/nvme0n1p2", "super_options": ["rw"],
+    }
+
+    def storage_record(path: Path) -> dict[str, Any]:
+        return {
+            "path": str(path), "device": "259:2", "mount": mount,
+            "backing_chain": backing_chain, "filesystem_type": "ext4", "tmpfs": False,
+        }
+
+    network = {
+        "address_family": "AF_INET", "destination": "127.0.0.1", "source": "127.0.0.1",
+        "interface": "lo", "ifindex": 1,
+        "route": {"dst": "127.0.0.1", "dev": "lo", "source": "127.0.0.1"},
+        "network_namespace_inode": 1, "shared_kernel": True,
+        "physical_nic_claimed": False, "claim": "ipv4_loopback_shared_kernel_only",
+    }
+    schedule = {
+        "seed": 7, "duration_seconds": 2, "sample_interval_ms": 100,
+        "startup_deadline_seconds": 1, "total_deadline_seconds": 5,
+        "term_deadline_seconds": 1, "kill_deadline_seconds": 1,
+        "minimum_overlap_seconds": 1, "startup_ready_windows": 1,
+        "cpu_duty_basis_points": 1000, "pressure_cpu_affinity": cpu_ids,
+        "application_cpu_affinity": cpu_ids, "disk_bytes_per_second": 40960,
+        "scratch_file_bytes": 65536, "network_requests_per_second": 10,
+        "network_payload_bytes": 16,
+    }
+    thresholds = {
+        "cpu_busy_min_basis_points": 1,
+        "disk_write_min_bytes_per_second": 1,
+        "disk_queue_or_stall_min_microseconds": 1,
+        "loopback_requests_min_per_second": 1,
+        "loopback_latency_p99_max_nanoseconds": 1_000_000_000,
+        "loopback_tx_min_bytes_per_second": 1,
+        "loopback_rx_min_bytes_per_second": 1,
+    }
+    host = {
+        "kernel_release": os.uname().release,
+        "boot_id_sha256": hashlib.sha256(Path("/proc/sys/kernel/random/boot_id").read_bytes().strip()).hexdigest(),
+        "allowed_cpu_affinity": cpu_ids, "pressure_cpu_affinity": cpu_ids,
+        "application_cpu_affinity": cpu_ids,
+        "network": network,
+        "application_storage": [storage_record(root), storage_record(tmpdir)],
+        "pressure_scratch": storage_record(root / "pressure-scratch"),
+    }
+    (root / "pressure-scratch").mkdir(mode=0o700)
+    storage = {
+        "application_io_paths": [str(root), str(tmpdir)],
+        "pressure_scratch_path": str(root / "pressure-scratch"),
+        "output_minimum_free_bytes": 1,
+        "application_device": "259:2", "application_mount_id": 1,
+        "backing_chain": backing_chain, "non_tmpfs": True,
+    }
+    files = {
+        "source_manifest": manifest,
+        "application_binary": {
+            "path": str(binary), "raw_sha256": app_sha,
+            "mode": stat.S_IMODE(binary.stat().st_mode), "size": binary.stat().st_size,
+        },
+        "policy": policy,
+        "application_capacity_calibration": capacity,
+    }
+    body: dict[str, Any] = {
+        "schema": pressure_reader.RECIPE_SCHEMA,
+        "identity": {
+            "host_id": "host-v2-fixture", "run_id": run_id, "pair_id": run_id,
+            "condition_id": condition_id, "member": "bounded", "nonce": nonce,
+            "allocator": "allocatbelt", "executor": "allocatbelt", "phase": "external_pressure",
+        },
+        "files": files,
+        "process": {"executable_path": str(binary), "application_tmpdir_path": str(tmpdir)},
+        "host": host,
+        "storage": storage,
+        "network": network,
+        "schedule": schedule,
+        "artifact_budget": pressure_reader._artifact_budget(schedule, backing_chain),
+        "pressure_calibration": calibration,
+        "readiness_thresholds": thresholds,
+        "script_hashes": {
+            "driver_sha256": driver_sha,
+            "reader_sha256": hash_file(Path(__file__).with_name("application-pressure-readback.py")),
+        },
+    }
+    condition_material = {
+        "host_id": body["identity"]["host_id"],
+        "condition_id": condition_id,
+        "source_manifest_sha256": manifest["raw_sha256"],
+        "policy_sha256": policy["raw_sha256"],
+        "application_capacity_calibration_sha256": capacity["raw_sha256"],
+        "host": {
+            key: host[key] for key in (
+                "kernel_release", "boot_id_sha256", "allowed_cpu_affinity",
+                "pressure_cpu_affinity", "application_cpu_affinity",
+            )
+        },
+        "storage": {
+            "device": storage["application_device"],
+            "mount_id": storage["application_mount_id"],
+            "backing_chain": backing_chain,
+        },
+        "network": network, "schedule": schedule,
+        "pressure_calibration_sha256": calibration["raw_sha256"],
+        "readiness_thresholds": thresholds,
+    }
+    body["condition_sha256"] = pressure_reader.digest_object(condition_material)
+    semantic_sha = pressure_reader.digest_object(body)
+    pressure_recipe = {**body, "recipe_sha256": semantic_sha}
+    pressure_reader._validate_recipe(pressure_recipe, semantic_sha)
+    recipe_path = root / "pressure-recipe.json"
+    recipe_raw = canon(pressure_recipe)
+    write_private(recipe_path, recipe_raw)
+    raw_sha = digest_bytes(recipe_raw)
+    pressure_info = {
+        "value": pressure_recipe, "reader": pressure_reader,
+        "recipe_sha256": semantic_sha, "raw_sha256": raw_sha,
+        "condition_sha256": pressure_recipe["condition_sha256"],
+        "recipe_path": str(recipe_path),
+        "driver_path": str(driver), "driver_sha256": driver_sha,
+        "output_dir": str(output / "pressure"),
+        "launch_record_path": str(output / "pressure" / "launch-record.json"),
+        "ready_path": str(output / "pressure" / "pressure-ready.json"),
+        "source_root": str(root), "readiness_thresholds": thresholds,
+        "driver_readiness_thresholds": thresholds,
+    }
+    parent_recipe = {
+        "schema": module.RECIPE_SCHEMA_V2,
+        "pressure": {
+            "recipe": {
+                "path": str(recipe_path), "raw_sha256": raw_sha,
+                "semantic_sha256": semantic_sha,
+            },
+            "driver": {"path": driver.relative_to(root).as_posix(), "sha256": driver_sha},
+        },
+        "qualification": {"pressure_condition": {"readiness_thresholds": thresholds}},
+    }
+    parent_recipe_path = root / "soak-v2-parent-recipe.json"
+    parent_raw = canon(parent_recipe)
+    write_private(parent_recipe_path, parent_raw)
+    reference_ring = root / "reference-ring.tsv"
+    write_private(reference_ring, b"fixture reference ring\n")
+    runner_path = root / "run-application-soak.sh"
+    write_private(runner_path, b"#!/bin/sh\nexit 0\n", 0o700)
+    identity = {
+        "campaign_id": "campaign-v2-fixture", "host_id": "host-v2-fixture",
+        "run_id": run_id, "nonce": nonce, "allocator": "allocatbelt",
+        "executor": "bounded", "profile": "mixed", "source_sha256": "1" * 64,
+        "binary_sha256": app_sha, "resource_ceiling_sha256": "2" * 64,
+    }
+    audit: dict[str, Any] = {
+        "launch_enabled": True, "recipe_sha256": digest_bytes(parent_raw),
+        "identity": identity, "ring": {"path": str(reference_ring), "sha256": hash_file(reference_ring)},
+        "source": {
+            "candidate_binary_path": str(binary), "candidate_binary_sha256": app_sha,
+            "source_root": str(root),
+            "application_supervision": {
+                "application_wall_timeout_seconds": timeout_seconds,
+                "pressure_duration_seconds": schedule["duration_seconds"],
+            },
+            "pressure_recipe": pressure_info,
+        },
+        "recipe": parent_recipe,
+        "execution": {
+            "reader_path": str(SCRIPT), "reader_sha256": hash_file(SCRIPT),
+            "runner_path": str(runner_path), "runner_sha256": hash_file(runner_path),
+        },
+        "source_root": str(root), "mode": "functional",
+        "duration_seconds": 2, "sample_interval_ms": 100,
+    }
+    descriptor = module._make_launch_descriptor_v2(audit, output, cpu_set, None, None)
+    audit["launch_descriptor"] = descriptor
+    return audit, descriptor, pressure_recipe
+
+
+def write_fixture_pressure_prefix(pressure_dir: Path, pressure_recipe: dict[str, Any]) -> tuple[dict[str, Any], str]:
+    """Publish a self-consistent SourceV5 ownership/ACK/start prefix for V2 tests."""
+    schedule = pressure_recipe["schedule"]
+    nonce = pressure_recipe["identity"]["nonce"]
+    recipe_sha = pressure_recipe["recipe_sha256"]
+    cpus = schedule["pressure_cpu_affinity"]
+    workers = [
+        {"role": "cpu", "cpu": cpu, "pid": 501 + index, "start_ticks": 501 + index,
+         "pgid": 501 + index, "session_id": 501 + index, "nonce": nonce}
+        for index, cpu in enumerate(cpus)
+    ]
+    workers.extend([
+        {"role": role, "cpu": None, "pid": pid, "start_ticks": pid,
+         "pgid": pid, "session_id": pid, "nonce": nonce}
+        for role, pid in (("disk", 502), ("loopback", 503))
+    ])
+    owner_body = {
+        "schema": pressure_reader.EVENT_SCHEMA, "kind": "worker_ownership",
+        "recipe_sha256": recipe_sha, "nonce": nonce, "monotonic_ns": 10,
+        "workers": workers,
+    }
+    ownership_sha = digest_bytes(canon(owner_body))
+    owner_event = {**owner_body, "ownership_sha256": ownership_sha}
+    authorized_body = {
+        "schema": pressure_reader.EVENT_SCHEMA, "kind": "workers_authorized",
+        "recipe_sha256": recipe_sha, "nonce": nonce, "ownership_sha256": ownership_sha,
+        "monotonic_ns": 11, "workers": workers,
+    }
+    authorization_sha = digest_bytes(canon(authorized_body))
+    authorized_event = {**authorized_body, "authorization_sha256": authorization_sha}
+    start_event = {
+        "schema": pressure_reader.EVENT_SCHEMA, "kind": "pressure_start", "sequence": -1,
+        "recipe_sha256": recipe_sha, "nonce": nonce, "monotonic_ns": 12,
+        "ownership_sha256": ownership_sha, "authorization_sha256": authorization_sha,
+        "workers": workers,
+    }
+    write_private(pressure_dir / "events.jsonl", b"".join(canon(item) for item in (owner_event, authorized_event, start_event)))
+    thresholds = pressure_recipe["readiness_thresholds"]
+    ready_body = {
+        "schema": "allocatbelt.application-pressure-ready.v1",
+        "recipe_sha256": recipe_sha,
+        "condition_sha256": pressure_recipe["condition_sha256"],
+        "nonce": nonce,
+        "ownership_protocol": module.SOURCE_V5_PRESSURE_OWNERSHIP_PROTOCOL,
+        "worker_ownership_sha256": ownership_sha,
+        "worker_authorization_sha256": authorization_sha,
+        "pressure_ready_monotonic_ns": time.monotonic_ns(),
+        "readiness": {
+            "cpu_ready": True, "disk_ready": True, "loopback_ready": True, "all_ready": True,
+            "cpu_busy_basis_points": max(1, thresholds["cpu_busy_min_basis_points"]),
+            "disk_write_bytes_per_second": max(1, thresholds["disk_write_min_bytes_per_second"]),
+            "disk_queue_or_stall_microseconds": max(1, thresholds["disk_queue_or_stall_min_microseconds"]),
+            "loopback_requests_per_second": max(1, thresholds["loopback_requests_min_per_second"]),
+            "loopback_latency_p99_upper_nanoseconds": min(1000, thresholds["loopback_latency_p99_max_nanoseconds"]),
+            "loopback_tx_bytes_per_second": max(1, thresholds["loopback_tx_min_bytes_per_second"]),
+            "loopback_rx_bytes_per_second": max(1, thresholds["loopback_rx_min_bytes_per_second"]),
+        },
+    }
+    ready = {**ready_body, "ready_sha256": digest_bytes(canon(ready_body))}
+    write_private(pressure_dir / "pressure-ready.json", canon(ready))
+    return ready, digest_bytes(canon(ready))
 
 
 class Fixture:
@@ -840,18 +1124,11 @@ class SoakReadbackTests(unittest.TestCase):
             app_binary = root / "soak-binary"
             write_private(app_binary, b"soak binary", 0o700)
             app_binary.chmod(0o700)
-            pressure_recipe_path = root / "pressure-recipe.json"
-            pressure_recipe = {
-                "schema": "test.pressure.v1", "recipe_sha256": "b" * 64,
-                "schedule": {
-                    "pressure_cpu_affinity": [2], "sample_interval_ms": 100,
-                    "duration_seconds": 2, "startup_deadline_seconds": 1,
-                    "term_deadline_seconds": 1, "kill_deadline_seconds": 1,
-                    "total_deadline_seconds": 10,
-                },
-            }
-            write_private(pressure_recipe_path, canon(pressure_recipe))
             pressure_dir = output / "pressure"
+            audit, descriptor, pressure_recipe = source_v5_pressure_fixture(
+                root, output, app_binary, driver, "2", 11_050, "waits-for-readiness",
+            )
+            pressure_recipe_path = Path(audit["recipe"]["pressure"]["recipe"]["path"])
             events = []
             pressure_process = SimpleNamespace(pid=600, returncode=None)
 
@@ -869,43 +1146,12 @@ class SoakReadbackTests(unittest.TestCase):
                 events.append("pressure_start")
                 return pressure_process
 
-            descriptor = {
-                "launch_enabled": True,
-                "argv": [str(app_binary), "--duration-seconds", "2"],
-                "binary_sha256": "c" * 64,
-                "pressure_recipe_path": str(pressure_recipe_path),
-                "pressure_recipe_sha256": pressure_recipe["recipe_sha256"],
-                "pressure_condition_sha256": "d" * 64,
-                "pressure_driver_path": str(driver),
-                "pressure_driver_sha256": hash_file(driver),
-                "pressure_output_dir": str(pressure_dir),
-                "pressure_launch_path": str(pressure_dir / "launch-record.json"),
-                "pressure_ready_path": str(pressure_dir / "pressure-ready.json"),
-                "application_wall_timeout_seconds": 11_050,
-                "pressure_duration_seconds": 11_061,
-                "terminal_path": str(output / "terminal-records.tsv"),
-                "samples_path": str(output / "resource-samples.tsv"),
-                "environment": {"TMPDIR": str(root / "tmp")},
-                "cwd": str(root),
-            }
-            audit = {
-                "launch_descriptor": descriptor,
-                "source": {
-                    "pressure_recipe": {"value": pressure_recipe, "reader": SimpleNamespace(), "recipe_sha256": pressure_recipe["recipe_sha256"], "condition_sha256": "d" * 64},
-                    "application_supervision": {"application_wall_timeout_seconds": 11_050, "pressure_duration_seconds": 11_061},
-                },
-                "recipe": {"pressure": {"recipe": {"path": str(pressure_recipe_path), "raw_sha256": hash_file(pressure_recipe_path)}}},
-                "identity": {"nonce": "e" * 32},
-                "source_root": str(root),
-                "duration_seconds": 2,
-                "sample_interval_ms": 100,
-            }
             def fake_launch(command, cpu_set, stdout_path, stderr_path, timing_path, timeout, grace, monitored_files, *, environment, cwd, expected_executable_sha256, return_details, on_started, monitor, on_signal, on_cleanup, timeout_from_before_popen, timeout_includes_cleanup):
                 self.assertEqual(events, ["pressure_start", "ready"])
                 self.assertEqual(timeout, 11_050)
                 self.assertTrue(timeout_from_before_popen)
                 self.assertTrue(timeout_includes_cleanup)
-                app_process = SimpleNamespace(pid=700)
+                app_process = fake_owned_app_process(700)
                 on_started(app_process, Path(command[0]), expected_executable_sha256, Path(command[0]).stat(), {2}, cwd, environment)
                 events.append("app_popen")
                 monitor(app_process)
@@ -937,7 +1183,7 @@ class SoakReadbackTests(unittest.TestCase):
             def ready(*_args, **kwargs):
                 kwargs["capture_workers"]()
                 events.append("ready")
-                return ({"schema": "ready"}, "1" * 64)
+                return write_fixture_pressure_prefix(pressure_dir, pressure_recipe)
 
             args = SimpleNamespace(
                 command=["--", *descriptor["argv"]], cpu_set="2", output_dir=output,
@@ -953,6 +1199,7 @@ class SoakReadbackTests(unittest.TestCase):
                  mock.patch.object(module, "_capture_pressure_worker_sessions", side_effect=capture_workers), \
                  mock.patch.object(module, "_wait_pressure_workers_gone", return_value=True), \
                  mock.patch.object(module, "_make_pressure_launch_binding", side_effect=lambda *_args: {"schema": "binding.v1"}), \
+                 mock.patch.object(module, "_make_application_launch_attestation", return_value={"schema": "attestation.fixture.v1"}), \
                  mock.patch.object(module, "launch_process", side_effect=fake_launch), \
                  mock.patch.object(module, "_launch_receipt_value", return_value={"schema": "launch.v1"}), \
                  mock.patch.object(module, "_validate_pressure_proof", side_effect=lambda *_args: (events.append("pressure_proof") or {"raw_sha256": "2" * 64})):
@@ -965,14 +1212,53 @@ class SoakReadbackTests(unittest.TestCase):
             self.assertEqual(status, 0)
             self.assertEqual(events, ["pressure_start", "ready", "app_popen", "pressure_exit", "pressure_proof"])
 
+    def test_pressure_supervisor_rejects_environment_over_frozen_byte_bound_before_popen(self):
+        with tempfile.TemporaryDirectory(prefix="allocatbelt-pressure-environment-bound-") as temporary:
+            root = Path(temporary)
+            output = root / "output"
+            output.mkdir(mode=0o700)
+            driver = root / "pressure-driver.py"
+            driver.write_text("# pinned test driver\n", encoding="ascii")
+            binary = root / "soak-binary"
+            write_private(binary, b"soak binary", 0o700)
+            audit, descriptor, _pressure_recipe = source_v5_pressure_fixture(
+                root, output, binary, driver, "2", 5, "oversized-environment",
+            )
+            args = SimpleNamespace(
+                command=["--", *descriptor["argv"]], cpu_set=descriptor["cpu_set"],
+                timeout_seconds=5.0, term_grace_seconds=1.5,
+            )
+            pressure_info, app_descriptor = module._adapt_soak_v2_launch(
+                args, audit, {"terminal_budget_bytes": 1024, "sample_budget_bytes": 1024},
+            )
+            self.assertIs(type(app_descriptor["application_wall_timeout_seconds"]), int)
+            app_descriptor["environment"] = {"ALLOCATBELT_TEST": "x" * module.MAX_ENVIRONMENT_BYTES}
+            with mock.patch.object(module.subprocess, "Popen") as popen:
+                with self.assertRaisesRegex(module.SoakReadbackError, "environment exceeds its finite bound"):
+                    module.supervise_pressure_application(
+                        app_descriptor, pressure_info, output,
+                        lambda _value: None, lambda _value: None,
+                    )
+                popen.assert_not_called()
+
     def test_source_v5_pressure_proof_requires_durable_marker_and_matching_event_prefix(self):
         with tempfile.TemporaryDirectory(prefix="allocatbelt-soak-v5-pressure-prefix-") as temporary:
             root = Path(temporary)
             pressure_dir = root / "pressure"
             pressure_dir.mkdir(mode=0o700)
             nonce = "a" * 32
-            recipe_sha = "b" * 64
             condition_sha = "c" * 64
+            pressure_body = {
+                "schema": pressure_reader.RECIPE_SCHEMA,
+                "identity": {"nonce": nonce},
+                "condition_sha256": condition_sha,
+            }
+            recipe_sha = pressure_reader.digest_object(pressure_body)
+            pressure_recipe = {**pressure_body, "recipe_sha256": recipe_sha}
+            recipe_raw = canon(pressure_recipe)
+            recipe_path = root / "recipe.json"
+            write_private(recipe_path, recipe_raw)
+            raw_sha = digest_bytes(recipe_raw)
             worker = {
                 "role": "cpu", "cpu": 2, "pid": 101, "start_ticks": 501,
                 "pgid": 101, "session_id": 101, "nonce": nonce,
@@ -1002,8 +1288,9 @@ class SoakReadbackTests(unittest.TestCase):
             events_raw = b"".join(canon(item) for item in (owner_event, authorization_event, start_event))
             write_private(pressure_dir / "events.jsonl", events_raw)
             pressure_info = {
-                "value": {"identity": {"nonce": nonce}},
+                "value": pressure_recipe,
                 "recipe_sha256": recipe_sha,
+                "raw_sha256": raw_sha,
                 "condition_sha256": condition_sha,
             }
             marker = {
@@ -1026,10 +1313,17 @@ class SoakReadbackTests(unittest.TestCase):
                     module._require_source_v5_pressure_prefix(pressure_dir, pressure_info, ready_sha)
 
             pressure_info["reader"] = SimpleNamespace(verify_pressure=mock.Mock())
-            pressure_info["value"]["identity"]["nonce"] = nonce
             audit = {
                 "source": {"pressure_recipe": pressure_info},
-                "recipe": {"pressure": {"recipe": {"path": str(root / "recipe.json")}}},
+                "recipe": {
+                    "pressure": {"recipe": {
+                        "path": str(recipe_path), "raw_sha256": raw_sha,
+                        "semantic_sha256": recipe_sha,
+                    }},
+                    "qualification": {"pressure_condition": {"readiness_thresholds": {
+                        "minimum_ready_samples": 1, "minimum_overlap_seconds": 1,
+                    }}},
+                },
             }
             legacy_marker = {"schema": "allocatbelt.application-pressure-ready.v1"}
             with mock.patch.object(module, "_pressure_output_hashes", return_value={
@@ -1068,18 +1362,6 @@ class SoakReadbackTests(unittest.TestCase):
                     driver.write_text("# pinned test driver\n", encoding="ascii")
                     binary = root / "soak-binary"
                     write_private(binary, b"soak binary", 0o700)
-                    pressure_recipe_path = root / "pressure-recipe.json"
-                    pressure_recipe = {
-                        "schema": "test.pressure.v1", "recipe_sha256": "b" * 64,
-                        "identity": {"nonce": "e" * 32},
-                        "schedule": {
-                            "pressure_cpu_affinity": [2], "sample_interval_ms": 100,
-                            "duration_seconds": 2, "startup_deadline_seconds": 1,
-                            "term_deadline_seconds": 1, "kill_deadline_seconds": 1,
-                            "total_deadline_seconds": 10,
-                        },
-                    }
-                    write_private(pressure_recipe_path, canon(pressure_recipe))
 
                     class FakePressure:
                         pid = 600
@@ -1097,50 +1379,10 @@ class SoakReadbackTests(unittest.TestCase):
                             return 0
 
                     pressure_process = FakePressure()
-                    descriptor = {
-                        "launch_enabled": True,
-                        "argv": [str(binary), "--duration-seconds", "2"],
-                        "binary_sha256": hash_file(binary),
-                        "pressure_recipe_path": str(pressure_recipe_path),
-                        "pressure_recipe_sha256": pressure_recipe["recipe_sha256"],
-                        "pressure_condition_sha256": "c" * 64,
-                        "pressure_driver_path": str(driver),
-                        "pressure_driver_sha256": hash_file(driver),
-                        "pressure_output_dir": str(output / "pressure"),
-                        "pressure_launch_path": str(output / "pressure" / "launch-record.json"),
-                        "pressure_ready_path": str(output / "pressure" / "pressure-ready.json"),
-                        "application_wall_timeout_seconds": 11_050,
-                        "pressure_duration_seconds": 11_061,
-                        "terminal_path": str(output / "terminal-records.tsv"),
-                        "samples_path": str(output / "resource-samples.tsv"),
-                        "environment": {"TMPDIR": str(root / "tmp")},
-                        "cwd": str(root),
-                    }
-                    audit = {
-                        "launch_descriptor": descriptor,
-                        "source": {
-                            "pressure_recipe": {
-                                "value": pressure_recipe, "reader": SimpleNamespace(),
-                                "recipe_sha256": pressure_recipe["recipe_sha256"],
-                                "condition_sha256": descriptor["pressure_condition_sha256"],
-                            },
-                            "application_supervision": {
-                                "application_wall_timeout_seconds": 11_050,
-                                "pressure_duration_seconds": 11_061,
-                            },
-                        },
-                        "recipe": {"pressure": {"recipe": {
-                            "path": str(pressure_recipe_path),
-                            "raw_sha256": hash_file(pressure_recipe_path),
-                        }}},
-                        "recipe_sha256": "f" * 64,
-                        "identity": {
-                            "campaign_id": "campaign-signal", "host_id": "host-signal",
-                            "run_id": f"run-{stage}", "nonce": "e" * 32,
-                        },
-                        "source_root": str(root), "duration_seconds": 2,
-                        "sample_interval_ms": 100,
-                    }
+                    audit, descriptor, pressure_recipe = source_v5_pressure_fixture(
+                        root, output, binary, driver, "2", 11_050, f"run-{stage}",
+                    )
+                    pressure_dir = output / "pressure"
                     args = SimpleNamespace(
                         command=["--", *descriptor["argv"]], cpu_set="2",
                         output_dir=output, timeout_seconds=11_050, term_grace_seconds=1.5,
@@ -1157,9 +1399,10 @@ class SoakReadbackTests(unittest.TestCase):
                     def ready(*_args, **kwargs):
                         kwargs["capture_workers"]()
                         events.append("ready")
+                        marker = write_fixture_pressure_prefix(pressure_dir, pressure_recipe)
                         if stage == "readiness":
                             os.kill(os.getpid(), signum)
-                        return ({"schema": "ready"}, "1" * 64)
+                        return marker
 
                     def capture_workers(_pid, _start, _path, _recipe_sha, _schedule, target, _nonce, **_kwargs):
                         for role, pid in (("cpu", 501), ("disk", 502), ("loopback", 503)):
@@ -1180,7 +1423,7 @@ class SoakReadbackTests(unittest.TestCase):
                         self.assertTrue(timeout_from_before_popen)
                         self.assertTrue(timeout_includes_cleanup)
                         self.assertTrue(callable(on_signal))
-                        app = SimpleNamespace(pid=700)
+                        app = fake_owned_app_process(700)
                         on_started(app, Path(command[0]), expected_executable_sha256,
                                    Path(command[0]).stat(), {2}, cwd, environment)
                         events.append("app_popen")
@@ -1226,6 +1469,7 @@ class SoakReadbackTests(unittest.TestCase):
                          mock.patch.object(module, "_stop_pressure_session", side_effect=stop_pressure), \
                          mock.patch.object(module, "_wait_pressure_workers_gone", return_value=True), \
                          mock.patch.object(module, "_make_pressure_launch_binding", return_value={"schema": "binding.v1"}), \
+                         mock.patch.object(module, "_make_application_launch_attestation", return_value={"schema": "attestation.fixture.v1"}), \
                          mock.patch.object(module, "launch_process", side_effect=fake_launch), \
                          mock.patch.object(module, "_launch_receipt_value", return_value={"schema": "launch.v1"}), \
                          mock.patch.object(module, "_validate_pressure_proof") as validate_proof:
@@ -1277,77 +1521,32 @@ class SoakReadbackTests(unittest.TestCase):
                 output.mkdir(mode=0o700)
                 driver = root / "pressure-driver.py"
                 driver.write_text("# pinned test driver\n", encoding="ascii")
-                started = root / "app-started"
                 binary = root / "signal-soak.py"
                 code = (
                     "#!/usr/bin/python3\nimport os,pathlib,signal,sys,time\n"
                     + ("signal.signal(signal.SIGTERM, signal.SIG_IGN)\n" if fail_reap else "")
-                    + "pathlib.Path(sys.argv[1]).write_text(str(os.getpid()))\n"
+                    + "args=sys.argv; out=pathlib.Path(args[args.index('--output-dir')+1])\n"
+                    "pathlib.Path(out/'app-started').write_text(str(os.getpid()))\n"
                     "time.sleep(0.3)\n"
                     f"os.kill(os.getppid(), {int(signum)})\n"
                     "time.sleep(60)\n"
                 )
                 write_private(binary, code.encode("ascii"), 0o700)
                 binary.chmod(0o700)
-                argv = [str(binary), str(started)]
-                pressure_recipe_path = root / "pressure-recipe.json"
-                pressure_recipe = {
-                    "schema": "test.pressure.v1", "recipe_sha256": "b" * 64,
-                    "identity": {"nonce": "e" * 32},
-                    "schedule": {
-                        "pressure_cpu_affinity": [available_cpu], "sample_interval_ms": 100,
-                        "duration_seconds": 2, "startup_deadline_seconds": 1,
-                        "term_deadline_seconds": 1, "kill_deadline_seconds": 1,
-                        "total_deadline_seconds": 10,
-                    },
-                }
-                write_private(pressure_recipe_path, canon(pressure_recipe))
+                audit, descriptor, pressure_recipe = source_v5_pressure_fixture(
+                    root, output, binary, driver, str(available_cpu), 5,
+                    f"real-signal-{int(signum)}",
+                )
+                started = output / "app-started"
+                pressure_dir = output / "pressure"
                 pressure_process = SimpleNamespace(pid=600, returncode=None)
                 pressure_process.poll = lambda: pressure_process.returncode
-                descriptor = {
-                    "launch_enabled": True, "argv": argv,
-                    "binary_sha256": hash_file(binary),
-                    "pressure_recipe_path": str(pressure_recipe_path),
-                    "pressure_recipe_sha256": pressure_recipe["recipe_sha256"],
-                    "pressure_condition_sha256": "c" * 64,
-                    "pressure_driver_path": str(driver),
-                    "pressure_driver_sha256": hash_file(driver),
-                    "pressure_output_dir": str(output / "pressure"),
-                    "pressure_launch_path": str(output / "pressure" / "launch-record.json"),
-                    "pressure_ready_path": str(output / "pressure" / "pressure-ready.json"),
-                    "application_wall_timeout_seconds": 5.0,
-                    "pressure_duration_seconds": 16,
-                    "terminal_path": str(output / "terminal-records.tsv"),
-                    "samples_path": str(output / "resource-samples.tsv"),
-                    "environment": {"PATH": "/usr/bin:/bin", "TMPDIR": str(root)},
-                    "cwd": str(root),
-                }
-                audit = {
-                    "launch_descriptor": descriptor,
-                    "source": {
-                        "pressure_recipe": {
-                            "value": pressure_recipe, "reader": SimpleNamespace(),
-                            "recipe_sha256": pressure_recipe["recipe_sha256"],
-                            "condition_sha256": descriptor["pressure_condition_sha256"],
-                        },
-                        "application_supervision": {"application_wall_timeout_seconds": 5.0},
-                    },
-                    "recipe": {"pressure": {"recipe": {
-                        "path": str(pressure_recipe_path),
-                        "raw_sha256": hash_file(pressure_recipe_path),
-                    }}},
-                    "recipe_sha256": "f" * 64,
-                    "identity": {
-                        "campaign_id": "campaign-real-signal", "host_id": "host-real-signal",
-                        "run_id": f"run-real-signal-{int(signum)}", "nonce": "e" * 32,
-                    },
-                    "source_root": str(root), "duration_seconds": 2,
-                    "sample_interval_ms": 100,
-                }
                 args = SimpleNamespace(
-                    command=["--", *argv], cpu_set=str(available_cpu), output_dir=output,
+                    command=["--", *descriptor["argv"]], cpu_set=str(available_cpu), output_dir=output,
                     timeout_seconds=5.0, term_grace_seconds=1.5,
                 )
+                self.assertIs(type(args.timeout_seconds), float)
+                self.assertEqual(args.timeout_seconds, descriptor["application_wall_timeout_seconds"])
                 app_identity: dict[str, int] = {}
 
                 def fake_popen(command, **kwargs):
@@ -1367,7 +1566,7 @@ class SoakReadbackTests(unittest.TestCase):
 
                 def ready(*_args, **kwargs):
                     kwargs["capture_workers"]()
-                    return ({"schema": "ready"}, "1" * 64)
+                    return write_fixture_pressure_prefix(pressure_dir, pressure_recipe)
 
                 def stop_pressure(*_args, **_kwargs):
                     pressure_process.returncode = 0
@@ -1378,8 +1577,17 @@ class SoakReadbackTests(unittest.TestCase):
                     app_identity.update(pid=process.pid, start_ticks=observed["start_ticks"])
                     return {"schema": "binding.v1"}
 
+                original_owned_reap = module._OwnedProcessGroup.reap_if_ready
+                injected_app_reaps = []
+
+                def fail_owned_app_reap(owner, *reap_args, **reap_kwargs):
+                    if owner.pid == app_identity.get("pid"):
+                        injected_app_reaps.append(owner.pid)
+                        raise module.SoakReadbackError("injected app reap failure")
+                    return original_owned_reap(owner, *reap_args, **reap_kwargs)
+
                 cleanup_patch = (
-                    mock.patch.object(module, "_bounded_reap", side_effect=module.SoakReadbackError("injected app reap failure"))
+                    mock.patch.object(module._OwnedProcessGroup, "reap_if_ready", autospec=True, side_effect=fail_owned_app_reap)
                     if fail_reap else contextlib.nullcontext()
                 )
                 try:
@@ -1389,9 +1597,10 @@ class SoakReadbackTests(unittest.TestCase):
                          mock.patch.object(module, "_capture_pressure_worker_sessions", side_effect=capture_workers), \
                          mock.patch.object(module, "_stop_pressure_session", side_effect=stop_pressure), \
                          mock.patch.object(module, "_make_pressure_launch_binding", side_effect=make_binding), \
+                         mock.patch.object(module, "_make_application_launch_attestation", return_value={"schema": "attestation.fixture.v1"}), \
                          mock.patch.object(module, "_launch_receipt_value", return_value={"schema": "launch.v1"}), \
                          mock.patch.object(module, "_validate_pressure_proof") as validate_proof, \
-                         cleanup_patch:
+                         cleanup_patch as app_reap_probe:
                         if fail_reap:
                             with self.assertRaisesRegex(module.SoakReadbackError, "application_cleanup='failed'"):
                                 module.command_launch_v2(
@@ -1407,6 +1616,9 @@ class SoakReadbackTests(unittest.TestCase):
                             )
                     if not fail_reap:
                         self.assertEqual(status, 128 + signum)
+                    else:
+                        app_reap_probe.assert_called()
+                        self.assertTrue(injected_app_reaps, "reap failure must target the actual APP child")
                     validate_proof.assert_not_called()
                 finally:
                     if fail_reap and app_identity:
@@ -1452,69 +1664,22 @@ class SoakReadbackTests(unittest.TestCase):
                     body = "#!/usr/bin/python3\nimport signal,time\nsignal.signal(signal.SIGTERM, signal.SIG_IGN)\ntime.sleep(5)\n"
                 else:
                     body = (
-                        "#!/usr/bin/python3\nimport pathlib,signal,sys,time\n"
+                        "#!/usr/bin/python3\nimport os,pathlib,signal,time\n"
                         "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
-                        "pathlib.Path(sys.argv[1]).write_bytes(b'x'*4096)\n"
+                        "pathlib.Path(os.environ['ALLOCATBELT_SOAK_TERMINALS']).write_bytes(b'x'*4096)\n"
                         "time.sleep(5)\n"
                     )
                 write_private(binary, body.encode("ascii"), 0o700)
                 binary.chmod(0o700)
-                pressure_recipe_path = root / "pressure-recipe.json"
-                pressure_recipe = {
-                    "schema": "test.pressure.v1", "recipe_sha256": "b" * 64,
-                    "identity": {"nonce": "e" * 32},
-                    "schedule": {
-                        "pressure_cpu_affinity": [available_cpu], "sample_interval_ms": 100,
-                        "duration_seconds": 2, "startup_deadline_seconds": 1,
-                        "term_deadline_seconds": 1, "kill_deadline_seconds": 1,
-                        "total_deadline_seconds": 10,
-                    },
-                }
-                write_private(pressure_recipe_path, canon(pressure_recipe))
                 terminal_path = output / "terminal-records.tsv"
-                argv = [str(binary)] if failure_mode == "timeout" else [str(binary), str(terminal_path)]
+                audit, descriptor, pressure_recipe = source_v5_pressure_fixture(
+                    root, output, binary, driver, str(available_cpu), 3,
+                    f"internal-{failure_mode}",
+                )
+                pressure_dir = output / "pressure"
+                argv = descriptor["argv"]
                 pressure_process = SimpleNamespace(pid=600, returncode=None)
                 pressure_process.poll = lambda: pressure_process.returncode
-                descriptor = {
-                    "launch_enabled": True, "argv": argv,
-                    "binary_sha256": hash_file(binary),
-                    "pressure_recipe_path": str(pressure_recipe_path),
-                    "pressure_recipe_sha256": pressure_recipe["recipe_sha256"],
-                    "pressure_condition_sha256": "c" * 64,
-                    "pressure_driver_path": str(driver),
-                    "pressure_driver_sha256": hash_file(driver),
-                    "pressure_output_dir": str(output / "pressure"),
-                    "pressure_launch_path": str(output / "pressure" / "launch-record.json"),
-                    "pressure_ready_path": str(output / "pressure" / "pressure-ready.json"),
-                    "application_wall_timeout_seconds": 3.0,
-                    "pressure_duration_seconds": 11,
-                    "terminal_path": str(terminal_path),
-                    "samples_path": str(output / "resource-samples.tsv"),
-                    "environment": {"PATH": "/usr/bin:/bin", "TMPDIR": str(root)},
-                    "cwd": str(root),
-                }
-                audit = {
-                    "launch_descriptor": descriptor,
-                    "source": {
-                        "pressure_recipe": {
-                            "value": pressure_recipe, "reader": SimpleNamespace(),
-                            "recipe_sha256": pressure_recipe["recipe_sha256"],
-                            "condition_sha256": descriptor["pressure_condition_sha256"],
-                        },
-                        "application_supervision": {"application_wall_timeout_seconds": 3.0},
-                    },
-                    "recipe": {"pressure": {"recipe": {
-                        "path": str(pressure_recipe_path),
-                        "raw_sha256": hash_file(pressure_recipe_path),
-                    }}},
-                    "recipe_sha256": "f" * 64,
-                    "identity": {
-                        "campaign_id": "campaign-internal", "host_id": "host-internal",
-                        "run_id": f"run-{failure_mode}", "nonce": "e" * 32,
-                    },
-                    "source_root": str(root), "duration_seconds": 2,
-                    "sample_interval_ms": 100,
-                }
                 args = SimpleNamespace(
                     command=["--", *argv], cpu_set=str(available_cpu), output_dir=output,
                     timeout_seconds=3.0, term_grace_seconds=1.5,
@@ -1537,7 +1702,7 @@ class SoakReadbackTests(unittest.TestCase):
 
                 def ready(*_args, **kwargs):
                     kwargs["capture_workers"]()
-                    return ({"schema": "ready"}, "1" * 64)
+                    return write_fixture_pressure_prefix(pressure_dir, pressure_recipe)
 
                 def stop_pressure(*_args, **_kwargs):
                     pressure_process.returncode = 0
@@ -1548,6 +1713,7 @@ class SoakReadbackTests(unittest.TestCase):
                      mock.patch.object(module, "_capture_pressure_worker_sessions", side_effect=capture_workers), \
                      mock.patch.object(module, "_stop_pressure_session", side_effect=stop_pressure), \
                      mock.patch.object(module, "_make_pressure_launch_binding", return_value={"schema": "binding.v1"}), \
+                     mock.patch.object(module, "_make_application_launch_attestation", return_value={"schema": "attestation.fixture.v1"}), \
                      mock.patch.object(module, "_launch_receipt_value", return_value={"schema": "launch.v1"}), \
                      mock.patch.object(module, "_validate_pressure_proof") as validate_proof:
                     status = module.command_launch_v2(
@@ -1742,6 +1908,403 @@ class SoakReadbackTests(unittest.TestCase):
                 b"",
             )
             self.assertTrue(self._wait_heartbeat_stopped(orphan_heartbeat))
+
+    def test_native_child_wait_and_group_signals_precede_the_only_reap(self):
+        with tempfile.TemporaryDirectory(prefix="allocatbelt-soak-owned-order-") as temporary:
+            root = Path(temporary)
+            child_pid_path = root / "descendant.pid"
+            descendant = (
+                "import pathlib,signal,sys,time; "
+                "signal.signal(signal.SIGTERM,signal.SIG_IGN); "
+                "pathlib.Path(sys.argv[1]).write_text(str(__import__('os').getpid())); time.sleep(60)"
+            )
+            leader = (
+                "import pathlib,subprocess,sys,time; "
+                "subprocess.Popen([sys.executable,'-c',sys.argv[2],sys.argv[1]],"
+                "stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL); "
+                "p=pathlib.Path(sys.argv[1]); deadline=time.monotonic()+2; "
+                "exec('while not p.exists() and time.monotonic()<deadline: time.sleep(0.005)'); "
+                "print('owned child complete')"
+            )
+
+            checked_output, checked_events, checked_pid = self._run_with_owned_wait_trace(
+                lambda: module._run_checked(
+                    [sys.executable, "-c", leader, str(child_pid_path), descendant],
+                    root,
+                    "owned ordering fixture",
+                    timeout=3,
+                )
+            )
+            self.assertEqual(checked_output, b"owned child complete\n")
+            self._assert_owned_reap_is_last(checked_events, checked_pid)
+            self.assertIn(("killpg", signal.SIGTERM), checked_events)
+            self.assertIn(("killpg", signal.SIGKILL), checked_events)
+            self.assertTrue(self._wait_process_stopped(int(child_pid_path.read_text(encoding="ascii"))))
+
+            child_pid_path.unlink()
+            output = root / "launch-output"
+            output.mkdir(mode=0o700)
+            launch_status, launch_events, launch_pid = self._run_with_owned_wait_trace(
+                lambda: module.launch_process(
+                    [sys.executable, "-c", leader, str(child_pid_path), descendant],
+                    str(min(os.sched_getaffinity(0))),
+                    output / "stdout.log", output / "stderr.log", output / "time.txt",
+                    timeout_seconds=3,
+                    term_grace_seconds=0.2,
+                )
+            )
+            self.assertEqual(launch_status, 0)
+            self._assert_owned_reap_is_last(launch_events, launch_pid)
+            self.assertIn(("killpg", signal.SIGTERM), launch_events)
+            self.assertIn(("killpg", signal.SIGKILL), launch_events)
+            self.assertTrue(self._wait_process_stopped(int(child_pid_path.read_text(encoding="ascii"))))
+
+    def test_late_hup_during_post_exit_binary_hash_never_reuses_the_reaped_pgid(self):
+        with tempfile.TemporaryDirectory(prefix="allocatbelt-soak-late-hup-") as temporary:
+            root = Path(temporary)
+            output = root / "launch-output"
+            output.mkdir(mode=0o700)
+            hash_calls = 0
+            original_hash = module._hash_open_executable
+            callback_signals = []
+
+            def signal_during_final_hash(*args, **kwargs):
+                nonlocal hash_calls
+                hash_calls += 1
+                if hash_calls == 2:
+                    os.kill(os.getpid(), signal.SIGHUP)
+                return original_hash(*args, **kwargs)
+
+            details, events, pid = self._run_with_owned_wait_trace(
+                lambda: module.launch_process(
+                    [sys.executable, "-c", "pass"],
+                    str(min(os.sched_getaffinity(0))),
+                    output / "stdout.log", output / "stderr.log", output / "time.txt",
+                    timeout_seconds=3,
+                    return_details=True,
+                    on_signal=callback_signals.append,
+                ),
+                hash_wrapper=signal_during_final_hash,
+            )
+            self.assertEqual(details["status"], 128 + signal.SIGHUP)
+            self.assertEqual(details["received_signal"], signal.SIGHUP)
+            self.assertEqual(callback_signals, [signal.SIGHUP])
+            self._assert_owned_reap_is_last(events, pid)
+
+    def test_late_term_and_hup_during_cleanup_receipt_write_update_final_details(self):
+        for signum in (signal.SIGTERM, signal.SIGHUP):
+            with self.subTest(signum=signum), tempfile.TemporaryDirectory(prefix=f"allocatbelt-soak-late-cleanup-{signum}-") as temporary:
+                root = Path(temporary)
+                output = root / "launch-output"
+                output.mkdir(mode=0o700)
+                cleanup_receipt_path = output / "cleanup-record.json"
+                callback_signals = []
+                original_writer = module._write_exclusive_json
+                original_handlers = {
+                    handled: signal.getsignal(handled)
+                    for handled in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
+                }
+
+                def signal_during_cleanup_receipt(path, value):
+                    if Path(path) == cleanup_receipt_path:
+                        os.kill(os.getpid(), signum)
+                    return original_writer(path, value)
+
+                def persist_cleanup_receipt(value):
+                    module._write_exclusive_json(cleanup_receipt_path, value)
+
+                details, events, pid = self._run_with_owned_wait_trace(
+                    lambda: module.launch_process(
+                        [sys.executable, "-c", "pass"],
+                        str(min(os.sched_getaffinity(0))),
+                        output / "stdout.log", output / "stderr.log", output / "time.txt",
+                        timeout_seconds=3,
+                        return_details=True,
+                        on_signal=callback_signals.append,
+                        on_cleanup=persist_cleanup_receipt,
+                    ),
+                    write_wrapper=signal_during_cleanup_receipt,
+                )
+                cleanup_receipt = module._readback_json(cleanup_receipt_path, "late-signal cleanup receipt")
+                self.assertEqual(details["status"], 128 + signum)
+                self.assertEqual(details["received_signal"], signum)
+                self.assertEqual(callback_signals, [signum])
+                self.assertEqual(cleanup_receipt["received_signal"], signum)
+                self.assertEqual(cleanup_receipt["status"], "verified")
+                self.assertEqual(
+                    {handled: signal.getsignal(handled) for handled in original_handlers},
+                    original_handlers,
+                )
+                self._assert_owned_reap_is_last(events, pid)
+
+    def test_group_scan_failure_uses_only_the_held_default_owner_for_fallback_signals(self):
+        with tempfile.TemporaryDirectory(prefix="allocatbelt-soak-group-scan-fault-") as temporary:
+            root = Path(temporary)
+            output = root / "launch-output"
+            output.mkdir(mode=0o700)
+            original_scandir = os.scandir
+            original_killpg = os.killpg
+            scanner_calls = 0
+            group_signals = []
+            cleanup_results = []
+
+            def fail_one_proc_scan(path):
+                nonlocal scanner_calls
+                if os.fspath(path) == "/proc" and scanner_calls == 0:
+                    scanner_calls += 1
+                    raise PermissionError(13, "injected process-table scan fault", "/proc")
+                return original_scandir(path)
+
+            def record_group_signal(pgid, signum):
+                group_signals.append(signum)
+                return original_killpg(pgid, signum)
+
+            with mock.patch.object(module.os, "scandir", side_effect=fail_one_proc_scan), \
+                 mock.patch.object(module.os, "killpg", side_effect=record_group_signal):
+                with self.assertRaisesRegex(module.SoakReadbackError, "could not verify its process group"):
+                    module.launch_process(
+                        [sys.executable, "-c", "import signal,time; signal.signal(signal.SIGTERM,signal.SIG_IGN); time.sleep(60)"],
+                        str(min(os.sched_getaffinity(0))),
+                        output / "stdout.log", output / "stderr.log", output / "time.txt",
+                        timeout_seconds=0.25,
+                        term_grace_seconds=0.1,
+                        on_cleanup=cleanup_results.append,
+                    )
+            self.assertEqual(scanner_calls, 1)
+            self.assertIn(signal.SIGTERM, group_signals, "scan-fault fallback did not signal while direct ownership was held")
+            self.assertIn(signal.SIGKILL, group_signals)
+            self.assertEqual(cleanup_results[0]["status"], "failed")
+            self.assertIsInstance(cleanup_results[0]["return_code"], int)
+
+    def test_sigchld_change_during_scan_blocks_group_signal_and_final_wait(self):
+        for stage, child_code in (
+            ("signal", "import time; time.sleep(30)"),
+            ("final-wait", "pass"),
+        ):
+            with self.subTest(stage=stage), tempfile.TemporaryDirectory(prefix=f"allocatbelt-soak-sigchld-{stage}-") as temporary:
+                root = Path(temporary)
+                pid_path = root / "app.pid"
+                result_path = root / "result.json"
+                wrapper = root / "sigchld-wrapper.py"
+                wrapper.write_text(
+                    "import importlib.machinery,importlib.util,json,os,signal,sys\n"
+                    "from pathlib import Path\n"
+                    "loader=importlib.machinery.SourceFileLoader('sigchld_readback',sys.argv[1])\n"
+                    "spec=importlib.util.spec_from_loader(loader.name,loader)\n"
+                    "module=importlib.util.module_from_spec(spec); loader.exec_module(module)\n"
+                    "pid_path=Path(sys.argv[2]); result_path=Path(sys.argv[3]); cpu_set=sys.argv[4]\n"
+                    "stage=sys.argv[5]; child_code=sys.argv[6]\n"
+                    "group_signals=[]; waits=[]; watched_pid=None; changed=False\n"
+                    "original_killpg=os.killpg; original_waitpid=os.waitpid\n"
+                    "def record_killpg(pgid,signum):\n"
+                    " global watched_pid\n"
+                    " if pgid==watched_pid: group_signals.append(signum)\n"
+                    " return original_killpg(pgid,signum)\n"
+                    "def record_waitpid(pid,options):\n"
+                    " global watched_pid\n"
+                    " if pid==watched_pid: waits.append(pid)\n"
+                    " return original_waitpid(pid,options)\n"
+                    "os.killpg=record_killpg; os.waitpid=record_waitpid\n"
+                    "original_scan=module._OwnedProcessGroup._scan_group_unlocked\n"
+                    "def change_after_scan(owner):\n"
+                    " global changed\n"
+                    " result=original_scan(owner)\n"
+                    " if not changed:\n"
+                    "  signal.signal(signal.SIGCHLD,signal.SIG_IGN); changed=True\n"
+                    " return result\n"
+                    "module._OwnedProcessGroup._scan_group_unlocked=change_after_scan\n"
+                    "def started(process,*_args):\n"
+                    " global watched_pid\n"
+                    " watched_pid=process.pid; pid_path.write_text(str(process.pid))\n"
+                    "try:\n"
+                    " module.launch_process([sys.executable,'-c',child_code],cpu_set,"
+                    "result_path.parent/'stdout.log',result_path.parent/'stderr.log',result_path.parent/'time.txt',"
+                    "timeout_seconds=0.2,term_grace_seconds=0.1,on_started=started)\n"
+                    "except module.SoakReadbackError as error:\n"
+                    " result_path.write_text(json.dumps({'error':str(error),'killpg':group_signals,'waitpid':waits,'stage':stage}))\n"
+                    " raise SystemExit(42)\n"
+                    "raise SystemExit(43)\n",
+                    encoding="utf-8",
+                )
+                process = subprocess.Popen(
+                    [sys.executable, "-B", str(wrapper), str(SCRIPT), str(pid_path), str(result_path),
+                     str(min(os.sched_getaffinity(0))), stage, child_code],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    start_new_session=True,
+                )
+                stdout, stderr = process.communicate(timeout=3)
+                self.assertEqual(process.returncode, 42, stderr.decode(errors="replace"))
+                result = json.loads(result_path.read_text(encoding="utf-8"))
+                self.assertIn("SIGCHLD", result["error"])
+                self.assertEqual(result["killpg"], [], "ownership loss must prevent every numeric process-group signal")
+                self.assertEqual(result["waitpid"], [], "unsupported wait semantics must not produce a child status")
+                if stage == "signal":
+                    child_pid = int(pid_path.read_text(encoding="ascii"))
+                    try:
+                        os.kill(child_pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    self.assertTrue(self._wait_process_stopped(child_pid))
+
+    def test_same_session_new_pgid_descendants_are_unverified_and_never_group_signaled(self):
+        escaped_child = (
+            "import json,os,pathlib,signal,sys,time; os.setpgid(0,0); "
+            "signal.signal(signal.SIGTERM,signal.SIG_IGN); "
+            "raw=pathlib.Path(f'/proc/{os.getpid()}/stat').read_bytes(); tail=raw[raw.rfind(b')')+1:].split(); "
+            "record={'pid':os.getpid(),'start_ticks':int(tail[19]),'pgid':os.getpgrp(),'session_id':os.getsid(0)}; "
+            "pathlib.Path(sys.argv[1]).write_text(json.dumps(record,sort_keys=True)); time.sleep(60)"
+        )
+        ready_leader = (
+            "import pathlib,subprocess,sys,time; "
+            "subprocess.Popen([sys.executable,'-c',sys.argv[2],sys.argv[1]]); "
+            "p=pathlib.Path(sys.argv[1]); deadline=time.monotonic()+2; "
+            "exec('while not p.exists() and time.monotonic()<deadline: time.sleep(0.005)'); "
+            "print('leader exited after escaped member was ready')"
+        )
+        capture_leader = (
+            "import pathlib,subprocess,sys,time; "
+            "subprocess.Popen([sys.executable,'-c',sys.argv[2],sys.argv[1]],"
+            "stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL); "
+            "p=pathlib.Path(sys.argv[1]); deadline=time.monotonic()+2; "
+            "exec('while not p.exists() and time.monotonic()<deadline: time.sleep(0.005)'); "
+            "print('capture leader exited after escaped member was ready')"
+        )
+
+        with tempfile.TemporaryDirectory(prefix="allocatbelt-soak-same-session-escape-") as temporary:
+            root = Path(temporary)
+            ready = root / "escaped.json"
+            output = root / "launch-output"
+            output.mkdir(mode=0o700)
+            cleanup_results = []
+            try:
+                launch_result, launch_events, leader_pid = self._run_with_owned_wait_trace(
+                    lambda: self._capture_launch_cleanup_failure(
+                        [sys.executable, "-c", ready_leader, str(ready), escaped_child],
+                        output, cleanup_results,
+                    )
+                )
+                self.assertIn("same-session processes outside its owned process group", launch_result["error"])
+                self.assertEqual(cleanup_results[0]["status"], "failed")
+                self.assertEqual(cleanup_results[0]["return_code"], 0)
+                escaped = json.loads(ready.read_text(encoding="utf-8"))
+                self.assertNotEqual(escaped["pgid"], leader_pid)
+                self.assertEqual(escaped["session_id"], leader_pid)
+                self._assert_live_test_identity(escaped)
+                self.assertEqual(os.stat(f"/proc/{escaped['pid']}/fd/1").st_ino, (output / "stdout.log").stat().st_ino)
+                self.assertFalse(any(event[0] == "killpg" for event in launch_events), "escaped PGID must not be signaled through the leader's numeric PGID")
+            finally:
+                if ready.exists():
+                    self._kill_retained_test_identity(json.loads(ready.read_text(encoding="utf-8")))
+
+        with tempfile.TemporaryDirectory(prefix="allocatbelt-soak-capture-session-escape-") as temporary:
+            root = Path(temporary)
+            ready = root / "escaped.json"
+            events = []
+            original_killpg = os.killpg
+
+            def trace_killpg(pgid, signum):
+                events.append((pgid, signum))
+                return original_killpg(pgid, signum)
+
+            try:
+                with mock.patch.object(module.os, "killpg", side_effect=trace_killpg):
+                    with self.assertRaisesRegex(module.SoakReadbackError, "same-session processes outside its owned process group"):
+                        module._run_checked(
+                            [sys.executable, "-c", capture_leader, str(ready), escaped_child],
+                            root,
+                            "same-session capture escape fixture",
+                            timeout=3,
+                        )
+                escaped = json.loads(ready.read_text(encoding="utf-8"))
+                self.assertNotEqual(escaped["pgid"], escaped["session_id"])
+                self._assert_live_test_identity(escaped)
+                self.assertEqual(events, [], "capture cleanup must leave the escaped PGID untouched")
+            finally:
+                if ready.exists():
+                    self._kill_retained_test_identity(json.loads(ready.read_text(encoding="utf-8")))
+
+    @staticmethod
+    def _capture_launch_cleanup_failure(command, output, cleanup_results):
+        try:
+            return module.launch_process(
+                command,
+                str(min(os.sched_getaffinity(0))),
+                output / "stdout.log", output / "stderr.log", output / "time.txt",
+                timeout_seconds=3,
+                term_grace_seconds=0.2,
+                on_cleanup=cleanup_results.append,
+            )
+        except module.SoakReadbackError as error:
+            return {"error": str(error)}
+
+    def _assert_live_test_identity(self, record):
+        identity = module._parse_proc_stat(
+            record["pid"], Path(f"/proc/{record['pid']}/stat").read_bytes(), "test-owned escaped descendant",
+        )
+        self.assertEqual(identity["start_ticks"], record["start_ticks"])
+        self.assertEqual(identity["pgid"], record["pgid"])
+        self.assertEqual(identity["session_id"], record["session_id"])
+        self.assertNotIn(identity["state"], ("Z", "X"))
+
+    def _kill_retained_test_identity(self, record):
+        try:
+            identity = module._parse_proc_stat(
+                record["pid"], Path(f"/proc/{record['pid']}/stat").read_bytes(), "test-owned escaped descendant cleanup",
+            )
+        except FileNotFoundError:
+            return
+        if (identity["start_ticks"], identity["pgid"], identity["session_id"]) != (
+            record["start_ticks"], record["pgid"], record["session_id"],
+        ):
+            raise AssertionError("escaped descendant PID no longer has the test's retained identity")
+        os.kill(record["pid"], signal.SIGKILL)
+        self.assertTrue(self._wait_process_stopped(record["pid"]))
+
+    def test_proc_stat_zero_group_and_session_record_is_ignored_as_foreign(self):
+        def stat_record(pid, parent_pid, pgid, sid, start_ticks):
+            tail = ["S", str(parent_pid), str(pgid), str(sid), *(["0"] * 15), str(start_ticks)]
+            return f"{pid} (kernel worker fixture) {' '.join(tail)}\n".encode("ascii")
+
+        leader_pid = 4242
+        foreign_pid = 900042
+        leader_raw = stat_record(leader_pid, 42, leader_pid, leader_pid, 123456)
+        foreign_raw = stat_record(foreign_pid, 2, 0, 0, 999999)
+
+        class FakeProcEntry:
+            def __init__(self, pid):
+                self.name = str(pid)
+                self.path = f"/proc/{pid}"
+
+        class FakeProcEntries:
+            def __enter__(self):
+                return iter((FakeProcEntry(leader_pid), FakeProcEntry(foreign_pid)))
+
+            def __exit__(self, *_args):
+                return False
+
+        owner = SimpleNamespace(
+            pid=leader_pid,
+            label="zero stat fixture",
+            identity={"start_ticks": 123456, "parent_pid": 42},
+        )
+        original_read_bytes = Path.read_bytes
+
+        def fake_read_bytes(path):
+            if path == Path(f"/proc/{leader_pid}/stat"):
+                return leader_raw
+            if path == Path(f"/proc/{foreign_pid}/stat"):
+                return foreign_raw
+            return original_read_bytes(path)
+
+        parsed_foreign = module._parse_proc_stat(foreign_pid, foreign_raw, "zero stat fixture")
+        self.assertEqual((parsed_foreign["pgid"], parsed_foreign["session_id"]), (0, 0))
+        with mock.patch.object(module.os, "scandir", return_value=FakeProcEntries()), \
+             mock.patch.object(Path, "read_bytes", new=fake_read_bytes):
+            members, escaped, scan_error = module._OwnedProcessGroup._scan_group_unlocked(owner)
+        self.assertIsNone(scan_error)
+        self.assertEqual([member["pid"] for member in members], [leader_pid])
+        self.assertEqual(escaped, [])
 
     def test_run_checked_reaps_its_group_when_interrupted(self):
         with tempfile.TemporaryDirectory(prefix="allocatbelt-soak-checked-signal-") as temp:
@@ -2211,6 +2774,70 @@ class SoakReadbackTests(unittest.TestCase):
             time.sleep(0.02)
         return False
 
+    @staticmethod
+    def _run_with_owned_wait_trace(run, *, hash_wrapper=None, write_wrapper=None):
+        events = []
+        child_pids = []
+        original_popen = module.subprocess.Popen
+        original_waitid = os.waitid
+        original_waitpid = os.waitpid
+        original_killpg = os.killpg
+
+        def capture_popen(*args, **kwargs):
+            process = original_popen(*args, **kwargs)
+            child_pids.append(process.pid)
+            return process
+
+        def trace_waitid(idtype, pid, options):
+            result = original_waitid(idtype, pid, options)
+            if child_pids and idtype == os.P_PID and pid == child_pids[0]:
+                events.append(("waitid", options))
+            return result
+
+        def trace_waitpid(pid, options):
+            result = original_waitpid(pid, options)
+            if child_pids and pid == child_pids[0]:
+                events.append(("waitpid", options))
+            return result
+
+        def trace_killpg(pgid, signum):
+            if child_pids and pgid == child_pids[0]:
+                events.append(("killpg", signum))
+            return original_killpg(pgid, signum)
+
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(mock.patch.object(module.subprocess, "Popen", side_effect=capture_popen))
+            stack.enter_context(mock.patch.object(module.os, "waitid", side_effect=trace_waitid))
+            stack.enter_context(mock.patch.object(module.os, "waitpid", side_effect=trace_waitpid))
+            stack.enter_context(mock.patch.object(module.os, "killpg", side_effect=trace_killpg))
+            if hash_wrapper is not None:
+                stack.enter_context(mock.patch.object(module, "_hash_open_executable", side_effect=hash_wrapper))
+            if write_wrapper is not None:
+                stack.enter_context(mock.patch.object(module, "_write_exclusive_json", side_effect=write_wrapper))
+            result = run()
+        if len(child_pids) != 1:
+            raise AssertionError(f"expected one traced native child, captured {child_pids}")
+        return result, events, child_pids[0]
+
+    def _assert_owned_reap_is_last(self, events, child_pid):
+        self.assertTrue(events, "native supervision made no observable wait calls")
+        waitpid_indexes = [index for index, event in enumerate(events) if event[0] == "waitpid"]
+        self.assertEqual(len(waitpid_indexes), 1, f"owned child must have one final waitpid: {events}")
+        final_waitpid = waitpid_indexes[0]
+        self.assertEqual(events[final_waitpid][1], os.WNOHANG)
+        self.assertTrue(any(event[0] == "waitid" for event in events[:final_waitpid]))
+        for index, event in enumerate(events):
+            if event[0] == "waitid":
+                self.assertTrue(event[1] & os.WNOWAIT, f"waitid reaped or failed to preserve child {child_pid}: {events}")
+            if event[0] == "killpg":
+                self.assertLess(index, final_waitpid, f"killpg followed the owned child's final reap: {events}")
+                self.assertGreater(index, 0)
+                self.assertEqual(events[index - 1][0], "waitid", f"killpg lacked an immediate post-scan ownership guard: {events}")
+        self.assertFalse(
+            any(event[0] in ("waitid", "killpg") for event in events[final_waitpid + 1:]),
+            f"numeric process operations followed final waitpid for child {child_pid}: {events}",
+        )
+
     def test_timeout_escalates_and_kills_descendants_in_the_launch_group(self):
         with tempfile.TemporaryDirectory(prefix="allocatbelt-soak-timeout-") as temp:
             root = Path(temp)
@@ -2253,6 +2880,8 @@ class SoakReadbackTests(unittest.TestCase):
                 timeout_from_before_popen=True, timeout_includes_cleanup=True,
             )
             self.assertTrue(details["timed_out"])
+            self.assertEqual(details["status"], 124)
+            self.assertIsNone(details["received_signal"], "internal timeout TERM is not an external signal")
             self.assertLess(time.monotonic() - before, 1.1)
 
     def test_pressure_cleanup_waits_past_generic_grace_for_frozen_driver_term(self):

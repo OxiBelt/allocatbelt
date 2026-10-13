@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import ctypes
+import errno
 import fcntl
 import hashlib
 import json
@@ -89,9 +90,13 @@ MAX_TERMINAL_BYTES = 32 * 1024 * 1024 * 1024
 MAX_SAMPLE_BYTES = 96 * 1024 * 1024
 MAX_EXECUTABLE_BYTES = 512 * 1024 * 1024
 MAX_SOURCE_FILE_BYTES = 64 * 1024 * 1024
+# Environment snapshots are retained in both launch bindings and attestations.
+# Keep this ceiling aligned with the existing bounded launch-environment reads.
+MAX_ENVIRONMENT_BYTES = 16 * 1024 * 1024
 MAX_LINE_BYTES = 8192
 _SOURCE_INVENTORY_MODULE_CACHE: dict[str, Any] = {}
 _PRESSURE_SUBREAPER_ACTIVE = False
+OWNED_GROUP_SCAN_MAX_SECONDS = 0.05
 
 QUALIFIED_SECONDS = 10_800
 SAMPLE_INTERVAL_MS = 100
@@ -421,38 +426,238 @@ def source_tree_digest(entries: list[dict[str, Any]]) -> str:
     return inventory_module.digest_records(entries)
 
 
-def _group_exists(pgid: int) -> bool:
-    try:
-        os.killpg(pgid, 0)
-        return True
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
+class _LinuxSigSet(ctypes.Structure):
+    _fields_ = [("_values", ctypes.c_ulong * 16)]
 
 
-def _terminate_group(pgid: int, grace_seconds: float = 0.2) -> None:
-    if not _group_exists(pgid):
-        return
+class _LinuxSigAction(ctypes.Structure):
+    _fields_ = [
+        ("handler", ctypes.c_void_p),
+        ("mask", _LinuxSigSet),
+        ("flags", ctypes.c_int),
+        ("restorer", ctypes.c_void_p),
+    ]
+
+
+def _require_waitid_ownership_support() -> None:
+    """Require waitid(WNOWAIT) and an unreaped, default-SIGCHLD child owner."""
+    require(sys.platform.startswith("linux"), "owned process-group supervision requires Linux waitid semantics")
+    require(signal.getsignal(signal.SIGCHLD) == signal.SIG_DFL, "SIGCHLD disposition is not default; child wait ownership is unsupported")
+    required = ("waitid", "waitpid", "P_PID", "WEXITED", "WNOHANG", "WNOWAIT", "waitstatus_to_exitcode")
+    require(all(hasattr(os, name) for name in required), "owned process-group supervision lacks waitid(WNOWAIT) support")
     try:
-        os.killpg(pgid, signal.SIGTERM)
-    except ProcessLookupError:
-        return
-    deadline = time.monotonic() + grace_seconds
-    while time.monotonic() < deadline and _group_exists(pgid):
-        time.sleep(0.02)
-    if _group_exists(pgid):
+        libc = ctypes.CDLL(None, use_errno=True)
+        sigaction = libc.sigaction
+        sigaction.argtypes = (ctypes.c_int, ctypes.c_void_p, ctypes.POINTER(_LinuxSigAction))
+        sigaction.restype = ctypes.c_int
+        action = _LinuxSigAction()
+        if sigaction(signal.SIGCHLD, None, ctypes.byref(action)) != 0:
+            error_number = ctypes.get_errno()
+            raise OSError(error_number, os.strerror(error_number))
+    except (AttributeError, OSError) as error:
+        raise SoakReadbackError(f"cannot verify default SIGCHLD wait ownership: {error}") from error
+    require(action.handler in (None, 0), "SIGCHLD native handler is not default; child wait ownership is unsupported")
+    require(action.flags & getattr(signal, "SA_NOCLDWAIT", 2) == 0, "SIGCHLD has SA_NOCLDWAIT; child wait ownership is unsupported")
+
+
+def _parse_proc_stat(pid: int, raw: bytes, label: str) -> dict[str, Any]:
+    require(len(raw) <= 65_536, f"{label} /proc stat exceeds its finite bound")
+    try:
+        text_value = raw.decode("ascii").strip()
+    except UnicodeError as error:
+        raise SoakReadbackError(f"{label} /proc stat is not ASCII") from error
+    closing = text_value.rfind(")")
+    require(closing > 0, f"{label} /proc stat has malformed command framing")
+    head = text_value[:text_value.find("(")].strip()
+    tail = text_value[closing + 1:].strip().split()
+    require(head == str(pid) and len(tail) >= 20, f"{label} /proc stat has malformed identity fields")
+    try:
+        start_ticks, parent_pid, process_group, session_id = (int(tail[index]) for index in (19, 1, 2, 3))
+    except ValueError as error:
+        raise SoakReadbackError(f"{label} /proc stat identity is malformed") from error
+    require(start_ticks > 0 and parent_pid >= 0 and process_group >= 0 and session_id >= 0, f"{label} /proc stat identity is outside its bound")
+    return {
+        "pid": pid, "state": tail[0], "start_ticks": start_ticks,
+        "parent_pid": parent_pid, "pgid": process_group, "session_id": session_id,
+    }
+
+
+def _classify_owned_session_member(leader_pid: int, member: dict[str, Any]) -> str:
+    """Classify proc records without treating valid foreign zero IDs as errors."""
+    if member["session_id"] != leader_pid:
+        return "foreign"
+    require(leader_pid > 0 and member["session_id"] > 0 and member["pgid"] > 0, "owned session member has a zero or invalid process-group identity")
+    return "owned_group" if member["pgid"] == leader_pid else "escaped_group"
+
+
+class _OwnedProcessGroup:
+    """Keep a Popen child unreaped until every numeric process-group operation is done."""
+
+    def __init__(self, process: subprocess.Popen[bytes], label: str):
+        self.process = process
+        self.pid = process.pid
+        self.label = label
+        self.reaped = False
+        self.return_code: int | None = None
+        self.identity: dict[str, Any] | None = None
+        self.identity_error: str | None = None
+        self.last_signal: int | None = None
+        self._wait_lock = getattr(process, "_waitpid_lock", None)
+        require(self.pid > 0 and self._wait_lock is not None, f"{label} direct-child wait lock is unavailable")
+        with self._wait_lock:
+            first_status = self._peek_unlocked()
+            try:
+                identity = _parse_proc_stat(self.pid, Path(f"/proc/{self.pid}/stat").read_bytes(), label)
+                require(identity["parent_pid"] == os.getpid(), f"{label} is not the directly owned child")
+                require(identity["pgid"] == self.pid and identity["session_id"] == self.pid, f"{label} did not enter its owned process group and session")
+                self.identity = identity
+            except (OSError, SoakReadbackError) as error:
+                # The session created by Popen still pins the intended PGID to
+                # this unreaped child. Later group signals may use that fact as
+                # an emergency fallback, but cleanup cannot be verified.
+                self.identity_error = f"{label} process identity scan failed: {error}"
+            self._peek_unlocked()
+            if first_status is not None:
+                self.return_code = first_status
+        process._allocatbelt_owned_group = self
+
+    def _peek_unlocked(self) -> int | None:
+        _require_waitid_ownership_support()
+        require(not self.reaped and self.process.returncode is None, f"{self.label} direct-child wait ownership was already consumed")
         try:
-            os.killpg(pgid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
+            result = os.waitid(os.P_PID, self.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+        except ChildProcessError as error:
+            raise SoakReadbackError(f"{self.label} direct-child ownership was lost (waitid returned ECHILD)") from error
+        except OSError as error:
+            if error.errno == errno.ECHILD:
+                raise SoakReadbackError(f"{self.label} direct-child ownership was lost (waitid returned ECHILD)") from error
+            raise SoakReadbackError(f"{self.label} cannot observe its unreaped child: {error}") from error
+        if result is None or result.si_pid == 0:
+            return None
+        require(result.si_pid == self.pid, f"{self.label} waitid observed a different child")
+        if result.si_code == getattr(os, "CLD_EXITED", 1):
+            return result.si_status
+        if result.si_code in (getattr(os, "CLD_KILLED", 2), getattr(os, "CLD_DUMPED", 3)):
+            return -result.si_status
+        raise SoakReadbackError(f"{self.label} waitid returned an unsupported child state")
+
+    def observe(self) -> int | None:
+        with self._wait_lock:
+            return self._peek_unlocked()
+
+    def _scan_group_unlocked(self) -> tuple[list[dict[str, Any]], list[dict[str, Any]], str | None]:
+        if self.identity is None:
+            return [], [], self.identity_error or f"{self.label} process identity is unavailable"
+        deadline = time.monotonic() + OWNED_GROUP_SCAN_MAX_SECONDS
+        members: list[dict[str, Any]] = []
+        escaped: list[dict[str, Any]] = []
+        leader_seen = False
+        scanned = 0
+        try:
+            with os.scandir("/proc") as entries:
+                for entry in entries:
+                    if not entry.name.isdecimal():
+                        continue
+                    scanned += 1
+                    if scanned % 32 == 0 and time.monotonic() >= deadline:
+                        raise TimeoutError(f"process table scan exceeded {OWNED_GROUP_SCAN_MAX_SECONDS:g} seconds")
+                    try:
+                        raw = Path(entry.path, "stat").read_bytes()
+                    except FileNotFoundError:
+                        continue
+                    except OSError as error:
+                        raise SoakReadbackError(f"cannot inspect process {entry.name} during {self.label} group scan: {error}") from error
+                    try:
+                        pid = int(entry.name)
+                    except ValueError:
+                        continue
+                    member = _parse_proc_stat(pid, raw, self.label)
+                    classification = _classify_owned_session_member(self.pid, member)
+                    if classification == "foreign":
+                        continue
+                    if pid == self.pid:
+                        require(
+                            member["start_ticks"] == self.identity["start_ticks"]
+                            and member["parent_pid"] == self.identity["parent_pid"]
+                            and member["pgid"] == self.pid
+                            and member["session_id"] == self.pid,
+                            f"{self.label} leader PID/start/parent/group/session identity changed",
+                        )
+                        leader_seen = True
+                    if classification == "owned_group":
+                        members.append(member)
+                    else:
+                        escaped.append(member)
+        except SoakReadbackError as error:
+            return [], [], str(error)
+        except (OSError, TimeoutError) as error:
+            return [], [], f"{self.label} process-group scan failed: {error}"
+        if not leader_seen:
+            return [], [], f"{self.label} unreaped leader was absent from its process-group scan"
+        return members, escaped, None
+
+    @staticmethod
+    def _active_members(members: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        return [member for member in members if member["state"] not in ("Z", "X")]
+
+    def signal_group(
+        self, signum: int,
+    ) -> tuple[list[dict[str, Any]] | None, list[dict[str, Any]] | None, str | None]:
+        """Signal only after a fresh owned waitid check and a guarded /proc scan."""
+        with self._wait_lock:
+            self._peek_unlocked()
+            members, escaped, scan_error = self._scan_group_unlocked()
+            self._peek_unlocked()  # Recheck immediately after scanning, before killpg.
+            active = self._active_members(members) if scan_error is None else None
+            active_escaped = self._active_members(escaped) if scan_error is None else None
+            if scan_error is not None or active:
+                try:
+                    os.killpg(self.pid, signum)
+                    self.last_signal = signum
+                except ProcessLookupError:
+                    pass
+                except OSError as error:
+                    if error.errno != errno.ESRCH:
+                        raise SoakReadbackError(f"{self.label} process-group signal failed: {error}") from error
+            return active, active_escaped, scan_error
+
+    def reap_if_ready(
+        self, *, allow_unverified_group: bool = False,
+    ) -> tuple[int | None, list[dict[str, Any]] | None, list[dict[str, Any]] | None, str | None]:
+        """Reap only after the final guarded group scan; never inspect PGID afterward."""
+        with self._wait_lock:
+            child_status = self._peek_unlocked()
+            if child_status is None:
+                return None, None, None, None
+            members, escaped, scan_error = self._scan_group_unlocked()
+            self._peek_unlocked()  # Must be the last check before final owned waitpid.
+            active = self._active_members(members) if scan_error is None else None
+            active_escaped = self._active_members(escaped) if scan_error is None else None
+            if (active or active_escaped) and not allow_unverified_group:
+                return None, active, active_escaped, None
+            if scan_error is not None and not allow_unverified_group:
+                return None, None, None, scan_error
+            if (active or scan_error is not None) and self.last_signal != signal.SIGKILL:
+                return None, active, active_escaped, scan_error or "process group remained active without a final SIGKILL"
+            try:
+                waited_pid, wait_status = os.waitpid(self.pid, os.WNOHANG)
+            except ChildProcessError as error:
+                raise SoakReadbackError(f"{self.label} direct-child ownership was lost before final waitpid (ECHILD)") from error
+            except OSError as error:
+                raise SoakReadbackError(f"{self.label} final owned waitpid failed: {error}") from error
+            require(waited_pid == self.pid, f"{self.label} exited waitid without a final waitpid status")
+            wait_code = os.waitstatus_to_exitcode(wait_status)
+            require(wait_code == child_status, f"{self.label} waitid and waitpid child statuses differ")
+            self.process.returncode = wait_code
+            self.return_code = wait_code
+            self.reaped = True
+            return wait_code, active, active_escaped, scan_error
 
 
-def _signal_group(pgid: int, signum: int) -> None:
-    try:
-        os.killpg(pgid, signum)
-    except ProcessLookupError:
-        pass
+def _owned_child_exit(process: subprocess.Popen[bytes]) -> int | None:
+    owner = getattr(process, "_allocatbelt_owned_group", None)
+    require(isinstance(owner, _OwnedProcessGroup) and owner.process is process, "application child has no unreaped direct-child owner")
+    return owner.observe()
 
 
 def _close_selector_streams(selector: selectors.BaseSelector) -> None:
@@ -467,23 +672,6 @@ def _close_selector_streams(selector: selectors.BaseSelector) -> None:
             pass
 
 
-def _bounded_reap(process: subprocess.Popen[bytes], label: str) -> str | None:
-    """Try to stop and reap a child without ever waiting without a deadline."""
-    if process.poll() is not None:
-        return None
-    _terminate_group(process.pid, 0.1)
-    try:
-        process.wait(timeout=0.4)
-        return None
-    except subprocess.TimeoutExpired:
-        _signal_group(process.pid, signal.SIGKILL)
-    try:
-        process.wait(timeout=0.5)
-        return None
-    except subprocess.TimeoutExpired:
-        return f"{label} cleanup failed: child was not reaped after bounded SIGKILL"
-
-
 def _run_checked(
     argv: list[str],
     cwd: Path,
@@ -495,7 +683,9 @@ def _run_checked(
 ) -> bytes:
     require(argv and all(type(item) is str for item in argv), f"{label} command is malformed")
     require(0 < timeout <= 120 and 0 < stdout_limit <= MAX_MANIFEST_BYTES and 0 < stderr_limit <= 1024 * 1024, f"{label} bounds are invalid")
+    _require_waitid_ownership_support()
     process: subprocess.Popen[bytes] | None = None
+    owner: _OwnedProcessGroup | None = None
     selector: selectors.BaseSelector | None = None
     old_handlers: dict[int, Any] = {}
     output = {"stdout": bytearray(), "stderr": bytearray()}
@@ -503,6 +693,10 @@ def _run_checked(
     failure: str | None = None
     cleanup_started: float | None = None
     kill_sent = False
+    kill_sent_at: float | None = None
+    term_sent = False
+    term_sent_at: float | None = None
+    hard_cleanup_attempted = False
     cleanup_failure: str | None = None
     received_signal: list[int] = []
 
@@ -515,12 +709,23 @@ def _run_checked(
             failure = reason
         if cleanup_started is None:
             cleanup_started = time.monotonic()
-            if process is not None:
-                _signal_group(process.pid, signal.SIGTERM)
 
     def interrupted(signum: int, _frame: Any) -> None:
         if not received_signal:
             received_signal.append(signum)
+
+    def send_group_signal(signum: int) -> tuple[list[dict[str, Any]] | None, list[dict[str, Any]] | None]:
+        nonlocal cleanup_failure
+        assert owner is not None
+        try:
+            active, escaped, scan_error = owner.signal_group(signum)
+        except SoakReadbackError:
+            raise
+        if scan_error is not None and cleanup_failure is None:
+            cleanup_failure = f"{label} cleanup could not verify its process group: {scan_error}"
+        if escaped and cleanup_failure is None:
+            cleanup_failure = f"{label} cleanup found live same-session processes outside its owned process group"
+        return active, escaped
 
     try:
         for signum in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
@@ -533,6 +738,7 @@ def _run_checked(
             stderr=subprocess.PIPE,
             start_new_session=True,
         )
+        owner = _OwnedProcessGroup(process, label)
         selector = selectors.DefaultSelector()
         assert process.stdout is not None and process.stderr is not None
         streams = {"stdout": process.stdout, "stderr": process.stderr}
@@ -542,37 +748,99 @@ def _run_checked(
         deadline = time.monotonic() + timeout
         if received_signal:
             begin_cleanup(f"{label} interrupted by signal {received_signal[0]}")
-        while selector.get_map() or process.poll() is None:
+        while True:
             if received_signal and failure is None:
                 begin_cleanup(f"{label} interrupted by signal {received_signal[0]}")
             if time.monotonic() >= deadline and failure is None:
                 begin_cleanup(f"{label} exceeded its {timeout:g}-second deadline")
             now = time.monotonic()
-            if process.poll() is not None and cleanup_started is None:
+            child_status = owner.observe()
+            if child_status is not None and cleanup_started is None:
                 # The leader may leave descendants that still hold the pipes.
                 # Give its process group the same bounded cleanup treatment.
                 begin_cleanup()
             if cleanup_started is not None:
-                if not kill_sent and now >= cleanup_started + term_grace_seconds:
-                    _signal_group(process.pid, signal.SIGKILL)
+                if not term_sent:
+                    send_group_signal(signal.SIGTERM)
+                    term_sent = True
+                    term_sent_at = time.monotonic()
+                escalation_at = (term_sent_at if term_sent_at is not None else cleanup_started) + term_grace_seconds
+                if not kill_sent and now >= escalation_at:
+                    send_group_signal(signal.SIGKILL)
                     kill_sent = True
-                hard_deadline = cleanup_started + term_grace_seconds + kill_reap_seconds
+                    kill_sent_at = time.monotonic()
+                hard_deadline = (
+                    kill_sent_at + kill_reap_seconds - OWNED_GROUP_SCAN_MAX_SECONDS
+                    if kill_sent_at is not None
+                    else escalation_at + kill_reap_seconds + 2 * OWNED_GROUP_SCAN_MAX_SECONDS
+                )
                 if now >= hard_deadline:
-                    _signal_group(process.pid, signal.SIGKILL)
+                    if not kill_sent:
+                        send_group_signal(signal.SIGKILL)
+                        kill_sent = True
+                        kill_sent_at = time.monotonic()
+                    hard_cleanup_attempted = True
                     open_streams = list(selector.get_map().values())
                     if open_streams:
-                        cleanup_failure = (
+                        cleanup_failure = cleanup_failure or (
                             f"{label} cleanup failed: {len(open_streams)} capture pipe(s) remained open "
                             "at the hard deadline; output is incomplete"
                         )
                     _close_selector_streams(selector)
-                    if process.poll() is None:
+                    try:
+                        return_code, active, escaped, scan_error = owner.reap_if_ready(allow_unverified_group=True)
+                    except SoakReadbackError as error:
+                        cleanup_failure = f"{cleanup_failure}; {error}" if cleanup_failure else str(error)
+                        break
+                    if return_code is None:
                         child_failure = f"{label} cleanup failed: child was not reaped by its hard deadline"
                         cleanup_failure = f"{cleanup_failure}; {child_failure}" if cleanup_failure else child_failure
+                    if active:
+                        cleanup_failure = cleanup_failure or f"{label} cleanup failed: process-group members remained live after bounded SIGKILL"
+                    if escaped:
+                        cleanup_failure = cleanup_failure or f"{label} cleanup found live same-session processes outside its owned process group"
+                    if scan_error is not None:
+                        cleanup_failure = cleanup_failure or f"{label} cleanup could not verify its process group: {scan_error}"
                     break
+                if child_status is not None and not selector.get_map():
+                    return_code, active, escaped, scan_error = owner.reap_if_ready()
+                    if return_code is not None:
+                        if scan_error is not None:
+                            cleanup_failure = cleanup_failure or f"{label} cleanup could not verify its process group: {scan_error}"
+                        if active:
+                            cleanup_failure = cleanup_failure or f"{label} cleanup failed: live process-group members remained"
+                        if escaped:
+                            cleanup_failure = cleanup_failure or f"{label} cleanup found live same-session processes outside its owned process group"
+                        break
+                    if scan_error is not None:
+                        cleanup_failure = cleanup_failure or f"{label} cleanup could not verify its process group: {scan_error}"
+                    elif escaped and not active:
+                        return_code, active, escaped, scan_error = owner.reap_if_ready(allow_unverified_group=True)
+                        cleanup_failure = cleanup_failure or f"{label} cleanup found live same-session processes outside its owned process group"
+                        if return_code is not None:
+                            break
+            if child_status is not None and not selector.get_map() and cleanup_started is None:
+                # A clean, already-closed capture can be reaped only after the
+                # final guarded group scan proves there are no live descendants.
+                return_code, active, escaped, scan_error = owner.reap_if_ready()
+                if return_code is not None:
+                    break
+                if scan_error is not None:
+                    cleanup_failure = f"{label} cleanup could not verify its process group: {scan_error}"
+                    begin_cleanup(cleanup_failure)
+                elif active:
+                    begin_cleanup()
+                elif escaped:
+                    cleanup_failure = f"{label} cleanup found live same-session processes outside its owned process group"
+                    begin_cleanup(cleanup_failure)
             select_timeout = 0.05
             if cleanup_started is not None:
-                hard_deadline = cleanup_started + term_grace_seconds + kill_reap_seconds
+                escalation_at = (term_sent_at if term_sent_at is not None else cleanup_started) + term_grace_seconds
+                hard_deadline = (
+                    kill_sent_at + kill_reap_seconds - OWNED_GROUP_SCAN_MAX_SECONDS
+                    if kill_sent_at is not None
+                    else escalation_at + kill_reap_seconds + 2 * OWNED_GROUP_SCAN_MAX_SECONDS
+                )
                 select_timeout = min(select_timeout, max(0.0, hard_deadline - now))
             elif failure is None:
                 select_timeout = min(select_timeout, max(0.0, deadline - now))
@@ -593,14 +861,7 @@ def _run_checked(
                 elif failure is None or len(buffer) < limits[name]:
                     remaining = max(0, limits[name] - len(buffer))
                     buffer.extend(block[:remaining])
-        if cleanup_started is None:
-            # Also stop descendants that closed their inherited capture pipes.
-            _terminate_group(process.pid, term_grace_seconds)
-        _signal_group(process.pid, signal.SIGKILL)
-        return_code = process.poll()
-        if return_code is None:
-            _signal_group(process.pid, signal.SIGKILL)
-            cleanup_failure = f"{label} cleanup failed: child was not reaped by its hard deadline"
+        return_code = owner.return_code
         if cleanup_failure is not None:
             raise SoakReadbackError(cleanup_failure)
         if failure is not None:
@@ -617,18 +878,42 @@ def _run_checked(
     finally:
         active_exception = sys.exc_info()[1]
         final_cleanup_failure: str | None = None
-        if process is not None:
-            if cleanup_failure is not None:
-                _signal_group(process.pid, signal.SIGKILL)
-                try:
-                    process.wait(timeout=0)
-                except subprocess.TimeoutExpired:
-                    final_cleanup_failure = f"{label} cleanup failed: child remains unreaped after hard deadline"
-            else:
-                try:
-                    final_cleanup_failure = _bounded_reap(process, label)
-                except OSError as error:
-                    final_cleanup_failure = f"{label} cleanup failed: {error}"
+        if owner is not None and not owner.reaped and not hard_cleanup_attempted:
+            try:
+                # Emergency fallback keeps the known session leader unreaped
+                # while attempting bounded group termination. If wait
+                # ownership has been lost, signal_group fails before killpg.
+                _active, escaped, scan_error = owner.signal_group(signal.SIGTERM)
+                if scan_error is not None:
+                    final_cleanup_failure = f"{label} cleanup could not verify its process group: {scan_error}"
+                if escaped:
+                    final_cleanup_failure = final_cleanup_failure or f"{label} cleanup found live same-session processes outside its owned process group"
+                emergency_deadline = time.monotonic() + 0.1
+                while time.monotonic() < emergency_deadline and owner.observe() is None:
+                    time.sleep(0.01)
+                _active, escaped, scan_error = owner.signal_group(signal.SIGKILL)
+                if scan_error is not None:
+                    final_cleanup_failure = final_cleanup_failure or f"{label} cleanup could not verify its process group: {scan_error}"
+                if escaped:
+                    final_cleanup_failure = final_cleanup_failure or f"{label} cleanup found live same-session processes outside its owned process group"
+                reap_deadline = time.monotonic() + 0.25
+                while time.monotonic() < reap_deadline and owner.observe() is None:
+                    time.sleep(0.01)
+                return_code, active, escaped, scan_error = owner.reap_if_ready(allow_unverified_group=True)
+                if return_code is None:
+                    final_cleanup_failure = final_cleanup_failure or f"{label} cleanup failed: child remains unreaped after bounded SIGKILL"
+                if active:
+                    final_cleanup_failure = final_cleanup_failure or f"{label} cleanup failed: process-group members remained live after bounded SIGKILL"
+                if escaped:
+                    final_cleanup_failure = final_cleanup_failure or f"{label} cleanup found live same-session processes outside its owned process group"
+                if scan_error is not None:
+                    final_cleanup_failure = final_cleanup_failure or f"{label} cleanup could not verify its process group: {scan_error}"
+            except SoakReadbackError as error:
+                final_cleanup_failure = f"{label} cleanup failed: {error}"
+        elif owner is not None and not owner.reaped and hard_cleanup_attempted:
+            final_cleanup_failure = final_cleanup_failure or f"{label} cleanup failed: child remains unreaped after hard SIGKILL deadline"
+        elif process is not None and owner is None:
+            final_cleanup_failure = f"{label} cleanup failed: direct-child ownership was not established"
         if selector is not None:
             try:
                 selector.close()
@@ -3144,63 +3429,89 @@ def launch_process(
     require(command and all(type(arg) is str for arg in command), "launch command is malformed")
     cpu_ids = _parse_cpu_set(cpu_set)
     require(0 < timeout_seconds <= 14_400 and 0 < term_grace_seconds <= 60, "launch timeout is outside its finite bounds")
-    require(not timeout_includes_cleanup or (timeout_from_before_popen and timeout_seconds > term_grace_seconds + 0.75), "whole-process timeout needs a pre-Popen clock and room for bounded cleanup")
+    cleanup_scan_reserve = 3 * OWNED_GROUP_SCAN_MAX_SECONDS
+    require(
+        not timeout_includes_cleanup
+        or (timeout_from_before_popen and timeout_seconds >= term_grace_seconds + 0.75 + cleanup_scan_reserve),
+        "whole-process timeout needs a pre-Popen clock and room for bounded TERM/KILL, group scans, and reap",
+    )
+    _require_waitid_ownership_support()
     for path in (stdout_path, stderr_path, timing_path):
         require(not path.exists() and not path.is_symlink(), f"refusing to replace launch output {path}")
     output_fds: list[int] = []
     executable_fd: int | None = None
     inherited_executable_fd: int | None = None
     process: subprocess.Popen[bytes] | None = None
+    owner: _OwnedProcessGroup | None = None
     received_signal: list[int] = []
+    signal_intents: list[tuple[int, float, bool]] = []
+    external_signal_intents: list[tuple[int, float]] = []
+    cleanup_result_ref: dict[str, Any] | None = None
     old_handlers: dict[int, Any] = {}
     stop_started: float | None = None
     timed_out = False
     limit_exceeded = False
+    term_sent = False
+    term_sent_at: float | None = None
+    kill_sent = False
+    kill_sent_at: float | None = None
+    cleanup_failure: str | None = None
+    hard_cleanup_attempted = False
+    signal_callback_delivered = False
     launched_at_ns: int | None = None
     ended_at_ns: int | None = None
-    kill_sent_at: float | None = None
     kill_reap_seconds = 0.75
     timeout_wall_deadline: float | None = None
     executable_path = Path(command[0]).resolve(strict=True)
-
-    def group_exists(pgid: int) -> bool:
-        try:
-            os.killpg(pgid, 0)
-            return True
-        except ProcessLookupError:
-            return False
-        except PermissionError:
-            return True
-
-    def terminate_group(pgid: int, grace: float) -> None:
-        if not group_exists(pgid):
-            return
-        try:
-            os.killpg(pgid, signal.SIGTERM)
-        except ProcessLookupError:
-            return
-        end = time.monotonic() + grace
-        while time.monotonic() < end and group_exists(pgid):
-            time.sleep(0.02)
-        if group_exists(pgid):
-            try:
-                os.killpg(pgid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
+    result_value: int | dict[str, Any] | None = None
 
     def request_stop(signum: int, _frame: Any) -> None:
-        nonlocal stop_started
-        if received_signal:
+        # Signal handlers record intent only. The main loop performs every
+        # process-group operation while the direct child is still unreaped.
+        when = time.monotonic()
+        external = _frame is not None
+        if external and not external_signal_intents:
+            external_signal_intents.append((signum, when))
+            received_signal.append(signum)
+            if cleanup_result_ref is not None:
+                cleanup_result_ref["received_signal"] = signum
+        if not signal_intents:
+            signal_intents.append((signum, when, external))
+
+    def consume_signal_intent() -> None:
+        nonlocal stop_started, signal_callback_delivered
+        if not signal_intents:
             return
-        received_signal.append(signum)
-        stop_started = time.monotonic()
-        if on_signal is not None and _frame is not None:
-            on_signal(signum)
-        if process is not None:
-            try:
-                os.killpg(process.pid, signal.SIGTERM)
-            except ProcessLookupError:
-                pass
+        _signum, when, _external = signal_intents[0]
+        if stop_started is None:
+            stop_started = when
+        if external_signal_intents and on_signal is not None and not signal_callback_delivered:
+            signal_callback_delivered = True
+            on_signal(external_signal_intents[0][0])
+
+    def signal_owned_group(signum: int) -> tuple[list[dict[str, Any]] | None, list[dict[str, Any]] | None]:
+        nonlocal cleanup_failure
+        assert owner is not None
+        active, escaped, scan_error = owner.signal_group(signum)
+        if scan_error is not None and cleanup_failure is None:
+            cleanup_failure = f"soak launch cleanup could not verify its process group: {scan_error}"
+        if escaped and cleanup_failure is None:
+            cleanup_failure = "soak launch cleanup found live same-session processes outside its owned process group"
+        return active, escaped
+
+    def note_reap_result(
+        return_code: int | None, active: list[dict[str, Any]] | None,
+        escaped: list[dict[str, Any]] | None, scan_error: str | None,
+    ) -> None:
+        nonlocal cleanup_failure
+        if active:
+            cleanup_failure = cleanup_failure or "soak launch cleanup failed: process-group members remained live after bounded SIGKILL"
+        if escaped:
+            cleanup_failure = cleanup_failure or "soak launch cleanup found live same-session processes outside its owned process group"
+        if scan_error is not None:
+            cleanup_failure = cleanup_failure or f"soak launch cleanup could not verify its process group: {scan_error}"
+        if return_code is None and owner is not None and owner.reaped:
+            cleanup_failure = cleanup_failure or "soak launch cleanup failed: direct-child status was not captured"
 
     try:
         for path in (stdout_path, stderr_path, timing_path):
@@ -3244,18 +3555,27 @@ def launch_process(
             pass_fds=(inherited_executable_fd,),
             start_new_session=True,
         )
+        owner = _OwnedProcessGroup(process, "soak launch")
+        process._allocatbelt_executable_binding = {
+            "fd_reference": executable_reference,
+            "device": executable_info.st_dev,
+            "inode": executable_info.st_ino,
+            "size": executable_info.st_size,
+            "sha256": executable_sha256,
+        }
         if on_started is not None:
             on_started(process, executable_path, executable_sha256, executable_info, cpu_ids, cwd, environment)
         if timeout_wall_deadline is None:
             deadline = time.monotonic() + timeout_seconds
         elif timeout_includes_cleanup:
-            deadline = timeout_wall_deadline - term_grace_seconds - kill_reap_seconds
+            deadline = timeout_wall_deadline - term_grace_seconds - kill_reap_seconds - cleanup_scan_reserve
         else:
             deadline = timeout_wall_deadline
         while True:
+            consume_signal_intent()
             now = time.monotonic()
             remaining = deadline - now
-            if remaining <= 0 and not received_signal:
+            if remaining <= 0 and not signal_intents:
                 timed_out = True
                 request_stop(signal.SIGTERM, None)
             for monitored_path, maximum in monitored_files:
@@ -3266,26 +3586,76 @@ def launch_process(
                 require(stat.S_ISREG(info.st_mode), f"monitored output is not a regular file: {monitored_path.name}")
                 if info.st_size > maximum:
                     limit_exceeded = True
-                    if not received_signal:
+                    if not signal_intents:
                         request_stop(signal.SIGTERM, None)
             if monitor is not None:
                 monitor(process)
+            consume_signal_intent()
+            child_status = owner.observe()
+            now = time.monotonic()
+            if stop_started is None and child_status is not None:
+                return_code, active, escaped, scan_error = owner.reap_if_ready()
+                if return_code is not None:
+                    break
+                if scan_error is not None or active or escaped:
+                    if scan_error is not None:
+                        cleanup_failure = f"soak launch cleanup could not verify its process group: {scan_error}"
+                    elif escaped:
+                        cleanup_failure = "soak launch cleanup found live same-session processes outside its owned process group"
+                    stop_started = now
             if stop_started is not None:
-                escalation_at = stop_started + term_grace_seconds
-                if kill_sent_at is None and now >= escalation_at:
-                    _signal_group(process.pid, signal.SIGKILL)
-                    kill_sent_at = now
-                hard_cleanup_deadline = escalation_at + kill_reap_seconds
-                if kill_sent_at is not None and now >= hard_cleanup_deadline:
-                    raise SoakReadbackError("soak launch cleanup failed: child was not reaped by its hard SIGKILL deadline")
+                if not term_sent:
+                    signal_owned_group(signal.SIGTERM)
+                    term_sent = True
+                    term_sent_at = time.monotonic()
+                escalation_at = (term_sent_at if term_sent_at is not None else stop_started) + term_grace_seconds
+                if not kill_sent and now >= escalation_at:
+                    signal_owned_group(signal.SIGKILL)
+                    kill_sent = True
+                    kill_sent_at = time.monotonic()
+                hard_cleanup_deadline = (
+                    kill_sent_at + kill_reap_seconds - OWNED_GROUP_SCAN_MAX_SECONDS
+                    if kill_sent_at is not None
+                    else escalation_at + kill_reap_seconds + 2 * OWNED_GROUP_SCAN_MAX_SECONDS
+                )
+                child_status = owner.observe()
+                if child_status is not None:
+                    return_code, active, escaped, scan_error = owner.reap_if_ready()
+                    if return_code is not None:
+                        note_reap_result(return_code, active, escaped, scan_error)
+                        break
+                    if scan_error is not None:
+                        cleanup_failure = cleanup_failure or f"soak launch cleanup could not verify its process group: {scan_error}"
+                    elif escaped and not active:
+                        return_code, active, escaped, scan_error = owner.reap_if_ready(allow_unverified_group=True)
+                        note_reap_result(return_code, active, escaped, scan_error)
+                        if return_code is not None:
+                            break
+                    if active and not kill_sent and now >= escalation_at:
+                        signal_owned_group(signal.SIGKILL)
+                        kill_sent = True
+                if now >= hard_cleanup_deadline:
+                    if not kill_sent:
+                        signal_owned_group(signal.SIGKILL)
+                        kill_sent = True
+                        kill_sent_at = time.monotonic()
+                    hard_cleanup_attempted = True
+                    return_code, active, escaped, scan_error = owner.reap_if_ready(allow_unverified_group=True)
+                    note_reap_result(return_code, active, escaped, scan_error)
+                    if return_code is None:
+                        cleanup_failure = cleanup_failure or "soak launch cleanup failed: child was not reaped by its hard SIGKILL deadline"
+                    break
             remaining = deadline - now
             if stop_started is not None:
-                remaining = min(remaining, max(0.0, stop_started + term_grace_seconds + kill_reap_seconds - now))
-            try:
-                return_code = process.wait(timeout=max(0.01, min(max(remaining, 0.0), 0.1)))
-                break
-            except subprocess.TimeoutExpired:
-                continue
+                cleanup_deadline = (
+                    kill_sent_at + kill_reap_seconds - OWNED_GROUP_SCAN_MAX_SECONDS
+                    if kill_sent_at is not None
+                    else (term_sent_at if term_sent_at is not None else stop_started) + term_grace_seconds + kill_reap_seconds + 2 * OWNED_GROUP_SCAN_MAX_SECONDS
+                )
+                remaining = min(remaining, max(0.0, cleanup_deadline - now))
+            time.sleep(min(0.05, max(0.005, remaining)))
+        require(owner.reaped and owner.return_code is not None, "soak launch did not obtain a verified owned child status")
+        return_code = owner.return_code
         os.fsync(stdout_fd)
         os.fsync(stderr_fd)
         timing_record = {
@@ -3302,22 +3672,13 @@ def launch_process(
         final_executable_sha256, final_executable_info = _hash_open_executable(
             executable_fd, executable_path, "launched soak binary after execution"
         )
+        consume_signal_intent()
         require(final_executable_sha256 == executable_sha256, "launched binary bytes changed while the child ran")
         require(_fingerprint(final_executable_info) == _fingerprint(executable_info), "launched binary descriptor identity changed while the child ran")
-        if timed_out:
-            status = 124
-        elif limit_exceeded:
-            status = 125
-        elif received_signal:
-            status = 128 + received_signal[0]
-        elif return_code < 0:
-            status = 128 + (-return_code)
-        else:
-            status = return_code
         if return_details:
             launch_environment = dict(os.environ) if environment is None else dict(environment)
-            return {
-                "status": status,
+            result_value = {
+                "status": None,
                 "child_return_code": return_code,
                 "timed_out": timed_out,
                 "artifact_budget_exceeded": limit_exceeded,
@@ -3338,45 +3699,78 @@ def launch_process(
                 "cwd": str(cwd.resolve(strict=True)) if cwd is not None else str(Path.cwd()),
                 "cpu_set": cpu_set,
             }
-        return status
+        else:
+            result_value = return_code
+    except SoakReadbackError:
+        raise
     except OSError as error:
         raise SoakReadbackError(f"cannot launch soak process: {error}") from error
     finally:
         active_exception = sys.exc_info()[1]
-        cleanup_failure: str | None = None
-        if process is not None:
+        final_cleanup_failure: str | None = cleanup_failure
+        if process is not None and owner is not None and not owner.reaped and not hard_cleanup_attempted:
             try:
-                # Always clean the process group, even if its leader exited
-                # while a descendant still holds the original group ID.
-                if process.poll() is None and kill_sent_at is not None:
-                    _signal_group(process.pid, signal.SIGKILL)
-                    try:
-                        process.wait(timeout=0)
-                    except subprocess.TimeoutExpired:
-                        cleanup_failure = "soak launch cleanup failed: child remains unreaped after the hard deadline"
-                elif process.poll() is not None:
-                    terminate_group(process.pid, min(term_grace_seconds, 0.2))
-                else:
-                    _terminate_group(process.pid, 0.1)
-                    cleanup_failure = _bounded_reap(process, "soak launch")
-            except BaseException as error:
-                cleanup_failure = cleanup_failure or f"soak launch cleanup failed: {error}"
+                # This path handles callback, scan, and I/O exceptions. The
+                # direct child stays unreaped while the known session receives
+                # bounded TERM/KILL attempts. Lost wait ownership stops here.
+                _active, escaped, scan_error = owner.signal_group(signal.SIGTERM)
+                if scan_error is not None:
+                    final_cleanup_failure = final_cleanup_failure or f"soak launch cleanup could not verify its process group: {scan_error}"
+                if escaped:
+                    final_cleanup_failure = final_cleanup_failure or "soak launch cleanup found live same-session processes outside its owned process group"
+                emergency_deadline = time.monotonic() + min(term_grace_seconds, 0.2)
+                while time.monotonic() < emergency_deadline and owner.observe() is None:
+                    time.sleep(0.01)
+                _active, escaped, scan_error = owner.signal_group(signal.SIGKILL)
+                if scan_error is not None:
+                    final_cleanup_failure = final_cleanup_failure or f"soak launch cleanup could not verify its process group: {scan_error}"
+                if escaped:
+                    final_cleanup_failure = final_cleanup_failure or "soak launch cleanup found live same-session processes outside its owned process group"
+                reap_deadline = time.monotonic() + kill_reap_seconds
+                while time.monotonic() < reap_deadline and owner.observe() is None:
+                    time.sleep(0.01)
+                return_code, active, escaped, scan_error = owner.reap_if_ready(allow_unverified_group=True)
+                if return_code is None:
+                    final_cleanup_failure = final_cleanup_failure or "soak launch cleanup failed: child remains unreaped after bounded SIGKILL"
+                if active:
+                    final_cleanup_failure = final_cleanup_failure or "soak launch cleanup failed: process-group members remained live after bounded SIGKILL"
+                if escaped:
+                    final_cleanup_failure = final_cleanup_failure or "soak launch cleanup found live same-session processes outside its owned process group"
+                if scan_error is not None:
+                    final_cleanup_failure = final_cleanup_failure or f"soak launch cleanup could not verify its process group: {scan_error}"
+            except SoakReadbackError as error:
+                final_cleanup_failure = f"soak launch cleanup failed: {error}"
+        elif process is not None and owner is not None and not owner.reaped and hard_cleanup_attempted:
+            final_cleanup_failure = final_cleanup_failure or "soak launch cleanup failed: child remains unreaped after hard SIGKILL deadline"
+        elif process is not None and owner is None:
+            final_cleanup_failure = final_cleanup_failure or "soak launch cleanup failed: direct-child ownership was not established"
+        cleanup_result: dict[str, Any] | None = None
+        if process is not None:
             if on_cleanup is not None:
                 cleanup_result = {
                     "schema": "allocatbelt.application-soak-process-cleanup.v1",
-                    "status": "failed" if cleanup_failure is not None else "verified",
+                    "status": "failed" if final_cleanup_failure is not None or owner is None or not owner.reaped else "verified",
                     "pid": process.pid,
                     "return_code": process.returncode,
                     "received_signal": received_signal[0] if received_signal else None,
-                    "cleanup_error": cleanup_failure,
+                    "cleanup_error": final_cleanup_failure,
                 }
+                cleanup_result_ref = cleanup_result
                 try:
                     on_cleanup(cleanup_result)
                 except BaseException as error:
-                    if cleanup_failure is None:
-                        cleanup_failure = f"soak launch cleanup-result callback failed: {error}"
+                    final_cleanup_failure = final_cleanup_failure or f"soak launch cleanup-result callback failed: {error}"
+        try:
+            consume_signal_intent()
+        except BaseException as error:
+            final_cleanup_failure = final_cleanup_failure or f"soak launch signal callback failed: {error}"
+        if cleanup_result is not None:
+            cleanup_result["received_signal"] = received_signal[0] if received_signal else None
         for signum, old_handler in old_handlers.items():
-            signal.signal(signum, old_handler)
+            try:
+                signal.signal(signum, old_handler)
+            except (OSError, ValueError) as error:
+                final_cleanup_failure = f"{final_cleanup_failure}; signal handler restore failed: {error}" if final_cleanup_failure else f"signal handler restore failed: {error}"
         for fd in output_fds:
             try:
                 os.close(fd)
@@ -3388,10 +3782,35 @@ def launch_process(
                     os.close(fd)
                 except OSError:
                     pass
-        if cleanup_failure is not None:
+        try:
+            consume_signal_intent()
+        except BaseException as error:
+            final_cleanup_failure = final_cleanup_failure or f"soak launch signal callback failed: {error}"
+        if cleanup_result is not None:
+            cleanup_result["received_signal"] = received_signal[0] if received_signal else None
+        if final_cleanup_failure is not None:
             if active_exception is None:
-                raise SoakReadbackError(cleanup_failure)
-            raise SoakReadbackError(f"{active_exception}; {cleanup_failure}") from active_exception
+                raise SoakReadbackError(final_cleanup_failure)
+            raise SoakReadbackError(f"{active_exception}; {final_cleanup_failure}") from active_exception
+
+    require(result_value is not None, "soak launch completed without a return value")
+    final_signal = received_signal[0] if received_signal else None
+    if timed_out:
+        final_status = 124
+    elif limit_exceeded:
+        final_status = 125
+    elif final_signal is not None:
+        final_status = 128 + final_signal
+    elif return_code < 0:
+        final_status = 128 + (-return_code)
+    else:
+        final_status = return_code
+    if return_details:
+        assert isinstance(result_value, dict)
+        result_value["status"] = final_status
+        result_value["received_signal"] = final_signal
+        return result_value
+    return final_status
 
 
 def command_launch(args: argparse.Namespace) -> int:
@@ -3513,7 +3932,7 @@ def _make_pressure_launch_binding(
         environment_raw = Path(f"/proc/{pid}/environ").read_bytes()
     except OSError as error:
         raise SoakReadbackError(f"cannot capture the application process launch identity: {error}") from error
-    require(len(environment_raw) <= 16 * 1024 * 1024, "application environment exceeds its launch-binding bound")
+    require(len(environment_raw) <= MAX_ENVIRONMENT_BYTES, "application environment exceeds its launch-binding bound")
     env_map: dict[str, str] = {}
     for entry in environment_raw.split(b"\0"):
         if not entry:
@@ -3548,6 +3967,80 @@ def _make_pressure_launch_binding(
         "process": process_value,
     }
     return {**body, "launch_binding_sha256": hashlib.sha256(canonical_bytes(body)).hexdigest()}
+
+
+def _make_application_launch_attestation(
+    process: subprocess.Popen[bytes],
+    expected_argv: list[str],
+    expected_environment: dict[str, str],
+    execution_kind: str,
+    process_binding: dict[str, Any],
+) -> dict[str, Any]:
+    """Seal the direct APP Popen argv, full environment, and executable fd."""
+    require(execution_kind in ("normal_app", "timed_soak"), "pressure application descriptor has an unknown execution kind")
+    pid = process.pid
+    try:
+        command_raw = Path(f"/proc/{pid}/cmdline").read_bytes()
+        environment_raw = Path(f"/proc/{pid}/environ").read_bytes()
+        executable_path = os.readlink(f"/proc/{pid}/exe")
+        cwd_path = os.readlink(f"/proc/{pid}/cwd")
+    except OSError as error:
+        raise SoakReadbackError(f"cannot capture direct application argv/environment identity: {error}") from error
+    require(len(command_raw) <= 1024 * 1024, "application command line exceeds its launch attestation bound")
+    require(len(environment_raw) <= MAX_ENVIRONMENT_BYTES, "application environment exceeds its launch attestation bound")
+    require(command_raw.endswith(b"\0"), "application command line is not NUL terminated")
+    try:
+        actual_argv = [item.decode("utf-8", "strict") for item in command_raw[:-1].split(b"\0")]
+        actual_environment: dict[str, str] = {}
+        for entry in environment_raw.split(b"\0"):
+            if not entry:
+                continue
+            key_raw, separator, value_raw = entry.partition(b"=")
+            require(bool(separator) and bool(key_raw), "application environment contains a malformed entry")
+            key = key_raw.decode("ascii", "strict")
+            require(key not in actual_environment, "application environment repeats a variable")
+            actual_environment[key] = value_raw.decode("utf-8", "strict")
+    except (UnicodeError, SoakReadbackError) as error:
+        raise SoakReadbackError(f"application argv/environment is not canonical UTF-8: {error}") from error
+    require(actual_argv == expected_argv, "actual APP argv differs from the frozen member descriptor")
+    require(actual_environment == expected_environment, "actual APP environment differs from the complete frozen member environment")
+    descriptor_identity = getattr(process, "_allocatbelt_executable_binding", None)
+    require(type(descriptor_identity) is dict, "direct APP Popen omitted its verified executable fd identity")
+    require(
+        set(descriptor_identity) == {"fd_reference", "device", "inode", "size", "sha256"}
+        and descriptor_identity["sha256"] == process_binding["process"]["executable_sha256"],
+        "direct APP executable fd identity differs from the pressure launch record",
+    )
+    actual_start_ticks = _proc_start_ticks(pid)
+    require(actual_start_ticks == process_binding["process"]["start_ticks"], "direct APP PID/start identity changed during launch attestation")
+    command_sha = hashlib.sha256(canonical_bytes(actual_argv)).hexdigest()
+    environment_sha = hashlib.sha256(canonical_bytes(actual_environment)).hexdigest()
+    body = {
+        "schema": "allocatbelt.application-pressure-app-launch-attestation.v1",
+        "execution_kind": execution_kind,
+        "process": {
+            "pid": pid,
+            "start_ticks": actual_start_ticks,
+            "executable_path": executable_path.removesuffix(" (deleted)"),
+            "executable_sha256": descriptor_identity["sha256"],
+            "executable_device": descriptor_identity["device"],
+            "executable_inode": descriptor_identity["inode"],
+            "executable_size": descriptor_identity["size"],
+            "executable_fd_reference": descriptor_identity["fd_reference"],
+            "cwd": cwd_path,
+            "argv": actual_argv,
+            "argv_sha256": command_sha,
+            "cmdline_raw_sha256": hashlib.sha256(command_raw).hexdigest(),
+            "environment_sha256": environment_sha,
+            "environment_raw_sha256": hashlib.sha256(environment_raw).hexdigest(),
+        },
+    }
+    require(
+        body["process"]["executable_path"] == process_binding["process"]["executable_path"]
+        and body["process"]["cwd"] == process_binding["process"]["cwd"],
+        "direct APP procfs executable or cwd differs from the pressure launch identity",
+    )
+    return {**body, "attestation_sha256": hashlib.sha256(canonical_bytes(body)).hexdigest()}
 
 
 def _read_pressure_ready(path: Path, pressure_recipe: dict[str, Any], expected_recipe_sha: str, expected_condition_sha: str) -> tuple[dict[str, Any], str]:
@@ -3630,17 +4123,26 @@ def _require_source_v5_pressure_prefix(
         before = os.fstat(descriptor)
         require(stat.S_ISREG(before.st_mode) and before.st_size <= MAX_TERMINAL_BYTES, "SourceV5 pressure events are not a bounded regular file")
         records: list[dict[str, Any]] = []
+        prefix_raw = bytearray()
         with os.fdopen(descriptor, "rb", closefd=False) as stream:
             for index in range(3):
                 raw_line = stream.readline(2 * 1024 * 1024 + 1)
                 require(raw_line and raw_line.endswith(b"\n") and len(raw_line) <= 2 * 1024 * 1024, f"SourceV5 pressure event prefix line {index} is missing or oversized")
+                prefix_raw.extend(raw_line)
                 value = _read_json_raw(raw_line, f"SourceV5 pressure event prefix line {index}")
                 require(raw_line == canonical_bytes(value), f"SourceV5 pressure event prefix line {index} is not canonical")
                 records.append(value)
+        prefix_again = os.pread(descriptor, len(prefix_raw), 0)
         after = os.fstat(descriptor)
         after_path = events_path.lstat()
-        fingerprint = lambda item: (item.st_dev, item.st_ino, item.st_mode, item.st_size, item.st_mtime_ns, item.st_ctime_ns)
-        require(fingerprint(before) == fingerprint(after) == fingerprint(after_path), "SourceV5 pressure events changed while checking their durable prefix")
+        identity = lambda item: (item.st_dev, item.st_ino, stat.S_IFMT(item.st_mode))
+        require(
+            identity(before) == identity(after) == identity(after_path)
+            and after.st_size >= before.st_size >= len(prefix_raw)
+            and after.st_size <= MAX_TERMINAL_BYTES
+            and prefix_again == bytes(prefix_raw),
+            "SourceV5 pressure events changed while checking their durable prefix",
+        )
     finally:
         os.close(descriptor)
 
@@ -3677,31 +4179,90 @@ def _require_source_v5_pressure_prefix(
     return ready, ready_sha
 
 
-def _validate_pressure_proof(artifact_dir: Path, audit: dict[str, Any]) -> dict[str, Any]:
-    pressure_info = audit["source"].get("pressure_recipe")
-    require(type(pressure_info) is dict, "SourceV5 pressure proof is missing its frozen recipe")
-    pressure_dir = artifact_dir / "pressure"
+def validate_pressure_proof_inputs(
+    pressure_dir: Path,
+    pressure_info: dict[str, Any],
+    artifact_pins: dict[str, str],
+    readiness_thresholds: dict[str, Any],
+    proof_path: Path,
+) -> dict[str, Any]:
+    """Validate one completed pressure directory using explicit frozen inputs."""
+    require(type(pressure_info) is dict, "pressure proof is missing its frozen recipe inputs")
+    required = {
+        "value", "reader", "recipe_sha256", "raw_sha256", "condition_sha256", "recipe_path",
+    }
+    require(required <= set(pressure_info), "pressure proof inputs omit a frozen recipe pin or reader")
+    pin_keys = {"recipe", "run", "events", "launch", "process_binding", "ready"}
+    exact_object(artifact_pins, pin_keys, "pressure proof artifact pins")
+    for key, value in artifact_pins.items():
+        digest(value, f"pressure proof {key} raw SHA-256")
+    require(artifact_pins["recipe"] == pressure_info["recipe_sha256"], "pressure proof recipe pin differs from the validated recipe")
+    require(type(readiness_thresholds) is dict, "pressure readiness thresholds are malformed")
     require(pressure_dir.resolve(strict=True) == pressure_dir, "pressure artifact directory is a symlink or alias")
-    expected = {"recipe": pressure_info["recipe_sha256"], **_pressure_output_hashes(pressure_dir)}
-    _require_source_v5_pressure_prefix(pressure_dir, pressure_info, expected["ready"])
+    actual_artifacts = _pressure_output_hashes(pressure_dir)
+    require({key: artifact_pins[key] for key in actual_artifacts} == actual_artifacts, "pressure proof raw artifact pins differ from the completed pressure directory")
+    expected = {"recipe": pressure_info["recipe_sha256"], **artifact_pins}
+    _require_source_v5_pressure_prefix(pressure_dir, pressure_info, artifact_pins["ready"])
     try:
         proof = pressure_info["reader"].verify_pressure(
-            Path(audit["recipe"]["pressure"]["recipe"]["path"]),
+            Path(pressure_info["recipe_path"]),
             pressure_info["recipe_sha256"], pressure_dir, expected,
         )
     except (OSError, TypeError, ValueError, KeyError) as error:
         raise SoakReadbackError(f"captured pressure readback rejected its raw process-bound artifacts: {error}") from error
-    condition = audit["recipe"]["qualification"]["pressure_condition"]
-    require(proof["sample_count"] >= condition["readiness_thresholds"]["minimum_ready_samples"], "pressure proof has fewer measured ready samples than SourceV5 requires")
-    require(proof["application_overlap_nanoseconds"] >= condition["readiness_thresholds"]["minimum_overlap_seconds"] * 1_000_000_000, "pressure proof overlap is below SourceV5 readiness requirement")
+    minimum_samples = uint(
+        readiness_thresholds.get("minimum_ready_samples"),
+        "pressure minimum ready samples", positive=True,
+    )
+    minimum_overlap_seconds = uint(
+        readiness_thresholds.get("minimum_overlap_seconds"),
+        "pressure minimum overlap seconds", positive=True,
+    )
+    require(proof["sample_count"] >= minimum_samples, "pressure proof has fewer measured ready samples than SourceV5 requires")
+    require(proof["application_overlap_nanoseconds"] >= minimum_overlap_seconds * 1_000_000_000, "pressure proof overlap is below SourceV5 readiness requirement")
     proof_raw = canonical_bytes(proof)
-    proof_path = artifact_dir / "pressure-readback.json"
     if proof_path.exists():
         existing, existing_sha, existing_raw = read_json(proof_path, "external pressure validation proof", MAX_RECEIPT_BYTES)
         require(existing_raw == proof_raw, "saved external pressure proof differs from the captured independent validator")
         return {"proof": existing, "raw_sha256": existing_sha}
     proof_sha = _write_exclusive_json(proof_path, proof)
     return {"proof": proof, "raw_sha256": proof_sha}
+
+
+def _validate_pressure_proof(artifact_dir: Path, audit: dict[str, Any]) -> dict[str, Any]:
+    pressure_info = audit["source"].get("pressure_recipe")
+    require(type(pressure_info) is dict, "SourceV5 pressure proof is missing its frozen recipe")
+    recipe_pin = audit["recipe"]["pressure"]["recipe"]
+    require(type(recipe_pin) is dict, "SourceV5 parent audit is missing its pressure recipe pin")
+    require(
+        pressure_info.get("raw_sha256") == recipe_pin.get("raw_sha256")
+        and pressure_info.get("recipe_sha256") == recipe_pin.get("semantic_sha256"),
+        "SourceV5 pressure proof recipe identity differs from its parent pin",
+    )
+    pressure_info = _legacy_pressure_info_for_postflight(pressure_info, recipe_pin)
+    condition = audit["recipe"]["qualification"]["pressure_condition"]
+    artifact_pins = {"recipe": pressure_info["recipe_sha256"], **_pressure_output_hashes(artifact_dir / "pressure")}
+    return validate_pressure_proof_inputs(
+        artifact_dir / "pressure",
+        pressure_info,
+        artifact_pins,
+        condition["readiness_thresholds"],
+        artifact_dir / "pressure-readback.json",
+    )
+
+
+def _legacy_pressure_info_for_postflight(
+    pressure_info: dict[str, Any], recipe_pin: dict[str, Any],
+) -> dict[str, Any]:
+    """Adapt the accepted V2 audit summary to the shared explicit proof API."""
+    exact_object(recipe_pin, {"path", "raw_sha256", "semantic_sha256"}, "SourceV5 parent pressure recipe pin")
+    require(
+        pressure_info.get("raw_sha256") == recipe_pin["raw_sha256"]
+        and pressure_info.get("recipe_sha256") == recipe_pin["semantic_sha256"],
+        "SourceV5 pressure proof recipe identity differs from its parent pin",
+    )
+    adapted = {**pressure_info, "recipe_path": recipe_pin["path"]}
+    return adapted
 
 
 def _tail_text(path: Path, maximum: int = 8192) -> str:
@@ -3720,7 +4281,7 @@ def _require_pressure_live_while_application_runs(
     pressure_process: subprocess.Popen[bytes], app_process: subprocess.Popen[bytes], stderr_path: Path,
 ) -> None:
     pressure_exit = pressure_process.poll()
-    if pressure_exit is not None and app_process.poll() is None:
+    if pressure_exit is not None and _owned_child_exit(app_process) is None:
         raise SoakReadbackError(
             f"pressure driver exited {pressure_exit} while the soak process was live; stderr tail: {_tail_text(stderr_path)}"
         )
@@ -4369,8 +4930,21 @@ def _wait_pressure_ready(
     raise SoakReadbackError(f"pressure did not produce an independently measured, recipe-pinned readiness marker before its startup deadline{reason}; stderr tail: {_tail_text(diagnostic_stderr)}")
 
 
-def command_launch_v2(args: argparse.Namespace, audit: dict[str, Any], preflight: dict[str, Any], output_dir: Path) -> int:
+def _run_pressure_supervisor_impl(args: argparse.Namespace, audit: dict[str, Any], preflight: dict[str, Any], output_dir: Path) -> int:
     descriptor = audit["launch_descriptor"]
+    require(descriptor.get("execution_kind") in ("normal_app", "timed_soak"), "pressure supervisor requires an explicit normal_app or timed_soak descriptor")
+    supervision_state = descriptor.setdefault("_supervision_state", {})
+    supervision_state.update({
+        "status": None,
+        "interrupted": False,
+        "pressure_cleanup": "not_started",
+        "application_cleanup": "not_started",
+        "application_binding": None,
+        "application_attestation": None,
+        "pressure_ready_sha256": None,
+        "pressure_proof": None,
+        "details": None,
+    })
     command = args.command
     if command and command[0] == "--":
         command = command[1:]
@@ -4378,7 +4952,7 @@ def command_launch_v2(args: argparse.Namespace, audit: dict[str, Any], preflight
     require(descriptor["launch_enabled"] is True, "external-pressure launch descriptor is disabled")
     expected_app_timeout = audit["source"]["application_supervision"]["application_wall_timeout_seconds"]
     require(args.timeout_seconds == expected_app_timeout == descriptor["application_wall_timeout_seconds"], "external-pressure app timeout differs from the independently derived complete wall bound")
-    require(args.term_grace_seconds == 1.5, "external-pressure runner TERM grace differs from the frozen app wall-bound formula")
+    require(args.term_grace_seconds == descriptor["term_grace_seconds"], "pressure APP TERM grace differs from its explicit descriptor")
     pressure_info = audit["source"]["pressure_recipe"]
     pressure_recipe = pressure_info["value"]
     pressure_recipe_path = Path(descriptor["pressure_recipe_path"])
@@ -4390,8 +4964,8 @@ def command_launch_v2(args: argparse.Namespace, audit: dict[str, Any], preflight
     pressure_dir = Path(descriptor["pressure_output_dir"])
     pressure_dir.mkdir(mode=0o700)
     os.chmod(pressure_dir, 0o700)
-    pressure_stdout = output_dir / "pressure-driver.stdout.log"
-    pressure_stderr = output_dir / "pressure-driver.stderr.log"
+    pressure_stdout = Path(descriptor["pressure_stdout_path"])
+    pressure_stderr = Path(descriptor["pressure_stderr_path"])
     signal_handlers, supervisor_signal = _install_external_supervisor_signal_handlers()
     pressure_out_fd = -1
     pressure_err_fd = -1
@@ -4425,12 +4999,35 @@ def command_launch_v2(args: argparse.Namespace, audit: dict[str, Any], preflight
             require(result["schema"] == "allocatbelt.application-soak-process-cleanup.v1", "application cleanup result schema differs")
             require(result["status"] in ("verified", "failed"), "application cleanup result status differs")
             application_cleanup = result["status"]
+            supervision_state["application_cleanup"] = result
+            callback = descriptor.get("_on_cleanup")
+            if callback is not None:
+                callback(result)
 
         def finish_external_interruption(signum: int) -> int:
-            status = _write_external_supervisor_interruption(
-                output_dir, audit, signum, pressure_process, pressure_start_ticks,
-                application_cleanup, pressure_cleanup,
-            )
+            callback = descriptor.get("_on_interrupted")
+            if callback is None:
+                status = _write_external_supervisor_interruption(
+                    output_dir, audit, signum, pressure_process, pressure_start_ticks,
+                    application_cleanup, pressure_cleanup,
+                )
+            else:
+                status = callback({
+                    "signal": signum,
+                    "pressure_pid": None if pressure_process is None else pressure_process.pid,
+                    "pressure_start_ticks": pressure_start_ticks,
+                    "pressure_return_code": None if pressure_process is None else pressure_process.poll(),
+                    "application_cleanup": application_cleanup,
+                    "pressure_cleanup": pressure_cleanup,
+                    "workers": list(pressure_workers.values()),
+                })
+            supervision_state.update({
+                "status": status,
+                "interrupted": True,
+                "pressure_cleanup": pressure_cleanup,
+                "application_cleanup_status": application_cleanup,
+                "received_signal": signum,
+            })
             if application_cleanup not in ("not_started", "verified") or pressure_cleanup not in ("not_started", "verified"):
                 raise SoakReadbackError(
                     f"external signal {signum} was recorded, but cleanup is {application_cleanup=} {pressure_cleanup=}"
@@ -4442,6 +5039,7 @@ def command_launch_v2(args: argparse.Namespace, audit: dict[str, Any], preflight
             if pressure_process is None or pressure_stopped:
                 return
             pressure_cleanup = "unverified"
+            supervision_state["pressure_cleanup"] = pressure_cleanup
             try:
                 _stop_pressure_session(
                     pressure_process, pressure_start_ticks, driver_path,
@@ -4452,9 +5050,17 @@ def command_launch_v2(args: argparse.Namespace, audit: dict[str, Any], preflight
                 )
             except BaseException:
                 pressure_cleanup = "failed"
+                supervision_state["pressure_cleanup"] = pressure_cleanup
                 pressure_stopped = True
                 raise
             pressure_cleanup = "verified"
+            supervision_state["pressure_cleanup"] = pressure_cleanup
+            supervision_state["pressure_driver"] = {
+                "pid": pressure_process.pid,
+                "start_ticks": pressure_start_ticks,
+                "return_code": pressure_process.returncode,
+            }
+            supervision_state["pressure_worker_sessions"] = list(pressure_workers.values())
             pressure_stopped = True
 
         pressure_env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "LANG": "C", "LC_ALL": "C"}
@@ -4510,6 +5116,7 @@ def command_launch_v2(args: argparse.Namespace, audit: dict[str, Any], preflight
             interrupt_check=check_supervisor_interruption,
         )
         check_supervisor_interruption()
+        _require_source_v5_pressure_prefix(pressure_dir, pressure_info, ready_sha)
         require(set(pressure_workers) == _expected_pressure_worker_keys(pressure_recipe["schedule"]), "pressure readiness arrived before every isolated worker session was captured")
 
         def bind_started_process(
@@ -4526,8 +5133,18 @@ def command_launch_v2(args: argparse.Namespace, audit: dict[str, Any], preflight
             binding = _make_pressure_launch_binding(
                 process, executable_path, executable_sha, cpu_ids, cwd, environment, pressure_recipe,
             )
+            attestation = _make_application_launch_attestation(
+                process, descriptor["argv"], descriptor["environment"],
+                descriptor["execution_kind"], binding,
+            )
             actual_binding_sha = _atomic_json_publish(Path(descriptor["pressure_launch_path"]), binding)
             require(actual_binding_sha == hashlib.sha256(canonical_bytes(binding)).hexdigest(), "atomically published pressure launch record digest differs")
+            supervision_state["application_binding"] = binding
+            supervision_state["application_binding_sha256"] = actual_binding_sha
+            supervision_state["application_attestation"] = attestation
+            callback = descriptor.get("_on_started")
+            if callback is not None:
+                callback(attestation)
 
         def monitor_pressure(app_process: subprocess.Popen[bytes]) -> None:
             check_supervisor_interruption()
@@ -4538,18 +5155,12 @@ def command_launch_v2(args: argparse.Namespace, audit: dict[str, Any], preflight
         details = launch_process(
             command,
             args.cpu_set,
-            output_dir / "stdout.log",
-            output_dir / "stderr.log",
-            output_dir / "time.txt",
+            Path(descriptor["stdout_path"]),
+            Path(descriptor["stderr_path"]),
+            Path(descriptor["timing_path"]),
             args.timeout_seconds,
             args.term_grace_seconds,
-            tuple(
-                (path, maximum)
-                for path, maximum in (
-                    (Path(descriptor["terminal_path"]), preflight["terminal_budget_bytes"]),
-                    (Path(descriptor["samples_path"]), preflight["sample_budget_bytes"]),
-                )
-            ),
+            tuple((Path(path), maximum) for path, maximum in descriptor["monitored_files"]),
             environment=descriptor["environment"],
             cwd=Path(descriptor["cwd"]),
             expected_executable_sha256=descriptor["binary_sha256"],
@@ -4562,9 +5173,19 @@ def command_launch_v2(args: argparse.Namespace, audit: dict[str, Any], preflight
             timeout_includes_cleanup=True,
         )
         require(type(details) is dict, "external-pressure soak supervisor omitted its parent process receipt")
+        if supervisor_signal["received_signal"] is not None:
+            signum = supervisor_signal["received_signal"]
+            record_inner_signal(signum)
+            details["received_signal"] = signum
+            if not details["timed_out"] and not details["artifact_budget_exceeded"]:
+                details["status"] = 128 + signum
+        supervision_state["details"] = details
+        supervision_state["status"] = details["status"]
         require(application_cleanup == "verified", "application process cleanup did not complete successfully")
-        launch_receipt = _launch_receipt_value(details, audit, preflight)
-        launch_receipt_sha = _write_exclusive_json(output_dir / "soak-launch.json", launch_receipt)
+        if descriptor.get("persist_legacy_receipt", True):
+            launch_receipt = _launch_receipt_value(details, audit, preflight)
+            launch_receipt_sha = _write_exclusive_json(output_dir / "soak-launch.json", launch_receipt)
+            supervision_state["legacy_launch_receipt_sha256"] = launch_receipt_sha
         if supervisor_signal["received_signal"] is not None:
             stop_pressure_session()
             return finish_external_interruption(supervisor_signal["received_signal"])
@@ -4591,18 +5212,29 @@ def command_launch_v2(args: argparse.Namespace, audit: dict[str, Any], preflight
             require(set(pressure_workers) == _expected_pressure_worker_keys(pressure_recipe["schedule"]), "pressure driver exited without every frozen worker session having been captured")
             require(_wait_pressure_workers_gone(pressure_workers, time.monotonic() + 1.0), "pressure driver exited before captured worker sessions were gone")
             pressure_cleanup = "verified"
+            supervision_state["pressure_cleanup"] = pressure_cleanup
+            supervision_state["pressure_driver"] = {
+                "pid": pressure_process.pid,
+                "start_ticks": pressure_start_ticks,
+                "return_code": pressure_process.returncode,
+            }
+            supervision_state["pressure_worker_sessions"] = list(pressure_workers.values())
         if pressure_process.poll() != 0:
             raise SoakReadbackError(f"pressure driver exited {pressure_process.returncode}; stderr tail: {_tail_text(pressure_stderr)}")
+        supervision_state["pressure_ready_sha256"] = ready_sha
+        supervision_state["pressure_cleanup"] = pressure_cleanup
         proof = _validate_pressure_proof(output_dir, audit)
+        supervision_state["pressure_proof"] = proof
         check_supervisor_interruption()
-        print(json.dumps({
-            "exit_code": details["status"],
-            "launch_receipt_sha256": launch_receipt_sha,
-            "pressure_readback_path": str(output_dir / "pressure-readback.json"),
-            "pressure_readback_sha256": proof["raw_sha256"],
-            "pressure_ready_sha256": ready_sha,
-            "launch_enabled": True,
-        }, sort_keys=True))
+        if descriptor.get("emit_result", True):
+            print(json.dumps({
+                "exit_code": details["status"],
+                "launch_receipt_sha256": supervision_state.get("legacy_launch_receipt_sha256"),
+                "pressure_readback_path": str(output_dir / "pressure-readback.json"),
+                "pressure_readback_sha256": proof["raw_sha256"],
+                "pressure_ready_sha256": ready_sha,
+                "launch_enabled": True,
+            }, sort_keys=True))
         return details["status"]
     except BaseException as primary_error:
         pressure_cleanup_error: BaseException | None = None
@@ -4633,6 +5265,360 @@ def command_launch_v2(args: argparse.Namespace, audit: dict[str, Any], preflight
                 _set_child_subreaper(subreaper_previous)
         finally:
             _restore_external_supervisor_signal_handlers(signal_handlers)
+
+
+def supervise_pressure_application(
+    app_descriptor: dict[str, Any],
+    pressure_recipe_info: dict[str, Any],
+    output_root: Path,
+    on_started: Any,
+    on_cleanup: Any,
+) -> dict[str, Any]:
+    """Supervise one direct APP under a fresh SourceV5 pressure session.
+
+    The explicit `execution_kind` distinguishes the existing timed-soak adapter
+    from normal SourceV5 applications. The returned receipt keeps the direct
+    APP Popen identity, the pressure launch binding, worker cleanup, and the
+    closed pressure proof together; callbacks run inside the protected lifetime.
+    """
+    descriptor_keys = {
+        "schema", "execution_kind", "argv", "cpu_set", "cwd", "environment",
+        "binary_path", "binary_sha256", "application_wall_timeout_seconds",
+        "term_grace_seconds", "stdout_path", "stderr_path", "timing_path",
+        "monitored_files",
+    }
+    require(type(app_descriptor) is dict and set(app_descriptor) in (descriptor_keys, descriptor_keys | {"on_interrupted"}), "pressure application descriptor has an unexpected field set")
+    descriptor = app_descriptor
+    require(descriptor["schema"] == "allocatbelt.application-pressure-app-descriptor.v1", "unsupported pressure application descriptor")
+    require(descriptor["execution_kind"] in ("normal_app", "timed_soak"), "pressure application descriptor must select normal_app or timed_soak")
+    require(callable(on_started) and callable(on_cleanup), "pressure application lifecycle callbacks must be callable")
+    argv = descriptor["argv"]
+    require(type(argv) is list and 1 <= len(argv) <= 96 and all(type(item) is str and item and "\x00" not in item for item in argv), "pressure application argv is malformed")
+    binary_path = safe_absolute_path(descriptor["binary_path"], "pressure application binary")
+    require(argv[0] == str(binary_path) and binary_path.resolve(strict=True) == binary_path, "pressure APP argv[0] differs from its canonical executable path")
+    binary_sha = digest(descriptor["binary_sha256"], "pressure application binary SHA-256")
+    cwd = safe_absolute_path(descriptor["cwd"], "pressure application cwd")
+    require(str(cwd) == descriptor["cwd"] and cwd.resolve(strict=True) == cwd, "pressure application cwd traverses an alias")
+    environment = descriptor["environment"]
+    require(type(environment) is dict and environment and all(
+        type(key) is str and key and "=" not in key and "\x00" not in key
+        and type(value) is str and "\x00" not in value
+        for key, value in environment.items()
+    ), "pressure application environment is malformed")
+    require(len(canonical_bytes(environment)) <= MAX_ENVIRONMENT_BYTES, "pressure application environment exceeds its finite bound")
+    cpu_set = descriptor["cpu_set"]
+    cpu_ids = _parse_cpu_set(cpu_set)
+    recipe = pressure_recipe_info.get("value") if type(pressure_recipe_info) is dict else None
+    require(type(recipe) is dict, "pressure application has no validated frozen driver recipe")
+    require(
+        recipe.get("schema") == "allocatbelt.application-pressure-recipe.v1"
+        and recipe.get("identity", {}).get("phase") == "external_pressure",
+        "pressure application recipe has the wrong schema or phase",
+    )
+    recipe_path = safe_absolute_path(pressure_recipe_info.get("recipe_path"), "pressure recipe path")
+    recipe_raw_sha = digest(pressure_recipe_info.get("raw_sha256"), "pressure recipe raw SHA-256")
+    recipe_sha = digest(pressure_recipe_info.get("recipe_sha256"), "pressure recipe semantic SHA-256")
+    condition_sha = digest(pressure_recipe_info.get("condition_sha256"), "pressure condition SHA-256")
+    recipe_value, actual_recipe_raw_sha, recipe_raw = read_json(recipe_path, "frozen pressure recipe", MAX_RECIPE_BYTES)
+    require(recipe_raw == canonical_bytes(recipe_value) and actual_recipe_raw_sha == recipe_raw_sha, "pressure recipe bytes differ from the frozen raw pin")
+    require(recipe_value == recipe and recipe.get("recipe_sha256") == recipe_sha and recipe.get("condition_sha256") == condition_sha, "pressure recipe differs from the independently validated recipe identity")
+    require(recipe["files"]["application_binary"]["raw_sha256"] == binary_sha, "pressure recipe application binary differs from the APP descriptor")
+    require(recipe["process"]["executable_path"] == str(binary_path), "pressure recipe executable path differs from the APP descriptor")
+    require(recipe["process"]["application_tmpdir_path"] == environment.get("TMPDIR"), "pressure APP TMPDIR differs from its frozen driver recipe")
+    require(recipe["identity"]["nonce"] == environment.get("ALLOCATBELT_APP_PRESSURE_NONCE"), "pressure APP nonce differs from its frozen driver recipe")
+    require(sorted(cpu_ids) == recipe["schedule"]["application_cpu_affinity"], "pressure APP affinity differs from its frozen driver recipe")
+    require(str(cwd) in recipe["storage"]["application_io_paths"], "pressure APP cwd is outside its frozen I/O path set")
+    require(type(pressure_recipe_info.get("reader")) is types.ModuleType, "pressure recipe has no captured independent reader module")
+    thresholds = pressure_recipe_info.get("readiness_thresholds")
+    require(type(thresholds) is dict, "pressure proof readiness thresholds are malformed")
+    driver_thresholds = pressure_recipe_info.get("driver_readiness_thresholds")
+    if driver_thresholds is not None:
+        require(type(driver_thresholds) is dict and driver_thresholds == recipe["readiness_thresholds"], "pressure driver readiness thresholds differ from the frozen recipe")
+
+    output_root = safe_absolute_path(str(output_root), "pressure application output root")
+    require(output_root.is_dir() and output_root.resolve(strict=True) == output_root, "pressure application output root must be an existing canonical directory")
+    require(stat.S_IMODE(output_root.stat().st_mode) & 0o077 == 0, "pressure application output root is not private")
+    def reserved_output_path(value: object, label: str, expected_parent: Path) -> Path:
+        raw = text(value, label, maximum=4096)
+        path = Path(raw)
+        require(path.is_absolute() and path.name not in ("", ".", "..") and ".." not in path.parts, f"{label} must be a normalized absolute file path")
+        require(path.parent == expected_parent, f"{label} parent differs from its reserved output directory")
+        if expected_parent.exists():
+            require(expected_parent.resolve(strict=True) == expected_parent, f"{label} parent is a symlink or alias")
+        else:
+            require(expected_parent == pressure_dir and not expected_parent.is_symlink(), f"{label} parent does not exist as the reserved pressure directory")
+        require(not path.exists() and not path.is_symlink(), f"{label} already exists")
+        return path
+
+    def monitored_output_path(value: object, label: str) -> Path:
+        raw = text(value, label, maximum=4096)
+        path = Path(raw)
+        require(path.is_absolute() and ".." not in path.parts and path != output_root, f"{label} must be a normalized absolute file below the APP output root")
+        try:
+            path.relative_to(output_root)
+        except ValueError as error:
+            raise SoakReadbackError(f"{label} escaped the APP output root") from error
+        require(not path.is_relative_to(pressure_dir), f"{label} is inside the closed pressure artifact directory")
+        parts = path.relative_to(output_root).parts
+        current = output_root
+        for component in parts[:-1]:
+            current = current / component
+            if current.exists():
+                info = current.lstat()
+                require(stat.S_ISDIR(info.st_mode) and not stat.S_ISLNK(info.st_mode), f"{label} parent is not a regular directory")
+        require(not path.exists() and not path.is_symlink(), f"{label} already exists")
+        return path
+
+    pressure_dir_raw = text(pressure_recipe_info.get("output_dir"), "pressure artifact directory", maximum=4096)
+    pressure_dir = Path(pressure_dir_raw)
+    require(pressure_dir.is_absolute() and pressure_dir.parent.resolve(strict=True) == output_root and pressure_dir.name == "pressure", "pressure artifacts must use the dedicated pressure subdirectory")
+    require(pressure_dir == output_root / "pressure", "pressure artifacts must use the dedicated pressure subdirectory")
+    require(not pressure_dir.exists() and not pressure_dir.is_symlink(), "pressure artifact directory already exists")
+    driver_path = safe_absolute_path(pressure_recipe_info.get("driver_path"), "SourceV5 pressure driver")
+    driver_sha = digest(pressure_recipe_info.get("driver_sha256"), "SourceV5 pressure driver SHA-256")
+    require(sha256_file(driver_path, "SourceV5 pressure driver", MAX_SOURCE_FILE_BYTES) == driver_sha, "SourceV5 pressure driver changed before Popen")
+    source_root = safe_absolute_path(pressure_recipe_info.get("source_root"), "SourceV5 source root")
+    launch_path = reserved_output_path(pressure_recipe_info.get("launch_record_path"), "pressure launch record", pressure_dir)
+    ready_path = reserved_output_path(pressure_recipe_info.get("ready_path"), "pressure readiness marker", pressure_dir)
+    require(launch_path == pressure_dir / "launch-record.json" and ready_path == pressure_dir / "pressure-ready.json", "pressure launch/readiness paths differ from the canonical private artifact layout")
+
+    timeout = uint(descriptor["application_wall_timeout_seconds"], "pressure APP wall timeout", positive=True, maximum=SOURCE_V5_PRESSURE_MAX_TOTAL_SECONDS)
+    term_grace = descriptor["term_grace_seconds"]
+    require(type(term_grace) in (int, float) and 0 < term_grace <= 60, "pressure APP TERM grace is outside its finite bound")
+    monitored: list[tuple[Path, int]] = []
+    require(type(descriptor["monitored_files"]) is list and len(descriptor["monitored_files"]) <= 8, "pressure APP monitored-file list is malformed")
+    for index, entry in enumerate(descriptor["monitored_files"]):
+        item = exact_object(entry, {"path", "maximum_bytes"}, f"pressure monitored artifact[{index}]")
+        path = monitored_output_path(item["path"], f"pressure monitored artifact[{index}] path")
+        maximum = uint(item["maximum_bytes"], f"pressure monitored artifact[{index}] budget", positive=True, maximum=MAX_TERMINAL_BYTES)
+        monitored.append((path, maximum))
+    require(len({path for path, _maximum in monitored}) == len(monitored), "pressure monitored-file list repeats an output path")
+
+    paths = {
+        name: reserved_output_path(descriptor[name], f"pressure APP {name}", output_root)
+        for name in ("stdout_path", "stderr_path", "timing_path")
+    }
+    require(all(path.parent == output_root and path != pressure_dir for path in paths.values()), "pressure APP logs must stay outside the pressure artifact directory")
+    require(len(set(paths.values())) == len(paths), "pressure APP stdout, stderr and timing paths overlap")
+    require(app_descriptor.get("on_interrupted") is None or callable(app_descriptor.get("on_interrupted")), "pressure interruption callback is malformed")
+
+    def record_generic_interruption(record: dict[str, Any]) -> int:
+        status = 128 + record["signal"]
+        value = {
+            "schema": "allocatbelt.application-pressure-supervision-interruption.v1",
+            "execution_kind": descriptor["execution_kind"],
+            "status": status,
+            "signal": record["signal"],
+            "pressure_driver": {
+                "pid": record["pressure_pid"],
+                "start_ticks": record["pressure_start_ticks"],
+                "return_code": record["pressure_return_code"],
+            },
+            "application_cleanup": record["application_cleanup"],
+            "pressure_cleanup": record["pressure_cleanup"],
+            "pressure_worker_sessions": record["workers"],
+        }
+        value["interruption_sha256"] = hashlib.sha256(canonical_bytes(value)).hexdigest()
+        _write_exclusive_json(output_root / "supervision-interruption.json", value)
+        return status
+
+    interruption_callback = app_descriptor.get("on_interrupted", record_generic_interruption)
+    execution = {
+        **descriptor,
+        "launch_enabled": True,
+        "application_wall_timeout_seconds": timeout,
+        "pressure_recipe_path": str(recipe_path),
+        "pressure_recipe_sha256": recipe_sha,
+        "pressure_driver_path": str(driver_path),
+        "pressure_driver_sha256": driver_sha,
+        "pressure_output_dir": str(pressure_dir),
+        "pressure_launch_path": str(launch_path),
+        "pressure_ready_path": str(ready_path),
+        "pressure_condition_sha256": condition_sha,
+        "pressure_stdout_path": str(output_root / "pressure-driver.stdout.log"),
+        "pressure_stderr_path": str(output_root / "pressure-driver.stderr.log"),
+        "stdout_path": str(paths["stdout_path"]),
+        "stderr_path": str(paths["stderr_path"]),
+        "timing_path": str(paths["timing_path"]),
+        "binary_path": str(binary_path),
+        "binary_sha256": binary_sha,
+        "cwd": str(cwd),
+        "environment": environment,
+        "monitored_files": monitored,
+        "execution_kind": descriptor["execution_kind"],
+        "emit_result": False,
+        "persist_legacy_receipt": False,
+        "_on_started": on_started,
+        "_on_cleanup": on_cleanup,
+        "_on_interrupted": interruption_callback,
+        "_supervision_state": {},
+    }
+    pressure_info = {
+        "value": recipe,
+        "reader": pressure_recipe_info["reader"],
+        "recipe_sha256": recipe_sha,
+        "raw_sha256": recipe_raw_sha,
+        "condition_sha256": condition_sha,
+        "recipe_path": str(recipe_path),
+        "readiness_thresholds": thresholds,
+    }
+    audit = {
+        "launch_descriptor": execution,
+        "identity": {"nonce": recipe["identity"]["nonce"], "run_id": recipe["identity"]["run_id"]},
+        "source": {
+            "pressure_recipe": pressure_info,
+            "application_supervision": {"application_wall_timeout_seconds": timeout},
+        },
+        "source_root": str(source_root),
+        "recipe": {
+            "pressure": {"recipe": {"path": str(recipe_path), "raw_sha256": recipe_raw_sha}},
+            "qualification": {"pressure_condition": {"readiness_thresholds": thresholds}},
+        },
+    }
+    preflight = {
+        "terminal_budget_bytes": max((maximum for path, maximum in monitored if path.suffix == ".tsv"), default=MAX_TERMINAL_BYTES),
+        "sample_budget_bytes": max((maximum for path, maximum in monitored if path.suffix == ".csv"), default=MAX_SAMPLE_BYTES),
+    }
+    args = argparse.Namespace(
+        command=list(argv), cpu_set=cpu_set, timeout_seconds=timeout,
+        term_grace_seconds=float(term_grace),
+    )
+    status = _run_pressure_supervisor_impl(args, audit, preflight, output_root)
+    state = execution["_supervision_state"]
+    return {
+        "schema": "allocatbelt.application-pressure-supervision.v1",
+        "execution_kind": descriptor["execution_kind"],
+        "status": status,
+        "interrupted": state.get("interrupted", False),
+        "received_signal": state.get("received_signal"),
+        "application_cleanup": state.get("application_cleanup"),
+        "application_binding": state.get("application_binding"),
+        "application_binding_sha256": state.get("application_binding_sha256"),
+        "application_attestation": state.get("application_attestation"),
+        "pressure_ready_sha256": state.get("pressure_ready_sha256"),
+        "pressure_proof": state.get("pressure_proof"),
+        "pressure_cleanup": state.get("pressure_cleanup"),
+        "pressure_driver": state.get("pressure_driver"),
+        "pressure_worker_sessions": state.get("pressure_worker_sessions"),
+        "details": state.get("details"),
+    }
+
+
+def _adapt_soak_v2_launch(
+    args: argparse.Namespace, audit: dict[str, Any], preflight: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Restore the immutable V2 CLI contract before building the shared descriptor."""
+    descriptor = audit["launch_descriptor"]
+    command = list(args.command)
+    if command and command[0] == "--":
+        command = command[1:]
+    require(command == descriptor["argv"], "Soak V2 CLI command differs from the frozen launch descriptor")
+    require(args.cpu_set == descriptor["cpu_set"], "Soak V2 CLI CPU set differs from the frozen launch descriptor")
+
+    frozen_timeout = uint(
+        audit["source"]["application_supervision"]["application_wall_timeout_seconds"],
+        "SourceV5 Soak V2 derived application timeout", positive=True,
+        maximum=SOURCE_V5_PRESSURE_MAX_TOTAL_SECONDS,
+    )
+    require(descriptor["application_wall_timeout_seconds"] == frozen_timeout, "Soak V2 launch descriptor timeout differs from the independently derived bound")
+    require(args.timeout_seconds == frozen_timeout, "Soak V2 CLI timeout differs from the independently derived bound")
+    require(args.term_grace_seconds == 1.5, "Soak V2 CLI TERM grace differs from its frozen 1.5-second contract")
+
+    pressure_info = audit["source"]["pressure_recipe"]
+    recipe_pin = audit["recipe"]["pressure"]["recipe"]
+    require(type(pressure_info) is dict and type(recipe_pin) is dict, "SourceV5 Soak V2 pressure recipe is missing")
+    require(
+        pressure_info.get("raw_sha256") == recipe_pin.get("raw_sha256")
+        and pressure_info.get("recipe_sha256") == recipe_pin.get("semantic_sha256"),
+        "Soak V2 pressure recipe differs from its parent-pinned raw/semantic identities",
+    )
+    pressure_info = {
+        **pressure_info,
+        "recipe_path": recipe_pin["path"],
+        "raw_sha256": recipe_pin["raw_sha256"],
+        "driver_path": descriptor["pressure_driver_path"],
+        "driver_sha256": descriptor["pressure_driver_sha256"],
+        "output_dir": descriptor["pressure_output_dir"],
+        "launch_record_path": descriptor["pressure_launch_path"],
+        "ready_path": descriptor["pressure_ready_path"],
+        "source_root": audit["source_root"],
+        "readiness_thresholds": audit["recipe"]["qualification"]["pressure_condition"]["readiness_thresholds"],
+    }
+    app_descriptor = {
+        "schema": "allocatbelt.application-pressure-app-descriptor.v1",
+        "execution_kind": "timed_soak",
+        "argv": command,
+        "cpu_set": descriptor["cpu_set"],
+        "cwd": descriptor["cwd"],
+        "environment": descriptor["environment"],
+        "binary_path": descriptor["binary_path"],
+        "binary_sha256": descriptor["binary_sha256"],
+        "application_wall_timeout_seconds": frozen_timeout,
+        "term_grace_seconds": 1.5,
+        "stdout_path": str(Path(descriptor["stdout_path"])),
+        "stderr_path": str(Path(descriptor["stderr_path"])),
+        "timing_path": str(Path(descriptor["timing_path"])),
+        "monitored_files": [
+            {"path": str(Path(descriptor["terminal_path"])), "maximum_bytes": preflight["terminal_budget_bytes"]},
+            {"path": str(Path(descriptor["samples_path"])), "maximum_bytes": preflight["sample_budget_bytes"]},
+        ],
+    }
+    return pressure_info, app_descriptor
+
+
+def command_launch_v2(args: argparse.Namespace, audit: dict[str, Any], preflight: dict[str, Any], output_dir: Path) -> int:
+    """Adapt the shared pressure-first supervisor to the established soak V2 receipt."""
+    descriptor = audit["launch_descriptor"]
+    def on_interrupted(record: dict[str, Any]) -> int:
+        exit_code = 128 + record["signal"]
+        cleanup_states_verified = record["application_cleanup"] in ("not_started", "verified") and record["pressure_cleanup"] in ("not_started", "verified")
+        cleanup_state = "verified" if cleanup_states_verified else "failed" if "failed" in (record["application_cleanup"], record["pressure_cleanup"]) else "unverified"
+        receipt_value = {
+            "schema": "allocatbelt.application-soak-supervisor-interruption.v2",
+            "recipe_sha256": audit["recipe_sha256"],
+            "campaign_id": audit["identity"]["campaign_id"],
+            "host_id": audit["identity"]["host_id"],
+            "run_id": audit["identity"]["run_id"],
+            "nonce": audit["identity"]["nonce"],
+            "signal": record["signal"],
+            "exit_code": exit_code,
+            "pressure_driver_pid": record["pressure_pid"],
+            "pressure_driver_start_ticks": record["pressure_start_ticks"],
+            "pressure_driver_return_code": record["pressure_return_code"],
+            "application_cleanup": record["application_cleanup"],
+            "pressure_cleanup": record["pressure_cleanup"],
+            "cleanup": cleanup_state,
+        }
+        _write_exclusive_json(output_dir / "soak-supervisor-interruption.json", receipt_value)
+        print(json.dumps(receipt_value, sort_keys=True, separators=(",", ":")))
+        return exit_code
+
+    pressure_info, app_descriptor = _adapt_soak_v2_launch(args, audit, preflight)
+    app_descriptor["stdout_path"] = str(output_dir / "stdout.log")
+    app_descriptor["stderr_path"] = str(output_dir / "stderr.log")
+    app_descriptor["timing_path"] = str(output_dir / "time.txt")
+    app_descriptor["on_interrupted"] = on_interrupted
+    receipt = supervise_pressure_application(
+        app_descriptor, pressure_info, output_dir,
+        on_started=lambda _attestation: None,
+        on_cleanup=lambda _cleanup: None,
+    )
+    details = receipt["details"]
+    if type(details) is dict:
+        launch_receipt = _launch_receipt_value(details, audit, preflight)
+        launch_receipt_sha = _write_exclusive_json(output_dir / "soak-launch.json", launch_receipt)
+        if receipt["status"] == 0 and not receipt["interrupted"]:
+            proof = receipt["pressure_proof"]
+            require(type(proof) is dict, "shared pressure supervisor omitted the soak proof")
+            print(json.dumps({
+                "exit_code": receipt["status"],
+                "launch_receipt_sha256": launch_receipt_sha,
+                "pressure_readback_path": str(output_dir / "pressure-readback.json"),
+                "pressure_readback_sha256": proof["raw_sha256"],
+                "pressure_ready_sha256": receipt["pressure_ready_sha256"],
+                "launch_enabled": True,
+            }, sort_keys=True))
+    return receipt["status"]
 
 
 def _add_audit_args(parser: argparse.ArgumentParser) -> None:
