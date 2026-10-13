@@ -155,7 +155,7 @@ impl NativeAcceptorFixture {
     )
     .expect("create acceptor test domain");
     let limits = application_domain.local_limits();
-    let rates = application_domain.rate_config();
+    let rates = application_domain.rate_configs();
     let driver = MultiThreadBuilder::new(AsyncConfig {
       workers,
       max_outstanding: 32,
@@ -178,9 +178,9 @@ impl NativeAcceptorFixture {
       max_registrations: 24,
       max_waiters: 40,
     })
-    .disk_rate(rates)
-    .upload_rate(rates)
-    .download_rate(rates)
+    .disk_rate(rates.disk)
+    .upload_rate(rates.upload)
+    .download_rate(rates.download)
     .build()
     .expect("start acceptor test runtime");
     let bindings = application_domain

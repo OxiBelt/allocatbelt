@@ -429,7 +429,7 @@ fn native_pressure_factory_uses_the_owning_driver_feedback_service() {
     .feedback_factory()
     .expect("feedback factory")
     .unwrap();
-  let rate = domain.rate_config();
+  let rates = domain.rate_configs();
   let mut driver = MultiThreadBuilder::new(AsyncConfig {
     workers: 2,
     max_outstanding: 8,
@@ -438,9 +438,9 @@ fn native_pressure_factory_uses_the_owning_driver_feedback_service() {
   .resources(domain.local_limits())
   .resource_domain(domain.tenant())
   .rate_timer_registrations(256)
-  .disk_rate(rate)
-  .upload_rate(rate)
-  .download_rate(rate)
+  .disk_rate(rates.disk)
+  .upload_rate(rates.upload)
+  .download_rate(rates.download)
   .blocking(BlockingConfig {
     workers: 2,
     max_outstanding: 8,

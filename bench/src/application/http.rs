@@ -406,7 +406,7 @@ fn run_bounded(options: Options, settings: Settings, plan: ArrivalPlan) -> Resul
   #[cfg(feature = "resource-feedback")]
   let mut feedback_trace;
   let local_limits = domain.local_limits();
-  let rate_config = domain.rate_config();
+  let rate_configs = domain.rate_configs();
   let blocking_workers = if options.workload == Workload::Mixed {
     plan.async_workers
   } else {
@@ -450,9 +450,9 @@ fn run_bounded(options: Options, settings: Settings, plan: ArrivalPlan) -> Resul
     None => builder,
   };
   let mut async_runtime = builder
-    .disk_rate(rate_config)
-    .upload_rate(rate_config)
-    .download_rate(rate_config)
+    .disk_rate(rate_configs.disk)
+    .upload_rate(rate_configs.upload)
+    .download_rate(rate_configs.download)
     .build()
     .map_err(|error| format!("allocatbelt owning HTTP runtime start failed: {error}"))?;
   let mut run_bindings = domain.for_native(&async_runtime)?;

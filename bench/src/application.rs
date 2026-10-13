@@ -1137,6 +1137,7 @@ fn run_with_plan(
   };
   let domain =
     ApplicationDomain::new_for_profile(options.workload, plan.async_workers, plan.profile.label())?;
+  let rate_configs = domain.rate_configs();
   #[cfg(feature = "resource-feedback")]
   let mut feedback_trace;
   let (submitter, observer, scope, runtime, resources, mut run_bindings) = match options.executor {
@@ -1150,9 +1151,9 @@ fn run_with_plan(
         .resource_domain(domain.tenant())
         .resources(domain.local_limits())
         .rate_timer_registrations(256)
-        .disk_rate(domain.rate_config())
-        .upload_rate(domain.rate_config())
-        .download_rate(domain.rate_config());
+        .disk_rate(rate_configs.disk)
+        .upload_rate(rate_configs.upload)
+        .download_rate(rate_configs.download);
       #[cfg(feature = "resource-feedback")]
       if let Some(factory) = domain.feedback_factory()? {
         builder = builder.feedback_sources(factory);

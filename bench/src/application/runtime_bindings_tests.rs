@@ -89,7 +89,7 @@ fn startup_barrier_waits_for_accepted_fresh_cpu_in_both_binding_paths() {
     .feedback_factory()
     .expect("native pressure factory")
     .expect("external workload factory");
-  let rate = native_domain.rate_config();
+  let rates = native_domain.rate_configs();
   let mut driver = allocatbelt::runtime::MultiThreadBuilder::new(
     allocatbelt::runtime::asynchronous::AsyncConfig {
       workers: 2,
@@ -101,9 +101,9 @@ fn startup_barrier_waits_for_accepted_fresh_cpu_in_both_binding_paths() {
   .resource_domain(native_domain.tenant())
   .timer(2)
   .rate_timer_registrations(256)
-  .disk_rate(rate)
-  .upload_rate(rate)
-  .download_rate(rate)
+  .disk_rate(rates.disk)
+  .upload_rate(rates.upload)
+  .download_rate(rates.download)
   .feedback_sources(factory)
   .build()
   .expect("native pressure driver");
@@ -263,6 +263,186 @@ fn task_role_leases_are_charged_to_the_shared_tenant_until_drop() {
     .expect("fixed rate timer shutdown");
 }
 
+#[cfg(feature = "resource-feedback")]
+fn calibrated_mixed_application_domain() -> ApplicationDomain {
+  let source_sha256 = "a".repeat(64);
+  let bytes = String::from_utf8(capacity_artifact(
+    "1250000000",
+    APPLICATION_BYTE_CALIBRATION_UNITS,
+  ))
+  .expect("capacity artifact is UTF-8")
+  .replace("profile\tsteady", "profile\tmixed")
+  .replace("workload\tdisk", "workload\tmixed")
+  .replace(
+    "disk.bytes_per_second\t1000000",
+    "disk.bytes_per_second\t750000000",
+  )
+  .into_bytes();
+  let sha256 = capacity_artifact_hash::sha256_hex(&bytes);
+  let path = write_calibration_test_file(&bytes);
+  let domain = ApplicationDomain::new_for_feedback_probe(
+    Workload::Mixed,
+    4,
+    "mixed",
+    CapacityCalibrationProbeInput {
+      path: &path,
+      sha256: &sha256,
+      host_id: "agent-9700x",
+      source_sha256: &source_sha256,
+    },
+  );
+  std::fs::remove_file(path).expect("remove temporary calibration input after loading");
+  domain.expect("calibrated mixed application domain")
+}
+
+#[cfg(feature = "resource-feedback")]
+fn assert_calibrated_directional_bindings(bindings: &ApplicationRunBindings) {
+  let rates = bindings
+    .io()
+    .readback_rows()
+    .into_iter()
+    .collect::<std::collections::HashMap<_, _>>();
+  let upload_rate = APPLICATION_RATE_CEILING_BYTES_PER_SECOND.to_string();
+  for (direction, expected) in [
+    ("disk", "750000000"),
+    ("download", "1250000000"),
+    ("upload", upload_rate.as_str()),
+  ] {
+    assert_eq!(
+      rates[&format!("{direction}_bytes_per_second")].as_str(),
+      expected
+    );
+    assert_eq!(
+      rates[&format!("{direction}_ceiling_bytes_per_second")].as_str(),
+      expected,
+    );
+  }
+  let policy = bindings
+    .policy_rows()
+    .into_iter()
+    .collect::<std::collections::HashMap<_, _>>();
+  for (name, expected) in [
+    ("disk.initial", "750000000"),
+    ("disk.ceiling", "750000000"),
+    ("download.initial", "1250000000"),
+    ("download.ceiling", "1250000000"),
+  ] {
+    assert_eq!(
+      policy[&format!("feedback.policy.{name}")].as_str(),
+      expected
+    );
+  }
+}
+
+#[cfg(feature = "resource-feedback")]
+fn assert_application_domain_released(readback: &ResourceDomain, baseline: usize) {
+  let snapshot = readback.snapshot();
+  after_release_global_snapshot_rows(&snapshot, baseline)
+    .expect("all application owners return to the constructor baseline");
+  assert_eq!(snapshot.live_tenants, 0);
+  assert_eq!(snapshot.used.get(DomainResource::Control), baseline);
+  for resource in [
+    DomainResource::Cpu,
+    DomainResource::Memory,
+    DomainResource::Disk,
+    DomainResource::Network,
+    DomainResource::Tasks,
+  ] {
+    assert_eq!(snapshot.used.get(resource), 0);
+  }
+}
+
+#[cfg(feature = "resource-feedback")]
+#[test]
+fn calibrated_native_and_tokio_bindings_match_directional_buckets_receipts_and_cleanup() {
+  let tokio_domain = calibrated_mixed_application_domain();
+  let tokio_baseline = tokio_domain.fixed_global_control_baseline();
+  let tokio_readback = tokio_domain.readback_domain();
+  let mut tokio_bindings = tokio_domain
+    .for_tokio()
+    .expect("calibrated Tokio feedback bindings");
+  assert!(tokio_bindings.feedback_started());
+  assert_calibrated_directional_bindings(&tokio_bindings);
+  tokio_bindings
+    .shutdown_feedback(Duration::from_secs(5))
+    .expect("calibrated Tokio feedback shutdown");
+  tokio_bindings
+    .shutdown_auxiliary_timer()
+    .expect("calibrated Tokio rate timer shutdown");
+  drop(tokio_bindings);
+  drop(tokio_domain);
+  assert_application_domain_released(&tokio_readback, tokio_baseline);
+
+  let native_domain = calibrated_mixed_application_domain();
+  let native_baseline = native_domain.fixed_global_control_baseline();
+  let native_readback = native_domain.readback_domain();
+  let factory = native_domain
+    .feedback_factory()
+    .expect("calibrated native feedback factory")
+    .expect("mixed workload starts feedback");
+  let rates = native_domain.rate_configs();
+  let mut driver = allocatbelt::runtime::MultiThreadBuilder::new(
+    allocatbelt::runtime::asynchronous::AsyncConfig {
+      workers: 4,
+      max_outstanding: 8,
+      max_scopes: 2,
+    },
+  )
+  .resources(native_domain.local_limits())
+  .resource_domain(native_domain.tenant())
+  .rate_timer_registrations(256)
+  .disk_rate(rates.disk)
+  .upload_rate(rates.upload)
+  .download_rate(rates.download)
+  .blocking(allocatbelt::runtime::Config {
+    workers: 4,
+    max_outstanding: 8,
+    capacity: allocatbelt::runtime::Resources {
+      disk: 8,
+      ..allocatbelt::runtime::Resources::ZERO
+    },
+  })
+  .filesystem()
+  .feedback_sources(factory)
+  .build()
+  .expect("calibrated native feedback driver");
+  let mut native_bindings = native_domain
+    .for_native(&driver)
+    .expect("calibrated native run bindings");
+  assert!(native_bindings.feedback_started());
+  assert_calibrated_directional_bindings(&native_bindings);
+  driver
+    .request_shutdown(allocatbelt::runtime::MultiShutdown {
+      tasks: allocatbelt::runtime::asynchronous::AsyncShutdown::Drain,
+      blocking: allocatbelt::runtime::ShutdownMode::Drain,
+      processes: allocatbelt::runtime::process::ProcessShutdownMode::Wait,
+    })
+    .expect("calibrated native shutdown request");
+  let deadline = Instant::now() + Duration::from_secs(5);
+  loop {
+    match driver
+      .drive_shutdown_step()
+      .expect("calibrated native shutdown progress")
+    {
+      allocatbelt::runtime::ShutdownProgress::Complete => break,
+      allocatbelt::runtime::ShutdownProgress::Pending => {
+        assert!(
+          Instant::now() < deadline,
+          "calibrated native driver shutdown timed out"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+      }
+    }
+  }
+  native_bindings
+    .shutdown_feedback(Duration::from_secs(5))
+    .expect("calibrated native feedback shutdown");
+  drop(native_bindings);
+  drop(driver);
+  drop(native_domain);
+  assert_application_domain_released(&native_readback, native_baseline);
+}
+
 #[test]
 fn fixed_domain_bounds_cpu_waiters_tasks_and_managed_resources() {
   let domain = ApplicationDomain::new(Workload::Mixed, 4).expect("mixed application domain");
@@ -371,7 +551,7 @@ fn native_driver_and_application_scope_share_one_tenant_domain() {
   let domain = ApplicationDomain::new(Workload::Cpu, 2).expect("native application domain");
   let readback_domain = domain.readback_domain();
   let fixed_control_baseline = domain.fixed_global_control_baseline();
-  let rate = domain.rate_config();
+  let rates = domain.rate_configs();
   let mut driver = allocatbelt::runtime::MultiThreadBuilder::new(
     allocatbelt::runtime::asynchronous::AsyncConfig {
       workers: 2,
@@ -382,9 +562,9 @@ fn native_driver_and_application_scope_share_one_tenant_domain() {
   .resources(domain.local_limits())
   .resource_domain(domain.tenant())
   .rate_timer_registrations(256)
-  .disk_rate(rate)
-  .upload_rate(rate)
-  .download_rate(rate)
+  .disk_rate(rates.disk)
+  .upload_rate(rates.upload)
+  .download_rate(rates.download)
   .build()
   .expect("native owning driver");
   let bindings = domain.for_native(&driver).expect("native run bindings");
@@ -396,7 +576,7 @@ fn native_driver_and_application_scope_share_one_tenant_domain() {
     tenant.snapshot().expect("tenant snapshot").ceiling,
     domain.domain_limits()
   );
-  assert_eq!(bindings.io().fixed_rate_parameters(), rate);
+  assert_eq!(bindings.io().fixed_rate_parameters(), rates.disk);
   assert_eq!(
     bindings
       .snapshots()
@@ -457,7 +637,7 @@ fn native_driver_with_equal_limits_but_a_different_tenant_is_rejected() {
   let wrong_tenant = wrong_domain
     .tenant(domain.domain_limits())
     .expect("wrong tenant with equal ceilings");
-  let rate = domain.rate_config();
+  let rates = domain.rate_configs();
   let mut wrong_driver = allocatbelt::runtime::MultiThreadBuilder::new(
     allocatbelt::runtime::asynchronous::AsyncConfig {
       workers: 2,
@@ -468,9 +648,9 @@ fn native_driver_with_equal_limits_but_a_different_tenant_is_rejected() {
   .resources(domain.local_limits())
   .resource_domain(wrong_tenant)
   .rate_timer_registrations(256)
-  .disk_rate(rate)
-  .upload_rate(rate)
-  .download_rate(rate)
+  .disk_rate(rates.disk)
+  .upload_rate(rates.upload)
+  .download_rate(rates.download)
   .build()
   .expect("wrong-tenant native driver");
 
@@ -727,6 +907,238 @@ fn pressure_capacity_requirements_follow_the_actual_workload() {
       baseline
     );
   }
+}
+
+#[cfg(feature = "resource-feedback")]
+fn loaded_test_calibrations(
+  workload: &str,
+  disk_capacity: &str,
+  download_capacity: &str,
+) -> (ResourceDomain, FeedbackCalibrations) {
+  let download_units = if download_capacity == "missing" {
+    "missing"
+  } else {
+    APPLICATION_BYTE_CALIBRATION_UNITS
+  };
+  let mut text = String::from_utf8(capacity_artifact(download_capacity, download_units))
+    .expect("capacity artifact is UTF-8")
+    .replace("workload\tdisk", &format!("workload\t{workload}"))
+    .replace(
+      "disk.bytes_per_second\t1000000",
+      &format!("disk.bytes_per_second\t{disk_capacity}"),
+    );
+  if disk_capacity == "missing" {
+    text = text.replace(
+      &format!("disk.units\t{APPLICATION_BYTE_CALIBRATION_UNITS}"),
+      "disk.units\tmissing",
+    );
+  }
+  let bytes = text.into_bytes();
+  let hash = capacity_artifact_hash::sha256_hex(&bytes);
+  let source_sha = "a".repeat(64);
+  let control = DomainResources::ZERO.with(DomainResource::Control, 1024 * 1024);
+  let domain = ResourceDomain::new(control, 1).expect("test calibration domain");
+  let tenant = domain.tenant(control).expect("test calibration tenant");
+  let identity = CalibrationRunIdentity {
+    host_id: "agent-9700x",
+    profile: "steady",
+    workload,
+    source_sha256: &source_sha,
+    pressure_qualification: false,
+  };
+  let charge = tenant
+    .try_acquire(
+      DomainResources::ZERO.with(DomainResource::Control, CALIBRATION_ARTIFACT_CONTROL_CHARGE),
+    )
+    .expect("test calibration charge");
+  let calibrations = FeedbackCalibrations::from_bytes_with_charge(bytes, &hash, &identity, charge)
+    .expect("test calibration artifact loads");
+  drop(tenant);
+  (domain, calibrations)
+}
+
+#[cfg(feature = "resource-feedback")]
+#[test]
+fn calibrated_feedback_resolves_directional_buckets_and_preserves_cpu_quantization() {
+  for workers in [2, 4] {
+    let (_domain, calibrations) = loaded_test_calibrations("mixed", "750000000", "1250000000");
+    let resolved = resolve_application_feedback(Workload::Mixed, workers, &calibrations)
+      .expect("both application byte sources resolve");
+    let frozen = feedback_policy(workers);
+    assert_eq!(resolved.policy.cpu_concurrency, frozen.cpu_concurrency);
+    assert_eq!(resolved.policy.cpu_concurrency.initial, workers as u64);
+    assert_eq!(resolved.policy.cpu_concurrency.ceiling, workers as u64);
+    assert_eq!(resolved.policy.cpu_concurrency.floor, 1);
+    assert_eq!(resolved.policy.cpu_concurrency.initial / 10, 0);
+    assert_eq!(resolved.policy.disk_rate.floor, frozen.disk_rate.floor);
+    assert_eq!(
+      resolved.policy.disk_rate.low_utilization_basis_points,
+      frozen.disk_rate.low_utilization_basis_points
+    );
+    assert_eq!(
+      resolved.policy.disk_rate.high_utilization_basis_points,
+      frozen.disk_rate.high_utilization_basis_points
+    );
+    assert_eq!(resolved.policy.disk_rate.initial, 750_000_000);
+    assert_eq!(resolved.policy.disk_rate.ceiling, 750_000_000);
+    assert_eq!(resolved.policy.network_rate.initial, 1_250_000_000);
+    assert_eq!(resolved.policy.network_rate.ceiling, 1_250_000_000);
+    assert_eq!(resolved.rates.disk.bytes_per_second, 750_000_000);
+    assert_eq!(resolved.rates.download.bytes_per_second, 1_250_000_000);
+    assert_eq!(resolved.rates.upload, fixed_rate_config());
+    assert_eq!(calibrations.disk_capacity(), NonZeroU64::new(750_000_000));
+    assert_eq!(
+      calibrations.download_capacity(),
+      NonZeroU64::new(1_250_000_000)
+    );
+    let rows = feedback_policy_rows(
+      workers,
+      &calibrations,
+      resolved,
+      "owning_FsRate_application_bytes",
+    );
+    for (key, expected) in [
+      ("feedback.policy.disk.initial", "750000000"),
+      ("feedback.policy.disk.ceiling", "750000000"),
+      ("feedback.policy.download.initial", "1250000000"),
+      ("feedback.policy.download.ceiling", "1250000000"),
+    ] {
+      assert_eq!(
+        rows
+          .iter()
+          .find(|(row, _)| row == key)
+          .map(|(_, value)| value.as_str()),
+        Some(expected),
+        "{key} must report the resolved constructor policy"
+      );
+    }
+  }
+}
+
+#[cfg(feature = "resource-feedback")]
+#[test]
+fn calibrated_feedback_clips_bucket_roofs_but_keeps_raw_sensor_denominators() {
+  let raw_disk = 32 * APPLICATION_RATE_CEILING_BYTES_PER_SECOND;
+  let raw_download = 33 * APPLICATION_RATE_CEILING_BYTES_PER_SECOND;
+  let (_domain, calibrations) =
+    loaded_test_calibrations("mixed", &raw_disk.to_string(), &raw_download.to_string());
+  let resolved = resolve_application_feedback(Workload::Mixed, 4, &calibrations)
+    .expect("above-roof capacities clip to the existing rate roof");
+  assert_eq!(
+    resolved.policy.disk_rate.initial,
+    APPLICATION_RATE_CEILING_BYTES_PER_SECOND
+  );
+  assert_eq!(
+    resolved.policy.disk_rate.ceiling,
+    APPLICATION_RATE_CEILING_BYTES_PER_SECOND
+  );
+  assert_eq!(
+    resolved.rates.disk.bytes_per_second,
+    APPLICATION_RATE_CEILING_BYTES_PER_SECOND
+  );
+  assert_eq!(
+    resolved.policy.network_rate.initial,
+    APPLICATION_RATE_CEILING_BYTES_PER_SECOND
+  );
+  assert_eq!(
+    resolved.policy.network_rate.ceiling,
+    APPLICATION_RATE_CEILING_BYTES_PER_SECOND
+  );
+  assert_eq!(
+    calibrations.disk_capacity().map(NonZeroU64::get),
+    Some(raw_disk)
+  );
+  assert_eq!(
+    calibrations.download_capacity().map(NonZeroU64::get),
+    Some(raw_download)
+  );
+}
+
+#[cfg(feature = "resource-feedback")]
+#[test]
+fn calibrated_feedback_rejects_relevant_missing_and_below_floor_sources() {
+  let (_domain, missing_disk) = loaded_test_calibrations("disk", "missing", "missing");
+  assert!(resolve_application_feedback(Workload::Disk, 2, &missing_disk).is_err());
+
+  let (_domain, missing_download) = loaded_test_calibrations("http", "missing", "missing");
+  assert!(resolve_application_feedback(Workload::Http, 2, &missing_download).is_err());
+
+  let (_domain, disk_below_floor) = loaded_test_calibrations("disk", "1000000", "missing");
+  assert!(resolve_application_feedback(Workload::Disk, 2, &disk_below_floor).is_err());
+
+  let (_domain, download_below_floor) = loaded_test_calibrations("http", "missing", "1000000");
+  assert!(resolve_application_feedback(Workload::Http, 2, &download_below_floor).is_err());
+
+  let (_domain, missing_mixed_download) = loaded_test_calibrations("mixed", "750000000", "missing");
+  assert!(resolve_application_feedback(Workload::Mixed, 4, &missing_mixed_download).is_err());
+
+  let (_domain, missing_mixed_disk) = loaded_test_calibrations("mixed", "missing", "1250000000");
+  assert!(resolve_application_feedback(Workload::Mixed, 4, &missing_mixed_disk).is_err());
+}
+
+#[cfg(feature = "resource-feedback")]
+#[test]
+fn uncalibrated_and_zero_io_directions_keep_the_static_policy_and_buckets() {
+  for workload in [Workload::Cpu, Workload::Memory] {
+    let resolved = resolve_application_feedback(workload, 2, &FeedbackCalibrations::default())
+      .expect("uncalibrated constructor keeps the frozen defaults");
+    assert_eq!(resolved.policy, feedback_policy(2));
+    assert_eq!(resolved.rates, ApplicationRateConfigs::fixed());
+  }
+
+  let (_domain, cpu_calibration) = loaded_test_calibrations("cpu", "missing", "missing");
+  let cpu = resolve_application_feedback(Workload::Cpu, 2, &cpu_calibration)
+    .expect("missing non-applicable byte sources do not create controls");
+  assert_eq!(cpu.policy, feedback_policy(2));
+  assert_eq!(cpu.rates, ApplicationRateConfigs::fixed());
+
+  let (_domain, disk_calibration) = loaded_test_calibrations("disk", "750000000", "missing");
+  let disk = resolve_application_feedback(Workload::Disk, 4, &disk_calibration)
+    .expect("missing download is irrelevant to disk-only work");
+  assert_eq!(disk.policy.network_rate, feedback_policy(4).network_rate);
+  assert_eq!(disk.rates.download, fixed_rate_config());
+
+  let (_domain, http_calibration) = loaded_test_calibrations("http", "missing", "1250000000");
+  let http = resolve_application_feedback(Workload::Http, 4, &http_calibration)
+    .expect("missing disk is irrelevant to HTTP-only work");
+  assert_eq!(http.policy.disk_rate, feedback_policy(4).disk_rate);
+  assert_eq!(http.rates.disk, fixed_rate_config());
+  assert_eq!(http.policy.network_rate.initial, 1_250_000_000);
+}
+
+#[cfg(feature = "resource-feedback")]
+#[test]
+fn feedback_rate_validation_checks_initial_rate_and_construction_ceiling() {
+  let resolved = resolve_application_feedback(Workload::Mixed, 2, &FeedbackCalibrations::default())
+    .expect("default resolved policy");
+  let disk = ByteRateLimit::new(resolved.rates.disk).expect("matching disk bucket");
+  let download = ByteRateLimit::new(resolved.rates.download).expect("matching download bucket");
+  assert!(validate_initial_feedback_rates(&disk, &download, resolved).is_ok());
+
+  disk
+    .set_limits(FEEDBACK_RATE_FLOOR, resolved.rates.disk.burst_bytes)
+    .expect("valid reduced initial rate");
+  assert!(validate_initial_feedback_rates(&disk, &download, resolved).is_err());
+
+  let larger_ceiling = ByteRateConfig {
+    bytes_per_second: resolved.policy.network_rate.ceiling + 1,
+    ..resolved.rates.download
+  };
+  let wrong_ceiling = ByteRateLimit::new(larger_ceiling).expect("valid larger bucket ceiling");
+  wrong_ceiling
+    .set_limits(
+      resolved.policy.network_rate.initial,
+      resolved.rates.download.burst_bytes,
+    )
+    .expect("initial rate remains below the test ceiling");
+  assert!(
+    validate_initial_feedback_rates(
+      &ByteRateLimit::new(resolved.rates.disk).expect("matching disk bucket"),
+      &wrong_ceiling,
+      resolved,
+    )
+    .is_err()
+  );
 }
 
 #[cfg(feature = "resource-feedback")]

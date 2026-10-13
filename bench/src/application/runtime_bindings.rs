@@ -57,7 +57,7 @@ pub(crate) const CPU_WAITER_CEILING: usize = APPLICATION_TASK_CEILING;
 // cover the owning async pool, filesystem pool, and bounded service roles.
 const DOMAIN_WAITER_CEILING: usize = 256;
 const DOMAIN_CONTROL_CEILING: usize = 64 * 1024 * 1024;
-const APPLICATION_RATE_CEILING_BYTES_PER_SECOND: u64 = 16 * 1024 * 1024 * 1024;
+pub(super) const APPLICATION_RATE_CEILING_BYTES_PER_SECOND: u64 = 16 * 1024 * 1024 * 1024;
 const RATE_BURST_BYTES: usize = 64 * 1024;
 const RATE_RESERVATIONS: usize = 64;
 const RATE_TIMER_REGISTRATIONS: usize = 256;
@@ -112,9 +112,9 @@ impl ApplicationMode {
 }
 
 #[cfg(feature = "resource-feedback")]
-const APPLICATION_BYTE_CALIBRATION_UNITS: &str = "application_bytes_per_second";
+pub(super) const APPLICATION_BYTE_CALIBRATION_UNITS: &str = "application_bytes_per_second";
 #[cfg(feature = "resource-feedback")]
-const CAPACITY_CALIBRATION_SCHEMA: &str = "allocatbelt.app-byte-capacity.v1";
+pub(super) const CAPACITY_CALIBRATION_SCHEMA: &str = "allocatbelt.app-byte-capacity.v1";
 #[cfg(feature = "resource-feedback")]
 const MAX_CAPACITY_CALIBRATION_BYTES: u64 = 4096;
 #[cfg(feature = "resource-feedback")]
@@ -143,9 +143,9 @@ const CALIBRATION_ARTIFACT_CONTROL_CHARGE: usize = 3 * MAX_CAPACITY_CALIBRATION_
 
 #[cfg(feature = "resource-feedback")]
 #[derive(Clone, Debug)]
-struct DirectionCalibration {
-  bytes_per_second: Option<NonZeroU64>,
-  provenance: Range<usize>,
+pub(super) struct DirectionCalibration {
+  pub(super) bytes_per_second: Option<NonZeroU64>,
+  pub(super) provenance: Range<usize>,
 }
 
 #[cfg(feature = "resource-feedback")]
@@ -161,16 +161,16 @@ struct ParsedCapacityCalibration {
 
 #[cfg(feature = "resource-feedback")]
 #[derive(Debug)]
-struct CapacityCalibrationArtifact {
-  payload: String,
-  calibration_id: Range<usize>,
-  host_id: Range<usize>,
-  profile: Range<usize>,
-  workload: Range<usize>,
-  source_sha256: Range<usize>,
-  artifact_sha256: [u8; 64],
-  disk: DirectionCalibration,
-  download: DirectionCalibration,
+pub(super) struct CapacityCalibrationArtifact {
+  pub(super) payload: String,
+  pub(super) calibration_id: Range<usize>,
+  pub(super) host_id: Range<usize>,
+  pub(super) profile: Range<usize>,
+  pub(super) workload: Range<usize>,
+  pub(super) source_sha256: Range<usize>,
+  pub(super) artifact_sha256: [u8; 64],
+  pub(super) disk: DirectionCalibration,
+  pub(super) download: DirectionCalibration,
   _charge: DomainReservation,
 }
 
@@ -186,20 +186,45 @@ struct CalibrationRunIdentity<'a> {
 
 #[cfg(feature = "resource-feedback")]
 impl CapacityCalibrationArtifact {
-  fn value(&self, range: &Range<usize>) -> &str {
+  pub(super) fn value(&self, range: &Range<usize>) -> &str {
     &self.payload[range.clone()]
   }
 }
 
 #[cfg(feature = "resource-feedback")]
+#[derive(Clone, Copy)]
+pub(super) struct CapacityCalibrationProbeInput<'a> {
+  pub(super) path: &'a std::path::Path,
+  pub(super) sha256: &'a str,
+  pub(super) host_id: &'a str,
+  pub(super) source_sha256: &'a str,
+}
+
+#[cfg(feature = "resource-feedback")]
 #[derive(Clone, Debug, Default)]
-struct FeedbackCalibrations {
-  artifact: Option<Arc<CapacityCalibrationArtifact>>,
-  pressure_qualification: bool,
+pub(super) struct FeedbackCalibrations {
+  pub(super) artifact: Option<Arc<CapacityCalibrationArtifact>>,
+  pub(super) pressure_qualification: bool,
 }
 
 #[cfg(feature = "resource-feedback")]
 impl FeedbackCalibrations {
+  fn from_explicit_probe_file(
+    tenant: &TenantDomain,
+    workload: Workload,
+    profile: &str,
+    input: CapacityCalibrationProbeInput<'_>,
+  ) -> Result<Self, String> {
+    let identity = CalibrationRunIdentity {
+      host_id: input.host_id,
+      profile,
+      workload: workload.label(),
+      source_sha256: input.source_sha256,
+      pressure_qualification: false,
+    };
+    Self::from_file(tenant, input.path, input.sha256, &identity)
+  }
+
   fn from_environment(
     tenant: &TenantDomain,
     workload: Workload,
@@ -601,6 +626,87 @@ pub(crate) fn fixed_rate_config() -> ByteRateConfig {
   }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ApplicationRateConfigs {
+  pub(crate) disk: ByteRateConfig,
+  pub(crate) upload: ByteRateConfig,
+  pub(crate) download: ByteRateConfig,
+}
+
+impl ApplicationRateConfigs {
+  fn fixed() -> Self {
+    Self {
+      disk: fixed_rate_config(),
+      upload: fixed_rate_config(),
+      download: fixed_rate_config(),
+    }
+  }
+}
+
+#[cfg(feature = "resource-feedback")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ResolvedApplicationFeedback {
+  pub(crate) policy: ResourceFeedbackPolicyConfig,
+  pub(crate) rates: ApplicationRateConfigs,
+}
+
+#[cfg(feature = "resource-feedback")]
+fn resolve_application_feedback(
+  workload: Workload,
+  workers: usize,
+  calibrations: &FeedbackCalibrations,
+) -> Result<ResolvedApplicationFeedback, String> {
+  let mut policy = feedback_policy(workers);
+  let mut rates = ApplicationRateConfigs::fixed();
+  let Some(artifact) = calibrations.artifact.as_deref() else {
+    return Ok(ResolvedApplicationFeedback { policy, rates });
+  };
+
+  let needs_disk = matches!(workload, Workload::Disk | Workload::Mixed);
+  let needs_download = matches!(workload, Workload::Http | Workload::Mixed);
+  if needs_disk {
+    resolve_calibrated_rate(
+      "disk",
+      artifact.disk.bytes_per_second,
+      &mut policy.disk_rate,
+      &mut rates.disk,
+    )?;
+  }
+  if needs_download {
+    resolve_calibrated_rate(
+      "download",
+      artifact.download.bytes_per_second,
+      &mut policy.network_rate,
+      &mut rates.download,
+    )?;
+  }
+  Ok(ResolvedApplicationFeedback { policy, rates })
+}
+
+#[cfg(feature = "resource-feedback")]
+fn resolve_calibrated_rate(
+  direction: &str,
+  measured_capacity: Option<NonZeroU64>,
+  control: &mut FeedbackControlConfig,
+  bucket: &mut ByteRateConfig,
+) -> Result<(), String> {
+  let measured_capacity = measured_capacity.ok_or_else(|| {
+    format!("capacity calibration is missing the relevant {direction} application-byte source")
+  })?;
+  let resolved = measured_capacity
+    .get()
+    .min(APPLICATION_RATE_CEILING_BYTES_PER_SECOND);
+  if resolved < control.floor {
+    return Err(format!(
+      "{direction} application-byte capacity is below the feedback floor"
+    ));
+  }
+  control.initial = resolved;
+  control.ceiling = resolved;
+  bucket.bytes_per_second = resolved;
+  Ok(())
+}
+
 pub(crate) fn application_domain_limits(
   local_limits: ResourceLimits,
   workers: usize,
@@ -647,10 +753,13 @@ pub(crate) struct ApplicationDomain {
   local_limits: ResourceLimits,
   domain_limits: DomainResources,
   fixed_global_control_baseline: usize,
+  application_rates: ApplicationRateConfigs,
   #[cfg(feature = "resource-feedback")]
   workers: usize,
   #[cfg(feature = "resource-feedback")]
   feedback_calibrations: FeedbackCalibrations,
+  #[cfg(feature = "resource-feedback")]
+  resolved_feedback: ResolvedApplicationFeedback,
   mode: ApplicationMode,
   #[cfg(feature = "resource-feedback")]
   feedback_meters: Option<Arc<FeedbackMeterCaptureOwner>>,
@@ -699,6 +808,8 @@ impl ApplicationDomain {
       selected_profile,
       #[cfg(feature = "resource-feedback")]
       None,
+      #[cfg(feature = "resource-feedback")]
+      None,
     )
   }
 
@@ -710,7 +821,31 @@ impl ApplicationDomain {
     mode: ApplicationMode,
     feedback_calibrations: FeedbackCalibrations,
   ) -> Result<Self, String> {
-    Self::build(workload, workers, mode, None, Some(feedback_calibrations))
+    Self::build(
+      workload,
+      workers,
+      mode,
+      None,
+      Some(feedback_calibrations),
+      None,
+    )
+  }
+
+  #[cfg(feature = "resource-feedback")]
+  pub(super) fn new_for_feedback_probe(
+    workload: Workload,
+    workers: usize,
+    selected_profile: &str,
+    calibration: CapacityCalibrationProbeInput<'_>,
+  ) -> Result<Self, String> {
+    Self::build(
+      workload,
+      workers,
+      ApplicationMode::ExternalPressure,
+      Some(selected_profile),
+      None,
+      Some(calibration),
+    )
   }
 
   fn build(
@@ -719,6 +854,9 @@ impl ApplicationDomain {
     mode: ApplicationMode,
     #[cfg(feature = "resource-feedback")] selected_profile: Option<&str>,
     #[cfg(feature = "resource-feedback")] injected_calibrations: Option<FeedbackCalibrations>,
+    #[cfg(feature = "resource-feedback")] probe_calibration: Option<
+      CapacityCalibrationProbeInput<'_>,
+    >,
   ) -> Result<Self, String> {
     if workers == 0 || workers > 4 {
       return Err("application runtime requires a frozen two- or four-worker bound".into());
@@ -735,17 +873,33 @@ impl ApplicationDomain {
       .map_err(|error| format!("application CPU gate startup failed: {error:?}"))?;
     #[cfg(feature = "resource-feedback")]
     let feedback_calibrations = if mode.feedback_enabled() {
-      match injected_calibrations {
-        Some(calibrations) => calibrations,
-        None => {
+      match (injected_calibrations, probe_calibration) {
+        (Some(calibrations), None) => calibrations,
+        (None, Some(calibration)) => {
+          let selected_profile = selected_profile
+            .ok_or_else(|| "calibration probe requires the selected workload profile".to_owned())?;
+          FeedbackCalibrations::from_explicit_probe_file(
+            &tenant,
+            workload,
+            selected_profile,
+            calibration,
+          )?
+        }
+        (None, None) => {
           let selected_profile = selected_profile.ok_or_else(|| {
             "external-pressure application bindings require the selected workload profile"
               .to_owned()
           })?;
           FeedbackCalibrations::from_environment(&tenant, workload, selected_profile)?
         }
+        (Some(_), Some(_)) => {
+          return Err("application feedback calibration source was supplied more than once".into());
+        }
       }
     } else {
+      if injected_calibrations.is_some() || probe_calibration.is_some() {
+        return Err("fixed-policy application cannot load feedback calibration".into());
+      }
       if pressure_qualification_requested()? {
         return Err(
           "pressure qualification requires the external-pressure comparison family".into(),
@@ -753,6 +907,13 @@ impl ApplicationDomain {
       }
       FeedbackCalibrations::default()
     };
+    #[cfg(feature = "resource-feedback")]
+    let resolved_feedback =
+      resolve_application_feedback(workload, workers, &feedback_calibrations)?;
+    #[cfg(feature = "resource-feedback")]
+    let application_rates = resolved_feedback.rates;
+    #[cfg(not(feature = "resource-feedback"))]
+    let application_rates = ApplicationRateConfigs::fixed();
     #[cfg(feature = "resource-feedback")]
     let feedback_meters = if mode.feedback_enabled() {
       Some(FeedbackMeterCaptureOwner::new(&tenant)?)
@@ -770,10 +931,13 @@ impl ApplicationDomain {
       local_limits,
       domain_limits,
       fixed_global_control_baseline,
+      application_rates,
       #[cfg(feature = "resource-feedback")]
       workers,
       #[cfg(feature = "resource-feedback")]
       feedback_calibrations,
+      #[cfg(feature = "resource-feedback")]
+      resolved_feedback,
       mode,
       #[cfg(feature = "resource-feedback")]
       feedback_meters,
@@ -801,7 +965,9 @@ impl ApplicationDomain {
     let expected_limits = self.local_limits;
     let disk_capacity = self.feedback_calibrations.disk_capacity();
     let download_capacity = self.feedback_calibrations.download_capacity();
-    let policy = feedback_policy(self.workers);
+    let resolved = self.resolved_feedback;
+    let upload_rate_config = self.application_rates.upload;
+    let policy = resolved.policy;
     let history = feedback_history_config()?;
     Ok(Some(
       allocatbelt::runtime::driver::feedback_sources_with_history(
@@ -841,8 +1007,11 @@ impl ApplicationDomain {
               "feedback upload bucket missing from matched runtime",
             )
           })?;
-          validate_initial_feedback_rates(&disk_rate, &download_rate)?;
-          if upload_rate.snapshot().bytes_per_second != APPLICATION_RATE_CEILING_BYTES_PER_SECOND {
+          validate_initial_feedback_rates(&disk_rate, &download_rate, resolved)?;
+          let upload_snapshot = upload_rate.snapshot();
+          if upload_snapshot.bytes_per_second != upload_rate_config.bytes_per_second
+            || upload_snapshot.ceiling_bytes_per_second != upload_rate_config.bytes_per_second
+          {
             return Err(std::io::Error::new(
               std::io::ErrorKind::InvalidInput,
               "upload rate differs from the matched fixed bucket",
@@ -891,6 +1060,14 @@ impl ApplicationDomain {
     self.tenant.clone()
   }
 
+  #[cfg(feature = "resource-feedback")]
+  pub(crate) fn reserve_task(&self) -> Result<ApplicationTaskLease, String> {
+    ApplicationTaskAdmission {
+      tenant: self.tenant.clone(),
+    }
+    .reserve()
+  }
+
   pub(crate) fn local_limits(&self) -> ResourceLimits {
     self.local_limits
   }
@@ -908,8 +1085,18 @@ impl ApplicationDomain {
     self.domain.clone()
   }
 
-  pub(crate) fn rate_config(&self) -> ByteRateConfig {
-    fixed_rate_config()
+  pub(crate) fn rate_configs(&self) -> ApplicationRateConfigs {
+    self.application_rates
+  }
+
+  #[cfg(feature = "resource-feedback")]
+  pub(super) fn resolved_feedback(&self) -> ResolvedApplicationFeedback {
+    self.resolved_feedback
+  }
+
+  #[cfg(feature = "resource-feedback")]
+  pub(super) fn feedback_calibrations(&self) -> &FeedbackCalibrations {
+    &self.feedback_calibrations
   }
 
   pub(crate) fn for_native(
@@ -970,6 +1157,7 @@ impl ApplicationDomain {
         service: None,
         workers: self.workers,
         calibrations: self.feedback_calibrations.clone(),
+        resolved: self.resolved_feedback,
       },
       #[cfg(not(feature = "resource-feedback"))]
       mode: self.mode,
@@ -985,12 +1173,11 @@ impl ApplicationDomain {
       TimerDriver::new_realtime_in_tenant(RATE_TIMER_REGISTRATIONS, &self.tenant)
         .map_err(|error| format!("Tokio fixed-rate timer startup failed: {error:?}"))?;
     let timer = timer_owner.handle();
-    let rate = fixed_rate_config();
-    let disk_rate = ByteRateLimit::new_in_tenant(rate, &self.tenant)
+    let disk_rate = ByteRateLimit::new_in_tenant(self.application_rates.disk, &self.tenant)
       .map_err(|error| format!("Tokio disk byte bucket startup failed: {error:?}"))?;
-    let upload = ByteRateLimit::new_in_tenant(rate, &self.tenant)
+    let upload = ByteRateLimit::new_in_tenant(self.application_rates.upload, &self.tenant)
       .map_err(|error| format!("Tokio upload byte bucket startup failed: {error:?}"))?;
-    let download = ByteRateLimit::new_in_tenant(rate, &self.tenant)
+    let download = ByteRateLimit::new_in_tenant(self.application_rates.download, &self.tenant)
       .map_err(|error| format!("Tokio download byte bucket startup failed: {error:?}"))?;
     #[cfg(feature = "resource-feedback")]
     let meters = if self.mode.feedback_enabled() {
@@ -1046,9 +1233,18 @@ impl ApplicationDomain {
     #[cfg(feature = "resource-feedback")]
     let feedback_service = if let Some(meters) = meters.as_ref() {
       let sensor = feedback_sensor(self.workers, meters, &self.feedback_calibrations)?;
+      validate_initial_feedback_rates(&disk_rate, &download, self.resolved_feedback)
+        .map_err(|error| format!("Tokio feedback rate construction mismatch: {error}"))?;
+      let upload_snapshot = upload.snapshot();
+      if upload_snapshot.bytes_per_second != self.application_rates.upload.bytes_per_second
+        || upload_snapshot.ceiling_bytes_per_second
+          != self.application_rates.upload.bytes_per_second
+      {
+        return Err("Tokio upload rate differs from the matched fixed bucket".into());
+      }
       Some(
         ResourceFeedbackService::start_in_tenant_with_history(
-          feedback_policy(self.workers),
+          self.resolved_feedback.policy,
           sensor,
           RuntimeFeedbackActuator::new(
             CpuFeedbackTarget::Tenant(self.tenant.clone()),
@@ -1092,6 +1288,7 @@ impl ApplicationDomain {
         service: feedback_service,
         workers: self.workers,
         calibrations: self.feedback_calibrations.clone(),
+        resolved: self.resolved_feedback,
       },
       #[cfg(not(feature = "resource-feedback"))]
       mode: self.mode,
@@ -1133,12 +1330,30 @@ pub(crate) fn feedback_policy(workers: usize) -> ResourceFeedbackPolicyConfig {
 fn validate_initial_feedback_rates(
   disk_rate: &ByteRateLimit,
   download_rate: &ByteRateLimit,
+  resolved: ResolvedApplicationFeedback,
 ) -> std::io::Result<()> {
-  for (name, rate) in [("disk", disk_rate), ("download", download_rate)] {
-    if rate.snapshot().bytes_per_second != APPLICATION_RATE_CEILING_BYTES_PER_SECOND {
+  for (name, rate, control, bucket) in [
+    (
+      "disk",
+      disk_rate,
+      resolved.policy.disk_rate,
+      resolved.rates.disk,
+    ),
+    (
+      "download",
+      download_rate,
+      resolved.policy.network_rate,
+      resolved.rates.download,
+    ),
+  ] {
+    let snapshot = rate.snapshot();
+    if snapshot.bytes_per_second != control.initial
+      || snapshot.ceiling_bytes_per_second != control.ceiling
+      || snapshot.ceiling_bytes_per_second != bucket.bytes_per_second
+    {
       return Err(std::io::Error::new(
         std::io::ErrorKind::InvalidInput,
-        format!("{name} feedback rate differs from the frozen initial value"),
+        format!("{name} feedback rate differs from the resolved initial value or ceiling"),
       ));
     }
   }
@@ -1564,6 +1779,7 @@ impl ApplicationRunBindings {
         rows.extend(feedback_policy_rows(
           self.feedback.workers,
           &self.feedback.calibrations,
+          self.feedback.resolved,
           disk_source,
         ));
       }
@@ -1935,6 +2151,7 @@ struct FeedbackOwner {
   service: Option<ResourceFeedbackService>,
   workers: usize,
   calibrations: FeedbackCalibrations,
+  resolved: ResolvedApplicationFeedback,
 }
 
 #[must_use = "retain through the lifetime of the task, producer or observer owner"]
@@ -2119,9 +2336,10 @@ impl ApplicationIoBindings {
 fn feedback_policy_rows(
   workers: usize,
   calibrations: &FeedbackCalibrations,
+  resolved: ResolvedApplicationFeedback,
   disk_source: &str,
 ) -> Vec<(String, String)> {
-  let policy = feedback_policy(workers);
+  let policy = resolved.policy;
   let mut rows = vec![
     (
       "feedback.schema".to_owned(),
@@ -2368,7 +2586,7 @@ fn feedback_meter_rows(
 mod tests;
 
 #[cfg(feature = "resource-feedback")]
-mod capacity_artifact_hash {
+pub(super) mod capacity_artifact_hash {
   pub(super) fn sha256_ascii(bytes: &[u8]) -> [u8; 64] {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut hasher = Sha256::new();
@@ -2391,7 +2609,7 @@ mod capacity_artifact_hash {
   }
 
   #[cfg(test)]
-  pub(super) fn sha256_hex(bytes: &[u8]) -> String {
+  pub(in crate::application) fn sha256_hex(bytes: &[u8]) -> String {
     String::from_utf8_lossy(&sha256_ascii(bytes)).into_owned()
   }
 

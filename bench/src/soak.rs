@@ -2659,7 +2659,7 @@ fn run_native_session(
     4
   };
   let limits = application_domain.local_limits();
-  let rate_config = application_domain.rate_config();
+  let rate_configs = application_domain.rate_configs();
   let blocking = BlockingConfig {
     workers,
     max_outstanding: 64,
@@ -2683,9 +2683,9 @@ fn run_native_session(
     max_registrations: 2 * WINDOW + 4,
     max_waiters: 4 * WINDOW + 8,
   })
-  .disk_rate(rate_config)
-  .upload_rate(rate_config)
-  .download_rate(rate_config);
+  .disk_rate(rate_configs.disk)
+  .upload_rate(rate_configs.upload)
+  .download_rate(rate_configs.download);
   #[cfg(feature = "resource-feedback")]
   let builder = if args.comparison_mode.feedback_enabled() {
     let factory = application_domain
