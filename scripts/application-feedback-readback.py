@@ -24,21 +24,68 @@ from typing import Any, BinaryIO, Callable, Iterator
 
 EXPECTATION_SCHEMA_V1 = "allocatbelt.application-feedback-expectation.v1"
 EXPECTATION_SCHEMA_V2 = "allocatbelt.application-feedback-expectation.v2"
+EXPECTATION_SCHEMA_V3 = "allocatbelt.application-feedback-expectation.v3"
 EXPECTATION_SCHEMA = EXPECTATION_SCHEMA_V2
 CONSTRUCTION_PROBE_SCHEMA = "allocatbelt.application-feedback-policy-probe.v1"
 TRACE_MANIFEST_SCHEMA = "allocatbelt.application-feedback-trace-manifest.v1"
 EVENT_SCHEMA = "allocatbelt.application-feedback-event.v1"
 SAMPLE_SCHEMA = "allocatbelt.application-feedback-resource-sample.v1"
 READBACK_SCHEMA = "allocatbelt.application-feedback-validation.v1"
+READBACK_SCHEMA_V2 = "allocatbelt.application-feedback-validation.v2"
 SOURCE_MANIFEST_SCHEMA = "allocatbelt.application-source-manifest.v4"
+SOURCE_MANIFEST_SCHEMA_V5 = "allocatbelt.application-source-manifest.v5"
+SOURCE_V5_CONTROLLER_PATH = "scripts/application-campaign.py"
+SOURCE_V5_CAMPAIGN_INPUTS_PATH = "scripts/application-campaign-inputs.py"
 PRESSURE_READBACK_SCHEMA = "allocatbelt.application-pressure-readback.v1"
 RUNTIME_BINDING_SCHEMA_V1 = "allocatbelt.application-runtime-binding.v1"
 RUNTIME_BINDING_SCHEMA_V2 = "allocatbelt.application-runtime-binding.v2"
+RUNTIME_SOAK_SCHEMA_V2 = "allocatbelt.runtime-soak.v2"
+SOAK_READBACK_SCHEMA_V2 = "allocatbelt.application-soak-readback.v2"
+
+SOAK_PARENT_IDENTITY_FIELDS = {
+    "campaign_id", "host_id", "run_id", "nonce", "allocator", "executor", "workload",
+    "profile", "comparison_family", "source_sha256", "build_sha256", "binary_sha256",
+    "resource_ceiling_sha256",
+}
+SOAK_RECEIPT_CLOCK_PHASES = (
+    "started", "trace_ended", "drain_ended", "shutdown_ended", "postprocess_ended",
+)
+SOAK_RECEIPT_CLOCK_FIELDS = {
+    f"{phase}_monotonic_{bound}_ns"
+    for phase in SOAK_RECEIPT_CLOCK_PHASES
+    for bound in ("lower", "upper")
+}
+SOAK_RECEIPT_FIELDS_V2 = {
+    "schema", "campaign_id", "host_id", "run_id", "nonce", "allocator", "executor", "workload",
+    "profile", "comparison_family", "mode", "qualification_eligible", "source_sha256", "binary_sha256",
+    "resource_ceiling_sha256", "reference_ring_sha256", "reference_ring_rows",
+    "reference_average_rate_per_second", "duration_seconds", "sample_interval_ms", "warmup_seconds",
+    "logical_window", "attempted", "completed", "errors", "lost", "terminal_records",
+    "terminal_stream_sha256", "terminal_stream_relative_path", "resource_samples_count",
+    "resource_samples_sha256", "resource_samples_relative_path", "first_post_warmup_hour_rss_median_kib",
+    "final_hour_rss_median_kib", "feedback_started", "feedback_worker_joined", "feedback_worker_failure",
+    "feedback_trace_worker_joined", "qualified_horizon", "started_monotonic_ns", "trace_ended_monotonic_ns",
+    "drain_ended_monotonic_ns", "shutdown_ended_monotonic_ns", "postprocess_ended_monotonic_ns",
+    "ended_monotonic_ns", "actual_trace_duration_ns", "drain_duration_ns", "shutdown_duration_ns",
+    "postprocess_after_shutdown_ns", "production_cpu_started_ns", "production_cpu_ended_ns",
+    "production_cpu_ns", "final_global_live_tenants", "final_global_cpu_used", "final_global_memory_used",
+    "final_global_disk_used", "final_global_network_used", "final_global_tasks_used", "final_global_control_used",
+    "fixed_global_control_baseline", "final_tenant_cpu_used", "final_tenant_memory_used", "final_tenant_disk_used",
+    "final_tenant_network_used", "final_tenant_tasks_used", "final_tenant_control_used", "final_scope_memory_used",
+    "final_scope_disk_used", "final_scope_network_used",
+} | SOAK_RECEIPT_CLOCK_FIELDS
+SOAK_READBACK_FIELDS_V2 = {
+    "schema", "validated", "passed", "qualification_eligible", "mode", "identity",
+    "source_manifest_sha256", "source_tree_sha256", "build_sha256", "candidate_binary_sha256",
+    "resource_ceiling_sha256", "fixed_global_control_baseline", "receipt_sha256", "validator_sha256",
+    "monotonic_endpoints",
+}
 
 MAX_EXPECTATION_BYTES = 2 * 1024 * 1024
 MAX_SOURCE_MANIFEST_BYTES = 8 * 1024 * 1024
 MAX_PRESSURE_PROOF_BYTES = 256 * 1024
 MAX_RUNTIME_BINDING_BYTES = 4 * 1024 * 1024
+MAX_SOAK_BINDING_BYTES = 256 * 1024
 MAX_CONSTRUCTION_PROBE_BYTES = 512 * 1024
 MAX_MANIFEST_BYTES = 64 * 1024
 MAX_EVENT_FILE_BYTES = 1024 * 1024 * 1024
@@ -49,6 +96,7 @@ MAX_EVENT_RECORDS = 478_915
 MAX_SAMPLE_ROWS = 114_002
 MAX_TRACE_HORIZON_NS = 11_400_000_000_000
 U64_MAX = (1 << 64) - 1
+U128_MAX = (1 << 128) - 1
 NSEC = 1_000_000_000
 
 DOMAIN = ("cpu", "memory", "disk", "network", "tasks", "control")
@@ -322,10 +370,11 @@ def _validate_expectation_body(value: object) -> dict[str, Any]:
     require(type(value) is dict, "feedback expectation must be one JSON object")
     schema = value.get("schema")
     require(
-        schema == EXPECTATION_SCHEMA_V1 or schema == EXPECTATION_SCHEMA_V2,
+        schema in (EXPECTATION_SCHEMA_V1, EXPECTATION_SCHEMA_V2, EXPECTATION_SCHEMA_V3),
         "unsupported feedback expectation schema",
     )
-    expectation_v2 = schema == EXPECTATION_SCHEMA_V2
+    expectation_v2 = schema in (EXPECTATION_SCHEMA_V2, EXPECTATION_SCHEMA_V3)
+    expectation_v3 = schema == EXPECTATION_SCHEMA_V3
     recipe_keys = {
         "schema", "mode", "identity", "policy", "app_capacity_artifact_sha256",
         "host_binding", "external_pressure_proof", "final_runtime_binding",
@@ -333,8 +382,13 @@ def _validate_expectation_body(value: object) -> dict[str, Any]:
     }
     if expectation_v2:
         recipe_keys.add("construction_probe")
+    if expectation_v3:
+        recipe_keys.add("external_soak_identity")
     recipe = exact(value, recipe_keys, "feedback expectation")
-    require(recipe["mode"] in ("capacity_calibration", "pressure_validation"), "unsupported expectation mode")
+    if expectation_v3:
+        require(recipe["mode"] == "pressure_soak_validation", "expectation v3 requires pressure_soak_validation mode")
+    else:
+        require(recipe["mode"] in ("capacity_calibration", "pressure_validation"), "unsupported expectation mode")
     identity = exact(recipe["identity"], {
         "host_id", "run_id", "report_nonce", "process_id", "allocator", "executor",
         "workload", "profile", "mode", "source_sha256", "binary_sha256",
@@ -360,7 +414,27 @@ def _validate_expectation_body(value: object) -> dict[str, Any]:
         digest(construction_probe["raw_sha256"], "construction policy probe raw SHA-256")
         digest(construction_probe["binary_sha256"], "construction probe binary SHA-256")
         require(construction_probe["allocator"] == identity["allocator"], "construction probe allocator differs from feedback identity")
-        require(construction_probe["binary_sha256"] == identity["binary_sha256"], "construction probe binary differs from feedback identity")
+        if expectation_v3:
+            require(construction_probe["binary_sha256"] != identity["binary_sha256"], "construction probe application binary must differ from the timed soak binary")
+        else:
+            require(construction_probe["binary_sha256"] == identity["binary_sha256"], "construction probe binary differs from feedback identity")
+
+    if expectation_v3:
+        soak_identity = exact(recipe["external_soak_identity"], set(SOAK_PARENT_IDENTITY_FIELDS), "external soak identity")
+        for key in ("campaign_id", "host_id", "run_id", "allocator", "executor", "workload", "profile", "comparison_family"):
+            require(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", text(soak_identity[key], f"external_soak_identity.{key}")) is not None, f"external_soak_identity.{key} is not a canonical token")
+        require(re.fullmatch(r"[0-9a-f]{32}", text(soak_identity["nonce"], "external_soak_identity.nonce", 32)) is not None, "external soak nonce must be 32 lowercase hexadecimal characters")
+        for key in ("source_sha256", "build_sha256", "binary_sha256", "resource_ceiling_sha256"):
+            digest(soak_identity[key], f"external_soak_identity.{key}")
+        require(identity["allocator"] == "allocatbelt" and soak_identity["allocator"] == "allocatbelt", "pressure-soak validation supports only the allocatbelt artifact role")
+        require(identity["executor"] == "allocatbelt" and soak_identity["executor"] == "bounded", "pressure-soak validation requires the explicit bounded-to-allocatbelt executor role mapping")
+        require(identity["workload"] == "mixed" and soak_identity["workload"] == "mixed", "pressure-soak validation requires the mixed workload role")
+        require(identity["mode"] == "soak", "pressure-soak feedback trace must carry the soak run mode")
+        require(identity["profile"] == soak_identity["profile"], "external soak profile differs from the feedback trace profile")
+        require(soak_identity["comparison_family"] == "external_pressure", "external soak identity is not the external-pressure role")
+        require(soak_identity["host_id"] == identity["host_id"] and soak_identity["source_sha256"] == identity["source_sha256"], "external soak host or source differs from feedback identity")
+        require(soak_identity["run_id"] == identity["run_id"] and soak_identity["nonce"] == identity["report_nonce"], "external soak run ID or nonce differs from the feedback trace")
+        require(soak_identity["binary_sha256"] == identity["binary_sha256"], "external soak binary differs from the timed feedback trace executable")
 
     policy_keys = {
         "version", "sample_interval_ns", "max_dense_gap_ns", "telemetry_freshness_ns",
@@ -431,10 +505,18 @@ def _validate_expectation_body(value: object) -> dict[str, Any]:
         digest(proof["raw_sha256"], "pressure proof raw SHA-256")
         digest(proof["validator_sha256"], "pressure validator SHA-256")
         digest(proof["recipe_raw_sha256"], "pressure recipe raw SHA-256")
-        runtime = exact(recipe["final_runtime_binding"], {"path", "raw_sha256"}, "final runtime binding pin")
-        absolute_path(runtime["path"], "runtime binding path")
-        digest(runtime["raw_sha256"], "runtime binding raw SHA-256")
-        require(identity["pressure_qualification"] is True, "pressure validation identity must request pressure qualification")
+        if expectation_v3:
+            binding = exact(recipe["final_runtime_binding"], {"soak_receipt", "soak_readback"}, "v3 final runtime binding")
+            for key, label in (("soak_receipt", "Rust soak receipt"), ("soak_readback", "audited soak readback")):
+                pin = exact(binding[key], {"path", "raw_sha256"}, f"{label} pin")
+                absolute_path(pin["path"], f"{label} path")
+                digest(pin["raw_sha256"], f"{label} raw SHA-256")
+            require(identity["pressure_qualification"] is True, "pressure-soak validation identity must request pressure qualification")
+        else:
+            runtime = exact(recipe["final_runtime_binding"], {"path", "raw_sha256"}, "final runtime binding pin")
+            absolute_path(runtime["path"], "runtime binding path")
+            digest(runtime["raw_sha256"], "runtime binding raw SHA-256")
+            require(identity["pressure_qualification"] is True, "pressure validation identity must request pressure qualification")
     uint(recipe["minimum_production_seconds"], "minimum production duration", positive=True, maximum=10_800)
     uint(recipe["minimum_pressure_overlap_seconds"], "minimum pressure overlap", maximum=10_800)
     if recipe["mode"] == "capacity_calibration":
@@ -511,7 +593,7 @@ def validate_construction_probe(
     recipe: dict[str, Any], source_manifest_value: dict[str, Any],
 ) -> str:
     """Validate a v2 probe against a checked expectation and source manifest."""
-    require(recipe.get("schema") == EXPECTATION_SCHEMA_V2, "construction probe validation requires expectation v2")
+    require(recipe.get("schema") in (EXPECTATION_SCHEMA_V2, EXPECTATION_SCHEMA_V3), "construction probe validation requires expectation v2 or v3")
     identity = recipe["identity"]
     _validate_v2_workload_profile(identity["workload"], identity["profile"])
     pin = exact(recipe["construction_probe"], {
@@ -525,11 +607,20 @@ def validate_construction_probe(
         "construction probe allocator is not a canonical token",
     )
     require(pin["allocator"] == identity["allocator"], "construction probe allocator differs from feedback identity")
-    require(pin["binary_sha256"] == identity["binary_sha256"], "construction probe binary differs from feedback identity")
-    require(source_manifest_value.get("schema") == SOURCE_MANIFEST_SCHEMA, "construction probe source manifest schema is unsupported")
-    artifacts = exact(source_manifest_value["artifacts"], {
-        "allocatbelt", "mimalloc-secure", "mimalloc-standard", "system",
-    }, "source manifest artifacts")
+    if recipe.get("schema") == EXPECTATION_SCHEMA_V3:
+        require(pin["binary_sha256"] != identity["binary_sha256"], "construction probe application binary must differ from the timed soak binary")
+    else:
+        require(pin["binary_sha256"] == identity["binary_sha256"], "construction probe binary differs from feedback identity")
+    source_schema = source_manifest_value.get("schema")
+    require(
+        (recipe.get("schema") == EXPECTATION_SCHEMA_V2 and source_schema == SOURCE_MANIFEST_SCHEMA)
+        or (recipe.get("schema") == EXPECTATION_SCHEMA_V3 and source_schema == SOURCE_MANIFEST_SCHEMA_V5),
+        "construction probe source manifest schema is unsupported",
+    )
+    artifacts = source_manifest_value["artifacts"]
+    require(type(artifacts) is dict and recipe["identity"]["allocator"] in artifacts, "construction probe allocator is absent from the source manifest")
+    if source_schema == SOURCE_MANIFEST_SCHEMA:
+        require(set(artifacts) == {"allocatbelt", "mimalloc-secure", "mimalloc-standard", "system"}, "source manifest artifact set is incomplete")
     require(pin["allocator"] in artifacts, "construction probe allocator is absent from the source manifest")
     artifact = exact(artifacts[pin["allocator"]], {"path", "sha256"}, "construction probe source artifact")
     require(
@@ -639,7 +730,139 @@ def validate_construction_probe(
     source_references = exact(probe["source_references"], set(CONSTRUCTION_PROBE_SOURCE_REFERENCES), "construction probe source references")
     for name, expected in CONSTRUCTION_PROBE_SOURCE_REFERENCES.items():
         require(source_references[name] == expected, f"construction probe source reference differs at {name}")
+    if source_schema == SOURCE_MANIFEST_SCHEMA_V5:
+        source = exact(source_manifest_value["source"], {"git_commit", "source_tree_sha256", "cargo_lock_sha256", "files"}, "SourceV5 manifest source")
+        records = source["files"]
+        require(type(records) is list, "SourceV5 typed source inventory must be a list")
+        by_path: dict[str, dict[str, Any]] = {}
+        for index, record_value in enumerate(records):
+            require(type(record_value) is dict, f"SourceV5 inventory record {index} is malformed")
+            record = record_value
+            path = text(record.get("path"), f"SourceV5 inventory record {index} path", 4096)
+            require(path not in by_path, f"SourceV5 inventory repeats {path}")
+            by_path[path] = record
+        for name, relative in CONSTRUCTION_PROBE_SOURCE_REFERENCES.items():
+            record = by_path.get(relative)
+            require(type(record) is dict and record.get("kind") == "file", f"construction probe source reference is not a regular SourceV5 inventory entry: {name}")
+            exact(record, {"path", "kind", "mode", "sha256", "size"}, f"SourceV5 regular source entry {name}")
+            require(record["path"] == relative and record["mode"] in ("100644", "100755"), f"SourceV5 source entry is malformed at {name}")
+            digest(record["sha256"], f"SourceV5 source entry SHA-256 {name}")
+            uint(record["size"], f"SourceV5 source entry size {name}")
+        policy_artifact = exact(source_manifest_value["feedback_policy"], {"schema", "policy", "policy_sha256"}, "SourceV5 feedback policy artifact")
+        require(policy_artifact["schema"] == "allocatbelt.application-feedback-policy-artifact.v1", "SourceV5 feedback policy artifact schema is unsupported")
+        policy_body = exact(policy_artifact["policy"], {"schema", "version", "reader_contract", "algorithm", "contexts", "source_pins"}, "SourceV5 feedback policy body")
+        require(digest(policy_artifact["policy_sha256"], "SourceV5 feedback policy digest") == digest_object(policy_body), "SourceV5 feedback policy digest is invalid")
+        require(policy_body["schema"] == "allocatbelt.application-feedback-policy-artifact.v1", "SourceV5 feedback policy body schema differs")
+        require(policy_body["version"] == policy["version"], "SourceV5 feedback policy version differs from expectation")
+        reader_contract = exact(policy_body["reader_contract"], {
+            "sample_interval_ns", "max_dense_gap_ns", "telemetry_freshness_ns",
+            "required_breach_samples", "actuation_cooldown_ns", "minimum_dense_observations",
+        }, "SourceV5 feedback policy reader contract")
+        expected_reader_contract = {field: policy[field] for field in (
+            "sample_interval_ns", "max_dense_gap_ns", "telemetry_freshness_ns",
+            "required_breach_samples", "actuation_cooldown_ns", "minimum_dense_observations",
+        )}
+        require(reader_contract == expected_reader_contract, "SourceV5 reader contract differs from the frozen feedback expectation")
+        require(policy_body["algorithm"] == algorithm, "SourceV5 feedback algorithm differs from the construction probe")
+        context_key = f"{identity['workload']}/{identity['profile']}"
+        contexts = policy_body["contexts"]
+        require(type(contexts) is dict and context_key in contexts, "SourceV5 feedback policy omits the frozen workload/profile context")
+        context = exact(contexts[context_key], {"workers", "minimum_dense_observations", "controls"}, "SourceV5 feedback policy context")
+        require(context["workers"] == workers and context["minimum_dense_observations"] == policy["minimum_dense_observations"], "SourceV5 feedback policy context worker/density differs from the construction probe")
+        require(context["controls"] == policy["controls"], "SourceV5 feedback policy context controls differ from the construction probe")
     return probe_sha
+
+
+def _source_v5_regular_record(source: object, relative_path: str, label: str) -> dict[str, Any]:
+    require(type(source) is dict, "SourceV5 source identity must be an object")
+    files = source.get("files")
+    require(type(files) is list, "SourceV5 typed source inventory must be a list")
+    matches = [item for item in files if type(item) is dict and item.get("path") == relative_path]
+    require(len(matches) == 1, f"SourceV5 inventory must contain exactly one {label} entry")
+    record = exact(matches[0], {"path", "kind", "mode", "sha256", "size"}, f"SourceV5 {label} inventory entry")
+    require(record["path"] == relative_path and record["kind"] == "file", f"SourceV5 {label} must be a regular file entry")
+    require(record["mode"] in ("100644", "100755"), f"SourceV5 {label} mode is unsupported")
+    digest(record["sha256"], f"SourceV5 {label} SHA-256")
+    uint(record["size"], f"SourceV5 {label} size")
+    return record
+
+
+def _capture_source_v5_sibling(relative_path: str, record: dict[str, Any], label: str) -> bytes:
+    """Capture only the known pinned controller/helper sibling before executing it."""
+    path = Path(__file__).resolve().with_name(PurePosixPath(relative_path).name)
+    try:
+        require(path.resolve(strict=True) == path, f"SourceV5 {label} traverses a symlink or alias")
+        before_path = path.lstat()
+        require(stat.S_ISREG(before_path.st_mode), f"SourceV5 {label} is not a regular nonsymlink file")
+        mode_text = f"{stat.S_IFMT(before_path.st_mode) | stat.S_IMODE(before_path.st_mode):06o}"
+        require(mode_text == record["mode"] and before_path.st_size == record["size"], f"SourceV5 {label} mode or size differs from its typed inventory pin")
+        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
+    except OSError as error:
+        raise ValidationError(f"cannot safely capture SourceV5 {label}: {error}") from error
+    try:
+        before_fd = os.fstat(descriptor)
+        require(stat.S_ISREG(before_fd.st_mode) and _stat_key(before_fd) == _stat_key(before_path), f"SourceV5 {label} changed while opening")
+        require(before_fd.st_size <= MAX_SOURCE_MANIFEST_BYTES, f"SourceV5 {label} exceeds its finite size bound")
+        raw = bytearray()
+        while len(raw) < before_fd.st_size:
+            block = os.read(descriptor, min(1024 * 1024, before_fd.st_size - len(raw)))
+            require(block, f"SourceV5 {label} was truncated during capture")
+            raw.extend(block)
+        after_fd = os.fstat(descriptor)
+        after_path = path.lstat()
+        require(_stat_key(before_fd) == _stat_key(after_fd) == _stat_key(after_path), f"SourceV5 {label} changed during capture")
+    finally:
+        os.close(descriptor)
+    captured = bytes(raw)
+    require(len(captured) == record["size"] and sha256_bytes(captured) == record["sha256"], f"SourceV5 {label} bytes differ from the typed inventory pin")
+    return captured
+
+
+def _verify_source_manifest_v5(value: dict[str, Any], recipe: dict[str, Any]) -> None:
+    require(recipe.get("schema") == EXPECTATION_SCHEMA_V3, "SourceV5 verification requires feedback expectation v3")
+    require(recipe.get("mode") == "pressure_soak_validation", "SourceV5 verification requires pressure-soak validation mode")
+    source = value.get("source")
+    controller_record = _source_v5_regular_record(source, SOURCE_V5_CONTROLLER_PATH, "campaign controller")
+    # The captured controller's V5 verifier validates this regular entry and
+    # passes its expected digest into campaign_inputs_module before executing
+    # the source-bound qualification policy validators.
+    _source_v5_regular_record(source, SOURCE_V5_CAMPAIGN_INPUTS_PATH, "campaign inputs module")
+    harness = value.get("qualification_harness")
+    require(type(harness) is dict and "campaign_controller" in harness, "SourceV5 qualification harness omits its campaign controller pin")
+    controller_pin = exact(harness["campaign_controller"], {"path", "sha256"}, "SourceV5 campaign controller pin")
+    require(controller_pin["path"] == SOURCE_V5_CONTROLLER_PATH, "SourceV5 campaign controller path is unsupported")
+    require(controller_pin["sha256"] == controller_record["sha256"], "SourceV5 campaign controller pin differs from its typed inventory entry")
+
+    # Validate the caller-executed validator itself before evaluating the
+    # independently captured controller.  The controller's full verifier then
+    # checks all versioned SourceV5 records, policy artifacts and pins.
+    feedback_record = _source_v5_regular_record(source, "scripts/application-feedback-readback.py", "feedback validator")
+    feedback_pin = exact(harness.get("feedback_validator"), {"path", "sha256"}, "SourceV5 feedback validator pin")
+    require(feedback_pin["path"] == "scripts/application-feedback-readback.py" and feedback_pin["sha256"] == feedback_record["sha256"], "SourceV5 feedback validator pin differs from its typed inventory entry")
+    _feedback_raw, feedback_sha = read_stable(Path(__file__).resolve(), "feedback readback validator", MAX_SOURCE_MANIFEST_BYTES)
+    require(feedback_sha == feedback_record["sha256"], "installed feedback validator differs from its SourceV5 inventory pin")
+
+    raw = _capture_source_v5_sibling(SOURCE_V5_CONTROLLER_PATH, controller_record, "campaign controller")
+    controller_sha = sha256_bytes(raw)
+    module_name = f"application_campaign_controller_{controller_sha}"
+    import types
+
+    controller = types.ModuleType(module_name)
+    controller.__file__ = str(Path(__file__).resolve().with_name("application-campaign.py"))
+    controller.__package__ = ""
+    try:
+        exec(compile(raw, controller.__file__, "exec", dont_inherit=True), controller.__dict__)
+    except (SyntaxError, ValueError, TypeError) as error:
+        raise ValidationError(f"pinned SourceV5 campaign controller cannot be compiled: {error}") from error
+    require(
+        getattr(controller, "SOURCE_SCHEMA_V5", None) == SOURCE_MANIFEST_SCHEMA_V5
+        and callable(getattr(controller, "verify_source_manifest", None)),
+        "pinned SourceV5 campaign controller has no supported full verifier",
+    )
+    try:
+        controller.verify_source_manifest(value, verify_artifacts=False)
+    except getattr(controller, "CampaignError", Exception) as error:
+        raise ValidationError(f"SourceV5 full campaign verifier rejected the manifest: {error}") from error
 
 
 def _verify_source_manifest(recipe: dict[str, Any]) -> dict[str, Any]:
@@ -647,6 +870,33 @@ def _verify_source_manifest(recipe: dict[str, Any]) -> dict[str, Any]:
     value, raw_sha = read_canonical(
         Path(pin["path"]), "source manifest", MAX_SOURCE_MANIFEST_BYTES, pin["raw_sha256"],
     )
+    if value.get("schema") == SOURCE_MANIFEST_SCHEMA_V5:
+        _verify_source_manifest_v5(value, recipe)
+        source = value["source"]
+        build = value["build"]
+        artifacts = value["artifacts"]
+        require(text(build["host_id"], "SourceV5 manifest host ID") == recipe["identity"]["host_id"], "SourceV5 manifest host differs from feedback expectation")
+        require(digest(source["source_tree_sha256"], "SourceV5 source tree SHA-256") == recipe["identity"]["source_sha256"], "SourceV5 source tree hash differs from feedback identity")
+        require(recipe["identity"]["allocator"] in artifacts, "SourceV5 manifest omits the expected application allocator artifact")
+        app_artifact = exact(artifacts[recipe["identity"]["allocator"]], {"path", "sha256"}, "SourceV5 application emitter artifact")
+        app_binary_sha = digest(app_artifact["sha256"], "SourceV5 application emitter binary SHA-256")
+        if recipe["schema"] == EXPECTATION_SCHEMA_V3:
+            probe_binary_sha = recipe["construction_probe"]["binary_sha256"]
+            require(app_binary_sha == probe_binary_sha, "SourceV5 application emitter binary differs from the construction probe")
+            require(app_binary_sha != recipe["identity"]["binary_sha256"], "SourceV5 application emitter and timed soak binaries must be distinct")
+            soak_artifacts = value["soak_artifacts"]
+            require(type(soak_artifacts) is dict and "allocatbelt" in soak_artifacts, "SourceV5 manifest omits the allocatbelt timed soak artifact")
+            soak_artifact = exact(soak_artifacts["allocatbelt"], {"path", "sha256"}, "SourceV5 timed soak artifact")
+            soak_binary_sha = digest(soak_artifact["sha256"], "SourceV5 timed soak binary SHA-256")
+            require(soak_binary_sha == recipe["identity"]["binary_sha256"], "SourceV5 timed soak binary differs from the feedback trace identity")
+            external = recipe["external_soak_identity"]
+            require(external["build_sha256"] == digest_object(build), "external soak build digest differs from SourceV5")
+            require(external["binary_sha256"] == soak_binary_sha, "external soak identity differs from SourceV5 timed soak artifact")
+        else:
+            require(app_binary_sha == recipe["identity"]["binary_sha256"], "SourceV5 application binary hash differs from feedback identity")
+        return {"raw_sha256": raw_sha, "value": value}
+
+    require(recipe["schema"] in (EXPECTATION_SCHEMA_V1, EXPECTATION_SCHEMA_V2), "feedback expectation v3 requires a SourceV5 manifest")
     exact(value, {
         "schema", "source", "build", "artifacts", "soak_artifacts", "analysis_artifact",
         "fixed_runtime_policy", "runtime_readback_validator", "resource_domain_calibration",
@@ -929,6 +1179,154 @@ def _verify_runtime_binding(
     if release_complete:
         require(all(rows[key] == "0" for key in after_release_global), "runtime binding reports live global application usage after owner release")
     return True, raw_sha, release_complete
+
+
+def _verify_soak_final_binding_v3(
+    recipe: dict[str, Any], source_manifest_binding: dict[str, Any], manifest: dict[str, Any],
+) -> dict[str, Any]:
+    """Bind the feedback trace to its independently audited SourceV5 soak run."""
+    source_manifest = source_manifest_binding["value"]
+    source_manifest_raw_sha = digest(source_manifest_binding["raw_sha256"], "SourceV5 manifest raw SHA-256")
+    binding = exact(recipe["final_runtime_binding"], {"soak_receipt", "soak_readback"}, "v3 final runtime binding")
+    receipt_pin = exact(binding["soak_receipt"], {"path", "raw_sha256"}, "Rust soak receipt pin")
+    readback_pin = exact(binding["soak_readback"], {"path", "raw_sha256"}, "audited soak readback pin")
+    receipt, receipt_sha = read_canonical(
+        Path(receipt_pin["path"]), "Rust runtime-soak v2 receipt", MAX_SOAK_BINDING_BYTES,
+        digest(receipt_pin["raw_sha256"], "Rust soak receipt raw SHA-256"),
+    )
+    readback, readback_sha = read_canonical(
+        Path(readback_pin["path"]), "application-soak-readback v2 composite", MAX_SOAK_BINDING_BYTES,
+        digest(readback_pin["raw_sha256"], "soak readback raw SHA-256"),
+    )
+    exact(receipt, SOAK_RECEIPT_FIELDS_V2, "Rust runtime-soak v2 receipt")
+    exact(readback, SOAK_READBACK_FIELDS_V2, "audited application soak readback v2")
+    require(receipt["schema"] == RUNTIME_SOAK_SCHEMA_V2, "unsupported Rust runtime-soak receipt schema")
+    require(readback["schema"] == SOAK_READBACK_SCHEMA_V2, "unsupported application soak readback schema")
+    require(readback["validated"] is True and readback["passed"] is True, "application soak readback did not pass its independent audit")
+    require(readback["mode"] in ("qualified", "functional"), "application soak readback mode is unsupported")
+    require(type(readback["qualification_eligible"]) is bool, "application soak qualification eligibility is not boolean")
+    composite_receipt_sha = digest(readback["receipt_sha256"], "soak composite receipt SHA-256")
+    require(composite_receipt_sha == receipt_sha, "soak composite receipt digest differs from the captured Rust receipt bytes")
+    if readback["mode"] == "functional":
+        require(readback["qualification_eligible"] is False, "short functional soak cannot be qualification-eligible")
+
+    external = recipe["external_soak_identity"]
+    receipt_fields = (
+        "campaign_id", "host_id", "run_id", "nonce", "allocator", "executor", "workload", "profile",
+        "comparison_family", "source_sha256", "binary_sha256", "resource_ceiling_sha256",
+    )
+    for field in receipt_fields:
+        require(receipt[field] == external[field], f"Rust soak receipt identity differs at {field}")
+    require(receipt["mode"] == "soak", "Rust soak receipt mode is not soak")
+    require(receipt["qualification_eligible"] is False, "Rust soak receipt must not self-assert qualification eligibility")
+    require(receipt["feedback_started"] is True and receipt["feedback_worker_joined"] is True, "Rust soak receipt omits feedback start/join evidence")
+    require(receipt["feedback_trace_worker_joined"] is True and receipt["feedback_worker_failure"] is None, "Rust soak feedback trace worker did not join cleanly")
+    require(type(receipt["qualified_horizon"]) is bool, "Rust soak qualified-horizon field is not boolean")
+    soak_duration = uint(receipt["duration_seconds"], "Rust soak duration", positive=True, maximum=10_800)
+    if readback["mode"] == "qualified":
+        require(soak_duration == 10_800 and receipt["qualified_horizon"] is True, "qualified soak mode differs from the exact Rust horizon")
+    else:
+        require(soak_duration < 10_800 and receipt["qualified_horizon"] is False, "functional soak mode must remain short and ineligible")
+
+    source = exact(source_manifest["source"], {"git_commit", "source_tree_sha256", "cargo_lock_sha256", "files"}, "SourceV5 source identity")
+    build_sha = digest_object(source_manifest["build"])
+    require(external["source_sha256"] == source["source_tree_sha256"], "external soak source differs from SourceV5")
+    require(external["build_sha256"] == build_sha, "external soak build differs from SourceV5")
+    require(readback["source_manifest_sha256"] == source_manifest_raw_sha, "soak composite source manifest digest differs from SourceV5")
+    require(readback["source_tree_sha256"] == external["source_sha256"], "soak composite source tree differs from external soak identity")
+    require(readback["build_sha256"] == external["build_sha256"], "soak composite build digest differs from external soak identity")
+    require(readback["candidate_binary_sha256"] == external["binary_sha256"], "soak composite candidate binary differs from external soak identity")
+    require(readback["resource_ceiling_sha256"] == external["resource_ceiling_sha256"], "soak composite resource ceiling differs from external soak identity")
+
+    source_soak_artifacts = source_manifest["soak_artifacts"]
+    require(type(source_soak_artifacts) is dict and "allocatbelt" in source_soak_artifacts, "SourceV5 manifest omits the allocatbelt soak artifact")
+    soak_artifact = exact(source_soak_artifacts["allocatbelt"], {"path", "sha256"}, "SourceV5 allocatbelt soak artifact")
+    soak_binary_sha = digest(soak_artifact["sha256"], "SourceV5 allocatbelt soak binary SHA-256")
+    require(soak_binary_sha == external["binary_sha256"] == recipe["identity"]["binary_sha256"], "SourceV5 soak artifact differs from the timed feedback executable")
+    app_artifact = exact(source_manifest["artifacts"]["allocatbelt"], {"path", "sha256"}, "SourceV5 application emitter artifact")
+    app_binary_sha = digest(app_artifact["sha256"], "SourceV5 application emitter binary SHA-256")
+    require(app_binary_sha == recipe["construction_probe"]["binary_sha256"] and app_binary_sha != soak_binary_sha, "SourceV5 application emitter and timed soak artifact roles are not distinct")
+
+    readback_identity = exact(readback["identity"], set(SOAK_PARENT_IDENTITY_FIELDS), "soak composite parent identity")
+    require(readback_identity == external, "soak composite identity differs from caller-frozen external soak identity")
+    harness = source_manifest["qualification_harness"]
+    soak_validator = exact(harness["soak_validator"], {"path", "sha256"}, "SourceV5 soak validator pin")
+    pressure_validator = exact(harness["pressure_validator"], {"path", "sha256"}, "SourceV5 pressure validator pin")
+    require(readback["validator_sha256"] == soak_validator["sha256"], "soak composite validator differs from SourceV5 harness pin")
+    require(recipe["external_pressure_proof"]["validator_sha256"] == pressure_validator["sha256"], "pressure readback validator differs from SourceV5 harness pin")
+
+    calibration = exact(source_manifest["resource_domain_calibration"], {
+        "binary", "output", "record", "source", "build", "build_sha256",
+    }, "SourceV5 resource-domain calibration")
+    baseline = uint(calibration["record"]["fixed_global_control_baseline"], "SourceV5 fixed global Control baseline", positive=True)
+    require(baseline == recipe["policy"]["collector"]["expected_global_control_baseline"], "SourceV5 calibration baseline differs from the feedback construction probe")
+    require(uint(readback["fixed_global_control_baseline"], "soak composite fixed Control baseline", positive=True) == baseline, "soak composite fixed Control baseline differs from SourceV5 calibration")
+    require(uint(receipt["fixed_global_control_baseline"], "Rust soak fixed Control baseline", positive=True) == baseline, "Rust soak receipt fixed Control baseline differs from SourceV5 calibration")
+    require(uint(receipt["final_global_live_tenants"], "Rust soak final global live tenants") == 0, "Rust soak receipt retains live global tenants")
+    require(uint(receipt["final_global_control_used"], "Rust soak final global Control use") == baseline, "Rust soak receipt global Control does not return to the calibrated baseline")
+    for field in (
+        "final_global_cpu_used", "final_global_memory_used", "final_global_disk_used", "final_global_network_used",
+        "final_global_tasks_used", "final_tenant_cpu_used", "final_tenant_memory_used", "final_tenant_disk_used",
+        "final_tenant_network_used", "final_tenant_tasks_used", "final_tenant_control_used",
+        "final_scope_memory_used", "final_scope_disk_used", "final_scope_network_used",
+    ):
+        require(uint(receipt[field], f"Rust soak final field {field}") == 0, f"Rust soak receipt retains final application usage at {field}")
+
+    scalar_fields = {
+        "started": "started_monotonic_ns",
+        "trace_ended": "trace_ended_monotonic_ns",
+        "drain_ended": "drain_ended_monotonic_ns",
+        "shutdown_ended": "shutdown_ended_monotonic_ns",
+        "postprocess_ended": "postprocess_ended_monotonic_ns",
+    }
+    receipt_endpoints: dict[str, list[int]] = {}
+    clock_width = manifest["clock_anchor"][1] - manifest["clock_anchor"][0]
+    for phase in SOAK_RECEIPT_CLOCK_PHASES:
+        lower = uint(receipt[f"{phase}_monotonic_lower_ns"], f"Rust soak {phase} lower endpoint", positive=True, maximum=U128_MAX)
+        upper = uint(receipt[f"{phase}_monotonic_upper_ns"], f"Rust soak {phase} upper endpoint", positive=True, maximum=U128_MAX)
+        scalar = uint(receipt[scalar_fields[phase]], f"Rust soak {phase} scalar endpoint", positive=True, maximum=U128_MAX)
+        require(lower <= scalar <= upper, f"Rust soak {phase} scalar endpoint is outside its captured TraceClock bracket")
+        require(upper - lower == clock_width, f"Rust soak {phase} bracket width differs from the feedback trace clock anchor")
+        receipt_endpoints[phase] = [lower, upper]
+    composite_endpoints = exact(readback["monotonic_endpoints"], set(SOAK_RECEIPT_CLOCK_PHASES), "soak composite monotonic endpoints")
+    for phase, pair in receipt_endpoints.items():
+        value = composite_endpoints[phase]
+        require(type(value) is list and len(value) == 2, f"soak composite {phase} endpoint must be a two-value bracket")
+        actual = [
+            uint(value[0], f"soak composite {phase} lower endpoint", positive=True, maximum=U128_MAX),
+            uint(value[1], f"soak composite {phase} upper endpoint", positive=True, maximum=U128_MAX),
+        ]
+        require(actual == pair, f"soak composite {phase} bracket differs from the Rust receipt")
+
+    phases = manifest["phases"]
+    for soak_phase, trace_phase in (
+        ("started", "production_start"),
+        ("trace_ended", "production_end"),
+        ("drain_ended", "drain_end"),
+        ("shutdown_ended", "shutdown_end"),
+    ):
+        trace = phases[trace_phase]
+        require(receipt_endpoints[soak_phase] == [trace["lower"], trace["upper"]], f"Rust soak {soak_phase} clock bracket differs from feedback trace {trace_phase}")
+    owner_release = phases["owner_release"]
+    require(
+        receipt_endpoints["shutdown_ended"][1] <= owner_release["lower"]
+        and owner_release["upper"] <= receipt_endpoints["postprocess_ended"][0],
+        "feedback owner-release marker does not lie between soak shutdown and postprocess endpoints",
+    )
+    scalars = {phase: uint(receipt[field], f"Rust soak {field}", positive=True, maximum=U128_MAX) for phase, field in scalar_fields.items()}
+    require(scalars["started"] <= scalars["trace_ended"] <= scalars["drain_ended"] <= scalars["shutdown_ended"] <= scalars["postprocess_ended"], "Rust soak scalar phase endpoints are unordered")
+    require(uint(receipt["ended_monotonic_ns"], "Rust soak ended endpoint", positive=True, maximum=U128_MAX) == scalars["postprocess_ended"], "Rust soak ended endpoint differs from postprocess")
+    require(uint(receipt["actual_trace_duration_ns"], "Rust soak trace duration", maximum=U128_MAX) == scalars["trace_ended"] - scalars["started"], "Rust soak trace duration differs from its captured endpoints")
+    require(uint(receipt["drain_duration_ns"], "Rust soak drain duration", maximum=U128_MAX) == scalars["drain_ended"] - scalars["trace_ended"], "Rust soak drain duration differs from its captured endpoints")
+    require(uint(receipt["shutdown_duration_ns"], "Rust soak shutdown duration", maximum=U128_MAX) == scalars["shutdown_ended"] - scalars["drain_ended"], "Rust soak shutdown duration differs from its captured endpoints")
+    require(uint(receipt["postprocess_after_shutdown_ns"], "Rust soak postprocess duration", maximum=U128_MAX) == scalars["postprocess_ended"] - scalars["shutdown_ended"], "Rust soak postprocess duration differs from its captured endpoints")
+    return {
+        "raw_sha256": receipt_sha,
+        "readback_raw_sha256": readback_sha,
+        "validated": True,
+        "qualification_eligible": readback["qualification_eligible"],
+        "mode": readback["mode"],
+    }
 
 
 def _parse_manifest(lines: list[bytes], recipe: dict[str, Any]) -> dict[str, Any]:
@@ -1801,7 +2199,7 @@ def _validate_resource_sample_rows(
                 limit = row[f"{owner}_limit_{resource}"]
                 used = row[f"{owner}_used_{resource}"]
                 require(ceiling == ceilings[resource], f"resource sample {owner} {resource} ceiling differs from caller-pinned value")
-                zero_limit_allowed = expectation["schema"] == EXPECTATION_SCHEMA_V2 and ceiling == 0
+                zero_limit_allowed = expectation["schema"] in (EXPECTATION_SCHEMA_V2, EXPECTATION_SCHEMA_V3) and ceiling == 0
                 require((limit > 0 or zero_limit_allowed) and limit <= ceiling and used <= ceiling, f"resource sample {owner} {resource} exceeds its hard ceiling")
         expected_scope = {
             "managed_memory_limit": "managed_memory", "disk_operation_limit": "disk_operations",
@@ -1906,7 +2304,7 @@ def verify_feedback(
     recipe = _validate_expectation_body({key: value for key, value in expectation.items() if key != "recipe_sha256"})
     require(digest(expectation.get("recipe_sha256"), "expectation self digest") == digest_object(recipe), "feedback expectation self digest is invalid")
     source_manifest = _verify_source_manifest(recipe)
-    if recipe["schema"] == EXPECTATION_SCHEMA_V2:
+    if recipe["schema"] in (EXPECTATION_SCHEMA_V2, EXPECTATION_SCHEMA_V3):
         validate_construction_probe(recipe, source_manifest["value"])
     artifact_pins = {
         "feedback-trace-manifest.tsv": digest(expected_artifact_sha256.get("manifest"), "expected manifest raw SHA-256"),
@@ -1942,31 +2340,61 @@ def verify_feedback(
     pressure_ok = False
     runtime_ok = False
     runtime_sha: str | None = None
+    soak_readback_sha: str | None = None
+    soak_qualification_eligible = False
+    soak_mode: str | None = None
     release_complete = False
-    if recipe["mode"] == "pressure_validation":
+    if recipe["mode"] in ("pressure_validation", "pressure_soak_validation"):
+        if recipe["schema"] == EXPECTATION_SCHEMA_V3:
+            harness = source_manifest["value"]["qualification_harness"]
+            pressure_validator = exact(harness["pressure_validator"], {"path", "sha256"}, "SourceV5 pressure validator pin")
+            require(recipe["external_pressure_proof"]["validator_sha256"] == pressure_validator["sha256"], "pressure proof validator differs from SourceV5 harness pin")
         pressure_ok, _ = _verify_pressure_proof(
             recipe, tuple(production["start_monotonic_ns"]), drain,
         )
-        runtime_ok, runtime_sha, release_complete = _verify_runtime_binding(recipe, event_info["final_state"], model.sample_count)
+        if recipe["schema"] == EXPECTATION_SCHEMA_V3:
+            soak_binding = _verify_soak_final_binding_v3(recipe, source_manifest, manifest)
+            runtime_ok = soak_binding["validated"]
+            runtime_sha = soak_binding["raw_sha256"]
+            soak_readback_sha = soak_binding["readback_raw_sha256"]
+            soak_qualification_eligible = soak_binding["qualification_eligible"]
+            soak_mode = soak_binding["mode"]
+            release_complete = runtime_ok
+        else:
+            runtime_ok, runtime_sha, release_complete = _verify_runtime_binding(recipe, event_info["final_state"], model.sample_count)
     _, reader_sha = read_stable(Path(__file__).resolve(), "feedback readback validator", 4 * 1024 * 1024)
     result = {
-        "schema": READBACK_SCHEMA,
+        "schema": READBACK_SCHEMA_V2 if recipe["schema"] == EXPECTATION_SCHEMA_V3 else READBACK_SCHEMA,
         "mode": recipe["mode"],
         "validated": True,
         "qualification_eligible": bool(
-            recipe["schema"] == EXPECTATION_SCHEMA_V2
-            and recipe["mode"] == "pressure_validation"
-            and pressure_ok and runtime_ok and release_complete
+            (
+                recipe["schema"] == EXPECTATION_SCHEMA_V2
+                and recipe["mode"] == "pressure_validation"
+                and pressure_ok and runtime_ok and release_complete
+            )
+            or (
+                recipe["schema"] == EXPECTATION_SCHEMA_V3
+                and recipe["mode"] == "pressure_soak_validation"
+                and pressure_ok and runtime_ok and release_complete and soak_qualification_eligible
+            )
         ),
         "expectation_raw_sha256": expectation_raw_sha,
         "validator_sha256": reader_sha,
         "identity": dict(recipe["identity"]),
         "raw_artifact_sha256": {"manifest": manifest_sha, "events": events_sha, "samples": samples_sha},
         "production_window": production,
-        "final_runtime_binding": {
-            "raw_sha256": runtime_sha,
-            "validated": runtime_ok,
-        },
+        "final_runtime_binding": (
+            {
+                "raw_sha256": runtime_sha,
+                "readback_raw_sha256": soak_readback_sha,
+                "validated": runtime_ok,
+                "qualification_eligible": soak_qualification_eligible,
+                "mode": soak_mode,
+            }
+            if recipe["schema"] == EXPECTATION_SCHEMA_V3 else
+            {"raw_sha256": runtime_sha, "validated": runtime_ok}
+        ),
     }
     require(set(result) == {
         "schema", "mode", "validated", "qualification_eligible", "expectation_raw_sha256",

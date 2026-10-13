@@ -404,7 +404,8 @@ def _force_all_meter_sources_zero(fixture: Fixture) -> None:
 def _mark_cpu_samples_missing(fixture: Fixture, ordinals: set[int]) -> None:
     events = [json.loads(line) for line in fixture.events_path.read_text(encoding="ascii").splitlines()]
     decisions = [index for index, event in enumerate(events) if event["kind"] == "sample_decision"]
-    if not ordinals.issubset(set(range(len(decisions)))):
+    require_indices = set(range(len(decisions)))
+    if not ordinals.issubset(require_indices):
         raise AssertionError("missing CPU test sample ordinal is outside the fixture")
     for ordinal, event_index in enumerate(decisions):
         decision = events[event_index]
@@ -466,6 +467,165 @@ def _freeze_fixture_expectation(fixture: Fixture, body: dict[str, Any]) -> None:
     fixture.expectation_bytes = raw
     fixture.expectation_sha = raw_sha
     fixture.expectation_path.write_bytes(raw)
+
+
+def _pressure_soak_expectation_spec(fixture: Fixture) -> dict[str, Any]:
+    value = json.loads(fixture.expectation_bytes)
+    value.pop("recipe_sha256")
+    value["schema"] = reader.EXPECTATION_SCHEMA_V3
+    value["mode"] = "pressure_soak_validation"
+    value["identity"] = dict(fixture.identity)
+    value["identity"].update({
+        "executor": "allocatbelt", "mode": "soak", "binary_sha256": "d" * 64,
+        "pressure_qualification": True,
+    })
+    value["construction_probe"]["binary_sha256"] = "b" * 64
+    value["app_capacity_artifact_sha256"] = "c" * 64
+    value["external_pressure_proof"] = {
+        "path": str(fixture.root / "pressure-readback.json"),
+        "raw_sha256": "1" * 64, "validator_sha256": _sha(PRESSURE_READER_PATH.read_bytes()),
+        "recipe_raw_sha256": "2" * 64,
+    }
+    value["final_runtime_binding"] = {
+        "soak_receipt": {"path": str(fixture.root / "soak-receipt.json"), "raw_sha256": "3" * 64},
+        "soak_readback": {"path": str(fixture.root / "soak-readback.json"), "raw_sha256": "4" * 64},
+    }
+    value["external_soak_identity"] = {
+        "campaign_id": "campaign-v3", "host_id": fixture.identity["host_id"],
+        "run_id": fixture.identity["run_id"], "nonce": fixture.identity["report_nonce"],
+        "allocator": "allocatbelt", "executor": "bounded", "workload": "mixed",
+        "profile": fixture.identity["profile"], "comparison_family": "external_pressure",
+        "source_sha256": fixture.identity["source_sha256"], "build_sha256": "5" * 64,
+        "binary_sha256": "d" * 64, "resource_ceiling_sha256": "6" * 64,
+    }
+    value["minimum_pressure_overlap_seconds"] = 1
+    return value
+
+
+def _v3_soak_binding_case(
+    fixture: Fixture,
+    *,
+    receipt_changes: dict[str, Any] | None = None,
+    endpoint_changes: dict[str, list[int]] | None = None,
+    composite_receipt_sha: object | None = None,
+    stale_composite_receipt: bool = False,
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+    body = _pressure_soak_expectation_spec(fixture)
+    build = {"target_triple": "x86_64-unknown-linux-gnu", "profile": "release"}
+    build_sha = reader.digest_object(build)
+    body["external_soak_identity"]["build_sha256"] = build_sha
+
+    baseline = body["policy"]["collector"]["expected_global_control_baseline"]
+    soak_validator_sha = "c" * 64
+    pressure_validator_sha = _sha(PRESSURE_READER_PATH.read_bytes())
+    source_manifest_value = {
+        "schema": reader.SOURCE_MANIFEST_SCHEMA_V5,
+        "manifest_sha256": "7" * 64,
+        "source": {
+            "git_commit": "synthetic-source-v5", "source_tree_sha256": fixture.identity["source_sha256"],
+            "cargo_lock_sha256": "8" * 64, "files": [],
+        },
+        "build": build,
+        "artifacts": {"allocatbelt": {"path": "artifacts/app", "sha256": "b" * 64}},
+        "soak_artifacts": {"allocatbelt": {"path": "artifacts/soak", "sha256": "d" * 64}},
+        "qualification_harness": {
+            "soak_validator": {"path": "scripts/application-soak-readback.py", "sha256": soak_validator_sha},
+            "pressure_validator": {"path": "scripts/application-pressure-readback.py", "sha256": pressure_validator_sha},
+        },
+        "resource_domain_calibration": {
+            "binary": {"path": "calibration/bin", "sha256": "9" * 64},
+            "output": {"path": "calibration/output", "sha256": "a" * 64},
+            "record": {"fixed_global_control_baseline": baseline},
+            "source": {}, "build": build, "build_sha256": build_sha,
+        },
+    }
+
+    lower = {
+        "started": 1_000,
+        "trace_ended": 2_000,
+        "drain_ended": 2_100,
+        "shutdown_ended": 2_200,
+        "postprocess_ended": 2_400,
+    }
+    receipt: dict[str, Any] = {key: 0 for key in reader.SOAK_RECEIPT_FIELDS_V2}
+    receipt.update({
+        "schema": reader.RUNTIME_SOAK_SCHEMA_V2,
+        "campaign_id": body["external_soak_identity"]["campaign_id"],
+        "host_id": body["external_soak_identity"]["host_id"],
+        "run_id": body["external_soak_identity"]["run_id"],
+        "nonce": body["external_soak_identity"]["nonce"],
+        "allocator": "allocatbelt", "executor": "bounded", "workload": "mixed",
+        "profile": body["external_soak_identity"]["profile"],
+        "comparison_family": "external_pressure", "mode": "soak", "qualification_eligible": False,
+        "source_sha256": body["external_soak_identity"]["source_sha256"],
+        "binary_sha256": body["external_soak_identity"]["binary_sha256"],
+        "resource_ceiling_sha256": body["external_soak_identity"]["resource_ceiling_sha256"],
+        "reference_ring_sha256": "c" * 64, "terminal_stream_sha256": "e" * 64,
+        "resource_samples_sha256": "f" * 64, "terminal_stream_relative_path": "terminals.tsv",
+        "resource_samples_relative_path": "samples.tsv", "first_post_warmup_hour_rss_median_kib": None,
+        "final_hour_rss_median_kib": None, "feedback_started": True,
+        "feedback_worker_joined": True, "feedback_worker_failure": None,
+        "feedback_trace_worker_joined": True, "qualified_horizon": False,
+        "started_monotonic_ns": lower["started"],
+        "trace_ended_monotonic_ns": lower["trace_ended"],
+        "drain_ended_monotonic_ns": lower["drain_ended"],
+        "shutdown_ended_monotonic_ns": lower["shutdown_ended"],
+        "postprocess_ended_monotonic_ns": lower["postprocess_ended"],
+        "ended_monotonic_ns": lower["postprocess_ended"],
+        "actual_trace_duration_ns": 1_000, "drain_duration_ns": 100,
+        "shutdown_duration_ns": 100, "postprocess_after_shutdown_ns": 200,
+        "production_cpu_started_ns": 1, "production_cpu_ended_ns": 2, "production_cpu_ns": 1,
+        "duration_seconds": 10, "sample_interval_ms": 100, "warmup_seconds": 300,
+        "logical_window": 8, "resource_samples_count": 101,
+        "fixed_global_control_baseline": baseline,
+        "final_global_live_tenants": 0, "final_global_control_used": baseline,
+    })
+    for phase, scalar in lower.items():
+        receipt[f"{phase}_monotonic_lower_ns"] = scalar
+        receipt[f"{phase}_monotonic_upper_ns"] = scalar + 10
+    original_receipt_sha = _sha(reader.canonical_bytes(receipt))
+    receipt.update(receipt_changes or {})
+
+    receipt_path = fixture.root / "soak-receipt.json"
+    receipt_raw = reader.canonical_bytes(receipt)
+    receipt_path.write_bytes(receipt_raw)
+    receipt_sha = _sha(receipt_raw)
+    endpoints = {phase: [receipt[f"{phase}_monotonic_lower_ns"], receipt[f"{phase}_monotonic_upper_ns"]] for phase in lower}
+    endpoints.update(endpoint_changes or {})
+    readback = {
+        "schema": reader.SOAK_READBACK_SCHEMA_V2,
+        "validated": True, "passed": True, "qualification_eligible": False, "mode": "functional",
+        "identity": dict(body["external_soak_identity"]),
+        "source_manifest_sha256": "6" * 64,
+        "source_tree_sha256": body["external_soak_identity"]["source_sha256"],
+        "build_sha256": build_sha,
+        "candidate_binary_sha256": body["external_soak_identity"]["binary_sha256"],
+        "resource_ceiling_sha256": body["external_soak_identity"]["resource_ceiling_sha256"],
+        "fixed_global_control_baseline": baseline,
+        "receipt_sha256": (
+            composite_receipt_sha if composite_receipt_sha is not None else
+            original_receipt_sha if stale_composite_receipt else receipt_sha
+        ),
+        "validator_sha256": soak_validator_sha,
+        "monotonic_endpoints": endpoints,
+    }
+    readback_path = fixture.root / "soak-readback.json"
+    readback_raw = reader.canonical_bytes(readback)
+    readback_path.write_bytes(readback_raw)
+    body["final_runtime_binding"] = {
+        "soak_receipt": {"path": str(receipt_path), "raw_sha256": receipt_sha},
+        "soak_readback": {"path": str(readback_path), "raw_sha256": _sha(readback_raw)},
+    }
+    recipe = reader._validate_expectation_body(body)
+    phases = {
+        "production_start": {"lower": lower["started"], "upper": lower["started"] + 10},
+        "production_end": {"lower": lower["trace_ended"], "upper": lower["trace_ended"] + 10},
+        "drain_end": {"lower": lower["drain_ended"], "upper": lower["drain_ended"] + 10},
+        "shutdown_end": {"lower": lower["shutdown_ended"], "upper": lower["shutdown_ended"] + 10},
+        "owner_release": {"lower": 2_300, "upper": 2_310},
+    }
+    manifest = {"clock_anchor": (100, 110), "phases": phases}
+    return recipe, {"raw_sha256": "6" * 64, "value": source_manifest_value}, manifest
 
 
 def _sample_row(
@@ -576,6 +736,200 @@ class FeedbackReadbackTests(unittest.TestCase):
         _mark_cpu_samples_missing(self.fixture, set(range(14)))
         with self.assertRaisesRegex(reader.ValidationError, "capacity calibration has insufficient dense CPU observations during production/drain"):
             self.fixture.verify()
+
+    def test_source_v5_uses_captured_pinned_controller_full_verifier(self) -> None:
+        controller_path = SCRIPT_DIR / "application-campaign.py"
+        inputs_path = SCRIPT_DIR / "application-campaign-inputs.py"
+        feedback_path = SCRIPT_DIR / "application-feedback-readback.py"
+
+        def regular_record(path: Path, relative: str) -> dict[str, Any]:
+            raw = path.read_bytes()
+            info = path.stat(follow_symlinks=False)
+            mode = f"{stat.S_IFMT(info.st_mode) | stat.S_IMODE(info.st_mode):06o}"
+            return {
+                "path": relative, "kind": "file", "mode": mode,
+                "sha256": _sha(raw), "size": len(raw),
+            }
+
+        controller = regular_record(controller_path, "scripts/application-campaign.py")
+        inputs = regular_record(inputs_path, "scripts/application-campaign-inputs.py")
+        feedback = regular_record(feedback_path, "scripts/application-feedback-readback.py")
+        value = {
+            "schema": reader.SOURCE_MANIFEST_SCHEMA_V5,
+            "source": {
+                "git_commit": "synthetic-source-v5",
+                "source_tree_sha256": "a" * 64,
+                "cargo_lock_sha256": "b" * 64,
+                "files": [controller, inputs, feedback],
+            },
+            "build": {}, "artifacts": {}, "soak_artifacts": {},
+            "analysis_artifact": {}, "fixed_runtime_policy": {},
+            "runtime_readback_validator": {}, "resource_domain_calibration": {},
+            "qualification_harness": {
+                "campaign_controller": {"path": controller["path"], "sha256": controller["sha256"]},
+                "feedback_validator": {"path": feedback["path"], "sha256": feedback["sha256"]},
+            },
+            "feedback_policy": {},
+            "manifest_sha256": "0" * 64,
+        }
+        recipe = {"schema": reader.EXPECTATION_SCHEMA_V3, "mode": "pressure_soak_validation"}
+        with self.assertRaisesRegex(reader.ValidationError, "SourceV5 full campaign verifier rejected the manifest: source-manifest digest mismatch"):
+            reader._verify_source_manifest_v5(value, recipe)
+
+        wrong_controller = dict(controller, sha256="c" * 64)
+        value["source"]["files"][0] = wrong_controller
+        value["qualification_harness"]["campaign_controller"]["sha256"] = "c" * 64
+        with self.assertRaisesRegex(reader.ValidationError, "campaign controller bytes differ from the typed inventory pin"):
+            reader._verify_source_manifest_v5(value, recipe)
+
+    def test_v3_expectation_uses_distinct_application_probe_and_timed_soak_roles(self) -> None:
+        fixture = Fixture(self.fixture.root / "pressure-soak-v3", workload="mixed")
+        body = _pressure_soak_expectation_spec(fixture)
+        recipe = reader._validate_expectation_body(body)
+        self.assertEqual(recipe["mode"], "pressure_soak_validation")
+        self.assertEqual(recipe["identity"]["binary_sha256"], recipe["external_soak_identity"]["binary_sha256"])
+        self.assertNotEqual(recipe["construction_probe"]["binary_sha256"], recipe["identity"]["binary_sha256"])
+
+        invalid_role = json.loads(json.dumps(body))
+        invalid_role["identity"]["executor"] = "tokio-1.53.1"
+        with self.assertRaisesRegex(reader.ValidationError, "explicit bounded-to-allocatbelt executor role mapping"):
+            reader._validate_expectation_body(invalid_role)
+
+    def test_v3_expectation_rejects_source_v4(self) -> None:
+        fixture = Fixture(self.fixture.root / "source-v4-v3", workload="mixed")
+        recipe = reader._validate_expectation_body(_pressure_soak_expectation_spec(fixture))
+        with self.assertRaisesRegex(reader.ValidationError, "feedback expectation v3 requires a SourceV5 manifest"):
+            reader._verify_source_manifest(recipe)
+
+    def test_v3_construction_probe_maps_to_regular_source_v5_inventory_entries(self) -> None:
+        fixture = Fixture(self.fixture.root / "probe-v3", workload="mixed")
+        body = _pressure_soak_expectation_spec(fixture)
+        recipe = reader._validate_expectation_body(body)
+        source_records = [
+            {"path": path, "kind": "file", "mode": "100644", "sha256": "a" * 64, "size": 1}
+            for path in reader.CONSTRUCTION_PROBE_SOURCE_REFERENCES.values()
+        ]
+        policy_body = {
+            "schema": "allocatbelt.application-feedback-policy-artifact.v1",
+            "version": recipe["policy"]["version"],
+            "reader_contract": {
+                key: recipe["policy"][key] for key in (
+                    "sample_interval_ns", "max_dense_gap_ns", "telemetry_freshness_ns",
+                    "required_breach_samples", "actuation_cooldown_ns", "minimum_dense_observations",
+                )
+            },
+            "algorithm": fixture._construction_probe()["rust_control_context"]["algorithm"],
+            "contexts": {
+                "mixed/mixed": {
+                    "workers": 4,
+                    "minimum_dense_observations": recipe["policy"]["minimum_dense_observations"],
+                    "controls": recipe["policy"]["controls"],
+                },
+            },
+            "source_pins": {
+                name: {"path": f"scripts/{name}.py", "sha256": "b" * 64}
+                for name in ("feedback_validator", "runtime_bindings", "runtime_policy", "runtime_sensor")
+            },
+        }
+        source_manifest = {
+            "schema": reader.SOURCE_MANIFEST_SCHEMA_V5,
+            "source": {"git_commit": "synthetic-v5", "source_tree_sha256": "b" * 64, "cargo_lock_sha256": "c" * 64, "files": source_records},
+            "artifacts": {"allocatbelt": {"path": "artifacts/app", "sha256": recipe["construction_probe"]["binary_sha256"]}},
+            "feedback_policy": {
+                "schema": "allocatbelt.application-feedback-policy-artifact.v1",
+                "policy": policy_body,
+                "policy_sha256": reader.digest_object(policy_body),
+            },
+        }
+        probe_sha = reader.validate_construction_probe(recipe, source_manifest)
+        self.assertEqual(probe_sha, recipe["construction_probe"]["raw_sha256"])
+
+        missing = json.loads(json.dumps(source_manifest))
+        missing["source"]["files"] = [record for record in missing["source"]["files"] if record["path"] != "crates/allocatbelt/src/runtime/resource_domain.rs"]
+        with self.assertRaisesRegex(reader.ValidationError, "not a regular SourceV5 inventory entry: resource_domain"):
+            reader.validate_construction_probe(recipe, missing)
+
+    def test_v3_soak_receipt_and_composite_bind_exact_final_state_and_clock(self) -> None:
+        fixture = Fixture(self.fixture.root / "soak-binding-v3", workload="mixed")
+        recipe, source_manifest, trace_manifest = _v3_soak_binding_case(fixture)
+        result = reader._verify_soak_final_binding_v3(recipe, source_manifest, trace_manifest)
+        self.assertTrue(result["validated"])
+        self.assertFalse(result["qualification_eligible"])
+        self.assertEqual(result["mode"], "functional")
+
+    def test_v3_soak_binding_rejects_nonzero_final_usage(self) -> None:
+        fixture = Fixture(self.fixture.root / "soak-binding-final-v3", workload="mixed")
+        recipe, source_manifest, trace_manifest = _v3_soak_binding_case(
+            fixture, receipt_changes={"final_global_tasks_used": 1},
+        )
+        with self.assertRaisesRegex(reader.ValidationError, "retains final application usage at final_global_tasks_used"):
+            reader._verify_soak_final_binding_v3(recipe, source_manifest, trace_manifest)
+
+    def test_v3_soak_binding_rejects_composite_clock_drift(self) -> None:
+        fixture = Fixture(self.fixture.root / "soak-binding-clock-v3", workload="mixed")
+        recipe, source_manifest, trace_manifest = _v3_soak_binding_case(
+            fixture, endpoint_changes={"started": [1_001, 1_011]},
+        )
+        with self.assertRaisesRegex(reader.ValidationError, "soak composite started bracket differs from the Rust receipt"):
+            reader._verify_soak_final_binding_v3(recipe, source_manifest, trace_manifest)
+
+    def test_v3_soak_binding_rejects_changed_receipt_with_stale_composite(self) -> None:
+        fixture = Fixture(self.fixture.root / "soak-binding-stale-composite-v3", workload="mixed")
+        recipe, source_manifest, trace_manifest = _v3_soak_binding_case(
+            fixture,
+            receipt_changes={"terminal_stream_sha256": "0" * 64},
+            stale_composite_receipt=True,
+        )
+        with self.assertRaisesRegex(reader.ValidationError, "soak composite receipt digest differs from the captured Rust receipt bytes"):
+            reader._verify_soak_final_binding_v3(recipe, source_manifest, trace_manifest)
+
+    def test_v3_soak_binding_rejects_malformed_composite_receipt_digest(self) -> None:
+        fixture = Fixture(self.fixture.root / "soak-binding-malformed-receipt-digest-v3", workload="mixed")
+        recipe, source_manifest, trace_manifest = _v3_soak_binding_case(
+            fixture, composite_receipt_sha="not-a-sha256",
+        )
+        with self.assertRaisesRegex(reader.ValidationError, "soak composite receipt SHA-256 must be lowercase SHA-256"):
+            reader._verify_soak_final_binding_v3(recipe, source_manifest, trace_manifest)
+
+    def test_v3_soak_binding_rejects_pinned_well_formed_wrong_composite_receipt_digest(self) -> None:
+        fixture = Fixture(self.fixture.root / "soak-binding-wrong-receipt-digest-v3", workload="mixed")
+        recipe, source_manifest, trace_manifest = _v3_soak_binding_case(
+            fixture, composite_receipt_sha="0" * 64,
+        )
+        with self.assertRaisesRegex(reader.ValidationError, "soak composite receipt digest differs from the captured Rust receipt bytes"):
+            reader._verify_soak_final_binding_v3(recipe, source_manifest, trace_manifest)
+
+    def test_v3_feedback_readback_consumes_both_external_proofs_and_stays_component_scoped(self) -> None:
+        fixture = Fixture(self.fixture.root / "feedback-v3", workload="mixed")
+        body = _pressure_soak_expectation_spec(fixture)
+        fixture.identity = dict(body["identity"])
+        fixture._write_trace()
+        _freeze_fixture_expectation(fixture, body)
+        source_value = {
+            "schema": reader.SOURCE_MANIFEST_SCHEMA_V5,
+            "qualification_harness": {
+                "pressure_validator": {
+                    "path": "scripts/application-pressure-readback.py",
+                    "sha256": body["external_pressure_proof"]["validator_sha256"],
+                },
+            },
+        }
+        soak_summary = {
+            "raw_sha256": "a" * 64, "readback_raw_sha256": "b" * 64,
+            "validated": True, "qualification_eligible": False, "mode": "functional",
+        }
+        with patch.object(reader, "_verify_source_manifest", return_value={"raw_sha256": "c" * 64, "value": source_value}), \
+             patch.object(reader, "validate_construction_probe", return_value="d" * 64), \
+             patch.object(reader, "_verify_pressure_proof", return_value=(True, "e" * 64)), \
+             patch.object(reader, "_verify_soak_final_binding_v3", return_value=soak_summary):
+            result = fixture.verify()
+        self.assertTrue(result["validated"])
+        self.assertEqual(result["schema"], reader.READBACK_SCHEMA_V2)
+        self.assertFalse(result["qualification_eligible"])
+        self.assertEqual(result["final_runtime_binding"], {
+            "raw_sha256": "a" * 64, "readback_raw_sha256": "b" * 64,
+            "validated": True, "qualification_eligible": False, "mode": "functional",
+        })
 
     def test_archived_v1_pressure_receipt_validates_but_never_qualifies(self) -> None:
         self.fixture.identity["pressure_qualification"] = True

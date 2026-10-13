@@ -29,25 +29,28 @@ python3 scripts/application-feedback-readback.py verify \
   --output /absolute/private/run/feedback-validation.json
 ```
 
-New frozen expectations use
-`allocatbelt.application-feedback-expectation.v2`. Archived v1 expectations
-remain readable using their historical exact-count meter contract, but are
-never pressure qualification-eligible. Every JSON object has an exact key set,
-duplicate keys and non-finite values are rejected, and canonical JSON uses
-sorted keys, compact separators, ASCII escaping, and one final LF. The recipe
-binds the actual process ID and report nonce, run, allocator, executor,
-workload, profile, run mode, source tree and binary hashes, plus the source
-manifest path and raw digest. The source manifest must be v4; its
-`build.host_id`,
+New application feedback expectations use
+`allocatbelt.application-feedback-expectation.v2`; v3 adds the external soak
+binding described below. Archived v1 expectations remain readable using their
+historical exact-count meter contract, but are never pressure
+qualification-eligible. V1 and v2 use SourceV4 and retain their original
+single-binary identity. Every JSON object has an exact key set, duplicate keys
+and non-finite values are rejected, and canonical JSON uses sorted keys,
+compact separators, ASCII escaping, and one final LF. The recipe binds the
+actual process ID and report nonce, run, allocator, executor, workload,
+profile, run mode, source tree and binary hashes, plus the source-manifest path
+and raw digest. For v1/v2, the source manifest's `build.host_id`,
 `source.source_tree_sha256`, and `artifacts[allocator].sha256` must match the
 expectation.
 
-Every v2 expectation also pins a canonical construction-only feedback policy
+Every v2/v3 expectation also pins a canonical construction-only feedback policy
 probe by absolute path, raw SHA-256, allocator and binary digest. The reader
 checks the probe context and all timing, control, ceiling, scope, bucket,
 collector and meter-bound projections against the caller-frozen policy, and
-requires the probe binary digest to match that allocator's SourceManifest
-artifact. The probe starts no workload and cannot establish when it ran; the
+requires the probe binary digest to match the expected application-emitter
+artifact. For v2 that is also the feedback process binary. For v3 it is the
+normal `artifacts.allocatbelt` binary and is distinct from the timed soak
+binary. The probe starts no workload and cannot establish when it ran; the
 owning campaign controller records that the probe preceded qualification in
 its run ledger.
 
@@ -90,6 +93,48 @@ It separately preserves the measured application/pressure overlap minimum and
 the PID/start/nonce/binary binding. The pressure reader reports a real IPv4
 loopback witness; no physical NIC claim is accepted.
 
+`pressure_soak_validation` uses expectation v3 and requires the same pressure
+readback plus two independently frozen final-binding inputs: the canonical
+`allocatbelt.runtime-soak.v2` receipt and the canonical
+`allocatbelt.application-soak-readback.v2` composite. SourceV5 is verified by
+the captured, regular, inventory-pinned campaign controller and its full
+versioned verifier. Its typed regular-file entries must bind every
+construction-probe source reference and the feedback, pressure and soak
+validators. The reader also checks the probe's reader, algorithm and
+workload/profile controls against the SourceV5 feedback-policy artifact. The
+construction probe remains bound to the normal
+`artifacts.allocatbelt` application emitter; the feedback process is bound to
+`soak_artifacts.allocatbelt`. Those binaries have separate hashes.
+
+The v3 `external_soak_identity` freezes these 13 parent fields:
+`campaign_id`, `host_id`, `run_id`, `nonce`, `allocator`, `executor`,
+`workload`, `profile`, `comparison_family`, `source_sha256`, `build_sha256`,
+`binary_sha256`, and `resource_ceiling_sha256`. The Rust receipt records
+executor `bounded`, while the feedback trace labels that same native executor
+`allocatbelt`; this is the explicit role mapping. The receipt omits a build
+digest, so the adapter binds it through
+SourceV5 and the audited composite. Run ID, nonce, host, source, workload,
+profile and timed binary must bind across the soak identity and feedback trace.
+It checks the receipt's final global and tenant application charges are zero,
+global live tenants are zero, global
+Control equals the independently calibrated baseline, and feedback workers
+started and joined without failure.
+
+The Rust receipt carries bracket fields `<phase>_monotonic_lower_ns` and
+`<phase>_monotonic_upper_ns` for `started`, `trace_ended`, `drain_ended`,
+`shutdown_ended`, and `postprocess_ended`, alongside the legacy scalar
+endpoints. The soak composite has exactly fifteen fields, including its
+validator pin, receipt digest and a `monotonic_endpoints` map with those five
+two-value brackets. The feedback reader requires each bracket to match the
+Rust receipt, and requires the composite's `receipt_sha256` to equal the
+captured raw receipt SHA. It matches the first four
+receipt brackets exactly to the trace's production start/end, drain end and
+shutdown end markers, and requires owner release to fall after shutdown and
+before postprocess. Endpoints use the same captured `Instant`; no timing
+tolerance is applied. The mandatory pressure proof must cover production
+start through drain end. A short functional soak can validate its artifacts
+but is always ineligible for qualification.
+
 The event reader independently transcribes `runtime-feedback-policy-v1`. It
 checks startup actuator readbacks, sample order and cadence, policy freshness
 and density, hysteresis, breach streaks, cooldowns, CPU/rate quantization,
@@ -116,8 +161,9 @@ state. The phase markers must order production, drain, RSS checkpoints,
 shutdown and owner release; production duration is reported with conservative
 monotonic-clock bounds.
 
-The final runtime-binding reader checks identity, zero application and owner
-usage after shutdown, zero byte-bucket reservations, feedback join, and the
+For `pressure_validation` v1/v2, the final runtime-binding reader checks
+identity, zero application and owner usage after shutdown, zero byte-bucket
+reservations, feedback join, and the
 post-release global Control baseline. `application-runtime-binding.v2` also
 requires captured post-release global CPU, memory, disk, network, and Task
 usage, with every dimension equal to zero. Historical v1 receipts remain
@@ -131,8 +177,12 @@ The validation receipt has exactly ten top-level keys:
 `schema`, `mode`, `validated`, `qualification_eligible`,
 `expectation_raw_sha256`, `validator_sha256`, `identity`,
 `raw_artifact_sha256`, `production_window`, and `final_runtime_binding`.
-`production_window` contains exactly `start_monotonic_ns` and
-`end_monotonic_ns` two-bound arrays, plus lower and upper duration bounds.
+For v3, the result uses validation schema v2 and `final_runtime_binding`
+reports the soak receipt and composite digests, validation state, soak mode,
+and component eligibility. This remains one component result and does not
+complete SourceV5 campaign qualification. `production_window` contains exactly
+`start_monotonic_ns` and `end_monotonic_ns` two-bound arrays, plus lower and
+upper duration bounds.
 
 Run the focused suites only on the designated native SSH-MCP host:
 
