@@ -143,6 +143,8 @@ def runtime_fixture_for(binding: dict, source: dict, include_artifacts: bool = F
         "after_release.expected_global_control_baseline": str(baseline),
         "after_release.control_matches_fixed_baseline": "true",
     })
+    for dimension in module.APP_DIMENSIONS:
+        fields[f"after_release.global.used.{dimension}"] = "0"
     validation = module.validate_runtime_readback(fields, expected)
     receipt_text = f"schema\t{module.SCHEMA}\n" + "".join(
         f"{key}\t{value}\n" for key, value in sorted(fields.items())

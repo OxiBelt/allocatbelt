@@ -35,10 +35,14 @@ from typing import Any
 
 
 SPEC_SCHEMA = "allocatbelt.application-campaign-spec.v2"
+SPEC_SCHEMA_V3 = "allocatbelt.application-campaign-spec.v3"
 SOURCE_SCHEMA = "allocatbelt.application-source-manifest.v4"
+SOURCE_SCHEMA_V5 = "allocatbelt.application-source-manifest.v5"
+CAMPAIGN_INPUTS_MODULE_PATH = "scripts/application-campaign-inputs.py"
 SOURCE_INVENTORY_SCHEMA = "allocatbelt.application-source-inventory.v1"
 SOURCE_INVENTORY_MODULE_SHA256 = "09557087a64e83bc81e4116f8e8f6b59e42a59beb500108e57d66942bd05f950"
 PLAN_SCHEMA = "allocatbelt.application-campaign-plan.v2"
+PLAN_SCHEMA_V3 = "allocatbelt.application-campaign-plan.v3"
 LEDGER_SCHEMA = "allocatbelt.application-campaign-ledger.v1"
 FIXED_POLICY_SCHEMA = "allocatbelt.application-fixed-policy-artifact.v1"
 CALIBRATION_SCHEMA = "allocatbelt.resource-domain-calibration.v1"
@@ -75,6 +79,11 @@ MAX_ARRIVALS = 1_000_000
 # readback. Manifest labels alone cannot enable native execution or pass gates.
 RUNTIME_QUALIFICATION_READBACK_SUPPORTED = False
 EXTERNAL_PRESSURE_DRIVER_SUPPORTED = False
+# V5 presently freezes reader/Rust control numerics only. The construction-only
+# collector charge, attachment counts, and fixed global Control baseline still
+# need an independent numeric emitter before a matched feedback launch can be
+# prospective-complete.
+FEEDBACK_RUNTIME_COMPOSITION_SUPPORTED = False
 ANALYZER_INPUT_MAGIC = b"ABQST01\0"
 ANALYZER_OUTPUT_MAGIC = b"ABQSO01\0"
 ANALYZER_INPUT_LIMIT_BYTES = 32 * 1024**3
@@ -294,6 +303,7 @@ def digest_object(value: dict[str, Any], field: str = "manifest_sha256") -> str:
 
 _RUNTIME_READBACK_MODULE_CACHE: dict[str, Any] = {}
 _SOURCE_INVENTORY_MODULE_CACHE: dict[str, Any] = {}
+_CAMPAIGN_INPUTS_MODULE_CACHE: dict[str, Any] = {}
 
 
 def runtime_readback_module(expected_sha256: str | None = None) -> Any:
@@ -346,6 +356,42 @@ def source_inventory_module(expected_sha256: str | None = None) -> Any:
         _SOURCE_INVENTORY_MODULE_CACHE.pop(next(iter(_SOURCE_INVENTORY_MODULE_CACHE)))
     _SOURCE_INVENTORY_MODULE_CACHE[source_sha256] = module
     return module
+
+
+def campaign_inputs_module(expected_sha256: str | None = None) -> Any:
+    path = Path(__file__).with_name("application-campaign-inputs.py")
+    raw, source_sha256 = read_stable_bytes(path, "campaign qualification inputs source", MAX_SOURCE_MANIFEST_BYTES)
+    require(expected_sha256 is None or source_sha256 == expected_sha256, "campaign qualification inputs source differs from its typed-inventory SHA-256")
+    module = _CAMPAIGN_INPUTS_MODULE_CACHE.get(source_sha256)
+    if module is not None:
+        return module
+    module_name = f"application_campaign_inputs_{source_sha256}"
+    module = types.ModuleType(module_name)
+    module.__file__ = str(path)
+    module.__package__ = ""
+    try:
+        code = compile(raw, str(path), "exec", dont_inherit=True)
+        exec(code, module.__dict__)
+    except (SyntaxError, ValueError, TypeError) as error:
+        raise CampaignError(f"campaign qualification inputs source cannot be compiled: {error}") from error
+    if len(_CAMPAIGN_INPUTS_MODULE_CACHE) >= 4:
+        _CAMPAIGN_INPUTS_MODULE_CACHE.pop(next(iter(_CAMPAIGN_INPUTS_MODULE_CACHE)))
+    _CAMPAIGN_INPUTS_MODULE_CACHE[source_sha256] = module
+    return module
+
+
+def campaign_inputs_source_sha256(sources: dict[str, dict[str, Any]]) -> str:
+    require(type(sources) is dict and len(sources) == 3, "SourceV5 campaign inputs require exactly three verified host manifests")
+    pins: set[str] = set()
+    for host_id, source in sources.items():
+        require(source.get("schema") == SOURCE_SCHEMA_V5, f"campaign inputs module pin requires SourceV5 for {host_id}")
+        files = source.get("source", {}).get("files")
+        require(type(files) is list, f"SourceV5 inventory is missing for {host_id}")
+        matches = [item for item in files if type(item) is dict and item.get("path") == CAMPAIGN_INPUTS_MODULE_PATH]
+        require(len(matches) == 1 and matches[0].get("kind") == "file" and is_sha256(matches[0].get("sha256")), f"SourceV5 does not pin one regular campaign inputs module for {host_id}")
+        pins.add(matches[0]["sha256"])
+    require(len(pins) == 1, "SourceV5 hosts do not share one campaign inputs module")
+    return next(iter(pins))
 
 
 def safe_relative_artifact(root: Path, value: Any, label: str, *, require_file: bool = True) -> tuple[Path, Path]:
@@ -637,8 +683,27 @@ def source_manifest(args: argparse.Namespace) -> dict[str, Any]:
         "build": build_identity,
         "build_sha256": digest_object(build_identity),
     }
+    legacy_v4 = bool(getattr(args, "legacy_v4", False))
+    qualification_harness: dict[str, dict[str, str]] | None = None
+    feedback_policy: dict[str, Any] | None = None
+    if not legacy_v4:
+        inputs = campaign_inputs_module()
+        inventory_by_path = {record["path"]: record for record in source_files}
+        qualification_harness = {}
+        for name, relative_path in inputs.HARNESS_PATHS.items():
+            record = inventory_by_path.get(relative_path)
+            require(
+                isinstance(record, dict) and record.get("kind") == "file" and is_sha256(record.get("sha256")),
+                f"qualification harness input is not a regular file in the typed source inventory: {relative_path}",
+            )
+            qualification_harness[name] = {"path": relative_path, "sha256": record["sha256"]}
+        try:
+            feedback_policy = inputs.build_feedback_policy_artifact(root, source_files, qualification_harness)
+            inputs.validate_feedback_policy_artifact(feedback_policy, source_files, qualification_harness)
+        except inputs.InputError as error:
+            raise CampaignError(f"cannot freeze numeric feedback policy artifact: {error}") from error
     manifest: dict[str, Any] = {
-        "schema": SOURCE_SCHEMA,
+        "schema": SOURCE_SCHEMA if legacy_v4 else SOURCE_SCHEMA_V5,
         "source": source_identity,
         "build": build_identity,
         "artifacts": artifacts,
@@ -654,6 +719,10 @@ def source_manifest(args: argparse.Namespace) -> dict[str, Any]:
         },
         "resource_domain_calibration": calibration,
     }
+    if not legacy_v4:
+        require(qualification_harness is not None and feedback_policy is not None, "SourceV5 qualification inputs were not assembled")
+        manifest["qualification_harness"] = qualification_harness
+        manifest["feedback_policy"] = feedback_policy
     require(is_sha256(args.features_sha256), "features manifest SHA-256 is required")
     require(is_sha256(args.build_inputs_sha256), "build inputs SHA-256 is required")
     manifest["manifest_sha256"] = digest_object(manifest)
@@ -678,12 +747,18 @@ def verify_source_manifest(
     manifest: dict[str, Any], source_root: Path | None = None, verify_artifacts: bool = True,
     timeout_seconds: float = 120.0,
 ) -> None:
-    exact_keys(manifest, {
+    schema = manifest.get("schema")
+    base_keys = {
         "schema", "source", "build", "artifacts", "soak_artifacts", "analysis_artifact",
         "fixed_runtime_policy", "runtime_readback_validator", "resource_domain_calibration",
         "manifest_sha256",
-    }, "source manifest")
-    require(manifest["schema"] == SOURCE_SCHEMA, "unsupported source-manifest schema")
+    }
+    if schema == SOURCE_SCHEMA:
+        exact_keys(manifest, base_keys, "SourceV4 manifest")
+    elif schema == SOURCE_SCHEMA_V5:
+        exact_keys(manifest, base_keys | {"qualification_harness", "feedback_policy"}, "SourceV5 manifest")
+    else:
+        raise CampaignError("unsupported source-manifest schema")
     require(is_sha256(manifest["manifest_sha256"]) and digest_object(manifest) == manifest["manifest_sha256"], "source-manifest digest mismatch")
     source = exact_keys(manifest["source"], {"git_commit", "source_tree_sha256", "cargo_lock_sha256", "files"}, "source manifest source")
     build = exact_keys(manifest["build"], {"host_id", "rustc_release", "rustc_verbose", "cargo_version", "target_triple", "target_cpu", "profile", "features_sha256", "build_inputs_sha256"}, "source manifest build")
@@ -715,6 +790,22 @@ def verify_source_manifest(
         and inventory_engine["sha256"] == SOURCE_INVENTORY_MODULE_SHA256,
         "source inventory does not bind the pinned regular shared inventory module",
     )
+    inputs_module: Any | None = None
+    if schema == SOURCE_SCHEMA_V5:
+        inputs_source = next((entry for entry in source["files"] if entry["path"] == CAMPAIGN_INPUTS_MODULE_PATH), None)
+        require(inputs_source is not None and inputs_source["kind"] == "file" and is_sha256(inputs_source["sha256"]), "SourceV5 inventory does not bind the regular campaign inputs module")
+        inputs_module = campaign_inputs_module(inputs_source["sha256"])
+        try:
+            harness = inputs_module.validate_qualification_harness(manifest["qualification_harness"], source["files"])
+            inputs_module.validate_feedback_policy_artifact(manifest["feedback_policy"], source["files"], harness)
+        except inputs_module.InputError as error:
+            raise CampaignError(f"invalid SourceV5 qualification inputs: {error}") from error
+        if source_root is not None:
+            try:
+                regenerated = inputs_module.build_feedback_policy_artifact(source_root.resolve(strict=True), source["files"], harness)
+            except inputs_module.InputError as error:
+                raise CampaignError(f"cannot independently rebuild SourceV5 feedback policy: {error}") from error
+            require(canonical_bytes(regenerated) == canonical_bytes(manifest["feedback_policy"]), "SourceV5 feedback policy artifact differs from the pinned reader/runtime numeric contract")
     validator = exact_keys(manifest["runtime_readback_validator"], {"path", "sha256"}, "runtime readback validator pin")
     validator_path = Path(validator["path"])
     require(validator["path"] == RUNTIME_VALIDATOR_RELATIVE_PATH and not validator_path.is_absolute() and ".." not in validator_path.parts and is_sha256(validator["sha256"]), "runtime readback validator path/digest is malformed")
@@ -755,6 +846,13 @@ def verify_source_manifest(
             "resource-domain-calibration-output": calibration_output,
             "runtime-readback-validator": validator,
         }
+        if schema == SOURCE_SCHEMA_V5:
+            all_artifacts.update({
+                f"qualification-harness-{name}": value
+                for name, value in manifest["qualification_harness"].items()
+            })
+            for name, value in manifest["feedback_policy"]["policy"]["source_pins"].items():
+                all_artifacts[f"feedback-policy-source-{name}"] = value
         live_calibration = None
         for label, artifact in all_artifacts.items():
             exact_keys(artifact, {"path", "sha256"}, f"artifact {label}")
@@ -828,10 +926,18 @@ def preregistration_digest(spec: dict[str, Any]) -> str:
     return digest_object(core)
 
 
-def validate_spec(spec: dict[str, Any], sources: dict[str, dict[str, Any]]) -> dict[str, Any]:
+def validate_spec(
+    spec: dict[str, Any], sources: dict[str, dict[str, Any]], input_root: Path | None = None,
+) -> dict[str, Any]:
     expected = {"schema", "campaign_id", "source_manifests", "runner_sha256", "hosts", "cells", "rates", "oracles", "protocol", "runtime_binding", "phase_adapters", "aa_controls", "soak", "deadlines"}
-    exact_keys(spec, expected, "campaign spec")
-    require(spec["schema"] == SPEC_SCHEMA, "unsupported campaign-spec schema")
+    schema = spec.get("schema")
+    spec_v3 = schema == SPEC_SCHEMA_V3
+    if spec_v3:
+        exact_keys(spec, expected | {"qualification_inputs"}, "campaign spec v3")
+    else:
+        exact_keys(spec, expected, "campaign spec v2")
+        require(schema == SPEC_SCHEMA, "unsupported campaign-spec schema")
+    source_schema = SOURCE_SCHEMA_V5 if spec_v3 else SOURCE_SCHEMA
     campaign_id = token(spec["campaign_id"], "campaign_id")
     require(is_sha256(spec["runner_sha256"]), "pair runner implementation is not pinned")
     hosts = spec["hosts"]
@@ -866,6 +972,7 @@ def validate_spec(spec: dict[str, Any], sources: dict[str, dict[str, Any]]) -> d
         require(sources[host_id]["build"]["host_id"] == host_id, f"build manifest host identity mismatch: {host_id}")
         refs_by_host[host_id] = ref
     require(set(refs_by_host) == seen_hosts and set(sources) == seen_hosts, "source manifests do not cover the exact host matrix")
+    require(all(source.get("schema") == source_schema for source in sources.values()), "campaign spec and source manifests use incompatible schema generations")
     identities = {
         (source["source"]["git_commit"], source["source"]["source_tree_sha256"], source["source"]["cargo_lock_sha256"], source["build"]["rustc_release"], tuple(source["build"]["rustc_verbose"]), source["build"]["cargo_version"], source["build"]["target_triple"], source["build"]["target_cpu"], source["build"]["features_sha256"], source["build"]["build_inputs_sha256"], source["analysis_artifact"]["path"], source["analysis_artifact"]["sha256"])
         for source in sources.values()
@@ -888,6 +995,11 @@ def validate_spec(spec: dict[str, Any], sources: dict[str, dict[str, Any]]) -> d
     validator_hashes = {source["runtime_readback_validator"]["sha256"] for source in sources.values()}
     require(len(validator_hashes) == 1, "host source manifests do not pin one exact runtime readback validator source")
     require(binding["resource_policy_sha256"] == next(iter(fixed_policies)), "runtime binding policy hash does not identify the numeric fixed-policy artifact")
+    feedback_policies: set[str] = set()
+    if spec_v3:
+        feedback_policies = {source["feedback_policy"]["policy_sha256"] for source in sources.values()}
+        require(len(feedback_policies) == 1, "SourceV5 host manifests do not share one numeric feedback policy artifact")
+        require(binding["feedback_policy_sha256"] == next(iter(feedback_policies)), "runtime binding feedback policy hash does not identify the numeric reader/runtime policy artifact")
     require(
         all(source["runtime_readback_validator"]["path"] == RUNTIME_VALIDATOR_RELATIVE_PATH for source in sources.values()),
         "host manifests do not pin the canonical runtime readback validator path",
@@ -926,6 +1038,18 @@ def validate_spec(spec: dict[str, Any], sources: dict[str, dict[str, Any]]) -> d
         require(is_sha256(cell["resource_ceiling_sha256"]), f"resource ceiling is not frozen for {key}")
         require(type(cell["capacity_horizon_seconds"]) is int and cell["capacity_horizon_seconds"] == 30, f"capacity horizon must be 30s for {key}")
     require(actual_cells == expected_profile_cells(), f"family/profile matrix differs from required set; missing={sorted(expected_profile_cells() - actual_cells)} extra={sorted(actual_cells - expected_profile_cells())}")
+
+    qualification_inputs: dict[str, Any] | None = None
+    campaign_inputs_sha256: str | None = None
+    if spec_v3:
+        campaign_inputs_sha256 = campaign_inputs_source_sha256(sources)
+        inputs_module = campaign_inputs_module(campaign_inputs_sha256)
+        try:
+            qualification_inputs = inputs_module.validate_qualification_inputs(
+                spec["qualification_inputs"], sorted(seen_hosts), cells, sources, input_root,
+            )
+        except inputs_module.InputError as error:
+            raise CampaignError(f"invalid prospective qualification inputs: {error}") from error
 
     protocol = exact_keys(spec["protocol"], {"exploration_pairs", "confirmation_pairs", "standalone_min_successes", "mixed_min_successes", "family_min_successes", "bootstrap_draws", "bootstrap_block_arrivals", "bootstrap_seed", "bootstrap_prng", "comparison_family_order", "external_pressure_predecessor", "confidence", "simultaneous_adjustment", "bootstrap_hierarchy", "weighting", "gate_scope", "safety_overload_gate_eligible", "soak_seconds", "soak_rss_growth_percent", "schedule_seed", "allocator_min_capacity_ratio", "allocator_max_p99_ratio", "executor_min_capacity_ratio", "executor_max_p99_ratio", "max_workload_throughput_ratio", "max_workload_cpu_ratio", "max_workload_p99_ratio", "max_retained_rss_ratio"}, "protocol")
     require(protocol["exploration_pairs"] == 6 and protocol["confirmation_pairs"] == 36, "exploration/confirmation pair counts are fixed at six and 36")
@@ -997,7 +1121,18 @@ def validate_spec(spec: dict[str, Any], sources: dict[str, dict[str, Any]]) -> d
     require(not oracle_keys or oracle_keys == expected_oracles, f"trusted oracle matrix incomplete: missing={len(expected_oracles - oracle_keys)} extra={len(oracle_keys - expected_oracles)}")
     require(not oracle_keys or bool(rate_keys), "trusted oracles require frozen 70/90 rates")
     oracles_frozen = oracle_keys == expected_oracles
-    confirmation_ready = bool(rate_keys) and oracles_frozen
+    capacity_evidence_supplied = qualification_inputs is not None and qualification_inputs["evidence_supplied"]
+    capacity_evidence_supplied_count = 0 if qualification_inputs is None else qualification_inputs["capacity_evidence_supplied_count"]
+    capacity_evidence_pins_checked = qualification_inputs is not None and qualification_inputs["capacity_evidence_pins_checked"]
+    capacity_evidence_validation_complete = qualification_inputs is not None and qualification_inputs["capacity_evidence_validation_complete"]
+    qualification_inputs_pins_checked = qualification_inputs is None or qualification_inputs["qualification_inputs_pins_checked"]
+    qualification_inputs_complete = qualification_inputs is None or qualification_inputs["qualification_inputs_validation_complete"]
+    # SourceV5 capacity evidence is only pinned in this phase. Readiness remains
+    # false until the producer TSV/provenance/identity/calibration checks and
+    # independent campaign-ledger chronology validator are implemented.
+    capacity_evidence_ready = qualification_inputs is None or capacity_evidence_validation_complete
+    feedback_runtime_composition_ready = not spec_v3 or FEEDBACK_RUNTIME_COMPOSITION_SUPPORTED
+    confirmation_ready = bool(rate_keys) and oracles_frozen and capacity_evidence_ready
 
     aa = spec["aa_controls"]
     require(isinstance(aa, list) and aa, "A/A controls must be explicitly preregistered")
@@ -1050,10 +1185,22 @@ def validate_spec(spec: dict[str, Any], sources: dict[str, dict[str, Any]]) -> d
     if not analysis_ready:
         gaps.append("simultaneous paired hierarchical bootstrap analyzer hash is not bound to this implementation")
     if not confirmation_ready:
-        gaps.append("confirmation cannot launch before frozen rates and trusted per-ID oracles exist")
-    execution_ready = binding_ready and RUNTIME_QUALIFICATION_READBACK_SUPPORTED
-    full_gate_ready = execution_ready and EXTERNAL_PRESSURE_DRIVER_SUPPORTED and rates_frozen and confirmation_ready and aa_runner_ready and soak_ready and analysis_ready
-    return {"campaign_id": campaign_id, "host_ids": sorted(seen_hosts), "cell_count": len(cells), "rate_count": len(rates), "oracle_count": len(oracles), "rates_frozen": rates_frozen, "oracles_frozen": oracles_frozen, "confirmation_ready": confirmation_ready, "execution_binding_complete": binding_ready, "runtime_readback_supported": RUNTIME_QUALIFICATION_READBACK_SUPPORTED, "pressure_family_ready": EXTERNAL_PRESSURE_DRIVER_SUPPORTED, "execution_ready": execution_ready, "full_gate_ready": full_gate_ready, "full_gate_gaps": gaps}
+        if spec_v3:
+            gaps.append("confirmation remains blocked until capacity producer/provenance validation and actual campaign-ledger chronology verification pass")
+        else:
+            gaps.append("confirmation cannot launch before frozen rates and trusted per-ID oracles exist")
+    if spec_v3 and not capacity_evidence_ready:
+        if capacity_evidence_supplied and capacity_evidence_pins_checked:
+            gaps.append("capacity artifact/receipt/stage bytes are pinned only; producer semantics, provenance, calibration identity, and campaign-ledger chronology are not validated")
+        elif capacity_evidence_supplied:
+            gaps.append("capacity evidence was supplied but its raw file pins have not been checked against files")
+        else:
+            gaps.append("capacity artifact, receipt, and independent chronology evidence are missing")
+    if spec_v3 and not feedback_runtime_composition_ready:
+        gaps.append("feedback collector Control charge, meter attachment counts, and fixed global Control baseline are not prospectively derived from construction/runtime readback")
+    execution_ready = binding_ready and capacity_evidence_ready and feedback_runtime_composition_ready and RUNTIME_QUALIFICATION_READBACK_SUPPORTED
+    full_gate_ready = execution_ready and qualification_inputs_complete and EXTERNAL_PRESSURE_DRIVER_SUPPORTED and rates_frozen and confirmation_ready and aa_runner_ready and soak_ready and analysis_ready
+    return {"campaign_id": campaign_id, "host_ids": sorted(seen_hosts), "cell_count": len(cells), "rate_count": len(rates), "oracle_count": len(oracles), "rates_frozen": rates_frozen, "oracles_frozen": oracles_frozen, "confirmation_ready": confirmation_ready, "capacity_evidence_supplied": capacity_evidence_supplied, "capacity_evidence_supplied_count": capacity_evidence_supplied_count, "capacity_evidence_pins_checked": capacity_evidence_pins_checked, "capacity_evidence_validation_complete": capacity_evidence_validation_complete, "capacity_evidence_ready": capacity_evidence_ready, "qualification_inputs_pins_checked": qualification_inputs_pins_checked, "qualification_inputs_complete": qualification_inputs_complete, "campaign_inputs_module_sha256": campaign_inputs_sha256, "feedback_runtime_composition_ready": feedback_runtime_composition_ready, "execution_binding_complete": binding_ready, "runtime_readback_supported": RUNTIME_QUALIFICATION_READBACK_SUPPORTED, "pressure_family_ready": EXTERNAL_PRESSURE_DRIVER_SUPPORTED, "execution_ready": execution_ready, "full_gate_ready": full_gate_ready, "full_gate_gaps": gaps}
 
 
 def load_rate_map(spec: dict[str, Any]) -> dict[tuple[str, str, str, int], int]:
@@ -3034,7 +3181,7 @@ def validate_oracle(path: Path, source_sha: str, binary_sha: str, workload: str,
 
 
 def prepare_oracles(spec: dict[str, Any], sources: dict[str, dict[str, Any]], args: argparse.Namespace) -> dict[str, Any]:
-    validation = validate_spec(spec, sources)
+    validation = validate_spec(spec, sources, Path(args.spec).resolve(strict=True).parent)
     require(validation["rates_frozen"], "canonical open-loop oracles require frozen 70/90 rates")
     host_id = args.host_id
     require(host_id in sources, f"unknown host id: {host_id}")
@@ -3336,11 +3483,14 @@ def runtime_process_bindings_for_plan(
     return result
 
 
-def freeze_plan(spec: dict[str, Any], sources: dict[str, dict[str, Any]]) -> dict[str, Any]:
-    validation = validate_spec(spec, sources)
+def freeze_plan(
+    spec: dict[str, Any], sources: dict[str, dict[str, Any]], input_root: Path | None = None,
+) -> dict[str, Any]:
+    validation = validate_spec(spec, sources, input_root)
+    spec_v3 = spec.get("schema") == SPEC_SCHEMA_V3
     jobs = {phase: build_jobs(spec, phase) for phase in ("exploration", "aa", "confirmation", "pressure", "soak")}
     plan = {
-        "schema": PLAN_SCHEMA,
+        "schema": PLAN_SCHEMA_V3 if spec_v3 else PLAN_SCHEMA,
         "campaign_id": spec["campaign_id"],
         "spec_sha256": digest_object(spec),
         "source_manifests": {host: sources[host]["manifest_sha256"] for host in validation["host_ids"]},
@@ -3354,14 +3504,48 @@ def freeze_plan(spec: dict[str, Any], sources: dict[str, dict[str, Any]]) -> dic
         "jobs": jobs,
         "runtime_process_bindings": runtime_process_bindings_for_plan(jobs, spec, sources),
     }
+    if spec_v3:
+        inputs_module_sha256 = validation["campaign_inputs_module_sha256"]
+        require(is_sha256(inputs_module_sha256), "SourceV5 campaign inputs module hash is not validated")
+        inputs_module = campaign_inputs_module(inputs_module_sha256)
+        try:
+            normalized_inputs = inputs_module.validate_qualification_inputs(
+                spec["qualification_inputs"], validation["host_ids"], spec["cells"], sources, input_root,
+            )
+            plan["campaign_inputs_module_sha256"] = inputs_module_sha256
+            plan.update(inputs_module.build_qualification_plan_inputs(spec, sources, normalized_inputs))
+        except inputs_module.InputError as error:
+            raise CampaignError(f"cannot freeze prospective qualification process templates: {error}") from error
     plan["plan_sha256"] = digest_object(plan, "plan_sha256")
     campaign_plan_bytes(plan)
     return plan
 
 
-def verify_plan(plan: dict[str, Any], validator_sha256: str | None = None) -> None:
-    exact_keys(plan, {"schema", "campaign_id", "spec_sha256", "source_manifests", "protocol", "runtime_binding", "execution_ready", "full_gate_ready", "full_gate_gaps", "host_ids", "cell_count", "jobs", "runtime_process_bindings", "plan_sha256"}, "campaign plan")
-    require(plan["schema"] == PLAN_SCHEMA, "unsupported campaign-plan schema")
+def verify_plan(
+    plan: dict[str, Any], validator_sha256: str | None = None,
+    campaign_inputs_module_sha256: str | None = None,
+) -> None:
+    schema = plan.get("schema")
+    v3_keys = {
+        "schema", "campaign_id", "spec_sha256", "source_manifests", "protocol", "runtime_binding",
+        "execution_ready", "full_gate_ready", "full_gate_gaps", "host_ids", "cell_count", "jobs",
+        "runtime_process_bindings", "capacity_process_templates", "capacity_process_templates_sha256",
+        "feedback_process_templates", "feedback_process_templates_sha256", "campaign_inputs_module_sha256", "plan_sha256",
+    }
+    v2_keys = {"schema", "campaign_id", "spec_sha256", "source_manifests", "protocol", "runtime_binding", "execution_ready", "full_gate_ready", "full_gate_gaps", "host_ids", "cell_count", "jobs", "runtime_process_bindings", "plan_sha256"}
+    if schema == PLAN_SCHEMA_V3:
+        exact_keys(plan, v3_keys, "campaign plan v3")
+        require(is_sha256(plan["campaign_inputs_module_sha256"]), "campaign plan lacks its pinned qualification inputs module hash")
+        require(campaign_inputs_module_sha256 == plan["campaign_inputs_module_sha256"], "campaign plan qualification inputs module differs from the verified SourceV5 pin")
+        inputs_module = campaign_inputs_module(campaign_inputs_module_sha256)
+        try:
+            inputs_module.validate_qualification_plan_maps(plan)
+        except inputs_module.InputError as error:
+            raise CampaignError(f"invalid prospective qualification process templates: {error}") from error
+        require(plan["execution_ready"] is False and plan["full_gate_ready"] is False, "SourceV5 execution and full-gate support must remain hard-disabled in the prospective plan")
+    else:
+        exact_keys(plan, v2_keys, "campaign plan v2")
+        require(schema == PLAN_SCHEMA, "unsupported campaign-plan schema")
     require(is_sha256(plan["plan_sha256"]) and digest_object(plan, "plan_sha256") == plan["plan_sha256"], "campaign-plan digest mismatch")
     require(is_sha256(plan["spec_sha256"]) and isinstance(plan["source_manifests"], dict) and plan["source_manifests"], "campaign-plan source/spec digest missing")
     require(all(is_sha256(value) for value in plan["source_manifests"].values()), "campaign plan contains an invalid host source pin")
@@ -3579,7 +3763,8 @@ def oracle_map_for_job(job: dict[str, Any]) -> dict[str, dict[str, Any]]:
 def run_jobs(plan: dict[str, Any], spec: dict[str, Any], sources: dict[str, dict[str, Any]], args: argparse.Namespace) -> int:
     require(args.host_id in sources, "selected host has no verified source manifest")
     source = sources[args.host_id]
-    verify_plan(plan, source["runtime_readback_validator"]["sha256"])
+    inputs_pin = campaign_inputs_source_sha256(sources) if plan.get("schema") == PLAN_SCHEMA_V3 else None
+    verify_plan(plan, source["runtime_readback_validator"]["sha256"], inputs_pin)
     if args.phase == "pressure":
         require(EXTERNAL_PRESSURE_DRIVER_SUPPORTED, "external-pressure phase is hard-disabled until the same-policy feedback driver and process readbacks are implemented")
     require(plan["execution_ready"], "qualification execution is hard-disabled until production binary runtime-domain/policy/ceiling readback is implemented and verified")
@@ -3915,6 +4100,7 @@ def build_parser() -> argparse.ArgumentParser:
     source.add_argument("--analysis-binary", required=True, metavar="RELATIVE_PATH")
     source.add_argument("--resource-domain-calibration-binary", required=True, metavar="RELATIVE_PATH")
     source.add_argument("--resource-domain-calibration-output", required=True, metavar="RELATIVE_PATH")
+    source.add_argument("--legacy-v4", action="store_true", help="emit the archived SourceV4 contract for its existing functional test fixture")
     source.add_argument("--output", required=True)
     for name in ("plan", "validate"):
         command = commands.add_parser(name, help="validate frozen inputs and build/check a deterministic campaign schedule")
@@ -3968,8 +4154,10 @@ def main(argv: list[str] | None = None) -> int:
             output.write_bytes(canonical_bytes(manifest))
             print(json.dumps({
                 "manifest_sha256": manifest["manifest_sha256"],
+                "schema": manifest["schema"],
                 "source_tree_sha256": manifest["source"]["source_tree_sha256"],
                 "fixed_policy_sha256": manifest["fixed_runtime_policy"]["policy_sha256"],
+                "feedback_policy_sha256": manifest.get("feedback_policy", {}).get("policy_sha256"),
                 "calibration_output_sha256": manifest["resource_domain_calibration"]["output"]["sha256"],
                 "fixed_global_control_baseline": manifest["resource_domain_calibration"]["record"]["fixed_global_control_baseline"],
                 "runtime_readback_validator_sha256": manifest["runtime_readback_validator"]["sha256"],
@@ -4013,7 +4201,8 @@ def main(argv: list[str] | None = None) -> int:
             sources = load_source_manifests(spec, Path(args.spec), source_root, args.host_id)
             require(args.host_id in sources, "analysis host has no verified source manifest")
             source = sources[args.host_id]
-            verify_plan(plan, source["runtime_readback_validator"]["sha256"])
+            inputs_pin = campaign_inputs_source_sha256(sources) if plan.get("schema") == PLAN_SCHEMA_V3 else None
+            verify_plan(plan, source["runtime_readback_validator"]["sha256"], inputs_pin)
             require(args.host_id in plan["host_ids"], "analysis host is absent from the frozen plan")
             analysis_source_manifest_path, analysis_source_manifest_pin = source_manifest_file(
                 spec, Path(args.spec), args.host_id
@@ -4021,9 +4210,10 @@ def main(argv: list[str] | None = None) -> int:
             analysis_source_manifest_file_sha256 = verify_source_manifest_file(
                 analysis_source_manifest_path, source, analysis_source_manifest_pin
             )
-            require(plan == freeze_plan(spec, sources), "analysis plan schedule differs from the frozen specification and host source pins")
+            spec_root = Path(args.spec).resolve(strict=True).parent
+            require(plan == freeze_plan(spec, sources, spec_root), "analysis plan schedule differs from the frozen specification and host source pins")
             campaign_artifacts = Path(args.campaign_artifacts).resolve(strict=True)
-            qualification_scope = validate_spec(spec, sources)
+            qualification_scope = validate_spec(spec, sources, spec_root)
             aa_expected = [job for job in plan["jobs"]["aa"] if job["host_id"] == args.host_id]
             aa_path = campaign_dir / "aa" / args.host_id / "controller-ledger.jsonl"
             aa_ledger = read_ledger(aa_path)
@@ -4116,11 +4306,12 @@ def main(argv: list[str] | None = None) -> int:
             spec = read_json(Path(args.spec))
             source_root = Path(args.source_root).resolve(strict=True)
             sources = load_source_manifests(spec, Path(args.spec), source_root)
-            summary = validate_spec(spec, sources)
+            spec_root = Path(args.spec).resolve(strict=True).parent
+            summary = validate_spec(spec, sources, spec_root)
             if args.command == "validate":
                 print(json.dumps(summary, sort_keys=True))
                 return 0
-            plan = freeze_plan(spec, sources)
+            plan = freeze_plan(spec, sources, spec_root)
             output = Path(args.output)
             require(not output.exists(), f"refusing to replace campaign plan: {output}")
             output.parent.mkdir(parents=True, exist_ok=True)
@@ -4131,9 +4322,11 @@ def main(argv: list[str] | None = None) -> int:
         spec = read_json(Path(args.spec))
         sources = load_source_manifests(spec, Path(args.spec), Path(args.source_root).resolve(strict=True), args.host_id)
         require(args.host_id in sources, "selected host has no verified source manifest")
-        verify_plan(plan, sources[args.host_id]["runtime_readback_validator"]["sha256"])
+        inputs_pin = campaign_inputs_source_sha256(sources) if plan.get("schema") == PLAN_SCHEMA_V3 else None
+        verify_plan(plan, sources[args.host_id]["runtime_readback_validator"]["sha256"], inputs_pin)
         require(digest_object(spec) == plan["spec_sha256"] and sources[args.host_id]["manifest_sha256"] == plan["source_manifests"].get(args.host_id), "run inputs differ from frozen plan")
-        require(plan == freeze_plan(spec, sources), "run plan schedule differs from the frozen specification and host source pins")
+        spec_root = Path(args.spec).resolve(strict=True).parent
+        require(plan == freeze_plan(spec, sources, spec_root), "run plan schedule differs from the frozen specification and host source pins")
         return run_jobs(plan, spec, sources, args)
     except CampaignError as error:
         print(f"application campaign refused: {error}", file=sys.stderr)
