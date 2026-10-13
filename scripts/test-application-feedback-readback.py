@@ -10,6 +10,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import shutil
 import stat
 import sys
 import tempfile
@@ -22,6 +23,7 @@ from unittest.mock import patch
 SCRIPT_DIR = Path(__file__).resolve().parent
 READER_PATH = SCRIPT_DIR / "application-feedback-readback.py"
 PRESSURE_READER_PATH = SCRIPT_DIR / "application-pressure-readback.py"
+CAMPAIGN_PATH = SCRIPT_DIR / "application-campaign.py"
 
 
 def _load(name: str, path: Path) -> Any:
@@ -35,12 +37,144 @@ def _load(name: str, path: Path) -> Any:
 
 
 reader = _load("application_feedback_readback_test_target", READER_PATH)
+campaign = _load("application_campaign_feedback_fixture", CAMPAIGN_PATH)
+
+
+def _source_v5_manifest(identity: dict[str, Any]) -> dict[str, Any]:
+    inputs = campaign.campaign_inputs_module()
+    inventory = campaign.source_inventory_module()
+    source_root = SCRIPT_DIR.parent
+    relative_paths = set(reader.CONSTRUCTION_PROBE_SOURCE_REFERENCES.values())
+    relative_paths.update(inputs.HARNESS_PATHS.values())
+    relative_paths.update((
+        "scripts/application-campaign-inputs.py",
+        "scripts/application-source-inventory.py",
+        "scripts/application-runtime-readback.py",
+        inputs.FEEDBACK_RUNTIME_PATH,
+        inputs.FEEDBACK_POLICY_PATH,
+        inputs.FEEDBACK_SENSOR_PATH,
+    ))
+    files = []
+    for relative in sorted(relative_paths, key=lambda value: value.encode("utf-8")):
+        path = source_root / relative
+        raw = path.read_bytes()
+        info = path.stat(follow_symlinks=False)
+        files.append({
+            "path": relative, "kind": "file",
+            "mode": "100755" if info.st_mode & 0o111 else "100644",
+            "sha256": _sha(raw), "size": len(raw),
+        })
+    source_tree = inventory.digest_records(files)
+    source = {
+        "git_commit": "synthetic-source-v5",
+        "source_tree_sha256": source_tree,
+        "cargo_lock_sha256": "d" * 64,
+        "files": files,
+    }
+    build = {
+        "host_id": identity["host_id"], "rustc_release": "1.99.0", "rustc_verbose": [],
+        "cargo_version": "cargo 1.99.0", "target_triple": "x86_64-unknown-linux-gnu",
+        "target_cpu": "x86-64-v3", "profile": "release", "features_sha256": "e" * 64,
+        "build_inputs_sha256": "f" * 64,
+    }
+    identity["source_sha256"] = source_tree
+    artifacts = {
+        "allocatbelt": {"path": "target/release/liballocatbelt.so", "sha256": identity["binary_sha256"]},
+        "mimalloc-secure": {"path": "target/release/libmimalloc-secure.so", "sha256": "1" * 64},
+        "mimalloc-standard": {"path": "target/release/libmimalloc-standard.so", "sha256": "2" * 64},
+        "system": {"path": "target/release/libsystem.so", "sha256": "3" * 64},
+    }
+    harness = {
+        name: {"path": relative, "sha256": next(item["sha256"] for item in files if item["path"] == relative)}
+        for name, relative in inputs.HARNESS_PATHS.items()
+    }
+    fixed_policy = campaign.fixed_runtime_policy_artifact(
+        next(item["sha256"] for item in files if item["path"] == "scripts/application-runtime-readback.py")
+    )
+    feedback_policy = inputs.build_feedback_policy_artifact(source_root, files, harness)
+    baseline = 8192
+    calibration_record = {
+        "schema": campaign.CALIBRATION_SCHEMA, "architecture": "x86_64",
+        "max_tenants": campaign.RUNTIME_FIXED_CONTROL_MAX_TENANTS,
+        "max_waiters": campaign.RUNTIME_FIXED_CONTROL_MAX_WAITERS,
+        "control_ceiling": campaign.RUNTIME_APPLICATION_CONTROL_CEILING,
+        "fixed_global_control_baseline": baseline, "tenant_owner_control_bytes": 4096,
+        "final_live_tenants": 0, "final_global_control_bytes": baseline,
+    }
+    manifest = {
+        "schema": reader.SOURCE_MANIFEST_SCHEMA_V5,
+        "source": source,
+        "build": build,
+        "artifacts": artifacts,
+        "soak_artifacts": {"allocatbelt": {"path": "target/soak/allocatbelt", "sha256": "4" * 64}},
+        "analysis_artifact": {"path": "target/release/analyzer", "sha256": "5" * 64},
+        "fixed_runtime_policy": fixed_policy,
+        "runtime_readback_validator": {
+            "path": "scripts/application-runtime-readback.py",
+            "sha256": next(item["sha256"] for item in files if item["path"] == "scripts/application-runtime-readback.py"),
+        },
+        "resource_domain_calibration": {
+            "binary": {"path": "target/calibration/control", "sha256": "6" * 64},
+            "output": {"path": "target/calibration/control.json", "sha256": "7" * 64},
+            "record": calibration_record,
+            "source": {key: source[key] for key in ("git_commit", "source_tree_sha256", "cargo_lock_sha256")},
+            "build": build,
+            "build_sha256": campaign.digest_object(build),
+        },
+        "qualification_harness": harness,
+        "feedback_policy": feedback_policy,
+    }
+    manifest["manifest_sha256"] = campaign.digest_object(manifest)
+    return manifest
+
+
+def _v4_policy_from_source(
+    identity: dict[str, Any], source: dict[str, Any], control_charge_bytes: int = 4096,
+) -> dict[str, Any]:
+    feedback = source["feedback_policy"]["policy"]
+    context = feedback["contexts"][f"{identity['workload']}/{identity['profile']}"]
+    fixed = source["fixed_runtime_policy"]["policy"]
+    fixed_workload = fixed["workloads"][identity["workload"]]
+    worker_count = context["workers"]
+    global_ceilings = dict(fixed_workload["domain_ceiling"])
+    global_ceilings["cpu"] = worker_count
+    return {
+        "version": feedback["version"],
+        **feedback["reader_contract"],
+        "controls": context["controls"],
+        "capacity_sources": {"disk": False, "download": False},
+        "global_ceilings": global_ceilings,
+        "tenant_ceilings": dict(global_ceilings),
+        "scope_limits": {
+            "managed_memory": fixed_workload["scope_limits"]["managed_memory_limit"],
+            "disk_operations": fixed_workload["scope_limits"]["disk_operation_limit"],
+            "network_operations": fixed_workload["scope_limits"]["network_operation_limit"],
+        },
+        "rate_buckets": {
+            direction: {
+                "ceiling_bytes_per_second": item["ceiling_bytes_per_second"],
+                "ceiling_burst_bytes": item["ceiling_burst_bytes"],
+                "max_reservations": item["max_reservations"],
+            }
+            for direction, item in fixed["byte_buckets"].items()
+        },
+        "meter_source_bounds": reader.meter_source_bounds_for_workload(identity["workload"]),
+        "collector": {
+            "task_lease_count": 1,
+            "control_charge_bytes": control_charge_bytes,
+            "expected_global_control_baseline": source["resource_domain_calibration"]["record"]["fixed_global_control_baseline"],
+        },
+    }
 
 
 class Fixture:
-    def __init__(self, root: Path, workload: str = "disk"):
+    def __init__(
+        self, root: Path, workload: str = "disk", *, profile: str | None = None,
+        capacity_trace: bool = False,
+    ):
         self.root = root
         self.root.mkdir(mode=0o700, parents=True, exist_ok=True)
+        self.capacity_trace = capacity_trace
         self.trace = root / "feedback-trace"
         self.trace.mkdir(mode=0o700)
         self.identity = {
@@ -51,7 +185,7 @@ class Fixture:
             "allocator": "allocatbelt",
             "executor": "tokio-1.53.1",
             "workload": workload,
-            "profile": "mixed" if workload == "mixed" else "steady",
+            "profile": profile or ("mixed" if workload == "mixed" else "steady"),
             "mode": "capacity",
             "source_sha256": "a" * 64,
             "binary_sha256": "b" * 64,
@@ -239,7 +373,8 @@ class Fixture:
             ))
         sequence += 1
         events.append(self._event(sequence, "service_started", base + 4_000_000))
-        sample_times = [base + 200_000_000 + index * 100_000_000 for index in range(14)]
+        observation_count = 303 if self.capacity_trace else 14
+        sample_times = [base + 200_000_000 + index * 100_000_000 for index in range(observation_count)]
         for index, sample_at in enumerate(sample_times, 1):
             sequence += 1
             raw = {"at": _bracket(sample_at), "cpu_basis_points": 9000, "disk_basis_points": None, "download_basis_points": None}
@@ -276,13 +411,15 @@ class Fixture:
             sequence += 1
             events.append(self._event(sequence, "plan", sample_at + 600, planned_at=_bracket(planned_at), controls=controls))
         sequence += 1
-        events.append(self._event(sequence, "stop_requested", base + 1_501_000_000))
+        stop_at = base + (30_410_000_000 if self.capacity_trace else 1_501_000_000)
+        events.append(self._event(sequence, "stop_requested", stop_at))
         sequence += 1
-        events.append(self._event(sequence, "worker_joined", base + 1_502_000_000, panicked=False))
+        events.append(self._event(sequence, "worker_joined", stop_at + 10_000_000, panicked=False))
         self.events_path = self.trace / "feedback-events.jsonl"
         self.events_path.write_bytes(b"".join(_json_line(event) for event in events))
 
-        row_times = [base + 150_000_000 + index * 100_000_000 for index in range(16)]
+        row_count = 305 if self.capacity_trace else 16
+        row_times = [base + 150_000_000 + index * 100_000_000 for index in range(row_count)]
         sample_lines = [
             f"schema\t{reader.SAMPLE_SCHEMA}\n".encode("ascii"),
             ("\t".join(reader.SAMPLE_HEADER) + "\n").encode("ascii"),
@@ -297,24 +434,42 @@ class Fixture:
                 "download": 16 if http_enabled and index % 2 == 1 else 0,
             }
             sample_lines.append(_sample_row(
-                self.policy, index, row_time, 14 if final else min(14, max(0, index - 1)), final,
+                self.policy, index, row_time,
+                observation_count if final else min(observation_count, max(0, index - 1)), final,
                 attached_sources=attached_sources,
+                capacity_progress_directions=(
+                    ({"disk"} if disk_enabled else set()) | ({"download"} if http_enabled else set())
+                    if self.capacity_trace else None
+                ),
             ))
         self.samples_path = self.trace / "resource-samples.tsv"
         self.samples_path.write_bytes(b"".join(sample_lines))
 
         event_sha = _sha(self.events_path.read_bytes())
         sample_sha = _sha(self.samples_path.read_bytes())
-        phases = {
-            "production_start": (base + 200_000_000, None),
-            "production_end": (base + 1_300_000_000, None),
-            "drain_end": (base + 1_400_000_000, None),
-            "rss_before": (base + 190_000_000, (100, 120)),
-            "rss_after_drain": (base + 1_410_000_000, (102, 125)),
-            "shutdown_end": (base + 1_540_000_000, None),
-            "rss_after_shutdown": (base + 1_580_000_000, (101, 125)),
-            "owner_release": (base + 1_700_000_000, None),
-        }
+        phases = (
+            {
+                "production_start": (base + 200_000_000, None),
+                "production_end": (base + 30_200_000_010, None),
+                "drain_end": (base + 30_300_000_000, None),
+                "rss_before": (base + 190_000_000, (100, 120)),
+                "rss_after_drain": (base + 30_310_000_000, (102, 125)),
+                "shutdown_end": (base + 30_430_000_000, None),
+                "rss_after_shutdown": (base + 30_450_000_000, (101, 125)),
+                "owner_release": (base + 30_600_000_000, None),
+            }
+            if self.capacity_trace else
+            {
+                "production_start": (base + 200_000_000, None),
+                "production_end": (base + 1_300_000_000, None),
+                "drain_end": (base + 1_400_000_000, None),
+                "rss_before": (base + 190_000_000, (100, 120)),
+                "rss_after_drain": (base + 1_410_000_000, (102, 125)),
+                "shutdown_end": (base + 1_540_000_000, None),
+                "rss_after_shutdown": (base + 1_580_000_000, (101, 125)),
+                "owner_release": (base + 1_700_000_000, None),
+            }
+        )
         lines = [
             f"schema\t{reader.TRACE_MANIFEST_SCHEMA}\n",
             f"identity\tprocess_id\t{self.identity['process_id']}\n",
@@ -345,7 +500,7 @@ class Fixture:
             rss_fields = ("none\tnone" if rss is None else f"{rss[0]}\t{rss[1]}")
             lines.append(f"phase\t{name}\t{at}\t{at + width}\t{rss_fields}\n")
         lines.extend([
-            "control\tcollector_charge_bytes\t4096\texpected_global_control_baseline\t8192\n",
+            f"control\tcollector_charge_bytes\t{self.policy['collector']['control_charge_bytes']}\texpected_global_control_baseline\t{self.policy['collector']['expected_global_control_baseline']}\n",
             "task\tcollector_task_lease_count\t1\n",
             "completion\tcomplete\ttrue\n",
         ])
@@ -360,6 +515,59 @@ class Fixture:
     def verify(self) -> dict[str, Any]:
         return reader.verify_feedback(self.expectation_path, self.expectation_sha, self.trace, dict(self.hashes))
 
+    def install_v4_source_v5(self) -> None:
+        source = _source_v5_manifest(self.identity)
+        self.source_path.write_bytes(reader.canonical_bytes(source))
+        self.source = source
+        self.identity["source_sha256"] = source["source"]["source_tree_sha256"]
+        self.source_pin = {
+            "path": str(self.source_path), "raw_sha256": _sha(self.source_path.read_bytes()),
+        }
+        source_app = source["artifacts"][self.identity["allocator"]]
+        probe_body = _v4_policy_from_source(self.identity, source)
+        self.policy = probe_body
+        probe_bytes = reader.canonical_bytes(self._construction_probe())
+        self.construction_probe_path.write_bytes(probe_bytes)
+        self.construction_probe_pin = {
+            "path": str(self.construction_probe_path), "raw_sha256": _sha(probe_bytes),
+            "allocator": self.identity["allocator"], "binary_sha256": source_app["sha256"],
+        }
+        self.identity["binary_sha256"] = source_app["sha256"]
+        self.identity["executor"] = "allocatbelt"
+        body = json.loads(self.expectation_bytes)
+        body["schema"] = reader.EXPECTATION_SCHEMA_V4
+        body["mode"] = "capacity_calibration"
+        body["identity"] = dict(self.identity)
+        body["policy"] = self.policy
+        body["construction_probe"] = dict(self.construction_probe_pin)
+        body["host_binding"] = dict(self.source_pin)
+        body["minimum_production_seconds"] = 30
+        body.pop("recipe_sha256", None)
+        _freeze_fixture_expectation(self, body)
+        self.capacity_trace = True
+        self._write_trace()
+        self.source["artifacts"]["allocatbelt"]["sha256"] = self.identity["binary_sha256"]
+        self.source["manifest_sha256"] = campaign.digest_object(self.source)
+        self.source_path.write_bytes(reader.canonical_bytes(self.source))
+        self.source_pin["raw_sha256"] = _sha(self.source_path.read_bytes())
+        self.expectation["host_binding"] = dict(self.source_pin)
+        body = {key: value for key, value in self.expectation.items() if key != "recipe_sha256"}
+        _freeze_fixture_expectation(self, body)
+        self.hashes = {
+            "manifest": _sha(self.manifest_path.read_bytes()),
+            "events": _sha(self.events_path.read_bytes()),
+            "samples": _sha(self.samples_path.read_bytes()),
+        }
+
+    def repin_v4_source(self) -> None:
+        self.source["manifest_sha256"] = campaign.digest_object(self.source)
+        source_raw = reader.canonical_bytes(self.source)
+        self.source_path.write_bytes(source_raw)
+        self.source_pin["raw_sha256"] = _sha(source_raw)
+        body = {key: value for key, value in self.expectation.items() if key != "recipe_sha256"}
+        body["host_binding"] = dict(self.source_pin)
+        _freeze_fixture_expectation(self, body)
+
     def repin(self, artifact: str, raw: bytes) -> None:
         path = {"events": self.events_path, "samples": self.samples_path}[artifact]
         path.write_bytes(raw)
@@ -373,6 +581,22 @@ class Fixture:
             if fields[0] == "artifact" and fields[1] == filename:
                 line = f"artifact\t{filename}\t{len(raw)}\t{raw_sha}"
             updated.append(line)
+        self.manifest_path.write_text("\n".join(updated) + "\n", encoding="ascii")
+        self.hashes["manifest"] = _sha(self.manifest_path.read_bytes())
+
+    def repin_phase(self, name: str, lower: int) -> None:
+        rows = self.manifest_path.read_text(encoding="ascii").splitlines()
+        updated = []
+        found = False
+        for line in rows:
+            fields = line.split("\t")
+            if fields[0] == "phase" and fields[1] == name:
+                fields[2], fields[3] = str(lower), str(lower + 10)
+                line = "\t".join(fields)
+                found = True
+            updated.append(line)
+        if not found:
+            raise AssertionError(f"phase is absent from the fixture: {name}")
         self.manifest_path.write_text("\n".join(updated) + "\n", encoding="ascii")
         self.hashes["manifest"] = _sha(self.manifest_path.read_bytes())
 
@@ -467,6 +691,7 @@ def _freeze_fixture_expectation(fixture: Fixture, body: dict[str, Any]) -> None:
     fixture.expectation_bytes = raw
     fixture.expectation_sha = raw_sha
     fixture.expectation_path.write_bytes(raw)
+    fixture.expectation = json.loads(raw)
 
 
 def _pressure_soak_expectation_spec(fixture: Fixture) -> dict[str, Any]:
@@ -631,6 +856,7 @@ def _v3_soak_binding_case(
 def _sample_row(
     policy: dict[str, Any], sequence: int, lower: int, feedback_count: int, final: bool,
     *, attached_sources: dict[str, int] | None = None,
+    capacity_progress_directions: set[str] | None = None,
 ) -> bytes:
     row: dict[str, Any] = {
         "sample_sequence": sequence, "window_lower_ns": lower, "window_upper_ns": lower + 1000,
@@ -660,9 +886,12 @@ def _sample_row(
             "available_bytes": burst, "reserved_bytes": 0, "reservations": 0,
         }.items():
             row[f"{direction}_rate_{field}"] = value
+        progress = capacity_progress_directions is not None and direction in capacity_progress_directions
+        committed = sequence * (1000 if direction == "disk" else 2000) if progress else 0
+        completions = sequence if progress else 0
         for field, value in {
             "measured_lower_ns": lower + 100, "measured_upper_ns": lower + 110,
-            "committed_bytes": 0, "completions": 0,
+            "committed_bytes": committed, "completions": completions,
             "attached_sources": (attached_sources or {}).get(direction, 0), "generation": 0,
             "counter_overflow": False, "invalid_io": False,
             "source_count_overflow": False, "generation_overflow": False,
@@ -736,6 +965,283 @@ class FeedbackReadbackTests(unittest.TestCase):
         _mark_cpu_samples_missing(self.fixture, set(range(14)))
         with self.assertRaisesRegex(reader.ValidationError, "capacity calibration has insufficient dense CPU observations during production/drain"):
             self.fixture.verify()
+
+    def test_v4_source_v5_capacity_trace_is_valid_but_never_eligible(self) -> None:
+        fixture = Fixture(Path(self.temp.name) / "v4-capacity", "mixed", profile="oversubscribed", capacity_trace=True)
+        fixture.install_v4_source_v5()
+        result = fixture.verify()
+        self.assertTrue(result["validated"])
+        self.assertFalse(result["qualification_eligible"])
+        self.assertEqual(result["schema"], reader.READBACK_SCHEMA)
+        self.assertEqual(result["mode"], "capacity_calibration")
+        self.assertEqual(result["final_runtime_binding"], {"raw_sha256": None, "validated": False})
+        self.assertEqual(len(result), 10)
+        self.assertEqual(fixture.expectation["schema"], reader.EXPECTATION_SCHEMA_V4)
+        self.assertEqual(fixture.policy["controls"]["cpu"]["initial"], 2)
+        self.assertEqual(len(fixture.source["feedback_policy"]["policy"]["contexts"]), 15)
+
+    def test_v4_rejects_non_calibration_modes_and_source_v4(self) -> None:
+        body = json.loads(self.fixture.expectation_bytes)
+        body.pop("recipe_sha256")
+        body["schema"] = reader.EXPECTATION_SCHEMA_V4
+        body["mode"] = "pressure_soak_validation"
+        with self.assertRaisesRegex(reader.ValidationError, "expectation v4 requires capacity_calibration mode"):
+            reader._validate_expectation_body(body)
+
+        body["mode"] = "capacity_calibration"
+        recipe = reader._validate_expectation_body(body)
+        with self.assertRaisesRegex(reader.ValidationError, "feedback expectation v4 requires a SourceV5 manifest"):
+            reader._verify_source_manifest(recipe)
+
+    def test_v4_source_v5_reader_captures_controller_input_and_self_modes_and_sizes(self) -> None:
+        fixture = Fixture(Path(self.temp.name) / "v4-captured-source")
+        fixture.install_v4_source_v5()
+        cases = (
+            ("scripts/application-campaign.py", "mode"),
+            ("scripts/application-campaign.py", "size", None),
+            ("scripts/application-campaign.py", "sha256"),
+            ("scripts/application-campaign-inputs.py", "mode"),
+            ("scripts/application-campaign-inputs.py", "size", None),
+            ("scripts/application-campaign-inputs.py", "sha256"),
+            ("scripts/application-feedback-readback.py", "mode"),
+            ("scripts/application-feedback-readback.py", "size", None),
+            ("scripts/application-feedback-readback.py", "sha256"),
+        )
+        for case in cases:
+            relative, field = case[:2]
+            candidate = Fixture(Path(self.temp.name) / f"v4-pin-{Path(relative).stem}-{field}")
+            candidate.install_v4_source_v5()
+            record = next(item for item in candidate.source["source"]["files"] if item["path"] == relative)
+            if field == "mode":
+                record[field] = "100755" if record[field] == "100644" else "100644"
+            elif field == "size":
+                record[field] += 1
+            else:
+                record[field] = "0" * 64
+                harness_key = {
+                    "scripts/application-campaign.py": "campaign_controller",
+                    "scripts/application-feedback-readback.py": "feedback_validator",
+                }.get(relative)
+                if harness_key is not None:
+                    candidate.source["qualification_harness"][harness_key]["sha256"] = record[field]
+            candidate.repin_v4_source()
+            recipe = reader._validate_expectation_body({
+                key: value for key, value in candidate.expectation.items() if key != "recipe_sha256"
+            })
+            with self.assertRaises(reader.ValidationError, msg=f"SourceV5 {relative} {field} drift was accepted"):
+                reader._verify_source_manifest(recipe)
+
+    def test_v4_recaptures_the_source_pinned_reader_before_emitting_a_receipt(self) -> None:
+        for drift, message in (
+            ("replacement", "SourceV5 feedback validator bytes differ from the typed inventory pin"),
+            ("mode", "SourceV5 feedback validator mode or size differs from its typed inventory pin"),
+        ):
+            fixture = Fixture(Path(self.temp.name) / f"v4-final-reader-{drift}", "mixed", capacity_trace=True)
+            fixture.install_v4_source_v5()
+            with tempfile.TemporaryDirectory(prefix="v4-reader-capture-") as temporary:
+                script_dir = Path(temporary)
+                support_files = (
+                    "application-campaign.py", "application-campaign-inputs.py",
+                    "application-runtime-readback.py", "application-source-inventory.py",
+                    "application-feedback-readback.py",
+                )
+                for name in support_files:
+                    source_path = SCRIPT_DIR / name
+                    target_path = script_dir / name
+                    shutil.copyfile(source_path, target_path)
+                    record = next(
+                        item for item in fixture.source["source"]["files"]
+                        if item["path"] == f"scripts/{name}"
+                    )
+                    os.chmod(target_path, int(record["mode"], 8) & 0o777)
+
+                reader_path = script_dir / "application-feedback-readback.py"
+                original_rows_validator = reader._validate_resource_sample_rows
+
+                def drift_after_trace_validation(*args: Any, **kwargs: Any) -> str:
+                    result = original_rows_validator(*args, **kwargs)
+                    if drift == "mode":
+                        os.chmod(reader_path, 0o755)
+                    else:
+                        replacement_path = script_dir / "reader-replacement"
+                        replacement_path.write_bytes(b"x" * reader_path.stat().st_size)
+                        os.chmod(replacement_path, 0o644)
+                        os.replace(replacement_path, reader_path)
+                    return result
+
+                with patch.object(reader, "__file__", str(reader_path)), \
+                     patch.object(reader, "_validate_resource_sample_rows", side_effect=drift_after_trace_validation):
+                    with self.assertRaisesRegex(reader.ValidationError, message):
+                        fixture.verify()
+
+    def test_v4_source_v5_rejects_repinned_host_tree_and_binary_mismatches(self) -> None:
+        cases = (
+            ("host", "SourceV5 manifest host differs from feedback expectation"),
+            ("tree", "SourceV5 source tree hash differs from feedback identity"),
+            ("binary", "SourceV5 application binary hash differs from feedback identity"),
+        )
+        for label, message in cases:
+            fixture = Fixture(Path(self.temp.name) / f"v4-identity-{label}", "mixed")
+            fixture.install_v4_source_v5()
+            body = {key: value for key, value in fixture.expectation.items() if key != "recipe_sha256"}
+            if label == "host":
+                body["identity"]["host_id"] = "repinned-other-host"
+            elif label == "tree":
+                body["identity"]["source_sha256"] = "0" * 64
+            else:
+                body["identity"]["binary_sha256"] = "0" * 64
+                body["construction_probe"]["binary_sha256"] = "0" * 64
+            _freeze_fixture_expectation(fixture, body)
+            recipe = reader._validate_expectation_body({key: value for key, value in fixture.expectation.items() if key != "recipe_sha256"})
+            with self.assertRaisesRegex(reader.ValidationError, message):
+                reader._verify_source_manifest(recipe)
+
+    def test_v4_source_v5_rejects_a_repinned_wrong_semantic_manifest_digest(self) -> None:
+        fixture = Fixture(Path(self.temp.name) / "v4-semantic-digest", "mixed")
+        fixture.install_v4_source_v5()
+        fixture.source["manifest_sha256"] = "0" * 64
+        source_raw = reader.canonical_bytes(fixture.source)
+        fixture.source_path.write_bytes(source_raw)
+        fixture.source_pin["raw_sha256"] = _sha(source_raw)
+        body = {key: value for key, value in fixture.expectation.items() if key != "recipe_sha256"}
+        body["host_binding"] = dict(fixture.source_pin)
+        _freeze_fixture_expectation(fixture, body)
+        recipe = reader._validate_expectation_body({key: value for key, value in fixture.expectation.items() if key != "recipe_sha256"})
+        with self.assertRaisesRegex(reader.ValidationError, "SourceV5 full campaign verifier rejected the manifest: source-manifest digest mismatch"):
+            reader._verify_source_manifest(recipe)
+
+    def test_v4_projects_all_source_v5_contexts_and_zero_registration_bounds(self) -> None:
+        fixture = Fixture(Path(self.temp.name) / "v4-contexts")
+        fixture.install_v4_source_v5()
+        source = fixture.source
+        base = {key: value for key, value in fixture.expectation.items() if key != "recipe_sha256"}
+        reader._verify_source_manifest_v5(source, reader._validate_expectation_body(base))
+        contexts = source["feedback_policy"]["policy"]["contexts"]
+        self.assertEqual(len(contexts), 15)
+        for context_key in sorted(contexts):
+            workload, profile = context_key.split("/", 1)
+            identity = dict(fixture.identity, workload=workload, profile=profile)
+            fixture.identity = identity
+            fixture.policy = _v4_policy_from_source(identity, source)
+            body = dict(base, identity=identity, policy=fixture.policy)
+            probe_raw = reader.canonical_bytes(fixture._construction_probe())
+            fixture.construction_probe_path.write_bytes(probe_raw)
+            body["construction_probe"] = {
+                "path": str(fixture.construction_probe_path), "raw_sha256": _sha(probe_raw),
+                "allocator": identity["allocator"], "binary_sha256": identity["binary_sha256"],
+            }
+            recipe = reader._validate_expectation_body(body)
+            reader.validate_construction_probe(recipe, source)
+            self.assertEqual(recipe["policy"]["controls"]["cpu"]["initial"], 2 if profile == "oversubscribed" else 4)
+            bounds = recipe["policy"]["meter_source_bounds"]
+            if workload not in ("disk", "mixed"):
+                self.assertEqual(bounds["disk"]["maximum_live"], 0)
+            if workload not in ("http", "mixed"):
+                self.assertEqual(bounds["upload"]["maximum_live"], 0)
+                self.assertEqual(bounds["download"]["maximum_live"], 0)
+
+    def test_v4_rejects_repinned_policy_and_probe_projection_tampering(self) -> None:
+        policy_mutations = (
+            ("control", lambda policy: policy["controls"]["disk"].__setitem__("low_bps", policy["controls"]["disk"]["low_bps"] + 1)),
+            ("global_ceiling", lambda policy: policy["global_ceilings"].__setitem__("memory", policy["global_ceilings"]["memory"] + 1)),
+            ("tenant_ceiling", lambda policy: policy["tenant_ceilings"].__setitem__("memory", policy["tenant_ceilings"]["memory"] + 1)),
+            ("scope", lambda policy: policy["scope_limits"].__setitem__("managed_memory", policy["scope_limits"]["managed_memory"] + 1)),
+            ("bucket", lambda policy: policy["rate_buckets"]["disk"].__setitem__("ceiling_burst_bytes", policy["rate_buckets"]["disk"]["ceiling_burst_bytes"] + 1)),
+            ("collector_charge", lambda policy: policy["collector"].__setitem__("control_charge_bytes", policy["collector"]["control_charge_bytes"] + 1)),
+            ("baseline", lambda policy: policy["collector"].__setitem__("expected_global_control_baseline", policy["collector"]["expected_global_control_baseline"] + 1)),
+        )
+        for label, mutate in policy_mutations:
+            fixture = Fixture(Path(self.temp.name) / f"v4-policy-{label}", "mixed")
+            fixture.install_v4_source_v5()
+            body = {key: value for key, value in fixture.expectation.items() if key != "recipe_sha256"}
+            mutate(body["policy"])
+            _freeze_fixture_expectation(fixture, body)
+            with self.assertRaises(reader.ValidationError, msg=f"repinned V4 {label} policy mutation was accepted"):
+                recipe = reader._validate_expectation_body({key: value for key, value in fixture.expectation.items() if key != "recipe_sha256"})
+                checked_source = reader._verify_source_manifest(recipe)
+                reader.validate_construction_probe(recipe, checked_source["value"])
+
+        probe_mutations = (
+            ("probe_control", lambda probe: probe["rust_control_context"]["controls"]["cpu"].__setitem__("low_bps", probe["rust_control_context"]["controls"]["cpu"]["low_bps"] + 1)),
+            ("probe_ceiling", lambda probe: probe["rust_control_context"]["global_ceilings"].__setitem__("memory", probe["rust_control_context"]["global_ceilings"]["memory"] + 1)),
+            ("probe_scope", lambda probe: probe["rust_control_context"]["scope_limits"].__setitem__("managed_memory", probe["rust_control_context"]["scope_limits"]["managed_memory"] + 1)),
+            ("probe_bucket", lambda probe: probe["rust_control_context"]["rate_buckets"]["disk"].__setitem__("max_reservations", probe["rust_control_context"]["rate_buckets"]["disk"]["max_reservations"] + 1)),
+            ("probe_collector_count", lambda probe: probe["collector"].__setitem__("task_lease_count", 2)),
+            ("probe_baseline", lambda probe: probe["baseline"].__setitem__("expected_global_control_baseline", probe["baseline"]["expected_global_control_baseline"] + 1)),
+            ("probe_registration_count", lambda probe: probe["meter_source_bounds"]["disk"].__setitem__("maximum_live", probe["meter_source_bounds"]["disk"]["maximum_live"] + 1)),
+            ("probe_source_reference", lambda probe: probe["source_references"].__setitem__("application_entrypoint", "bench/src/wrong.rs")),
+        )
+        for label, mutate in probe_mutations:
+            fixture = Fixture(Path(self.temp.name) / f"v4-{label}", "mixed")
+            fixture.install_v4_source_v5()
+            probe = json.loads(fixture.construction_probe_path.read_bytes())
+            mutate(probe)
+            probe_raw = reader.canonical_bytes(probe)
+            fixture.construction_probe_path.write_bytes(probe_raw)
+            body = {key: value for key, value in fixture.expectation.items() if key != "recipe_sha256"}
+            body["construction_probe"]["raw_sha256"] = _sha(probe_raw)
+            _freeze_fixture_expectation(fixture, body)
+            with self.assertRaises(reader.ValidationError, msg=f"repinned V4 {label} probe mutation was accepted"):
+                recipe = reader._validate_expectation_body({key: value for key, value in fixture.expectation.items() if key != "recipe_sha256"})
+                checked_source = reader._verify_source_manifest(recipe)
+                reader.validate_construction_probe(recipe, checked_source["value"])
+
+    def test_v4_trace_collector_charge_baseline_and_task_count_remain_bound(self) -> None:
+        cases = (
+            ("collector_charge_bytes", "trace collector Control charge differs from expectation"),
+            ("expected_global_control_baseline", "trace Control baseline differs from expectation"),
+            ("collector_task_lease_count", "trace collector Task lease differs from expectation"),
+        )
+        for field, message in cases:
+            fixture = Fixture(Path(self.temp.name) / f"v4-trace-{field}", "mixed", capacity_trace=True)
+            fixture.install_v4_source_v5()
+            rows = fixture.manifest_path.read_text(encoding="ascii").splitlines()
+            updated = []
+            for line in rows:
+                parts = line.split("\t")
+                if field == "collector_charge_bytes" and parts[0] == "control":
+                    parts[2] = str(int(parts[2]) + 1)
+                    line = "\t".join(parts)
+                elif field == "expected_global_control_baseline" and parts[0] == "control":
+                    parts[4] = str(int(parts[4]) + 1)
+                    line = "\t".join(parts)
+                elif field == "collector_task_lease_count" and parts[0] == "task":
+                    parts[2] = "2"
+                    line = "\t".join(parts)
+                updated.append(line)
+            fixture.manifest_path.write_text("\n".join(updated) + "\n", encoding="ascii")
+            fixture.hashes["manifest"] = _sha(fixture.manifest_path.read_bytes())
+            with self.assertRaisesRegex(reader.ValidationError, message):
+                fixture.verify()
+
+    def test_v4_capacity_allows_first_missing_cpu_priming_sample(self) -> None:
+        fixture = Fixture(Path(self.temp.name) / "v4-cpu-priming", "mixed", capacity_trace=True)
+        fixture.install_v4_source_v5()
+        _mark_cpu_samples_missing(fixture, {0})
+        result = fixture.verify()
+        self.assertTrue(result["validated"])
+        self.assertFalse(result["qualification_eligible"])
+
+    def test_v4_capacity_keeps_dense_cpu_and_full_window_guards(self) -> None:
+        fixture = Fixture(Path(self.temp.name) / "v4-cpu-density", "mixed", capacity_trace=True)
+        fixture.install_v4_source_v5()
+        _mark_cpu_samples_missing(fixture, set(range(303)))
+        with self.assertRaisesRegex(reader.ValidationError, "capacity calibration has insufficient dense CPU observations during production/drain"):
+            fixture.verify()
+
+        fixture = Fixture(Path(self.temp.name) / "v4-first-window", "mixed", capacity_trace=True)
+        fixture.install_v4_source_v5()
+        base = 5_000_000_000
+        fixture.repin_phase("production_start", base + 199_999_999)
+        with self.assertRaisesRegex(reader.ValidationError, "accepted feedback samples do not cover production through drain"):
+            fixture.verify()
+
+        fixture = Fixture(Path(self.temp.name) / "v4-last-window", "mixed", capacity_trace=True)
+        fixture.install_v4_source_v5()
+        fixture.repin_phase("drain_end", 5_000_000_000 + 30_401_000_000)
+        fixture.repin_phase("rss_after_drain", 5_000_000_000 + 30_412_000_000)
+        with self.assertRaisesRegex(reader.ValidationError, "accepted feedback samples do not cover production through drain"):
+            fixture.verify()
 
     def test_source_v5_uses_captured_pinned_controller_full_verifier(self) -> None:
         controller_path = SCRIPT_DIR / "application-campaign.py"
@@ -905,8 +1411,17 @@ class FeedbackReadbackTests(unittest.TestCase):
         fixture.identity = dict(body["identity"])
         fixture._write_trace()
         _freeze_fixture_expectation(fixture, body)
+        feedback_raw = READER_PATH.read_bytes()
+        feedback_info = READER_PATH.stat(follow_symlinks=False)
         source_value = {
             "schema": reader.SOURCE_MANIFEST_SCHEMA_V5,
+            "source": {
+                "files": [{
+                    "path": "scripts/application-feedback-readback.py", "kind": "file",
+                    "mode": f"{stat.S_IFMT(feedback_info.st_mode) | stat.S_IMODE(feedback_info.st_mode):06o}",
+                    "sha256": _sha(feedback_raw), "size": len(feedback_raw),
+                }],
+            },
             "qualification_harness": {
                 "pressure_validator": {
                     "path": "scripts/application-pressure-readback.py",

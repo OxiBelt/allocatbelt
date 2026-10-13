@@ -25,6 +25,7 @@ from typing import Any, BinaryIO, Callable, Iterator
 EXPECTATION_SCHEMA_V1 = "allocatbelt.application-feedback-expectation.v1"
 EXPECTATION_SCHEMA_V2 = "allocatbelt.application-feedback-expectation.v2"
 EXPECTATION_SCHEMA_V3 = "allocatbelt.application-feedback-expectation.v3"
+EXPECTATION_SCHEMA_V4 = "allocatbelt.application-feedback-expectation.v4"
 EXPECTATION_SCHEMA = EXPECTATION_SCHEMA_V2
 CONSTRUCTION_PROBE_SCHEMA = "allocatbelt.application-feedback-policy-probe.v1"
 TRACE_MANIFEST_SCHEMA = "allocatbelt.application-feedback-trace-manifest.v1"
@@ -370,11 +371,12 @@ def _validate_expectation_body(value: object) -> dict[str, Any]:
     require(type(value) is dict, "feedback expectation must be one JSON object")
     schema = value.get("schema")
     require(
-        schema in (EXPECTATION_SCHEMA_V1, EXPECTATION_SCHEMA_V2, EXPECTATION_SCHEMA_V3),
+        schema in (EXPECTATION_SCHEMA_V1, EXPECTATION_SCHEMA_V2, EXPECTATION_SCHEMA_V3, EXPECTATION_SCHEMA_V4),
         "unsupported feedback expectation schema",
     )
-    expectation_v2 = schema in (EXPECTATION_SCHEMA_V2, EXPECTATION_SCHEMA_V3)
+    expectation_v2 = schema in (EXPECTATION_SCHEMA_V2, EXPECTATION_SCHEMA_V3, EXPECTATION_SCHEMA_V4)
     expectation_v3 = schema == EXPECTATION_SCHEMA_V3
+    expectation_v4 = schema == EXPECTATION_SCHEMA_V4
     recipe_keys = {
         "schema", "mode", "identity", "policy", "app_capacity_artifact_sha256",
         "host_binding", "external_pressure_proof", "final_runtime_binding",
@@ -387,6 +389,8 @@ def _validate_expectation_body(value: object) -> dict[str, Any]:
     recipe = exact(value, recipe_keys, "feedback expectation")
     if expectation_v3:
         require(recipe["mode"] == "pressure_soak_validation", "expectation v3 requires pressure_soak_validation mode")
+    elif expectation_v4:
+        require(recipe["mode"] == "capacity_calibration", "expectation v4 requires capacity_calibration mode")
     else:
         require(recipe["mode"] in ("capacity_calibration", "pressure_validation"), "unsupported expectation mode")
     identity = exact(recipe["identity"], {
@@ -589,11 +593,116 @@ def _validate_meter_source_bounds(
     return validated
 
 
+def _validate_v4_policy_source_projection(
+    recipe: dict[str, Any], source_manifest_value: dict[str, Any], probe: dict[str, Any],
+) -> None:
+    """Bind V4 expectations to SourceV5 policy artifacts after full source verification."""
+    identity = recipe["identity"]
+    policy = recipe["policy"]
+    feedback_artifact = exact(
+        source_manifest_value["feedback_policy"],
+        {"schema", "policy", "policy_sha256"},
+        "SourceV5 feedback policy artifact",
+    )
+    feedback_body = exact(feedback_artifact["policy"], {
+        "schema", "version", "reader_contract", "algorithm", "contexts", "source_pins",
+    }, "SourceV5 feedback policy body")
+    context_key = f"{identity['workload']}/{identity['profile']}"
+    contexts = feedback_body["contexts"]
+    require(type(contexts) is dict and context_key in contexts, "SourceV5 feedback policy omits the V4 workload/profile context")
+    context = exact(contexts[context_key], {"workers", "minimum_dense_observations", "controls"}, "SourceV5 V4 feedback context")
+    workers = uint(context["workers"], "SourceV5 V4 worker count", positive=True, maximum=4)
+    require(workers == (2 if identity["profile"] == "oversubscribed" else 4), "SourceV5 V4 worker count differs from the frozen profile")
+
+    fixed_artifact = exact(
+        source_manifest_value["fixed_runtime_policy"],
+        {"schema", "policy", "policy_sha256"},
+        "SourceV5 fixed runtime policy artifact",
+    )
+    fixed_body = exact(fixed_artifact["policy"], {
+        "schema", "comparison_family", "resource_policy", "logical_window", "task_ceiling",
+        "workers_by_profile", "workloads", "byte_buckets", "kernel",
+    }, "SourceV5 fixed runtime policy body")
+    worker_policy = exact(fixed_body["workers_by_profile"], {"ordinary", "oversubscribed"}, "SourceV5 fixed worker policy")
+    require(worker_policy == {"ordinary": 4, "oversubscribed": 2}, "SourceV5 fixed worker policy differs from the V4 context contract")
+    workloads = fixed_body["workloads"]
+    require(type(workloads) is dict and identity["workload"] in workloads, "SourceV5 fixed policy omits the V4 workload")
+    fixed_workload = exact(workloads[identity["workload"]], {"domain_ceiling", "scope_limits"}, "SourceV5 fixed workload policy")
+    global_ceilings = dict(_uint_map(fixed_workload["domain_ceiling"], set(DOMAIN), "SourceV5 fixed domain ceilings"))
+    require(global_ceilings["cpu"] == worker_policy["ordinary"], "SourceV5 ordinary CPU ceiling differs from its fixed worker policy")
+    global_ceilings["cpu"] = workers
+    tenant_ceilings = dict(global_ceilings)
+
+    fixed_scope = exact(fixed_workload["scope_limits"], {
+        "managed_memory_limit", "disk_operation_limit", "network_operation_limit",
+    }, "SourceV5 fixed scope limits")
+    for name, value in fixed_scope.items():
+        uint(value, f"SourceV5 fixed scope limit {name}")
+    scope_limits = {
+        "managed_memory": fixed_scope["managed_memory_limit"],
+        "disk_operations": fixed_scope["disk_operation_limit"],
+        "network_operations": fixed_scope["network_operation_limit"],
+    }
+
+    source_buckets = exact(fixed_body["byte_buckets"], set(RATE_DIRECTIONS), "SourceV5 fixed byte buckets")
+    rate_buckets: dict[str, dict[str, int]] = {}
+    for direction in RATE_DIRECTIONS:
+        source_bucket = exact(source_buckets[direction], {
+            "bytes_per_second", "ceiling_bytes_per_second", "burst_bytes",
+            "ceiling_burst_bytes", "max_reservations",
+        }, f"SourceV5 fixed {direction} byte bucket")
+        for name, value in source_bucket.items():
+            uint(value, f"SourceV5 fixed {direction} bucket {name}", positive=True)
+        rate_buckets[direction] = {
+            "ceiling_bytes_per_second": source_bucket["ceiling_bytes_per_second"],
+            "ceiling_burst_bytes": source_bucket["ceiling_burst_bytes"],
+            "max_reservations": source_bucket["max_reservations"],
+        }
+
+    calibration = exact(source_manifest_value["resource_domain_calibration"], {
+        "binary", "output", "record", "source", "build", "build_sha256",
+    }, "SourceV5 resource-domain calibration")
+    calibration_record = exact(calibration["record"], {
+        "schema", "architecture", "max_tenants", "max_waiters", "control_ceiling",
+        "fixed_global_control_baseline", "tenant_owner_control_bytes", "final_live_tenants",
+        "final_global_control_bytes",
+    }, "SourceV5 resource-domain calibration record")
+    baseline = uint(calibration_record["fixed_global_control_baseline"], "SourceV5 calibrated global Control baseline", positive=True)
+
+    collector_probe = exact(probe["collector"], {"control_charge_bytes", "task_lease_count"}, "V4 construction probe collector")
+    collector = {
+        "task_lease_count": uint(collector_probe["task_lease_count"], "V4 collector task lease", positive=True),
+        "control_charge_bytes": uint(collector_probe["control_charge_bytes"], "V4 collector Control charge", positive=True),
+        "expected_global_control_baseline": baseline,
+    }
+    require(collector["task_lease_count"] == 1, "V4 collector Task lease differs from the fixed trace contract")
+    meter_bounds = meter_source_bounds_for_workload(identity["workload"])
+    expected = {
+        "version": feedback_body["version"],
+        **exact(feedback_body["reader_contract"], {
+            "sample_interval_ns", "max_dense_gap_ns", "telemetry_freshness_ns",
+            "required_breach_samples", "actuation_cooldown_ns", "minimum_dense_observations",
+        }, "SourceV5 feedback reader contract"),
+        "controls": context["controls"],
+        "capacity_sources": {"disk": False, "download": False},
+        "global_ceilings": global_ceilings,
+        "tenant_ceilings": tenant_ceilings,
+        "scope_limits": scope_limits,
+        "rate_buckets": rate_buckets,
+        "meter_source_bounds": meter_bounds,
+        "collector": collector,
+    }
+    for key, projected in expected.items():
+        require(policy[key] == projected, f"V4 expectation policy {key} differs from verified SourceV5 inputs")
+    require(context["minimum_dense_observations"] == policy["minimum_dense_observations"], "SourceV5 V4 density differs from the feedback expectation")
+    require(feedback_body["algorithm"] == probe["rust_control_context"]["algorithm"], "SourceV5 V4 algorithm differs from the construction probe")
+
+
 def validate_construction_probe(
     recipe: dict[str, Any], source_manifest_value: dict[str, Any],
 ) -> str:
     """Validate a v2 probe against a checked expectation and source manifest."""
-    require(recipe.get("schema") in (EXPECTATION_SCHEMA_V2, EXPECTATION_SCHEMA_V3), "construction probe validation requires expectation v2 or v3")
+    require(recipe.get("schema") in (EXPECTATION_SCHEMA_V2, EXPECTATION_SCHEMA_V3, EXPECTATION_SCHEMA_V4), "construction probe validation requires expectation v2, v3, or v4")
     identity = recipe["identity"]
     _validate_v2_workload_profile(identity["workload"], identity["profile"])
     pin = exact(recipe["construction_probe"], {
@@ -614,7 +723,7 @@ def validate_construction_probe(
     source_schema = source_manifest_value.get("schema")
     require(
         (recipe.get("schema") == EXPECTATION_SCHEMA_V2 and source_schema == SOURCE_MANIFEST_SCHEMA)
-        or (recipe.get("schema") == EXPECTATION_SCHEMA_V3 and source_schema == SOURCE_MANIFEST_SCHEMA_V5),
+        or (recipe.get("schema") in (EXPECTATION_SCHEMA_V3, EXPECTATION_SCHEMA_V4) and source_schema == SOURCE_MANIFEST_SCHEMA_V5),
         "construction probe source manifest schema is unsupported",
     )
     artifacts = source_manifest_value["artifacts"]
@@ -770,6 +879,8 @@ def validate_construction_probe(
         context = exact(contexts[context_key], {"workers", "minimum_dense_observations", "controls"}, "SourceV5 feedback policy context")
         require(context["workers"] == workers and context["minimum_dense_observations"] == policy["minimum_dense_observations"], "SourceV5 feedback policy context worker/density differs from the construction probe")
         require(context["controls"] == policy["controls"], "SourceV5 feedback policy context controls differ from the construction probe")
+        if recipe.get("schema") == EXPECTATION_SCHEMA_V4:
+            _validate_v4_policy_source_projection(recipe, source_manifest_value, probe)
     return probe_sha
 
 
@@ -819,14 +930,19 @@ def _capture_source_v5_sibling(relative_path: str, record: dict[str, Any], label
 
 
 def _verify_source_manifest_v5(value: dict[str, Any], recipe: dict[str, Any]) -> None:
-    require(recipe.get("schema") == EXPECTATION_SCHEMA_V3, "SourceV5 verification requires feedback expectation v3")
-    require(recipe.get("mode") == "pressure_soak_validation", "SourceV5 verification requires pressure-soak validation mode")
+    if recipe.get("schema") == EXPECTATION_SCHEMA_V3:
+        require(recipe.get("mode") == "pressure_soak_validation", "SourceV5 expectation v3 requires pressure-soak validation mode")
+    elif recipe.get("schema") == EXPECTATION_SCHEMA_V4:
+        require(recipe.get("mode") == "capacity_calibration", "SourceV5 expectation v4 requires capacity calibration mode")
+    else:
+        require(False, "SourceV5 verification requires feedback expectation v3 or v4")
     source = value.get("source")
     controller_record = _source_v5_regular_record(source, SOURCE_V5_CONTROLLER_PATH, "campaign controller")
     # The captured controller's V5 verifier validates this regular entry and
     # passes its expected digest into campaign_inputs_module before executing
     # the source-bound qualification policy validators.
-    _source_v5_regular_record(source, SOURCE_V5_CAMPAIGN_INPUTS_PATH, "campaign inputs module")
+    inputs_record = _source_v5_regular_record(source, SOURCE_V5_CAMPAIGN_INPUTS_PATH, "campaign inputs module")
+    _capture_source_v5_sibling(SOURCE_V5_CAMPAIGN_INPUTS_PATH, inputs_record, "campaign inputs module")
     harness = value.get("qualification_harness")
     require(type(harness) is dict and "campaign_controller" in harness, "SourceV5 qualification harness omits its campaign controller pin")
     controller_pin = exact(harness["campaign_controller"], {"path", "sha256"}, "SourceV5 campaign controller pin")
@@ -839,8 +955,7 @@ def _verify_source_manifest_v5(value: dict[str, Any], recipe: dict[str, Any]) ->
     feedback_record = _source_v5_regular_record(source, "scripts/application-feedback-readback.py", "feedback validator")
     feedback_pin = exact(harness.get("feedback_validator"), {"path", "sha256"}, "SourceV5 feedback validator pin")
     require(feedback_pin["path"] == "scripts/application-feedback-readback.py" and feedback_pin["sha256"] == feedback_record["sha256"], "SourceV5 feedback validator pin differs from its typed inventory entry")
-    _feedback_raw, feedback_sha = read_stable(Path(__file__).resolve(), "feedback readback validator", MAX_SOURCE_MANIFEST_BYTES)
-    require(feedback_sha == feedback_record["sha256"], "installed feedback validator differs from its SourceV5 inventory pin")
+    _capture_source_v5_sibling("scripts/application-feedback-readback.py", feedback_record, "feedback validator")
 
     raw = _capture_source_v5_sibling(SOURCE_V5_CONTROLLER_PATH, controller_record, "campaign controller")
     controller_sha = sha256_bytes(raw)
@@ -896,7 +1011,9 @@ def _verify_source_manifest(recipe: dict[str, Any]) -> dict[str, Any]:
             require(app_binary_sha == recipe["identity"]["binary_sha256"], "SourceV5 application binary hash differs from feedback identity")
         return {"raw_sha256": raw_sha, "value": value}
 
-    require(recipe["schema"] in (EXPECTATION_SCHEMA_V1, EXPECTATION_SCHEMA_V2), "feedback expectation v3 requires a SourceV5 manifest")
+    if recipe["schema"] == EXPECTATION_SCHEMA_V3:
+        require(False, "feedback expectation v3 requires a SourceV5 manifest")
+    require(recipe["schema"] in (EXPECTATION_SCHEMA_V1, EXPECTATION_SCHEMA_V2), "feedback expectation v4 requires a SourceV5 manifest")
     exact(value, {
         "schema", "source", "build", "artifacts", "soak_artifacts", "analysis_artifact",
         "fixed_runtime_policy", "runtime_readback_validator", "resource_domain_calibration",
@@ -2058,7 +2175,7 @@ def _validate_event_stream(
                 require(readings["disk"] is None and readings["download"] is None, "capacity calibration emitted app-byte telemetry before denominators existed")
                 if readings["cpu"] is None:
                     require(
-                        expectation["schema"] == EXPECTATION_SCHEMA_V2,
+                        expectation["schema"] in (EXPECTATION_SCHEMA_V2, EXPECTATION_SCHEMA_V4),
                         "legacy capacity calibration CPU telemetry is missing",
                     )
             model.observe(sample_at[0], readings)
@@ -2199,7 +2316,7 @@ def _validate_resource_sample_rows(
                 limit = row[f"{owner}_limit_{resource}"]
                 used = row[f"{owner}_used_{resource}"]
                 require(ceiling == ceilings[resource], f"resource sample {owner} {resource} ceiling differs from caller-pinned value")
-                zero_limit_allowed = expectation["schema"] in (EXPECTATION_SCHEMA_V2, EXPECTATION_SCHEMA_V3) and ceiling == 0
+                zero_limit_allowed = expectation["schema"] in (EXPECTATION_SCHEMA_V2, EXPECTATION_SCHEMA_V3, EXPECTATION_SCHEMA_V4) and ceiling == 0
                 require((limit > 0 or zero_limit_allowed) and limit <= ceiling and used <= ceiling, f"resource sample {owner} {resource} exceeds its hard ceiling")
         expected_scope = {
             "managed_memory_limit": "managed_memory", "disk_operation_limit": "disk_operations",
@@ -2304,7 +2421,7 @@ def verify_feedback(
     recipe = _validate_expectation_body({key: value for key, value in expectation.items() if key != "recipe_sha256"})
     require(digest(expectation.get("recipe_sha256"), "expectation self digest") == digest_object(recipe), "feedback expectation self digest is invalid")
     source_manifest = _verify_source_manifest(recipe)
-    if recipe["schema"] in (EXPECTATION_SCHEMA_V2, EXPECTATION_SCHEMA_V3):
+    if recipe["schema"] in (EXPECTATION_SCHEMA_V2, EXPECTATION_SCHEMA_V3, EXPECTATION_SCHEMA_V4):
         validate_construction_probe(recipe, source_manifest["value"])
     artifact_pins = {
         "feedback-trace-manifest.tsv": digest(expected_artifact_sha256.get("manifest"), "expected manifest raw SHA-256"),
@@ -2362,7 +2479,19 @@ def verify_feedback(
             release_complete = runtime_ok
         else:
             runtime_ok, runtime_sha, release_complete = _verify_runtime_binding(recipe, event_info["final_state"], model.sample_count)
-    _, reader_sha = read_stable(Path(__file__).resolve(), "feedback readback validator", 4 * 1024 * 1024)
+    source_value = source_manifest["value"]
+    if recipe["schema"] in (EXPECTATION_SCHEMA_V3, EXPECTATION_SCHEMA_V4):
+        feedback_record = _source_v5_regular_record(
+            source_value.get("source"),
+            "scripts/application-feedback-readback.py",
+            "feedback validator",
+        )
+        final_reader_raw = _capture_source_v5_sibling(
+            "scripts/application-feedback-readback.py", feedback_record, "feedback validator",
+        )
+        reader_sha = sha256_bytes(final_reader_raw)
+    else:
+        _, reader_sha = read_stable(Path(__file__).resolve(), "feedback readback validator", 4 * 1024 * 1024)
     result = {
         "schema": READBACK_SCHEMA_V2 if recipe["schema"] == EXPECTATION_SCHEMA_V3 else READBACK_SCHEMA,
         "mode": recipe["mode"],

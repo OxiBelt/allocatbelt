@@ -193,6 +193,47 @@ class CapacityTests(unittest.TestCase):
         fixture.refresh_validation()
         return fixture, probe_path
 
+    def v4_fixture(self, workload="mixed", profile="mixed"):
+        self._v4_sequence = getattr(self, "_v4_sequence", 0) + 1
+        root = Path(self.temp.name) / f"v4-{workload}-{profile}-{self._v4_sequence}"
+        root.mkdir()
+        feedback = feedback_fixtures.Fixture(
+            root / "feedback", workload, profile=profile, capacity_trace=True,
+        )
+        feedback.install_v4_source_v5()
+        validation = feedback.verify()
+        validation_path = root / "feedback-validation.json"
+        validation_raw = capacity.canonical(validation)
+        validation_path.write_bytes(validation_raw)
+        context = {
+            "schema": "allocatbelt.application-capacity-context.v1",
+            "identity": dict(feedback.identity), "stage": "pre_confirmation",
+            "storage": {"scope": "synthetic_fixture"},
+            "network": {"scope": "synthetic_fixture"},
+        }
+        context_path = root / "context.json"
+        context_path.write_bytes(capacity.canonical(context))
+        request = {
+            "schema": capacity.REQUEST_SCHEMA, "calibration_id": "v4-capacity-replay",
+            "identity": dict(feedback.identity),
+            "source_manifest": {"path": str(feedback.source_path), "sha256": feedback.source_pin["raw_sha256"]},
+            "validation": {"path": str(validation_path), "sha256": hashlib.sha256(validation_raw).hexdigest()},
+            "expectation": {"path": str(feedback.expectation_path), "sha256": feedback.expectation_sha},
+            "expectation_sha256": feedback.expectation_sha,
+            "validator_sha256": feedback.source["qualification_harness"]["feedback_validator"]["sha256"],
+            "trace_directory": str(feedback.trace),
+            "context": {"path": str(context_path), "sha256": hashlib.sha256(context_path.read_bytes()).hexdigest()},
+            "minimum_interval_seconds": 10,
+        }
+        request_raw = capacity.canonical(request)
+        request_path = root / "capacity-request.json"
+        request_path.write_bytes(request_raw)
+        return {
+            "feedback": feedback, "request": request,
+            "request_sha": hashlib.sha256(request_raw).hexdigest(),
+            "request_path": request_path,
+        }
+
     def test_v2_capacity_uses_the_source_pinned_reader_probe_projection(self):
         fixture, _ = self.v2_fixture()
         artifact, receipt = fixture.produce()
@@ -217,6 +258,114 @@ class CapacityTests(unittest.TestCase):
         fixture.refresh_validation()
         with self.assertRaisesRegex(capacity.CapacityError, "collector Control charge"):
             fixture.produce()
+
+    def test_v4_source_v5_producer_replays_full_trace_and_stays_ineligible(self):
+        fixture = self.v4_fixture()
+        artifact, receipt = capacity.produce(fixture["request"], fixture["request_sha"])
+        values = dict(line.split("\t") for line in artifact.decode("ascii").splitlines())
+        self.assertEqual(values["disk.bytes_per_second"], "10000")
+        self.assertEqual(values["download.bytes_per_second"], "20000")
+        self.assertFalse(receipt["qualification_eligible"])
+        self.assertEqual(receipt["producer_sha256"], fixture["feedback"].source["qualification_harness"]["byte_capacity_producer"]["sha256"])
+        self.assertEqual(receipt["validation_raw_sha256"], fixture["request"]["validation"]["sha256"])
+        self.assertEqual(len(fixture["feedback"].samples_path.read_text().splitlines()), 307)
+
+    def test_v4_rejects_forged_positive_validation_when_full_trace_is_invalid(self):
+        fixture = self.v4_fixture()
+        feedback = fixture["feedback"]
+        events = [json.loads(line) for line in feedback.events_path.read_text(encoding="ascii").splitlines()]
+        events[-1]["panicked"] = True
+        feedback.repin("events", b"".join(feedback_fixtures._json_line(event) for event in events))
+        validation = json.loads(Path(fixture["request"]["validation"]["path"]).read_bytes())
+        validation["raw_artifact_sha256"] = dict(feedback.hashes)
+        validation_raw = capacity.canonical(validation)
+        validation_path = Path(fixture["request"]["validation"]["path"])
+        validation_path.write_bytes(validation_raw)
+        fixture["request"]["validation"]["sha256"] = hashlib.sha256(validation_raw).hexdigest()
+        fixture["request_sha"] = hashlib.sha256(capacity.canonical(fixture["request"])).hexdigest()
+        with self.assertRaisesRegex(capacity.CapacityError, "captured V4 feedback reader rejected the full trace"):
+            capacity.produce(fixture["request"], fixture["request_sha"])
+
+    def test_v4_source_v5_rejects_inventory_mode_size_and_byte_drift(self):
+        producer_path = "scripts/application-byte-capacity.py"
+        for field in ("mode", "size", "sha256"):
+            fixture = self.v4_fixture()
+            source = fixture["feedback"].source
+            producer_record = next(item for item in source["source"]["files"] if item["path"] == producer_path)
+            original_mode, original_size, original_sha = producer_record["mode"], producer_record["size"], producer_record["sha256"]
+            replacement = (
+                ("100644" if original_mode == "100755" else "100755") if field == "mode" else
+                original_size + 1 if field == "size" else
+                "0" * 64
+            )
+            producer_record[field] = replacement
+            source["qualification_harness"]["byte_capacity_producer"]["sha256"] = producer_record["sha256"]
+            source["manifest_sha256"] = feedback_fixtures.campaign.digest_object(source)
+            source_raw = feedback_fixtures.reader.canonical_bytes(source)
+            source_path = fixture["feedback"].source_path
+            source_path.write_bytes(source_raw)
+            fixture["request"]["source_manifest"]["sha256"] = hashlib.sha256(source_raw).hexdigest()
+            expectation = json.loads(Path(fixture["request"]["expectation"]["path"]).read_bytes())
+            expectation.pop("recipe_sha256")
+            expectation["host_binding"]["raw_sha256"] = fixture["request"]["source_manifest"]["sha256"]
+            expectation_raw, expectation_sha = feedback_fixtures.reader.build_pressure_expectation_recipe(expectation)
+            Path(fixture["request"]["expectation"]["path"]).write_bytes(expectation_raw)
+            fixture["request"]["expectation"]["sha256"] = expectation_sha
+            fixture["request"]["expectation_sha256"] = expectation_sha
+            validation = json.loads(Path(fixture["request"]["validation"]["path"]).read_bytes())
+            validation["expectation_raw_sha256"] = expectation_sha
+            validation_raw = capacity.canonical(validation)
+            Path(fixture["request"]["validation"]["path"]).write_bytes(validation_raw)
+            fixture["request"]["validation"]["sha256"] = hashlib.sha256(validation_raw).hexdigest()
+            fixture["request_sha"] = hashlib.sha256(capacity.canonical(fixture["request"])).hexdigest()
+            with self.assertRaises(capacity.CapacityError, msg=f"producer inventory {field} drift was accepted"):
+                capacity.produce(fixture["request"], fixture["request_sha"])
+
+    def test_v4_capacity_bundle_replay_requires_exact_tsv_and_canonical_receipt(self):
+        fixture = self.v4_fixture()
+        artifact, receipt = capacity.produce(fixture["request"], fixture["request_sha"])
+        root = Path(self.temp.name) / "v4-bundle"
+        root.mkdir()
+        artifact_path = root / "application-byte-capacity.tsv"
+        receipt_path = root / "capacity-receipt.json"
+        artifact_path.write_bytes(artifact)
+        receipt_raw = capacity.canonical(receipt)
+        receipt_path.write_bytes(receipt_raw)
+        request_pin = {"path": str(fixture["request_path"]), "sha256": fixture["request_sha"]}
+        artifact_pin = {"path": str(artifact_path), "sha256": hashlib.sha256(artifact).hexdigest()}
+        receipt_pin = {"path": str(receipt_path), "sha256": hashlib.sha256(receipt_raw).hexdigest()}
+        self.assertTrue(capacity.verify_capacity_bundle(request_pin, artifact_pin, receipt_pin))
+        self.assertEqual(artifact_path.read_bytes(), artifact)
+        self.assertEqual(receipt_path.read_bytes(), receipt_raw)
+
+        for old, new in (
+            (b"disk.bytes_per_second\t10000\n", b"disk.bytes_per_second\t10001\n"),
+            (b"download.units\tapplication_bytes_per_second\n", b"download.units\tbytes_per_second\n"),
+            (b"disk.provenance\tapplication-trace:", b"disk.provenance\tforged:"),
+        ):
+            changed = artifact.replace(old, new)
+            self.assertNotEqual(changed, artifact)
+            artifact_path.write_bytes(changed)
+            artifact_pin["sha256"] = hashlib.sha256(changed).hexdigest()
+            with self.assertRaises(capacity.CapacityError):
+                capacity.verify_capacity_bundle(request_pin, artifact_pin, receipt_pin)
+        artifact_path.write_bytes(artifact)
+        artifact_pin["sha256"] = hashlib.sha256(artifact).hexdigest()
+
+        changes = (
+            lambda value: value["measurements"]["disk"]["first"].__setitem__("measured_lower_ns", 1),
+            lambda value: value.__setitem__("sample_rows", value["sample_rows"] + 1),
+            lambda value: value["identity"].__setitem__("run_id", "forged-run"),
+            lambda value: value.__setitem__("provenance_material_sha256", "0" * 64),
+        )
+        for change in changes:
+            changed_receipt = json.loads(receipt_raw)
+            change(changed_receipt)
+            changed_raw = capacity.canonical(changed_receipt)
+            receipt_path.write_bytes(changed_raw)
+            receipt_pin["sha256"] = hashlib.sha256(changed_raw).hexdigest()
+            with self.assertRaises(capacity.CapacityError):
+                capacity.verify_capacity_bundle(request_pin, artifact_pin, receipt_pin)
 
     def test_exact_application_rates_and_transitive_provenance(self):
         artifact, receipt = self.fixture.produce()
@@ -329,6 +478,32 @@ class CapacityTests(unittest.TestCase):
         self.fixture.refresh_validation()
         with self.assertRaisesRegex(capacity.CapacityError, "source-inventoried feedback validator"):
             self.fixture.produce()
+
+    def test_source_v4_keeps_legacy_validator_mode_pin_compatibility(self):
+        fixture = self.fixture
+        record = next(
+            item for item in fixture.source["source"]["files"]
+            if item["path"] == "scripts/application-feedback-readback.py"
+        )
+        record["mode"] = "100755"
+        inventory = campaign_fixtures.campaign.source_inventory_module()
+        source_tree = inventory.digest_records(fixture.source["source"]["files"])
+        fixture.identity["source_sha256"] = source_tree
+        fixture.source["source"]["source_tree_sha256"] = source_tree
+        fixture.source["resource_domain_calibration"]["source"]["source_tree_sha256"] = source_tree
+        fixture.source["manifest_sha256"] = campaign_fixtures.campaign.digest_object(fixture.source)
+        fixture.source_pin = fixture.pin_json("source.json", fixture.source)
+        fixture.request["source_manifest"] = fixture.source_pin
+        fixture.request["identity"] = dict(fixture.identity)
+        fixture.repin_expectation()
+
+        context, _ = capacity.metadata(fixture.request["context"])
+        context["identity"] = dict(fixture.identity)
+        fixture.request["context"] = fixture.pin_json("context.json", context)
+        fixture.refresh_validation()
+        request_sha = hashlib.sha256(capacity.canonical(fixture.request)).hexdigest()
+        _artifact, receipt = capacity.produce(fixture.request, request_sha)
+        self.assertFalse(receipt["qualification_eligible"])
 
     def test_future_source_schema_label_is_not_supported(self):
         self.fixture.source["schema"] = "allocatbelt.application-source-manifest.v5"

@@ -23,6 +23,9 @@ from typing import Any
 REQUEST_SCHEMA = "allocatbelt.application-byte-capacity-request.v1"
 RECEIPT_SCHEMA = "allocatbelt.application-byte-capacity-receipt.v1"
 VALIDATION_SCHEMA = "allocatbelt.application-feedback-validation.v1"
+EXPECTATION_SCHEMA_V1 = "allocatbelt.application-feedback-expectation.v1"
+EXPECTATION_SCHEMA_V2 = "allocatbelt.application-feedback-expectation.v2"
+EXPECTATION_SCHEMA_V4 = "allocatbelt.application-feedback-expectation.v4"
 CAPACITY_SCHEMA = "allocatbelt.app-byte-capacity.v1"
 UNITS = "application_bytes_per_second"
 U64_MAX = (1 << 64) - 1
@@ -165,8 +168,8 @@ def metadata(pin: dict[str, Any], maximum: int = MAX_METADATA) -> tuple[dict[str
     return value, raw
 
 
-def verify_validation(request: dict[str, Any]) -> dict[str, Any]:
-    validation, _ = metadata(request["validation"])
+def verify_validation(request: dict[str, Any]) -> tuple[dict[str, Any], bytes]:
+    validation, raw = metadata(request["validation"])
     exact(validation, {"schema", "mode", "validated", "qualification_eligible",
                        "expectation_raw_sha256", "validator_sha256", "identity",
                        "raw_artifact_sha256", "production_window", "final_runtime_binding"},
@@ -195,7 +198,7 @@ def verify_validation(request: dict[str, Any]) -> dict[str, Any]:
     exact(validation["final_runtime_binding"], {"raw_sha256", "validated"}, "final runtime binding")
     require(validation["final_runtime_binding"] == {"raw_sha256": None, "validated": False},
             "calibration receipt has an unexpected final proof")
-    return validation
+    return validation, raw
 
 
 def bracket(value: object) -> tuple[int, int]:
@@ -325,13 +328,12 @@ def _verify_expectation(request: dict[str, Any]) -> dict[str, Any]:
     require(hashlib.sha256(raw).hexdigest() == digest(request["expectation_sha256"]) ==
             request["expectation"]["sha256"], "caller-pinned expectation SHA mismatch")
     schema = expectation.get("schema")
-    require(schema in ("allocatbelt.application-feedback-expectation.v1",
-                       "allocatbelt.application-feedback-expectation.v2") and
+    require(schema in (EXPECTATION_SCHEMA_V1, EXPECTATION_SCHEMA_V2, EXPECTATION_SCHEMA_V4) and
             expectation.get("mode") == "capacity_calibration", "unsupported capacity expectation")
     keys = {"schema", "mode", "identity", "policy", "app_capacity_artifact_sha256",
             "host_binding", "external_pressure_proof", "final_runtime_binding",
             "minimum_production_seconds", "minimum_pressure_overlap_seconds", "recipe_sha256"}
-    if schema == "allocatbelt.application-feedback-expectation.v2":
+    if schema in (EXPECTATION_SCHEMA_V2, EXPECTATION_SCHEMA_V4):
         keys.add("construction_probe")
     exact(expectation, keys, "caller-pinned feedback expectation")
     body = {key: value for key, value in expectation.items() if key != "recipe_sha256"}
@@ -387,7 +389,9 @@ def _campaign_module(source: dict[str, Any]) -> types.ModuleType:
     return module
 
 
-def _verify_feedback_validator(source: dict[str, Any], expected_sha256: str) -> bytes:
+def _verify_feedback_validator(
+    source: dict[str, Any], expected_sha256: str, *, strict_mode: bool = False,
+) -> bytes:
     files = source.get("source", {}).get("files")
     require(type(files) is list, "source manifest inventory is malformed")
     records = [item for item in files if type(item) is dict and
@@ -404,6 +408,13 @@ def _verify_feedback_validator(source: dict[str, Any], expected_sha256: str) -> 
     path = Path(os.path.abspath(__file__)).with_name("application-feedback-readback.py")
     reader = PinnedFile(path, source_sha, MAX_METADATA)
     try:
+        declared_mode = int(record["mode"], 8)
+        observed_mode = stat.S_IFMT(reader.before.st_mode) | stat.S_IMODE(reader.before.st_mode)
+        if strict_mode:
+            require(observed_mode == declared_mode,
+                    "captured feedback validator mode differs from its source inventory")
+        require(reader.before.st_size == expected_size,
+                "captured feedback validator size differs from source inventory")
         raw = reader.stream.read(MAX_METADATA + 1)
         reader._add(raw)
         reader.finish()
@@ -413,8 +424,87 @@ def _verify_feedback_validator(source: dict[str, Any], expected_sha256: str) -> 
     return raw
 
 
-def verify_source(source: dict[str, Any], expectation: dict[str, Any], validator_sha256: str) -> None:
-    require(source.get("schema") == "allocatbelt.application-source-manifest.v4",
+def _verify_v4_capacity_producer(source: dict[str, Any]) -> bytes:
+    files = source.get("source", {}).get("files")
+    require(type(files) is list, "SourceV5 inventory is malformed")
+    relative = "scripts/application-byte-capacity.py"
+    records = [item for item in files if type(item) is dict and item.get("path") == relative]
+    require(len(records) == 1, "SourceV5 inventory does not contain one byte-capacity producer")
+    record = exact(records[0], {"path", "kind", "mode", "sha256", "size"}, "SourceV5 capacity producer inventory record")
+    require(record["path"] == relative and record["kind"] == "file" and record["mode"] in ("100644", "100755"),
+            "SourceV5 capacity producer must be a regular source file")
+    expected_sha = digest(record["sha256"])
+    expected_size = integer(record["size"], "SourceV5 capacity producer size", MAX_METADATA)
+    harness = source.get("qualification_harness")
+    require(type(harness) is dict and "byte_capacity_producer" in harness,
+            "SourceV5 qualification harness omits its byte-capacity producer pin")
+    pin = exact(harness["byte_capacity_producer"], {"path", "sha256"}, "SourceV5 byte-capacity producer pin")
+    require(pin["path"] == relative and pin["sha256"] == expected_sha,
+            "SourceV5 byte-capacity producer pin differs from its typed inventory entry")
+    path = Path(os.path.abspath(__file__))
+    reader = PinnedFile(path, expected_sha, MAX_METADATA)
+    try:
+        declared_mode = int(record["mode"], 8)
+        observed_mode = stat.S_IFMT(reader.before.st_mode) | stat.S_IMODE(reader.before.st_mode)
+        require(stat.S_ISREG(reader.before.st_mode) and observed_mode == declared_mode and
+                reader.before.st_size == expected_size,
+                "capacity producer mode or size differs from its SourceV5 regular inventory pin")
+        raw = reader.stream.read(MAX_METADATA + 1)
+        reader._add(raw)
+        reader.finish()
+    finally:
+        reader.close()
+    require(len(raw) == expected_size and hashlib.sha256(raw).hexdigest() == expected_sha,
+            "capacity producer bytes differ from its SourceV5 inventory pin")
+    return raw
+
+
+def _load_pinned_feedback_reader(raw: bytes) -> types.ModuleType:
+    path = Path(os.path.abspath(__file__)).with_name("application-feedback-readback.py")
+    module = types.ModuleType("allocatbelt_capacity_pinned_feedback")
+    module.__file__ = str(path)
+    try:
+        exec(compile(raw, str(path), "exec", dont_inherit=True), module.__dict__)
+    except Exception as error:
+        raise CapacityError("pinned feedback reader cannot be loaded") from error
+    require(getattr(module, "EXPECTATION_SCHEMA_V4", None) == EXPECTATION_SCHEMA_V4 and
+            callable(getattr(module, "verify_feedback", None)),
+            "pinned feedback reader does not implement the V4 full-trace contract")
+    return module
+
+
+def verify_source(
+    source: dict[str, Any], expectation: dict[str, Any], validator_sha256: str,
+) -> dict[str, Any]:
+    source_schema = source.get("schema")
+    if expectation.get("schema") == EXPECTATION_SCHEMA_V4:
+        require(source_schema == "allocatbelt.application-source-manifest.v5",
+                "feedback expectation v4 requires a SourceV5 manifest")
+        producer_raw = _verify_v4_capacity_producer(source)
+        validator_raw = _verify_feedback_validator(source, validator_sha256, strict_mode=True)
+        module = _load_pinned_feedback_reader(validator_raw)
+        try:
+            body = {key: value for key, value in expectation.items() if key != "recipe_sha256"}
+            encoded, _ = module.build_pressure_expectation_recipe(body)
+            require(encoded == canonical(expectation), "V4 expectation differs from its captured reader contract")
+            recipe = module._validate_expectation_body(body)
+            checked_source = module._verify_source_manifest(recipe)
+            module.validate_construction_probe(recipe, checked_source["value"])
+        except CapacityError:
+            raise
+        except Exception as error:
+            raise CapacityError(f"SourceV5 feedback validation setup failed: {error}") from error
+        require(source_schema == checked_source["value"].get("schema"),
+                "pinned feedback reader loaded a different source manifest")
+        identity = expectation["identity"]
+        require(source["build"]["host_id"] == identity["host_id"] and
+                source["source"]["source_tree_sha256"] == identity["source_sha256"] and
+                source["artifacts"][identity["allocator"]]["sha256"] == identity["binary_sha256"],
+                "source/host/binary binding mismatch")
+        return {"producer_sha256": hashlib.sha256(producer_raw).hexdigest(),
+                "feedback_reader": module}
+
+    require(source_schema == "allocatbelt.application-source-manifest.v4",
             "unsupported source manifest schema")
     controller = _campaign_module(source)
     try:
@@ -427,8 +517,10 @@ def verify_source(source: dict[str, Any], expectation: dict[str, Any], validator
             source["artifacts"][identity["allocator"]]["sha256"] == identity["binary_sha256"],
             "source/host/binary binding mismatch")
     validator_raw = _verify_feedback_validator(source, validator_sha256)
-    if expectation["schema"] == "allocatbelt.application-feedback-expectation.v2":
+    if expectation["schema"] == EXPECTATION_SCHEMA_V2:
         _validate_construction_probe(source, expectation, validator_raw)
+    return {"producer_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+            "feedback_reader": None}
 
 
 def _validate_construction_probe(
@@ -493,8 +585,23 @@ def produce(request: dict[str, Any], request_sha: str) -> tuple[bytes, dict[str,
     require(identity["workload"] in ("cpu", "memory", "disk", "http", "mixed"), "unknown workload")
     expectation = _verify_expectation(request)
     source, source_raw = metadata(request["source_manifest"])
-    verify_source(source, expectation, request["validator_sha256"])
-    validation = verify_validation(request)
+    source_checks = verify_source(source, expectation, request["validator_sha256"])
+    validation, validation_raw = verify_validation(request)
+    if expectation["schema"] == EXPECTATION_SCHEMA_V4:
+        reader_module = source_checks["feedback_reader"]
+        hashes = validation["raw_artifact_sha256"]
+        try:
+            replayed = reader_module.verify_feedback(
+                Path(request["expectation"]["path"]), request["expectation_sha256"],
+                Path(request["trace_directory"]), hashes,
+            )
+            replayed_raw = reader_module.canonical_bytes(replayed)
+        except Exception as error:
+            if isinstance(error, CapacityError):
+                raise
+            raise CapacityError(f"captured V4 feedback reader rejected the full trace: {error}") from error
+        require(replayed_raw == validation_raw,
+                "caller-pinned feedback validation bytes differ from the captured reader full-trace receipt")
     context, context_raw = metadata(request["context"])
     exact(context, {"schema", "identity", "stage", "storage", "network"}, "capacity context")
     require(context.get("schema") == "allocatbelt.application-capacity-context.v1" and
@@ -529,8 +636,7 @@ def produce(request: dict[str, Any], request_sha: str) -> tuple[bytes, dict[str,
                                          hashes["manifest"],
                                          start_upper, end_lower, identity["workload"], minimum * 1_000_000_000)
     events = verify_no_actuation(directory / "feedback-events.jsonl", hashes["events"])
-    producer = Path(__file__).absolute()
-    producer_raw_sha = hashlib.sha256(producer.read_bytes()).hexdigest()
+    producer_raw_sha = source_checks["producer_sha256"]
     receipt: dict[str, Any] = {"schema": RECEIPT_SCHEMA, "request_raw_sha256": digest(request_sha),
         "producer_sha256": producer_raw_sha, "calibration_id": calibration_id,
         "identity": identity, "source_manifest_raw_sha256": hashlib.sha256(source_raw).hexdigest(),
@@ -552,6 +658,38 @@ def produce(request: dict[str, Any], request_sha: str) -> tuple[bytes, dict[str,
     receipt["provenance_material_sha256"] = provenance_sha
     receipt["capacity_artifact_raw_sha256"] = hashlib.sha256(artifact).hexdigest()
     return artifact, receipt
+
+
+def _pinned_bytes(pin: dict[str, Any], label: str, maximum: int) -> bytes:
+    exact(pin, {"path", "sha256"}, f"{label} pin")
+    reader = PinnedFile(Path(pin["path"]), pin["sha256"], maximum)
+    try:
+        raw = reader.stream.read(maximum + 1)
+        reader._add(raw)
+        reader.finish()
+    finally:
+        reader.close()
+    return raw
+
+
+def verify_capacity_bundle(
+    request_pin: dict[str, Any], artifact_pin: dict[str, Any], receipt_pin: dict[str, Any],
+) -> bool:
+    """Replay V4 SourceV5 capacity evidence and compare the published bytes exactly."""
+    exact(request_pin, {"path", "sha256"}, "capacity request pin")
+    request, request_raw = metadata(request_pin)
+    expectation = _verify_expectation(request)
+    require(expectation["schema"] == EXPECTATION_SCHEMA_V4,
+            "capacity bundle replay requires a V4 feedback expectation")
+    source, _source_raw = metadata(request["source_manifest"])
+    require(source.get("schema") == "allocatbelt.application-source-manifest.v5",
+            "capacity bundle replay requires a SourceV5 manifest")
+    artifact, receipt = produce(request, hashlib.sha256(request_raw).hexdigest())
+    observed_artifact = _pinned_bytes(artifact_pin, "capacity TSV artifact", 4096)
+    observed_receipt = _pinned_bytes(receipt_pin, "capacity receipt", MAX_METADATA)
+    require(observed_artifact == artifact, "published capacity TSV bytes differ from V4 producer replay")
+    require(observed_receipt == canonical(receipt), "published capacity receipt bytes differ from canonical V4 producer replay")
+    return True
 
 
 def _open_absolute_directory(path: Path) -> int:

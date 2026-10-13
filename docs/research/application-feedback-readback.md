@@ -30,21 +30,23 @@ python3 scripts/application-feedback-readback.py verify \
 ```
 
 New application feedback expectations use
-`allocatbelt.application-feedback-expectation.v2`; v3 adds the external soak
-binding described below. Archived v1 expectations remain readable using their
-historical exact-count meter contract, but are never pressure
+`allocatbelt.application-feedback-expectation.v2` by default. V3 adds the
+external soak binding described below; v4 adds SourceV5 binding for normal
+application capacity calibration. Archived v1 expectations remain readable
+using their historical exact-count meter contract, but are never pressure
 qualification-eligible. V1 and v2 use SourceV4 and retain their original
-single-binary identity. Every JSON object has an exact key set, duplicate keys
-and non-finite values are rejected, and canonical JSON uses sorted keys,
-compact separators, ASCII escaping, and one final LF. The recipe binds the
-actual process ID and report nonce, run, allocator, executor, workload,
-profile, run mode, source tree and binary hashes, plus the source-manifest path
-and raw digest. For v1/v2, the source manifest's `build.host_id`,
+single-binary identity. V3 and v4 require SourceV5. Every JSON object has an
+exact key set, duplicate keys and non-finite values are rejected, and
+canonical JSON uses sorted keys, compact separators, ASCII escaping, and one
+final LF. The recipe binds the actual process ID and report nonce, run,
+allocator, executor, workload, profile, run mode, source tree and binary hashes,
+plus the source-manifest path and raw digest. For v1/v2, the source manifest's
+`build.host_id`,
 `source.source_tree_sha256`, and `artifacts[allocator].sha256` must match the
 expectation.
 
-Every v2/v3 expectation also pins a canonical construction-only feedback policy
-probe by absolute path, raw SHA-256, allocator and binary digest. The reader
+Every v2/v3/v4 expectation also pins a canonical construction-only feedback
+policy probe by absolute path, raw SHA-256, allocator and binary digest. The reader
 checks the probe context and all timing, control, ceiling, scope, bucket,
 collector and meter-bound projections against the caller-frozen policy, and
 requires the probe binary digest to match the expected application-emitter
@@ -53,6 +55,20 @@ normal `artifacts.allocatbelt` binary and is distinct from the timed soak
 binary. The probe starts no workload and cannot establish when it ran; the
 owning campaign controller records that the probe preceded qualification in
 its run ledger.
+
+V4 retains the V2 expectation key set, including `construction_probe`, while
+the default schema constant remains V2. Its timed application and construction
+probe both match `SourceV5.artifacts[allocator]`. After the pinned controller
+and campaign-inputs module validate the complete SourceV5 manifest, the reader
+projects cadence, density, controls and algorithm from the selected
+`feedback_policy` context. It projects global and tenant ceilings, scope
+limits and byte buckets from `fixed_runtime_policy`, using four workers for
+ordinary profiles and two for oversubscribed profiles. The global Control
+baseline comes from the independent
+`resource_domain_calibration.record`. The probe's collector Control charge
+and Task lease must match the expectation and trace manifest. Every
+construction-probe source reference must have one regular SourceV5 inventory
+entry.
 
 The policy section pins all three numeric control configurations, the fixed
 100 ms sample cadence, 200 ms dense gap, 500 ms freshness, three-sample breach,
@@ -78,6 +94,11 @@ limits with Missing telemetry and no write tickets. CPU must start at a fixed
 2 or 4 slots. The reader reconstructs CPU reduction quantization and ceiling
 recovery directly from samples and plans; it does not add artificial reduction
 steps. A calibration receipt is always `qualification_eligible: false`.
+V4 keeps the ten-field
+`allocatbelt.application-feedback-validation.v1` receipt and has no final
+runtime proof. Its initial missing CPU sample may serve as sensor priming;
+dense CPU observations must still cover production and drain, and the
+two-or-four-slot quantized CPU policy remains unchanged.
 
 `pressure_validation` requires an app-byte-capacity artifact digest, a pinned
 external pressure readback, and a pinned final runtime-binding TSV. The
