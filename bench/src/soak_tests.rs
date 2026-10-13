@@ -745,7 +745,7 @@ fn rss_windows_have_exact_bounded_sample_counts_and_endpoint_rules() {
   assert_eq!(super::rss_window(3_900_000_000_000), None);
   assert_eq!(super::rss_window(7_199_900_000_000), None);
   assert_eq!(super::rss_window(7_200_000_000_000), Some(FinalHour));
-  assert_eq!(super::rss_window(10_800_000_000_000), Some(FinalHour));
+  assert_eq!(super::rss_window(10_800_000_000_000), None);
   assert_eq!(super::rss_window(10_800_100_000_000), None);
 
   let mut first_count = 0;
@@ -759,8 +759,55 @@ fn rss_windows_have_exact_bounded_sample_counts_and_endpoint_rules() {
     }
   }
   assert_eq!(first_count, 36_000);
-  assert_eq!(final_count, 36_001);
-  assert_eq!(first_count + final_count, 72_001);
+  assert_eq!(final_count, 36_000);
+  assert_eq!(first_count + final_count, 72_000);
+}
+
+#[test]
+fn final_rss_window_excludes_boundary_sample_that_could_hide_growth() {
+  use super::RssWindow::{FinalHour, FirstPostWarmupHour};
+
+  let mut first_values = Vec::with_capacity(36_000);
+  let mut final_values = Vec::with_capacity(36_000);
+  for sample_index in 0..=108_000u128 {
+    let elapsed_ns = sample_index * 100_000_000;
+    match super::rss_window(elapsed_ns) {
+      Some(FirstPostWarmupHour) => first_values.push(100),
+      Some(FinalHour) if final_values.len() < 18_000 => final_values.push(105),
+      Some(FinalHour) => final_values.push(106),
+      None => {}
+    }
+  }
+  let endpoint_value = 105;
+  assert_eq!(super::rss_window(10_800_000_000_000), None);
+  assert_eq!(first_values.len(), 36_000);
+  assert_eq!(final_values.len(), 36_000);
+  assert_eq!(super::median(&mut first_values), Some(100));
+  let mut inclusive_values = final_values.clone();
+  inclusive_values.push(endpoint_value);
+  assert_eq!(super::median(&mut inclusive_values), Some(105));
+  assert_eq!(super::median(&mut final_values), Some(106));
+
+  let started = 12_000_000_000u128;
+  let trace_end = started + 10_800_000_000_000;
+  let stats = super::SoakStats {
+    attempted: 1,
+    completed: 1,
+    sample_count: 108_001,
+    started_monotonic_ns: started,
+    trace_ended_monotonic_ns: trace_end,
+    drain_ended_monotonic_ns: trace_end + 1,
+    ..super::SoakStats::default()
+  };
+  assert!(!super::qualifies_horizon(
+    Duration::from_secs(10_800),
+    Duration::from_millis(100),
+    &stats,
+    first_values.len(),
+    final_values.len(),
+    Some(100),
+    Some(106),
+  ));
 }
 
 #[test]
@@ -787,7 +834,7 @@ fn horizon_gate_uses_exact_trace_and_drain_phases_and_enforces_rss_growth() {
       Duration::from_millis(100),
       stats,
       36_000,
-      36_001,
+      36_000,
       first_median,
       final_median,
     )

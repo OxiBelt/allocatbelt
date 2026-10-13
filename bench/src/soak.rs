@@ -1104,7 +1104,7 @@ enum RssWindow {
 fn rss_window(elapsed_ns: u128) -> Option<RssWindow> {
   if (300_000_000_000..3_900_000_000_000).contains(&elapsed_ns) {
     Some(RssWindow::FirstPostWarmupHour)
-  } else if (7_200_000_000_000..=10_800_000_000_000).contains(&elapsed_ns) {
+  } else if (7_200_000_000_000..10_800_000_000_000).contains(&elapsed_ns) {
     Some(RssWindow::FinalHour)
   } else {
     None
@@ -1150,7 +1150,7 @@ fn qualifies_horizon(
     && sample_interval == Duration::from_millis(SAMPLE_INTERVAL_MS)
     && stats.sample_count == expected_samples
     && first_hour_samples == 36_000
-    && final_hour_samples == 36_001
+    && final_hour_samples == 36_000
     && stats.completed == stats.attempted
     && stats.errors == 0
     && stats.lost == 0
