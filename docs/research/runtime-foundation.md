@@ -276,3 +276,28 @@ milestone; qemu-user, cross targets and the required nightly toolchain are not
 installed locally. Allocator source, unsafe boundaries, features and platform
 gates are unchanged. Core Miri and bits/class mutation checks are not applicable
 to these runtime-only logic changes.
+
+## Signed feedback correctness checkpoint, 2026-10-13
+
+Signed source `808324264025ea2087fdc4555b1bfad791613c50` passed workspace
+formatting, warnings-denied all-target/all-feature Clippy and locked
+all-feature release tests on native Linux with Rust 1.99.0 and x86-64-v3
+compiler/rustdoc flags. The release logs contain 1,717 passing test executions
+across 98 harness summaries, with zero failures and four existing skips.
+These counts include repeated and nested harness executions rather than
+1,717 distinct test cases.
+
+All 20 feature combinations and the package/unpacked-consumer checks passed.
+CI-pinned cargo-audit 0.22.2 and cargo-deny 0.20.2 passed their dependency
+checks. The isolated source checkout remained clean, with identical Git tree
+and archive hashes before and after verification. Raw command, environment,
+signature, test and dependency logs are retained in the private resources
+checkout.
+
+Miri and Loom were not rerun for this checkpoint. Comparison with the prior
+qualified runtime source shows no allocator-core changes and only the
+feedback-policy version constant and regression tests under the production
+runtime. Earlier model evidence is recorded as a scoped bridge, not a new
+campaign pass. This checkpoint establishes correctness and tooling evidence;
+fresh-source application integration, native performance gates, physical
+pressure qualification and three-hour soaks remain open.
