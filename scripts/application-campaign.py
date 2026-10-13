@@ -35,7 +35,9 @@ from typing import Any
 
 
 SPEC_SCHEMA = "allocatbelt.application-campaign-spec.v2"
-SOURCE_SCHEMA = "allocatbelt.application-source-manifest.v3"
+SOURCE_SCHEMA = "allocatbelt.application-source-manifest.v4"
+SOURCE_INVENTORY_SCHEMA = "allocatbelt.application-source-inventory.v1"
+SOURCE_INVENTORY_MODULE_SHA256 = "09557087a64e83bc81e4116f8e8f6b59e42a59beb500108e57d66942bd05f950"
 PLAN_SCHEMA = "allocatbelt.application-campaign-plan.v2"
 LEDGER_SCHEMA = "allocatbelt.application-campaign-ledger.v1"
 FIXED_POLICY_SCHEMA = "allocatbelt.application-fixed-policy-artifact.v1"
@@ -291,6 +293,7 @@ def digest_object(value: dict[str, Any], field: str = "manifest_sha256") -> str:
 
 
 _RUNTIME_READBACK_MODULE_CACHE: dict[str, Any] = {}
+_SOURCE_INVENTORY_MODULE_CACHE: dict[str, Any] = {}
 
 
 def runtime_readback_module(expected_sha256: str | None = None) -> Any:
@@ -315,6 +318,33 @@ def runtime_readback_module(expected_sha256: str | None = None) -> Any:
     if len(_RUNTIME_READBACK_MODULE_CACHE) >= 4:
         _RUNTIME_READBACK_MODULE_CACHE.pop(next(iter(_RUNTIME_READBACK_MODULE_CACHE)))
     _RUNTIME_READBACK_MODULE_CACHE[source_sha256] = module
+    return module
+
+
+def source_inventory_module(expected_sha256: str | None = None) -> Any:
+    path = Path(__file__).with_name("application-source-inventory.py")
+    try:
+        raw, source_sha256 = read_stable_bytes(path, "shared source inventory module", MAX_SOURCE_MANIFEST_BYTES)
+    except CampaignError:
+        raise
+    require(source_sha256 == SOURCE_INVENTORY_MODULE_SHA256, "shared source inventory module differs from its frozen SHA-256")
+    require(expected_sha256 is None or source_sha256 == expected_sha256, "shared source inventory module differs from the caller's frozen SHA-256")
+    module = _SOURCE_INVENTORY_MODULE_CACHE.get(source_sha256)
+    if module is not None:
+        return module
+    module_name = f"application_source_inventory_{source_sha256}"
+    module = types.ModuleType(module_name)
+    module.__file__ = str(path)
+    module.__package__ = ""
+    try:
+        code = compile(raw, str(path), "exec", dont_inherit=True)
+        exec(code, module.__dict__)
+    except (SyntaxError, ValueError, TypeError) as error:
+        raise CampaignError(f"shared source inventory module cannot be compiled: {error}") from error
+    require(module.SCHEMA == SOURCE_INVENTORY_SCHEMA, "shared source inventory module has an unexpected schema")
+    if len(_SOURCE_INVENTORY_MODULE_CACHE) >= 4:
+        _SOURCE_INVENTORY_MODULE_CACHE.pop(next(iter(_SOURCE_INVENTORY_MODULE_CACHE)))
+    _SOURCE_INVENTORY_MODULE_CACHE[source_sha256] = module
     return module
 
 
@@ -505,27 +535,22 @@ def run_checked(args: list[str], cwd: Path | None = None, timeout_seconds: float
 
 
 def source_inventory(root: Path, timeout_seconds: float = 120.0) -> tuple[str, list[dict[str, Any]]]:
-    root = root.resolve(strict=True)
-    git_root = Path(run_checked(["git", "rev-parse", "--show-toplevel"], root, timeout_seconds).decode().strip()).resolve()
-    require(git_root == root, "source root must be the git worktree root")
-    files = run_checked(["git", "ls-files", "-co", "--exclude-standard", "-z"], root, timeout_seconds)
-    relpaths = sorted(path for path in files.split(b"\0") if path)
-    require(relpaths, "source tree contains no files")
-    records: list[dict[str, Any]] = []
-    checksum_input = bytearray()
-    for raw_path in relpaths:
-        require(b"\n" not in raw_path and b"\\" not in raw_path, "source paths with newline or backslash are not supported by the runner hash format")
-        rel = raw_path.decode("utf-8")
-        candidate = root / rel
-        require(not candidate.is_symlink(), f"source inventory refuses symlink: {rel}")
-        try:
-            data = candidate.read_bytes()
-        except OSError as error:
-            raise CampaignError(f"source file is unreadable: {rel}: {error}") from error
-        sha = hashlib.sha256(data).hexdigest()
-        records.append({"path": rel, "sha256": sha, "size": len(data)})
-        checksum_input.extend(f"{sha}  {rel}\n".encode("utf-8"))
-    return hashlib.sha256(checksum_input).hexdigest(), records
+    module = source_inventory_module()
+    try:
+        typed_inventory = module.inventory(root, timeout_seconds)
+        module_record = next(
+            (entry for entry in typed_inventory["entries"] if entry["path"] == "scripts/application-source-inventory.py"),
+            None,
+        )
+        require(
+            module_record is not None
+            and module_record["kind"] == "file"
+            and module_record["sha256"] == SOURCE_INVENTORY_MODULE_SHA256,
+            "source tree does not contain the pinned regular shared source inventory module",
+        )
+        return module.digest_inventory(typed_inventory), typed_inventory["entries"]
+    except module.InventoryError as error:
+        raise CampaignError(str(error)) from error
 
 
 def source_manifest(args: argparse.Namespace) -> dict[str, Any]:
@@ -672,21 +697,29 @@ def verify_source_manifest(
     require(not analysis_path.is_absolute() and ".." not in analysis_path.parts and is_sha256(manifest["analysis_artifact"]["sha256"]), "source manifest analyzer path/digest is malformed")
     require(len({item.get("path") for item in manifest["artifacts"].values()}) == len(ALLOCATORS), "source manifest aliases allocator binary paths")
     require(manifest["analysis_artifact"].get("path") not in {item.get("path") for item in manifest["artifacts"].values()} | {item.get("path") for item in manifest["soak_artifacts"].values()}, "source manifest reuses a treatment binary for analysis")
-    require(isinstance(source["files"], list) and source["files"], "source file inventory is missing")
-    file_paths: set[str] = set()
-    for index, entry_value in enumerate(source["files"]):
-        entry = exact_keys(entry_value, {"path", "sha256", "size"}, f"source file inventory[{index}]")
-        path = Path(entry["path"])
-        require(isinstance(entry["path"], str) and not path.is_absolute() and ".." not in path.parts and "\\" not in entry["path"], "source inventory path is not portable")
-        require(entry["path"] not in file_paths and is_sha256(entry["sha256"]) and type(entry["size"]) is int and entry["size"] >= 0, "source file inventory has a duplicate or invalid entry")
-        file_paths.add(entry["path"])
-    inventory_hash = hashlib.sha256("".join(f"{entry['sha256']}  {entry['path']}\n" for entry in source["files"]).encode()).hexdigest()
+    inventory_module = source_inventory_module()
+    try:
+        validated_files = inventory_module.validate_records({"schema": SOURCE_INVENTORY_SCHEMA, "entries": source["files"]})
+    except inventory_module.InventoryError as error:
+        raise CampaignError(f"invalid typed source inventory: {error}") from error
+    require(validated_files == source["files"], "source inventory records are not canonical")
+    inventory_hash = inventory_module.digest_records(source["files"])
     require(inventory_hash == source["source_tree_sha256"], "source file inventory digest is invalid")
+    inventory_engine = next(
+        (entry for entry in source["files"] if entry["path"] == "scripts/application-source-inventory.py"),
+        None,
+    )
+    require(
+        inventory_engine is not None
+        and inventory_engine["kind"] == "file"
+        and inventory_engine["sha256"] == SOURCE_INVENTORY_MODULE_SHA256,
+        "source inventory does not bind the pinned regular shared inventory module",
+    )
     validator = exact_keys(manifest["runtime_readback_validator"], {"path", "sha256"}, "runtime readback validator pin")
     validator_path = Path(validator["path"])
     require(validator["path"] == RUNTIME_VALIDATOR_RELATIVE_PATH and not validator_path.is_absolute() and ".." not in validator_path.parts and is_sha256(validator["sha256"]), "runtime readback validator path/digest is malformed")
     validator_file = next((entry for entry in source["files"] if entry["path"] == validator["path"]), None)
-    require(validator_file is not None and validator_file["sha256"] == validator["sha256"], "runtime readback validator hash is not bound by the source inventory")
+    require(validator_file is not None and validator_file["kind"] == "file" and validator_file["sha256"] == validator["sha256"], "runtime readback validator hash is not bound by a regular source inventory entry")
     policy_artifact = validate_fixed_runtime_policy_artifact(manifest["fixed_runtime_policy"], validator["sha256"])
     calibration = exact_keys(
         manifest["resource_domain_calibration"],

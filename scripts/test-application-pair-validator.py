@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import hashlib
+import importlib.util
 import os
 import re
 import signal
@@ -17,6 +18,9 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 RUNNER = ROOT / "scripts" / "run-application-pair.sh"
+SOURCE_INVENTORY = ROOT / "scripts" / "application-source-inventory.py"
+FUNCTIONAL_HELPER = ROOT / "scripts" / "test-application-pair-functional-e2e.py"
+CAMPAIGN = ROOT / "scripts" / "application-campaign.py"
 
 
 def embedded_validator(name: str) -> str:
@@ -83,6 +87,34 @@ class ApplicationPairValidatorTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.temp.cleanup()
 
+    def test_pair_source_identity_uses_the_pinned_shared_typed_inventory(self) -> None:
+        runner = RUNNER.read_text(encoding="utf-8")
+        functional = FUNCTIONAL_HELPER.read_text(encoding="utf-8")
+        campaign = CAMPAIGN.read_text(encoding="utf-8")
+        expected_hash = re.search(r"^source_inventory_module_sha256_expected=([0-9a-f]{64})$", runner, re.MULTILINE)
+        helper_hash = re.search(r'^SOURCE_INVENTORY_MODULE_SHA256 = "([0-9a-f]{64})"$', functional, re.MULTILINE)
+        campaign_hash = re.search(r'^SOURCE_INVENTORY_MODULE_SHA256 = "([0-9a-f]{64})"$', campaign, re.MULTILINE)
+        self.assertIsNotNone(expected_hash, "pair runner must pin the shared source inventory implementation")
+        self.assertIsNotNone(helper_hash, "functional E2E must pin the shared source inventory implementation")
+        self.assertIsNotNone(campaign_hash, "campaign controller must pin the shared source inventory implementation")
+        actual_hash = hashlib.sha256(SOURCE_INVENTORY.read_bytes()).hexdigest()
+        self.assertEqual(expected_hash.group(1), actual_hash)
+        self.assertEqual(helper_hash.group(1), actual_hash)
+        self.assertEqual(campaign_hash.group(1), actual_hash)
+        self.assertIn(
+            'python3 - "$source_inventory_module_path" "$source_inventory_module_sha256_expected" "$repo_root" <<\'PY\'',
+            runner,
+        )
+        self.assertIn('module.main(["digest", "--root", root])', runner)
+        self.assertLess(
+            runner.index('hashlib.sha256(raw).hexdigest() != expected_sha256'),
+            runner.index('exec(compile(raw, path, "exec", dont_inherit=True), module.__dict__)'),
+        )
+        self.assertIn("source_inventory_module_sha256_before", runner)
+        self.assertIn("source_inventory_module_sha256_after", runner)
+        self.assertIn('"schema": "allocatbelt.application-functional-source-overlay.v2"', functional)
+        self.assertIn('"schema": "allocatbelt.application-functional-pair-overlay.v2"', functional)
+
     def test_shell_rejects_oversized_arrivals_and_non_numeric_deadlines_before_arithmetic(self) -> None:
         base = [str(RUNNER), "/missing/benchmark", "system", "cpu", "open_loop", "1", "0", "numeric-1", str(self.directory)]
         oversized = subprocess.run(
@@ -130,6 +162,7 @@ class ApplicationPairValidatorTests(unittest.TestCase):
         ]
         environment = os.environ.copy()
         environment["qualification_runtime_readback_supported"] = "1"
+        environment["ALLOCATBELT_FUNCTIONAL_ONLY"] = "1"
         result = subprocess.run(arguments, check=False, capture_output=True, text=True, env=environment)
         self.assertEqual(result.returncode, 2)
         self.assertIn("qualification timing is hard-disabled", result.stderr)
@@ -144,6 +177,41 @@ class ApplicationPairValidatorTests(unittest.TestCase):
                 "calibration_binary_sha256", "calibration_output_sha256",
             ],
         )
+
+    def test_functional_only_entry_is_explicit_open_loop_and_finitely_bounded(self) -> None:
+        source = RUNNER.read_text(encoding="utf-8")
+        self.assertIn("qualification_runtime_readback_supported=0", source)
+        self.assertIn("external_pressure_driver_supported=0", source)
+        self.assertIn("execution_scope=qualification", source)
+        self.assertIn("p99_qualification=functional_only", source)
+
+        def invoke(*, mode: str, rate: str, arrivals: str, trace: str = "10") -> subprocess.CompletedProcess[str]:
+            args = [
+                str(RUNNER), "--functional-only", "/missing/benchmark", "allocatbelt", "cpu", mode,
+                rate, "0", "functional-1", str(self.directory), arrivals, trace, "10", "5", "240",
+                str(self.oracle), self.oracle_digest, "steady", "matched", "", "", "", "",
+                "--runtime-bindings", str(self.directory / "bindings.json"),
+                "--runtime-bindings-sha256", "a" * 64,
+                "--runtime-validator", str(RUNNER.parent / "application-runtime-readback.py"),
+                "--runtime-validator-sha256", "b" * 64,
+                "--fixed-global-control-baseline", "2048",
+                "--functional-overlay", str(self.directory / "functional-overlay.json"),
+                "--functional-overlay-sha256", "c" * 64,
+            ]
+            return subprocess.run(args, check=False, capture_output=True, text=True)
+
+        capacity = invoke(mode="capacity", rate="-", arrivals="5000")
+        self.assertEqual(capacity.returncode, 2)
+        self.assertIn("functional-only mode supports open_loop only", capacity.stderr)
+        too_many = invoke(mode="open_loop", rate="100", arrivals="1001", trace="30")
+        self.assertEqual(too_many.returncode, 2)
+        self.assertIn("arrivals must be in 1..=1000", too_many.stderr)
+        too_fast = invoke(mode="open_loop", rate="1001", arrivals="1")
+        self.assertEqual(too_fast.returncode, 2)
+        self.assertIn("rate must be in 1..=1000", too_fast.stderr)
+        too_long = invoke(mode="open_loop", rate="1", arrivals="1", trace="31")
+        self.assertEqual(too_long.returncode, 2)
+        self.assertIn("deadlines exceed their fixed finite limits", too_long.stderr)
 
     def test_gnu_timeout_foreground_keeps_term_ignoring_binary_in_controller_group(self) -> None:
         with tempfile.TemporaryDirectory(prefix="application-timeout-group-") as temporary:
@@ -587,6 +655,104 @@ class ApplicationPairValidatorTests(unittest.TestCase):
         report.write_text(report.read_text(encoding="utf-8").replace("family\tdisk\t2\t2", "family\tdisk\t2\t1"), encoding="utf-8")
         rejected = subprocess.run([sys.executable, "-c", program, *args], check=False, capture_output=True, text=True)
         self.assertNotEqual(rejected.returncode, 0)
+
+
+class FunctionalHelperSafetyTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory(prefix="functional-helper-safety-")
+        self.addCleanup(self.temp.cleanup)
+        self.work = Path(self.temp.name)
+        self.helper_path = ROOT / "scripts" / "test-application-pair-functional-e2e.py"
+        spec = importlib.util.spec_from_file_location("functional_pair_helper", self.helper_path)
+        assert spec is not None and spec.loader is not None
+        self.helper = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(self.helper)
+
+    def test_unverified_controller_cannot_execute(self) -> None:
+        scripts = self.work / "scripts"
+        scripts.mkdir()
+        marker = self.work / "executed"
+        (scripts / "application-campaign.py").write_text(
+            f"from pathlib import Path\nPath({str(marker)!r}).touch()\n", encoding="utf-8"
+        )
+        with self.assertRaisesRegex(RuntimeError, "pinned signed source"):
+            self.helper.load_campaign_module(self.work)
+        self.assertFalse(marker.exists())
+
+    def test_timeout_kills_term_ignoring_child_and_keeps_timeout_status(self) -> None:
+        program = "import signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); print('ready',flush=True); time.sleep(60)"
+        started = time.monotonic()
+        code = self.helper.run_bounded(
+            [sys.executable, "-c", program], self.work,
+            self.work / "stdout", self.work / "stderr", 1,
+        )
+        self.assertEqual(code, 124)
+        self.assertLess(time.monotonic() - started, 5)
+        self.assertIn("ready", (self.work / "stdout").read_text())
+
+    def test_reaped_leader_does_not_leave_running_descendant(self) -> None:
+        pid_path = self.work / "descendant.pid"
+        program = (
+            "import os,signal,time\nchild=os.fork()\n"
+            "if child == 0:\n signal.signal(signal.SIGTERM,signal.SIG_IGN)\n time.sleep(60)\n os._exit(0)\n"
+            f"open({str(pid_path)!r},'w').write(str(child))\nos._exit(0)\n"
+        )
+        code = self.helper.run_bounded(
+            [sys.executable, "-c", program], self.work,
+            self.work / "stdout", self.work / "stderr", 5,
+        )
+        self.assertEqual(code, 0)
+        pid = int(pid_path.read_text())
+        try:
+            deadline = time.monotonic() + 3
+            while time.monotonic() < deadline:
+                status = Path(f"/proc/{pid}/stat")
+                if not status.exists() or status.read_text().rsplit(")", 1)[1].split()[0] == "Z":
+                    return
+                time.sleep(0.02)
+            self.fail("descendant remains running after leader exit")
+        finally:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+
+    def test_early_interrupt_escalates_before_original_deadline(self) -> None:
+        ready_path = self.work / "ready.pid"
+        child = (
+            "import os,signal,time\nsignal.signal(signal.SIGTERM,signal.SIG_IGN)\n"
+            f"open({str(ready_path)!r},'w').write(str(os.getpid()))\ntime.sleep(60)\n"
+        )
+        wrapper = (
+            "import importlib.util,sys\nfrom pathlib import Path\n"
+            f"s=importlib.util.spec_from_file_location('helper',{str(self.helper_path)!r})\n"
+            "m=importlib.util.module_from_spec(s);s.loader.exec_module(m)\n"
+            f"print(m.run_bounded([sys.executable,'-c',{child!r}],Path({str(self.work)!r}),"
+            f"Path({str(self.work / 'stdout')!r}),Path({str(self.work / 'stderr')!r}),30),flush=True)\n"
+        )
+        driver = subprocess.Popen([sys.executable, "-B", "-c", wrapper], stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
+        try:
+            deadline = time.monotonic() + 5
+            while not ready_path.exists() and time.monotonic() < deadline:
+                time.sleep(0.02)
+            self.assertTrue(ready_path.exists(), "child never established its signal handler")
+            started = time.monotonic()
+            driver.send_signal(signal.SIGTERM)
+            stdout, stderr = driver.communicate(timeout=5)
+            self.assertEqual(driver.returncode, 0, stderr.decode(errors="replace"))
+            self.assertEqual(stdout.strip(), b"143")
+            self.assertLess(time.monotonic() - started, 5)
+        finally:
+            try:
+                os.killpg(driver.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            driver.wait(timeout=2)
+            if ready_path.exists():
+                try:
+                    os.killpg(int(ready_path.read_text()), signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
 
 
 if __name__ == "__main__":

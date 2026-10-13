@@ -158,6 +158,36 @@ For open-loop rows, `requested_arrivals` is the selected finite trace length.
 It is blank in duration-based capacity mode, where the observed attempt count
 is determined by the 30-second horizon.
 
+## Versioned source identities and functional runner checks
+
+Source manifest v4 uses the shared
+[`application-source-inventory.py`](../../scripts/application-source-inventory.py)
+implementation. Its canonical typed inventory binds each regular file's bytes
+and executable mode and each permitted symlink's raw target text. Links must
+be tracked, remain inside the checkout and directly target tracked regular
+files through nonsymlink directories. Dangling links, directory targets and
+link chains are rejected. Earlier artifacts require their original verifier;
+v4 does not reinterpret earlier inventory formats.
+
+The semantic `manifest_sha256` excludes its own digest field. A file SHA-256
+binds the actual serialized manifest bytes, including that field; callers must
+keep these two identities distinct. Source capture and Git helpers have finite
+bounds, stable descriptor reads and process-group cleanup.
+
+The pair runner's explicit `--functional-only` mode accepts bounded fixed-policy
+open-loop checks with at most 1,000 arrivals and a rate of at most 1,000 per
+second. It requires pinned runtime recipes, an independent construction-only
+Control calibration and a separately pinned overlay for the executing runner
+and inventory engine. Its completion, metadata and process-ledger scope stays
+`functional_only`; campaign metric extraction rejects that scope.
+
+A native pipeline check using signed runtime source
+`9290a2b194a667aba8816020214230d111ab80a3` passed matched bounded/Tokio,
+bounded A/A, Tokio A/A and candidate/secure-mimalloc cases, with eight validated
+process receipts. The draft tools were pinned separately from that source.
+This is functional integration evidence. Qualification and pressure support
+guards remain disabled; it supplies no throughput or p99 qualification result.
+
 ## Parameterized observation and reference artifacts
 
 `--arrivals N` selects 1 through 1,000,000 scheduled IDs in open-loop mode; the

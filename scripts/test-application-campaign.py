@@ -34,18 +34,32 @@ def source_for(host_id: str) -> dict:
     soak_sha = "b" * 64
     validator_path = campaign.RUNTIME_VALIDATOR_RELATIVE_PATH
     validator_sha = campaign.hashlib.sha256((SCRIPT.parent / "application-runtime-readback.py").read_bytes()).hexdigest()
+    inventory_engine_path = SCRIPT.parent / "application-source-inventory.py"
     files = [
-        {"path": "Cargo.lock", "sha256": file_sha, "size": 1},
-        {"path": "scripts/run-application-soak.sh", "sha256": soak_sha, "size": 1},
-        {"path": validator_path, "sha256": validator_sha, "size": (SCRIPT.parent / "application-runtime-readback.py").stat().st_size},
+        {"path": "Cargo.lock", "kind": "file", "mode": "100644", "sha256": file_sha, "size": 1},
+        {"path": "scripts/run-application-soak.sh", "kind": "file", "mode": "100755", "sha256": soak_sha, "size": 1},
+        {
+            "path": "scripts/application-source-inventory.py",
+            "kind": "file",
+            "mode": "100644",
+            "sha256": campaign.SOURCE_INVENTORY_MODULE_SHA256,
+            "size": inventory_engine_path.stat().st_size,
+        },
+        {
+            "path": validator_path,
+            "kind": "file",
+            "mode": "100644",
+            "sha256": validator_sha,
+            "size": (SCRIPT.parent / "application-runtime-readback.py").stat().st_size,
+        },
     ]
+    files.sort(key=lambda item: item["path"].encode("utf-8"))
+    inventory_module = campaign.source_inventory_module()
     source = {
         "git_commit": "a" * 40,
-        "source_tree_sha256": campaign.hashlib.sha256(
-            "".join(f"{item['sha256']}  {item['path']}\n" for item in sorted(files, key=lambda item: item["path"])).encode()
-        ).hexdigest(),
+        "source_tree_sha256": inventory_module.digest_records(files),
         "cargo_lock_sha256": file_sha,
-        "files": sorted(files, key=lambda item: item["path"]),
+        "files": files,
     }
     build = {
         "host_id": host_id,
@@ -336,10 +350,10 @@ class ApplicationCampaignTests(unittest.TestCase):
                 campaign._RUNTIME_READBACK_MODULE_CACHE.clear()
                 campaign._RUNTIME_READBACK_MODULE_CACHE.update(original_cache)
 
-    def test_source_v3_binds_numeric_policy_validator_and_independent_calibration(self) -> None:
+    def test_source_v4_binds_typed_inventory_numeric_policy_and_independent_calibration(self) -> None:
         source = source_for("host-1")
         campaign.verify_source_manifest(source, verify_artifacts=False)
-        self.assertEqual(source["schema"], "allocatbelt.application-source-manifest.v3")
+        self.assertEqual(source["schema"], "allocatbelt.application-source-manifest.v4")
         self.assertEqual(source["fixed_runtime_policy"]["policy"]["byte_buckets"]["disk"]["bytes_per_second"], 17_179_869_184)
         self.assertEqual(source["fixed_runtime_policy"]["policy"]["byte_buckets"]["disk"]["burst_bytes"], 65_536)
         self.assertEqual(source["fixed_runtime_policy"]["policy"]["byte_buckets"]["disk"]["max_reservations"], 64)
@@ -362,6 +376,41 @@ class ApplicationCampaignTests(unittest.TestCase):
             damaged["manifest_sha256"] = campaign.digest_object(damaged)
             with self.assertRaises(campaign.CampaignError):
                 campaign.verify_source_manifest(damaged, verify_artifacts=False)
+
+        legacy = copy.deepcopy(source)
+        legacy["schema"] = "allocatbelt.application-source-manifest.v3"
+        legacy["manifest_sha256"] = campaign.digest_object(legacy)
+        with self.assertRaisesRegex(campaign.CampaignError, "unsupported source-manifest schema"):
+            campaign.verify_source_manifest(legacy, verify_artifacts=False)
+
+    def test_source_manifest_validator_pin_must_name_a_regular_inventory_entry(self) -> None:
+        source = source_for("host-1")
+        validator = next(item for item in source["source"]["files"] if item["path"] == campaign.RUNTIME_VALIDATOR_RELATIVE_PATH)
+        target = "../Cargo.lock"
+        validator.update(
+            kind="symlink",
+            mode="120000",
+            target=target,
+            sha256=campaign.hashlib.sha256(target.encode("utf-8")).hexdigest(),
+            size=len(target.encode("utf-8")),
+        )
+        source["source"]["source_tree_sha256"] = campaign.source_inventory_module().digest_records(source["source"]["files"])
+        source["resource_domain_calibration"]["source"]["source_tree_sha256"] = source["source"]["source_tree_sha256"]
+        source["manifest_sha256"] = campaign.digest_object(source)
+        with self.assertRaisesRegex(campaign.CampaignError, "regular source inventory entry"):
+            campaign.verify_source_manifest(source, verify_artifacts=False)
+
+    def test_source_v4_requires_the_shared_inventory_engine_pin(self) -> None:
+        source = source_for("host-1")
+        source["source"]["files"] = [
+            entry for entry in source["source"]["files"]
+            if entry["path"] != "scripts/application-source-inventory.py"
+        ]
+        source["source"]["source_tree_sha256"] = campaign.source_inventory_module().digest_records(source["source"]["files"])
+        source["resource_domain_calibration"]["source"]["source_tree_sha256"] = source["source"]["source_tree_sha256"]
+        source["manifest_sha256"] = campaign.digest_object(source)
+        with self.assertRaisesRegex(campaign.CampaignError, "does not bind the pinned regular shared inventory module"):
+            campaign.verify_source_manifest(source, verify_artifacts=False)
 
     def test_source_manifest_requires_candidate_soak_and_validates_every_declared_binding(self) -> None:
         source = source_for("host-1")

@@ -5,13 +5,23 @@ set -euo pipefail
 export LC_ALL=C
 qualification_runtime_readback_supported=0
 external_pressure_driver_supported=0
+functional_only_mode=0
+execution_scope=qualification
+runtime_readback_enabled=$qualification_runtime_readback_supported
+if [[ "${1:-}" == "--functional-only" ]]; then
+  functional_only_mode=1
+  execution_scope=functional_only
+  runtime_readback_enabled=1
+  shift
+fi
 
 usage() {
-  echo "usage: $0 BINARY ALLOCATOR WORKLOAD MODE RATE_OR_DASH CPU_SET RUN_ID OUTPUT_ROOT [ARRIVALS TRACE_S DRAIN_S SHUTDOWN_S PROCESS_S ORACLE_FILE ORACLE_SHA256 PROFILE PAIR_KIND [BASELINE_BINARY BASELINE_ALLOCATOR BASELINE_ORACLE BASELINE_ORACLE_SHA256] [--runtime-bindings FILE --runtime-bindings-sha256 SHA --runtime-validator FILE --runtime-validator-sha256 SHA --fixed-global-control-baseline BYTES]]" >&2
+  echo "usage: $0 [--functional-only] BINARY ALLOCATOR WORKLOAD MODE RATE_OR_DASH CPU_SET RUN_ID OUTPUT_ROOT [ARRIVALS TRACE_S DRAIN_S SHUTDOWN_S PROCESS_S ORACLE_FILE ORACLE_SHA256 PROFILE PAIR_KIND [BASELINE_BINARY BASELINE_ALLOCATOR BASELINE_ORACLE BASELINE_ORACLE_SHA256] [--runtime-bindings FILE --runtime-bindings-sha256 SHA --runtime-validator FILE --runtime-validator-sha256 SHA --fixed-global-control-baseline BYTES [--functional-overlay FILE --functional-overlay-sha256 SHA]]]" >&2
   echo "  open_loop requires a precomputed oracle file and its SHA-256 digest." >&2
+  echo "  --functional-only runs a bounded, non-qualifying fixed-policy receipt check." >&2
 }
 
-if [[ $# -lt 8 || $# -gt 31 ]]; then usage; exit 2; fi
+if [[ $# -lt 8 || $# -gt 35 ]]; then usage; exit 2; fi
 binary_arg=$1
 allocator=$2
 workload=$3
@@ -38,8 +48,29 @@ runtime_bindings_sha_expected=
 runtime_validator_arg=
 runtime_validator_sha_expected=
 fixed_global_control_baseline_arg=
+functional_overlay_arg=
+functional_overlay_sha_expected=
+functional_overlay_file=
+functional_overlay_sha256_before=not_applicable
+functional_overlay_sha256_after=not_applicable
+source_inventory_schema=allocatbelt.application-source-inventory.v1
+source_inventory_module_sha256_expected=09557087a64e83bc81e4116f8e8f6b59e42a59beb500108e57d66942bd05f950
+source_inventory_module_path=
+source_inventory_module_sha256_before=unavailable
+source_inventory_module_sha256_after=unavailable
+pair_runner_path=
+pair_runner_sha256_before=unavailable
+pair_runner_sha256_after=unavailable
 if (( $# > 21 )); then
-  [[ $# -eq 31 && "${22}" == "--runtime-bindings" && "${24}" == "--runtime-bindings-sha256" && "${26}" == "--runtime-validator" && "${28}" == "--runtime-validator-sha256" && "${30}" == "--fixed-global-control-baseline" ]] || { usage; exit 2; }
+  if (( functional_only_mode == 1 )); then
+    [[ $# -eq 35 && "${32}" == "--functional-overlay" && "${34}" == "--functional-overlay-sha256" ]] || { usage; exit 2; }
+    functional_overlay_arg=${33}
+    functional_overlay_sha_expected=${35}
+    [[ "$functional_overlay_sha_expected" =~ ^[0-9a-f]{64}$ ]] || { echo "functional overlay manifest hash must be SHA-256" >&2; exit 2; }
+  else
+    [[ $# -eq 31 ]] || { usage; exit 2; }
+  fi
+  [[ "${22}" == "--runtime-bindings" && "${24}" == "--runtime-bindings-sha256" && "${26}" == "--runtime-validator" && "${28}" == "--runtime-validator-sha256" && "${30}" == "--fixed-global-control-baseline" ]] || { usage; exit 2; }
   runtime_bindings_arg=${23}
   runtime_bindings_sha_expected=${25}
   runtime_validator_arg=${27}
@@ -57,6 +88,10 @@ done
 case "$allocator" in allocatbelt|mimalloc-secure|mimalloc-standard|system) ;; *) usage; exit 2 ;; esac
 case "$workload" in cpu|memory|http|disk|mixed) ;; *) usage; exit 2 ;; esac
 case "$mode" in capacity|open_loop) ;; *) usage; exit 2 ;; esac
+if (( functional_only_mode == 1 )) && [[ "$mode" != open_loop ]]; then
+  echo "functional-only mode supports open_loop only" >&2
+  exit 2
+fi
 case "$profile" in steady|mixed|burst|oversubscribed|safety_overload) ;; *) echo "unknown profile: $profile" >&2; exit 2 ;; esac
 case "$pair_kind" in matched|aa-bounded|aa-tokio|allocator-match|pressure-matched|pressure-allocator-match) ;; *) echo "PAIR_KIND is not a frozen matched comparison family" >&2; exit 2 ;; esac
 if [[ "$pair_kind" == pressure-matched || "$pair_kind" == pressure-allocator-match ]]; then
@@ -135,11 +170,24 @@ pair_suffix=${run_id##*[!0-9]}
 pair_ordinal=$((10#$pair_suffix))
 (( pair_ordinal >= 1 && pair_ordinal <= 36 )) || { echo "pair ordinal must be from 1 through 36" >&2; exit 2; }
 
+if (( functional_only_mode == 1 )); then
+  [[ $# -eq 35 && -n "$runtime_bindings_arg" && -n "$runtime_validator_arg" && -n "$functional_overlay_arg" ]] || { echo "functional-only mode requires frozen runtime bindings, validator, and overlay manifest" >&2; exit 2; }
+  [[ "$mode" == open_loop ]] || { echo "functional-only mode supports open_loop only" >&2; exit 2; }
+  [[ "$arrivals" =~ ^[1-9][0-9]*$ ]] && (( arrivals <= 1000 )) || { echo "functional-only arrivals must be in 1..=1000" >&2; exit 2; }
+  (( rate <= 1000 )) || { echo "functional-only average rate must be in 1..=1000 arrivals per second" >&2; exit 2; }
+  (( trace_deadline <= 30 && drain_deadline <= 30 && shutdown_deadline <= 15 && process_deadline <= 300 )) || { echo "functional-only deadlines exceed their fixed finite limits" >&2; exit 2; }
+  [[ "$profile" != safety_overload ]] || { echo "functional-only mode does not allow safety_overload" >&2; exit 2; }
+  case "$pair_kind" in matched|aa-bounded|aa-tokio|allocator-match) ;; *) echo "functional-only mode accepts fixed-policy matched, A/A, or allocator-pair kinds only" >&2; exit 2 ;; esac
+fi
+
 for command in taskset timeout sha256sum awk rustc uname python3 cmp realpath; do
   command -v "$command" >/dev/null || { echo "missing required command: $command" >&2; exit 2; }
 done
 [[ -x /usr/bin/time ]] || { echo "GNU /usr/bin/time is required" >&2; exit 2; }
-(( qualification_runtime_readback_supported == 1 )) || { echo "qualification timing is hard-disabled until the binary provides verified runtime-domain, policy, and ceiling readback" >&2; exit 2; }
+if (( functional_only_mode == 0 && qualification_runtime_readback_supported != 1 )); then
+  echo "qualification timing is hard-disabled until the binary provides verified runtime-domain, policy, and ceiling readback" >&2
+  exit 2
+fi
 
 if [[ "$mode" == open_loop ]]; then
   oracle_file=$(realpath "$oracle_file_arg") || exit 2
@@ -162,6 +210,14 @@ else
 fi
 
 repo_root=$(git rev-parse --show-toplevel) || exit 2
+pair_runner_path=$(realpath "$0") || exit 2
+source_inventory_module_path="${pair_runner_path%/*}/application-source-inventory.py"
+source_inventory_module_sha256_before=$(sha256sum "$source_inventory_module_path" | awk '{print $1}') || exit 2
+[[ "$source_inventory_module_sha256_before" == "$source_inventory_module_sha256_expected" ]] || {
+  echo "shared source inventory module differs from its frozen SHA-256" >&2
+  exit 2
+}
+pair_runner_sha256_before=$(sha256sum "$pair_runner_path" | awk '{print $1}') || exit 2
 binary=$(realpath "$binary_arg") || exit 2
 [[ -x "$binary" ]] || { echo "binary is not executable: $binary" >&2; exit 2; }
 baseline_binary=
@@ -184,11 +240,64 @@ mkdir -- "$cell_dir" || { echo "run directory already exists: $cell_dir" >&2; ex
 cd "$repo_root"
 
 source_hash() {
-  git -C "$repo_root" ls-files -co --exclude-standard -z \
-    | sort -z \
-    | xargs -0 -r sha256sum \
-    | sha256sum \
-    | awk '{print $1}'
+  local module_sha256_before module_sha256_after digest
+  module_sha256_before=$(sha256sum "$source_inventory_module_path" | awk '{print $1}') || return 1
+  [[ "$module_sha256_before" == "$source_inventory_module_sha256_before" && "$module_sha256_before" == "$source_inventory_module_sha256_expected" ]] || {
+    echo "shared source inventory module differs from its frozen SHA-256" >&2
+    return 1
+  }
+  digest=$(python3 - "$source_inventory_module_path" "$source_inventory_module_sha256_expected" "$repo_root" <<'PY'
+import hashlib
+import os
+import stat
+import sys
+import types
+
+path, expected_sha256, root = sys.argv[1:]
+flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+try:
+    fd = os.open(path, flags)
+except OSError as error:
+    print(f"cannot open shared source inventory module: {error}", file=sys.stderr)
+    raise SystemExit(2)
+try:
+    before = os.fstat(fd)
+    if not stat.S_ISREG(before.st_mode) or before.st_size > 16 * 1024 * 1024:
+        raise SystemExit("shared source inventory module is not a bounded regular file")
+    chunks = []
+    count = 0
+    while True:
+        block = os.read(fd, min(65536, 16 * 1024 * 1024 + 1 - count))
+        if not block:
+            break
+        count += len(block)
+        if count > 16 * 1024 * 1024:
+            raise SystemExit("shared source inventory module exceeds its finite size bound")
+        chunks.append(block)
+    after = os.fstat(fd)
+    current = os.stat(path, follow_symlinks=False)
+    fingerprint = lambda item: (item.st_dev, item.st_ino, item.st_mode, item.st_size, item.st_mtime_ns, item.st_ctime_ns)
+    raw = b"".join(chunks)
+    if (fingerprint(before) != fingerprint(after) or count != before.st_size
+        or not stat.S_ISREG(current.st_mode) or fingerprint(before) != fingerprint(current)):
+        raise SystemExit("shared source inventory module changed while being captured")
+finally:
+    os.close(fd)
+if hashlib.sha256(raw).hexdigest() != expected_sha256:
+    raise SystemExit("shared source inventory module differs from its frozen SHA-256")
+module = types.ModuleType("pinned_application_source_inventory")
+module.__file__ = path
+module.__package__ = ""
+exec(compile(raw, path, "exec", dont_inherit=True), module.__dict__)
+raise SystemExit(module.main(["digest", "--root", root]))
+PY
+  ) || return 1
+  module_sha256_after=$(sha256sum "$source_inventory_module_path" | awk '{print $1}') || return 1
+  [[ "$module_sha256_after" == "$module_sha256_before" ]] || {
+    echo "shared source inventory module changed while taking the source identity" >&2
+    return 1
+  }
+  printf '%s\n' "$digest"
 }
 
 verify_runtime_inputs() {
@@ -203,7 +312,9 @@ verify_runtime_inputs() {
   python3 - "$bindings_file" "$runtime_bindings_sha_expected" "$validator_file" "$runtime_validator_sha_expected" "$fixed_global_control_baseline_arg" "$repo_root" "$source_digest" "$run_id" "$workload" "$profile" "$mode" "$rate" "$arrivals" <<'PY'
 import hashlib
 import json
+import os
 import re
+import stat
 import sys
 from pathlib import Path
 
@@ -219,6 +330,38 @@ def unique(pairs):
     return result
 def canonical(value):
     return (json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False) + "\n").encode("ascii")
+def stable_bytes(path, maximum):
+    fd = os.open(path, os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        before = os.fstat(fd)
+        if not stat.S_ISREG(before.st_mode) or before.st_size > maximum:
+            fail()
+        chunks = []
+        size = 0
+        while True:
+            block = os.read(fd, min(65536, maximum + 1 - size))
+            if not block:
+                break
+            size += len(block)
+            if size > maximum:
+                fail()
+            chunks.append(block)
+        after = os.fstat(fd)
+        current = os.stat(path, follow_symlinks=False)
+        if ((before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns, before.st_ctime_ns)
+            != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns)
+            or size != before.st_size or not stat.S_ISREG(current.st_mode)
+            or (current.st_dev, current.st_ino) != (before.st_dev, before.st_ino)):
+            fail()
+        return b"".join(chunks)
+    finally:
+        os.close(fd)
+def sha256_path(path):
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
 def safe_file(root, relative, expected_sha):
     if not isinstance(relative, str) or not relative or "\\" in relative:
         fail()
@@ -235,12 +378,12 @@ def safe_file(root, relative, expected_sha):
         resolved.relative_to(Path(root).resolve(strict=True))
     except ValueError:
         fail()
-    if not resolved.is_file() or hashlib.sha256(resolved.read_bytes()).hexdigest() != expected_sha:
+    if not resolved.is_file() or sha256_path(resolved) != expected_sha:
         fail()
     return resolved
 try:
-    raw = Path(manifest_path).read_bytes()
-    if len(raw) > 131072 or hashlib.sha256(raw).hexdigest() != raw_sha:
+    raw = stable_bytes(Path(manifest_path), 131072)
+    if hashlib.sha256(raw).hexdigest() != raw_sha:
         fail()
     manifest = json.loads(raw.decode("utf-8"), object_pairs_hook=unique)
     required = {"schema", "run_id", "comparison_family", "source_manifest_sha256", "source_sha256", "source", "build", "fixed_runtime_policy", "resource_domain_calibration", "runtime_readback_validator", "fixed_global_control_baseline", "processes", "manifest_sha256"}
@@ -292,8 +435,8 @@ try:
         fail()
     safe_file(source_root, calibration["binary"]["path"], calibration["binary"]["sha256"])
     output_path = safe_file(source_root, calibration["output"]["path"], calibration["output"]["sha256"])
-    calibration_raw = output_path.read_bytes()
-    if len(calibration_raw) > 131072 or json.loads(calibration_raw.decode("utf-8"), object_pairs_hook=unique) != record:
+    calibration_raw = stable_bytes(output_path, 131072)
+    if json.loads(calibration_raw.decode("utf-8"), object_pairs_hook=unique) != record:
         fail()
     validator = manifest["runtime_readback_validator"]
     if type(validator) is not dict or set(validator) != {"path", "sha256"} or validator["path"] != "scripts/application-runtime-readback.py" or validator["sha256"] != validator_sha:
@@ -309,7 +452,9 @@ runtime_binding_for_process() {
   python3 - "$runtime_bindings_arg" "$runtime_bindings_sha_expected" "$pair" "$executor" "$allocator_name" "$binary_hash" "$run_id" "$workload" "$profile" "$mode" "$rate" "$arrivals" "$source_digest" "$fixed_global_control_baseline_arg" "$runtime_validator_sha_expected" "$recipe_path" <<'PY'
 import hashlib
 import json
+import os
 import re
+import stat
 import sys
 from pathlib import Path
 
@@ -325,9 +470,35 @@ def unique(pairs):
     return result
 def canonical(value):
     return (json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False) + "\n").encode("ascii")
+def stable_bytes(path, maximum):
+    fd = os.open(path, os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        before = os.fstat(fd)
+        if not stat.S_ISREG(before.st_mode) or before.st_size > maximum:
+            fail()
+        chunks = []
+        size = 0
+        while True:
+            block = os.read(fd, min(65536, maximum + 1 - size))
+            if not block:
+                break
+            size += len(block)
+            if size > maximum:
+                fail()
+            chunks.append(block)
+        after = os.fstat(fd)
+        current = os.stat(path, follow_symlinks=False)
+        if ((before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns, before.st_ctime_ns)
+            != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns)
+            or size != before.st_size or not stat.S_ISREG(current.st_mode)
+            or (current.st_dev, current.st_ino) != (before.st_dev, before.st_ino)):
+            fail()
+        return b"".join(chunks)
+    finally:
+        os.close(fd)
 try:
-    raw = Path(manifest_path).read_bytes()
-    if len(raw) > 131072 or hashlib.sha256(raw).hexdigest() != manifest_sha:
+    raw = stable_bytes(manifest_path, 131072)
+    if hashlib.sha256(raw).hexdigest() != manifest_sha:
         fail()
     manifest = json.loads(raw.decode("utf-8"), object_pairs_hook=unique)
     row = [item for item in manifest["processes"] if item.get("pair") == pair and item.get("executor") == executor and item.get("allocator") == allocator]
@@ -371,9 +542,196 @@ except (OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError, KeyE
 PY
 }
 
+verify_functional_overlay() {
+  (( functional_only_mode == 1 )) || return 0
+  functional_overlay_file=$(realpath "$functional_overlay_arg") || return 1
+  local bindings_file
+  bindings_file=$(realpath "$runtime_bindings_arg") || return 1
+  [[ -f "$functional_overlay_file" && ! -L "$functional_overlay_arg" && "$functional_overlay_file" == "$output_root"/* ]] || { echo "functional overlay path escaped the private output root" >&2; return 1; }
+  [[ -f "$bindings_file" && ! -L "$runtime_bindings_arg" && "$bindings_file" == "$output_root"/* ]] || { echo "functional runtime bindings escaped the private output root" >&2; return 1; }
+  functional_overlay_sha256_before=$(sha256sum "$functional_overlay_file" | awk '{print $1}') || return 1
+  [[ "$functional_overlay_sha256_before" == "$functional_overlay_sha_expected" ]] || { echo "functional overlay SHA-256 differs from its pinned argument" >&2; return 1; }
+  python3 - "$functional_overlay_file" "$functional_overlay_sha_expected" "$bindings_file" "$runtime_bindings_sha_expected" "$pair_runner_sha256_before" "$source_digest" "$head_commit" "$run_id" "$pair_kind" "$allocator" "$baseline_allocator" "$workload" "$profile" "$mode" "$rate" "$arrivals" "$binary_digest" "$baseline_binary_digest" "$oracle_digest_actual" "$baseline_oracle_digest_actual" "$runtime_validator_sha_expected" "$source_inventory_module_sha256_before" <<'PY'
+import hashlib
+import json
+import os
+import re
+import stat
+import sys
+from pathlib import Path
+
+(overlay_path, overlay_sha, binding_path, binding_sha, runner_sha, source_sha, source_head,
+ run_id, pair_kind, allocator, baseline_allocator, workload, profile, mode, rate_text,
+ arrivals_text, binary_sha, baseline_binary_sha, oracle_sha, baseline_oracle_sha, validator_sha,
+ source_inventory_module_sha) = sys.argv[1:]
+
+def fail():
+    raise SystemExit(1)
+
+def unique(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            fail()
+        result[key] = value
+    return result
+
+def canonical(value):
+    return (json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False) + "\n").encode("ascii")
+
+def digest(value):
+    return type(value) is str and re.fullmatch(r"[a-f0-9]{64}", value) is not None
+
+def stable_bytes(path, maximum):
+    fd = os.open(path, os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        before = os.fstat(fd)
+        if not stat.S_ISREG(before.st_mode) or before.st_size > maximum:
+            fail()
+        chunks = []
+        size = 0
+        while True:
+            block = os.read(fd, min(65536, maximum + 1 - size))
+            if not block:
+                break
+            size += len(block)
+            if size > maximum:
+                fail()
+            chunks.append(block)
+        after = os.fstat(fd)
+        current = os.stat(path, follow_symlinks=False)
+        if ((before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns, before.st_ctime_ns)
+            != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns)
+            or size != before.st_size or not stat.S_ISREG(current.st_mode)
+            or (current.st_dev, current.st_ino) != (before.st_dev, before.st_ino)):
+            fail()
+        return b"".join(chunks)
+    finally:
+        os.close(fd)
+
+try:
+    overlay_raw = stable_bytes(overlay_path, 65536)
+    if hashlib.sha256(overlay_raw).hexdigest() != overlay_sha:
+        fail()
+    overlay = json.loads(overlay_raw.decode("utf-8"), object_pairs_hook=unique, parse_constant=lambda _value: fail())
+    expected_keys = {
+        "schema", "execution_scope", "run_id", "source_head", "source_tree_sha256", "source_manifest_sha256",
+        "source_inventory_module_sha256",
+        "pair_runner_sha256", "runtime_bindings_sha256", "runtime_validator_sha256",
+        "candidate_binary_sha256", "baseline_binary_sha256", "oracle_sha256", "baseline_oracle_sha256",
+        "workload", "profile", "mode", "rate_per_second", "arrivals", "pair_kind",
+        "resource_ceiling_sha256", "policy_sha256", "fixed_global_control_baseline",
+        "calibration_binary_sha256", "calibration_output_sha256", "processes", "functional_limits",
+    }
+    if type(overlay) is not dict or set(overlay) != expected_keys or overlay_raw != canonical(overlay):
+        fail()
+    expected_limits = {
+        "max_arrivals": 1000,
+        "max_rate_per_second": 1000,
+        "max_trace_deadline_seconds": 30,
+        "max_drain_deadline_seconds": 30,
+        "max_shutdown_deadline_seconds": 15,
+        "max_process_deadline_seconds": 300,
+    }
+    limits = overlay["functional_limits"]
+    if type(limits) is not dict or set(limits) != set(expected_limits) or any(type(limits[key]) is not int or limits[key] != value for key, value in expected_limits.items()):
+        fail()
+    if (overlay["schema"] != "allocatbelt.application-functional-pair-overlay.v2"
+        or overlay["execution_scope"] != "functional_only"
+        or overlay["run_id"] != run_id
+        or overlay["source_head"] != source_head
+        or overlay["source_tree_sha256"] != source_sha
+        or overlay["source_inventory_module_sha256"] != source_inventory_module_sha
+        or overlay["pair_runner_sha256"] != runner_sha
+        or overlay["runtime_bindings_sha256"] != binding_sha
+        or overlay["runtime_validator_sha256"] != validator_sha
+        or overlay["candidate_binary_sha256"] != binary_sha
+        or overlay["baseline_binary_sha256"] != (baseline_binary_sha or None)
+        or overlay["oracle_sha256"] != oracle_sha
+        or overlay["baseline_oracle_sha256"] != (baseline_oracle_sha or None)
+        or overlay["workload"] != workload or overlay["profile"] != profile
+        or overlay["mode"] != mode or type(overlay["rate_per_second"]) is not int
+        or overlay["rate_per_second"] != int(rate_text) or type(overlay["arrivals"]) is not int
+        or overlay["arrivals"] != int(arrivals_text) or overlay["pair_kind"] != pair_kind):
+        fail()
+    if not all(digest(overlay[name]) for name in (
+        "source_tree_sha256", "source_manifest_sha256", "source_inventory_module_sha256", "pair_runner_sha256", "runtime_bindings_sha256",
+        "runtime_validator_sha256", "candidate_binary_sha256", "oracle_sha256", "resource_ceiling_sha256",
+        "policy_sha256", "calibration_binary_sha256", "calibration_output_sha256",
+    )):
+        fail()
+    if baseline_binary_sha and not digest(overlay["baseline_binary_sha256"]):
+        fail()
+    if baseline_oracle_sha and not digest(overlay["baseline_oracle_sha256"]):
+        fail()
+    if type(overlay["fixed_global_control_baseline"]) is not int or overlay["fixed_global_control_baseline"] <= 0:
+        fail()
+
+    binding_raw = stable_bytes(binding_path, 131072)
+    if hashlib.sha256(binding_raw).hexdigest() != binding_sha:
+        fail()
+    manifest = json.loads(binding_raw.decode("utf-8"), object_pairs_hook=unique, parse_constant=lambda _value: fail())
+    if type(manifest) is not dict or manifest.get("schema") != "allocatbelt.application-runtime-process-bindings.v1" or manifest.get("run_id") != run_id:
+        fail()
+    if manifest.get("source_manifest_sha256") != overlay["source_manifest_sha256"] or manifest.get("source_sha256") != source_sha:
+        fail()
+    policy = manifest.get("fixed_runtime_policy")
+    calibration = manifest.get("resource_domain_calibration")
+    validator = manifest.get("runtime_readback_validator")
+    if type(policy) is not dict or policy.get("policy_sha256") != overlay["policy_sha256"]:
+        fail()
+    if type(calibration) is not dict or calibration.get("binary", {}).get("sha256") != overlay["calibration_binary_sha256"] or calibration.get("output", {}).get("sha256") != overlay["calibration_output_sha256"]:
+        fail()
+    if type(calibration.get("record")) is not dict or type(calibration["record"].get("fixed_global_control_baseline")) is not int or calibration["record"]["fixed_global_control_baseline"] != overlay["fixed_global_control_baseline"]:
+        fail()
+    if type(validator) is not dict or validator.get("sha256") != validator_sha:
+        fail()
+    bindings = manifest.get("processes")
+    expected_processes = overlay["processes"]
+    if type(bindings) is not list or len(bindings) != 2 or type(expected_processes) is not list or len(expected_processes) != 2:
+        fail()
+    expected_descriptors = []
+    for item in expected_processes:
+        if type(item) is not dict or set(item) != {"pair", "executor", "allocator"}:
+            fail()
+        expected_descriptors.append((item["pair"], item["executor"], item["allocator"]))
+    if len(set(expected_descriptors)) != 2:
+        fail()
+    actual_descriptors = []
+    for binding in bindings:
+        if type(binding) is not dict:
+            fail()
+        descriptor = (binding.get("pair"), binding.get("executor"), binding.get("allocator"))
+        actual_descriptors.append(descriptor)
+        if binding.get("policy_sha256") != overlay["policy_sha256"] or binding.get("resource_ceiling_sha256") != overlay["resource_ceiling_sha256"]:
+            fail()
+        if type(binding.get("fixed_global_control_baseline")) is not int or binding["fixed_global_control_baseline"] != overlay["fixed_global_control_baseline"]:
+            fail()
+        recipe = binding.get("recipe")
+        if type(recipe) is not dict or type(recipe.get("identity")) is not dict or recipe["identity"].get("source_sha256") != source_sha:
+            fail()
+        expected_binary = binary_sha if descriptor[2] == allocator else baseline_binary_sha
+        if recipe["identity"].get("binary_sha256") != expected_binary:
+            fail()
+        if recipe.get("run") != {
+            "workload": workload, "profile": profile, "mode": mode,
+            "rate_per_second": int(rate_text), "arrivals": int(arrivals_text),
+        }:
+            fail()
+    if len(set(actual_descriptors)) != 2 or set(actual_descriptors) != set(expected_descriptors):
+        fail()
+    if pair_kind in ("matched", "aa-bounded") and any(item[2] != allocator for item in actual_descriptors):
+        fail()
+    if pair_kind == "allocator-match" and {item[2] for item in actual_descriptors} != {allocator, baseline_allocator}:
+        fail()
+except (OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError, KeyError):
+    fail()
+PY
+}
+
 source_digest=$(source_hash) || exit 2
 binary_digest=$(sha256sum "$binary" | awk '{print $1}') || exit 2
-if (( qualification_runtime_readback_supported == 1 )); then
+if (( runtime_readback_enabled == 1 )); then
   verify_runtime_inputs || exit 2
 fi
 head_commit=$(git -C "$repo_root" rev-parse HEAD) || exit 2
@@ -383,6 +741,9 @@ host=$(hostname -f 2>/dev/null || hostname)
 comparison_family=fixed_policy
 if [[ "$pair_kind" == pressure-matched || "$pair_kind" == pressure-allocator-match ]]; then
   comparison_family=external_pressure
+fi
+if (( functional_only_mode == 1 )); then
+  verify_functional_overlay || { echo "functional overlay manifest failed independent pin validation" >&2; exit 2; }
 fi
 
 {
@@ -394,6 +755,15 @@ printf 'baseline_allocator\t%s\n' "$baseline_allocator"
   printf 'profile\t%s\n' "$profile"
   printf 'pair_kind\t%s\n' "$pair_kind"
   printf 'comparison_family\t%s\n' "$comparison_family"
+  printf 'execution_scope\t%s\n' "$execution_scope"
+  if (( functional_only_mode == 1 )); then
+    printf 'functional_max_arrivals\t1000\n'
+    printf 'functional_max_average_rate_per_second\t1000\n'
+    printf 'functional_max_trace_deadline_seconds\t30\n'
+    printf 'functional_max_drain_deadline_seconds\t30\n'
+    printf 'functional_max_shutdown_deadline_seconds\t15\n'
+    printf 'functional_max_process_deadline_seconds\t300\n'
+  fi
   printf 'resource_scope_binding\t%s\n' 'local ResourceScope; no shared runtime ResourceDomain'
   printf 'policy_qualification_stage\t%s\n' 'profile harness; no global or tenant ResourceDomain binding'
   printf 'mode\t%s\n' "$mode"
@@ -422,6 +792,8 @@ printf 'baseline_allocator\t%s\n' "$baseline_allocator"
   printf 'cpu_set\t%s\n' "$cpu_set"
   printf 'source_head\t%s\n' "$head_commit"
   printf 'source_tree_sha256\t%s\n' "$source_digest"
+  printf 'source_inventory_schema\t%s\n' "$source_inventory_schema"
+  printf 'source_inventory_module_sha256\t%s\n' "$source_inventory_module_sha256_before"
 printf 'binary_path\t%s\n' "$binary"
 printf 'binary_sha256\t%s\n' "$binary_digest"
   printf 'runtime_bindings_sha256_before\t%s\n' "$runtime_bindings_sha_expected"
@@ -930,24 +1302,24 @@ if [[ "$mode" == open_loop ]]; then
     --trace-deadline-seconds "$trace_deadline" \
     > "$cell_dir/oracle-generator.stdout.txt" 2> "$cell_dir/oracle-generator.stderr.txt"; then
     echo "canonical oracle generation failed before timing" >&2
-    printf 'pair_status\tfailed_or_invalid\n' > "$cell_dir/pair.failed"
+    printf 'pair_status\tfailed_or_invalid\nexecution_scope\t%s\n' "$execution_scope" > "$cell_dir/pair.failed"
     exit 1
   fi
   generated_oracle_digest=$(sha256sum "$generated_oracle" | awk '{print $1}') || exit 2
   if [[ "$generated_oracle_digest" != "$oracle_digest_expected" ]] || ! cmp -s "$oracle_file" "$generated_oracle"; then
     echo "manifest oracle differs from the pinned source and binary kernels" >&2
-    printf 'pair_status\tfailed_or_invalid\n' > "$cell_dir/pair.failed"
+    printf 'pair_status\tfailed_or_invalid\nexecution_scope\t%s\n' "$execution_scope" > "$cell_dir/pair.failed"
     exit 1
   fi
 fi
 if [[ "$mode" == open_loop ]] && ! validate_oracle_file "$oracle_file" "$arrivals" "$rate" "$workload" "$profile" "$source_digest" "$binary_digest"; then
   echo "oracle content does not match the frozen workload, rate, or arrival manifest" >&2
-  printf 'pair_status\tfailed_or_invalid\n' > "$cell_dir/pair.failed"
+  printf 'pair_status\tfailed_or_invalid\nexecution_scope\t%s\n' "$execution_scope" > "$cell_dir/pair.failed"
   exit 1
 fi
 if [[ "$mode" == open_loop && ( "$pair_kind" == allocator-match || "$pair_kind" == pressure-allocator-match ) ]] && ! validate_oracle_file "$baseline_oracle_file" "$arrivals" "$rate" "$workload" "$profile" "$source_digest" "$baseline_binary_digest"; then
   echo "baseline oracle content does not match its frozen binary and workload" >&2
-  printf 'pair_status\tfailed_or_invalid\n' > "$cell_dir/pair.failed"
+  printf 'pair_status\tfailed_or_invalid\nexecution_scope\t%s\n' "$execution_scope" > "$cell_dir/pair.failed"
   exit 1
 fi
 
@@ -982,7 +1354,7 @@ run_one() {
   local -a args=(--executor "$executor" --workload "$workload" --profile "$profile" --mode "$mode" --trace-deadline-seconds "$trace_deadline" --drain-deadline-seconds "$drain_deadline" --shutdown-deadline-seconds "$shutdown_deadline" --process-deadline-seconds "$process_deadline")
   local report_nonce recipe_path="$cell_dir/${pair}-${executor}.recipe.json" binding_values_path="$cell_dir/${pair}-${executor}.binding-values"
   local -a runtime_binding_values=()
-  if (( qualification_runtime_readback_supported == 1 )); then
+  if (( runtime_readback_enabled == 1 )); then
     runtime_binding_for_process "$pair" "$executor" "$process_allocator" "$process_binary_sha" "$recipe_path" > "$binding_values_path" || { failed=1; return 1; }
     mapfile -d '' -t runtime_binding_values < "$binding_values_path"
     (( ${#runtime_binding_values[@]} == 10 )) || { failed=1; return 1; }
@@ -1062,6 +1434,9 @@ run_one() {
     failed=1
     p99_qualification=invalid
   fi
+  if (( functional_only_mode == 1 )); then
+    p99_qualification=functional_only
+  fi
   local shutdown_sha256=not_applicable
   if [[ -f "$shutdown_report" ]]; then
     shutdown_sha256=$(sha256sum "$shutdown_report" | awk '{print $1}') || { failed=1; validation=invalid; shutdown_sha256=invalid; }
@@ -1080,6 +1455,7 @@ run_one() {
   printf 'policy_sha256_%s_%s\t%s\n' "$pair" "$executor" "$policy_sha256" >> "$cell_dir/metadata.tsv"
   printf 'resource_ceiling_sha256_%s_%s\t%s\n' "$pair" "$executor" "$resource_ceiling_sha256" >> "$cell_dir/metadata.tsv"
   printf 'fixed_global_control_baseline_%s_%s\t%s\n' "$pair" "$executor" "$fixed_global_control_baseline" >> "$cell_dir/metadata.tsv"
+  printf 'execution_scope_%s_%s\t%s\n' "$pair" "$executor" "$execution_scope" >> "$cell_dir/metadata.tsv"
   printf 'oracle_sha256_%s_%s\t%s\n' "$pair" "$executor" "$process_oracle_digest" >> "$cell_dir/metadata.tsv"
   printf 'shutdown_report_%s_%s\t%s\n' "$pair" "$executor" "$(basename "$shutdown_report")" >> "$cell_dir/metadata.tsv"
   if [[ -f "$ids_report" ]]; then
@@ -1119,6 +1495,11 @@ case "$pair_kind" in
 esac
 
 source_digest_after=$(source_hash) || { failed=1; source_digest_after=unavailable; }
+source_inventory_module_sha256_after=$(sha256sum "$source_inventory_module_path" | awk '{print $1}') || {
+  failed=1
+  source_inventory_module_sha256_after=unavailable
+}
+[[ "$source_inventory_module_sha256_after" == "$source_inventory_module_sha256_before" && "$source_inventory_module_sha256_after" == "$source_inventory_module_sha256_expected" ]] || failed=1
 binary_digest_after=$(sha256sum "$binary" | awk '{print $1}') || {
   failed=1
   binary_digest_after=unavailable
@@ -1152,7 +1533,13 @@ else
 fi
 runtime_bindings_sha_after=
 runtime_validator_sha_after=
-if (( qualification_runtime_readback_supported == 1 )); then
+pair_runner_sha256_after=$(sha256sum "$pair_runner_path" | awk '{print $1}') || { failed=1; pair_runner_sha256_after=unavailable; }
+[[ "$pair_runner_sha256_after" == "$pair_runner_sha256_before" ]] || failed=1
+if (( functional_only_mode == 1 )); then
+  functional_overlay_sha256_after=$(sha256sum "$functional_overlay_file" | awk '{print $1}') || { failed=1; functional_overlay_sha256_after=unavailable; }
+  [[ "$functional_overlay_sha256_after" == "$functional_overlay_sha_expected" && "$functional_overlay_sha256_after" == "$functional_overlay_sha256_before" ]] || failed=1
+fi
+if (( runtime_readback_enabled == 1 )); then
   runtime_bindings_sha_after=$(sha256sum "$runtime_bindings_arg" | awk '{print $1}') || { failed=1; runtime_bindings_sha_after=unavailable; }
   runtime_validator_sha_after=$(sha256sum "$runtime_validator_arg" | awk '{print $1}') || { failed=1; runtime_validator_sha_after=unavailable; }
   [[ "$runtime_bindings_sha_after" == "$runtime_bindings_sha_expected" && "$runtime_validator_sha_after" == "$runtime_validator_sha_expected" ]] || failed=1
@@ -1161,6 +1548,8 @@ fi
 {
   printf 'source_tree_sha256_before\t%s\n' "$source_digest"
   printf 'source_tree_sha256_after\t%s\n' "$source_digest_after"
+  printf 'source_inventory_module_sha256_before\t%s\n' "$source_inventory_module_sha256_before"
+  printf 'source_inventory_module_sha256_after\t%s\n' "$source_inventory_module_sha256_after"
   printf 'binary_sha256_before\t%s\n' "$binary_digest"
   printf 'binary_sha256_after\t%s\n' "$binary_digest_after"
   printf 'baseline_binary_sha256_before\t%s\n' "$baseline_binary_digest"
@@ -1171,15 +1560,25 @@ fi
   printf 'baseline_oracle_sha256_after\t%s\n' "$baseline_oracle_digest_after"
   printf 'runtime_bindings_sha256_after\t%s\n' "$runtime_bindings_sha_after"
   printf 'runtime_validator_sha256_after\t%s\n' "$runtime_validator_sha_after"
+  printf 'execution_scope_after\t%s\n' "$execution_scope"
+  printf 'pair_runner_sha256_before\t%s\n' "$pair_runner_sha256_before"
+  printf 'pair_runner_sha256_after\t%s\n' "$pair_runner_sha256_after"
+  printf 'functional_overlay_sha256_before\t%s\n' "$functional_overlay_sha256_before"
+  printf 'functional_overlay_sha256_after\t%s\n' "$functional_overlay_sha256_after"
 } >> "$cell_dir/metadata.tsv"
 [[ $(awk -F '\t' '$1=="source_tree_sha256_before"{b=$2} $1=="source_tree_sha256_after"{a=$2} END{print (b==a)?"same":"changed"}' "$cell_dir/metadata.tsv") == same ]] || failed=1
+[[ "$source_inventory_module_sha256_before" == "$source_inventory_module_sha256_after" ]] || failed=1
 [[ "$binary_digest" == "$binary_digest_after" ]] || failed=1
 if [[ "$mode" == open_loop ]]; then
   [[ "$oracle_digest_expected" == "$oracle_digest_actual" && "$oracle_digest_actual" == "$oracle_digest_after" ]] || failed=1
 fi
 if [[ $failed -eq 0 ]]; then
-  printf 'pair_status\tvalidated\n' > "$cell_dir/pair.complete"
+  if (( functional_only_mode == 1 )); then
+    printf 'pair_status\tfunctional_only\nexecution_scope\tfunctional_only\n' > "$cell_dir/pair.complete"
+  else
+    printf 'pair_status\tvalidated\nexecution_scope\tqualification\n' > "$cell_dir/pair.complete"
+  fi
   exit 0
 fi
-printf 'pair_status\tfailed_or_invalid\n' > "$cell_dir/pair.failed"
+printf 'pair_status\tfailed_or_invalid\nexecution_scope\t%s\n' "$execution_scope" > "$cell_dir/pair.failed"
 exit 1
