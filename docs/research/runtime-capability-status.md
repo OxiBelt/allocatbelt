@@ -135,6 +135,33 @@ Its earlier test counts and measurements are not the current release inventory.
 Update this ledger when public operations or acceptance fixtures change; publish
 only sanitized, source-specific qualification conclusions.
 
+### Signed runtime correctness qualification
+
+Signed source `9290a2b194a667aba8816020214230d111ab80a3` passed the full
+all-feature release workspace command with 1,691 passing executions and four
+documented skips, plus all-target/all-feature Clippy. These are execution
+counts, including repeated same-source checks, rather than unique test counts.
+The published runtime source also passed all 20 feature combinations and the
+packaging checks. Same-source runtime Loom checks passed 60 protocol tests and
+19 model tests; the latter include the four resource-domain models.
+
+Source-pinned checks passed all 18 compile-time platform gates, scalar ISA,
+experimental AArch64 ISA, stable RVV and rseq verification. The rebuilt
+full-system RISC-V payload passed vector-disabled and vector-enabled boots
+after full guest-asset integrity validation. Emulated outcomes establish
+correctness only.
+
+The full hardened sandbox passed after supplying static process-test fixtures:
+the runtime library recorded 1,080 passes and one existing benchmark skip,
+followed by all six seccomp/fallback scenarios and visible-ISA verification.
+The sandbox source bridge changed only its script, regression tests, CI
+prerequisites and documentation; runtime and Cargo sources were unchanged.
+The original missing-tool failures remain recorded. See the
+[sandbox contract](../sandbox.md) for fixture and isolation requirements.
+
+These results qualify the stated source and checks. Native performance gates,
+real-pressure acceptance and three-hour mixed-load soaks remain open.
+
 ### FIFO application acceptance scope
 
 Five focused [FIFO application cases](../../crates/allocatbelt-app-ports/tests/fifo_pipeline.rs)
