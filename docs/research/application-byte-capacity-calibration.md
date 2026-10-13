@@ -7,7 +7,10 @@ result says nothing about device bandwidth, network-interface capacity,
 allocator speed, or performance qualification.
 
 The request pins a canonical feedback expectation and source manifest by raw
-SHA-256. The expectation's `host_binding` must name the same source-manifest
+SHA-256. Expectation v2 additionally pins construction-only policy output. The
+producer captures the source-pinned feedback reader bytes and reuses its typed
+expectation and probe projection checks; a changed probe hash or numeric value
+is rejected. Archived expectation v1 remains supported. The expectation's `host_binding` must name the same source-manifest
 path and raw digest. The helper accepts only the currently supported
 `allocatbelt.application-source-manifest.v4` contract. It captures the
 `scripts/application-campaign.py` bytes, checks them against the regular-file

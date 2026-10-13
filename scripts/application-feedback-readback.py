@@ -1,0 +1,2038 @@
+#!/usr/bin/env python3
+"""Independently validate bounded application feedback traces.
+
+The reader accepts caller-pinned expectations and raw digests, streams both
+large trace artifacts, and reconstructs the feedback policy from sensor,
+decision, ticket, write, readback, acknowledgement, and reconciliation events.
+It does not trust a producer pass label. A valid trace is one component of a
+later qualification; it never establishes allocator performance.
+"""
+from __future__ import annotations
+
+import argparse
+from array import array
+from bisect import bisect_right
+import hashlib
+import json
+import os
+import re
+import stat
+import sys
+from pathlib import Path, PurePosixPath
+from typing import Any, BinaryIO, Callable, Iterator
+
+
+EXPECTATION_SCHEMA_V1 = "allocatbelt.application-feedback-expectation.v1"
+EXPECTATION_SCHEMA_V2 = "allocatbelt.application-feedback-expectation.v2"
+EXPECTATION_SCHEMA = EXPECTATION_SCHEMA_V2
+CONSTRUCTION_PROBE_SCHEMA = "allocatbelt.application-feedback-policy-probe.v1"
+TRACE_MANIFEST_SCHEMA = "allocatbelt.application-feedback-trace-manifest.v1"
+EVENT_SCHEMA = "allocatbelt.application-feedback-event.v1"
+SAMPLE_SCHEMA = "allocatbelt.application-feedback-resource-sample.v1"
+READBACK_SCHEMA = "allocatbelt.application-feedback-validation.v1"
+SOURCE_MANIFEST_SCHEMA = "allocatbelt.application-source-manifest.v4"
+PRESSURE_READBACK_SCHEMA = "allocatbelt.application-pressure-readback.v1"
+RUNTIME_BINDING_SCHEMA_V1 = "allocatbelt.application-runtime-binding.v1"
+RUNTIME_BINDING_SCHEMA_V2 = "allocatbelt.application-runtime-binding.v2"
+
+MAX_EXPECTATION_BYTES = 2 * 1024 * 1024
+MAX_SOURCE_MANIFEST_BYTES = 8 * 1024 * 1024
+MAX_PRESSURE_PROOF_BYTES = 256 * 1024
+MAX_RUNTIME_BINDING_BYTES = 4 * 1024 * 1024
+MAX_CONSTRUCTION_PROBE_BYTES = 512 * 1024
+MAX_MANIFEST_BYTES = 64 * 1024
+MAX_EVENT_FILE_BYTES = 1024 * 1024 * 1024
+MAX_SAMPLE_FILE_BYTES = 1024 * 1024 * 1024
+MAX_EVENT_LINE_BYTES = 2048
+MAX_SAMPLE_LINE_BYTES = 8192
+MAX_EVENT_RECORDS = 478_915
+MAX_SAMPLE_ROWS = 114_002
+MAX_TRACE_HORIZON_NS = 11_400_000_000_000
+U64_MAX = (1 << 64) - 1
+NSEC = 1_000_000_000
+
+DOMAIN = ("cpu", "memory", "disk", "network", "tasks", "control")
+RESOURCES = ("cpu", "disk", "download")
+RATE_DIRECTIONS = ("disk", "upload", "download")
+CONSTRUCTION_PROBE_SOURCE_REFERENCES = {
+    "application_entrypoint": "bench/src/application.rs",
+    "application_http": "bench/src/application/http.rs",
+    "application_runtime_bindings": "bench/src/application/runtime_bindings.rs",
+    "construction_policy_probe": "bench/src/application/feedback_policy_probe.rs",
+    "disk_port_config": "crates/allocatbelt-app-ports/src/disk.rs",
+    "feedback_trace_collector": "bench/src/application/feedback_trace.rs",
+    "filesystem_rate_control": "crates/allocatbelt/src/runtime/fs_rate.rs",
+    "http_port_config": "crates/allocatbelt-app-ports/src/http.rs",
+    "memory_port_config": "crates/allocatbelt-app-ports/src/memory.rs",
+    "rate_limited_io": "crates/allocatbelt/src/runtime/rate_io.rs",
+    "resource_domain": "crates/allocatbelt/src/runtime/resource_domain.rs",
+    "resource_feedback_policy": "crates/allocatbelt/src/runtime/resource_feedback_policy.rs",
+}
+CONSTRUCTION_PROBE_METER_SOURCE_MODEL = {
+    "disk_registration_owner": "one shared FsRateControl owner; clones retain its single registration",
+    "disk_source_path": "crates/allocatbelt/src/runtime/fs_rate.rs",
+    "http_client_window_source": "bench/src/application.rs::WINDOW",
+    "http_handler_window_source": "bench/src/application/http.rs::{CLIENT_TASKS,HANDLER_TASKS}",
+    "http_registration_owner": "each client and accepted handler RateLimitedIo registers one read and one write meter source",
+    "http_registration_source": "crates/allocatbelt/src/runtime/rate_io.rs::FeedbackMeters::new",
+    "http_source_path": "bench/src/application/http.rs",
+    "stream_registration_owner": "one registration for each endpoint direction while the adapter lives",
+    "disk_registration_source": "crates/allocatbelt/src/runtime/fs_rate.rs::FsRateControl::new",
+}
+REQUIRED_PHASES = (
+    "production_start", "production_end", "drain_end", "rss_before",
+    "rss_after_drain", "shutdown_end", "rss_after_shutdown", "owner_release",
+)
+
+SAMPLE_HEADER = (
+    "sample_sequence", "window_lower_ns", "window_upper_ns", "rss_kib", "hwm_kib",
+    "collector_task_lease_count",
+    *(f"global_{part}_{resource}" for resource in DOMAIN for part in ("ceiling", "limit", "used")),
+    *(f"tenant_{part}_{resource}" for resource in DOMAIN for part in ("ceiling", "limit", "used")),
+    "scope_managed_memory_limit", "scope_disk_operation_limit", "scope_network_operation_limit",
+    "scope_managed_memory_used", "scope_disk_operations_used", "scope_network_operations_used",
+    *(f"{direction}_rate_{field}" for direction in RATE_DIRECTIONS for field in (
+        "bytes_per_second", "burst_bytes", "ceiling_bytes_per_second",
+        "ceiling_burst_bytes", "max_reservations", "available_bytes",
+        "reserved_bytes", "reservations",
+    )),
+    *(f"{direction}_meter_{field}" for direction in RATE_DIRECTIONS for field in (
+        "measured_lower_ns", "measured_upper_ns", "committed_bytes", "completions",
+        "attached_sources", "generation", "counter_overflow", "invalid_io",
+        "source_count_overflow", "generation_overflow",
+    )),
+    "feedback_sample_count", "feedback_stop_requested", "feedback_shutdown_complete",
+    "feedback_worker_failure",
+    *(f"{resource}_{field}" for resource in RESOURCES for field in (
+        "current_limit", "utilization_basis_points", "telemetry", "policy_faulted",
+        "pending_generation", "no_change",
+    )),
+)
+
+
+class ValidationError(ValueError):
+    """A pinned expectation or trace artifact fails validation."""
+
+
+def require(condition: bool, message: str) -> None:
+    if not condition:
+        raise ValidationError(message)
+
+
+def canonical_bytes(value: object) -> bytes:
+    try:
+        text = json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False)
+    except (TypeError, ValueError) as error:
+        raise ValidationError(f"value is not canonical JSON: {error}") from error
+    return (text + "\n").encode("ascii")
+
+
+def sha256_bytes(raw: bytes) -> str:
+    return hashlib.sha256(raw).hexdigest()
+
+
+def digest_object(value: object) -> str:
+    return sha256_bytes(canonical_bytes(value))
+
+
+def _unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        require(key not in result, f"duplicate JSON object key: {key}")
+        result[key] = value
+    return result
+
+
+def _reject_constant(value: str) -> None:
+    raise ValidationError(f"non-finite JSON value is forbidden: {value}")
+
+
+def parse_json(raw: bytes, label: str, maximum: int) -> dict[str, Any]:
+    require(len(raw) <= maximum, f"{label} exceeds its byte bound")
+    try:
+        value = json.loads(raw.decode("utf-8"), object_pairs_hook=_unique_object, parse_constant=_reject_constant)
+    except (UnicodeError, json.JSONDecodeError, RecursionError) as error:
+        raise ValidationError(f"{label} is not bounded UTF-8 JSON: {error}") from error
+    require(type(value) is dict, f"{label} must be one JSON object")
+    return value
+
+
+def exact(value: object, keys: set[str], label: str) -> dict[str, Any]:
+    require(type(value) is dict and set(value) == keys, f"{label} has an unexpected key set")
+    return value
+
+
+def uint(value: object, label: str, *, positive: bool = False, maximum: int = U64_MAX) -> int:
+    require(type(value) is int and 0 <= value <= maximum, f"{label} must be an unsigned integer")
+    require(not positive or value > 0, f"{label} must be positive")
+    return value
+
+
+def text(value: object, label: str, maximum: int = 512) -> str:
+    require(type(value) is str and 0 < len(value) <= maximum, f"{label} must be a bounded string")
+    require(not any(ord(char) < 32 or ord(char) == 127 for char in value), f"{label} contains a control character")
+    return value
+
+
+def digest(value: object, label: str) -> str:
+    result = text(value, label, 64)
+    require(re.fullmatch(r"[0-9a-f]{64}", result) is not None, f"{label} must be lowercase SHA-256")
+    return result
+
+
+def absolute_path(value: object, label: str) -> Path:
+    raw = text(value, label, 4096)
+    path = Path(raw)
+    require(path.is_absolute() and str(path) == raw and ".." not in PurePosixPath(raw).parts, f"{label} must be a normalized absolute path")
+    return path
+
+
+def _stat_key(info: os.stat_result) -> tuple[int, int, int, int, int, int]:
+    return (info.st_dev, info.st_ino, info.st_mode, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+
+
+def read_stable(path: Path, label: str, maximum: int) -> tuple[bytes, str]:
+    try:
+        require(path.resolve(strict=True) == path, f"{label} traverses a symlink or alias")
+        before_path = path.lstat()
+        require(stat.S_ISREG(before_path.st_mode), f"{label} must be a regular nonsymlink file")
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
+    except OSError as error:
+        raise ValidationError(f"cannot safely open {label}: {error}") from error
+    try:
+        before = os.fstat(fd)
+        require(stat.S_ISREG(before.st_mode) and _stat_key(before) == _stat_key(before_path), f"{label} changed while opening")
+        require(0 <= before.st_size <= maximum, f"{label} exceeds its hard byte cap")
+        raw = bytearray()
+        while len(raw) < before.st_size:
+            block = os.read(fd, min(1024 * 1024, before.st_size - len(raw)))
+            require(block, f"{label} was truncated during readback")
+            raw.extend(block)
+        after_fd, after_path = os.fstat(fd), path.lstat()
+        require(_stat_key(before) == _stat_key(after_fd) == _stat_key(after_path), f"{label} changed during readback")
+        return bytes(raw), sha256_bytes(raw)
+    finally:
+        os.close(fd)
+
+
+def read_canonical(path: Path, label: str, maximum: int, expected_sha: str | None = None) -> tuple[dict[str, Any], str]:
+    raw, raw_sha = read_stable(path, label, maximum)
+    value = parse_json(raw, label, maximum)
+    require(raw == canonical_bytes(value), f"{label} is not canonical JSON")
+    if expected_sha is not None:
+        require(raw_sha == expected_sha, f"{label} raw SHA-256 differs from caller pin")
+    return value, raw_sha
+
+
+def _open_trace_directory(path: Path) -> int:
+    try:
+        require(path.resolve(strict=True) == path, "trace directory traverses a symlink or alias")
+        before = path.lstat()
+        require(stat.S_ISDIR(before.st_mode), "trace root must be a real directory")
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0))
+    except OSError as error:
+        raise ValidationError(f"cannot safely open trace directory: {error}") from error
+    after = os.fstat(fd)
+    require(stat.S_ISDIR(after.st_mode) and _stat_key(before)[:3] == _stat_key(after)[:3], "trace directory changed while opening")
+    return fd
+
+
+TRACE_FILES = frozenset({
+    "feedback-trace-manifest.tsv", "feedback-events.jsonl", "resource-samples.tsv",
+})
+
+
+def _validate_trace_directory_layout(directory_fd: int) -> None:
+    """Bound directory inspection and require exactly three regular files."""
+    names: set[str] = set()
+    try:
+        with os.scandir(directory_fd) as entries:
+            for entry in entries:
+                require(len(names) < len(TRACE_FILES), "feedback trace directory has more than three entries")
+                require(entry.name in TRACE_FILES, "feedback trace directory has an unexpected entry")
+                try:
+                    info = entry.stat(follow_symlinks=False)
+                except OSError as error:
+                    raise ValidationError(f"cannot inspect feedback trace entry {entry.name}: {error}") from error
+                require(stat.S_ISREG(info.st_mode), f"feedback trace entry {entry.name} must be a regular nonsymlink file")
+                names.add(entry.name)
+    except OSError as error:
+        raise ValidationError(f"cannot enumerate feedback trace directory: {error}") from error
+    require(names == TRACE_FILES, "feedback trace directory has missing or unexpected files")
+
+
+class BoundedLines:
+    """One anchored regular file read, hashed while bounded lines are consumed."""
+
+    def __init__(self, directory_fd: int, name: str, label: str, maximum_bytes: int, maximum_line: int):
+        require(name in {"feedback-trace-manifest.tsv", "feedback-events.jsonl", "resource-samples.tsv"}, f"invalid anchored trace filename for {label}")
+        self.name, self.label, self.maximum_line = name, label, maximum_line
+        try:
+            self.fd = os.open(name, os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0), dir_fd=directory_fd)
+        except OSError as error:
+            raise ValidationError(f"cannot safely open {label}: {error}") from error
+        self.before = os.fstat(self.fd)
+        require(stat.S_ISREG(self.before.st_mode) and 0 <= self.before.st_size <= maximum_bytes, f"{label} is not a bounded regular file")
+        self.maximum_bytes = maximum_bytes
+        self.hash = hashlib.sha256()
+        self.bytes_read = 0
+        self.lines = 0
+
+    def __enter__(self) -> "BoundedLines":
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        os.close(self.fd)
+
+    def __iter__(self) -> Iterator[bytes]:
+        with os.fdopen(os.dup(self.fd), "rb", buffering=0) as stream:
+            while True:
+                line = stream.readline(self.maximum_line + 1)
+                if not line:
+                    break
+                require(len(line) <= self.maximum_line, f"{self.label} contains an oversized line")
+                require(line.endswith(b"\n"), f"{self.label} has a partial final record")
+                require(b"\r" not in line and b"\x00" not in line, f"{self.label} has invalid framing")
+                self.bytes_read += len(line)
+                require(self.bytes_read <= self.maximum_bytes, f"{self.label} exceeded its byte bound while reading")
+                self.lines += 1
+                self.hash.update(line)
+                yield line[:-1]
+
+    def finish(self, directory_fd: int) -> str:
+        after_fd = os.fstat(self.fd)
+        after_path = os.stat(self.name, dir_fd=directory_fd, follow_symlinks=False)
+        require(_stat_key(self.before) == _stat_key(after_fd) == _stat_key(after_path), f"{self.label} changed during streaming read")
+        require(self.bytes_read == self.before.st_size, f"{self.label} size differs from bytes consumed")
+        return self.hash.hexdigest()
+
+
+def build_pressure_expectation_recipe(spec: object) -> tuple[bytes, str]:
+    """Return canonical expectation bytes and raw SHA-256 for a frozen spec."""
+    require(type(spec) is dict and "recipe_sha256" not in spec, "expectation spec must omit recipe_sha256")
+    _validate_expectation_body(spec)
+    raw_body = canonical_bytes(spec)
+    value = dict(spec)
+    value["recipe_sha256"] = sha256_bytes(raw_body)
+    raw = canonical_bytes(value)
+    return raw, sha256_bytes(raw)
+
+
+def _validate_expectation_body(value: object) -> dict[str, Any]:
+    require(type(value) is dict, "feedback expectation must be one JSON object")
+    schema = value.get("schema")
+    require(
+        schema == EXPECTATION_SCHEMA_V1 or schema == EXPECTATION_SCHEMA_V2,
+        "unsupported feedback expectation schema",
+    )
+    expectation_v2 = schema == EXPECTATION_SCHEMA_V2
+    recipe_keys = {
+        "schema", "mode", "identity", "policy", "app_capacity_artifact_sha256",
+        "host_binding", "external_pressure_proof", "final_runtime_binding",
+        "minimum_production_seconds", "minimum_pressure_overlap_seconds",
+    }
+    if expectation_v2:
+        recipe_keys.add("construction_probe")
+    recipe = exact(value, recipe_keys, "feedback expectation")
+    require(recipe["mode"] in ("capacity_calibration", "pressure_validation"), "unsupported expectation mode")
+    identity = exact(recipe["identity"], {
+        "host_id", "run_id", "report_nonce", "process_id", "allocator", "executor",
+        "workload", "profile", "mode", "source_sha256", "binary_sha256",
+        "pressure_qualification",
+    }, "feedback identity")
+    for key in ("host_id", "run_id", "allocator", "executor", "workload", "profile", "mode"):
+        require(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", text(identity[key], f"identity.{key}")) is not None, f"identity.{key} is not a canonical token")
+    require(re.fullmatch(r"[0-9a-f]{32}", text(identity["report_nonce"], "identity.report_nonce", 32)) is not None, "identity.report_nonce must be 32 lowercase hexadecimal characters")
+    uint(identity["process_id"], "identity.process_id", positive=True, maximum=(1 << 31) - 1)
+    digest(identity["source_sha256"], "identity.source_sha256")
+    digest(identity["binary_sha256"], "identity.binary_sha256")
+    require(type(identity["pressure_qualification"]) is bool, "identity.pressure_qualification must be boolean")
+    if expectation_v2:
+        _validate_v2_workload_profile(identity["workload"], identity["profile"])
+        construction_probe = exact(recipe["construction_probe"], {
+            "path", "raw_sha256", "allocator", "binary_sha256",
+        }, "construction policy probe pin")
+        absolute_path(construction_probe["path"], "construction policy probe path")
+        require(
+            re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", text(construction_probe["allocator"], "construction probe allocator")) is not None,
+            "construction probe allocator is not a canonical token",
+        )
+        digest(construction_probe["raw_sha256"], "construction policy probe raw SHA-256")
+        digest(construction_probe["binary_sha256"], "construction probe binary SHA-256")
+        require(construction_probe["allocator"] == identity["allocator"], "construction probe allocator differs from feedback identity")
+        require(construction_probe["binary_sha256"] == identity["binary_sha256"], "construction probe binary differs from feedback identity")
+
+    policy_keys = {
+        "version", "sample_interval_ns", "max_dense_gap_ns", "telemetry_freshness_ns",
+        "required_breach_samples", "actuation_cooldown_ns", "minimum_dense_observations",
+        "controls", "capacity_sources", "global_ceilings", "tenant_ceilings", "scope_limits",
+        "rate_buckets", "collector",
+    }
+    policy_keys.add("meter_source_bounds" if expectation_v2 else "meter_sources")
+    policy = exact(recipe["policy"], policy_keys, "feedback policy expectation")
+    require(policy["version"] == "runtime-feedback-policy-v1", "unsupported feedback policy version")
+    for key, expected in (("sample_interval_ns", 100_000_000), ("max_dense_gap_ns", 200_000_000),
+                          ("telemetry_freshness_ns", 500_000_000), ("required_breach_samples", 3),
+                          ("actuation_cooldown_ns", NSEC), ("minimum_dense_observations", 1)):
+        require(uint(policy[key], f"policy.{key}", positive=True) == expected, f"policy.{key} differs from the fixed runtime contract")
+    controls = exact(policy["controls"], set(RESOURCES), "control set")
+    for resource in RESOURCES:
+        control = exact(controls[resource], {"floor", "initial", "ceiling", "low_bps", "high_bps"}, f"{resource} control")
+        floor = uint(control["floor"], f"{resource}.floor", positive=True)
+        initial = uint(control["initial"], f"{resource}.initial", positive=True, maximum=(1 << 32) - 1 if resource == "cpu" else U64_MAX)
+        ceiling = uint(control["ceiling"], f"{resource}.ceiling", positive=True, maximum=(1 << 32) - 1 if resource == "cpu" else U64_MAX)
+        low = uint(control["low_bps"], f"{resource}.low_bps", maximum=10_000)
+        high = uint(control["high_bps"], f"{resource}.high_bps", positive=True, maximum=10_000)
+        require(floor <= initial <= ceiling and low < high, f"{resource} control bounds or hysteresis are invalid")
+    capacity_sources = exact(policy["capacity_sources"], {"disk", "download"}, "application byte-capacity sources")
+    for direction, available in capacity_sources.items():
+        require(type(available) is bool, f"{direction} capacity-source availability must be boolean")
+    global_ceilings = _uint_map(policy["global_ceilings"], set(DOMAIN), "global ceilings")
+    tenant_ceilings = _uint_map(policy["tenant_ceilings"], set(DOMAIN), "tenant ceilings")
+    if not expectation_v2:
+        for owner, ceilings in (("global", global_ceilings), ("tenant", tenant_ceilings)):
+            require(all(value > 0 for value in ceilings.values()), f"{owner} domain ceilings must be positive")
+    scope_limits = _uint_map(
+        policy["scope_limits"], {"managed_memory", "disk_operations", "network_operations"},
+        "scope limits", positive=not expectation_v2,
+    )
+    buckets = exact(policy["rate_buckets"], set(RATE_DIRECTIONS), "rate bucket set")
+    for direction, item in buckets.items():
+        item = exact(item, {"ceiling_bytes_per_second", "ceiling_burst_bytes", "max_reservations"}, f"{direction} bucket")
+        for name in item:
+            uint(item[name], f"{direction}.{name}", positive=True)
+    if expectation_v2:
+        _validate_meter_source_bounds(policy["meter_source_bounds"], identity["workload"])
+    else:
+        meter_sources = exact(policy["meter_sources"], set(RATE_DIRECTIONS), "legacy meter source counts")
+        for direction, value in meter_sources.items():
+            uint(value, f"{direction} attached meter sources")
+    collector = exact(policy["collector"], {
+        "task_lease_count", "control_charge_bytes", "expected_global_control_baseline",
+    }, "collector accounting")
+    require(uint(collector["task_lease_count"], "collector task lease", positive=True) == 1, "unsupported collector task lease")
+    uint(collector["control_charge_bytes"], "collector Control charge", positive=True)
+    uint(collector["expected_global_control_baseline"], "global Control baseline")
+
+    app_capacity = recipe["app_capacity_artifact_sha256"]
+    if recipe["mode"] == "capacity_calibration":
+        require(app_capacity is None, "capacity calibration must not depend on app-byte denominators")
+        require(capacity_sources == {"disk": False, "download": False}, "capacity calibration must freeze missing application-byte denominators")
+        require(recipe["external_pressure_proof"] is None and recipe["final_runtime_binding"] is None, "calibration mode cannot carry qualification proofs")
+        require(identity["pressure_qualification"] is False, "capacity calibration identity must not claim pressure qualification")
+        cpu = controls["cpu"]
+        require(cpu["initial"] in (2, 4) and cpu["ceiling"] == cpu["initial"], "capacity calibration CPU control must be pinned at 2 or 4 slots")
+        for resource in ("disk", "download"):
+            require(controls[resource]["ceiling"] >= controls[resource]["initial"], f"{resource} policy bounds are invalid")
+    else:
+        digest(app_capacity, "app_capacity_artifact_sha256")
+        proof = exact(recipe["external_pressure_proof"], {"path", "raw_sha256", "validator_sha256", "recipe_raw_sha256"}, "external pressure proof pin")
+        absolute_path(proof["path"], "pressure proof path")
+        digest(proof["raw_sha256"], "pressure proof raw SHA-256")
+        digest(proof["validator_sha256"], "pressure validator SHA-256")
+        digest(proof["recipe_raw_sha256"], "pressure recipe raw SHA-256")
+        runtime = exact(recipe["final_runtime_binding"], {"path", "raw_sha256"}, "final runtime binding pin")
+        absolute_path(runtime["path"], "runtime binding path")
+        digest(runtime["raw_sha256"], "runtime binding raw SHA-256")
+        require(identity["pressure_qualification"] is True, "pressure validation identity must request pressure qualification")
+    uint(recipe["minimum_production_seconds"], "minimum production duration", positive=True, maximum=10_800)
+    uint(recipe["minimum_pressure_overlap_seconds"], "minimum pressure overlap", maximum=10_800)
+    if recipe["mode"] == "capacity_calibration":
+        require(recipe["minimum_pressure_overlap_seconds"] == 0, "capacity calibration has no pressure overlap threshold")
+    else:
+        require(recipe["minimum_pressure_overlap_seconds"] > 0, "pressure validation requires a positive overlap threshold")
+    host_binding = exact(recipe["host_binding"], {"path", "raw_sha256"}, "source-manifest host binding")
+    absolute_path(host_binding["path"], "source manifest path")
+    digest(host_binding["raw_sha256"], "source manifest raw SHA-256")
+    return recipe
+
+
+def _uint_map(value: object, keys: set[str], label: str, *, positive: bool = False) -> dict[str, int]:
+    result = exact(value, keys, label)
+    for key, item in result.items():
+        uint(item, f"{label}.{key}", positive=positive)
+    return result
+
+
+def meter_source_bounds_for_workload(workload: str) -> dict[str, dict[str, object]]:
+    """Return the source-derived registration ceiling for a frozen workload."""
+    require(workload in ("cpu", "memory", "http", "disk", "mixed"), "unsupported construction probe workload")
+    disk_enabled = workload in ("disk", "mixed")
+    http_enabled = workload in ("http", "mixed")
+    return {
+        "disk": {
+            "minimum_live": 0,
+            "maximum_live": 1 if disk_enabled else 0,
+            "source_rule": "disk_shared_owner" if disk_enabled else "not_applicable",
+            "lifetime": "registered_endpoint_owner",
+        },
+        "upload": {
+            "minimum_live": 0,
+            "maximum_live": 16 if http_enabled else 0,
+            "source_rule": "http_client_and_server_window" if http_enabled else "not_applicable",
+            "lifetime": "registered_endpoint_owner",
+        },
+        "download": {
+            "minimum_live": 0,
+            "maximum_live": 16 if http_enabled else 0,
+            "source_rule": "http_client_and_server_window" if http_enabled else "not_applicable",
+            "lifetime": "registered_endpoint_owner",
+        },
+    }
+
+
+def _validate_v2_workload_profile(workload: object, profile: object) -> None:
+    require(type(workload) is str and workload in ("cpu", "memory", "http", "disk", "mixed"), "v2 expectation workload is outside the frozen 15-context matrix")
+    valid_profiles = ("mixed", "burst", "oversubscribed") if workload == "mixed" else ("steady", "burst", "oversubscribed")
+    require(type(profile) is str and profile in valid_profiles, "v2 expectation workload/profile pair is outside the frozen 15-context matrix")
+
+
+def _validate_meter_source_bounds(
+    value: object, workload: str, label: str = "meter source bounds",
+) -> dict[str, dict[str, Any]]:
+    expected_bounds = meter_source_bounds_for_workload(workload)
+    bounds = exact(value, set(RATE_DIRECTIONS), label)
+    validated: dict[str, dict[str, Any]] = {}
+    for direction, expected in expected_bounds.items():
+        bound = exact(bounds[direction], {
+            "minimum_live", "maximum_live", "source_rule", "lifetime",
+        }, f"{label}.{direction}")
+        minimum = uint(bound["minimum_live"], f"{direction} minimum live meter sources")
+        maximum = uint(bound["maximum_live"], f"{direction} maximum live meter sources", maximum=(1 << 32) - 1)
+        require(minimum == expected["minimum_live"], f"{direction} minimum live meter sources differ from the source-derived bound")
+        require(maximum == expected["maximum_live"], f"{direction} maximum live meter sources differ from the source-derived bound")
+        require(bound["source_rule"] == expected["source_rule"], f"{direction} meter source rule differs from the workload")
+        require(bound["lifetime"] == "registered_endpoint_owner", f"{direction} meter source lifetime is unsupported")
+        validated[direction] = bound
+    return validated
+
+
+def validate_construction_probe(
+    recipe: dict[str, Any], source_manifest_value: dict[str, Any],
+) -> str:
+    """Validate a v2 probe against a checked expectation and source manifest."""
+    require(recipe.get("schema") == EXPECTATION_SCHEMA_V2, "construction probe validation requires expectation v2")
+    identity = recipe["identity"]
+    _validate_v2_workload_profile(identity["workload"], identity["profile"])
+    pin = exact(recipe["construction_probe"], {
+        "path", "raw_sha256", "allocator", "binary_sha256",
+    }, "construction policy probe pin")
+    absolute_path(pin["path"], "construction policy probe path")
+    digest(pin["raw_sha256"], "construction policy probe raw SHA-256")
+    digest(pin["binary_sha256"], "construction probe binary SHA-256")
+    require(
+        re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", text(pin["allocator"], "construction probe allocator")) is not None,
+        "construction probe allocator is not a canonical token",
+    )
+    require(pin["allocator"] == identity["allocator"], "construction probe allocator differs from feedback identity")
+    require(pin["binary_sha256"] == identity["binary_sha256"], "construction probe binary differs from feedback identity")
+    require(source_manifest_value.get("schema") == SOURCE_MANIFEST_SCHEMA, "construction probe source manifest schema is unsupported")
+    artifacts = exact(source_manifest_value["artifacts"], {
+        "allocatbelt", "mimalloc-secure", "mimalloc-standard", "system",
+    }, "source manifest artifacts")
+    require(pin["allocator"] in artifacts, "construction probe allocator is absent from the source manifest")
+    artifact = exact(artifacts[pin["allocator"]], {"path", "sha256"}, "construction probe source artifact")
+    require(
+        digest(artifact["sha256"], "construction probe source artifact SHA-256") == pin["binary_sha256"],
+        "construction probe binary differs from its source-manifest artifact",
+    )
+    probe, probe_sha = read_canonical(
+        Path(pin["path"]), "construction policy probe", MAX_CONSTRUCTION_PROBE_BYTES, pin["raw_sha256"],
+    )
+    exact(probe, {
+        "schema", "context", "reader_context", "rust_control_context", "collector",
+        "baseline", "meter_source_bounds", "meter_source_model", "source_references",
+    }, "construction policy probe")
+    require(probe["schema"] == CONSTRUCTION_PROBE_SCHEMA, "unsupported construction policy probe schema")
+
+    context = exact(probe["context"], {"workload", "profile", "workers"}, "construction probe context")
+    require(context["workload"] == identity["workload"] and context["profile"] == identity["profile"], "construction probe workload or profile differs from expectation")
+    workers = uint(context["workers"], "construction probe workers", positive=True, maximum=4)
+    require(workers == (2 if identity["profile"] == "oversubscribed" else 4), "construction probe worker count differs from the frozen profile")
+
+    policy = recipe["policy"]
+    reader_context = exact(probe["reader_context"], {
+        "version", "minimum_dense_observations", "sample_interval_ns", "max_dense_gap_ns",
+        "required_breach_samples", "telemetry_freshness_ns", "actuation_cooldown_ns",
+    }, "construction probe reader context")
+    require(reader_context["version"] == policy["version"], "construction probe feedback version differs from expectation")
+    for field in (
+        "minimum_dense_observations", "sample_interval_ns", "max_dense_gap_ns",
+        "required_breach_samples", "telemetry_freshness_ns", "actuation_cooldown_ns",
+    ):
+        value = uint(reader_context[field], f"construction probe reader_context.{field}", positive=True)
+        require(value == policy[field], f"construction probe timing or density differs from expectation at {field}")
+
+    rust_context = exact(probe["rust_control_context"], {
+        "algorithm", "controls", "global_ceilings", "tenant_ceilings", "scope_limits",
+        "rate_buckets", "required_byte_sources",
+    }, "construction probe Rust control context")
+    algorithm = exact(rust_context["algorithm"], {
+        "cpu_reduction_rule", "cpu_recovery_increment", "network_sensor_source", "upload_controlled",
+    }, "construction probe feedback algorithm")
+    require(type(algorithm["upload_controlled"]) is bool, "construction probe upload-control flag must be boolean")
+    require(uint(algorithm["cpu_recovery_increment"], "construction probe CPU recovery increment", positive=True) == 1, "construction probe CPU recovery increment differs from the fixed runtime contract")
+    require(
+        algorithm["cpu_reduction_rule"] == "floor_current_limit_over_10_zero_is_quantized"
+        and algorithm["network_sensor_source"] == "download_application_bytes_only"
+        and algorithm["upload_controlled"] is False,
+        "construction probe feedback algorithm differs from the fixed runtime contract",
+    )
+    probe_controls = exact(rust_context["controls"], set(RESOURCES), "construction probe controls")
+    for resource in RESOURCES:
+        fields = exact(probe_controls[resource], {"floor", "initial", "ceiling", "low_bps", "high_bps"}, f"construction probe {resource} control")
+        for field, actual in fields.items():
+            uint(actual, f"construction probe {resource}.{field}")
+            require(actual == policy["controls"][resource][field], f"construction probe control differs from expectation at {resource}.{field}")
+    for owner in ("global_ceilings", "tenant_ceilings"):
+        ceilings = _uint_map(rust_context[owner], set(DOMAIN), f"construction probe {owner}")
+        require(ceilings == policy[owner], f"construction probe {owner} differ from expectation")
+    scope_limits = _uint_map(
+        rust_context["scope_limits"], {"managed_memory", "disk_operations", "network_operations"},
+        "construction probe scope limits",
+    )
+    require(scope_limits == policy["scope_limits"], "construction probe scope limits differ from expectation")
+    probe_buckets = exact(rust_context["rate_buckets"], set(RATE_DIRECTIONS), "construction probe rate buckets")
+    for direction in RATE_DIRECTIONS:
+        bucket = exact(probe_buckets[direction], {
+            "ceiling_bytes_per_second", "ceiling_burst_bytes", "max_reservations",
+        }, f"construction probe {direction} rate bucket")
+        for field, actual in bucket.items():
+            uint(actual, f"construction probe {direction}.{field}", positive=True)
+        require(bucket == policy["rate_buckets"][direction], f"construction probe {direction} rate bucket differs from expectation")
+
+    required_sources = exact(rust_context["required_byte_sources"], {"disk", "download"}, "construction probe required byte sources")
+    require(all(type(value) is bool for value in required_sources.values()), "construction probe byte-source flags must be boolean")
+    expected_sources = {
+        "disk": identity["workload"] in {"disk", "mixed"},
+        "download": identity["workload"] in {"http", "mixed"},
+    }
+    require(required_sources == expected_sources, "construction probe required byte sources differ from workload")
+
+    collector = exact(probe["collector"], {"control_charge_bytes", "task_lease_count"}, "construction probe collector")
+    control_charge = uint(collector["control_charge_bytes"], "construction probe collector Control charge", positive=True)
+    task_lease_count = uint(collector["task_lease_count"], "construction probe collector Task lease", positive=True)
+    require(control_charge == policy["collector"]["control_charge_bytes"], "construction probe collector Control charge differs from expectation")
+    require(task_lease_count == policy["collector"]["task_lease_count"], "construction probe collector Task lease differs from expectation")
+    baseline = exact(probe["baseline"], {"expected_global_control_baseline"}, "construction probe baseline")
+    baseline_value = uint(baseline["expected_global_control_baseline"], "construction probe global Control baseline")
+    require(baseline_value == policy["collector"]["expected_global_control_baseline"], "construction probe global Control baseline differs from expectation")
+
+    probe_bounds = _validate_meter_source_bounds(probe["meter_source_bounds"], identity["workload"], "construction probe meter source bounds")
+    expected_bounds = _validate_meter_source_bounds(policy["meter_source_bounds"], identity["workload"])
+    require(probe_bounds == expected_bounds, "construction probe meter source bounds differ from expectation")
+    model = exact(probe["meter_source_model"], {
+        "disk_registration_owner", "disk_source_path", "http_client_window", "http_handler_window",
+        "http_client_window_source", "http_handler_window_source", "http_registration_owner",
+        "http_registration_source", "http_source_path", "stream_registration_owner",
+        "disk_registration_source",
+    }, "construction probe meter source model")
+    for key, expected in CONSTRUCTION_PROBE_METER_SOURCE_MODEL.items():
+        require(model[key] == expected, f"construction probe meter source model differs at {key}")
+    client_window = uint(model["http_client_window"], "construction probe HTTP client window", positive=True)
+    handler_window = uint(model["http_handler_window"], "construction probe HTTP handler window", positive=True)
+    require(client_window == 8 and handler_window == 8, "construction probe HTTP source windows differ from the fixed runtime contract")
+    if identity["workload"] in {"http", "mixed"}:
+        require(client_window + handler_window == expected_bounds["upload"]["maximum_live"], "construction probe HTTP window does not explain its upload source ceiling")
+        require(client_window + handler_window == expected_bounds["download"]["maximum_live"], "construction probe HTTP window does not explain its download source ceiling")
+
+    source_references = exact(probe["source_references"], set(CONSTRUCTION_PROBE_SOURCE_REFERENCES), "construction probe source references")
+    for name, expected in CONSTRUCTION_PROBE_SOURCE_REFERENCES.items():
+        require(source_references[name] == expected, f"construction probe source reference differs at {name}")
+    return probe_sha
+
+
+def _verify_source_manifest(recipe: dict[str, Any]) -> dict[str, Any]:
+    pin = recipe["host_binding"]
+    value, raw_sha = read_canonical(
+        Path(pin["path"]), "source manifest", MAX_SOURCE_MANIFEST_BYTES, pin["raw_sha256"],
+    )
+    exact(value, {
+        "schema", "source", "build", "artifacts", "soak_artifacts", "analysis_artifact",
+        "fixed_runtime_policy", "runtime_readback_validator", "resource_domain_calibration",
+        "manifest_sha256",
+    }, "source manifest")
+    require(value["schema"] == SOURCE_MANIFEST_SCHEMA, "unsupported source manifest schema")
+    body = {key: item for key, item in value.items() if key != "manifest_sha256"}
+    require(digest(value["manifest_sha256"], "source manifest self digest") == digest_object(body), "source manifest self digest is invalid")
+    source = exact(value["source"], {"git_commit", "source_tree_sha256", "cargo_lock_sha256", "files"}, "source manifest source")
+    build = exact(value["build"], {
+        "host_id", "rustc_release", "rustc_verbose", "cargo_version", "target_triple", "target_cpu",
+        "profile", "features_sha256", "build_inputs_sha256",
+    }, "source manifest build")
+    require(text(build["host_id"], "source manifest host ID") == recipe["identity"]["host_id"], "source manifest host differs from feedback expectation")
+    require(digest(source["source_tree_sha256"], "source tree SHA-256") == recipe["identity"]["source_sha256"], "source tree hash differs from feedback identity")
+    artifacts = value["artifacts"]
+    require(type(artifacts) is dict and set(artifacts) == {"allocatbelt", "mimalloc-secure", "mimalloc-standard", "system"}, "source manifest artifact set is incomplete")
+    for allocator, record in artifacts.items():
+        exact(record, {"path", "sha256"}, f"source manifest binary artifact {allocator}")
+        digest(record["sha256"], f"source manifest {allocator} binary hash")
+    require(recipe["identity"]["allocator"] in artifacts, "source manifest omits the expected allocator artifact")
+    artifact = artifacts[recipe["identity"]["allocator"]]
+    require(digest(artifact["sha256"], "source manifest binary SHA-256") == recipe["identity"]["binary_sha256"], "source manifest binary hash differs from feedback identity")
+    return {"raw_sha256": raw_sha, "value": value}
+
+
+def _verify_pressure_proof(recipe: dict[str, Any], production: tuple[int, int], drain: tuple[int, int]) -> tuple[bool, str]:
+    pin = recipe["external_pressure_proof"]
+    proof, raw_sha = read_canonical(Path(pin["path"]), "external pressure readback", MAX_PRESSURE_PROOF_BYTES, pin["raw_sha256"])
+    exact(proof, {
+        "schema", "status", "recipe_sha256", "recipe_raw_sha256", "validator_sha256", "condition_sha256", "identity",
+        "run_sha256", "events_sha256",
+        "launch_record_sha256", "process_binding_sha256", "readiness_marker_sha256", "sample_count",
+        "application_overlap_nanoseconds", "application_process", "application_window", "continuous_ready_window",
+        "readiness_windows_passed", "cleanup_rechecked", "physical_nic_claimed", "readback_sha256",
+    }, "external pressure validation receipt")
+    require(proof["schema"] == PRESSURE_READBACK_SCHEMA and proof["status"] == "valid", "external pressure readback is not valid")
+    body = {key: item for key, item in proof.items() if key != "readback_sha256"}
+    require(digest(proof["readback_sha256"], "pressure readback self digest") == digest_object(body), "external pressure readback self digest is invalid")
+    for key in ("recipe_sha256", "recipe_raw_sha256", "validator_sha256", "condition_sha256", "run_sha256", "events_sha256", "launch_record_sha256", "process_binding_sha256", "readiness_marker_sha256"):
+        digest(proof[key], f"pressure receipt {key}")
+    require(proof["recipe_raw_sha256"] == pin["recipe_raw_sha256"] and proof["validator_sha256"] == pin["validator_sha256"], "external pressure proof does not match caller-pinned recipe or validator bytes")
+    _, actual_validator_sha = read_stable(Path(__file__).resolve().with_name("application-pressure-readback.py"), "pressure readback validator", 4 * 1024 * 1024)
+    require(actual_validator_sha == pin["validator_sha256"], "installed pressure validator bytes differ from caller pin")
+    pressure_identity = exact(proof["identity"], {
+        "host_id", "run_id", "pair_id", "condition_id", "member", "nonce", "allocator", "executor", "phase",
+    }, "pressure recipe identity")
+    identity = recipe["identity"]
+    for source_key, feedback_key in (("host_id", "host_id"), ("run_id", "run_id"), ("allocator", "allocator"), ("executor", "executor"), ("nonce", "report_nonce")):
+        require(pressure_identity[source_key] == identity[feedback_key], f"pressure proof identity differs from feedback {feedback_key}")
+    pressure_process = exact(proof["application_process"], {"pid", "start_ticks", "nonce", "executable_sha256"}, "pressure-bound application process")
+    require(uint(pressure_process["pid"], "pressure-bound application PID", positive=True, maximum=(1 << 31) - 1) == identity["process_id"], "pressure proof is bound to a different application PID")
+    uint(pressure_process["start_ticks"], "pressure-bound application start ticks", positive=True)
+    require(pressure_process["nonce"] == identity["report_nonce"] and digest(pressure_process["executable_sha256"], "pressure-bound application binary SHA-256") == identity["binary_sha256"], "pressure proof application nonce or binary differs from feedback identity")
+    require(proof["readiness_windows_passed"] is True and proof["cleanup_rechecked"] is True and proof["physical_nic_claimed"] is False, "external pressure readiness or cleanup proof is incomplete")
+    uint(proof["sample_count"], "pressure proof sample count", positive=True, maximum=120_000)
+    overlap = uint(proof["application_overlap_nanoseconds"], "pressure proof application overlap", positive=True)
+    app_window = exact(proof["application_window"], {"observed_start_monotonic_ns", "observed_exit_monotonic_ns"}, "pressure application observation window")
+    app_start = uint(app_window["observed_start_monotonic_ns"], "observed application start", positive=True)
+    app_exit = uint(app_window["observed_exit_monotonic_ns"], "observed application exit", positive=True)
+    require(app_exit > app_start and app_exit - app_start == overlap, "pressure application observation window disagrees with measured overlap")
+    ready = exact(proof["continuous_ready_window"], {"start_monotonic_ns", "end_monotonic_ns"}, "continuous ready pressure window")
+    ready_start = uint(ready["start_monotonic_ns"], "continuous ready start", positive=True)
+    ready_end = uint(ready["end_monotonic_ns"], "continuous ready end", positive=True)
+    require(app_exit > app_start, "pressure application observation window is empty")
+    require(ready_end > ready_start, "continuous ready pressure window is empty")
+    require(ready_start <= production[0] and ready_end >= drain[1], "continuous ready pressure window does not cover production through drain")
+    required = recipe["minimum_pressure_overlap_seconds"] * NSEC
+    require(overlap >= required, "measured application pressure overlap is below the preregistered minimum")
+    return True, raw_sha
+
+
+def _runtime_key_allowed(key: str) -> bool:
+    if re.fullmatch(r"after_release\.global\.used\.(cpu|memory|disk|network|tasks)", key):
+        return True
+    for stage in ("setup", "after_drain", "after_shutdown"):
+        prefix = stage + "."
+        if key.startswith(prefix):
+            suffix = key[len(prefix):]
+            if re.fullmatch(r"(?:global|tenant)\.(?:ceiling|limit|used)\.(?:cpu|memory|disk|network|tasks|control)", suffix):
+                return True
+            if re.fullmatch(r"(?:global|tenant)\.(?:live_tenants|application_work_tasks)", suffix):
+                return True
+            if suffix in {
+                "scope.managed_memory_limit", "scope.disk_operation_limit", "scope.network_operation_limit",
+                "scope.managed_memory_used", "scope.disk_operations_used", "scope.network_operations_used",
+                "collector_task_lease_count",
+            }:
+                return True
+            io_match = re.fullmatch(r"io\.(disk|upload|download)_(bytes_per_second|burst_bytes|ceiling_bytes_per_second|ceiling_burst_bytes|max_reservations|available_bytes|reserved_bytes|reservations)", suffix)
+            if io_match:
+                return True
+            feedback_fields = {
+                "sample_count", "worker_failure", "last_diagnostic", "last_sample_offset_ns",
+                "last_sample_age_ns", "last_plan_offset_ns", "last_plan_age_ns", "stop_requested",
+                "shutdown_complete", "reconciliation_pending", "reconciliation_in_flight",
+                "decision_evidence",
+            }
+            if suffix.startswith("feedback."):
+                rest = suffix.removeprefix("feedback.")
+                if rest in feedback_fields:
+                    return True
+                control_match = re.fullmatch(r"(cpu|disk_rate|download_rate)\.(current_limit|utilization_basis_points|telemetry|policy_faulted|no_change|pending_generation|last_diagnostic|decision_evidence)", rest)
+                if control_match:
+                    return True
+                meter_match = re.fullmatch(r"meter\.(disk|upload|download)\.(committed_bytes|completions|attached_sources|generation|diagnostics_clear|diagnostics\.(?:counter_overflow|invalid_io|source_count_overflow|generation_overflow))", rest)
+                if meter_match:
+                    return True
+            return False
+    if key.startswith("configuration.domain_ceiling."):
+        return key.rsplit(".", 1)[-1] in DOMAIN
+    if key.startswith("identity."):
+        return key in {
+            "identity.report_nonce", "identity.run_id", "identity.allocator", "identity.executor",
+            "identity.source_sha256", "identity.binary_sha256", "identity.comparison_family",
+            "identity.resource_ceiling_sha256", "identity.policy_sha256", "identity.profile",
+            "identity.workload", "identity.hashes_are_echoed_bindings_not_self_proof",
+        }
+    if key in {
+        "feedback.schema", "feedback.policy.version", "feedback.sample_interval_ms",
+        "feedback.max_dense_sample_gap_ms", "feedback.telemetry_freshness_ms",
+        "feedback.required_breach_samples", "feedback.actuation_cooldown_ms",
+        "feedback.minimum_dense_observations", "feedback.cpu_reduction_rule",
+        "feedback.cpu_recovery_increment", "feedback.cpu_capacity_equivalents",
+        "feedback.disk_source", "feedback.network_source", "feedback.network_direction",
+        "feedback.upload_controlled", "feedback.pressure_qualification_requested",
+        "feedback.pressure_claim", "feedback.calibration.schema", "feedback.calibration.id",
+        "feedback.calibration.artifact_sha256", "feedback.calibration.hash_scope",
+        "feedback.calibration.host_id", "feedback.calibration.profile", "feedback.calibration.workload",
+        "feedback.calibration.source_sha256", "feedback.calibration.source_sha256_meaning",
+        "feedback.policy.canonicalization",
+    }:
+        return True
+    if re.fullmatch(r"feedback\.policy\.(cpu|disk|download)\.(floor|initial|ceiling|low_utilization_basis_points|high_utilization_basis_points)", key):
+        return True
+    if re.fullmatch(r"feedback\.calibration\.(disk|download)\.(status|bytes_per_second|units|provenance)", key):
+        return True
+    static = {
+        "configuration.mode", "configuration.rate_per_second", "configuration.arrivals",
+        "configuration.async_workers", "configuration.logical_window", "configuration.trace_duration_ns",
+        "configuration.pulse_rate_per_second", "configuration.task_ceiling", "configuration.domain_ceiling.cpu",
+        "configuration.domain_ceiling.memory", "configuration.domain_ceiling.disk", "configuration.domain_ceiling.network",
+        "configuration.domain_ceiling.tasks", "configuration.domain_ceiling.control", "configuration.managed_memory_limit_bytes",
+        "configuration.disk_operation_limit", "configuration.network_operation_limit",
+        "configuration.fixed_global_control_baseline", "configuration.setup_global_control",
+        "configuration.blocking_disk_adapter_constructed", "accounting.cpu", "accounting.tasks",
+        "accounting.managed_payload", "accounting.disk_operations", "accounting.disk_bytes",
+        "accounting.network_operations", "accounting.network_bytes", "accounting.opaque_runtime_allocations",
+        "accounting.receipt_writer_storage", "kernel.cpu_rounds", "kernel.memory_initial_bytes",
+        "kernel.memory_grown_bytes", "kernel.memory_seed", "kernel.disk_bytes", "kernel.disk_offset",
+        "kernel.disk_seed", "kernel.http_body_bytes", "kernel.mixed_interleave",
+        "after_release.global.live_tenants", "after_release.global.used.control",
+        "after_release.expected_global_control_baseline", "after_release.control_matches_fixed_baseline",
+    }
+    return key in static
+
+
+def _verify_runtime_binding(
+    recipe: dict[str, Any], final_policy: dict[str, dict[str, Any]], accepted_sample_count: int,
+) -> tuple[bool, str, bool]:
+    pin = recipe["final_runtime_binding"]
+    raw, raw_sha = read_stable(Path(pin["path"]), "final runtime binding", MAX_RUNTIME_BINDING_BYTES)
+    require(raw_sha == pin["raw_sha256"], "final runtime binding raw SHA-256 differs from caller pin")
+    require(raw.endswith(b"\n") and b"\r" not in raw and b"\x00" not in raw, "runtime binding has invalid LF framing")
+    try:
+        lines = raw.decode("utf-8").splitlines()
+    except UnicodeError as error:
+        raise ValidationError("runtime binding is not UTF-8") from error
+    require(lines, "runtime binding omits its schema header")
+    schema_header = lines[0]
+    require(schema_header in {
+        f"schema\t{RUNTIME_BINDING_SCHEMA_V1}", f"schema\t{RUNTIME_BINDING_SCHEMA_V2}",
+    }, "unsupported runtime binding schema")
+    schema_v2 = schema_header == f"schema\t{RUNTIME_BINDING_SCHEMA_V2}"
+    rows: dict[str, str] = {}
+    for line in lines[1:]:
+        fields = line.split("\t")
+        require(len(fields) == 2 and fields[0] and fields[1] and not any(ord(c) < 32 or ord(c) == 127 for c in fields[0] + fields[1]), "runtime binding row is malformed")
+        key, value = fields
+        require(key not in rows and _runtime_key_allowed(key), f"runtime binding contains duplicate or unknown field: {key}")
+        rows[key] = value
+    identity = recipe["identity"]
+    expected_identity = {
+        "identity.report_nonce": identity["report_nonce"], "identity.run_id": identity["run_id"],
+        "identity.allocator": identity["allocator"], "identity.executor": identity["executor"],
+        "identity.source_sha256": identity["source_sha256"], "identity.binary_sha256": identity["binary_sha256"],
+        "identity.comparison_family": "external_pressure",
+        "identity.profile": identity["profile"], "identity.workload": identity["workload"],
+    }
+    for key, value in expected_identity.items():
+        require(rows.get(key) == value, f"runtime binding identity differs at {key}")
+    baseline = str(recipe["policy"]["collector"]["expected_global_control_baseline"])
+    require(rows.get("configuration.fixed_global_control_baseline") == baseline, "runtime configuration Control baseline differs from expectation")
+    for resource in DOMAIN:
+        require(rows.get(f"configuration.domain_ceiling.{resource}") == str(recipe["policy"]["global_ceilings"][resource]), f"runtime configuration {resource} ceiling differs from expectation")
+        require(rows.get(f"after_shutdown.global.ceiling.{resource}") == str(recipe["policy"]["global_ceilings"][resource]), f"runtime after-shutdown global {resource} ceiling differs from expectation")
+        require(rows.get(f"after_shutdown.tenant.ceiling.{resource}") == str(recipe["policy"]["tenant_ceilings"][resource]), f"runtime after-shutdown tenant {resource} ceiling differs from expectation")
+        for owner, ceiling in (("global", recipe["policy"]["global_ceilings"][resource]), ("tenant", recipe["policy"]["tenant_ceilings"][resource])):
+            positive_limit = recipe["schema"] == EXPECTATION_SCHEMA_V1 or ceiling > 0
+            limit = uint(
+                _decimal(rows.get(f"after_shutdown.{owner}.limit.{resource}", ""), f"runtime {owner} {resource} limit"),
+                f"runtime {owner} {resource} limit", positive=positive_limit,
+            )
+            require(limit <= ceiling, f"runtime after-shutdown {owner} {resource} limit exceeds its hard ceiling")
+    for sample_key, policy_key in (("configuration.managed_memory_limit_bytes", "managed_memory"),
+                                   ("configuration.disk_operation_limit", "disk_operations"),
+                                   ("configuration.network_operation_limit", "network_operations")):
+        require(rows.get(sample_key) == str(recipe["policy"]["scope_limits"][policy_key]), f"runtime configuration scope limit differs at {sample_key}")
+    for row_key, policy_key in (("after_shutdown.scope.managed_memory_limit", "managed_memory"),
+                                ("after_shutdown.scope.disk_operation_limit", "disk_operations"),
+                                ("after_shutdown.scope.network_operation_limit", "network_operations")):
+        require(rows.get(row_key) == str(recipe["policy"]["scope_limits"][policy_key]), f"runtime after-shutdown scope limit differs at {row_key}")
+    for resource in RESOURCES:
+        control = recipe["policy"]["controls"][resource]
+        name = {"cpu": "cpu", "disk": "disk", "download": "download"}[resource]
+        for field, policy_field in (("floor", "floor"), ("initial", "initial"), ("ceiling", "ceiling"),
+                                    ("low_utilization_basis_points", "low_bps"), ("high_utilization_basis_points", "high_bps")):
+            key = f"feedback.policy.{name}.{field}"
+            require(rows.get(key) == str(control[policy_field]), f"runtime policy differs from expectation at {key}")
+        feedback_name = {"cpu": "cpu", "disk": "disk_rate", "download": "download_rate"}[resource]
+        prefix = f"after_shutdown.feedback.{feedback_name}"
+        require(rows.get(prefix + ".current_limit") == str(final_policy[resource]["current_limit"]), f"runtime shutdown {resource} limit differs from event reconstruction")
+        expected_utilization = "missing" if final_policy[resource]["utilization_basis_points"] is None else str(final_policy[resource]["utilization_basis_points"])
+        require(rows.get(prefix + ".utilization_basis_points") == expected_utilization, f"runtime shutdown {resource} telemetry differs from event reconstruction")
+        require(rows.get(prefix + ".telemetry") == final_policy[resource]["telemetry"].lower(), f"runtime shutdown {resource} telemetry state differs from event reconstruction")
+        require(rows.get(prefix + ".policy_faulted") == "false" and rows.get(prefix + ".pending_generation") == "none", f"runtime shutdown {resource} control remains faulted or pending")
+    require(rows.get("feedback.policy.version") == "runtime-feedback-policy-v1", "runtime binding feedback policy version differs")
+    require(rows.get("feedback.sample_interval_ms") == "100" and rows.get("feedback.max_dense_sample_gap_ms") == "200" and rows.get("feedback.telemetry_freshness_ms") == "500" and rows.get("feedback.required_breach_samples") == "3" and rows.get("feedback.actuation_cooldown_ms") == "1000", "runtime feedback timing policy differs from the fixed contract")
+    require(rows.get("feedback.minimum_dense_observations") == "1", "runtime feedback density threshold differs from expectation")
+    require(rows.get("feedback.pressure_qualification_requested") == "true", "runtime binding did not request pressure qualification")
+    require(rows.get("feedback.calibration.artifact_sha256") == recipe["app_capacity_artifact_sha256"], "runtime app-byte calibration hash differs from expectation")
+    require(rows.get("feedback.calibration.host_id") == recipe["identity"]["host_id"] and rows.get("feedback.calibration.profile") == recipe["identity"]["profile"] and rows.get("feedback.calibration.workload") == recipe["identity"]["workload"] and rows.get("feedback.calibration.source_sha256") == recipe["identity"]["source_sha256"], "runtime capacity calibration identity differs from expectation")
+    for direction in ("disk", "download"):
+        expected_status = "calibrated" if recipe["policy"]["capacity_sources"][direction] else "missing"
+        require(rows.get(f"feedback.calibration.{direction}.status") == expected_status, f"runtime {direction} byte source availability differs from expectation")
+        if expected_status == "missing":
+            require(rows.get(f"feedback.calibration.{direction}.bytes_per_second") == "missing" and rows.get(f"feedback.calibration.{direction}.units") == "missing", f"runtime missing {direction} capacity was not preserved")
+        else:
+            uint(_decimal(rows.get(f"feedback.calibration.{direction}.bytes_per_second", ""), f"runtime {direction} capacity"), f"runtime {direction} capacity", positive=True)
+    for direction in RATE_DIRECTIONS:
+        bucket = recipe["policy"]["rate_buckets"][direction]
+        io_prefix = f"after_shutdown.io.{direction}_"
+        require(rows.get(io_prefix + "ceiling_bytes_per_second") == str(bucket["ceiling_bytes_per_second"]), f"runtime {direction} byte-rate ceiling differs from expectation")
+        require(rows.get(io_prefix + "ceiling_burst_bytes") == str(bucket["ceiling_burst_bytes"]), f"runtime {direction} burst ceiling differs from expectation")
+        require(rows.get(io_prefix + "max_reservations") == str(bucket["max_reservations"]), f"runtime {direction} reservation cap differs from expectation")
+        current_rate = uint(_decimal(rows.get(io_prefix + "bytes_per_second", ""), f"runtime {direction} current rate"), f"runtime {direction} current rate")
+        burst = uint(_decimal(rows.get(io_prefix + "burst_bytes", ""), f"runtime {direction} current burst"), f"runtime {direction} current burst")
+        available = uint(_decimal(rows.get(io_prefix + "available_bytes", ""), f"runtime {direction} available credits"), f"runtime {direction} available credits")
+        reserved = uint(_decimal(rows.get(io_prefix + "reserved_bytes", ""), f"runtime {direction} reserved credits"), f"runtime {direction} reserved credits")
+        require(current_rate <= bucket["ceiling_bytes_per_second"] and burst <= bucket["ceiling_burst_bytes"] and available + reserved <= burst, f"runtime {direction} bucket exceeds its rate or credit ceiling")
+    required = [
+        "after_shutdown.global.used.cpu", "after_shutdown.global.used.memory", "after_shutdown.global.used.disk",
+        "after_shutdown.global.used.network", "after_shutdown.global.used.tasks",
+        "after_shutdown.tenant.used.cpu", "after_shutdown.tenant.used.memory", "after_shutdown.tenant.used.disk",
+        "after_shutdown.tenant.used.network", "after_shutdown.tenant.used.tasks",
+        "after_shutdown.scope.managed_memory_used", "after_shutdown.scope.disk_operations_used",
+        "after_shutdown.scope.network_operations_used", "after_shutdown.io.disk_reservations",
+        "after_shutdown.io.upload_reservations", "after_shutdown.io.download_reservations",
+        "after_shutdown.feedback.shutdown_complete",
+        "after_shutdown.feedback.worker_failure", "after_shutdown.feedback.sample_count",
+        "after_shutdown.feedback.stop_requested", "after_shutdown.feedback.reconciliation_pending",
+        "after_shutdown.feedback.reconciliation_in_flight",
+        "after_release.global.live_tenants", "after_release.global.used.control",
+        "after_release.expected_global_control_baseline", "after_release.control_matches_fixed_baseline",
+    ]
+    require(all(key in rows for key in required), "runtime binding omits final shutdown/release evidence")
+    for key in required[:16]:
+        require(rows[key] == "0", f"runtime binding reports nonzero application or owner usage at {key}")
+    require(rows["after_shutdown.feedback.shutdown_complete"] == "true" and rows["after_shutdown.feedback.worker_failure"] == "none", "feedback worker did not cleanly join")
+    require(rows["after_shutdown.feedback.stop_requested"] == "true" and rows["after_shutdown.feedback.sample_count"] == str(accepted_sample_count), "feedback runtime receipt does not bind complete stop and sample count")
+    require(rows["after_shutdown.feedback.reconciliation_pending"] == "none" and rows["after_shutdown.feedback.reconciliation_in_flight"] == "none", "feedback runtime receipt has unfinished reconciliation")
+    require(rows["after_release.global.live_tenants"] == "0" and rows["after_release.global.used.control"] == baseline and rows["after_release.expected_global_control_baseline"] == baseline and rows["after_release.control_matches_fixed_baseline"] == "true", "runtime binding did not return global Control to its fixed baseline")
+    after_release_global = {f"after_release.global.used.{name}" for name in ("cpu", "memory", "disk", "network", "tasks")}
+    present_release = after_release_global.intersection(rows)
+    if schema_v2:
+        require(present_release == after_release_global, "runtime binding v2 omits a final after-release global resource field")
+    else:
+        require(not present_release, "runtime binding v1 contains v2-only after-release global resource fields")
+    release_complete = schema_v2
+    if release_complete:
+        require(all(rows[key] == "0" for key in after_release_global), "runtime binding reports live global application usage after owner release")
+    return True, raw_sha, release_complete
+
+
+def _parse_manifest(lines: list[bytes], recipe: dict[str, Any]) -> dict[str, Any]:
+    require(lines and len(lines) <= 256, "feedback manifest has an invalid row count")
+    try:
+        rows = [line.decode("ascii") for line in lines]
+    except UnicodeError as error:
+        raise ValidationError("feedback manifest is not ASCII") from error
+    index = 0
+
+    def take(prefix: str, field_count: int | None = None) -> list[str]:
+        nonlocal index
+        require(index < len(rows), f"feedback manifest omits {prefix}")
+        parts = rows[index].split("\t")
+        index += 1
+        require(parts[0] == prefix and (field_count is None or len(parts) == field_count), f"feedback manifest row is malformed: {prefix}")
+        return parts
+
+    require(take("schema", 2) == ["schema", TRACE_MANIFEST_SCHEMA], "unsupported feedback manifest schema")
+    identity = recipe["identity"]
+    process_row = take("identity", 3)
+    require(process_row[1:] == ["process_id", str(identity["process_id"])], "trace manifest process ID differs from expectation")
+    manifest_identity: dict[str, str] = {"process_id": process_row[2]}
+    expected_identity = {
+        "report_nonce": identity["report_nonce"], "run_id": identity["run_id"],
+        "executor": identity["executor"], "allocator": identity["allocator"],
+        "workload": identity["workload"], "profile": identity["profile"],
+        "mode": identity["mode"], "source_sha256": identity["source_sha256"],
+        "binary_sha256": identity["binary_sha256"],
+    }
+    for key, expected in expected_identity.items():
+        row = take("identity", 3)
+        require(row[1] == key and row[2] == expected, f"trace manifest identity differs at {key}")
+        manifest_identity[key] = row[2]
+    pressure_row = take("identity", 3)
+    require(pressure_row[1] == "pressure_qualification" and pressure_row[2] in ("true", "false"), "trace pressure-qualification identity row is malformed")
+    require((pressure_row[2] == "true") is identity["pressure_qualification"], "trace pressure-qualification flag differs from expectation")
+    manifest_identity[pressure_row[1]] = pressure_row[2]
+    directory = take("trace_directory", 5)
+    require(directory[1] == "device" and directory[3] == "mode", "trace directory manifest row is malformed")
+    _decimal(directory[2], "trace directory device")
+    require(re.fullmatch(r"[0-7]{3,4}", directory[4]) is not None, "trace directory mode is malformed")
+
+    artifacts: dict[str, dict[str, Any]] = {}
+    for _ in range(2):
+        row = take("artifact", 4)
+        name = row[1]
+        require(name in ("feedback-events.jsonl", "resource-samples.tsv") and name not in artifacts, "feedback manifest has an unexpected artifact")
+        artifacts[name] = {"bytes": uint(_decimal(row[2], f"{name} bytes"), f"{name} bytes"), "sha256": digest(row[3], f"{name} SHA-256")}
+    require(set(artifacts) == {"feedback-events.jsonl", "resource-samples.tsv"}, "feedback manifest omits a trace artifact")
+
+    event_row = take("events", 9)
+    require(event_row[1] == EVENT_SCHEMA, "feedback event summary schema is malformed")
+    event_count = uint(_decimal(event_row[2], "event count"), "event count", positive=True, maximum=MAX_EVENT_RECORDS)
+    event_first = uint(_decimal(event_row[3], "first event sequence"), "first event sequence", positive=True)
+    event_last = uint(_decimal(event_row[4], "last event sequence"), "last event sequence", positive=True)
+    require(event_first == 1 and event_last == event_count, "feedback event sequence summary has a gap")
+    require(event_row[5] == "ring_wrapped" and event_row[6] in ("true", "false") and event_row[7:] == ["read_gaps", "0"], "feedback event stream reports missing history")
+
+    sample_row = take("samples", 5)
+    require(sample_row[1] == SAMPLE_SCHEMA, "unsupported feedback sample schema")
+    sample_count = uint(_decimal(sample_row[2], "sample row count"), "sample row count", positive=True, maximum=MAX_SAMPLE_ROWS)
+    require(uint(_decimal(sample_row[3], "first sample sequence"), "first sample sequence", positive=True) == 1 and uint(_decimal(sample_row[4], "last sample sequence"), "last sample sequence", positive=True) == sample_count, "feedback sample sequence summary has a gap")
+    anchor = take("clock_anchor", 3)
+    clock_lower = uint(_decimal(anchor[1], "trace clock lower anchor"), "trace clock lower anchor", positive=True)
+    clock_upper = uint(_decimal(anchor[2], "trace clock upper anchor"), "trace clock upper anchor", positive=True)
+    require(clock_lower <= clock_upper and clock_upper - clock_lower <= 50_000_000, "trace monotonic anchor uncertainty exceeds 50 ms")
+    require(take("history_capacity", 2) == ["history_capacity", "16384"], "feedback history capacity differs from trace contract")
+
+    expected_budgets = {
+        "max_horizon_seconds": "11400", "sample_interval_ms": "100", "max_sample_rows": "114002",
+        "max_sample_cycles": "114001", "terminal_sample_headroom": "1", "max_sample_record_bytes": "8192",
+        "max_sample_file_bytes": str(MAX_SAMPLE_FILE_BYTES), "max_event_records": str(MAX_EVENT_RECORDS),
+        "max_event_record_bytes": str(MAX_EVENT_LINE_BYTES), "max_event_file_bytes": str(MAX_EVENT_FILE_BYTES),
+        "max_manifest_file_bytes": str(MAX_MANIFEST_BYTES), "base_events_per_sample_cycle": "3",
+        "control_count": "3", "actuation_cooldown_ms": "1000", "max_tickets_per_control": "11401",
+        "events_per_ticket": "4", "application_reconciliation_requests": "0", "terminal_event_headroom": "100",
+    }
+    budgets: dict[str, str] = {}
+    for _ in range(len(expected_budgets)):
+        row = take("budget", 3)
+        require(row[1] in expected_budgets and row[1] not in budgets, "feedback manifest contains an unknown or duplicate budget")
+        require(row[2] == expected_budgets[row[1]], f"feedback trace budget differs at {row[1]}")
+        budgets[row[1]] = row[2]
+    require(budgets == expected_budgets, "feedback manifest has incomplete artifact bounds")
+
+    phases: dict[str, dict[str, Any]] = {}
+    for _ in REQUIRED_PHASES:
+        row = take("phase", 6)
+        name = row[1]
+        require(name in REQUIRED_PHASES and name not in phases, "feedback manifest has unknown or duplicate phase marker")
+        lower, upper = uint(_decimal(row[2], f"phase {name} lower"), f"phase {name} lower", positive=True), uint(_decimal(row[3], f"phase {name} upper"), f"phase {name} upper", positive=True)
+        require(lower <= upper and upper - lower == clock_upper - clock_lower, f"phase {name} clock bracket differs from its fixed anchor")
+        if row[4] == "none" or row[5] == "none":
+            require(row[4:] == ["none", "none"], f"phase {name} RSS pair is incomplete")
+            rss = None
+        else:
+            rss = uint(_decimal(row[4], f"phase {name} RSS"), f"phase {name} RSS", positive=True)
+            hwm = uint(_decimal(row[5], f"phase {name} HWM"), f"phase {name} HWM", positive=True)
+            require(hwm >= rss, f"phase {name} HWM is below RSS")
+            rss = {"rss_kib": rss, "hwm_kib": hwm}
+        phases[name] = {"lower": lower, "upper": upper, "rss": rss}
+    require(set(phases) == set(REQUIRED_PHASES), "feedback manifest omits a phase marker")
+
+    control_row = take("control", 5)
+    require(control_row[1] == "collector_charge_bytes" and control_row[3] == "expected_global_control_baseline", "trace collector accounting row is malformed")
+    require(uint(_decimal(control_row[2], "trace collector Control charge"), "trace collector Control charge", positive=True) == recipe["policy"]["collector"]["control_charge_bytes"], "trace collector Control charge differs from expectation")
+    require(uint(_decimal(control_row[4], "trace Control baseline"), "trace Control baseline") == recipe["policy"]["collector"]["expected_global_control_baseline"], "trace Control baseline differs from expectation")
+    task_row = take("task", 3)
+    require(task_row == ["task", "collector_task_lease_count", "1"], "trace collector Task lease differs from expectation")
+    require(take("completion", 3) == ["completion", "complete", "true"], "feedback trace is not complete")
+    require(index == len(rows), "feedback manifest has trailing or unknown rows")
+
+    ordered = [phases[name] for name in (
+        "rss_before", "production_start", "production_end", "drain_end",
+        "rss_after_drain", "shutdown_end", "rss_after_shutdown", "owner_release",
+    )]
+    for previous, following in zip(ordered, ordered[1:]):
+        require(previous["upper"] <= following["lower"], "feedback phase markers overlap or are out of order")
+    require(phases["rss_before"]["rss"] is not None and phases["rss_after_drain"]["rss"] is not None and phases["rss_after_shutdown"]["rss"] is not None, "feedback trace omits required RSS checkpoints")
+    prod_start, prod_end = phases["production_start"], phases["production_end"]
+    drain_end = phases["drain_end"]
+    duration_lower = prod_end["lower"] - prod_start["upper"]
+    duration_upper = prod_end["upper"] - prod_start["lower"]
+    require(duration_lower > 0 and duration_lower >= recipe["minimum_production_seconds"] * NSEC, "feedback production interval is shorter than preregistered")
+    require(duration_upper <= MAX_TRACE_HORIZON_NS, "feedback production interval exceeds finite trace horizon")
+    require(prod_end["upper"] <= drain_end["lower"], "feedback production end does not precede drain completion")
+    return {
+        "identity": manifest_identity, "artifacts": artifacts, "event_count": event_count,
+        "sample_count": sample_count, "clock_anchor": (clock_lower, clock_upper),
+        "phases": phases, "production_window": {
+            "start_monotonic_ns": [prod_start["lower"], prod_start["upper"]],
+            "end_monotonic_ns": [prod_end["lower"], prod_end["upper"]],
+            "duration_lower_bound_ns": duration_lower,
+            "duration_upper_bound_ns": duration_upper,
+        }, "drain_window": (drain_end["lower"], drain_end["upper"]),
+    }
+
+
+def _timestamp(value: object, label: str, anchor_width: int) -> tuple[int, int]:
+    require(type(value) is list and len(value) == 2, f"{label} must be a two-bound monotonic bracket")
+    lower = uint(value[0], f"{label} lower", positive=True)
+    upper = uint(value[1], f"{label} upper", positive=True)
+    require(lower <= upper and upper - lower == anchor_width, f"{label} bracket differs from the fixed trace-clock uncertainty")
+    return lower, upper
+
+
+def _json_line(raw: bytes, label: str) -> dict[str, Any]:
+    value = parse_json(raw, label, MAX_EVENT_LINE_BYTES)
+    quoted = False
+    escaped = False
+    for byte in raw:
+        if quoted:
+            if escaped:
+                escaped = False
+            elif byte == 0x5C:
+                escaped = True
+            elif byte == 0x22:
+                quoted = False
+        elif byte == 0x22:
+            quoted = True
+        elif byte in b" \t\r\n":
+            raise ValidationError(f"{label} is not compact JSONL")
+    require(not quoted and not escaped, f"{label} has incomplete JSON string framing")
+    return value
+
+
+def _optional_uint(value: object, label: str, maximum: int = U64_MAX) -> int | None:
+    if value is None:
+        return None
+    return uint(value, label, maximum=maximum)
+
+
+def _sample_object(value: object, label: str, anchor_width: int, *, raw_sensor: bool = False) -> tuple[tuple[int, int], dict[str, int | None]]:
+    sample = exact(value, {"at", "cpu_basis_points", "disk_basis_points", "download_basis_points"}, label)
+    at = _timestamp(sample["at"], f"{label}.at", anchor_width)
+    readings: dict[str, int | None] = {}
+    for resource, key in (("cpu", "cpu_basis_points"), ("disk", "disk_basis_points"), ("download", "download_basis_points")):
+        reading = _optional_uint(sample[key], f"{label}.{key}", 65_535 if raw_sensor else 10_000)
+        readings[resource] = reading
+    return at, readings
+
+
+def _ticket(value: object, label: str, anchor_width: int) -> dict[str, Any]:
+    ticket = exact(value, {"resource", "generation", "from_limit", "to_limit", "planned_at"}, label)
+    require(ticket["resource"] in RESOURCES, f"{label} names an unknown resource")
+    result = dict(ticket)
+    result["generation"] = uint(ticket["generation"], f"{label}.generation", positive=True)
+    result["from_limit"] = uint(ticket["from_limit"], f"{label}.from_limit", positive=True)
+    result["to_limit"] = uint(ticket["to_limit"], f"{label}.to_limit", positive=True)
+    result["planned_at_bounds"] = _timestamp(ticket["planned_at"], f"{label}.planned_at", anchor_width)
+    return result
+
+
+class PolicyModel:
+    """Small independent transcription of runtime-feedback-policy-v1."""
+
+    def __init__(self, expectation: dict[str, Any], clock_width: int):
+        self.expectation = expectation
+        self.policy = expectation["policy"]
+        self.mode = expectation["mode"]
+        self.clock_width = clock_width
+        self.last_sample_at: int | None = None
+        self.sample_count = 0
+        self.accepted_sample_times = array("Q")
+        self.sample_decision_record_times = array("Q")
+        self.first_sample_at: int | None = None
+        self.last_sample_at: int | None = None
+        self.present_during_overlap = {resource: 0 for resource in RESOURCES}
+        self.dense_during_overlap = {resource: 0 for resource in RESOURCES}
+        self.production_bounds: tuple[int, int] | None = None
+        self.drain_bounds: tuple[int, int] | None = None
+        self.next_generation = 1
+        self.seen_generations: set[int] = set()
+        self.seen_limits: dict[str, set[int]] = {}
+        self.pending_intervals: dict[str, list[list[int | None]]] = {}
+        self.states: dict[str, dict[str, Any]] = {}
+        for resource in RESOURCES:
+            config = self.policy["controls"][resource]
+            self.states[resource] = {
+                "config": config, "current": config["initial"], "pending": None, "faulted": False,
+                "latest": None, "latest_at": None, "last_observation": None, "last_present": None,
+                "sparse": False, "breaches": 0, "last_success": None, "last_reconcile_bounds": None,
+                "invalidated_at": None, "visible": {
+                    "current_limit": config["initial"], "utilization_basis_points": None,
+                    "telemetry": "Missing", "policy_faulted": False,
+                    "pending_generation": None, "no_change": "None",
+                },
+            }
+            self.seen_limits[resource] = {config["initial"]}
+            self.pending_intervals[resource] = []
+        self.ticket_count = 0
+        self.pending_sensor: tuple[tuple[int, int], dict[str, int | None]] | None = None
+        self.expected_plan_at: tuple[int, int] | None = None
+        self.ticket_queue: list[dict[str, Any]] = []
+        self.ticket_stage: str | None = None
+        self.current_ticket: dict[str, Any] | None = None
+        self.apply_result: str | None = None
+        self.post_readback: tuple[str, int | None] | None = None
+        self.reconciliation: dict[str, Any] | None = None
+        self.started = False
+        self.stop_requested = False
+        self.joined = False
+        self.event_count = 0
+        self.last_event_lower: int | None = None
+
+    def observe(self, at: int, readings: dict[str, int | None]) -> None:
+        if self.last_sample_at is not None:
+            elapsed = at - self.last_sample_at
+            require(elapsed >= self.policy["sample_interval_ns"], "accepted feedback sample cadence is below 100 ms")
+        for resource in RESOURCES:
+            state = self.states[resource]
+            if state["invalidated_at"] is not None and at <= state["invalidated_at"]:
+                state["latest"] = None
+                state["latest_at"] = None
+                state["sparse"] = False
+                state["breaches"] = 0
+                continue
+            value = readings[resource]
+            observation_gap = state["last_observation"] is not None and at - state["last_observation"] > self.policy["max_dense_gap_ns"]
+            if value is None:
+                state["latest"], state["latest_at"] = None, None
+                state["sparse"] = observation_gap
+                state["breaches"] = 0
+            else:
+                present_gap = state["last_present"] is not None and at - state["last_present"] > self.policy["max_dense_gap_ns"]
+                state["sparse"] = observation_gap or present_gap
+                state["latest"], state["latest_at"], state["last_present"] = value, at, at
+                if state["sparse"]:
+                    state["breaches"] = 0
+                elif value >= state["config"]["high_bps"]:
+                    state["breaches"] = min(self.policy["required_breach_samples"], state["breaches"] + 1)
+                else:
+                    state["breaches"] = 0
+            state["last_observation"] = at
+        self.last_sample_at = at
+        self.sample_count += 1
+        if self.first_sample_at is None:
+            self.first_sample_at = at
+        self.last_sample_at = at
+        if self.production_bounds is not None and self.drain_bounds is not None and self.production_bounds[0] <= at <= self.drain_bounds[1]:
+            for resource, value in readings.items():
+                if value is not None:
+                    self.present_during_overlap[resource] += 1
+                    if not self.states[resource]["sparse"]:
+                        self.dense_during_overlap[resource] += 1
+
+    def _telemetry(self, state: dict[str, Any], now: int) -> str:
+        if state["latest"] is None or state["latest_at"] is None:
+            return "Missing"
+        age = now - state["latest_at"]
+        require(age >= 0, "feedback plan precedes its latest sample")
+        if age > self.policy["telemetry_freshness_ns"]:
+            return "Stale"
+        if state["sparse"] or age > self.policy["max_dense_gap_ns"]:
+            return "Sparse"
+        return "Fresh"
+
+    def _remaining_cooldown(self, state: dict[str, Any], now: int) -> tuple[int, int] | None:
+        ranges: list[tuple[int, int]] = []
+        at = state["last_success"]
+        if at is not None:
+            elapsed = now - at
+            require(elapsed >= 0, "feedback cooldown anchor follows current plan")
+            if elapsed < self.policy["actuation_cooldown_ns"]:
+                remaining = self.policy["actuation_cooldown_ns"] - elapsed
+                ranges.append((remaining, remaining))
+        bounds = state["last_reconcile_bounds"]
+        if bounds is not None:
+            early, late = bounds
+            require(now >= late >= early, "feedback reconciliation cooldown bounds are out of order")
+            minimum = max(0, self.policy["actuation_cooldown_ns"] - (now - early))
+            maximum = max(0, self.policy["actuation_cooldown_ns"] - (now - late))
+            if maximum > 0:
+                require(minimum > 0, "feedback plan falls inside an unresolvable reconciliation-cooldown boundary")
+                ranges.append((minimum, maximum))
+        return (max(item[0] for item in ranges), max(item[1] for item in ranges)) if ranges else None
+
+    def _decision(self, resource: str, now: int) -> dict[str, Any]:
+        state = self.states[resource]
+        config = state["config"]
+        telemetry = self._telemetry(state, now)
+        current = state["current"]
+        utilization = state["latest"]
+        no_change: dict[str, Any] | None = {"reason": "telemetry_unavailable"}
+        target: int | None = None
+        if state["faulted"]:
+            no_change = {"reason": "actuation_fault_latched"}
+        elif state["pending"] is not None:
+            no_change = {"reason": "plan_pending"}
+        elif telemetry != "Fresh":
+            no_change = {"reason": "telemetry_unavailable"}
+        elif utilization is not None and utilization >= config["high_bps"]:
+            if state["breaches"] < self.policy["required_breach_samples"]:
+                no_change = {"reason": "breach_samples_remaining", "observed": state["breaches"], "required": self.policy["required_breach_samples"]}
+            else:
+                remaining = self._remaining_cooldown(state, now)
+                if remaining is not None:
+                    no_change = {"reason": "cooling_down", "remaining_min_ns": remaining[0], "remaining_max_ns": remaining[1]}
+                else:
+                    reduction = current // 10
+                    if reduction == 0:
+                        no_change = {"reason": "reduction_quantized"}
+                    elif current == config["floor"]:
+                        no_change = {"reason": "at_floor"}
+                    else:
+                        target = max(config["floor"], current - reduction)
+                        no_change = None
+        elif utilization is not None and utilization <= config["low_bps"]:
+            if current == config["ceiling"]:
+                no_change = {"reason": "at_ceiling"}
+            else:
+                remaining = self._remaining_cooldown(state, now)
+                if remaining is not None:
+                    no_change = {"reason": "cooling_down", "remaining_min_ns": remaining[0], "remaining_max_ns": remaining[1]}
+                else:
+                    increment = 1 if resource == "cpu" else config["ceiling"] // 100
+                    if increment == 0:
+                        no_change = {"reason": "recovery_quantized"}
+                    else:
+                        target = min(config["ceiling"], current + increment)
+                        no_change = None
+        elif utilization is not None:
+            no_change = {"reason": "hysteresis_band"}
+        ticket = None
+        if target is not None:
+            require(target != current, "feedback policy constructed a no-op ticket")
+            ticket = {
+                "resource": resource, "generation": self.next_generation,
+                "from_limit": current, "to_limit": target,
+            }
+            self.seen_generations.add(self.next_generation)
+            self.ticket_count += 1
+            self.next_generation += 1
+            no_change = None
+        return {
+            "resource": resource, "current_limit": current,
+            "utilization_basis_points": utilization, "telemetry": telemetry,
+            "ticket": ticket, "no_change": no_change,
+        }
+
+    def validate_plan(self, event: dict[str, Any], now: int, planned_at: tuple[int, int]) -> None:
+        require(self.expected_plan_at is not None and planned_at == self.expected_plan_at, "plan time differs from accepted sample decision")
+        require(now >= planned_at[0], "plan history event precedes its planning instant")
+        require(type(event["controls"]) is list and len(event["controls"]) == len(RESOURCES), "plan must contain all three controls")
+        queue: list[dict[str, Any]] = []
+        for resource, actual in zip(RESOURCES, event["controls"]):
+            expected = self._decision(resource, planned_at[0])
+            actual_base = exact(actual, {"resource", "current_limit", "utilization_basis_points", "telemetry", "ticket", "no_change"}, f"{resource} plan decision")
+            for key in ("resource", "current_limit", "utilization_basis_points", "telemetry"):
+                require(actual_base[key] == expected[key], f"feedback plan {resource} differs at {key}")
+            if expected["ticket"] is None:
+                require(actual_base["ticket"] is None, f"feedback {resource} plan has an unexpected ticket")
+                if expected["no_change"]["reason"] == "cooling_down":
+                    actual_change = exact(actual_base["no_change"], {"reason", "remaining_ns"}, f"{resource} cooldown diagnostic")
+                    remaining = uint(actual_change["remaining_ns"], f"{resource} cooldown remaining")
+                    require(actual_change["reason"] == "cooling_down" and expected["no_change"]["remaining_min_ns"] <= remaining <= expected["no_change"]["remaining_max_ns"], f"feedback {resource} cooldown differs from reconstructed policy time")
+                else:
+                    require(actual_base["no_change"] == expected["no_change"], f"feedback {resource} no-change reason differs from reconstructed policy")
+                state = self.states[resource]
+                state["visible"] = {
+                    "current_limit": state["current"], "utilization_basis_points": state["latest"],
+                    "telemetry": expected["telemetry"], "policy_faulted": state["faulted"],
+                    "pending_generation": None if state["pending"] is None else state["pending"]["generation"],
+                    "no_change": _debug_no_change(actual_base["no_change"]),
+                }
+            else:
+                require(actual_base["no_change"] is None, f"planned {resource} change contains a no-change reason")
+                ticket = _ticket(actual_base["ticket"], f"{resource} planned ticket", self.clock_width)
+                expected_ticket = expected["ticket"]
+                require(
+                    ticket["resource"] == resource and ticket["generation"] == expected_ticket["generation"]
+                    and ticket["from_limit"] == expected_ticket["from_limit"] and ticket["to_limit"] == expected_ticket["to_limit"]
+                    and ticket["planned_at_bounds"] == planned_at,
+                    f"{resource} ticket differs from independently calculated limit transition",
+                )
+                state = self.states[resource]
+                state["pending"] = ticket
+                self.pending_intervals[resource].append([ticket["generation"], planned_at[0], None])
+                state["visible"] = {
+                    "current_limit": state["current"], "utilization_basis_points": state["latest"],
+                    "telemetry": expected["telemetry"], "policy_faulted": state["faulted"],
+                    "pending_generation": ticket["generation"], "no_change": "None",
+                }
+                queue.append(ticket)
+        self.expected_plan_at = None
+        self.ticket_queue = queue
+        self.ticket_stage = "pre" if queue else None
+        self.current_ticket = queue[0] if queue else None
+
+    def validate_ticket_event(self, event: dict[str, Any], now: int) -> None:
+        require(self.current_ticket is not None and self.ticket_stage is not None, "ticket operation appears without a planned write")
+        ticket = self.current_ticket
+        kind = event["kind"]
+        if kind == "pre_apply_readback":
+            require(self.ticket_stage == "pre", "pre-write readback is out of order")
+            found = _ticket(event["ticket"], "pre-write ticket", self.clock_width)
+            _same_ticket(found, ticket)
+            _callback_bounds(event, now, self.clock_width, allow_readback=True)
+            outcome, actual = _readback_value(event, "pre-write readback")
+            require(type(event["matches_ticket"]) is bool, "pre-write matches_ticket field is not boolean")
+            matches = event["matches_ticket"]
+            good = outcome == "value" and actual == ticket["from_limit"] and matches
+            require(matches == (outcome == "value" and actual == ticket["from_limit"]), "pre-write matches_ticket flag contradicts actual readback")
+            self.ticket_stage = "apply" if good else "ack_pre_failure"
+            return
+        if kind == "apply":
+            require(self.ticket_stage == "apply", "write callback lacks a matching pre-write readback")
+            found = _ticket(event["ticket"], "apply ticket", self.clock_width)
+            _same_ticket(found, ticket)
+            _callback_bounds(event, now, self.clock_width)
+            self.apply_result = text(event["outcome"], "apply result", 128)
+            require(self.apply_result == "Applied" or self.apply_result.startswith(("Failed(", "Panicked")), "apply result is not a known runtime diagnostic")
+            apply_start, apply_end = _timestamp(event["started_at"], "apply.started_at", self.clock_width), _timestamp(event["completed_at"], "apply.completed_at", self.clock_width)
+            self.set_apply_completed(apply_end)
+            self.ticket_stage = "post"
+            return
+        if kind == "post_apply_readback":
+            require(self.ticket_stage == "post", "post-write readback lacks a matching write callback")
+            found = _ticket(event["ticket"], "post-write ticket", self.clock_width)
+            _same_ticket(found, ticket)
+            _callback_bounds(event, now, self.clock_width, allow_readback=True)
+            self.post_readback = _readback_value(event, "post-write readback")
+            self.ticket_stage = "ack_post"
+            return
+        require(kind == "acknowledgement" and self.ticket_stage in ("ack_pre_failure", "ack_post"), "ticket acknowledgement is missing required readbacks or write")
+        found = _ticket(event["ticket"], "acknowledgement ticket", self.clock_width)
+        _same_ticket(found, ticket)
+        result = text(event["result"], "actuation acknowledgement result", 32)
+        require(type(event["accepted"]) is bool and type(event["faulted"]) is bool, "ticket acknowledgement flags are not boolean")
+        accepted = event["accepted"]
+        require(accepted and event["pending_generation"] is None, "ticket acknowledgement was rejected or remained pending")
+        acknowledged_limit = uint(event["current_limit"], "acknowledged current limit", positive=True)
+        state = self.states[ticket["resource"]]
+        if self.ticket_stage == "ack_pre_failure":
+            require(result == "Failed" and acknowledged_limit == ticket["from_limit"] and event["faulted"] is True, "failed pre-write readback did not latch the policy fault")
+            state["faulted"] = True
+        else:
+            require(type(self.apply_result) is str and self.post_readback is not None, "write attempt omits post-write evidence")
+            success = self.apply_result == "Applied" and self.post_readback == ("value", ticket["to_limit"])
+            require(result == ("Applied" if success else "Failed"), "acknowledgement disagrees with apply and post-readback evidence")
+            if success:
+                state["current"] = ticket["to_limit"]
+                self.seen_limits[ticket["resource"]].add(ticket["to_limit"])
+                state["last_success"] = self._apply_completed_at
+                state["faulted"] = False
+            else:
+                state["faulted"] = True
+            require(acknowledged_limit == state["current"] and event["faulted"] is state["faulted"], "acknowledgement state differs from reconstructed ticket result")
+        state["pending"] = None
+        interval = self.pending_intervals[ticket["resource"]][-1]
+        require(interval[0] == ticket["generation"] and interval[2] is None, "ticket pending-interval history is inconsistent")
+        interval[2] = now
+        state["visible"]["current_limit"] = state["current"]
+        state["visible"]["policy_faulted"] = state["faulted"]
+        state["visible"]["pending_generation"] = None
+        self.ticket_queue.pop(0)
+        self.current_ticket = self.ticket_queue[0] if self.ticket_queue else None
+        self.ticket_stage = "pre" if self.ticket_queue else None
+        self.apply_result = None
+        self.post_readback = None
+
+    def set_apply_completed(self, value: tuple[int, int]) -> None:
+        self._apply_completed_at = value[0]
+
+    def finish_reconciliation(self, event: dict[str, Any], now: int) -> None:
+        state = self.reconciliation
+        require(state is not None and state["stage"] == "finish" and event["resource"] == state["resource"], "reconciliation finish has no matching readback")
+        resource = state["resource"]
+        control = self.states[resource]
+        actual = _optional_uint(event["actual_limit"], "reconciliation finished actual limit")
+        require(actual == state["actual"], "reconciliation finish changed its actual readback")
+        accepted = event["accepted"]
+        require(type(accepted) is bool, "reconciliation accepted flag is not boolean")
+        require(type(event["faulted"]) is bool, "reconciliation fault flag is not boolean")
+        current_limit = uint(event["current_limit"], "reconciliation current limit", positive=True)
+        if accepted:
+            require(state["outcome"] == "value" and actual is not None and control["config"]["floor"] <= actual <= control["config"]["ceiling"] and event["rejection"] is None, "accepted reconciliation is outside policy bounds or lacks a value readback")
+            require(current_limit == actual and event["faulted"] is False and event["pending_generation"] is None, "reconciliation did not clear the fault and pending state")
+            control["current"], control["faulted"], control["pending"] = actual, False, None
+            self.seen_limits[resource].add(actual)
+            control["latest"], control["latest_at"], control["sparse"], control["breaches"] = None, None, False, 0
+            control["invalidated_at"] = now
+            control["last_reconcile_bounds"] = (state["readback_completed"], now)
+            control["visible"] = {
+                "current_limit": actual, "utilization_basis_points": None, "telemetry": "Missing",
+                "policy_faulted": False, "pending_generation": None,
+                "no_change": "Some(TelemetryUnavailable)",
+            }
+        else:
+            require(event["faulted"] is True and current_limit == control["current"], "rejected reconciliation cleared a fault or changed the current limit")
+            if state["outcome"] == "value":
+                require(event["rejection"] is not None, "out-of-range reconciliation omitted its policy rejection")
+                text(event["rejection"], "reconciliation rejection", 1024)
+            else:
+                require(event["rejection"] is None, "failed readback fabricated a policy reconciliation rejection")
+            require(control["faulted"], "rejected reconciliation has no latched fault")
+        self.reconciliation = None
+
+    def finish(self) -> dict[str, dict[str, Any]]:
+        require(self.started and self.stop_requested and self.joined, "feedback service omitted startup, stop, or joined evidence")
+        require(self.pending_sensor is None and self.expected_plan_at is None and not self.ticket_queue and self.reconciliation is None, "feedback trace ends with an incomplete operation")
+        for resource, state in self.states.items():
+            require(state["pending"] is None and not state["faulted"], f"feedback control {resource} remains pending or faulted")
+            require(all(interval[2] is not None for interval in self.pending_intervals[resource]), f"feedback control {resource} has an unclosed ticket interval")
+        require(self.first_sample_at is not None and self.last_sample_at is not None, "feedback trace has no accepted samples")
+        require(self.production_bounds is not None and self.drain_bounds is not None, "feedback reader lacks pinned production and drain windows")
+        require(self.first_sample_at <= self.production_bounds[0] and self.last_sample_at >= self.drain_bounds[1], "accepted feedback samples do not cover production through drain")
+        if self.mode == "capacity_calibration":
+            require(self.states["disk"]["current"] == self.states["disk"]["config"]["initial"] and self.states["download"]["current"] == self.states["download"]["config"]["initial"], "capacity calibration changed a byte-rate limit")
+            require(self.dense_during_overlap["cpu"] >= self.policy["minimum_dense_observations"], "capacity calibration has insufficient dense CPU observations during production/drain")
+        else:
+            require(self.dense_during_overlap["cpu"] >= self.policy["minimum_dense_observations"], "pressure validation has insufficient dense CPU observations during production/drain")
+            for resource in ("disk", "download"):
+                if self.policy["capacity_sources"][resource]:
+                    require(self.dense_during_overlap[resource] >= self.policy["minimum_dense_observations"], f"{resource} capacity has insufficient dense telemetry during production/drain")
+                else:
+                    require(self.states[resource]["latest"] is None and self.states[resource]["current"] == self.states[resource]["config"]["initial"], f"missing {resource} application-byte source was not held frozen")
+        return {resource: state["visible"] for resource, state in self.states.items()}
+
+
+def _debug_no_change(value: dict[str, Any]) -> str:
+    reason = value["reason"]
+    if reason == "breach_samples_remaining":
+        return f"Some(BreachSamplesRemaining {{ observed: {value['observed']}, required: {value['required']} }})"
+    if reason == "cooling_down":
+        duration = value["remaining_ns"]
+        if duration >= NSEC:
+            unit, suffix = NSEC, "s"
+        elif duration >= 1_000_000:
+            unit, suffix = 1_000_000, "ms"
+        elif duration >= 1_000:
+            unit, suffix = 1_000, "µs"
+        else:
+            unit, suffix = 1, "ns"
+        whole, fraction = divmod(duration, unit)
+        if unit == 1:
+            formatted = f"{whole}ns"
+        elif fraction == 0:
+            formatted = f"{whole}{suffix}"
+        else:
+            digits = {NSEC: 9, 1_000_000: 6, 1_000: 3}[unit]
+            fractional = f"{fraction:0{digits}d}".rstrip("0")
+            formatted = f"{whole}.{fractional}{suffix}"
+        return f"Some(CoolingDown {{ remaining: {formatted} }})"
+    names = {
+        "telemetry_unavailable": "TelemetryUnavailable", "plan_pending": "PlanPending",
+        "actuation_fault_latched": "ActuationFaultLatched", "hysteresis_band": "HysteresisBand",
+        "at_floor": "AtFloor", "at_ceiling": "AtCeiling", "reduction_quantized": "ReductionQuantized",
+        "recovery_quantized": "RecoveryQuantized",
+    }
+    require(reason in names, "unknown reconstructed no-change reason")
+    return f"Some({names[reason]})"
+
+
+def _same_ticket(found: dict[str, Any], expected: dict[str, Any]) -> None:
+    for key in ("resource", "generation", "from_limit", "to_limit", "planned_at_bounds"):
+        require(found[key] == expected[key], f"ticket event differs at {key}")
+
+
+def _callback_bounds(event: dict[str, Any], event_at: int, anchor_width: int, *, allow_readback: bool = False) -> tuple[tuple[int, int], tuple[int, int]]:
+    start = _timestamp(event["started_at"], f"{event['kind']}.started_at", anchor_width)
+    end = _timestamp(event["completed_at"], f"{event['kind']}.completed_at", anchor_width)
+    require(start[0] < end[0] <= event_at, f"{event['kind']} callback timestamps are out of order")
+    if allow_readback:
+        _readback_value(event, f"{event['kind']} readback")
+    return start, end
+
+
+def _readback_value(event: dict[str, Any], label: str) -> tuple[str, int | None]:
+    outcome = text(event["outcome"], f"{label} outcome", 32)
+    if outcome == "value":
+        require("error" not in event, f"{label} value outcome contains an error")
+        return outcome, uint(event["actual_limit"], f"{label} actual limit", positive=True)
+    if outcome == "failed":
+        require(event["actual_limit"] is None and "error" in event, f"{label} failure record is incomplete")
+        text(event["error"], f"{label} error", 1024)
+        return outcome, None
+    require(outcome == "panicked" and event["actual_limit"] is None and "error" not in event, f"{label} has an unknown readback outcome")
+    return outcome, None
+
+
+def _event_keys(event: dict[str, Any]) -> None:
+    base = {"schema", "sequence", "at", "kind"}
+    kind = event.get("kind")
+    keys: dict[str, set[str]] = {
+        "startup_readback": base | {"resource", "expected_limit", "started_at", "completed_at", "outcome", "actual_limit"},
+        "service_started": base,
+        "sensor_callback": base | {"started_at", "completed_at", "outcome", "raw_sample"},
+        "sample_decision": base | {"sample_at", "sample", "accepted", "rejection", "planned_at"},
+        "plan": base | {"planned_at", "controls"},
+        "plan_rejected": base | {"error"},
+        "pre_apply_readback": base | {"ticket", "started_at", "completed_at", "outcome", "actual_limit", "matches_ticket"},
+        "apply": base | {"ticket", "started_at", "completed_at", "outcome"},
+        "post_apply_readback": base | {"ticket", "started_at", "completed_at", "outcome", "actual_limit"},
+        "acknowledgement": base | {"ticket", "result", "accepted", "current_limit", "faulted", "pending_generation"},
+        "reconciliation_requested": base | {"resource"},
+        "reconciliation_started": base | {"resource"},
+        "reconciliation_readback": base | {"resource", "started_at", "completed_at", "outcome", "actual_limit"},
+        "reconciliation_finished": base | {"resource", "actual_limit", "accepted", "current_limit", "faulted", "pending_generation", "rejection"},
+        "stop_requested": base,
+        "worker_failure": base | {"failure"},
+        "worker_joined": base | {"panicked"},
+    }
+    require(kind in keys, f"unknown feedback event kind: {kind}")
+    expected = keys[kind]
+    if kind in ("startup_readback", "pre_apply_readback", "post_apply_readback", "reconciliation_readback") and event.get("outcome") == "failed":
+        expected = expected | {"error"}
+    require(set(event) == expected, f"feedback event {kind} has unknown or missing fields")
+
+
+def _begin_reconciliation(model: PolicyModel, event: dict[str, Any]) -> None:
+    resource = event["resource"]
+    require(resource in RESOURCES and model.reconciliation is None, "reconciliation request is unknown or duplicated")
+    state = model.states[resource]
+    require(state["faulted"] and state["pending"] is None, "reconciliation request lacks a latched fault or has a pending ticket")
+    model.reconciliation = {"resource": resource, "stage": "started", "outcome": None, "actual": None}
+
+
+def _validate_event_stream(
+    stream: BoundedLines,
+    directory_fd: int,
+    expectation: dict[str, Any],
+    manifest: dict[str, Any],
+    expected_sha: str,
+) -> tuple[str, PolicyModel, dict[str, Any]]:
+    model = PolicyModel(expectation, manifest["clock_anchor"][1] - manifest["clock_anchor"][0])
+    model.production_bounds = (manifest["phases"]["production_start"]["lower"], manifest["phases"]["production_start"]["upper"])
+    model.drain_bounds = (manifest["phases"]["drain_end"]["lower"], manifest["phases"]["drain_end"]["upper"])
+    startup_count = 0
+    event_count = 0
+    joined_at: tuple[int, int] | None = None
+    last_sensor: tuple[tuple[int, int], dict[str, int | None]] | None = None
+    for raw_line in stream:
+        event = _json_line(raw_line, "feedback event")
+        _event_keys(event)
+        require(event["schema"] == EVENT_SCHEMA, "unsupported feedback event schema")
+        sequence = uint(event["sequence"], "feedback event sequence", positive=True, maximum=MAX_EVENT_RECORDS)
+        require(sequence == event_count + 1, "feedback event sequence has a gap or duplicate")
+        at = _timestamp(event["at"], "feedback event time", model.clock_width)
+        require(model.last_event_lower is None or at[0] >= model.last_event_lower, "feedback event timestamps moved backwards")
+        model.last_event_lower = at[0]
+        model.event_count = sequence
+        event_count += 1
+        kind = event["kind"]
+        if model.joined:
+            raise ValidationError("feedback event appears after WorkerJoined")
+        if kind == "startup_readback":
+            require(not model.started and startup_count < len(RESOURCES), "startup readback is duplicated or follows service start")
+            resource = RESOURCES[startup_count]
+            require(event["resource"] == resource, "startup readback controls are out of fixed CPU/disk/download order")
+            initial = expectation["policy"]["controls"][resource]["initial"]
+            require(uint(event["expected_limit"], f"{resource} startup expected limit", positive=True) == initial, f"{resource} startup limit differs from expectation")
+            _callback_bounds(event, at[0], model.clock_width, allow_readback=True)
+            outcome, actual = _readback_value(event, f"{resource} startup readback")
+            require(outcome == "value" and actual == initial, f"{resource} startup actuator readback failed")
+            startup_count += 1
+        elif kind == "service_started":
+            require(startup_count == len(RESOURCES) and not model.started, "feedback service started without all three startup readbacks")
+            model.started = True
+        elif kind == "sensor_callback":
+            require(model.started and not model.joined and model.pending_sensor is None and model.expected_plan_at is None and not model.ticket_queue and model.reconciliation is None, "sensor callback overlaps an unfinished feedback operation")
+            start, end = _callback_bounds(event, at[0], model.clock_width)
+            outcome = text(event["outcome"], "sensor callback outcome", 1024)
+            require(outcome == "Sampled" and event["raw_sample"] is not None, "feedback sensor callback failed or returned no measured sample")
+            sample_at, readings = _sample_object(event["raw_sample"], "raw feedback sample", model.clock_width, raw_sensor=True)
+            require(start[0] <= sample_at[0] <= end[0] and end[0] <= at[0], "raw feedback sample lies outside its callback interval")
+            model.pending_sensor = (sample_at, readings)
+            last_sensor = model.pending_sensor
+        elif kind == "sample_decision":
+            require(model.started and model.pending_sensor is not None, "sample decision has no matching sensor callback")
+            sample_at, readings = _sample_object(event["sample"], "policy feedback sample", model.clock_width)
+            named_at = _timestamp(event["sample_at"], "sample decision time", model.clock_width)
+            require(sample_at == named_at and at[0] >= sample_at[0], "sample decision timestamp differs from its sample")
+            raw_at, raw_readings = model.pending_sensor
+            require(sample_at == raw_at, "sample decision changed the sensor's monotonic timestamp")
+            for resource, raw_value in raw_readings.items():
+                sanitized = None if raw_value is not None and raw_value > 10_000 else raw_value
+                require(readings[resource] == sanitized, f"sample decision changed or failed to sanitize {resource} telemetry")
+            require(type(event["accepted"]) is bool and event["rejection"] is None, "sample decision is rejected or has an unknown rejection diagnostic")
+            planned = None if event["planned_at"] is None else _timestamp(event["planned_at"], "sample planned time", model.clock_width)
+            if model.stop_requested:
+                require(event["accepted"] is False and planned is None, "feedback policy accepted a sample after stop was requested")
+                model.pending_sensor = None
+                last_sensor = None
+                continue
+            require(event["accepted"] is True and planned is not None, "feedback sample was rejected or lacks its policy plan")
+            if expectation["mode"] == "capacity_calibration":
+                require(readings["disk"] is None and readings["download"] is None, "capacity calibration emitted app-byte telemetry before denominators existed")
+                require(readings["cpu"] is not None, "capacity calibration CPU telemetry is missing")
+            model.observe(sample_at[0], readings)
+            model.accepted_sample_times.append(sample_at[0])
+            model.sample_decision_record_times.append(at[0])
+            model.expected_plan_at = planned
+            model.pending_sensor = None
+            last_sensor = None
+        elif kind == "plan":
+            require(model.expected_plan_at is not None, "feedback plan has no accepted sample")
+            planned = _timestamp(event["planned_at"], "policy plan time", model.clock_width)
+            model.validate_plan(event, at[0], planned)
+        elif kind == "plan_rejected":
+            raise ValidationError("feedback runtime rejected policy planning")
+        elif kind in ("pre_apply_readback", "apply", "post_apply_readback", "acknowledgement"):
+            model.validate_ticket_event(event, at[0])
+        elif kind == "reconciliation_requested":
+            require(model.started and not model.ticket_queue and model.expected_plan_at is None, "reconciliation overlaps a pending plan or write")
+            _begin_reconciliation(model, event)
+        elif kind == "reconciliation_started":
+            require(model.reconciliation is not None and model.reconciliation["stage"] == "started" and event["resource"] == model.reconciliation["resource"], "reconciliation start does not match a request")
+            model.reconciliation["stage"] = "readback"
+        elif kind == "reconciliation_readback":
+            state = model.reconciliation
+            require(state is not None and state["stage"] == "readback" and event["resource"] == state["resource"], "reconciliation readback has no matching start")
+            _, completed = _callback_bounds(event, at[0], model.clock_width, allow_readback=True)
+            outcome, actual = _readback_value(event, "reconciliation readback")
+            state["outcome"], state["actual"], state["readback_completed"] = outcome, actual, completed[0]
+            state["stage"] = "finish"
+        elif kind == "reconciliation_finished":
+            model.finish_reconciliation(event, at[0])
+        elif kind == "stop_requested":
+            require(model.started and not model.stop_requested, "feedback stop request is missing startup or duplicated")
+            model.stop_requested = True
+        elif kind == "worker_failure":
+            raise ValidationError("feedback trace records a worker failure")
+        elif kind == "worker_joined":
+            require(model.stop_requested and event["panicked"] is False, "feedback worker did not join cleanly after stop")
+            require(last_sensor is None, "feedback worker joined with an unfinished sensor callback")
+            model.joined = True
+            joined_at = at
+        else:
+            raise ValidationError(f"feedback event kind is unsupported: {kind}")
+
+    actual_sha = stream.finish(directory_fd)
+    require(actual_sha == expected_sha, "feedback event raw SHA-256 differs from caller pin")
+    require(event_count == manifest["event_count"] and event_count > 0, "feedback event count differs from manifest")
+    final_state = model.finish()
+    require(joined_at is not None, "feedback event stream omits WorkerJoined")
+    return actual_sha, model, {"final_state": final_state, "worker_joined_at": joined_at}
+
+
+def _parse_sample_row(line: bytes, sequence: int) -> dict[str, Any]:
+    try:
+        fields = line.decode("ascii").split("\t")
+    except UnicodeError as error:
+        raise ValidationError("resource sample row is not ASCII") from error
+    require(len(fields) == len(SAMPLE_HEADER), "resource sample row field count differs from its strict schema")
+    require(fields[0] == str(sequence), "resource sample sequence has a gap or duplicate")
+    result: dict[str, Any] = dict(zip(SAMPLE_HEADER, fields))
+    bool_fields = {
+        "feedback_stop_requested", "feedback_shutdown_complete",
+        *(f"{direction}_meter_{field}" for direction in RATE_DIRECTIONS for field in (
+            "counter_overflow", "invalid_io", "source_count_overflow", "generation_overflow",
+        )),
+        *(f"{resource}_policy_faulted" for resource in RESOURCES),
+    }
+    optional_fields = {
+        *(f"{resource}_utilization_basis_points" for resource in RESOURCES),
+        *(f"{resource}_pending_generation" for resource in RESOURCES),
+    }
+    enum_fields = {*(f"{resource}_telemetry" for resource in RESOURCES)}
+    textual_fields = {"feedback_worker_failure", *(f"{resource}_no_change" for resource in RESOURCES)}
+    for key, value in tuple(result.items()):
+        if key in bool_fields:
+            require(value in ("true", "false"), f"resource sample {key} is not boolean")
+            result[key] = value == "true"
+        elif key in optional_fields:
+            result[key] = None if value == "none" else uint(_decimal(value, key), key)
+        elif key in enum_fields:
+            require(value in ("Missing", "Sparse", "Stale", "Fresh"), f"resource sample {key} is an unknown telemetry state")
+        elif key in textual_fields:
+            text(value, key, 1024)
+        else:
+            result[key] = uint(_decimal(value, key), key)
+    for resource in RESOURCES:
+        value = result[f"{resource}_utilization_basis_points"]
+        require(value is None or value <= 10_000, f"resource sample {resource} utilization exceeds 100 percent")
+        telemetry = result[f"{resource}_telemetry"]
+        require((telemetry == "Missing") == (value is None), f"resource sample {resource} telemetry/value state contradicts")
+    require(result["feedback_worker_failure"] == "none", "resource sample records a feedback worker failure")
+    return result
+
+
+def _decimal(value: str, label: str) -> int:
+    require(re.fullmatch(r"0|[1-9][0-9]*", value) is not None, f"{label} is not a canonical unsigned decimal")
+    return int(value)
+
+
+def _validate_resource_sample_rows(
+    stream: BoundedLines,
+    directory_fd: int,
+    expectation: dict[str, Any],
+    manifest: dict[str, Any],
+    expected_sha: str,
+    model: PolicyModel,
+    event_info: dict[str, Any],
+) -> str:
+    iterator = iter(stream)
+    schema = next(iterator, None)
+    header = next(iterator, None)
+    require(schema == f"schema\t{SAMPLE_SCHEMA}".encode("ascii"), "resource sample file has an unsupported schema header")
+    require(header == "\t".join(SAMPLE_HEADER).encode("ascii"), "resource sample file has unknown, missing, or reordered columns")
+    previous_lower: int | None = None
+    previous_feedback_count = 0
+    previous_meters: dict[str, tuple[int, int, int, int, int, int]] = {}
+    final: dict[str, Any] | None = None
+    count = 0
+    phases = manifest["phases"]
+    anchor_width = manifest["clock_anchor"][1] - manifest["clock_anchor"][0]
+    policy = expectation["policy"]
+    for raw_line in iterator:
+        count += 1
+        require(count <= MAX_SAMPLE_ROWS, "resource sample file exceeds its fixed row cap")
+        row = _parse_sample_row(raw_line, count)
+        lower, upper = row["window_lower_ns"], row["window_upper_ns"]
+        require(lower <= upper and upper - lower <= 200_000_000, "resource sample window is reversed or excessively wide")
+        if previous_lower is not None:
+            elapsed = lower - previous_lower
+            require(0 < elapsed <= policy["max_dense_gap_ns"], "resource snapshots are duplicated, out of order, or sparse")
+        previous_lower = lower
+        require(row["rss_kib"] > 0 and row["hwm_kib"] >= row["rss_kib"], "resource sample RSS/HWM is invalid")
+        require(row["collector_task_lease_count"] == policy["collector"]["task_lease_count"], "resource sample collector Task lease differs from expectation")
+
+        for owner, ceilings in (("global", policy["global_ceilings"]), ("tenant", policy["tenant_ceilings"])):
+            for resource in DOMAIN:
+                ceiling = row[f"{owner}_ceiling_{resource}"]
+                limit = row[f"{owner}_limit_{resource}"]
+                used = row[f"{owner}_used_{resource}"]
+                require(ceiling == ceilings[resource], f"resource sample {owner} {resource} ceiling differs from caller-pinned value")
+                zero_limit_allowed = expectation["schema"] == EXPECTATION_SCHEMA_V2 and ceiling == 0
+                require((limit > 0 or zero_limit_allowed) and limit <= ceiling and used <= ceiling, f"resource sample {owner} {resource} exceeds its hard ceiling")
+        expected_scope = {
+            "managed_memory_limit": "managed_memory", "disk_operation_limit": "disk_operations",
+            "network_operation_limit": "network_operations",
+        }
+        for sample_key, policy_key in expected_scope.items():
+            require(row[f"scope_{sample_key}"] == policy["scope_limits"][policy_key], f"scope {sample_key} differs from caller-pinned limit")
+        for used_key, limit_key in (("scope_managed_memory_used", "scope_managed_memory_limit"),
+                                    ("scope_disk_operations_used", "scope_disk_operation_limit"),
+                                    ("scope_network_operations_used", "scope_network_operation_limit")):
+            require(row[used_key] <= row[limit_key], f"resource sample {used_key} exceeds its scope limit")
+
+        for direction in RATE_DIRECTIONS:
+            bucket = policy["rate_buckets"][direction]
+            prefix = f"{direction}_rate_"
+            require(row[prefix + "ceiling_bytes_per_second"] == bucket["ceiling_bytes_per_second"], f"{direction} bucket rate ceiling differs from expectation")
+            require(row[prefix + "ceiling_burst_bytes"] == bucket["ceiling_burst_bytes"], f"{direction} bucket burst ceiling differs from expectation")
+            require(row[prefix + "max_reservations"] == bucket["max_reservations"], f"{direction} bucket reservation cap differs from expectation")
+            require(row[prefix + "bytes_per_second"] <= bucket["ceiling_bytes_per_second"] and row[prefix + "burst_bytes"] <= bucket["ceiling_burst_bytes"], f"{direction} bucket exceeds its hard rate/burst cap")
+            require(row[prefix + "available_bytes"] + row[prefix + "reserved_bytes"] <= row[prefix + "burst_bytes"], f"{direction} bucket credits exceed its burst")
+            require(row[prefix + "reservations"] <= bucket["max_reservations"], f"{direction} bucket exceeds its reservation cap")
+        require(row["upload_rate_bytes_per_second"] == policy["rate_buckets"]["upload"]["ceiling_bytes_per_second"], "upload control changed despite being fixed")
+
+        for direction in RATE_DIRECTIONS:
+            prefix = f"{direction}_meter_"
+            measured_lower, measured_upper = row[prefix + "measured_lower_ns"], row[prefix + "measured_upper_ns"]
+            require(measured_lower <= measured_upper and measured_upper - measured_lower == anchor_width, f"{direction} meter timestamp bracket differs from trace anchor")
+            require(lower <= measured_lower and measured_upper <= upper, f"{direction} meter timestamp is outside its independently bracketed resource snapshot")
+            if expectation["schema"] == EXPECTATION_SCHEMA_V1:
+                require(row[prefix + "attached_sources"] == policy["meter_sources"][direction], f"legacy {direction} meter source count differs from expectation")
+            else:
+                bounds = policy["meter_source_bounds"][direction]
+                require(
+                    bounds["minimum_live"] <= row[prefix + "attached_sources"] <= bounds["maximum_live"],
+                    f"{direction} meter attached source count is outside caller-frozen bounds",
+                )
+            require(not any(row[prefix + field] for field in ("counter_overflow", "invalid_io", "source_count_overflow", "generation_overflow")), f"{direction} meter reports a counter or I/O fault")
+            current = (
+                measured_lower, row[prefix + "committed_bytes"], row[prefix + "completions"],
+                row[prefix + "generation"], row[prefix + "attached_sources"], measured_upper,
+            )
+            previous = previous_meters.get(direction)
+            if previous is not None:
+                meter_elapsed = measured_lower - previous[0]
+                require(0 < meter_elapsed <= policy["max_dense_gap_ns"] and row[prefix + "generation"] >= previous[3], f"{direction} meter timestamps failed strict advancement or 200 ms freshness")
+                if row[prefix + "generation"] == previous[3]:
+                    require(current[1] >= previous[1] and current[2] >= previous[2], f"{direction} meter counters decreased without a generation change")
+            previous_meters[direction] = current
+
+        feedback_count = row["feedback_sample_count"]
+        require(previous_feedback_count <= feedback_count <= model.sample_count, "resource sample feedback count moved backwards or exceeds event history")
+        definitely_updated = bisect_right(model.sample_decision_record_times, lower)
+        possibly_updated = bisect_right(model.accepted_sample_times, upper)
+        require(definitely_updated <= feedback_count <= possibly_updated, "resource sample feedback count does not fit its same-clock event window")
+        previous_feedback_count = feedback_count
+        for resource in RESOURCES:
+            config = policy["controls"][resource]
+            current = row[f"{resource}_current_limit"]
+            require(config["floor"] <= current <= config["ceiling"] and current in model.seen_limits[resource], f"resource sample {resource} current limit is not a reconstructed policy value")
+            if resource in ("disk", "download") and not policy["capacity_sources"][resource]:
+                require(row[f"{resource}_utilization_basis_points"] is None and row[f"{resource}_current_limit"] == config["initial"], f"missing {resource} byte source was not frozen")
+            pending = row[f"{resource}_pending_generation"]
+            if pending is not None:
+                require(pending in model.seen_generations, f"resource sample {resource} reports a generation absent from the event history")
+                active = any(
+                    gen == pending and start <= upper and (end is None or end >= lower)
+                    for gen, start, end in model.pending_intervals[resource]
+                )
+                require(active, f"resource sample {resource} reports a stale or fabricated pending generation")
+        final = row
+    actual_sha = stream.finish(directory_fd)
+    require(actual_sha == expected_sha and actual_sha == manifest["artifacts"]["resource-samples.tsv"]["sha256"], "resource sample raw SHA-256 differs from caller or manifest pin")
+    require(stream.bytes_read == manifest["artifacts"]["resource-samples.tsv"]["bytes"], "resource sample byte count differs from manifest")
+    require(count == manifest["sample_count"] and final is not None, "resource sample count differs from manifest")
+    require(final["window_lower_ns"] >= event_info["worker_joined_at"][0], "terminal resource sample precedes WorkerJoined history")
+    require(final["feedback_sample_count"] == model.sample_count and final["feedback_stop_requested"] is True and final["feedback_shutdown_complete"] is True, "terminal resource sample does not prove complete feedback shutdown")
+    for resource in RESOURCES:
+        expected = event_info["final_state"][resource]
+        require(final[f"{resource}_current_limit"] == expected["current_limit"], f"terminal {resource} limit differs from reconstructed policy")
+        require(final[f"{resource}_utilization_basis_points"] == expected["utilization_basis_points"], f"terminal {resource} telemetry differs from reconstructed policy")
+        require(final[f"{resource}_telemetry"] == expected["telemetry"], f"terminal {resource} telemetry state differs from reconstructed policy")
+        require(final[f"{resource}_policy_faulted"] is expected["policy_faulted"] and final[f"{resource}_pending_generation"] == expected["pending_generation"], f"terminal {resource} fault/pending state differs from reconstructed policy")
+        require(final[f"{resource}_no_change"] == expected["no_change"], f"terminal {resource} no-change reason differs from reconstructed policy")
+    if expectation["mode"] == "capacity_calibration":
+        require(model.ticket_count == 0, "capacity calibration contains a feedback write")
+        for resource in ("disk", "download"):
+            require(final[f"{resource}_telemetry"] == "Missing" and final[f"{resource}_utilization_basis_points"] is None, f"capacity calibration {resource} telemetry is not Missing")
+    require(final["feedback_worker_failure"] == "none", "terminal resource sample reports a worker failure")
+    return actual_sha
+
+
+def verify_feedback(
+    expectation_path: Path,
+    expected_expectation_sha256: str,
+    trace_directory: Path,
+    expected_artifact_sha256: dict[str, str],
+) -> dict[str, Any]:
+    expectation, expectation_raw_sha = read_canonical(
+        expectation_path, "feedback expectation", MAX_EXPECTATION_BYTES,
+        digest(expected_expectation_sha256, "expected expectation raw SHA-256"),
+    )
+    recipe = _validate_expectation_body({key: value for key, value in expectation.items() if key != "recipe_sha256"})
+    require(digest(expectation.get("recipe_sha256"), "expectation self digest") == digest_object(recipe), "feedback expectation self digest is invalid")
+    source_manifest = _verify_source_manifest(recipe)
+    if recipe["schema"] == EXPECTATION_SCHEMA_V2:
+        validate_construction_probe(recipe, source_manifest["value"])
+    artifact_pins = {
+        "feedback-trace-manifest.tsv": digest(expected_artifact_sha256.get("manifest"), "expected manifest raw SHA-256"),
+        "feedback-events.jsonl": digest(expected_artifact_sha256.get("events"), "expected events raw SHA-256"),
+        "resource-samples.tsv": digest(expected_artifact_sha256.get("samples"), "expected samples raw SHA-256"),
+    }
+    root_fd = _open_trace_directory(absolute_path(str(trace_directory), "trace directory"))
+    try:
+        require(TRACE_FILES == set(artifact_pins), "feedback trace artifact pins do not match the fixed file set")
+        _validate_trace_directory_layout(root_fd)
+        with BoundedLines(root_fd, "feedback-trace-manifest.tsv", "feedback trace manifest", MAX_MANIFEST_BYTES, MAX_MANIFEST_BYTES) as manifest_file:
+            manifest_rows = list(manifest_file)
+            manifest_sha = manifest_file.finish(root_fd)
+            require(manifest_sha == artifact_pins["feedback-trace-manifest.tsv"], "feedback manifest raw SHA-256 differs from caller pin")
+            manifest = _parse_manifest(manifest_rows, recipe)
+        require(manifest["artifacts"]["feedback-events.jsonl"]["sha256"] == artifact_pins["feedback-events.jsonl"], "manifest event digest differs from separately pinned raw SHA-256")
+        require(manifest["artifacts"]["resource-samples.tsv"]["sha256"] == artifact_pins["resource-samples.tsv"], "manifest sample digest differs from separately pinned raw SHA-256")
+        with BoundedLines(root_fd, "feedback-events.jsonl", "feedback events", MAX_EVENT_FILE_BYTES, MAX_EVENT_LINE_BYTES) as events_file:
+            require(events_file.before.st_size == manifest["artifacts"]["feedback-events.jsonl"]["bytes"], "event file size differs from manifest")
+            events_sha, model, event_info = _validate_event_stream(
+                events_file, root_fd, recipe, manifest, artifact_pins["feedback-events.jsonl"],
+            )
+        with BoundedLines(root_fd, "resource-samples.tsv", "resource samples", MAX_SAMPLE_FILE_BYTES, MAX_SAMPLE_LINE_BYTES) as samples_file:
+            require(samples_file.before.st_size == manifest["artifacts"]["resource-samples.tsv"]["bytes"], "resource sample file size differs from manifest")
+            samples_sha = _validate_resource_sample_rows(
+                samples_file, root_fd, recipe, manifest, artifact_pins["resource-samples.tsv"], model, event_info,
+            )
+    finally:
+        os.close(root_fd)
+
+    production = manifest["production_window"]
+    drain = manifest["drain_window"]
+    pressure_ok = False
+    runtime_ok = False
+    runtime_sha: str | None = None
+    release_complete = False
+    if recipe["mode"] == "pressure_validation":
+        pressure_ok, _ = _verify_pressure_proof(
+            recipe, tuple(production["start_monotonic_ns"]), drain,
+        )
+        runtime_ok, runtime_sha, release_complete = _verify_runtime_binding(recipe, event_info["final_state"], model.sample_count)
+    _, reader_sha = read_stable(Path(__file__).resolve(), "feedback readback validator", 4 * 1024 * 1024)
+    result = {
+        "schema": READBACK_SCHEMA,
+        "mode": recipe["mode"],
+        "validated": True,
+        "qualification_eligible": bool(
+            recipe["schema"] == EXPECTATION_SCHEMA_V2
+            and recipe["mode"] == "pressure_validation"
+            and pressure_ok and runtime_ok and release_complete
+        ),
+        "expectation_raw_sha256": expectation_raw_sha,
+        "validator_sha256": reader_sha,
+        "identity": dict(recipe["identity"]),
+        "raw_artifact_sha256": {"manifest": manifest_sha, "events": events_sha, "samples": samples_sha},
+        "production_window": production,
+        "final_runtime_binding": {
+            "raw_sha256": runtime_sha,
+            "validated": runtime_ok,
+        },
+    }
+    require(set(result) == {
+        "schema", "mode", "validated", "qualification_eligible", "expectation_raw_sha256",
+        "validator_sha256", "identity", "raw_artifact_sha256", "production_window",
+        "final_runtime_binding",
+    }, "feedback validation receipt has an unstable key set")
+    return result
+
+
+def _write_exclusive(path: Path, raw: bytes) -> None:
+    require(path.is_absolute() and str(path) == str(Path(str(path))), "output path must be absolute and normalized")
+    try:
+        require(path.parent.resolve(strict=True) == path.parent, "output parent traverses a symlink or alias")
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0), 0o600)
+    except OSError as error:
+        raise ValidationError(f"cannot create fresh output file: {error}") from error
+    try:
+        view = memoryview(raw)
+        while view:
+            written = os.write(fd, view)
+            require(written > 0, "output write made no progress")
+            view = view[written:]
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    commands = parser.add_subparsers(dest="command", required=True)
+    freeze = commands.add_parser("freeze", help="canonicalize a caller-supplied feedback expectation")
+    freeze.add_argument("--spec", type=Path, required=True)
+    freeze.add_argument("--output", type=Path, required=True)
+    verify = commands.add_parser("verify", help="independently stream and validate one feedback trace")
+    verify.add_argument("--expectation", type=Path, required=True)
+    verify.add_argument("--expected-expectation-sha256", required=True)
+    verify.add_argument("--trace-directory", type=Path, required=True)
+    verify.add_argument("--expected-manifest-sha256", required=True)
+    verify.add_argument("--expected-events-sha256", required=True)
+    verify.add_argument("--expected-samples-sha256", required=True)
+    verify.add_argument("--output", type=Path, required=True)
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = _parser().parse_args(argv)
+    try:
+        if args.command == "freeze":
+            raw, raw_sha = read_stable(args.spec, "feedback expectation spec", MAX_EXPECTATION_BYTES)
+            spec = parse_json(raw, "feedback expectation spec", MAX_EXPECTATION_BYTES)
+            require(raw == canonical_bytes(spec), "feedback expectation spec is not canonical JSON")
+            frozen, frozen_sha = build_pressure_expectation_recipe(spec)
+            _write_exclusive(args.output, frozen)
+            sys.stdout.buffer.write(canonical_bytes({"expectation_raw_sha256": frozen_sha, "recipe_sha256": json.loads(frozen)["recipe_sha256"]}))
+            return 0
+        result = verify_feedback(
+            args.expectation, args.expected_expectation_sha256, args.trace_directory,
+            {
+                "manifest": args.expected_manifest_sha256,
+                "events": args.expected_events_sha256,
+                "samples": args.expected_samples_sha256,
+            },
+        )
+        _write_exclusive(args.output, canonical_bytes(result))
+        sys.stdout.buffer.write(canonical_bytes({"validated": result["validated"], "qualification_eligible": result["qualification_eligible"], "expectation_raw_sha256": result["expectation_raw_sha256"], "validator_sha256": result["validator_sha256"]}))
+        return 0
+    except (ValidationError, OSError, ValueError) as error:
+        print(f"application-feedback-readback: {error}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

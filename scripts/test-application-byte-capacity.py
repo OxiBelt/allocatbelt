@@ -24,6 +24,12 @@ assert CAMPAIGN_TEST_SPEC is not None and CAMPAIGN_TEST_SPEC.loader is not None
 campaign_fixtures = importlib.util.module_from_spec(CAMPAIGN_TEST_SPEC)
 CAMPAIGN_TEST_SPEC.loader.exec_module(campaign_fixtures)
 
+FEEDBACK_TEST_PATH = Path(__file__).with_name("test-application-feedback-readback.py")
+FEEDBACK_TEST_SPEC = importlib.util.spec_from_file_location("capacity_feedback_fixtures", FEEDBACK_TEST_PATH)
+assert FEEDBACK_TEST_SPEC is not None and FEEDBACK_TEST_SPEC.loader is not None
+feedback_fixtures = importlib.util.module_from_spec(FEEDBACK_TEST_SPEC)
+FEEDBACK_TEST_SPEC.loader.exec_module(feedback_fixtures)
+
 
 class Fixture:
     def __init__(self, root: Path, workload: str = "mixed"):
@@ -163,6 +169,54 @@ class CapacityTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory(prefix="byte-capacity-", dir="/var/tmp")
         self.addCleanup(self.temp.cleanup)
         self.fixture = Fixture(Path(self.temp.name))
+
+    def v2_fixture(self):
+        root = Path(self.temp.name) / "v2"
+        root.mkdir()
+        fixture = Fixture(root, "disk")
+        feedback = feedback_fixtures.Fixture(root / "feedback-policy", "disk")
+        probe_path = root / "construction-probe.json"
+        probe_raw = capacity.canonical(feedback._construction_probe())
+        probe_path.write_bytes(probe_raw)
+        body = {key: value for key, value in fixture.expectation.items() if key != "recipe_sha256"}
+        body["schema"] = "allocatbelt.application-feedback-expectation.v2"
+        body["policy"] = feedback.policy
+        body["construction_probe"] = {
+            "path": str(probe_path), "raw_sha256": hashlib.sha256(probe_raw).hexdigest(),
+            "allocator": fixture.identity["allocator"], "binary_sha256": fixture.identity["binary_sha256"],
+        }
+        body["recipe_sha256"] = hashlib.sha256(capacity.canonical(body)).hexdigest()
+        fixture.expectation = body
+        fixture.expectation_pin = fixture.pin_json("expectation.json", body)
+        fixture.request["expectation"] = fixture.expectation_pin
+        fixture.request["expectation_sha256"] = fixture.expectation_pin["sha256"]
+        fixture.refresh_validation()
+        return fixture, probe_path
+
+    def test_v2_capacity_uses_the_source_pinned_reader_probe_projection(self):
+        fixture, _ = self.v2_fixture()
+        artifact, receipt = fixture.produce()
+        self.assertIn(b"disk.bytes_per_second\t10000\n", artifact)
+        self.assertEqual(receipt["expectation_raw_sha256"], fixture.expectation_pin["sha256"])
+        self.assertFalse(receipt["qualification_eligible"])
+
+    def test_v2_probe_pin_and_numeric_projection_are_both_required(self):
+        fixture, probe_path = self.v2_fixture()
+        probe = json.loads(probe_path.read_bytes())
+        probe["collector"]["control_charge_bytes"] += 1
+        probe_raw = capacity.canonical(probe)
+        probe_path.write_bytes(probe_raw)
+        with self.assertRaises(capacity.CapacityError):
+            fixture.produce()
+        fixture.expectation["construction_probe"]["raw_sha256"] = hashlib.sha256(probe_raw).hexdigest()
+        body = {key: value for key, value in fixture.expectation.items() if key != "recipe_sha256"}
+        body["recipe_sha256"] = hashlib.sha256(capacity.canonical(body)).hexdigest()
+        fixture.expectation_pin = fixture.pin_json("expectation.json", body)
+        fixture.request["expectation"] = fixture.expectation_pin
+        fixture.request["expectation_sha256"] = fixture.expectation_pin["sha256"]
+        fixture.refresh_validation()
+        with self.assertRaisesRegex(capacity.CapacityError, "collector Control charge"):
+            fixture.produce()
 
     def test_exact_application_rates_and_transitive_provenance(self):
         artifact, receipt = self.fixture.produce()

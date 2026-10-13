@@ -1112,7 +1112,7 @@ def verify_pressure(
     recipe_path: Path, expected_recipe_sha: str, artifacts: Path,
     expected: dict[str, str],
 ) -> dict[str, Any]:
-    recipe_value, _, _ = read_canonical(recipe_path, "frozen pressure recipe", MAX_RECIPE_BYTES)
+    recipe_value, _, recipe_raw_sha = read_canonical(recipe_path, "frozen pressure recipe", MAX_RECIPE_BYTES)
     recipe_info = _validate_recipe(recipe_value, expected_recipe_sha)
     recipe = recipe_value
     _verify_script_hashes(recipe_info)
@@ -1173,7 +1173,7 @@ def verify_pressure(
     workers = _validate_worker_start(start_event, recipe)
     require(all(item["pid"] != process["pid"] for item in workers.values()), "application PID is also listed as a pressure worker")
     _validate_cleanup(run, workers, recipe)
-    _validate_event_timeline(events, start_event, recipe, process, binding, run, workers)
+    timeline = _validate_event_timeline(events, start_event, recipe, process, binding, run, workers)
     require(event_state.get("event_count") == run["event_count"] and event_state.get("events_sha256") == run["events_sha256"] == expected["events"] and event_state.get("events_bytes") == run["events_bytes"], "run receipt event count/digest differs from streamed raw event file")
     scratch_path = Path(recipe["storage"]["pressure_scratch_path"]) / f".allocatbelt-pressure-{recipe_info['identity']['nonce']}.bin"
     require(not scratch_path.exists() and not scratch_path.is_symlink(), "bounded block-I/O scratch file remains after pressure cleanup")
@@ -1183,7 +1183,13 @@ def verify_pressure(
         "schema": READBACK_SCHEMA,
         "status": "valid",
         "recipe_sha256": expected_recipe_sha,
+        "recipe_raw_sha256": recipe_raw_sha,
+        "validator_sha256": recipe_info["script_hashes"]["reader_sha256"],
         "condition_sha256": recipe_info["condition_sha256"],
+        "identity": {
+            key: recipe_info["identity"][key]
+            for key in ("host_id", "run_id", "pair_id", "condition_id", "member", "nonce", "allocator", "executor", "phase")
+        },
         "run_sha256": expected["run"],
         "events_sha256": expected["events"],
         "launch_record_sha256": expected["launch"],
@@ -1191,6 +1197,14 @@ def verify_pressure(
         "readiness_marker_sha256": expected["ready"],
         "sample_count": run["sample_count"],
         "application_overlap_nanoseconds": run["application_overlap_nanoseconds"],
+        "application_process": {
+            "pid": process["pid"],
+            "start_ticks": process["start_ticks"],
+            "nonce": observed_process["nonce"],
+            "executable_sha256": observed_process["executable_sha256"],
+        },
+        "application_window": timeline["application_window"],
+        "continuous_ready_window": timeline["continuous_ready_window"],
         "readiness_windows_passed": True,
         "cleanup_rechecked": True,
         "physical_nic_claimed": False,
@@ -1216,7 +1230,7 @@ def _advance_app_sample_continuity(
 def _validate_event_timeline(
     events: Iterator[dict[str, Any]], start_event: dict[str, Any], recipe: dict[str, Any], process: dict[str, Any],
     binding: dict[str, Any], run: dict[str, Any], workers: dict[tuple[str, int | None], dict[str, Any]],
-) -> None:
+) -> dict[str, dict[str, int]]:
     start_ns = uint(start_event["monotonic_ns"], "pressure start time", positive=True)
     interval_ns = recipe["schedule"]["sample_interval_ms"] * 1_000_000
     previous_end: int | None = None
@@ -1235,6 +1249,9 @@ def _validate_event_timeline(
     cleanup_count = 0
     app_start_count = 0
     app_exit_count = 0
+    continuous_ready_start_ns: int | None = None
+    continuous_ready_end_ns: int | None = None
+    continuous_ready_broken = False
     for event in events:
         require(event.get("schema") == EVENT_SCHEMA, "pressure event has unknown schema")
         kind = event.get("kind")
@@ -1260,11 +1277,26 @@ def _validate_event_timeline(
             if app_start_ns is None:
                 startup_ready.append(result["readiness"]["all_ready"])
                 del startup_ready[:-recipe["schedule"]["startup_ready_windows"]]
-            elif start >= app_start_ns and result["app_active"]:
-                active_readiness_windows += 1
-                active_readiness_ok = active_readiness_ok and result["readiness"]["all_ready"]
+            else:
+                ready_barrier_ns = binding["pressure_ready_monotonic_ns"]
+                require(start >= ready_barrier_ns, "pressure sample precedes the authenticated readiness barrier")
+                sample_ready = result["readiness"]["all_ready"]
+                if sample_ready:
+                    if continuous_ready_start_ns is None:
+                        continuous_ready_start_ns = start
+                        require(
+                            continuous_ready_start_ns >= ready_barrier_ns,
+                            "continuous ready pressure interval precedes its readiness barrier",
+                        )
+                    if not continuous_ready_broken:
+                        continuous_ready_end_ns = end
+                elif continuous_ready_start_ns is not None:
+                    continuous_ready_broken = True
             if result["app_active"]:
                 require(app_start_ns is not None, "application was live before its authenticated start event")
+                active_readiness_windows += 1
+                active_readiness_ok = active_readiness_ok and result["readiness"]["all_ready"]
+                require(result["readiness"]["all_ready"], "pressure window overlapping the live application is unready")
                 if first_live_sequence is None:
                     first_live_sequence = sequence
                 last_live_sample = {
@@ -1325,6 +1357,24 @@ def _validate_event_timeline(
     require(overlap >= recipe["schedule"]["minimum_overlap_seconds"] * 1_000_000_000 and overlap == run["application_overlap_nanoseconds"], "application overlap differs from the frozen minimum or receipt")
     require(active_readiness_windows > 0 and active_readiness_ok, "readiness failed or application was not live through a complete pressure window")
     _require_pid_reaped(process["pid"], process["start_ticks"], "application")
+    require(
+        continuous_ready_start_ns is not None
+        and continuous_ready_end_ns is not None
+        and app_start_ns is not None
+        and app_exit_ns is not None
+        and continuous_ready_end_ns > continuous_ready_start_ns,
+        "pressure trace has no complete continuous-ready application window",
+    )
+    return {
+        "application_window": {
+            "observed_start_monotonic_ns": app_start_ns,
+            "observed_exit_monotonic_ns": app_exit_ns,
+        },
+        "continuous_ready_window": {
+            "start_monotonic_ns": continuous_ready_start_ns,
+            "end_monotonic_ns": continuous_ready_end_ns,
+        },
+    }
 
 
 def _parser() -> argparse.ArgumentParser:

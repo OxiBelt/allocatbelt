@@ -324,12 +324,16 @@ def _verify_expectation(request: dict[str, Any]) -> dict[str, Any]:
     expectation, raw = metadata(request["expectation"])
     require(hashlib.sha256(raw).hexdigest() == digest(request["expectation_sha256"]) ==
             request["expectation"]["sha256"], "caller-pinned expectation SHA mismatch")
-    require(expectation.get("schema") == "allocatbelt.application-feedback-expectation.v1" and
+    schema = expectation.get("schema")
+    require(schema in ("allocatbelt.application-feedback-expectation.v1",
+                       "allocatbelt.application-feedback-expectation.v2") and
             expectation.get("mode") == "capacity_calibration", "unsupported capacity expectation")
-    exact(expectation, {"schema", "mode", "identity", "policy", "app_capacity_artifact_sha256",
-                        "host_binding", "external_pressure_proof", "final_runtime_binding",
-                        "minimum_production_seconds", "minimum_pressure_overlap_seconds",
-                        "recipe_sha256"}, "caller-pinned feedback expectation")
+    keys = {"schema", "mode", "identity", "policy", "app_capacity_artifact_sha256",
+            "host_binding", "external_pressure_proof", "final_runtime_binding",
+            "minimum_production_seconds", "minimum_pressure_overlap_seconds", "recipe_sha256"}
+    if schema == "allocatbelt.application-feedback-expectation.v2":
+        keys.add("construction_probe")
+    exact(expectation, keys, "caller-pinned feedback expectation")
     body = {key: value for key, value in expectation.items() if key != "recipe_sha256"}
     require(digest(expectation.get("recipe_sha256")) == hashlib.sha256(canonical(body)).hexdigest(),
             "expectation self digest mismatch")
@@ -383,7 +387,7 @@ def _campaign_module(source: dict[str, Any]) -> types.ModuleType:
     return module
 
 
-def _verify_feedback_validator(source: dict[str, Any], expected_sha256: str) -> None:
+def _verify_feedback_validator(source: dict[str, Any], expected_sha256: str) -> bytes:
     files = source.get("source", {}).get("files")
     require(type(files) is list, "source manifest inventory is malformed")
     records = [item for item in files if type(item) is dict and
@@ -406,6 +410,7 @@ def _verify_feedback_validator(source: dict[str, Any], expected_sha256: str) -> 
     finally:
         reader.close()
     require(len(raw) == expected_size, "captured feedback validator size differs from source inventory")
+    return raw
 
 
 def verify_source(source: dict[str, Any], expectation: dict[str, Any], validator_sha256: str) -> None:
@@ -421,7 +426,28 @@ def verify_source(source: dict[str, Any], expectation: dict[str, Any], validator
             source["source"]["source_tree_sha256"] == identity["source_sha256"] and
             source["artifacts"][identity["allocator"]]["sha256"] == identity["binary_sha256"],
             "source/host/binary binding mismatch")
-    _verify_feedback_validator(source, validator_sha256)
+    validator_raw = _verify_feedback_validator(source, validator_sha256)
+    if expectation["schema"] == "allocatbelt.application-feedback-expectation.v2":
+        _validate_construction_probe(source, expectation, validator_raw)
+
+
+def _validate_construction_probe(
+    source: dict[str, Any], expectation: dict[str, Any], validator_raw: bytes,
+) -> None:
+    """Reuse only captured, source-pinned reader code for the v2 projection."""
+    path = Path(os.path.abspath(__file__)).with_name("application-feedback-readback.py")
+    module = types.ModuleType("allocatbelt_capacity_pinned_feedback")
+    module.__file__ = str(path)
+    try:
+        exec(compile(validator_raw, str(path), "exec", dont_inherit=True), module.__dict__)
+        body = {key: value for key, value in expectation.items() if key != "recipe_sha256"}
+        encoded, _ = module.build_pressure_expectation_recipe(body)
+        require(encoded == canonical(expectation), "v2 expectation differs from its typed reader contract")
+        module.validate_construction_probe(expectation, source)
+    except CapacityError:
+        raise
+    except Exception as error:
+        raise CapacityError(f"construction policy probe validation failed: {error}") from error
 
 
 def verify_no_actuation(path: Path, expected: str) -> int:

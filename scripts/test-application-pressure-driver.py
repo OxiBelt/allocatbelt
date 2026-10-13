@@ -199,6 +199,72 @@ class PressureDriverTests(unittest.TestCase):
                 app_active=True, readiness_ok=True, complete_overlap_window=True,
             )
 
+    def test_ready_bounds_use_measured_windows_across_between_sample_app_observations(self) -> None:
+        base = 10_000_000_000
+        ready_snapshot = {"all_ready": True}
+        pid, start_ticks = 101, 1001
+        binding = {
+            "pressure_ready_monotonic_ns": base + 100_000_000,
+            "readiness_snapshot": ready_snapshot,
+            "observed_monotonic_ns": base + 150_000_000,
+            "launch_record_sha256": "a" * 64,
+        }
+        process = {"pid": pid, "start_ticks": start_ticks}
+        recipe = {"schedule": {
+            "sample_interval_ms": 100, "startup_ready_windows": 1, "minimum_overlap_seconds": 0,
+        }}
+        run = {
+            "sample_count": 3, "application_overlap_nanoseconds": 50_000_000,
+            "finish_monotonic_ns": base + 500_000_000, "worker_cleanup": [],
+        }
+
+        def validate_sample(event: dict[str, Any], _recipe: dict[str, Any], _sequence: int) -> dict[str, Any]:
+            return {
+                "start": event["start_monotonic_ns"], "end": event["end_monotonic_ns"],
+                "app_active": event["app_active"], "readiness": {"all_ready": event["all_ready"]},
+            }
+
+        def timeline(trailing_ready: bool) -> dict[str, dict[str, int]]:
+            events = [
+                {"schema": readback.EVENT_SCHEMA, "kind": "sample", "start_monotonic_ns": base,
+                 "end_monotonic_ns": base + 100_000_000, "app_active": False, "all_ready": True},
+                {"schema": readback.EVENT_SCHEMA, "kind": "application_start", "sequence": 0,
+                 "monotonic_ns": base + 150_000_000, "pid": pid, "start_ticks": start_ticks,
+                 "launch_record_sha256": binding["launch_record_sha256"]},
+                {"schema": readback.EVENT_SCHEMA, "kind": "sample", "start_monotonic_ns": base + 100_000_000,
+                 "end_monotonic_ns": base + 200_000_000, "app_active": True, "all_ready": True},
+                {"schema": readback.EVENT_SCHEMA, "kind": "sample", "start_monotonic_ns": base + 200_000_000,
+                 "end_monotonic_ns": base + 300_000_000, "app_active": False, "all_ready": trailing_ready},
+                {"schema": readback.EVENT_SCHEMA, "kind": "application_exit", "sequence": 1,
+                 "monotonic_ns": base + 200_000_000, "pid": pid, "start_ticks": start_ticks,
+                 "exit_observed": True},
+                {"schema": readback.EVENT_SCHEMA, "kind": "pressure_cleanup",
+                 "monotonic_ns": base + 400_000_000, "workers": [],
+                 "scratch_file_removed": True, "cleanup_ok": True},
+            ]
+            start_event = {"monotonic_ns": base - 100_000_000}
+            with patch.object(readback, "_validate_sample", side_effect=validate_sample), \
+                 patch.object(readback, "_require_pid_reaped"):
+                return readback._validate_event_timeline(
+                    iter(events), start_event, recipe, process, binding, run, {},
+                )
+
+        measured = timeline(trailing_ready=True)
+        self.assertEqual(measured["application_window"], {
+            "observed_start_monotonic_ns": base + 150_000_000,
+            "observed_exit_monotonic_ns": base + 200_000_000,
+        })
+        self.assertEqual(measured["continuous_ready_window"], {
+            "start_monotonic_ns": base + 100_000_000,
+            "end_monotonic_ns": base + 300_000_000,
+        })
+
+        unready_boundary = timeline(trailing_ready=False)
+        self.assertEqual(unready_boundary["continuous_ready_window"], {
+            "start_monotonic_ns": base + 100_000_000,
+            "end_monotonic_ns": base + 200_000_000,
+        })
+
     def test_readiness_proposal_is_derived_from_numeric_measurements(self) -> None:
         summary = {
             "sample_count": 4,
@@ -412,6 +478,52 @@ class PressureDriverTests(unittest.TestCase):
             readback_value = json.loads(verify.stdout.decode("utf-8"))
             self.assertEqual(readback_value["status"], "valid")
             self.assertFalse(readback_value["physical_nic_claimed"])
+            self.assertEqual(readback_value["recipe_raw_sha256"], driver.digest_bytes(recipe_path.read_bytes()))
+            self.assertEqual(readback_value["validator_sha256"], driver.digest_bytes(READER_PATH.read_bytes()))
+            self.assertEqual(readback_value["identity"]["host_id"], run_identity["host_id"])
+            self.assertEqual(readback_value["identity"]["run_id"], run_identity["run_id"])
+            self.assertEqual(readback_value["identity"]["nonce"], run_identity["nonce"])
+            self.assertEqual(readback_value["application_process"]["pid"], app_process.pid)
+            self.assertEqual(readback_value["application_process"]["start_ticks"], app_stat["start_ticks"])
+            self.assertEqual(readback_value["application_process"]["nonce"], run_identity["nonce"])
+            self.assertEqual(readback_value["application_process"]["executable_sha256"], driver.digest_bytes(binary_raw))
+            application_window = readback_value["application_window"]
+            continuous_ready = readback_value["continuous_ready_window"]
+            self.assertEqual(
+                set(application_window),
+                {"observed_start_monotonic_ns", "observed_exit_monotonic_ns"},
+            )
+            self.assertEqual(set(continuous_ready), {"start_monotonic_ns", "end_monotonic_ns"})
+            self.assertGreaterEqual(
+                continuous_ready["end_monotonic_ns"],
+                application_window["observed_exit_monotonic_ns"],
+            )
+            self.assertGreater(
+                continuous_ready["end_monotonic_ns"], continuous_ready["start_monotonic_ns"]
+            )
+            process_binding = json.loads((artifacts / "process-binding.json").read_text(encoding="utf-8"))
+            self.assertGreaterEqual(
+                continuous_ready["start_monotonic_ns"],
+                process_binding["pressure_ready_monotonic_ns"],
+            )
+            pressure_events = [
+                json.loads(line) for line in (artifacts / "events.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+            sample_events = [event for event in pressure_events if event.get("kind") == "sample"]
+            start_samples = [
+                sample for sample in sample_events
+                if sample["interval_start_monotonic_ns"] == continuous_ready["start_monotonic_ns"]
+            ]
+            end_samples = [
+                sample for sample in sample_events
+                if sample["interval_end_monotonic_ns"] == continuous_ready["end_monotonic_ns"]
+            ]
+            self.assertEqual(len(start_samples), 1)
+            self.assertEqual(len(end_samples), 1)
+            self.assertTrue(start_samples[0]["readiness"]["all_ready"])
+            self.assertTrue(end_samples[0]["readiness"]["all_ready"])
+            proof_body = {key: value for key, value in readback_value.items() if key != "readback_sha256"}
+            self.assertEqual(readback_value["readback_sha256"], driver.digest_object(proof_body))
 
             tampered = root / "tampered-artifacts"
             shutil.copytree(artifacts, tampered)
