@@ -26,25 +26,38 @@ import stat
 import struct
 import subprocess
 import sys
+import importlib.machinery
 import threading
 import time
 from pathlib import Path, PurePosixPath
+import types
 from typing import Any
 
 
 REQUEST_SCHEMA = "allocatbelt.application-pressure-request.v1"
+CALIBRATION_REQUEST_SCHEMA_V2 = "allocatbelt.application-pressure-calibration-request.v2"
 CALIBRATION_SCHEMA = "allocatbelt.application-pressure-contention-calibration.v1"
+CALIBRATION_SCHEMA_V2 = "allocatbelt.application-pressure-contention-calibration.v2"
 RECIPE_SCHEMA = "allocatbelt.application-pressure-recipe.v1"
+RECIPE_SCHEMA_V2 = "allocatbelt.application-pressure-recipe.v2"
 LAUNCH_SCHEMA = "allocatbelt.application-pressure-launch-binding.v1"
 PROCESS_BINDING_SCHEMA = "allocatbelt.application-pressure-process-binding.v1"
 EVENT_SCHEMA = "allocatbelt.application-pressure-event.v1"
 RUN_SCHEMA = "allocatbelt.application-pressure-run.v1"
 READY_SCHEMA = "allocatbelt.application-pressure-ready.v1"
+CALIBRATION_SCOPE_SCHEMA_V2 = "allocatbelt.application-pressure-calibration-scope.v2"
+CALIBRATION_SCOPE_RECEIPT_SCHEMA_V2 = "allocatbelt.application-pressure-calibration-scope-readback.v2"
+CAPACITY_BUNDLE_PIN_SCHEMA_V2 = "allocatbelt.application-pressure-capacity-bundle-pin.v2"
+CONTEXT_POLICY_BUNDLE_SCHEMA_V2 = "allocatbelt.application-pressure-context-policy-bundle.v2"
+CALIBRATION_BINDING_SCHEMA_V2 = "allocatbelt.application-pressure-calibration-binding.v2"
+SOURCE5_PRESSURE_CONDITION_SCHEMA = "allocatbelt.application-source5-pressure-condition.v1"
 
 DRIVER_PATH = Path(__file__).resolve()
 READER_PATH = DRIVER_PATH.with_name("application-pressure-readback.py")
 MAX_REQUEST_BYTES = 2 * 1024 * 1024
 MAX_CALIBRATION_BYTES = 64 * 1024 * 1024
+MAX_SCOPE_RECEIPT_BYTES = 8 * 1024 * 1024
+MAX_CONTEXT_POLICY_BUNDLE_BYTES = 8 * 1024 * 1024
 MAX_RECIPE_BYTES = 4 * 1024 * 1024
 MAX_ARTIFACT_BYTES = 512 * 1024 * 1024
 MAX_EVENT_LINE_BYTES = 2 * 1024 * 1024
@@ -767,9 +780,171 @@ def _identity(value: object, *, calibration: bool = False) -> dict[str, Any]:
     }
 
 
+def _load_scope_readback_module() -> Any:
+    raw, digest = read_stable(READER_PATH, "pressure scope readback validator", 4 * 1024 * 1024)
+    name = f"allocatbelt_pressure_scope_readback_{digest[:16]}"
+    module = types.ModuleType(name)
+    module.__file__ = str(READER_PATH)
+    module.__package__ = ""
+    module.__loader__ = None
+    module.__spec__ = importlib.machinery.ModuleSpec(name, loader=None, origin=str(READER_PATH))
+    sys.modules[name] = module
+    try:
+        captured_code = compile(raw, str(READER_PATH), "exec", dont_inherit=True)
+        exec(captured_code, module.__dict__)
+    except Exception as error:
+        sys.modules.pop(name, None)
+        raise PressureError(f"verified pressure scope reader bytes could not be executed: {type(error).__name__}") from error
+    require(digest_bytes(raw) == digest and getattr(module, "CALIBRATION_SCOPE_RECEIPT_SCHEMA_V2", None) == CALIBRATION_SCOPE_RECEIPT_SCHEMA_V2, "independent pressure scope validator contract differs")
+    return module
+
+
+def _context_calibration_storage(value: object) -> dict[str, Any]:
+    storage = exact_object(value, {"application_io_paths", "pressure_scratch_path", "output_minimum_free_bytes"}, "context calibration storage")
+    raw_paths = storage["application_io_paths"]
+    require(type(raw_paths) is list and 1 <= len(raw_paths) <= 16, "context calibration application I/O paths must contain 1..16 entries")
+    paths = [absolute_path(item, f"context calibration application I/O path {index}") for index, item in enumerate(raw_paths)]
+    require(len({str(path) for path in paths}) == len(paths), "context calibration application I/O paths repeat")
+    scratch = absolute_path(storage["pressure_scratch_path"], "context calibration scratch path")
+    free_floor = uint(storage["output_minimum_free_bytes"], "context calibration output free-space floor", positive=True, maximum=1 << 40)
+    return {
+        "application_io_paths": [str(path) for path in paths],
+        "pressure_scratch_path": str(scratch),
+        "output_minimum_free_bytes": free_floor,
+    }
+
+
+def _require_live_source5_host(observed: dict[str, Any], host: dict[str, Any]) -> None:
+    require(type(observed) is dict and observed.get("schema") == "allocatbelt.application-capacity-host-context.v1", "context calibration lacks its validated Source5 host context")
+    require(os.uname().release == observed["kernel_release"] == host["kernel_release"], "live kernel differs from the observed Source5 host")
+    boot = digest_bytes(Path("/proc/sys/kernel/random/boot_id").read_bytes().strip())
+    require(boot == observed["boot_id_sha256"] == host["boot_id_sha256"], "live boot identity differs from the observed Source5 host")
+    require(_affinity(0) == observed["cpu_affinity"] == host["allowed_cpu_affinity"], "live CPU affinity differs from the observed Source5 host")
+    cpu_raw = bytearray()
+    descriptor = os.open("/proc/cpuinfo", os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        while True:
+            block = os.read(descriptor, min(1024 * 1024, 16 * 1024 * 1024 + 1 - len(cpu_raw)))
+            if not block:
+                break
+            cpu_raw.extend(block)
+            require(len(cpu_raw) <= 16 * 1024 * 1024, "live CPU model source exceeds its finite bound")
+    finally:
+        os.close(descriptor)
+    try:
+        models = {
+            line.split(":", 1)[1].strip()
+            for line in bytes(cpu_raw).decode("utf-8").splitlines()
+            if line.lower().startswith("model name") and ":" in line
+        }
+    except UnicodeError as error:
+        raise PressureError("live CPU model source is not UTF-8") from error
+    require(len(models) == 1 and next(iter(models)) == observed["cpu_model"], "live CPU model differs from the observed Source5 host")
+    namespace = os.stat("/proc/self/ns/net").st_ino
+    require(namespace == observed["network_namespace_inode"] == host["network"]["network_namespace_inode"], "live network namespace differs from the observed Source5 host")
+
+
+def _source5_context_calibration_request_v2(value: object) -> dict[str, Any]:
+    request = exact_object(value, {
+        "schema", "identity", "files", "storage", "schedule", "scope",
+    }, "context calibration request v2")
+    require(request["schema"] == CALIBRATION_REQUEST_SCHEMA_V2, "unsupported context calibration request schema")
+    identity_value = exact_object(request["identity"], {"host_id", "run_id", "condition_id", "nonce"}, "context calibration identity")
+    identity = {
+        "host_id": token(identity_value["host_id"], "context calibration host"),
+        "run_id": token(identity_value["run_id"], "context calibration run ID"),
+        "condition_id": token(identity_value["condition_id"], "context calibration condition ID"),
+        "nonce": string(identity_value["nonce"], "context calibration nonce", 32),
+        "phase": "calibration",
+    }
+    require(re.fullmatch(r"[0-9a-f]{32}", identity["nonce"]) is not None, "context calibration nonce must be 32 lowercase hexadecimal characters")
+    raw_files = exact_object(request["files"], {"source_manifest", "policy", "application_capacity_calibration"}, "context calibration raw files")
+    source = _file_spec(raw_files["source_manifest"], "source manifest")
+    policy = _file_spec(raw_files["policy"], "policy")
+    capacity_file = _file_spec(raw_files["application_capacity_calibration"], "application capacity calibration")
+    scope_value = exact_object(request["scope"], {
+        "schema", "condition", "source_root", "source_manifest", "context_policy",
+        "capacity_bundle_pins", "observed_host", "capacity_key",
+    }, "context calibration scope")
+    require(scope_value["schema"] == CALIBRATION_SCOPE_SCHEMA_V2, "unsupported context calibration scope schema")
+    reader = _load_scope_readback_module()
+    key = reader._capacity_key_v2(scope_value["capacity_key"])
+    require(key["host_id"] == identity["host_id"], "context calibration identity differs from the prepared capacity key")
+    source_root = absolute_path(scope_value["source_root"], "context calibration SourceV5 root")
+    source_pin = exact_object(scope_value["source_manifest"], {"path", "raw_sha256"}, "context calibration SourceV5 manifest pin")
+    source_pin = {"path": str(absolute_path(source_pin["path"], "context calibration SourceV5 manifest path")), "raw_sha256": sha256(source_pin["raw_sha256"], "context calibration SourceV5 manifest raw SHA-256")}
+    require(source_pin == source, "context calibration SourceV5 pin differs from its raw source-manifest input")
+    context_policy_pin = exact_object(scope_value["context_policy"], {"path", "raw_sha256"}, "context calibration policy-bundle pin")
+    context_policy_pin = {"path": str(absolute_path(context_policy_pin["path"], "context calibration policy-bundle path")), "raw_sha256": sha256(context_policy_pin["raw_sha256"], "context calibration policy-bundle raw SHA-256")}
+    capacity_bundle = exact_object(scope_value["capacity_bundle_pins"], {
+        "schema", "capacity_key", "source_manifest", "request", "artifact", "receipt",
+    }, "context calibration complete capacity bundle")
+    require(capacity_bundle["schema"] == CAPACITY_BUNDLE_PIN_SCHEMA_V2 and reader._capacity_key_v2(capacity_bundle["capacity_key"]) == key, "context calibration capacity bundle schema/key differs")
+    for name in ("source_manifest", "request", "artifact", "receipt"):
+        capacity_bundle[name] = {
+            "path": str(absolute_path(capacity_bundle[name]["path"], f"capacity bundle {name} path")),
+            "raw_sha256": sha256(capacity_bundle[name]["raw_sha256"], f"capacity bundle {name} raw SHA-256"),
+        } if type(capacity_bundle[name]) is dict else capacity_bundle[name]
+        exact_object(capacity_bundle[name], {"path", "raw_sha256"}, f"capacity bundle {name} pin")
+    observed_host_pin = exact_object(scope_value["observed_host"], {"path", "raw_sha256"}, "context calibration observed-host pin")
+    observed_host_pin = {"path": str(absolute_path(observed_host_pin["path"], "observed Source5 host path")), "raw_sha256": sha256(observed_host_pin["raw_sha256"], "observed Source5 host raw SHA-256")}
+    condition_pin = exact_object(scope_value["condition"], {"path", "raw_sha256"}, "Source5 pressure condition pin")
+    condition_pin = {"path": str(absolute_path(condition_pin["path"], "Source5 pressure condition path")), "raw_sha256": sha256(condition_pin["raw_sha256"], "Source5 pressure condition raw SHA-256")}
+    scope = {
+        "schema": CALIBRATION_SCOPE_SCHEMA_V2,
+        "condition": condition_pin,
+        "condition_id": identity["condition_id"],
+        "capacity_key": key,
+        "source_root": str(source_root),
+        "source_manifest": source_pin,
+        "context_policy_bundle": context_policy_pin,
+        "capacity_bundle_pins": capacity_bundle,
+        "observed_host": observed_host_pin,
+    }
+    schedule = _schedule(request["schedule"], calibration=True)
+    try:
+        condition_pin, condition = reader._verify_condition_file_v2(condition_pin, key, identity["condition_id"], schedule)
+        source_stack = reader._source5_stack(source_pin, source_root)
+        observed_pin, observed = reader._verify_observed_host_pin_v2(observed_host_pin, key["host_id"])
+        capacity = reader._verify_capacity_bundle_v2(source_stack, capacity_bundle, source_pin, observed)
+        policy_context = reader._verify_context_policy_bundle_v2(source_stack, context_policy_pin, capacity, source_pin)
+    except Exception as error:
+        if isinstance(error, PressureError):
+            raise
+        raise PressureError(f"SourceV5 context calibration inputs failed independent replay: {type(error).__name__}: {error}") from error
+    require(capacity["capacity_key"] == key and capacity["capacity_tsv_raw_sha256"] == capacity_file["raw_sha256"], "prepared capacity TSV differs from the exact pinned SourceV5 producer bundle")
+    require(policy_context["policy_pin"] == policy and context_policy_pin["raw_sha256"] == policy_context["raw_sha256"], "policy input differs from the independently replayed context-policy bundle")
+    require(condition_pin["raw_sha256"] == scope["condition"]["raw_sha256"] and observed_pin == observed_host_pin, "condition/observed-host pins changed during context validation")
+    return {
+        "identity": identity,
+        "files": {
+            "source_manifest": source,
+            "policy": policy,
+            "application_capacity_calibration": capacity_file,
+        },
+        "process": None,
+        "storage": _context_calibration_storage(request["storage"]),
+        "schedule": schedule,
+        "scope": {
+            **scope,
+            "pressure_calibration_id": condition["pressure_calibration_id"],
+            "readiness_thresholds": condition["readiness_thresholds"],
+            "pressure_thresholds": condition["pressure_thresholds"],
+            "context_policy_sha256": policy_context["numeric_context_policy_sha256"],
+            "context_policy_artifact_raw_sha256": policy_context["policy_raw_sha256"],
+            "source_manifest_semantic_sha256": source_stack["source_semantic_sha256"],
+            "source_tree_sha256": source_stack["source_tree_sha256"],
+            "observed_host_value": observed,
+            "condition_value": condition,
+            "context_policy_bundle_raw_sha256": policy_context["raw_sha256"],
+        },
+    }
+
+
 def _request(value: object, *, calibration: bool = False) -> dict[str, Any]:
     common_keys = {"schema", "identity", "files", "process", "storage", "schedule"}
-    expected_keys = common_keys if calibration else common_keys | {"pressure_calibration", "readiness_thresholds"}
+    v2_scope_input = not calibration and type(value) is dict and "calibration_scope_v2" in value
+    expected_keys = common_keys if calibration else common_keys | {"pressure_calibration", "readiness_thresholds"} | ({"calibration_scope_v2"} if v2_scope_input else set())
     request = exact_object(value, expected_keys, "pressure request")
     require(request["schema"] == REQUEST_SCHEMA, "unsupported pressure request schema")
     identity = _identity(request["identity"], calibration=calibration)
@@ -792,6 +967,7 @@ def _request(value: object, *, calibration: bool = False) -> dict[str, Any]:
     scratch_path = absolute_path(storage["pressure_scratch_path"], "pressure scratch path")
     minimum_free = uint(storage["output_minimum_free_bytes"], "minimum free bytes", positive=True, maximum=1 << 40)
     pressure_calibration: dict[str, Any] | None = None
+    calibration_scope_v2: dict[str, Any] | None = None
     thresholds: dict[str, Any] | None = None
     if not calibration:
         pressure_calibration = exact_object(request["pressure_calibration"], {"path", "sha256"}, "pressure contention calibration")
@@ -799,10 +975,94 @@ def _request(value: object, *, calibration: bool = False) -> dict[str, Any]:
         pressure_sha = sha256(pressure_calibration["sha256"], "pressure contention calibration raw SHA-256")
         pressure_cal, pressure_raw, actual_pressure_sha = verify_canonical_json(pressure_path, "pressure contention calibration", MAX_CALIBRATION_BYTES)
         require(actual_pressure_sha == pressure_sha, "pressure contention calibration raw SHA-256 differs from request")
-        _validate_calibration(pressure_cal, schedule, identity, source, policy, capacity)
+        if v2_scope_input:
+            reader = _load_scope_readback_module()
+            binding = exact_object(request["calibration_scope_v2"], {
+                "schema", "scope_receipt", "validator_sha256", "condition", "context_policy",
+                "capacity_bundle_pins", "observed_host", "context_policy_sha256",
+            }, "pressure calibration v2 binding")
+            require(binding["schema"] == CALIBRATION_BINDING_SCHEMA_V2, "unsupported pressure calibration v2 binding")
+            validator_sha = sha256(binding["validator_sha256"], "pressure calibration v2 validator SHA-256")
+            require(validator_sha == _hash_script(READER_PATH, "pressure calibration v2 reader"), "pressure calibration v2 binding uses different reader bytes")
+            condition_pin = exact_object(binding["condition"], {"path", "raw_sha256"}, "pressure calibration v2 condition pin")
+            condition_pin = {"path": str(absolute_path(condition_pin["path"], "pressure calibration v2 condition path")), "raw_sha256": sha256(condition_pin["raw_sha256"], "pressure calibration v2 condition raw SHA-256")}
+            raw_receipt_pin = exact_object(binding["scope_receipt"], {"path", "raw_sha256", "scope_sha256"}, "pressure calibration v2 scope receipt pin")
+            receipt_pin = {
+                "path": str(absolute_path(raw_receipt_pin["path"], "pressure calibration v2 scope receipt path")),
+                "raw_sha256": sha256(raw_receipt_pin["raw_sha256"], "pressure calibration v2 scope receipt raw SHA-256"),
+                "scope_sha256": sha256(raw_receipt_pin["scope_sha256"], "pressure calibration v2 scope receipt scope SHA-256"),
+            }
+            context_policy_pin = exact_object(binding["context_policy"], {"path", "raw_sha256"}, "pressure calibration v2 context-policy bundle pin")
+            context_policy_pin = {"path": str(absolute_path(context_policy_pin["path"], "pressure calibration v2 context-policy bundle path")), "raw_sha256": sha256(context_policy_pin["raw_sha256"], "pressure calibration v2 context-policy bundle raw SHA-256")}
+            capacity_pins = exact_object(binding["capacity_bundle_pins"], {
+                "schema", "capacity_key", "source_manifest", "request", "artifact", "receipt",
+            }, "pressure calibration v2 complete capacity bundle")
+            require(capacity_pins["schema"] == CAPACITY_BUNDLE_PIN_SCHEMA_V2, "unsupported pressure calibration v2 capacity bundle schema")
+            for pin_name in ("source_manifest", "request", "artifact", "receipt"):
+                raw_pin = exact_object(capacity_pins[pin_name], {"path", "raw_sha256"}, f"pressure calibration v2 capacity {pin_name} pin")
+                capacity_pins[pin_name] = {
+                    "path": str(absolute_path(raw_pin["path"], f"pressure calibration v2 capacity {pin_name} path")),
+                    "raw_sha256": sha256(raw_pin["raw_sha256"], f"pressure calibration v2 capacity {pin_name} raw SHA-256"),
+                }
+            observed_pin = exact_object(binding["observed_host"], {"path", "raw_sha256"}, "pressure calibration v2 observed-host pin")
+            observed_pin = {"path": str(absolute_path(observed_pin["path"], "pressure calibration v2 observed-host path")), "raw_sha256": sha256(observed_pin["raw_sha256"], "pressure calibration v2 observed-host raw SHA-256")}
+            calibration_v2 = reader._validate_calibration_v2_body(pressure_cal)
+            require(calibration_v2["identity"]["host_id"] == identity["host_id"] and calibration_v2["identity"]["condition_id"] == identity["condition_id"], "context calibration v2 host/condition differs from actual recipe identity")
+            require(calibration_v2["scope"]["condition"] == condition_pin, "actual Source5 pressure condition bytes differ from the prepared calibration condition")
+            scope_receipt, _, receipt_raw_sha = verify_canonical_json(Path(receipt_pin["path"]), "pressure calibration v2 independent scope receipt", MAX_SCOPE_RECEIPT_BYTES)
+            require(receipt_raw_sha == receipt_pin["raw_sha256"], "pressure calibration v2 independent receipt raw digest differs")
+            scope_receipt = reader._validate_scope_receipt_v2(scope_receipt, actual_pressure_sha)
+            scope_replay = reader.verify_calibration_scope_v2(
+                {"path": str(pressure_path), "raw_sha256": actual_pressure_sha},
+                context_policy_pin, capacity_pins, observed_pin,
+            )
+            require(
+                reader._scope_receipts_match_replay_v2(scope_receipt, scope_replay),
+                "stored independent scope receipt differs from current SourceV5 context replay",
+            )
+            require(
+                receipt_pin["scope_sha256"] == scope_replay["scope_sha256"]
+                and binding["context_policy_sha256"] == scope_replay["context_policy_sha256"] == calibration_v2["scope"]["context_policy_sha256"],
+                "pressure calibration v2 receipt pin/policy digest differs from the verified context",
+            )
+            require(
+                scope_replay["source_manifest_sha256"] == source["raw_sha256"]
+                and scope_replay["capacity_tsv_raw_sha256"] == capacity["raw_sha256"]
+                and scope_replay["context_policy_artifact_raw_sha256"] == policy["raw_sha256"]
+                and source == calibration_v2["scope"]["source_manifest"]
+                and capacity["path"] == calibration_v2["scope"]["capacity_bundle_pins"]["artifact"]["path"]
+                and capacity["raw_sha256"] == calibration_v2["scope"]["capacity_bundle_pins"]["artifact"]["raw_sha256"]
+                and _pressure_profile(schedule) == _pressure_profile(calibration_v2["schedule"]),
+                "actual recipe files/intensity differ from the independently verified SourceV5 calibration context",
+            )
+            current_policy_bundle, _, current_policy_bundle_raw_sha = verify_canonical_json(
+                Path(context_policy_pin["path"]), "current context-policy bundle", MAX_CONTEXT_POLICY_BUNDLE_BYTES,
+            )
+            require(current_policy_bundle_raw_sha == context_policy_pin["raw_sha256"], "current context-policy bundle raw digest differs")
+            current_policy_bundle = exact_object(current_policy_bundle, {"schema", "artifact", "members"}, "current context-policy bundle")
+            current_policy_artifact = exact_object(current_policy_bundle["artifact"], {"path", "raw_sha256"}, "current shared policy artifact pin")
+            require(
+                current_policy_bundle["schema"] == CONTEXT_POLICY_BUNDLE_SCHEMA_V2
+                and current_policy_artifact == policy,
+                "actual recipe policy input differs from the current context-policy bundle artifact",
+            )
+            thresholds = reader._pressure_thresholds_v2(request["readiness_thresholds"], "actual pressure recipe numeric thresholds")
+            require(thresholds == calibration_v2["scope"]["pressure_thresholds"], "actual pressure recipe thresholds differ from the prospectively frozen Source5 condition")
+            calibration_scope_v2 = {
+                "schema": CALIBRATION_BINDING_SCHEMA_V2,
+                "scope_receipt": receipt_pin,
+                "validator_sha256": validator_sha,
+                "condition": condition_pin,
+                "context_policy": context_policy_pin,
+                "capacity_bundle_pins": capacity_pins,
+                "observed_host": observed_pin,
+                "context_policy_sha256": scope_replay["context_policy_sha256"],
+            }
+        else:
+            _validate_calibration(pressure_cal, schedule, identity, source, policy, capacity)
+            thresholds = _validate_threshold_selection(request["readiness_thresholds"], pressure_cal)
         pressure_calibration = {"path": str(pressure_path), "raw_sha256": actual_pressure_sha}
         del pressure_raw
-        thresholds = _validate_threshold_selection(request["readiness_thresholds"], pressure_cal)
     return {
         "identity": identity,
         "files": {
@@ -819,6 +1079,7 @@ def _request(value: object, *, calibration: bool = False) -> dict[str, Any]:
         },
         "schedule": schedule,
         "pressure_calibration": pressure_calibration,
+        "calibration_scope_v2": calibration_scope_v2,
         "readiness_thresholds": thresholds,
     }
 
@@ -1041,7 +1302,7 @@ def freeze_recipe(request_path: Path, output_path: Path) -> dict[str, Any]:
     reader_sha = _hash_script(READER_PATH, "pressure reader")
     require(os.geteuid() == os.stat(DRIVER_PATH).st_uid or os.access(DRIVER_PATH, os.R_OK), "pressure driver file is not readable by this process")
     recipe_body = {
-        "schema": RECIPE_SCHEMA,
+        "schema": RECIPE_SCHEMA_V2 if normalized["calibration_scope_v2"] is not None else RECIPE_SCHEMA,
         "identity": normalized["identity"],
         "files": normalized["files"],
         "process": normalized["process"],
@@ -1087,6 +1348,8 @@ def freeze_recipe(request_path: Path, output_path: Path) -> dict[str, Any]:
             "readiness_thresholds": normalized["readiness_thresholds"],
         }),
     }
+    if normalized["calibration_scope_v2"] is not None:
+        recipe_body["calibration_scope_v2"] = normalized["calibration_scope_v2"]
     recipe = {**recipe_body, "recipe_sha256": digest_object(recipe_body)}
     raw = canonical_bytes(recipe)
     output_parent = output_path.parent
@@ -1101,12 +1364,19 @@ def _hash_script(path: Path, label: str) -> str:
 
 
 def _validate_recipe(value: object, expected_sha256: str | None = None) -> dict[str, Any]:
-    recipe = exact_object(value, {
+    base_keys = {
         "schema", "identity", "files", "process", "host", "storage", "network",
         "schedule", "artifact_budget", "pressure_calibration", "readiness_thresholds", "script_hashes",
         "condition_sha256", "recipe_sha256",
-    }, "frozen pressure recipe")
-    require(recipe["schema"] == RECIPE_SCHEMA, "unsupported frozen pressure recipe schema")
+    }
+    require(type(value) is dict, "frozen pressure recipe must be an object")
+    recipe_schema = value.get("schema")
+    if recipe_schema == RECIPE_SCHEMA:
+        recipe = exact_object(value, base_keys, "frozen pressure recipe")
+    elif recipe_schema == RECIPE_SCHEMA_V2:
+        recipe = exact_object(value, base_keys | {"calibration_scope_v2"}, "frozen pressure recipe v2")
+    else:
+        raise PressureError("unsupported frozen pressure recipe schema")
     body = {key: value for key, value in recipe.items() if key != "recipe_sha256"}
     actual_sha = digest_object(body)
     claimed = sha256(recipe["recipe_sha256"], "recipe digest")
@@ -1138,6 +1408,51 @@ def _validate_recipe(value: object, expected_sha256: str | None = None) -> dict[
     require(recipe["network"].get("interface") == "lo" and recipe["network"].get("destination") == "127.0.0.1", "network recipe does not bind IPv4 loopback")
     require(recipe["storage"].get("non_tmpfs") is True and recipe["storage"].get("application_device") == recipe["host"]["application_storage"][0]["device"], "storage recipe is not bound to the non-tmpfs application device")
     require(identity["nonce"] == recipe["identity"]["nonce"], "process nonce changed during recipe validation")
+    if recipe_schema == RECIPE_SCHEMA_V2:
+        files = exact_object(recipe["files"], {"source_manifest", "application_binary", "policy", "application_capacity_calibration"}, "recipe raw files v2")
+        for label, record in files.items():
+            expected = {"path", "raw_sha256"} | ({"mode", "size"} if label == "application_binary" else set())
+            exact_object(record, expected, f"recipe {label} input")
+            absolute_path(record["path"], f"recipe {label} path")
+            sha256(record["raw_sha256"], f"recipe {label} raw SHA-256")
+        binding = exact_object(recipe["calibration_scope_v2"], {
+            "schema", "scope_receipt", "validator_sha256", "condition", "context_policy", "capacity_bundle_pins", "observed_host", "context_policy_sha256",
+        }, "recipe context calibration v2 binding")
+        require(binding["schema"] == CALIBRATION_BINDING_SCHEMA_V2, "unsupported recipe context calibration binding schema")
+        raw_receipt_pin = exact_object(binding["scope_receipt"], {"path", "raw_sha256", "scope_sha256"}, "recipe context calibration scope receipt pin")
+        binding["scope_receipt"] = {
+            "path": str(absolute_path(raw_receipt_pin["path"], "recipe context calibration scope receipt path")),
+            "raw_sha256": sha256(raw_receipt_pin["raw_sha256"], "recipe context calibration scope receipt raw SHA-256"),
+            "scope_sha256": sha256(raw_receipt_pin["scope_sha256"], "recipe context calibration scope receipt scope SHA-256"),
+        }
+        for name in ("condition", "context_policy", "observed_host"):
+            pin = exact_object(binding[name], {"path", "raw_sha256"}, f"recipe context calibration {name} pin")
+            absolute_path(pin["path"], f"recipe context calibration {name} path")
+            sha256(pin["raw_sha256"], f"recipe context calibration {name} raw SHA-256")
+        sha256(binding["context_policy_sha256"], "recipe context policy digest")
+        require(sha256(binding["validator_sha256"], "recipe scope validator SHA-256") == hashes["reader_sha256"], "recipe scope receipt validator differs from the pinned pressure reader")
+        capacity_bundle = exact_object(binding["capacity_bundle_pins"], {
+            "schema", "capacity_key", "source_manifest", "request", "artifact", "receipt",
+        }, "recipe complete context capacity bundle")
+        require(capacity_bundle["schema"] == CAPACITY_BUNDLE_PIN_SCHEMA_V2, "recipe context capacity bundle schema is unsupported")
+        capacity_key = exact_object(capacity_bundle["capacity_key"], {"host_id", "workload", "profile", "calibration_id"}, "recipe context capacity key")
+        require(capacity_key["host_id"] == recipe["identity"]["host_id"], "recipe context capacity host differs from its actual APP identity")
+        for name in ("source_manifest", "request", "artifact", "receipt"):
+            pin = exact_object(capacity_bundle[name], {"path", "raw_sha256"}, f"recipe capacity bundle {name} pin")
+            absolute_path(pin["path"], f"recipe capacity bundle {name} path")
+            sha256(pin["raw_sha256"], f"recipe capacity bundle {name} raw SHA-256")
+        require(capacity_bundle["source_manifest"] == {
+            "path": files["source_manifest"]["path"], "raw_sha256": files["source_manifest"]["raw_sha256"],
+        } and capacity_bundle["artifact"] == {
+            "path": files["application_capacity_calibration"]["path"],
+            "raw_sha256": files["application_capacity_calibration"]["raw_sha256"],
+        }, "recipe SourceV5/capacity files differ from the complete producer bundle")
+        policy_bundle, _, policy_bundle_sha = verify_canonical_json(Path(binding["context_policy"]["path"]), "recipe context-policy bundle", MAX_CONTEXT_POLICY_BUNDLE_BYTES)
+        require(policy_bundle_sha == binding["context_policy"]["raw_sha256"], "recipe context-policy bundle raw digest differs")
+        exact_object(policy_bundle, {"schema", "artifact", "members"}, "recipe context-policy bundle")
+        require(policy_bundle["schema"] == CONTEXT_POLICY_BUNDLE_SCHEMA_V2 and policy_bundle["artifact"] == {
+            "path": files["policy"]["path"], "raw_sha256": files["policy"]["raw_sha256"],
+        }, "recipe shared policy differs from the context-policy bundle")
     return recipe
 
 
@@ -1149,6 +1464,26 @@ def _verify_recipe_inputs(recipe: dict[str, Any]) -> None:
     calibration = recipe["pressure_calibration"]
     _, raw_sha = read_stable(Path(calibration["path"]), "frozen pressure contention calibration", MAX_CALIBRATION_BYTES)
     require(raw_sha == calibration["raw_sha256"], "pressure contention calibration changed after recipe construction")
+    if recipe["schema"] == RECIPE_SCHEMA_V2:
+        binding = recipe["calibration_scope_v2"]
+        reader = _load_scope_readback_module()
+        calibration_value, _, _ = verify_canonical_json(Path(calibration["path"]), "frozen context calibration v2", MAX_CALIBRATION_BYTES)
+        checked_calibration = reader._validate_calibration_v2_body(calibration_value)
+        require(checked_calibration["scope"]["condition"] == binding["condition"], "Source5 pressure condition bytes changed after recipe freeze")
+        scope_receipt, _, receipt_sha = verify_canonical_json(Path(binding["scope_receipt"]["path"]), "frozen context calibration scope receipt", MAX_SCOPE_RECEIPT_BYTES)
+        require(receipt_sha == binding["scope_receipt"]["raw_sha256"], "frozen context calibration receipt changed after recipe construction")
+        scope_receipt = reader._validate_scope_receipt_v2(scope_receipt, raw_sha)
+        require(scope_receipt["scope_sha256"] == binding["scope_receipt"]["scope_sha256"], "frozen context calibration receipt pin names a different scope digest")
+        replay = reader.verify_calibration_scope_v2(
+            {"path": calibration["path"], "raw_sha256": raw_sha}, binding["context_policy"],
+            binding["capacity_bundle_pins"], binding["observed_host"],
+        )
+        require(
+            reader._scope_receipts_match_replay_v2(scope_receipt, replay)
+            and replay["context_policy_sha256"] == binding["context_policy_sha256"]
+            and replay["source_manifest_sha256"] == scope_receipt["source_manifest_sha256"],
+            "independent context calibration scope changed after recipe freeze",
+        )
 
 
 def _verify_live_environment(recipe: dict[str, Any]) -> None:
@@ -2900,12 +3235,43 @@ def run_pressure(recipe_path: Path, expected_sha: str, launch_path: Path, output
 
 
 def calibrate(request_path: Path, output_path: Path) -> dict[str, Any]:
+    return _calibrate_request(request_path, output_path, context_v2=False)
+
+
+def calibrate_context_v2(request_path: Path, output_path: Path, scope_receipt_path: Path) -> dict[str, Any]:
+    result = _calibrate_request(request_path, output_path, context_v2=True)
+    reader = _load_scope_readback_module()
+    calibration_pin = {"path": str(output_path), "raw_sha256": result["calibration_raw_sha256"]}
+    receipt = reader.verify_calibration_scope_v2(
+        calibration_pin,
+        result["_v2_scope"]["context_policy_bundle"],
+        result["_v2_scope"]["capacity_bundle_pins"],
+        result["_v2_scope"]["observed_host"],
+    )
+    receipt_raw = canonical_bytes(receipt)
+    receipt_sha = safe_write_new(scope_receipt_path, receipt_raw, "independent context calibration scope receipt", maximum=MAX_SCOPE_RECEIPT_BYTES)
+    result.pop("_v2_scope", None)
+    return {
+        **result,
+        "scope_receipt": {
+            "path": str(scope_receipt_path),
+            "raw_sha256": receipt_sha,
+            "scope_sha256": receipt["scope_sha256"],
+        },
+        "scope_sha256": receipt["scope_sha256"],
+        "context_policy_sha256": receipt["context_policy_sha256"],
+    }
+
+
+def _calibrate_request(request_path: Path, output_path: Path, *, context_v2: bool) -> dict[str, Any]:
     request, request_raw, _ = verify_canonical_json(request_path, "pressure calibration request", MAX_REQUEST_BYTES)
     require(request_raw == canonical_bytes(request), "pressure calibration request is not canonical")
-    normalized = _request(request, calibration=True)
+    normalized = _source5_context_calibration_request_v2(request) if context_v2 else _request(request, calibration=True)
     schedule = normalized["schedule"]
     storage_paths = [Path(path) for path in normalized["storage"]["application_io_paths"]]
     host = _host_facts(schedule["pressure_cpu_affinity"], schedule["application_cpu_affinity"], storage_paths)
+    if context_v2:
+        _require_live_source5_host(normalized["scope"]["observed_host_value"], host)
     scratch_path = Path(normalized["storage"]["pressure_scratch_path"])
     scratch = _storage_record(scratch_path, "pressure calibration scratch path")
     app_storage = host["application_storage"][0]
@@ -3023,6 +3389,10 @@ def calibrate(request_path: Path, output_path: Path) -> dict[str, Any]:
             worker_after = workers.process_io()
             sample = _build_sample(fake_recipe, seq, previous_end, time.monotonic_ns(), before, after, worker_records, worker_before, worker_after, False)
             samples.append(sample)
+            if context_v2:
+                prospective = normalized["scope"]["pressure_thresholds"]
+                observed = _readiness_from_sample(sample, prospective)
+                require(observed["all_ready"], f"calibration sample[{seq}] fails its prospectively frozen Source5 pressure thresholds")
             if seq % max(1, 1000 // schedule["sample_interval_ms"]) == 0:
                 _storage_reserve(fake_recipe, run_dir, scratch_reserved=True)
             counters_before = after
@@ -3069,28 +3439,15 @@ def calibrate(request_path: Path, output_path: Path) -> dict[str, Any]:
     summary = _summarize_samples(samples)
     require(len(samples) == schedule["duration_seconds"] * 1000 // schedule["sample_interval_ms"], "pressure calibration sample count differs from its frozen schedule")
     suggested = _suggest_thresholds(summary)
-    body = {
-        "schema": CALIBRATION_SCHEMA,
-        "identity": {
-            "host_id": normalized["identity"]["host_id"],
-            "pair_id": normalized["identity"]["pair_id"],
-            "condition_id": normalized["identity"]["condition_id"],
-            "phase": "calibration",
-        },
-        "schedule_sha256": digest_object(_pressure_profile(schedule)),
-        "raw_inputs": {
-            "source_manifest_sha256": normalized["files"]["source_manifest"]["raw_sha256"],
-            "policy_sha256": normalized["files"]["policy"]["raw_sha256"],
-            "application_capacity_calibration_sha256": normalized["files"]["application_capacity_calibration"]["raw_sha256"],
-        },
-        "driver_sha256": _hash_script(DRIVER_PATH, "pressure driver"),
+    worker_sessions = [
+        {"role": child["role"], "cpu": child["cpu"], "pid": child["pid"], "start_ticks": child["start_ticks"], "pgid": child["pgid"], "session_id": child["session_id"]}
+        for child in workers.children
+    ]
+    common_body = {
         "host": host,
         "storage": {"application_device": app_storage["device"], "mount_id": app_storage["mount"]["mount_id"], "backing_chain": app_storage["backing_chain"]},
         "network": host["network"],
-        "worker_sessions": [
-            {"role": child["role"], "cpu": child["cpu"], "pid": child["pid"], "start_ticks": child["start_ticks"], "pgid": child["pgid"], "session_id": child["session_id"]}
-            for child in workers.children
-        ],
+        "worker_sessions": worker_sessions,
         "samples": samples,
         "summary": summary,
         "suggested_readiness_thresholds": suggested,
@@ -3105,6 +3462,72 @@ def calibrate(request_path: Path, output_path: Path) -> dict[str, Any]:
             "kill_seconds": schedule["kill_deadline_seconds"],
         },
     }
+    if context_v2:
+        context_scope = normalized["scope"]
+        scope_value = {
+            "schema": CALIBRATION_SCOPE_SCHEMA_V2,
+            "condition": context_scope["condition"],
+            "condition_id": context_scope["condition_id"],
+            "pressure_calibration_id": context_scope["pressure_calibration_id"],
+            "capacity_key": context_scope["capacity_key"],
+            "source_root": context_scope["source_root"],
+            "source_manifest": context_scope["source_manifest"],
+            "source_manifest_semantic_sha256": context_scope["source_manifest_semantic_sha256"],
+            "source_tree_sha256": context_scope["source_tree_sha256"],
+            "capacity_bundle_pins": context_scope["capacity_bundle_pins"],
+            "context_policy_bundle": context_scope["context_policy_bundle"],
+            "context_policy_sha256": context_scope["context_policy_sha256"],
+            "readiness_thresholds": context_scope["readiness_thresholds"],
+            "pressure_thresholds": context_scope["pressure_thresholds"],
+            "observed_host": context_scope["observed_host"],
+            "host_sha256": digest_object(host),
+            "storage_sha256": digest_object(common_body["storage"]),
+            "network_sha256": digest_object(host["network"]),
+            "pressure_profile_sha256": digest_object(_pressure_profile(schedule)),
+        }
+        body = {
+            "schema": CALIBRATION_SCHEMA_V2,
+            "identity": {
+                "host_id": normalized["identity"]["host_id"],
+                "run_id": normalized["identity"]["run_id"],
+                "condition_id": normalized["identity"]["condition_id"],
+                "nonce": normalized["identity"]["nonce"],
+                "phase": "calibration",
+            },
+            "schedule": schedule,
+            "schedule_sha256": digest_object(_pressure_profile(schedule)),
+            "scope": scope_value,
+            "raw_inputs": {
+                "source_manifest_raw_sha256": normalized["files"]["source_manifest"]["raw_sha256"],
+                "policy_artifact_raw_sha256": normalized["files"]["policy"]["raw_sha256"],
+                "application_capacity_calibration_sha256": normalized["files"]["application_capacity_calibration"]["raw_sha256"],
+                "capacity_bundle_pins_sha256": digest_object(context_scope["capacity_bundle_pins"]),
+                "context_policy_bundle_raw_sha256": context_scope["context_policy_bundle_raw_sha256"],
+                "condition_raw_sha256": context_scope["condition"]["raw_sha256"],
+                "observed_host_raw_sha256": context_scope["observed_host"]["raw_sha256"],
+            },
+            "driver_sha256": _hash_script(DRIVER_PATH, "pressure driver"),
+            "reader_sha256": _hash_script(READER_PATH, "pressure reader"),
+            **common_body,
+        }
+    else:
+        body = {
+            "schema": CALIBRATION_SCHEMA,
+            "identity": {
+                "host_id": normalized["identity"]["host_id"],
+                "pair_id": normalized["identity"]["pair_id"],
+                "condition_id": normalized["identity"]["condition_id"],
+                "phase": "calibration",
+            },
+            "schedule_sha256": digest_object(_pressure_profile(schedule)),
+            "raw_inputs": {
+                "source_manifest_sha256": normalized["files"]["source_manifest"]["raw_sha256"],
+                "policy_sha256": normalized["files"]["policy"]["raw_sha256"],
+                "application_capacity_calibration_sha256": normalized["files"]["application_capacity_calibration"]["raw_sha256"],
+            },
+            "driver_sha256": _hash_script(DRIVER_PATH, "pressure driver"),
+            **common_body,
+        }
     calibration = {**body, "calibration_sha256": digest_object(body)}
     raw = canonical_bytes(calibration)
     safe_write_new(output_path, raw, "pressure contention calibration", maximum=MAX_CALIBRATION_BYTES)
@@ -3118,7 +3541,10 @@ def calibrate(request_path: Path, output_path: Path) -> dict[str, Any]:
     except OSError:
         # Keep calibration failure artifacts rather than deleting diagnostics.
         pass
-    return {"calibration_sha256": calibration["calibration_sha256"], "calibration_raw_sha256": digest_bytes(raw), "sample_count": len(samples), "suggested_readiness_thresholds": suggested, "path": str(output_path)}
+    result = {"calibration_sha256": calibration["calibration_sha256"], "calibration_raw_sha256": digest_bytes(raw), "sample_count": len(samples), "suggested_readiness_thresholds": suggested, "path": str(output_path)}
+    if context_v2:
+        result["_v2_scope"] = normalized["scope"]
+    return result
 
 
 def _normalize_worker_records(
@@ -3154,6 +3580,10 @@ def _parser() -> argparse.ArgumentParser:
     calibrate_parser = sub.add_parser("calibrate", help="run one finite contention calibration; no application performance thresholds")
     calibrate_parser.add_argument("--request", type=Path, required=True)
     calibrate_parser.add_argument("--output", type=Path, required=True)
+    context_calibrate = sub.add_parser("calibrate-context-v2", help="measure one SourceV5 pressure context and store an independent scope receipt")
+    context_calibrate.add_argument("--request", type=Path, required=True)
+    context_calibrate.add_argument("--output", type=Path, required=True)
+    context_calibrate.add_argument("--scope-receipt", type=Path, required=True)
     run = sub.add_parser("run", help="run one bounded pressure session for one authenticated application process")
     run.add_argument("--recipe", type=Path, required=True)
     run.add_argument("--expected-recipe-sha256", required=True)
@@ -3193,6 +3623,8 @@ def main(argv: list[str] | None = None) -> int:
             result = freeze_recipe(args.request, args.output)
         elif args.command == "calibrate":
             result = calibrate(args.request, args.output)
+        elif args.command == "calibrate-context-v2":
+            result = calibrate_context_v2(args.request, args.output, args.scope_receipt)
         elif args.command == "run":
             expected = sha256(args.expected_recipe_sha256, "expected recipe SHA-256")
             result = run_pressure(args.recipe, expected, args.launch_record, args.output_dir, args.ready_file)

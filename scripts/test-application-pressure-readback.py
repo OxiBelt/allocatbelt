@@ -1,0 +1,788 @@
+#!/usr/bin/env python3
+"""Focused offline tests for the context-scoped pressure readback contract."""
+from __future__ import annotations
+
+import argparse
+import importlib.util
+import builtins
+import json
+import stat
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+from typing import Any
+from unittest.mock import patch
+
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+READER_PATH = SCRIPT_DIR / "application-pressure-readback.py"
+DRIVER_PATH = SCRIPT_DIR / "application-pressure-driver.py"
+
+
+def _load_module(name: str, path: Path) -> Any:
+    spec = importlib.util.spec_from_file_location(name, path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"cannot load {path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+readback = _load_module("pressure_readback_v2_test_target", READER_PATH)
+driver = _load_module("pressure_driver_v2_test_target", DRIVER_PATH)
+SCOPE_FIXTURE_SCHEMA = "allocatbelt.application-pressure-calibration-v2-native-fixture.v1"
+SCOPE_FIXTURE_EXPECTED_KEYS = {
+    "host_id", "condition_id", "pressure_calibration_id", "capacity_key",
+    "calibration_raw_sha256", "calibration_sha256", "scope_sha256",
+    "condition_sha256", "source_manifest_sha256", "source_manifest_semantic_sha256",
+    "source_tree_sha256", "capacity_tsv_raw_sha256", "capacity_bundle_pins_sha256",
+    "context_policy_sha256", "context_policy_artifact_raw_sha256",
+    "sample_count", "samples_sha256", "summary", "pressure_thresholds",
+    "readiness_thresholds", "driver_sha256", "reader_sha256", "capacity_producer_sha256",
+    "feedback_composer_sha256", "feedback_reader_sha256", "host_verification_sha256",
+    "calibration_context_policy_bundle_raw_sha256", "per_job_context_policy_bundle_raw_sha256",
+    "worker_cleanup_sha256", "worker_session_count", "scratch_file_removed",
+}
+
+
+def run_genuine_scope_fixture(path: Path) -> dict[str, Any]:
+    fixture, _, _ = readback.read_canonical(path, "genuine SourceV5 pressure scope fixture", 4 * 1024 * 1024)
+    fixture = readback.exact(fixture, {
+        "schema", "source_root", "evidence_path_map", "calibration_pin", "context_policy_pin",
+        "capacity_bundle_pins", "observed_host_pin", "host_verification_pin", "expected",
+    }, "genuine SourceV5 pressure scope fixture")
+    if fixture["schema"] != SCOPE_FIXTURE_SCHEMA:
+        raise readback.ReadbackError("unsupported genuine SourceV5 pressure scope fixture schema")
+    expected = readback.exact(fixture["expected"], SCOPE_FIXTURE_EXPECTED_KEYS, "genuine pressure scope expected pins")
+    calibration_pin = readback._raw_pin(fixture["calibration_pin"], "fixture calibration pin")
+    context_policy_pin = readback._raw_pin(fixture["context_policy_pin"], "fixture per-job context-policy pin")
+    observed_host_pin = readback._raw_pin(fixture["observed_host_pin"], "fixture observed-host pin")
+    capacity_bundle = readback.exact(fixture["capacity_bundle_pins"], {
+        "schema", "capacity_key", "source_manifest", "request", "artifact", "receipt",
+    }, "fixture complete capacity bundle")
+    for name in ("source_manifest", "request", "artifact", "receipt"):
+        readback._raw_pin(capacity_bundle[name], f"fixture capacity {name} pin")
+    host_receipt_pin = readback._scope_receipt_pin_v2(
+        fixture["host_verification_pin"], "fixture strict host-verification receipt",
+    )
+    calibration, _, calibration_raw_sha = readback.read_canonical(
+        Path(calibration_pin["path"]), "fixture context calibration", 64 * 1024 * 1024,
+    )
+    if calibration_raw_sha != calibration_pin["raw_sha256"]:
+        raise readback.ReadbackError("fixture calibration bytes differ from their pin")
+    calibration = readback._validate_calibration_v2_body(calibration)
+    original_policy_sha = calibration["scope"]["context_policy_bundle"]["raw_sha256"]
+    if context_policy_pin["raw_sha256"] == original_policy_sha:
+        raise readback.ReadbackError("fixture does not include distinct per-job composer references")
+    original_bundle, _, _ = readback.read_canonical(
+        Path(calibration["scope"]["context_policy_bundle"]["path"]),
+        "fixture calibration context-policy bundle", 8 * 1024 * 1024,
+    )
+    current_bundle, _, _ = readback.read_canonical(
+        Path(context_policy_pin["path"]), "fixture per-job context-policy bundle", 8 * 1024 * 1024,
+    )
+    original_members = readback.exact(original_bundle, {"schema", "artifact", "members"}, "fixture calibration context bundle")["members"]
+    current_members = readback.exact(current_bundle, {"schema", "artifact", "members"}, "fixture per-job context bundle")["members"]
+    if type(original_members) is not list or type(current_members) is not list or len(original_members) != 2 or len(current_members) != 2:
+        raise readback.ReadbackError("fixture context-policy bundles do not each contain two genuine members")
+    for index, (original_member, current_member) in enumerate(zip(original_members, current_members)):
+        original_member = readback.exact(
+            original_member,
+            {"descriptor", "request", "construction_probe", "resolved_policy", "composition_receipt"},
+            f"fixture calibration member[{index}]",
+        )
+        current_member = readback.exact(
+            current_member,
+            {"descriptor", "request", "construction_probe", "resolved_policy", "composition_receipt"},
+            f"fixture per-job member[{index}]",
+        )
+        for field in ("request", "construction_probe", "resolved_policy", "composition_receipt"):
+            if field == "construction_probe":
+                original_pin = readback.exact(original_member[field], {"path", "raw_sha256", "allocator", "binary_sha256"}, f"fixture original member[{index}] probe")
+                current_pin = readback.exact(current_member[field], {"path", "raw_sha256", "allocator", "binary_sha256"}, f"fixture current member[{index}] probe")
+                original_reference = (original_pin["path"], original_pin["raw_sha256"])
+                current_reference = (current_pin["path"], current_pin["raw_sha256"])
+            else:
+                original_pin = readback._raw_pin(original_member[field], f"fixture original member[{index}] {field}")
+                current_pin = readback._raw_pin(current_member[field], f"fixture current member[{index}] {field}")
+                original_reference = (original_pin["path"], original_pin["raw_sha256"])
+                current_reference = (current_pin["path"], current_pin["raw_sha256"])
+            if current_reference == original_reference:
+                raise readback.ReadbackError(f"fixture per-job member[{index}] reuses calibration {field} references")
+    result = readback.verify_calibration_scope_v2_offline(
+        calibration_pin, context_policy_pin, capacity_bundle, observed_host_pin,
+        source_root=fixture["source_root"], evidence_path_map=fixture["evidence_path_map"],
+        host_verification_pin=host_receipt_pin,
+    )
+    require_values = {
+        "host_id": result["capacity_key"]["host_id"],
+        "condition_id": result["condition_id"],
+        "pressure_calibration_id": result["pressure_calibration_id"],
+        "capacity_key": result["capacity_key"],
+        "calibration_raw_sha256": result["calibration_raw_sha256"],
+        "calibration_sha256": result["calibration_sha256"],
+        "scope_sha256": result["scope_sha256"],
+        "condition_sha256": result["condition_sha256"],
+        "source_manifest_sha256": result["source_manifest_sha256"],
+        "source_manifest_semantic_sha256": result["source_manifest_semantic_sha256"],
+        "source_tree_sha256": result["source_tree_sha256"],
+        "capacity_tsv_raw_sha256": result["capacity_tsv_raw_sha256"],
+        "capacity_bundle_pins_sha256": result["capacity_bundle_pins_sha256"],
+        "context_policy_sha256": result["context_policy_sha256"],
+        "context_policy_artifact_raw_sha256": result["context_policy_artifact_raw_sha256"],
+        "sample_count": result["sample_count"],
+        "samples_sha256": result["samples_sha256"],
+        "summary": result["summary"],
+        "pressure_thresholds": result["pressure_thresholds"],
+        "readiness_thresholds": result["readiness_thresholds"],
+        "driver_sha256": result["driver_sha256"],
+        "reader_sha256": result["reader_sha256"],
+        "capacity_producer_sha256": result["capacity_producer_sha256"],
+        "feedback_composer_sha256": result["feedback_composer_sha256"],
+        "feedback_reader_sha256": result["feedback_reader_sha256"],
+        "host_verification_sha256": result["host_verification"]["host_verification_sha256"],
+        "calibration_context_policy_bundle_raw_sha256": original_policy_sha,
+        "per_job_context_policy_bundle_raw_sha256": context_policy_pin["raw_sha256"],
+        "worker_cleanup_sha256": result["worker_cleanup_sha256"],
+        "worker_session_count": result["worker_session_count"],
+        "scratch_file_removed": result["scratch_file_removed"],
+    }
+    if require_values != expected:
+        raise readback.ReadbackError("genuine SourceV5 scope fixture expected pins differ from full public replay")
+
+    def evidence_map_with(directory: Path) -> dict[str, Any]:
+        entries = list(fixture["evidence_path_map"]["entries"])
+        entry = {"origin": str(directory), "local": str(directory)}
+        if all(item["origin"] != entry["origin"] for item in entries):
+            entries.append(entry)
+        entries.sort(key=lambda item: item["origin"])
+        return {"schema": readback.EVIDENCE_PATH_MAP_SCHEMA_V1, "entries": entries}
+
+    def write_canonical(directory: Path, name: str, value: object) -> tuple[Path, str]:
+        target = directory / name
+        raw = readback.canonical_bytes(value)
+        target.write_bytes(raw)
+        return target, readback.sha256_bytes(raw)
+
+    def expect_rejected(
+        *, calibration: dict[str, str] = calibration_pin,
+        context_policy: dict[str, str] = context_policy_pin,
+        capacity: dict[str, Any] = capacity_bundle,
+        host_receipt: dict[str, str] = host_receipt_pin,
+        evidence_map: dict[str, Any],
+    ) -> None:
+        try:
+            readback.verify_calibration_scope_v2_offline(
+                calibration, context_policy, capacity, observed_host_pin,
+                source_root=fixture["source_root"], evidence_path_map=evidence_map,
+                host_verification_pin=host_receipt,
+            )
+        except readback.ReadbackError:
+            return
+        raise AssertionError("mutated genuine SourceV5 scope inputs unexpectedly replayed")
+
+    def identity_map_with_file_paths(paths: list[Path]) -> dict[str, Any]:
+        entries = list(fixture["evidence_path_map"]["entries"])
+        origins = {item["origin"] for item in entries}
+        for path_value in paths:
+            target = readback.absolute_path(str(path_value), "additional identity evidence path")
+            info = target.lstat()
+            if not stat.S_ISREG(info.st_mode):
+                raise readback.ReadbackError("additional identity evidence path is not a regular file")
+            if str(target) not in origins:
+                entries.append({"origin": str(target), "local": str(target)})
+                origins.add(str(target))
+        entries.sort(key=lambda item: item["origin"])
+        return {"schema": readback.EVIDENCE_PATH_MAP_SCHEMA_V1, "entries": entries}
+
+    def identity_map_without_file_path(path_value: str) -> dict[str, Any]:
+        target = readback.absolute_path(path_value, "nested evidence path under test")
+        original = list(fixture["evidence_path_map"]["entries"])
+        directory_origins = []
+        for entry in original:
+            origin = Path(entry["origin"])
+            try:
+                info = origin.lstat()
+            except OSError:
+                continue
+            if stat.S_ISDIR(info.st_mode) and (target == origin or origin in target.parents):
+                directory_origins.append(origin)
+        exact_target = [entry for entry in original if entry["origin"] == str(target)]
+        if not directory_origins:
+            if not exact_target:
+                raise readback.ReadbackError("fixture path map does not authorize the selected nested path")
+            remaining = [entry for entry in original if entry["origin"] != str(target)]
+        else:
+            root = min(directory_origins, key=lambda item: len(item.parts))
+            source_root = readback.absolute_path(fixture["source_root"], "fixture SourceV5 source root")
+            if target == source_root or source_root in target.parents:
+                raise readback.ReadbackError("fixture nested evidence path is covered by the required SourceV5 root mapping")
+            remaining = [
+                entry for entry in original
+                if entry["origin"] != str(root) and not entry["origin"].startswith(str(root).rstrip("/") + "/")
+            ]
+            try:
+                relative_parts = target.relative_to(root).parts
+            except ValueError as error:
+                raise readback.ReadbackError("selected nested path escaped its mapped evidence directory") from error
+            current = root
+            for index, component in enumerate(relative_parts):
+                next_directory: Path | None = None
+                for child in current.iterdir():
+                    if child.name == component:
+                        if index == len(relative_parts) - 1:
+                            if child != target or not child.is_file() or child.is_symlink():
+                                raise readback.ReadbackError("selected nested evidence path is not the expected regular file")
+                            continue
+                        if not child.is_dir() or child.is_symlink():
+                            raise readback.ReadbackError("selected nested evidence path traverses a non-directory")
+                        next_directory = child
+                        continue
+                    if child.is_symlink():
+                        continue
+                    info = child.lstat()
+                    if stat.S_ISDIR(info.st_mode) or stat.S_ISREG(info.st_mode):
+                        remaining.append({"origin": str(child), "local": str(child)})
+                if index < len(relative_parts) - 1:
+                    if next_directory is None:
+                        raise readback.ReadbackError("selected nested evidence path has a missing directory")
+                    current = next_directory
+            if (source_root == root or root in source_root.parents) and not any(
+                entry["origin"] == str(source_root) for entry in remaining
+            ):
+                remaining.append({"origin": str(source_root), "local": str(source_root)})
+        remaining.sort(key=lambda item: item["origin"])
+        if len(remaining) > 4096:
+            raise readback.ReadbackError("fixture path-map narrowing exceeds its closed entry bound")
+        narrowed = {"schema": readback.EVIDENCE_PATH_MAP_SCHEMA_V1, "entries": remaining}
+        readback._normalize_evidence_path_map(narrowed, fixture["source_root"])
+        return narrowed
+
+    def expect_missing_path_map(path_value: str) -> None:
+        narrowed = identity_map_without_file_path(path_value)
+        try:
+            readback.verify_calibration_scope_v2_offline(
+                calibration_pin, context_policy_pin, capacity_bundle, observed_host_pin,
+                source_root=fixture["source_root"], evidence_path_map=narrowed,
+                host_verification_pin=host_receipt_pin,
+            )
+        except readback.ReadbackError as error:
+            if "absent from the explicit identity path map" not in str(error):
+                raise AssertionError(f"nested path omission did not fail at the map boundary: {error}") from error
+            return
+        raise AssertionError("offline replay accepted a nested canonical input omitted from its identity map")
+
+    capacity_request, _, _ = readback.read_canonical(
+        Path(capacity_bundle["request"]["path"]), "fixture capacity producer request", 2 * 1024 * 1024,
+    )
+    expectation_pin = readback.exact(capacity_request["expectation"], {"path", "sha256"}, "fixture capacity expectation pin")
+    expectation, _, expectation_sha = readback.read_canonical(
+        Path(expectation_pin["path"]), "fixture capacity expectation", 2 * 1024 * 1024,
+    )
+    if expectation_sha != expectation_pin["sha256"] or "construction_probe" not in expectation:
+        raise readback.ReadbackError("genuine capacity fixture lacks its pinned V4 construction probe")
+    composer_probe = readback.exact(
+        current_members[0]["construction_probe"],
+        {"path", "raw_sha256", "allocator", "binary_sha256"},
+        "fixture first per-job composer probe pin",
+    )
+    expectation_probe = readback.exact(
+        expectation["construction_probe"],
+        {"path", "raw_sha256", "allocator", "binary_sha256"},
+        "fixture capacity expectation construction-probe pin",
+    )
+    for omitted_path in (expectation_pin["path"], expectation_probe["path"], composer_probe["path"]):
+        expect_missing_path_map(omitted_path)
+    authorized_path_map = identity_map_with_file_paths([
+        Path(expectation_pin["path"]), Path(expectation_probe["path"]), Path(composer_probe["path"]),
+    ])
+    repeated = readback.verify_calibration_scope_v2_offline(
+        calibration_pin, context_policy_pin, capacity_bundle, observed_host_pin,
+        source_root=fixture["source_root"], evidence_path_map=authorized_path_map,
+        host_verification_pin=host_receipt_pin,
+    )
+    strict_receipt, _, strict_receipt_sha = readback.read_canonical(
+        Path(host_receipt_pin["path"]), "fixture strict host verification receipt", 8 * 1024 * 1024,
+    )
+    if strict_receipt_sha != host_receipt_pin["raw_sha256"] or repeated != strict_receipt:
+        raise readback.ReadbackError("offline replay did not succeed after restoring explicit nested identity entries")
+
+    with tempfile.TemporaryDirectory(prefix="pressure-v2-resealed-negatives-") as temporary:
+        temp_root = Path(temporary).resolve()
+        extra_map = evidence_map_with(temp_root)
+
+        current_bundle, _, _ = readback.read_canonical(
+            Path(context_policy_pin["path"]), "fixture current context-policy bundle", 8 * 1024 * 1024,
+        )
+        policy_pin = readback._raw_pin(current_bundle["artifact"], "fixture current shared policy artifact")
+        policy, _, _ = readback.read_canonical(
+            Path(policy_pin["path"]), "fixture current shared policy", 8 * 1024 * 1024,
+        )
+        collector = policy["numeric_policy"]["collector"]
+        if type(collector.get("control_charge_bytes")) is not int:
+            raise readback.ReadbackError("genuine fixture lacks the SourceV5 collector charge field")
+        collector["control_charge_bytes"] += 1
+        policy_body = {key: item for key, item in policy.items() if key != "policy_sha256"}
+        policy["policy_sha256"] = readback.digest_object(policy_body)
+        mutated_policy_path = temp_root / "mutated-shared-policy.json"
+        mutated_policy_raw = readback.canonical_bytes(policy)
+        mutated_policy_path.write_bytes(mutated_policy_raw)
+        mutated_bundle = dict(current_bundle)
+        mutated_bundle["artifact"] = {
+            "path": str(mutated_policy_path),
+            "raw_sha256": readback.sha256_bytes(mutated_policy_raw),
+        }
+        mutated_bundle_path = temp_root / "mutated-context-policy-bundle.json"
+        mutated_bundle_raw = readback.canonical_bytes(mutated_bundle)
+        mutated_bundle_path.write_bytes(mutated_bundle_raw)
+        expect_rejected(
+            context_policy={
+                "path": str(mutated_bundle_path),
+                "raw_sha256": readback.sha256_bytes(mutated_bundle_raw),
+            },
+            evidence_map=extra_map,
+        )
+
+        source_manifest, _, _ = readback.read_canonical(
+            Path(calibration["scope"]["source_manifest"]["path"]),
+            "fixture SourceV5 manifest", readback.MAX_SOURCE_BYTES,
+        )
+        original_commit = source_manifest["source"]["git_commit"]
+        changed_commit = ("0" if original_commit[0] != "0" else "1") + original_commit[1:]
+        source_manifest["source"]["git_commit"] = changed_commit
+        source_manifest_body = {key: item for key, item in source_manifest.items() if key != "manifest_sha256"}
+        source_manifest["manifest_sha256"] = readback.digest_object(source_manifest_body)
+        changed_source_path, changed_source_sha = write_canonical(
+            temp_root, "mutated-source-manifest.json", source_manifest,
+        )
+        source_calibration = json.loads(readback.canonical_bytes(calibration))
+        source_calibration["scope"]["source_manifest"] = {
+            "path": str(changed_source_path), "raw_sha256": changed_source_sha,
+        }
+        source_calibration["scope"]["source_manifest_semantic_sha256"] = source_manifest["manifest_sha256"]
+        source_calibration["raw_inputs"]["source_manifest_raw_sha256"] = changed_source_sha
+        source_calibration_body = {
+            key: item for key, item in source_calibration.items() if key != "calibration_sha256"
+        }
+        source_calibration["calibration_sha256"] = readback.digest_object(source_calibration_body)
+        changed_source_calibration_path, changed_source_calibration_sha = write_canonical(
+            temp_root, "mutated-source-calibration.json", source_calibration,
+        )
+        expect_rejected(
+            calibration={
+                "path": str(changed_source_calibration_path),
+                "raw_sha256": changed_source_calibration_sha,
+            },
+            evidence_map=extra_map,
+        )
+
+        receipt, _, _ = readback.read_canonical(
+            Path(host_receipt_pin["path"]), "fixture strict host receipt", 8 * 1024 * 1024,
+        )
+        mutated_thresholds = dict(receipt["pressure_thresholds"])
+        cpu_minimum = mutated_thresholds["cpu_busy_min_basis_points"]
+        mutated_thresholds["cpu_busy_min_basis_points"] = cpu_minimum + 1 if cpu_minimum < 10000 else cpu_minimum - 1
+        receipt["pressure_thresholds"] = mutated_thresholds
+        receipt_body = {key: item for key, item in receipt.items() if key != "receipt_sha256"}
+        receipt["receipt_sha256"] = readback.digest_object(receipt_body)
+        mutated_receipt_path = temp_root / "mutated-host-receipt.json"
+        mutated_receipt_raw = readback.canonical_bytes(receipt)
+        mutated_receipt_path.write_bytes(mutated_receipt_raw)
+        expect_rejected(
+            host_receipt={
+                "path": str(mutated_receipt_path),
+                "raw_sha256": readback.sha256_bytes(mutated_receipt_raw),
+                "scope_sha256": host_receipt_pin["scope_sha256"],
+            },
+            evidence_map=extra_map,
+        )
+
+        condition_value, _, _ = readback.read_canonical(
+            Path(calibration["scope"]["condition"]["path"]), "fixture prospective condition", 1 * 1024 * 1024,
+        )
+        condition_value["pressure_thresholds"]["disk_write_min_bytes_per_second"] = readback.U64_MAX
+        mutated_condition_path, mutated_condition_sha = write_canonical(
+            temp_root, "mutated-pressure-condition.json", condition_value,
+        )
+        condition_calibration = json.loads(readback.canonical_bytes(calibration))
+        condition_calibration["scope"]["condition"] = {
+            "path": str(mutated_condition_path), "raw_sha256": mutated_condition_sha,
+        }
+        condition_calibration["scope"]["pressure_thresholds"] = dict(condition_value["pressure_thresholds"])
+        condition_calibration["raw_inputs"]["condition_raw_sha256"] = mutated_condition_sha
+        condition_calibration_body = {
+            key: value for key, value in condition_calibration.items() if key != "calibration_sha256"
+        }
+        condition_calibration["calibration_sha256"] = readback.digest_object(condition_calibration_body)
+        condition_calibration_path, condition_calibration_sha = write_canonical(
+            temp_root, "mutated-condition-calibration.json", condition_calibration,
+        )
+        expect_rejected(
+            calibration={"path": str(condition_calibration_path), "raw_sha256": condition_calibration_sha},
+            evidence_map=extra_map,
+        )
+
+        capacity_artifact_path = Path(capacity_bundle["artifact"]["path"])
+        capacity_artifact_raw, _ = readback.read_stable(
+            capacity_artifact_path, "fixture prepared capacity TSV", 4096,
+        )
+        mutated_capacity_raw = capacity_artifact_raw[:-1] + bytes([capacity_artifact_raw[-1] ^ 1])
+        mutated_capacity_path = temp_root / "mutated-capacity.tsv"
+        mutated_capacity_path.write_bytes(mutated_capacity_raw)
+        mutated_capacity_bundle = json.loads(readback.canonical_bytes(capacity_bundle))
+        mutated_capacity_sha = readback.sha256_bytes(mutated_capacity_raw)
+        mutated_capacity_bundle["artifact"] = {
+            "path": str(mutated_capacity_path), "raw_sha256": mutated_capacity_sha,
+        }
+        capacity_calibration = json.loads(readback.canonical_bytes(calibration))
+        capacity_calibration["scope"]["capacity_bundle_pins"] = mutated_capacity_bundle
+        capacity_calibration["raw_inputs"]["capacity_bundle_pins_sha256"] = readback.digest_object(mutated_capacity_bundle)
+        capacity_calibration["raw_inputs"]["application_capacity_calibration_sha256"] = mutated_capacity_sha
+        capacity_calibration_body = {
+            key: value for key, value in capacity_calibration.items() if key != "calibration_sha256"
+        }
+        capacity_calibration["calibration_sha256"] = readback.digest_object(capacity_calibration_body)
+        capacity_calibration_path, capacity_calibration_sha = write_canonical(
+            temp_root, "mutated-capacity-calibration.json", capacity_calibration,
+        )
+        expect_rejected(
+            calibration={"path": str(capacity_calibration_path), "raw_sha256": capacity_calibration_sha},
+            capacity=mutated_capacity_bundle,
+            evidence_map=extra_map,
+        )
+
+        calibration_bad = json.loads(readback.canonical_bytes(calibration))
+        calibration_bad["worker_cleanup"][0]["alive_after_cleanup"] = True
+        calibration_body = {key: item for key, item in calibration_bad.items() if key != "calibration_sha256"}
+        calibration_bad["calibration_sha256"] = readback.digest_object(calibration_body)
+        mutated_calibration_path = temp_root / "mutated-worker-cleanup-calibration.json"
+        mutated_calibration_raw = readback.canonical_bytes(calibration_bad)
+        mutated_calibration_path.write_bytes(mutated_calibration_raw)
+        expect_rejected(
+            calibration={
+                "path": str(mutated_calibration_path),
+                "raw_sha256": readback.sha256_bytes(mutated_calibration_raw),
+            },
+            evidence_map=extra_map,
+        )
+    return result
+
+
+class PressureReadbackV2Tests(unittest.TestCase):
+    def test_numeric_context_projection_ignores_only_member_references(self) -> None:
+        policy = {
+            "schema": readback.SOURCE5_PRESSURE_POLICY_SCHEMA,
+            "source_manifest": {"path": "/source/manifest.json", "raw_sha256": "a" * 64},
+            "context": {"host_id": "host", "workload": "work", "profile": "profile", "calibration_id": "capacity-cal"},
+            "capacity_bundle": {"request": {}, "artifact": {}, "receipt": {}},
+            "base_policy_artifact_sha256": "b" * 64,
+            "base_policy_sha256": "c" * 64,
+            "base_context_sha256": "d" * 64,
+            "resolution_rule_version": "rule-v1",
+            "numeric_policy": {"collector": {"control_charge_bytes": 48}},
+            "baseline": {"expected_global_control_baseline": 10},
+            "hard_ceilings": {"global": {}, "tenant": {}},
+            "normalization_denominators": {"capacity_sources": {}, "scope_limits": {}, "rate_buckets": {}},
+            "member_resolutions": [{"request_raw_sha256": "e" * 64}, {"request_raw_sha256": "f" * 64}],
+            "policy_sha256": "0" * 64,
+        }
+
+        def reseal(value: dict[str, Any]) -> dict[str, Any]:
+            sealed = dict(value)
+            body = {key: item for key, item in sealed.items() if key != "policy_sha256"}
+            sealed["policy_sha256"] = readback.digest_object(body)
+            return sealed
+
+        policy = reseal(policy)
+        original = readback._context_policy_numeric_projection_digest_v2(policy)
+        changed_references = dict(policy)
+        changed_references["member_resolutions"] = [
+            {"request_raw_sha256": "1" * 64}, {"request_raw_sha256": "2" * 64},
+        ]
+        changed_references = reseal(changed_references)
+        self.assertEqual(readback._context_policy_numeric_projection_digest_v2(changed_references), original)
+
+        changed_numeric = dict(changed_references)
+        changed_numeric["numeric_policy"] = {"collector": {"control_charge_bytes": 49}}
+        changed_numeric = reseal(changed_numeric)
+        self.assertNotEqual(readback._context_policy_numeric_projection_digest_v2(changed_numeric), original)
+        with self.assertRaises(readback.ReadbackError):
+            readback._context_policy_numeric_projection_digest_v2(dict(policy, unexpected_numeric_field=1))
+
+        stored_receipt = {
+            "context_policy_bundle_raw_sha256": "a" * 64,
+            "context_policy_artifact_raw_sha256": "b" * 64,
+            "context_policy_sha256": original,
+            "capacity_bundle_pins_sha256": "c" * 64,
+            "scope_sha256": "d" * 64,
+            "host_verification": {"host_id": "host"},
+            "receipt_sha256": "e" * 64,
+        }
+        current_replay = dict(stored_receipt)
+        current_replay["context_policy_bundle_raw_sha256"] = "f" * 64
+        current_replay["context_policy_artifact_raw_sha256"] = "1" * 64
+        current_replay["receipt_sha256"] = "2" * 64
+        self.assertTrue(readback._scope_receipts_match_replay_v2(stored_receipt, current_replay))
+        current_replay["capacity_bundle_pins_sha256"] = "3" * 64
+        self.assertFalse(readback._scope_receipts_match_replay_v2(stored_receipt, current_replay))
+
+    def test_source5_condition_freezes_exact_numeric_thresholds_and_distinct_identity(self) -> None:
+        calibration_schedule = {
+            "seed": 7,
+            "duration_seconds": 30,
+            "sample_interval_ms": 100,
+            "startup_deadline_seconds": 2,
+            "total_deadline_seconds": 40,
+            "term_deadline_seconds": 2,
+            "kill_deadline_seconds": 2,
+            "minimum_overlap_seconds": 30,
+            "startup_ready_windows": 1,
+            "cpu_duty_basis_points": 7000,
+            "pressure_cpu_affinity": [0],
+            "application_cpu_affinity": [0],
+            "disk_bytes_per_second": 1024 * 1024,
+            "scratch_file_bytes": 65536,
+            "network_requests_per_second": 100,
+            "network_payload_bytes": 256,
+        }
+        capacity_key = {"host_id": "host", "workload": "app", "profile": "default", "calibration_id": "capacity-cal"}
+        condition = {
+            "schema": readback.SOURCE5_PRESSURE_CONDITION_SCHEMA,
+            "host_id": "host",
+            "condition_id": "condition-v2",
+            "capacity_key": capacity_key,
+            "pressure_calibration_id": "pressure-cal-v2",
+            "readiness_threshold_rule": readback.SOURCE5_PRESSURE_READINESS_RULE_V1,
+            "readiness_thresholds": {
+                "minimum_overlap_seconds": 30,
+                "minimum_ready_samples": 300,
+                "maximum_sample_gap_ms": 200,
+            },
+            "pressure_thresholds": {
+                "cpu_busy_min_basis_points": 6000,
+                "disk_write_min_bytes_per_second": 100_000,
+                "disk_queue_or_stall_min_microseconds": 10,
+                "loopback_requests_min_per_second": 50,
+                "loopback_latency_p99_max_nanoseconds": 1_000_000,
+                "loopback_tx_min_bytes_per_second": 10_000,
+                "loopback_rx_min_bytes_per_second": 10_000,
+            },
+            "schedule": dict(calibration_schedule, duration_seconds=10800, total_deadline_seconds=12000),
+        }
+        with tempfile.TemporaryDirectory(prefix="pressure-condition-v2-") as temporary:
+            root = Path(temporary)
+            path = root / "condition.json"
+            raw = readback.canonical_bytes(condition)
+            path.write_bytes(raw)
+            pin = {"path": str(path), "raw_sha256": readback.sha256_bytes(raw)}
+            normalized_pin, normalized = readback._verify_condition_file_v2(
+                pin, capacity_key, "condition-v2", calibration_schedule,
+            )
+            self.assertEqual(normalized_pin, pin)
+            self.assertEqual(normalized["pressure_thresholds"], condition["pressure_thresholds"])
+            self.assertEqual(normalized["pressure_calibration_id"], "pressure-cal-v2")
+
+            mutations = (
+                {"pressure_thresholds": dict(condition["pressure_thresholds"], cpu_busy_min_basis_points=True)},
+                {"pressure_thresholds": dict(condition["pressure_thresholds"], cpu_busy_min_basis_points=10001)},
+                {"pressure_calibration_id": "capacity-cal"},
+                {"schedule": dict(condition["schedule"], disk_bytes_per_second=2 * 1024 * 1024)},
+            )
+            for index, mutation in enumerate(mutations):
+                invalid = dict(condition, **mutation)
+                bad_path = root / f"invalid-{index}.json"
+                bad_raw = readback.canonical_bytes(invalid)
+                bad_path.write_bytes(bad_raw)
+                bad_pin = {"path": str(bad_path), "raw_sha256": readback.sha256_bytes(bad_raw)}
+                with self.assertRaises(readback.ReadbackError):
+                    readback._verify_condition_file_v2(bad_pin, capacity_key, "condition-v2", calibration_schedule)
+
+            oversized = dict(condition, schedule=dict(condition["schedule"], duration_seconds=12001))
+            bad_path = root / "oversized.json"
+            bad_raw = readback.canonical_bytes(oversized)
+            bad_path.write_bytes(bad_raw)
+            bad_pin = {"path": str(bad_path), "raw_sha256": readback.sha256_bytes(bad_raw)}
+            with self.assertRaises(readback.ReadbackError):
+                readback._verify_condition_file_v2(bad_pin, capacity_key, "condition-v2", calibration_schedule)
+            with self.assertRaises(readback.ReadbackError):
+                readback._validate_calibration_schedule_v2(condition["schedule"])
+
+    def test_every_measured_window_must_meet_frozen_thresholds(self) -> None:
+        thresholds = {
+            "cpu_busy_min_basis_points": 6000,
+            "disk_write_min_bytes_per_second": 100_000,
+            "disk_queue_or_stall_min_microseconds": 10,
+            "loopback_requests_min_per_second": 50,
+            "loopback_latency_p99_max_nanoseconds": 100,
+            "loopback_tx_min_bytes_per_second": 10_000,
+            "loopback_rx_min_bytes_per_second": 10_000,
+        }
+        sample = {
+            "interval_start_monotonic_ns": 10_000_000_000,
+            "interval_end_monotonic_ns": 11_000_000_000,
+            "cpu": {"busy_basis_points": 7000},
+            "block": {
+                "write_bytes": 200_000,
+                "writes_completed": 1,
+                "weighted_io_milliseconds": 1,
+                "in_flight": 0,
+            },
+            "io_psi_delta_microseconds": 0,
+            "loopback": {"requests_completed": 200, "p99_upper_latency_nanoseconds": 64},
+            "loopback_counters": {
+                "tx_bytes": 20_000, "rx_bytes": 20_000,
+                "rx_errors": 0, "tx_errors": 0, "rx_dropped": 0, "tx_dropped": 0,
+            },
+        }
+        readback._validate_samples_meet_pressure_thresholds_v2([sample], thresholds)
+        failed = dict(sample, loopback={"requests_completed": 200, "p99_upper_latency_nanoseconds": 128})
+        with self.assertRaises(readback.ReadbackError):
+            readback._validate_samples_meet_pressure_thresholds_v2([sample, failed], thresholds)
+        with self.assertRaises(readback.ReadbackError):
+            readback._pressure_thresholds_v2(dict(thresholds, cpu_busy_min_basis_points=True), "fixture thresholds")
+
+    def test_offline_path_map_is_closed_sorted_identity_only(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="pressure-evidence-map-") as temporary:
+            root = Path(temporary).resolve()
+            payload = root / "receipt.json"
+            payload.write_bytes(b"{}\n")
+            entries = [
+                {"origin": str(root), "local": str(root)},
+                {"origin": str(payload), "local": str(payload)},
+            ]
+            normalized, directories = readback._normalize_evidence_path_map({
+                "schema": readback.EVIDENCE_PATH_MAP_SCHEMA_V1,
+                "entries": entries,
+            }, root)
+            self.assertEqual(normalized[str(root)], str(root))
+            self.assertIn(str(root), directories)
+            token = readback._EVIDENCE_PATH_MAP_CONTEXT.set((normalized, directories))
+            try:
+                readback._require_absolute_evidence_paths_mapped({"source": str(root / "source.json")})
+                with self.assertRaises(readback.ReadbackError):
+                    readback._require_absolute_evidence_paths_mapped({"source": str(Path(temporary).parent / "outside.json")})
+            finally:
+                readback._EVIDENCE_PATH_MAP_CONTEXT.reset(token)
+
+            with self.assertRaises(readback.ReadbackError):
+                readback._normalize_evidence_path_map({
+                    "schema": readback.EVIDENCE_PATH_MAP_SCHEMA_V1,
+                    "entries": [
+                        {"origin": str(root), "local": str(root)},
+                        {"origin": str(payload), "local": str(root / "renamed.json")},
+                    ],
+                }, root)
+
+    def test_host_verification_binds_original_observed_host_and_worker_reap(self) -> None:
+        observed = {
+            "host_id": "host",
+            "boot_id_sha256": "a" * 64,
+            "kernel_release": "7.0.0-test",
+            "cpu_affinity": [2, 4],
+            "cpu_model": "test-cpu",
+            "network_namespace_inode": 98765,
+        }
+        observed_pin = {"path": "/evidence/observed-host.json", "raw_sha256": "b" * 64}
+        calibration = {
+            "host": {
+                "boot_id_sha256": observed["boot_id_sha256"],
+                "kernel_release": observed["kernel_release"],
+                "allowed_cpu_affinity": observed["cpu_affinity"],
+            },
+            "network": {"network_namespace_inode": observed["network_namespace_inode"]},
+        }
+        proof = readback._host_verification_v2(calibration, observed_pin, observed, require_live=False)
+        self.assertEqual(proof["schema"], readback.CALIBRATION_HOST_VERIFICATION_SCHEMA_V2)
+        self.assertEqual(proof["host_id"], "host")
+        self.assertEqual(proof["observed_host_raw_sha256"], observed_pin["raw_sha256"])
+        self.assertIs(proof["owned_worker_pids_reaped"], True)
+        body = {key: value for key, value in proof.items() if key != "host_verification_sha256"}
+        self.assertEqual(proof["host_verification_sha256"], readback.digest_object(body))
+
+    def test_source_module_executes_hashed_bytes_after_path_swap_and_ignores_cache(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="pressure-captured-module-") as temporary:
+            root = Path(temporary).resolve()
+            source_path = root / "scripts" / "pinned-helper.py"
+            source_path.parent.mkdir()
+            captured = b'CAPTURED_VALUE = "verified-source-bytes"\n'
+            replacement = b'CAPTURED_VALUE = "changed-after-hash"\n'
+            source_path.write_bytes(captured)
+            source_path.chmod(0o644)
+            cache = source_path.parent / "__pycache__" / "pinned-helper.cpython-999.pyc"
+            cache.parent.mkdir()
+            cache.write_bytes(b"untrusted stale bytecode")
+            record = {
+                "path": "scripts/pinned-helper.py",
+                "kind": "file",
+                "mode": "100644",
+                "sha256": readback.sha256_bytes(captured),
+                "size": len(captured),
+            }
+            source = {"source": {"files": [record]}}
+            actual_compile = builtins.compile
+
+            def replace_before_compile(code: bytes, filename: str, mode: str, **kwargs: Any):
+                source_path.write_bytes(replacement)
+                return actual_compile(code, filename, mode, **kwargs)
+
+            with patch.object(readback, "compile", side_effect=replace_before_compile, create=True):
+                module, actual = readback._load_source_module(root, source, record["path"], "captured-helper")
+            self.assertEqual(actual, record["sha256"])
+            self.assertEqual(module.CAPTURED_VALUE, "verified-source-bytes")
+            self.assertEqual(source_path.read_bytes(), replacement)
+
+    def test_driver_loads_captured_reader_bytes_after_path_swap(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="pressure-captured-reader-") as temporary:
+            path = Path(temporary) / "application-pressure-readback.py"
+            captured = (
+                b'CALIBRATION_SCOPE_RECEIPT_SCHEMA_V2 = '
+                b'"allocatbelt.application-pressure-calibration-scope-readback.v2"\n'
+            )
+            replacement = b'CALIBRATION_SCOPE_RECEIPT_SCHEMA_V2 = "replaced-reader"\n'
+            path.write_bytes(captured)
+            path.chmod(0o644)
+            original_reader = driver.read_stable
+
+            def replace_after_capture(candidate: Path, label: str, maximum: int):
+                if candidate == path:
+                    path.write_bytes(replacement)
+                    return captured, driver.digest_bytes(captured)
+                return original_reader(candidate, label, maximum)
+
+            with patch.object(driver, "READER_PATH", path), patch.object(
+                driver, "read_stable", side_effect=replace_after_capture,
+            ):
+                module = driver._load_scope_readback_module()
+            self.assertEqual(
+                module.CALIBRATION_SCOPE_RECEIPT_SCHEMA_V2,
+                driver.CALIBRATION_SCOPE_RECEIPT_SCHEMA_V2,
+            )
+            self.assertEqual(path.read_bytes(), replacement)
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--scope-fixture", type=Path,
+        help="run full replay and mutation checks against a raw-pinned genuine SourceV5 fixture",
+    )
+    args = parser.parse_args(argv)
+    if args.scope_fixture is not None:
+        result = run_genuine_scope_fixture(args.scope_fixture)
+        sys.stdout.buffer.write(readback.canonical_bytes({
+            "schema": SCOPE_FIXTURE_SCHEMA,
+            "status": "full_replay_and_mutations_passed",
+            "scope_sha256": result["scope_sha256"],
+            "calibration_raw_sha256": result["calibration_raw_sha256"],
+            "receipt_sha256": result["receipt_sha256"],
+            "qualification_eligible": result["qualification_eligible"],
+        }))
+        return 0
+    result = unittest.main(argv=[sys.argv[0]], exit=False)
+    return 0 if result.result.wasSuccessful() else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
