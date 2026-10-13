@@ -152,7 +152,7 @@ class Fixture:
             "logical_window": module.LOGICAL_WINDOW,
             "task_ceiling": module.TASK_CEILING,
             "workers_by_profile": {"ordinary": 4, "oversubscribed": 2},
-            "workloads": {"mixed": {"domain_ceiling": domain, "scope_limits": scope}},
+            "workloads": {"mixed": {"domain_ceiling": {**domain, "cpu": 4}, "scope_limits": scope}},
             "byte_buckets": buckets,
         }
         fixed_runtime_policy = {
@@ -517,6 +517,39 @@ class Fixture:
 
 
 class SoakReadbackTests(unittest.TestCase):
+    def test_oversubscribed_derives_two_slots_from_canonical_ordinary_policy(self):
+        with tempfile.TemporaryDirectory(prefix="allocatbelt-soak-oversubscribed-") as temp:
+            fixture = Fixture(Path(temp), profile="oversubscribed")
+            frozen_manifest = fixture.manifest_path.read_bytes()
+            audit = fixture.audit()
+            self.assertEqual(audit["source"]["domain_ceilings"]["cpu"], 2)
+            self.assertEqual(audit["recipe"]["runtime"]["resource_limits"]["cpu_charges"], 2)
+            self.assertEqual(fixture.manifest_path.read_bytes(), frozen_manifest)
+            policy = json.loads(frozen_manifest)["fixed_runtime_policy"]["policy"]
+            self.assertEqual(policy["workloads"]["mixed"]["domain_ceiling"]["cpu"], 4)
+            for profile in ("mixed", "burst", "oversubscribed"):
+                self.assertEqual(module._expected_mixed_limits(profile, policy)[0]["cpu_charges"], 2 if profile == "oversubscribed" else 4)
+            self.assertEqual(policy["workloads"]["mixed"]["domain_ceiling"]["cpu"], 4)
+
+    def test_oversubscribed_rejects_rewritten_artifact_or_worker_map(self):
+        with tempfile.TemporaryDirectory(prefix="allocatbelt-soak-policy-rewrite-") as temp:
+            fixture = Fixture(Path(temp), profile="oversubscribed")
+            original = json.loads(fixture.manifest_path.read_bytes())["fixed_runtime_policy"]["policy"]
+            rewritten = json.loads(json.dumps(original))
+            rewritten["workloads"]["mixed"]["domain_ceiling"]["cpu"] = 2
+            with self.assertRaisesRegex(module.SoakReadbackError, "domain ceiling"):
+                module._expected_mixed_limits("oversubscribed", rewritten)
+            for section, name in (("domain_ceiling", "cpu"), ("domain_ceiling", "memory"), ("scope_limits", "disk_operation_limit")):
+                rewritten = json.loads(json.dumps(original))
+                rewritten["workloads"]["mixed"][section][name] = float(rewritten["workloads"]["mixed"][section][name])
+                with self.assertRaisesRegex(module.SoakReadbackError, "integer"):
+                    module._expected_mixed_limits("oversubscribed", rewritten)
+            for ordinary, oversubscribed in ((2, 2), (4, 4), (True, 2), (4.0, 2), (4, 2.0)):
+                rewritten = json.loads(json.dumps(original))
+                rewritten["workers_by_profile"] = {"ordinary": ordinary, "oversubscribed": oversubscribed}
+                with self.assertRaisesRegex(module.SoakReadbackError, "worker map"):
+                    module._expected_mixed_limits("oversubscribed", rewritten)
+
     def test_run_checked_bounds_capture_and_reaps_timeout_and_orphan_groups(self):
         with tempfile.TemporaryDirectory(prefix="allocatbelt-soak-checked-") as temp:
             root = Path(temp)

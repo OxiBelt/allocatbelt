@@ -655,7 +655,7 @@ def verify_source_tree(root: Path, source: dict[str, Any]) -> str:
 def _expected_mixed_limits(profile: str, policy: dict[str, Any]) -> tuple[dict[str, int], dict[str, int], dict[str, int]]:
     require(profile in PROFILES, "unsupported soak profile")
     workers_by_profile = policy.get("workers_by_profile")
-    require(type(workers_by_profile) is dict, "fixed policy omits its worker map")
+    require(type(workers_by_profile) is dict and workers_by_profile == {"ordinary": 4, "oversubscribed": 2} and all(type(value) is int for value in workers_by_profile.values()), "fixed policy worker map differs from the frozen profile contract")
     workers = workers_by_profile.get("oversubscribed" if profile == "oversubscribed" else "ordinary")
     workers = uint(workers, "fixed worker count", positive=True)
     require(workers == (2 if profile == "oversubscribed" else 4), "fixed policy worker count differs from the soak profile contract")
@@ -664,8 +664,12 @@ def _expected_mixed_limits(profile: str, policy: dict[str, Any]) -> tuple[dict[s
     mixed = workloads["mixed"]
     domain = exact_object(mixed.get("domain_ceiling"), set(DOMAINS), "mixed domain ceiling")
     scope = exact_object(mixed.get("scope_limits"), {"managed_memory_limit", "disk_operation_limit", "network_operation_limit"}, "mixed scope limits")
+    for name, value in domain.items():
+        uint(value, f"mixed domain ceiling {name}")
+    for name, value in scope.items():
+        uint(value, f"mixed scope limit {name}")
     require(domain == {
-        "cpu": workers,
+        "cpu": 4,
         "memory": 1_638_536,
         "disk": 8,
         "network": 16,
@@ -677,6 +681,9 @@ def _expected_mixed_limits(profile: str, policy: dict[str, Any]) -> tuple[dict[s
         "disk_operation_limit": 8,
         "network_operation_limit": 16,
     }, "mixed scope limits differ from the frozen fixed policy")
+    # The canonical artifact records the ordinary ceiling. Derive the selected
+    # profile from its separately frozen worker map without changing the artifact.
+    domain = {**domain, "cpu": workers}
     limits = {
         "managed_bytes": domain["memory"],
         "disk_ops": domain["disk"],
