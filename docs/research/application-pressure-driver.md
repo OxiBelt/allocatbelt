@@ -4,6 +4,13 @@ The pressure driver supplies a finite CPU, block-I/O and IPv4 loopback load to
 one application process. It is a prospective harness component. Implementing
 the driver does not enable campaign execution or qualify an allocator/runtime.
 
+The SourceV5 three-hour soak runner starts this driver first, validates its
+measured readiness marker, and only then starts the soak application. The
+application launch binding is atomically published after `Popen` with the
+observed PID/start ticks, binary, affinity, network namespace, cwd and TMPDIR.
+See [`application-soak-readback.md`](application-soak-readback.md) for the
+independent soak composite and its separate pressure and feedback proofs.
+
 Every application process receives its own canonical recipe and fresh driver
 session. Pair members use distinct binary hashes, process nonces and launch
 records, while sharing one `condition_id`, the exact schedule, pressure
@@ -193,6 +200,43 @@ and never claims a physical NIC. `run` exits unsuccessfully on missing or
 sparse samples, failed readiness, early application exit, deadline breach,
 storage reserve loss, worker error, scratch mismatch or incomplete cleanup.
 It writes a failed run receipt when bounded artifacts can still be preserved.
+
+Every new driver run and calibration uses a durable three-step worker start
+protocol. The parent first records and syncs the exact isolated worker PID,
+`/proc` start ticks, PGID, session, role and nonce. A worker verifies that row
+against its own identity and the parent PID/start, then acknowledges it while
+remaining blocked. The parent syncs the exact acknowledgement set and a
+pressure-start record before sending the separate work-start grant. Workers
+install `PR_SET_PDEATHSIG` before opening load sources and exit if the bound
+driver lifetime changes. The readiness marker includes the protocol name and
+the ownership/acknowledgement journal hashes. The pressure reader accepts the
+older pressure-start-only event form for archived records; SourceV5 soak
+preflight requires the durable protocol and its independent reader checks all
+three event records before accepting readiness.
+
+For `calibrate`, the ownership, acknowledgement and work-start journals are
+private temporary files beside the calibration output. They are synced before
+the corresponding worker grants and removed only after a successful calibration
+receipt is published. Failed calibrations retain them with the bounded failure
+diagnostics. During a SourceV5 soak, the outer runner is a Linux child subreaper
+before it launches the driver. It captures worker identities from the driver's
+child list and, if the driver dies, from its adopted children; it preserves the
+same start/session bindings through adoption and reaps only those exact child
+PIDs. If an adopted zombie has lost its command line, its pressure role is
+authenticated only by an exact PID/start/PGID/session/nonce match in the
+durable ownership event. Other direct-child zombies are recorded as unknown
+and reaped with `waitpid`; they never fill a missing worker role and make the
+inventory fail. Unknown live children are never signalled.
+
+The outer SourceV5 supervisor records TERM and HUP from before pressure-driver
+`Popen` through readiness, application supervision, final driver wait and
+cleanup. It restores the exact handlers it replaced after cleanup and writes
+a bounded interruption receipt with the stable `128 + signal` exit code. A
+missing or incomplete inventory after driver exit fails cleanup.
+
+SourceV5 keeps pressure supervisor stdout/stderr logs beside the pressure
+artifact directory. The artifact directory itself remains the validator's
+exact five-file set.
 
 The independent reader does not trust the receipt's pass label. Its caller
 supplies the recipe self digest and raw digests for the run receipt, event

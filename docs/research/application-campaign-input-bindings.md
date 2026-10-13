@@ -41,13 +41,18 @@ conditions bind the capacity key, condition bytes, pressure calibration
 outputs, readiness thresholds, and prospective driver schedule.
 
 Campaign-plan V3 freezes reusable capacity and fixed/pressure feedback
-templates per host and context. A later phase must derive distinct nonces from
-the template nonce plus campaign job, run, pair member, and ordinal for each
-of the original 36 repetitions. The plan carries source and binary hashes,
-numeric policy, template digests, and required proof names; it contains no live
-process IDs and claims no observed proof. Runtime and pressure qualification
-remain hard-disabled until the evidence readers, nonce instantiation, and
-launch flow are implemented and verified.
+templates per host and context. The SourceV5 soak recipe derives a run nonce
+from the selected template nonce, campaign job, `soak` member, and ordinal. The
+plan still contains no live process IDs and claims no observed proof. The
+pressure-first soak runner waits for measured readiness before application
+`Popen`, then atomically binds the actual process identity for the pressure
+driver.
+
+The SourceV5 soak contract and its independent v2 composite are documented in
+[`application-soak-readback.md`](application-soak-readback.md). Runtime and
+pressure qualification remain disabled while capacity chronology and
+construction-derived feedback composition are incomplete. Raw pins and a
+successful pressure startup marker do not complete those semantic gates.
 
 The V3 plan also pins the regular-inventory SHA-256 of
 `application-campaign-inputs.py`. Validation, freezing, and plan verification

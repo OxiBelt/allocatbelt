@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Run one fixed-policy mixed soak from a parent-pinned recipe. The campaign
-# controller does not yet generate this recipe; until it does, this runner
-# refuses to launch instead of inferring missing source/oracle expectations.
+# Run one source-pinned mixed soak from a parent recipe. V1 recipes preserve
+# their archived fixed-policy behavior; V2 pressure recipes gate app launch on
+# the driver's measured, recipe-pinned readiness marker.
 set -euo pipefail
 export LC_ALL=C
 umask 077
@@ -58,11 +58,6 @@ if [[ "$mode" == qualified ]]; then
 else
   (( duration < 10800 )) || { echo "functional mode requires a short horizon and is never qualification eligible" >&2; exit 2; }
 fi
-if [[ "${ALLOCATBELT_APP_COMPARISON_FAMILY:-fixed_policy}" != fixed_policy ]]; then
-  echo "external-pressure and unknown comparison families are unsupported by this fixed-policy soak runner" >&2
-  exit 2
-fi
-
 for command in python3 sha256sum realpath taskset; do
   command -v "$command" >/dev/null || { echo "missing required command: $command" >&2; exit 2; }
 done
@@ -101,11 +96,29 @@ preflight_json=$(python3 -B "$readback_script" preflight \
   --duration-seconds "$duration") || exit 2
 reference_ring=$(python3 -B -c 'import json,sys; print(json.load(sys.stdin)["reference_ring_path"])' <<<"$preflight_json")
 reference_ring_sha=$(python3 -B -c 'import json,sys; print(json.load(sys.stdin)["reference_ring_sha256"])' <<<"$preflight_json")
+comparison_family=$(python3 -B -c 'import json,sys; print(json.load(sys.stdin).get("comparison_family", "fixed_policy"))' <<<"$preflight_json")
+launch_enabled=$(python3 -B -c 'import json,sys; print(str(json.load(sys.stdin).get("launch_enabled", True)).lower())' <<<"$preflight_json")
+runner_outer_seconds=$(python3 -B -c 'import json,sys; x=json.load(sys.stdin); print(x.get("application_wall_timeout_seconds", x["duration_seconds"]+1200))' <<<"$preflight_json")
+[[ "$runner_outer_seconds" =~ ^[1-9][0-9]*$ ]] || { echo "preflight returned an invalid app wall timeout" >&2; exit 2; }
+case "$comparison_family" in
+  fixed_policy)
+    if [[ -n "${ALLOCATBELT_APP_COMPARISON_FAMILY:-}" && "$ALLOCATBELT_APP_COMPARISON_FAMILY" != fixed_policy ]]; then
+      echo "runner comparison-family argument differs from the pinned fixed-policy recipe" >&2
+      exit 2
+    fi
+    ;;
+  external_pressure)
+    [[ "$launch_enabled" == true ]] || {
+      echo "SourceV5 soak recipe is preparatory: capacity chronology, feedback composition, and pressure recipe readiness are not complete" >&2
+      exit 2
+    }
+    ;;
+  *) echo "unsupported comparison family in the verified parent recipe" >&2; exit 2 ;;
+esac
 
 terminal="$output_dir/terminal-records.tsv"
 samples="$output_dir/resource-samples.tsv"
 
-runner_outer_seconds=$((duration + 1200))
 set +e
 python3 -B "$readback_script" launch \
   --recipe "$recipe" \

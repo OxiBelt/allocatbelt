@@ -15,6 +15,7 @@ import re
 import stat
 import subprocess
 import sys
+import tempfile
 import types
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -24,6 +25,7 @@ SOURCE_SCHEMA = "allocatbelt.application-source-manifest.v4"
 SPEC_SCHEMA = "allocatbelt.application-campaign-spec.v2"
 PLAN_SCHEMA = "allocatbelt.application-campaign-plan.v2"
 RECIPE_RECEIPT_SCHEMA = "allocatbelt.application-soak-recipe-build-receipt.v1"
+RECIPE_RECEIPT_SCHEMA_V2 = "allocatbelt.application-soak-recipe-build-receipt.v2"
 SOURCE_INVENTORY_SCHEMA = "allocatbelt.application-source-inventory.v1"
 SOURCE_INVENTORY_PATH = "scripts/application-source-inventory.py"
 SOAK_READER_PATH = "scripts/application-soak-readback.py"
@@ -36,6 +38,9 @@ HOST_CONTROL_KEYS = {
     "background_load_policy_sha256", "x86_64_v3_capability_sha256", "target_triple", "target_cpu",
 }
 SOAK_SECONDS = 10_800
+SOURCE_V5_SCHEMA = "allocatbelt.application-source-manifest.v5"
+SPEC_SCHEMA_V3 = "allocatbelt.application-campaign-spec.v3"
+PLAN_SCHEMA_V3 = "allocatbelt.application-campaign-plan.v3"
 RSS_GROWTH_PERCENT = 5
 MAX_SPEC_BYTES = 32 * 1024 * 1024
 MAX_PLAN_BYTES = 256 * 1024 * 1024
@@ -44,6 +49,15 @@ MAX_SOURCE_FILE_BYTES = 64 * 1024 * 1024
 MAX_SCRIPT_BYTES = 4 * 1024 * 1024
 MAX_EXECUTABLE_BYTES = 512 * 1024 * 1024
 MAX_EXTERNAL_ORACLE_BYTES = 512 * 1024 * 1024
+SOURCE_V5_APP_SETUP_BUDGET_SECONDS = 120
+SOURCE_V5_TRACE_OVERRUN_SECONDS = 5
+SOURCE_V5_DRAIN_BUDGET_SECONDS = 5
+SOURCE_V5_SHUTDOWN_BUDGET_SECONDS = 60
+SOURCE_V5_POSTPROCESS_BUDGET_SECONDS = 60
+SOURCE_V5_PRESSURE_EXIT_OBSERVATION_SECONDS = 1
+SOURCE_V5_PRESSURE_MAX_DURATION_SECONDS = 12_000
+SOURCE_V5_PRESSURE_MAX_SAMPLES = 120_000
+SOURCE_V5_PRESSURE_MAX_TOTAL_SECONDS = 14_400
 
 
 class RecipeBuildError(ValueError):
@@ -511,11 +525,41 @@ def build_recipe(
     duration_seconds: int,
     terminal_budget_bytes: int,
     sample_budget_bytes: int,
+    construction_probe_path: Path | None = None,
+    construction_probe_sha256: str | None = None,
+    plan_path: Path | None = None,
+    plan_file_sha256: str | None = None,
+    pressure_recipe_path: Path | None = None,
+    pressure_recipe_raw_sha256: str | None = None,
+    pressure_recipe_semantic_sha256: str | None = None,
 ) -> dict[str, Any]:
     """Build and reader-validate one immutable soak recipe without launching."""
     spec_raw, spec_file_sha256 = read_stable(spec_path, "campaign spec", MAX_SPEC_BYTES)
     require(spec_file_sha256 == spec_sha256, "campaign spec file differs from its caller-frozen SHA-256")
     require(parse_json(spec_raw, "campaign spec") == spec and spec_raw == canonical_bytes(spec), "campaign spec object differs from its canonical frozen file")
+    if spec.get("schema") == SPEC_SCHEMA_V3 and type(job) is dict and job.get("phase") == "soak":
+        require(construction_probe_path is not None and is_sha256(construction_probe_sha256), "SourceV5 soak recipe requires the actual compiled application construction probe path and raw SHA")
+        return build_external_pressure_recipe(
+            spec, plan, job,
+            spec_sha256=spec_sha256,
+            plan_sha256=plan_sha256,
+            spec_path=spec_path,
+            source_root=source_root,
+            oracle_root=oracle_root,
+            ring_relative_path=ring_relative_path,
+            ring_sha256=ring_sha256,
+            mode=mode,
+            duration_seconds=duration_seconds,
+            terminal_budget_bytes=terminal_budget_bytes,
+            sample_budget_bytes=sample_budget_bytes,
+            construction_probe_path=construction_probe_path,
+            construction_probe_sha256=construction_probe_sha256,
+            plan_path=plan_path,
+            plan_file_sha256=plan_file_sha256,
+            pressure_recipe_path=pressure_recipe_path,
+            pressure_recipe_raw_sha256=pressure_recipe_raw_sha256,
+            pressure_recipe_semantic_sha256=pressure_recipe_semantic_sha256,
+        )
     campaign_id, _host, source_refs, soak = _check_spec_and_plan(spec, plan, job, spec_sha256, plan_sha256)
     require(mode in ("qualified", "functional"), "recipe mode must be qualified or functional")
     duration = uint(duration_seconds, "recipe duration", positive=True)
@@ -745,6 +789,439 @@ def build_recipe(
     }
 
 
+def process_nonce(template_nonce: str, campaign_id: str, job_run_id: str, pair_member: str, ordinal: int) -> str:
+    """Instantiate one reusable SourceV5 nonce with its job/member/ordinal scope."""
+    material = {
+        "template_nonce": template_nonce,
+        "campaign_id": campaign_id,
+        "job_run_id": job_run_id,
+        "pair_member": pair_member,
+        "ordinal": ordinal,
+    }
+    return sha256(b"allocatbelt.application-process-nonce-instantiation.v1\0" + canonical_bytes(material))[:32]
+
+
+def _derive_v5_pressure_schedule(duration_seconds: int, request: dict[str, Any], condition_schedule: dict[str, Any]) -> dict[str, Any]:
+    """Derive a pressure window enclosing startup, the soak and bounded cleanup."""
+    schedule_keys = {
+        "seed", "duration_seconds", "sample_interval_ms", "startup_deadline_seconds",
+        "total_deadline_seconds", "term_deadline_seconds", "kill_deadline_seconds",
+        "minimum_overlap_seconds", "startup_ready_windows", "cpu_duty_basis_points",
+        "pressure_cpu_affinity", "application_cpu_affinity", "disk_bytes_per_second",
+        "scratch_file_bytes", "network_requests_per_second", "network_payload_bytes",
+    }
+    require(request.get("schema") == "allocatbelt.application-pressure-request.v1", "SourceV5 pressure template is not the canonical pressure-request schema")
+    base = exact_object(request.get("schedule"), schedule_keys, "SourceV5 raw pressure request schedule")
+    template_schedule = exact_object(condition_schedule, {"duration_seconds", "sample_interval_ms", "seed"}, "SourceV5 typed pressure condition schedule")
+    base_duration = uint(base["duration_seconds"], "SourceV5 request-template pressure duration", positive=True, maximum=SOURCE_V5_PRESSURE_MAX_DURATION_SECONDS)
+    template_duration = uint(template_schedule["duration_seconds"], "SourceV5 typed pressure duration", positive=True, maximum=SOURCE_V5_PRESSURE_MAX_DURATION_SECONDS)
+    base_interval = uint(base["sample_interval_ms"], "SourceV5 request-template pressure interval", positive=True, maximum=1000)
+    template_interval = uint(template_schedule["sample_interval_ms"], "SourceV5 typed pressure interval", positive=True, maximum=1000)
+    base_seed = uint(base["seed"], "SourceV5 request-template pressure seed", positive=True, maximum=(1 << 63) - 1)
+    template_seed = uint(template_schedule["seed"], "SourceV5 typed pressure seed", positive=True, maximum=(1 << 63) - 1)
+    require(
+        base_duration == template_duration
+        and base_interval == template_interval == 100
+        and base_seed == template_seed,
+        "SourceV5 typed pressure schedule differs from the immutable request template or fixed sample interval",
+    )
+    startup = uint(base["startup_deadline_seconds"], "SourceV5 pressure startup deadline", positive=True, maximum=10)
+    term = uint(base["term_deadline_seconds"], "SourceV5 pressure TERM deadline", positive=True, maximum=30)
+    kill = uint(base["kill_deadline_seconds"], "SourceV5 pressure KILL deadline", positive=True, maximum=15)
+    raw_total = uint(base["total_deadline_seconds"], "SourceV5 pressure total deadline", positive=True, maximum=SOURCE_V5_PRESSURE_MAX_TOTAL_SECONDS)
+    duration = uint(duration_seconds, "SourceV5 timed app horizon", positive=True, maximum=SOAK_SECONDS)
+    app_wall = (
+        SOURCE_V5_APP_SETUP_BUDGET_SECONDS
+        + duration
+        + SOURCE_V5_TRACE_OVERRUN_SECONDS
+        + SOURCE_V5_DRAIN_BUDGET_SECONDS
+        + SOURCE_V5_SHUTDOWN_BUDGET_SECONDS
+        + SOURCE_V5_POSTPROCESS_BUDGET_SECONDS
+    )
+    pressure_duration = startup + app_wall + SOURCE_V5_PRESSURE_EXIT_OBSERVATION_SECONDS
+    interval = base_interval
+    require(interval >= 100 and pressure_duration * 1000 % interval == 0, "derived SourceV5 pressure horizon does not align to its frozen sample interval")
+    require(pressure_duration <= SOURCE_V5_PRESSURE_MAX_DURATION_SECONDS, "derived SourceV5 pressure horizon exceeds the driver duration bound")
+    require(pressure_duration * 1000 // interval <= SOURCE_V5_PRESSURE_MAX_SAMPLES, "derived SourceV5 pressure horizon exceeds the driver sample bound")
+    derived = dict(base)
+    derived["duration_seconds"] = pressure_duration
+    derived["total_deadline_seconds"] = max(raw_total, startup + pressure_duration + term + kill)
+    require(derived["total_deadline_seconds"] <= SOURCE_V5_PRESSURE_MAX_TOTAL_SECONDS, "derived SourceV5 pressure total deadline exceeds the driver bound")
+    return {"application_wall_timeout_seconds": app_wall, "pressure_duration_seconds": pressure_duration, "pressure_schedule": derived}
+
+
+def _v5_manifest_context(
+    spec: dict[str, Any], plan: dict[str, Any], spec_path: Path, plan_path: Path,
+    source_root: Path,
+) -> tuple[dict[str, Any], dict[str, dict[str, Any]], dict[str, Path], dict[str, str], Any, dict[str, Any]]:
+    source_base = safe_directory(source_root, "SourceV5 source root")
+    input_root = safe_directory(spec_path.resolve(strict=True).parent, "SourceV5 frozen input directory")
+    controller: types.ModuleType | None = None
+    sources: dict[str, dict[str, Any]] = {}
+    paths: dict[str, Path] = {}
+    raw_shas: dict[str, str] = {}
+    references = spec.get("source_manifests")
+    require(type(references) is list and len(references) == 3, "SourceV5 spec must name exactly three source manifests")
+    for index, ref_value in enumerate(references):
+        ref = exact_object(ref_value, {"host_id", "relative_path", "sha256"}, f"SourceV5 source ref[{index}]")
+        host = token(ref["host_id"], f"SourceV5 source ref[{index}] host")
+        require(host not in sources, "SourceV5 spec repeats a host source manifest")
+        path = safe_child(input_root, ref["relative_path"], f"SourceV5 {host} source manifest")
+        raw, raw_sha = read_stable(path, f"SourceV5 {host} source manifest", MAX_MANIFEST_BYTES)
+        manifest = parse_json(raw, f"SourceV5 {host} source manifest")
+        require(raw == canonical_bytes(manifest) and manifest.get("schema") == SOURCE_V5_SCHEMA and manifest.get("manifest_sha256") == ref["sha256"], f"SourceV5 {host} source manifest is noncanonical or differs from its semantic pin")
+        records = manifest.get("source", {}).get("files")
+        require(type(records) is list, f"SourceV5 {host} source inventory is missing")
+        controller_pin = manifest.get("qualification_harness", {}).get("campaign_controller")
+        controller_pin = exact_object(controller_pin, {"path", "sha256"}, f"SourceV5 {host} campaign controller pin")
+        if controller is None:
+            controller = _source_v5_module(source_base, records, controller_pin["path"], controller_pin["sha256"], "soak_builder_source_v5_controller")
+        sources[host] = manifest
+        paths[host] = path
+        raw_shas[host] = raw_sha
+    require(controller is not None, "SourceV5 full controller was not loaded")
+    return {"root": source_base, "input_root": input_root}, sources, paths, raw_shas, controller, {"spec": spec, "plan": plan}
+
+
+def _source_v5_module(
+    source_root: Path, source_records: list[dict[str, Any]], path_text: str,
+    expected_sha256: str, module_name: str,
+) -> types.ModuleType:
+    record = next((item for item in source_records if type(item) is dict and item.get("path") == path_text), None)
+    require(type(record) is dict and record.get("kind") == "file" and record.get("sha256") == expected_sha256, f"SourceV5 source module {path_text} is not pinned to a regular inventory entry")
+    module_path = safe_child(source_root, path_text, f"SourceV5 module {path_text}")
+    return load_pinned_module(module_path, expected_sha256, f"SourceV5 module {path_text}", MAX_SCRIPT_BYTES, module_name)
+
+
+def _source_v5_feedback_policy(
+    manifest: dict[str, Any], probe: dict[str, Any],
+) -> dict[str, Any]:
+    policy_body = manifest["feedback_policy"]["policy"]
+    context = policy_body["contexts"][f"mixed/{probe['context']['profile']}"]
+    reader_context = probe["reader_context"]
+    rust_context = probe["rust_control_context"]
+    return {
+        "version": policy_body["version"],
+        "sample_interval_ns": reader_context["sample_interval_ns"],
+        "max_dense_gap_ns": reader_context["max_dense_gap_ns"],
+        "telemetry_freshness_ns": reader_context["telemetry_freshness_ns"],
+        "required_breach_samples": reader_context["required_breach_samples"],
+        "actuation_cooldown_ns": reader_context["actuation_cooldown_ns"],
+        "minimum_dense_observations": context["minimum_dense_observations"],
+        "controls": context["controls"],
+        "capacity_sources": rust_context["required_byte_sources"],
+        "global_ceilings": rust_context["global_ceilings"],
+        "tenant_ceilings": rust_context["tenant_ceilings"],
+        "scope_limits": rust_context["scope_limits"],
+        "rate_buckets": rust_context["rate_buckets"],
+        "collector": {
+            "task_lease_count": probe["collector"]["task_lease_count"],
+            "control_charge_bytes": probe["collector"]["control_charge_bytes"],
+            "expected_global_control_baseline": probe["baseline"]["expected_global_control_baseline"],
+        },
+        "meter_source_bounds": probe["meter_source_bounds"],
+    }
+
+
+def build_external_pressure_recipe(
+    spec: dict[str, Any], plan: dict[str, Any], job: dict[str, Any], *,
+    spec_sha256: str, plan_sha256: str, spec_path: Path, source_root: Path,
+    oracle_root: Path, ring_relative_path: str, ring_sha256: str,
+    mode: str, duration_seconds: int, terminal_budget_bytes: int, sample_budget_bytes: int,
+    construction_probe_path: Path, construction_probe_sha256: str,
+    plan_path: Path | None, plan_file_sha256: str | None,
+    pressure_recipe_path: Path | None, pressure_recipe_raw_sha256: str | None,
+    pressure_recipe_semantic_sha256: str | None,
+) -> dict[str, Any]:
+    require(isinstance(plan_path, Path) and is_sha256(plan_file_sha256), "SourceV5 builder requires the frozen plan path and raw SHA-256")
+    require(type(job) is dict and job.get("phase") == "soak" and job.get("comparison_family") == "external_pressure", "SourceV5 builder accepts only the original external-pressure soak job")
+    require(mode in ("qualified", "functional"), "SourceV5 soak mode is unsupported")
+    duration = uint(duration_seconds, "SourceV5 duration", positive=True)
+    require((mode == "qualified" and duration == SOAK_SECONDS) or (mode == "functional" and 0 < duration < SOAK_SECONDS), "SourceV5 soak mode and duration differ")
+    terminal_budget = uint(terminal_budget_bytes, "SourceV5 terminal budget", positive=True)
+    sample_budget = uint(sample_budget_bytes, "SourceV5 sample budget", positive=True)
+
+    spec_raw, spec_raw_sha = read_stable(spec_path, "SourceV5 campaign spec", MAX_SPEC_BYTES)
+    plan_raw, plan_raw_sha = read_stable(plan_path, "SourceV5 campaign plan", MAX_PLAN_BYTES)
+    require(spec_raw_sha == sha256(canonical_bytes(spec)) == spec_sha256, "SourceV5 spec raw/semantic pin differs")
+    require(plan_raw_sha == plan_file_sha256 and plan_raw == canonical_bytes(plan), "SourceV5 plan raw pin or canonical bytes differ")
+    require(plan.get("schema") == PLAN_SCHEMA_V3 and spec.get("schema") == SPEC_SCHEMA_V3, "SourceV5 recipe requires spec/plan v3")
+    plan_body = dict(plan)
+    plan_semantic = plan_body.pop("plan_sha256", None)
+    require(is_sha256(plan_semantic) and plan_semantic == sha256(canonical_bytes(plan_body)) == plan_sha256, "SourceV5 plan semantic SHA differs")
+
+    roots, sources, manifest_paths, manifest_raw_shas, controller, _loaded = _v5_manifest_context(spec, plan, spec_path, plan_path, source_root)
+    input_root = roots["input_root"]
+    source_base = roots["root"]
+    selected_host = token(job.get("host_id"), "SourceV5 soak host")
+    require(selected_host in sources, "SourceV5 soak host is outside the exact source matrix")
+    selected_manifest = sources[selected_host]
+    harness = selected_manifest["qualification_harness"]
+    try:
+        for host, manifest in sources.items():
+            controller.verify_source_manifest(manifest, source_root=source_base if host == selected_host else None, verify_artifacts=host == selected_host)
+        validation = controller.validate_spec(spec, sources, input_root=input_root)
+        input_module_sha = plan.get("campaign_inputs_module_sha256")
+        require(is_sha256(input_module_sha), "SourceV5 plan omits its campaign-inputs module pin")
+        controller.verify_plan(plan, selected_manifest["runtime_readback_validator"]["sha256"], input_module_sha)
+        input_module = controller.campaign_inputs_module(input_module_sha)
+        normalized = input_module.validate_qualification_inputs(spec["qualification_inputs"], validation["host_ids"], spec["cells"], sources, input_root)
+    except (OSError, TypeError, ValueError, getattr(controller, "CampaignError", ValueError)) as error:
+        raise RecipeBuildError(f"captured SourceV5 controller rejected a manifest/spec/plan input: {error}") from error
+
+    soak = exact_object(spec["soak"], {"workload", "profile", "allocator", "executor", "driver_relative_path", "driver_sha256", "interval_ms"}, "SourceV5 soak contract")
+    require(soak == {
+        "workload": "mixed", "profile": soak["profile"], "allocator": "allocatbelt", "executor": "bounded",
+        "driver_relative_path": SOAK_RUNNER_PATH, "driver_sha256": harness["soak_runner"]["sha256"], "interval_ms": 100,
+    }, "SourceV5 soak contract differs from the original role/cadence")
+    host_id = selected_host
+    planned = [item for item in plan["jobs"]["soak"] if type(item) is dict and item.get("run_id") == job.get("run_id")]
+    require(len(planned) == 1 and canonical_bytes(planned[0]) == canonical_bytes(job), "selected external soak job is not the exact unique frozen SourceV5 job")
+    require(job.get("workload") == "mixed" and job.get("family") == "mixed" and job.get("profile") == soak["profile"] and job.get("allocator") == "allocatbelt" and job.get("executor") == "bounded" and job.get("duration_seconds") == SOAK_SECONDS, "selected SourceV5 soak job differs from the frozen original schedule")
+
+    cells = [cell for cell in spec["cells"] if type(cell) is dict and cell.get("family") == "mixed" and cell.get("workload") == "mixed" and cell.get("profile") == soak["profile"]]
+    require(len(cells) == 1, "SourceV5 soak does not have one mixed workload/profile resource cell")
+    cell = cells[0]
+    limits = exact_object(cell["resource_limits"], {"managed_bytes", "disk_ops", "network_ops", "tasks", "cpu_charges"}, "SourceV5 soak resource limits")
+    ceiling_sha = sha256(canonical_bytes(limits))
+    require(cell["resource_ceiling_sha256"] == ceiling_sha, "SourceV5 soak ceiling SHA differs from the exact cell limits")
+
+    capacity_rows = [item for item in normalized["capacity_templates"] if item["host_id"] == host_id and item["workload"] == "mixed" and item["profile"] == soak["profile"]]
+    condition_rows = [item for item in normalized["pressure_conditions"] if item["host_id"] == host_id and item["capacity_key"]["workload"] == "mixed" and item["capacity_key"]["profile"] == soak["profile"]]
+    require(len(capacity_rows) == len(condition_rows) == 1, "SourceV5 soak capacity or pressure input is ambiguous")
+    capacity, pressure_condition = capacity_rows[0], condition_rows[0]
+    require(pressure_condition["capacity_key"]["calibration_id"] == capacity["calibration_id"], "SourceV5 soak pressure condition does not bind its exact capacity calibration")
+
+    app_pin = exact_object(selected_manifest["artifacts"]["allocatbelt"], {"path", "sha256"}, "SourceV5 normal allocatbelt application artifact")
+    soak_pin = exact_object(selected_manifest["soak_artifacts"]["allocatbelt"], {"path", "sha256"}, "SourceV5 timed allocatbelt soak artifact")
+    app_binary = safe_child(source_base, app_pin["path"], "SourceV5 application emitter binary")
+    soak_binary = safe_child(source_base, soak_pin["path"], "SourceV5 timed soak binary")
+    app_sha = app_pin["sha256"]
+    soak_sha = soak_pin["sha256"]
+    require(is_sha256(app_sha), "SourceV5 application binary SHA-256 is malformed")
+    require(is_sha256(soak_sha), "SourceV5 soak binary SHA-256 is malformed")
+    require(app_binary != soak_binary and app_sha != soak_sha, "SourceV5 app emitter and timed soak artifacts must be distinct")
+
+    construction_probe_raw, construction_probe_raw_sha = read_stable(construction_probe_path, "caller-pinned app construction probe", 512 * 1024)
+    require(construction_probe_raw_sha == construction_probe_sha256, "caller-pinned construction probe raw SHA differs")
+    probe = parse_json(construction_probe_raw, "caller-pinned app construction probe")
+    require(construction_probe_raw == canonical_bytes(probe), "caller-pinned construction probe is not canonical JSON")
+    require(probe.get("context") == {"workload": "mixed", "profile": soak["profile"], "workers": 2 if soak["profile"] == "oversubscribed" else 4}, "app construction probe workload/profile differs")
+    probe_run = subprocess.run(
+        [str(app_binary), "--emit-feedback-policy-only", "--workload", "mixed", "--profile", soak["profile"]],
+        cwd=source_base,
+        env={"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "LANG": "C", "LC_ALL": "C"},
+        stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30, check=False,
+    )
+    require(len(probe_run.stdout) <= 512 * 1024 and len(probe_run.stderr) <= 64 * 1024, "compiled app construction probe exceeded its bound")
+    require(probe_run.returncode == 0 and probe_run.stdout == construction_probe_raw, "caller-pinned construction probe is not the exact output of the SourceV5 application binary")
+    feedback_validator_pin = harness["feedback_validator"]
+    feedback_module = _source_v5_module(source_base, selected_manifest["source"]["files"], feedback_validator_pin["path"], feedback_validator_pin["sha256"], "source_v5_feedback_validator")
+    feedback_policy = _source_v5_feedback_policy(selected_manifest, probe)
+    probe_context = {
+        "schema": feedback_module.EXPECTATION_SCHEMA_V3,
+        "identity": {"allocator": "allocatbelt", "binary_sha256": soak_sha, "workload": "mixed", "profile": soak["profile"]},
+        "construction_probe": {"path": str(construction_probe_path.resolve(strict=True)), "raw_sha256": construction_probe_raw_sha, "allocator": "allocatbelt", "binary_sha256": app_sha},
+        "policy": feedback_policy,
+    }
+    try:
+        feedback_module.validate_construction_probe(probe_context, selected_manifest)
+    except (OSError, TypeError, ValueError, getattr(feedback_module, "ValidationError", ValueError)) as error:
+        raise RecipeBuildError(f"captured SourceV5 feedback reader rejected the actual construction probe: {error}") from error
+    probe_baseline = probe["baseline"]["expected_global_control_baseline"]
+    require(probe_baseline == selected_manifest["resource_domain_calibration"]["record"]["fixed_global_control_baseline"], "compiled construction probe Control baseline differs from SourceV5 calibration")
+
+    feedback_templates = [item for item in plan["feedback_process_templates"] if (
+        type(item) is dict and type(item.get("identity")) is dict
+        and item["identity"].get("host_id") == host_id
+        and item["identity"].get("workload") == "mixed"
+        and item["identity"].get("profile") == soak["profile"]
+        and item["identity"].get("comparison_family") == "external_pressure"
+        and item["identity"].get("allocator") == "allocatbelt"
+        and item["identity"].get("executor") == "allocatbelt"
+        and item["identity"].get("pressure_condition_id") == pressure_condition["condition_id"]
+    )]
+    require(len(feedback_templates) == 1, "SourceV5 plan lacks one exact external mixed feedback template")
+    feedback_template = feedback_templates[0]
+    template_identity = feedback_template["identity"]
+    require(template_identity["binary_sha256"] == app_sha and feedback_template["policy"]["context"] == selected_manifest["feedback_policy"]["policy"]["contexts"][f"mixed/{soak['profile']}"] , "SourceV5 feedback template differs from source application/policy pins")
+    ordinal = uint(job.get("ordinal"), "SourceV5 soak ordinal", positive=True)
+    nonce = process_nonce(template_identity["prospective_nonce"], spec["campaign_id"], job["run_id"], "soak", ordinal)
+    nonce_material = {
+        "schema": "allocatbelt.application-process-nonce-instantiation.v1",
+        "template_nonce": template_identity["prospective_nonce"],
+        "campaign_id": spec["campaign_id"], "job_run_id": job["run_id"], "pair_member": "soak",
+        "ordinal": ordinal, "nonce": nonce,
+    }
+    soak_identity = {
+        "campaign_id": spec["campaign_id"], "host_id": host_id, "run_id": job["run_id"], "nonce": nonce,
+        "allocator": "allocatbelt", "executor": "bounded", "workload": "mixed", "profile": soak["profile"],
+        "comparison_family": "external_pressure", "source_sha256": selected_manifest["source"]["source_tree_sha256"],
+        "build_sha256": sha256(canonical_bytes(selected_manifest["build"])), "binary_sha256": soak_sha,
+        "resource_ceiling_sha256": ceiling_sha,
+    }
+    trace_identity = {
+        "host_id": host_id, "run_id": job["run_id"], "report_nonce": nonce, "allocator": "allocatbelt",
+        "executor": "allocatbelt", "workload": "mixed", "profile": soak["profile"],
+        "mode": "pressure_soak_validation", "source_sha256": selected_manifest["source"]["source_tree_sha256"],
+        "binary_sha256": soak_sha, "pressure_qualification": True,
+    }
+
+    source_manifest_path = manifest_paths[host_id]
+    source_manifest_raw_sha = manifest_raw_shas[host_id]
+    inventory_record = next((item for item in selected_manifest["source"]["files"] if type(item) is dict and item.get("path") == SOURCE_INVENTORY_PATH), None)
+    require(type(inventory_record) is dict and inventory_record.get("kind") == "file" and is_sha256(inventory_record.get("sha256")), "SourceV5 source inventory does not pin its shared inventory engine")
+    source_inventory = load_pinned_module(
+        safe_child(source_base, SOURCE_INVENTORY_PATH, "SourceV5 source inventory"),
+        inventory_record["sha256"],
+        "SourceV5 source inventory", MAX_SOURCE_FILE_BYTES, "source_v5_soak_inventory",
+    )
+    require(source_inventory.digest_records(selected_manifest["source"]["files"]) == selected_manifest["source"]["source_tree_sha256"], "SourceV5 inventory digest differs")
+    require(run_git_commit(source_base) == selected_manifest["source"]["git_commit"], "live SourceV5 Git commit differs")
+    require(hash_file(safe_child(source_base, "Cargo.lock", "SourceV5 Cargo.lock"), "SourceV5 Cargo.lock", MAX_SOURCE_FILE_BYTES) == selected_manifest["source"]["cargo_lock_sha256"], "SourceV5 Cargo.lock differs")
+
+    oracle_base = safe_directory(oracle_root, "SourceV5 oracle root")
+    ring_path = safe_child(oracle_base, ring_relative_path, "SourceV5 mixed soak oracle ring")
+    require(hash_file(ring_path, "SourceV5 mixed soak oracle ring", MAX_MANIFEST_BYTES) == ring_sha256, "SourceV5 mixed soak ring differs from its independent raw pin")
+    reader_record = next((item for item in selected_manifest["source"]["files"] if item.get("path") == SOAK_READER_PATH), None)
+    require(type(reader_record) is dict and reader_record.get("kind") == "file", "SourceV5 inventory omits its soak reader")
+    soak_reader = load_pinned_module(safe_child(source_base, SOAK_READER_PATH, "SourceV5 soak reader"), reader_record["sha256"], "SourceV5 soak reader", MAX_SCRIPT_BYTES, "source_v5_soak_reader")
+    _fixed_limits, expected_domain, expected_scope, expected_buckets, _fixed_policy_sha = soak_reader._check_policy(selected_manifest["fixed_runtime_policy"], soak["profile"])
+    rust_probe_context = probe["rust_control_context"]
+    require(rust_probe_context["global_ceilings"] == expected_domain and rust_probe_context["tenant_ceilings"] == expected_domain, "compiled construction probe hard ceilings differ from SourceV5 numeric resource policy")
+    require(rust_probe_context["scope_limits"] == {
+        "managed_memory": expected_scope["managed_memory_limit"],
+        "disk_operations": expected_scope["disk_operation_limit"],
+        "network_operations": expected_scope["network_operation_limit"],
+    }, "compiled construction probe scope limits differ from SourceV5 numeric resource policy")
+    require(rust_probe_context["rate_buckets"] == {
+        direction: {
+            "ceiling_bytes_per_second": bucket["ceiling_bytes_per_second"],
+            "ceiling_burst_bytes": bucket["ceiling_burst_bytes"],
+            "max_reservations": bucket["max_reservations"],
+        }
+        for direction, bucket in expected_buckets.items()
+    }, "compiled construction probe rate buckets differ from SourceV5 numeric resource policy")
+    ring_info = soak_reader._validate_ring({"identity": {"profile": soak["profile"]}, "oracle": {"ring_path": str(ring_path), "ring_sha256": ring_sha256}}, selected_manifest["source"]["source_tree_sha256"], soak_sha)
+    rate_rows = [row for row in spec["rates"] if row.get("host_id") == host_id and row.get("family") == "mixed" and row.get("profile") == soak["profile"] and row.get("load_percent") == 70]
+    require(len(rate_rows) == 1 and rate_rows[0]["arrivals_per_second"] == ring_info["average_rate_per_second"], "SourceV5 soak ring is not the canonical 70-percent mixed oracle")
+
+    condition_path = safe_child(input_root, pressure_condition["condition"]["relative_path"], "SourceV5 pressure condition template")
+    condition_raw, condition_raw_sha = read_stable(condition_path, "SourceV5 pressure condition template", MAX_SPEC_BYTES)
+    require(condition_raw_sha == pressure_condition["condition_sha256"] and condition_raw == canonical_bytes(parse_json(condition_raw, "SourceV5 pressure condition template")), "SourceV5 pressure condition raw bytes differ")
+    condition_value = parse_json(condition_raw, "SourceV5 pressure condition template")
+    require(condition_value.get("schema") == "allocatbelt.application-pressure-request.v1" and condition_value.get("identity", {}).get("condition_id") == pressure_condition["condition_id"], "SourceV5 pressure condition is not the exact pressure request template")
+    supervision = _derive_v5_pressure_schedule(duration, condition_value, pressure_condition["schedule"])
+
+    pressure_pin: dict[str, Any] | None = None
+    pressure_semantic_sha: str | None = None
+    if pressure_recipe_path is not None:
+        require(type(pressure_recipe_raw_sha256) is str and is_sha256(pressure_recipe_raw_sha256) and is_sha256(pressure_recipe_semantic_sha256), "SourceV5 pressure recipe requires both raw and semantic SHA pins")
+        require(capacity["evidence"] is not None, "SourceV5 pressure recipe cannot be frozen without app-byte capacity evidence")
+        raw, raw_sha = read_stable(pressure_recipe_path, "SourceV5 instantiated pressure recipe", MAX_MANIFEST_BYTES)
+        require(raw_sha == pressure_recipe_raw_sha256, "SourceV5 pressure recipe raw bytes differ from caller pin")
+        pressure_value = parse_json(raw, "SourceV5 instantiated pressure recipe")
+        require(raw == canonical_bytes(pressure_value), "SourceV5 instantiated pressure recipe is not canonical JSON")
+        pressure_module = _source_v5_module(source_base, selected_manifest["source"]["files"], harness["pressure_validator"]["path"], harness["pressure_validator"]["sha256"], "source_v5_pressure_validator")
+        try:
+            pressure_info = pressure_module._validate_recipe(pressure_value, pressure_recipe_semantic_sha256)
+        except (TypeError, ValueError, getattr(pressure_module, "ReadbackError", ValueError)) as error:
+            raise RecipeBuildError(f"captured SourceV5 pressure validator rejected its final recipe: {error}") from error
+        identity = pressure_info["identity"]
+        require(identity["host_id"] == host_id and identity["run_id"] == job["run_id"] and identity["nonce"] == nonce and identity["condition_id"] == pressure_condition["condition_id"], "SourceV5 pressure recipe host/run/nonce/condition differs")
+        require(identity["allocator"] == "allocatbelt" and identity["executor"] == "allocatbelt", "SourceV5 pressure recipe application role differs")
+        require(pressure_value["files"]["source_manifest"]["raw_sha256"] == source_manifest_raw_sha and pressure_value["files"]["application_binary"]["raw_sha256"] == soak_sha, "SourceV5 pressure source/binary pins differ from the timed soak")
+        evidence = capacity["evidence"]
+        capacity_artifact_path = safe_child(input_root, evidence["artifact"]["relative_path"], "SourceV5 app-byte capacity evidence")
+        pressure_calibration_path = safe_child(input_root, pressure_condition["pressure_calibration"]["artifact"]["relative_path"], "SourceV5 pressure calibration evidence")
+        require(pressure_info["files"]["application_capacity_calibration"]["raw_sha256"] == evidence["artifact"]["raw_sha256"], "SourceV5 pressure recipe app-byte calibration differs from the capacity evidence pin")
+        require(pressure_info["files"]["application_capacity_calibration"]["path"] == str(capacity_artifact_path), "SourceV5 pressure recipe app-byte calibration path differs from its capacity artifact")
+        require(pressure_info["calibration_sha256"] == pressure_condition["pressure_calibration"]["artifact"]["raw_sha256"], "SourceV5 pressure recipe calibration digest differs from its exact evidence pin")
+        require(pressure_info["schedule"]["seed"] == pressure_condition["schedule"]["seed"], "SourceV5 pressure recipe seed differs from its condition schedule")
+        require(pressure_info["schedule"] == supervision["pressure_schedule"], "SourceV5 pressure recipe does not preserve the raw condition while extending the complete soak/process-cleanup horizon")
+        require(pressure_info["schedule"]["duration_seconds"] == supervision["pressure_duration_seconds"] and pressure_info["schedule"]["sample_interval_ms"] == pressure_condition["schedule"]["sample_interval_ms"] == 100, "SourceV5 pressure recipe differs from its independently derived enclosing horizon")
+        require(pressure_info["schedule"]["minimum_overlap_seconds"] >= pressure_condition["readiness_thresholds"]["minimum_overlap_seconds"], "SourceV5 pressure overlap is below the pinned condition threshold")
+        require(pressure_info["schedule"]["duration_seconds"] * 1000 // pressure_info["schedule"]["sample_interval_ms"] >= pressure_condition["readiness_thresholds"]["minimum_ready_samples"], "SourceV5 pressure schedule cannot provide the pinned readiness sample count")
+        require(pressure_info["schedule"]["sample_interval_ms"] <= pressure_condition["readiness_thresholds"]["maximum_sample_gap_ms"], "SourceV5 pressure cadence exceeds the pinned maximum sample gap")
+        require(pressure_info["condition_sha256"] == pressure_value["condition_sha256"], "SourceV5 pressure condition semantic digest differs from its full validator")
+        pressure_pin = {"path": str(pressure_recipe_path.resolve(strict=True)), "raw_sha256": raw_sha, "semantic_sha256": pressure_recipe_semantic_sha256}
+        pressure_semantic_sha = pressure_info["condition_sha256"]
+    elif any(value is not None for value in (pressure_recipe_raw_sha256, pressure_recipe_semantic_sha256)):
+        raise RecipeBuildError("SourceV5 pressure recipe path and both SHA pins must be supplied together")
+
+    qualification = {
+        "spec": {"path": str(spec_path.resolve(strict=True)), "raw_sha256": spec_raw_sha, "semantic_sha256": spec_sha256},
+        "plan": {"path": str(plan_path.resolve(strict=True)), "raw_sha256": plan_raw_sha, "semantic_sha256": plan_sha256},
+        "campaign_inputs_module_sha256": input_module_sha,
+        "capacity_template": {
+            "template_sha256": next(item["template_sha256"] for item in plan["capacity_process_templates"] if item["capacity_key"]["host_id"] == host_id and item["capacity_key"]["workload"] == "mixed" and item["capacity_key"]["profile"] == soak["profile"]),
+            "calibration_id": capacity["calibration_id"], "request_template": capacity["request_template"],
+            "context_template": capacity["context_template"], "evidence": capacity["evidence"],
+        },
+        "pressure_condition": {
+            "condition_id": pressure_condition["condition_id"], "condition_sha256": pressure_condition["condition_sha256"],
+            "condition": pressure_condition["condition"], "pressure_calibration": pressure_condition["pressure_calibration"],
+            "readiness_thresholds": pressure_condition["readiness_thresholds"], "schedule": pressure_condition["schedule"],
+        },
+        "feedback_process_template": {
+            **feedback_template,
+        },
+        "nonce_instantiation": nonce_material,
+        "capacity_evidence_ready": bool(validation["capacity_evidence_ready"]),
+        "feedback_runtime_composition_ready": bool(validation["feedback_runtime_composition_ready"]),
+        "execution_ready": bool(validation["execution_ready"]), "full_gate_ready": bool(validation["full_gate_ready"]),
+        "launch_enabled": bool(validation["execution_ready"] and validation["capacity_evidence_ready"] and validation["feedback_runtime_composition_ready"] and pressure_pin is not None),
+        "full_gate_gaps": validation["full_gate_gaps"],
+    }
+    pressure_binding = {
+        "request_template": {"path": str(condition_path.resolve(strict=True)), "raw_sha256": condition_raw_sha},
+        "recipe": pressure_pin,
+        "condition_sha256": pressure_semantic_sha,
+        "driver": harness["pressure_driver"], "validator": harness["pressure_validator"],
+    }
+    feedback_expectation = {
+        "template": qualification["feedback_process_template"],
+        "template_sha256": feedback_template["template_sha256"],
+        "trace_identity": trace_identity,
+        "policy": feedback_policy,
+        "validator": harness["feedback_validator"],
+    }
+    recipe = {
+        "schema": "allocatbelt.application-soak-parent-recipe.v2",
+        "identity": soak_identity,
+        "source": {"root": str(source_base), "manifest_path": str(manifest_paths[host_id].resolve(strict=True)), "manifest_sha256": source_manifest_raw_sha},
+        "oracle": {"producer_path": str(app_binary), "producer_sha256": app_sha, "ring_path": str(ring_path), "ring_sha256": ring_sha256},
+        "runtime": {
+            "mode": mode, "duration_seconds": duration, "sample_interval_ms": 100,
+            "resource_limits": limits, "fixed_global_control_baseline": selected_manifest["resource_domain_calibration"]["record"]["fixed_global_control_baseline"],
+            "terminal_budget_bytes": terminal_budget, "sample_budget_bytes": sample_budget,
+        },
+        "qualification": qualification,
+        "construction_probe": {"path": str(construction_probe_path.resolve(strict=True)), "raw_sha256": construction_probe_raw_sha, "allocator": "allocatbelt", "binary_sha256": app_sha},
+        "pressure": pressure_binding,
+        "feedback_expectation": feedback_expectation,
+        "validator": harness["soak_validator"],
+        "runner": harness["soak_runner"],
+    }
+    reader = load_pinned_module(safe_child(source_base, SOAK_READER_PATH, "SourceV5 soak reader"), harness["soak_validator"]["sha256"], "SourceV5 soak reader", MAX_SCRIPT_BYTES, "source_v5_soak_recipe_reader")
+    recipe_bytes = canonical_bytes(recipe)
+    recipe_raw_sha = sha256(recipe_bytes)
+    try:
+        normalized_recipe, normalized_identity = reader._validate_recipe(recipe, recipe_raw_sha)
+    except (OSError, TypeError, ValueError) as error:
+        raise RecipeBuildError(f"captured SourceV5 soak validator rejected generated recipe: {error}") from error
+    require(canonical_bytes(normalized_recipe) == recipe_bytes and normalized_identity == soak_identity, "captured SourceV5 soak reader normalized its frozen recipe")
+    return {
+        "recipe": recipe, "recipe_bytes": recipe_bytes, "recipe_sha256": recipe_raw_sha,
+        "soak_run_id": job["run_id"], "context_job_run_id": job["run_id"],
+        "planned_pressure_soak_run_id": job["run_id"],
+        "source_manifest_semantic_sha256": selected_manifest["manifest_sha256"],
+        "source_manifest_file_sha256": source_manifest_raw_sha, "source_tree_sha256": selected_manifest["source"]["source_tree_sha256"],
+        "spec_sha256": spec_sha256, "plan_sha256": plan_sha256, "mode": mode, "duration_seconds": duration,
+        "execution_started": False, "qualification_enabled": False, "launch_enabled": qualification["launch_enabled"],
+    }
+
+
 def write_exclusive(path: Path, data: bytes) -> None:
     require(path.is_absolute(), "recipe output path must be absolute")
     parent = safe_directory(path.parent, "recipe output directory")
@@ -789,9 +1266,16 @@ def command_build(args: argparse.Namespace) -> int:
     spec = _load_json_pin(args.spec, args.spec_sha256, "campaign spec", MAX_SPEC_BYTES)
     plan = _load_json_pin(args.plan, args.plan_file_sha256, "campaign plan", MAX_PLAN_BYTES)
     jobs = plan.get("jobs")
-    require(type(jobs) is dict and type(jobs.get("confirmation")) is list, "campaign plan has no fixed confirmation jobs")
-    matching_jobs = [job for job in jobs["confirmation"] if type(job) is dict and job.get("run_id") == args.job_run_id]
-    require(len(matching_jobs) == 1, "requested fixed context run ID is missing or duplicated in the frozen plan")
+    require(type(jobs) is dict, "campaign plan has no phase job map")
+    if spec.get("schema") == SPEC_SCHEMA_V3 and plan.get("schema") == PLAN_SCHEMA_V3:
+        selected_jobs = jobs.get("soak")
+        label = "SourceV5 external-pressure soak"
+    else:
+        selected_jobs = jobs.get("confirmation")
+        label = "fixed context"
+    require(type(selected_jobs) is list, f"campaign plan has no {label} jobs")
+    matching_jobs = [job for job in selected_jobs if type(job) is dict and job.get("run_id") == args.job_run_id]
+    require(len(matching_jobs) == 1, f"requested {label} run ID is missing or duplicated in the frozen plan")
     result = build_recipe(
         spec, plan, matching_jobs[0],
         spec_sha256=args.spec_sha256,
@@ -805,6 +1289,13 @@ def command_build(args: argparse.Namespace) -> int:
         duration_seconds=args.duration_seconds,
         terminal_budget_bytes=args.terminal_budget_bytes,
         sample_budget_bytes=args.sample_budget_bytes,
+        construction_probe_path=None if args.construction_probe is None else args.construction_probe.resolve(strict=True),
+        construction_probe_sha256=args.construction_probe_sha256,
+        plan_path=args.plan,
+        plan_file_sha256=args.plan_file_sha256,
+        pressure_recipe_path=args.pressure_recipe,
+        pressure_recipe_raw_sha256=args.pressure_recipe_raw_sha256,
+        pressure_recipe_semantic_sha256=args.pressure_recipe_semantic_sha256,
     )
     require(args.output.is_absolute(), "recipe output path must be absolute")
     output_parent = safe_directory(args.output.parent, "recipe output directory")
@@ -816,8 +1307,9 @@ def command_build(args: argparse.Namespace) -> int:
     write_exclusive(args.output, result["recipe_bytes"])
     saved_recipe, saved_recipe_sha256 = read_stable(args.output, "new parent recipe", MAX_SPEC_BYTES)
     require(saved_recipe == result["recipe_bytes"] and saved_recipe_sha256 == result["recipe_sha256"], "written recipe differs from its preflighted canonical bytes")
+    v2_recipe = result["recipe"]["schema"] == "allocatbelt.application-soak-parent-recipe.v2"
     receipt = {
-        "schema": RECIPE_RECEIPT_SCHEMA,
+        "schema": RECIPE_RECEIPT_SCHEMA_V2 if v2_recipe else RECIPE_RECEIPT_SCHEMA,
         "recipe_path": str(args.output.resolve(strict=True)),
         "recipe_sha256": result["recipe_sha256"],
         "soak_run_id": result["soak_run_id"],
@@ -833,6 +1325,17 @@ def command_build(args: argparse.Namespace) -> int:
         "execution_started": False,
         "qualification_enabled": False,
     }
+    if v2_recipe:
+        receipt.update({
+            "launch_enabled": result["launch_enabled"],
+            "construction_probe_raw_sha256": result["recipe"]["construction_probe"]["raw_sha256"],
+            "construction_probe_binary_sha256": result["recipe"]["construction_probe"]["binary_sha256"],
+            "pressure_recipe_raw_sha256": result["recipe"]["pressure"]["recipe"]["raw_sha256"] if result["recipe"]["pressure"]["recipe"] is not None else None,
+            "pressure_recipe_semantic_sha256": result["recipe"]["pressure"]["recipe"]["semantic_sha256"] if result["recipe"]["pressure"]["recipe"] is not None else None,
+            "pressure_condition_sha256": result["recipe"]["pressure"]["condition_sha256"],
+            "capacity_evidence_ready": result["recipe"]["qualification"]["capacity_evidence_ready"],
+            "feedback_runtime_composition_ready": result["recipe"]["qualification"]["feedback_runtime_composition_ready"],
+        })
     sys.stdout.buffer.write(canonical_bytes(receipt))
     return 0
 
@@ -855,6 +1358,11 @@ def _parser() -> argparse.ArgumentParser:
     build.add_argument("--duration-seconds", type=int, required=True)
     build.add_argument("--terminal-budget-bytes", type=int, required=True)
     build.add_argument("--sample-budget-bytes", type=int, required=True)
+    build.add_argument("--construction-probe", type=Path)
+    build.add_argument("--construction-probe-sha256")
+    build.add_argument("--pressure-recipe", type=Path)
+    build.add_argument("--pressure-recipe-raw-sha256")
+    build.add_argument("--pressure-recipe-semantic-sha256")
     build.add_argument("--output", type=Path, required=True)
     build.set_defaults(handler=command_build)
     return parser

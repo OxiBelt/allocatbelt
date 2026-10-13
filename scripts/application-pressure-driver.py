@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import base64
 import binascii
+import ctypes
 from collections import deque
 import hashlib
 import json
@@ -48,6 +49,9 @@ MAX_RECIPE_BYTES = 4 * 1024 * 1024
 MAX_ARTIFACT_BYTES = 512 * 1024 * 1024
 MAX_EVENT_LINE_BYTES = 2 * 1024 * 1024
 EVENT_TERMINAL_RESERVE_BYTES = 2 * 1024 * 1024
+OWNERSHIP_PROTOCOL = "allocatbelt.pressure-worker-ownership.v1"
+OWNERSHIP_GRANT_SCHEMA = "allocatbelt.application-pressure-worker-ownership-grant.v1"
+WORKER_START_SCHEMA = "allocatbelt.application-pressure-worker-start.v2"
 MAX_MANIFEST_BYTES = 2 * 1024 * 1024
 MAX_FAILURE_BYTES = 4 * 1024 * 1024
 MAX_SOURCE_BYTES = 64 * 1024 * 1024
@@ -298,7 +302,36 @@ def _proc_stat(pid: int) -> dict[str, Any]:
     require(head == str(pid) and len(tail) >= 20, f"process {pid} stat has malformed fields")
     # Fields after comm start at field 3; starttime is field 22.
     start_ticks = uint(int(tail[19]), f"process {pid} start_ticks", positive=True)
-    return {"pid": pid, "state": tail[0], "start_ticks": start_ticks}
+    parent_pid = uint(int(tail[1]), f"process {pid} parent PID")
+    process_group = uint(int(tail[2]), f"process {pid} process group", positive=True)
+    session_id = uint(int(tail[3]), f"process {pid} session", positive=True)
+    return {
+        "pid": pid, "state": tail[0], "start_ticks": start_ticks,
+        "parent_pid": parent_pid, "pgid": process_group, "session_id": session_id,
+    }
+
+
+def _install_worker_parent_death_signal(expected_parent_pid: int, expected_parent_start_ticks: int) -> None:
+    """Bind the worker to its exact driver before it can receive work authorization."""
+    parent_pid = uint(expected_parent_pid, "pressure worker driver PID", positive=True, maximum=(1 << 31) - 1)
+    parent_ticks = uint(expected_parent_start_ticks, "pressure worker driver start ticks", positive=True)
+    try:
+        libc = ctypes.CDLL(None, use_errno=True)
+        prctl = libc.prctl
+        prctl.argtypes = (ctypes.c_int, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_ulong)
+        prctl.restype = ctypes.c_int
+        # Linux PR_SET_PDEATHSIG is 1. Install it before checking the parent so
+        # death either delivers SIGTERM or is detected by the PID/start check.
+        result = prctl(1, signal.SIGTERM, 0, 0, 0)
+        if result != 0:
+            error_number = ctypes.get_errno()
+            raise OSError(error_number, os.strerror(error_number))
+    except (AttributeError, OSError) as error:
+        raise PressureError(f"cannot bind pressure worker to its parent lifetime: {error}") from error
+    require(os.getppid() == parent_pid, "pressure worker parent changed before its death signal was bound")
+    parent = _proc_stat(parent_pid)
+    require(parent["start_ticks"] == parent_ticks and parent["state"] not in ("Z", "X"), "pressure worker parent PID/start identity changed")
+    require(not _WORKER_STOP_REQUESTED, "pressure worker received parent-death signal before ownership")
 
 
 def _pid_exists(pid: int, start_ticks: int) -> bool:
@@ -1446,6 +1479,8 @@ def _storage_reserve(
 class WorkerSet:
     def __init__(self, recipe: dict[str, Any]):
         self.recipe = recipe
+        self.driver_pid = os.getpid()
+        self.driver_start_ticks = _proc_stat(self.driver_pid)["start_ticks"]
         self.children: list[dict[str, Any]] = []
         self.selector = selectors.DefaultSelector()
         self.lines: dict[int, dict[int, dict[str, Any]]] = {}
@@ -1463,6 +1498,9 @@ class WorkerSet:
         common = [
             sys.executable, script, "_worker",
             "--recipe-sha256", recipe["recipe_sha256"],
+            "--owner-nonce", recipe["identity"]["nonce"],
+            "--driver-pid", str(self.driver_pid),
+            "--driver-start-ticks", str(self.driver_start_ticks),
             "--interval-ms", str(schedule["sample_interval_ms"]),
             "--duration-seconds", str(schedule["duration_seconds"]),
             "--seed", str(schedule["seed"]),
@@ -1534,6 +1572,7 @@ class WorkerSet:
             "process": process,
             "start_ticks": None,
             "ready": False,
+            "ownership_ack": None,
             "stderr": process.stderr,
             "stderr_raw_capture": bytearray(),
             "stderr_raw_truncated": False,
@@ -1565,12 +1604,68 @@ class WorkerSet:
             child["sid_observed"] = os.getsid(child["pid"])
             require(child["pgid_observed"] == child["pid"] and child["sid_observed"] == child["pid"], "pressure worker is not isolated in its own process group and session")
 
-    def begin(self, start_ns: int) -> None:
-        line = canonical_bytes({"start_monotonic_ns": start_ns})
+    def ownership_rows(self) -> list[dict[str, Any]]:
+        require(self.children and all(child["ready"] and child["start_ticks"] is not None for child in self.children), "pressure worker ownership cannot be journaled before every worker is ready and identified")
+        rows = [
+            {
+                "role": child["role"], "cpu": child["cpu"], "pid": child["pid"],
+                "start_ticks": child["start_ticks"], "pgid": child["pgid_observed"],
+                "session_id": child["sid_observed"], "nonce": self.recipe["identity"]["nonce"],
+            }
+            for child in self.children
+        ]
+        return sorted(rows, key=lambda item: (item["role"], -1 if item["cpu"] is None else item["cpu"]))
+
+    def grant_ownership(self, ownership_sha256: str) -> None:
+        sha256(ownership_sha256, "durable worker ownership journal SHA-256")
+        rows = {(item["role"], item["cpu"]): item for item in self.ownership_rows()}
+        for child in self.children:
+            row = rows[(child["role"], child["cpu"])]
+            grant = {
+                "schema": OWNERSHIP_GRANT_SCHEMA,
+                "recipe_sha256": self.recipe["recipe_sha256"],
+                "nonce": self.recipe["identity"]["nonce"],
+                "ownership_sha256": ownership_sha256,
+                "worker": row,
+            }
+            stream = child["process"].stdin
+            require(stream is not None and not stream.closed, "pressure worker ownership pipe is unavailable")
+            stream.write(canonical_bytes(grant))
+            stream.flush()
+
+    def await_ownership_ack(self, ownership_sha256: str, deadline_ns: int) -> list[dict[str, Any]]:
+        sha256(ownership_sha256, "durable worker ownership journal SHA-256")
+        while not all(child["ownership_ack"] is not None for child in self.children):
+            now = time.monotonic_ns()
+            require(now < deadline_ns, "pressure worker ownership acknowledgement deadline expired")
+            for key, _ in self.selector.select(min(0.05, (deadline_ns - now) / 1_000_000_000)):
+                self._consume(key.fileobj, key.data)
+            for child in self.children:
+                process = child["process"]
+                if process.poll() is not None and child["ownership_ack"] is None:
+                    detail = self._stderr_excerpt(child)
+                    raise PressureError(f"{child['role']} worker exited before ownership acknowledgement: {detail}")
+        acknowledgements = [child["ownership_ack"] for child in self.children]
+        require(all(item["ownership_sha256"] == ownership_sha256 for item in acknowledgements), "worker ownership acknowledgement names a different journal digest")
+        return sorted(acknowledgements, key=lambda item: (item["role"], -1 if item["cpu"] is None else item["cpu"]))
+
+    def begin(self, start_ns: int, ownership_sha256: str, authorization_sha256: str) -> None:
+        sha256(ownership_sha256, "work-start ownership journal SHA-256")
+        sha256(authorization_sha256, "work-start authorization journal SHA-256")
         for child in self.children:
             stream = child["process"].stdin
-            require(stream is not None, "pressure worker stdin disappeared")
-            stream.write(line)
+            require(stream is not None and not stream.closed, "worker stdin disappeared before work authorization")
+            message = {
+                "schema": WORKER_START_SCHEMA,
+                "recipe_sha256": self.recipe["recipe_sha256"],
+                "nonce": self.recipe["identity"]["nonce"],
+                "ownership_sha256": ownership_sha256,
+                "authorization_sha256": authorization_sha256,
+                "pid": child["pid"],
+                "start_ticks": child["start_ticks"],
+                "start_monotonic_ns": start_ns,
+            }
+            stream.write(canonical_bytes(message))
             stream.flush()
             stream.close()
 
@@ -1618,6 +1713,25 @@ class WorkerSet:
                     require(item.get("network_namespace_inode") == self.recipe["network"]["network_namespace_inode"], "loopback worker entered a different network namespace")
                     child["loopback_address"] = item["address"]
                 child["ready"] = True
+                continue
+            if item.get("event") == "ownership_ack":
+                ack = exact_object(item, {
+                    "schema", "event", "recipe_sha256", "nonce", "ownership_sha256", "role", "cpu",
+                    "pid", "start_ticks", "pgid", "session_id", "ack_sha256",
+                }, "pressure worker ownership acknowledgement")
+                ack_body = {key: value for key, value in ack.items() if key != "ack_sha256"}
+                require(
+                    ack["schema"] == "allocatbelt.application-pressure-worker-ownership-ack.v1"
+                    and ack["recipe_sha256"] == self.recipe["recipe_sha256"]
+                    and ack["nonce"] == self.recipe["identity"]["nonce"]
+                    and ack["role"] == child["role"] and ack["cpu"] == child["cpu"]
+                    and ack["pid"] == child["pid"] and ack["start_ticks"] == child["start_ticks"]
+                    and ack["pgid"] == child["pgid_observed"] and ack["session_id"] == child["sid_observed"]
+                    and digest_object(ack_body) == ack["ack_sha256"],
+                    "pressure worker ownership acknowledgement differs from the durable parent row",
+                )
+                require(child["ownership_ack"] is None, "pressure worker repeated its ownership acknowledgement")
+                child["ownership_ack"] = ack
                 continue
             seq = uint(item.get("sequence"), "worker sample sequence")
             require(seq not in self.lines[pid], f"{child['role']} worker repeated sample {seq}")
@@ -1794,13 +1908,58 @@ def _worker_emit(value: dict[str, Any]) -> None:
     require(written == len(raw), "short worker telemetry write")
 
 
-def _worker_read_start() -> int:
+def _worker_read_ownership(args: argparse.Namespace) -> dict[str, Any]:
     raw = sys.stdin.buffer.readline(65537)
-    require(raw and len(raw) <= 65536 and raw.endswith(b"\n"), "worker did not receive its bounded start barrier")
-    value = parse_object(raw[:-1], "worker start barrier", 65536)
-    require(raw == canonical_bytes(value), "worker start barrier is not canonical")
-    exact_object(value, {"start_monotonic_ns"}, "worker start barrier")
-    return uint(value["start_monotonic_ns"], "worker start time", positive=True)
+    require(raw and len(raw) <= 65536 and raw.endswith(b"\n"), "worker did not receive its bounded ownership grant")
+    value = parse_object(raw[:-1], "worker ownership grant", 65536)
+    require(raw == canonical_bytes(value), "worker ownership grant is not canonical")
+    grant = exact_object(value, {
+        "schema", "recipe_sha256", "nonce", "ownership_sha256", "worker",
+    }, "worker ownership grant")
+    require(grant["schema"] == OWNERSHIP_GRANT_SCHEMA and grant["recipe_sha256"] == args.recipe_sha256, "worker ownership grant recipe differs")
+    require(grant["nonce"] == args.owner_nonce and re.fullmatch(r"[0-9a-f]{32}", grant["nonce"]) is not None, "worker ownership grant nonce differs")
+    ownership_sha = sha256(grant["ownership_sha256"], "worker ownership journal SHA-256")
+    worker = exact_object(grant["worker"], {
+        "role", "cpu", "pid", "start_ticks", "pgid", "session_id", "nonce",
+    }, "worker ownership identity")
+    role = args.kind
+    cpu = args.cpu if role == "cpu" else None
+    observed = _proc_stat(os.getpid())
+    require(
+        worker["role"] == role and worker["cpu"] == cpu
+        and worker["pid"] == os.getpid() and worker["start_ticks"] == observed["start_ticks"]
+        and worker["pgid"] == os.getpgrp() == os.getpid()
+        and worker["session_id"] == os.getsid(0) == os.getpid()
+        and worker["nonce"] == grant["nonce"],
+        "worker ownership grant does not match this PID/start/session/nonce",
+    )
+    ack_body = {
+        "schema": "allocatbelt.application-pressure-worker-ownership-ack.v1",
+        "event": "ownership_ack",
+        "recipe_sha256": args.recipe_sha256,
+        "nonce": grant["nonce"],
+        "ownership_sha256": ownership_sha,
+        **{key: worker[key] for key in ("role", "cpu", "pid", "start_ticks", "pgid", "session_id")},
+    }
+    ack = {**ack_body, "ack_sha256": digest_object(ack_body)}
+    _worker_emit(ack)
+    return {**ack_body, "ack_sha256": ack["ack_sha256"]}
+
+
+def _worker_read_start(args: argparse.Namespace, ownership: dict[str, Any]) -> int:
+    raw = sys.stdin.buffer.readline(65537)
+    require(raw and len(raw) <= 65536 and raw.endswith(b"\n"), "worker did not receive its bounded work-start barrier")
+    value = parse_object(raw[:-1], "worker work-start barrier", 65536)
+    require(raw == canonical_bytes(value), "worker work-start barrier is not canonical")
+    start = exact_object(value, {
+        "schema", "recipe_sha256", "nonce", "ownership_sha256", "authorization_sha256",
+        "pid", "start_ticks", "start_monotonic_ns",
+    }, "worker work-start barrier")
+    require(start["schema"] == WORKER_START_SCHEMA and start["recipe_sha256"] == args.recipe_sha256, "worker work-start barrier recipe differs")
+    require(start["nonce"] == ownership["nonce"] and start["ownership_sha256"] == ownership["ownership_sha256"], "worker work-start barrier ownership differs")
+    sha256(start["authorization_sha256"], "worker authorization event SHA-256")
+    require(start["pid"] == os.getpid() and start["start_ticks"] == ownership["start_ticks"], "worker work-start barrier PID/start differs")
+    return uint(start["start_monotonic_ns"], "worker start time", positive=True)
 
 
 def _sleep_until(
@@ -1837,7 +1996,8 @@ def _worker_cpu(args: argparse.Namespace) -> None:
     if os.sched_getaffinity(0) != {args.cpu}:
         raise PressureError("CPU worker could not pin itself to the frozen CPU")
     _worker_emit({"event": "ready", "role": "cpu", "cpu": args.cpu, "recipe_sha256": args.recipe_sha256})
-    start_ns = _worker_read_start()
+    ownership = _worker_read_ownership(args)
+    start_ns = _worker_read_start(args, ownership)
     _worker_wait_until(start_ns)
     interval_ns = args.interval_ms * 1_000_000
     duty_ns = interval_ns * args.duty_basis_points // 10000
@@ -1876,7 +2036,8 @@ def _worker_disk(args: argparse.Namespace) -> None:
         require(stat.S_ISREG(info.st_mode) and info.st_size == args.scratch_bytes, "pressure scratch file does not match its frozen size")
         require(info.st_dev == args.scratch_device and info.st_ino == args.scratch_inode, "pressure scratch file identity changed before worker startup")
         _worker_emit({"event": "ready", "role": "disk", "recipe_sha256": args.recipe_sha256})
-        start_ns = _worker_read_start()
+        ownership = _worker_read_ownership(args)
+        start_ns = _worker_read_start(args, ownership)
         _worker_wait_until(start_ns)
         interval_ns = args.interval_ms * 1_000_000
         end_ns = start_ns + args.duration_seconds * 1_000_000_000
@@ -2000,7 +2161,8 @@ def _worker_loopback(args: argparse.Namespace) -> None:
         "event": "ready", "role": "loopback", "recipe_sha256": args.recipe_sha256,
         "address": ["127.0.0.1", address[1]], "network_namespace_inode": os.stat("/proc/self/ns/net").st_ino,
     })
-    start_ns = _worker_read_start()
+    ownership = _worker_read_ownership(args)
+    start_ns = _worker_read_start(args, ownership)
     _worker_wait_until(start_ns)
     interval_ns = args.interval_ms * 1_000_000
     end_ns = start_ns + args.duration_seconds * 1_000_000_000
@@ -2065,10 +2227,12 @@ def _worker_loopback(args: argparse.Namespace) -> None:
 
 def worker_main(args: argparse.Namespace) -> int:
     require(re.fullmatch(r"[0-9a-f]{64}", args.recipe_sha256) is not None, "worker recipe SHA is malformed")
+    require(re.fullmatch(r"[0-9a-f]{32}", args.owner_nonce) is not None, "worker ownership nonce is malformed")
     def stop_worker(_signum: int, _frame: Any) -> None:
         global _WORKER_STOP_REQUESTED
         _WORKER_STOP_REQUESTED = True
     signal.signal(signal.SIGTERM, stop_worker)
+    _install_worker_parent_death_signal(args.driver_pid, args.driver_start_ticks)
     if args.kind == "cpu":
         _worker_cpu(args)
     elif args.kind == "disk":
@@ -2292,12 +2456,25 @@ def _write_event(stream: Any, event: dict[str, Any], *, maximum_bytes: int = MAX
     return _write_event_raw(stream, canonical_bytes(event), maximum_bytes=maximum_bytes)
 
 
-def _write_ready_marker(path: Path, recipe: dict[str, Any], ready_sample: dict[str, Any]) -> str:
+def _write_event_durable(stream: Any, event: dict[str, Any], *, maximum_bytes: int = MAX_ARTIFACT_BYTES) -> bytes:
+    """Append and sync an ownership authorization record before releasing workers."""
+    raw = _write_event(stream, event, maximum_bytes=maximum_bytes)
+    os.fsync(stream.fileno())
+    return raw
+
+
+def _write_ready_marker(
+    path: Path, recipe: dict[str, Any], ready_sample: dict[str, Any],
+    ownership_sha256: str, authorization_sha256: str,
+) -> str:
     body = {
         "schema": READY_SCHEMA,
         "recipe_sha256": recipe["recipe_sha256"],
         "condition_sha256": recipe["condition_sha256"],
         "nonce": recipe["identity"]["nonce"],
+        "ownership_protocol": OWNERSHIP_PROTOCOL,
+        "worker_ownership_sha256": ownership_sha256,
+        "worker_authorization_sha256": authorization_sha256,
         "pressure_ready_monotonic_ns": ready_sample["interval_end_monotonic_ns"],
         "readiness": ready_sample["readiness"],
     }
@@ -2384,18 +2561,55 @@ def run_pressure(recipe_path: Path, expected_sha: str, launch_path: Path, output
         children.spawn()
         _storage_reserve(recipe, output_dir, scratch_reserved=True, reserve_event_budget=True)
         children.await_ready(startup_deadline_ns)
+        ownership_body = {
+            "schema": EVENT_SCHEMA,
+            "kind": "worker_ownership",
+            "recipe_sha256": actual_recipe_sha,
+            "nonce": recipe["identity"]["nonce"],
+            "monotonic_ns": time.monotonic_ns(),
+            "workers": children.ownership_rows(),
+        }
+        ownership_sha256 = digest_object(ownership_body)
+        ownership_event = {**ownership_body, "ownership_sha256": ownership_sha256}
+        raw_ownership = _write_event_durable(events_stream, ownership_event, maximum_bytes=event_max_bytes)
+        events_hash.update(raw_ownership)
+        event_count += 1
+
+        # Workers acknowledge the durable ownership row and remain blocked.
+        # Only after their exact ACK set is itself journaled do they receive a
+        # separate work-start barrier.
+        children.grant_ownership(ownership_sha256)
+        ownership_acks = children.await_ownership_ack(ownership_sha256, startup_deadline_ns)
+        authorization_body = {
+            "schema": EVENT_SCHEMA,
+            "kind": "workers_authorized",
+            "recipe_sha256": actual_recipe_sha,
+            "nonce": recipe["identity"]["nonce"],
+            "ownership_sha256": ownership_sha256,
+            "monotonic_ns": time.monotonic_ns(),
+            "workers": ownership_acks,
+        }
+        authorization_sha256 = digest_object(authorization_body)
+        authorization_event = {**authorization_body, "authorization_sha256": authorization_sha256}
+        raw_authorization = _write_event_durable(events_stream, authorization_event, maximum_bytes=event_max_bytes)
+        events_hash.update(raw_authorization)
+        event_count += 1
+
         start_ns = time.monotonic_ns() + 250_000_000
-        children.begin(start_ns)
         start_event = {
             "schema": EVENT_SCHEMA, "kind": "pressure_start", "sequence": -1,
             "recipe_sha256": actual_recipe_sha, "monotonic_ns": start_ns,
+            "nonce": recipe["identity"]["nonce"],
+            "ownership_sha256": ownership_sha256,
+            "authorization_sha256": authorization_sha256,
             "workers": [{"role": child["role"], "cpu": child["cpu"], "pid": child["pid"], "start_ticks": child["start_ticks"], "pgid": child["pgid"], "session_id": child["session_id"]} for child in children.children],
             "storage_device": recipe["storage"]["application_device"],
             "network_namespace_inode": recipe["network"]["network_namespace_inode"],
         }
-        raw_start = _write_event(events_stream, start_event, maximum_bytes=event_max_bytes)
+        raw_start = _write_event_durable(events_stream, start_event, maximum_bytes=event_max_bytes)
         events_hash.update(raw_start)
         event_count += 1
+        children.begin(start_ns, ownership_sha256, authorization_sha256)
         # Wait for the first exact sample before opening the application gate.
         selector_start = start_ns
         interval_ns = schedule["sample_interval_ms"] * 1_000_000
@@ -2452,7 +2666,9 @@ def run_pressure(recipe_path: Path, expected_sha: str, launch_path: Path, output
             event_count += 1
             if process_binding is None and seq + 1 >= schedule["startup_ready_windows"]:
                 require(len(startup_readiness) == schedule["startup_ready_windows"] and all(startup_readiness), "measured pressure readiness did not pass the frozen startup windows")
-                readiness_marker_sha = _write_ready_marker(ready_path, recipe, sample)
+                readiness_marker_sha = _write_ready_marker(
+                    ready_path, recipe, sample, ownership_sha256, authorization_sha256,
+                )
                 binding, launch_raw, launch_raw_sha, observed_launch_ns = _wait_for_launch(
                     launch_path, recipe, startup_deadline_ns,
                 )
@@ -2738,6 +2954,9 @@ def calibrate(request_path: Path, output_path: Path) -> dict[str, Any]:
     samples: list[dict[str, Any]] = []
     failure: str | None = None
     cleanup: list[dict[str, Any]] = []
+    ownership_path = run_dir / "worker-ownership.json"
+    authorization_path = run_dir / "worker-authorization.json"
+    work_start_path = run_dir / "worker-work-start.json"
     calibration_start_ns = time.monotonic_ns()
     calibration_deadline_ns = calibration_start_ns + schedule["total_deadline_seconds"] * 1_000_000_000
     try:
@@ -2746,8 +2965,47 @@ def calibrate(request_path: Path, output_path: Path) -> dict[str, Any]:
         _storage_reserve(fake_recipe, run_dir, scratch_reserved=True)
         start_deadline = calibration_start_ns + schedule["startup_deadline_seconds"] * 1_000_000_000
         workers.await_ready(start_deadline)
+        ownership_body = {
+            "schema": EVENT_SCHEMA, "kind": "worker_ownership",
+            "recipe_sha256": fake_recipe["recipe_sha256"],
+            "nonce": normalized["identity"]["nonce"],
+            "monotonic_ns": time.monotonic_ns(),
+            "workers": workers.ownership_rows(),
+        }
+        ownership_sha256 = digest_object(ownership_body)
+        ownership_record = {**ownership_body, "ownership_sha256": ownership_sha256}
+        safe_write_new(ownership_path, canonical_bytes(ownership_record), "calibration worker ownership journal", maximum=MAX_EVENT_LINE_BYTES)
+        workers.grant_ownership(ownership_sha256)
+        ownership_acks = workers.await_ownership_ack(ownership_sha256, start_deadline)
+        authorization_body = {
+            "schema": EVENT_SCHEMA, "kind": "workers_authorized",
+            "recipe_sha256": fake_recipe["recipe_sha256"],
+            "nonce": normalized["identity"]["nonce"],
+            "ownership_sha256": ownership_sha256,
+            "monotonic_ns": time.monotonic_ns(), "workers": ownership_acks,
+        }
+        authorization_sha256 = digest_object(authorization_body)
+        authorization_record = {**authorization_body, "authorization_sha256": authorization_sha256}
+        safe_write_new(authorization_path, canonical_bytes(authorization_record), "calibration worker authorization journal", maximum=MAX_EVENT_LINE_BYTES)
         start_ns = time.monotonic_ns() + 250_000_000
-        workers.begin(start_ns)
+        work_start_body = {
+            "schema": EVENT_SCHEMA, "kind": "pressure_start", "sequence": -1,
+            "recipe_sha256": fake_recipe["recipe_sha256"], "nonce": normalized["identity"]["nonce"],
+            "monotonic_ns": start_ns, "ownership_sha256": ownership_sha256,
+            "authorization_sha256": authorization_sha256,
+            "workers": [
+                {
+                    "role": child["role"], "cpu": child["cpu"], "pid": child["pid"],
+                    "start_ticks": child["start_ticks"], "pgid": child["pgid_observed"],
+                    "session_id": child["sid_observed"],
+                }
+                for child in workers.children
+            ],
+            "storage_device": app_storage["device"],
+            "network_namespace_inode": host["network"]["network_namespace_inode"],
+        }
+        safe_write_new(work_start_path, canonical_bytes(work_start_body), "calibration worker work-start journal", maximum=MAX_EVENT_LINE_BYTES)
+        workers.begin(start_ns, ownership_sha256, authorization_sha256)
         interval_ns = schedule["sample_interval_ms"] * 1_000_000
         counters_before: dict[str, Any] | None = None
         io_before: dict[str, dict[str, int]] | None = None
@@ -2850,6 +3108,11 @@ def calibrate(request_path: Path, output_path: Path) -> dict[str, Any]:
     calibration = {**body, "calibration_sha256": digest_object(body)}
     raw = canonical_bytes(calibration)
     safe_write_new(output_path, raw, "pressure contention calibration", maximum=MAX_CALIBRATION_BYTES)
+    for journal_path in (work_start_path, authorization_path, ownership_path):
+        try:
+            journal_path.unlink()
+        except FileNotFoundError:
+            pass
     try:
         run_dir.rmdir()
     except OSError:
@@ -2900,6 +3163,9 @@ def _parser() -> argparse.ArgumentParser:
     worker = sub.add_parser("_worker", help=argparse.SUPPRESS)
     worker.add_argument("--kind", choices=("cpu", "disk", "loopback"), required=True)
     worker.add_argument("--recipe-sha256", required=True)
+    worker.add_argument("--owner-nonce", required=True)
+    worker.add_argument("--driver-pid", type=int, required=True)
+    worker.add_argument("--driver-start-ticks", type=int, required=True)
     worker.add_argument("--interval-ms", type=int, required=True)
     worker.add_argument("--duration-seconds", type=int, required=True)
     worker.add_argument("--seed", type=int, required=True)

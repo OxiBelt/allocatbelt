@@ -29,6 +29,7 @@ from unittest.mock import patch
 SCRIPT_DIR = Path(__file__).resolve().parent
 DRIVER_PATH = SCRIPT_DIR / "application-pressure-driver.py"
 READER_PATH = SCRIPT_DIR / "application-pressure-readback.py"
+SOAK_READBACK_PATH = SCRIPT_DIR / "application-soak-readback.py"
 
 
 def _load_module(name: str, path: Path) -> Any:
@@ -43,6 +44,7 @@ def _load_module(name: str, path: Path) -> Any:
 
 driver = _load_module("pressure_driver_test_target", DRIVER_PATH)
 readback = _load_module("pressure_readback_test_target", READER_PATH)
+soak_supervisor = _load_module("pressure_subreaper_test_target", SOAK_READBACK_PATH)
 
 
 class PressureDriverTests(unittest.TestCase):
@@ -509,6 +511,16 @@ class PressureDriverTests(unittest.TestCase):
             pressure_events = [
                 json.loads(line) for line in (artifacts / "events.jsonl").read_text(encoding="utf-8").splitlines()
             ]
+            self.assertEqual(
+                [event["kind"] for event in pressure_events[:3]],
+                ["worker_ownership", "workers_authorized", "pressure_start"],
+            )
+            ownership_event, authorized_event, pressure_start_event = pressure_events[:3]
+            self.assertEqual(ownership_event["nonce"], run_identity["nonce"])
+            self.assertEqual(authorized_event["ownership_sha256"], ownership_event["ownership_sha256"])
+            self.assertEqual(pressure_start_event["authorization_sha256"], authorized_event["authorization_sha256"])
+            self.assertEqual(pressure_start_event["ownership_sha256"], ownership_event["ownership_sha256"])
+            self.assertEqual(len(authorized_event["workers"]), len(ownership_event["workers"]))
             sample_events = [event for event in pressure_events if event.get("kind") == "sample"]
             start_samples = [
                 sample for sample in sample_events
@@ -524,6 +536,42 @@ class PressureDriverTests(unittest.TestCase):
             self.assertTrue(end_samples[0]["readiness"]["all_ready"])
             proof_body = {key: value for key, value in readback_value.items() if key != "readback_sha256"}
             self.assertEqual(readback_value["readback_sha256"], driver.digest_object(proof_body))
+
+            duplicate_pid = root / "duplicate-worker-pid-artifacts"
+            shutil.copytree(artifacts, duplicate_pid)
+            duplicate_events = []
+            for event in pressure_events:
+                if event["kind"] == "worker_ownership":
+                    event = json.loads(driver.canonical_bytes(event))
+                    event["workers"][1]["pid"] = event["workers"][0]["pid"]
+                    event["workers"][1]["pgid"] = event["workers"][0]["pid"]
+                    event["workers"][1]["session_id"] = event["workers"][0]["pid"]
+                    owner_body = {key: value for key, value in event.items() if key != "ownership_sha256"}
+                    event["ownership_sha256"] = driver.digest_object(owner_body)
+                duplicate_events.append(driver.canonical_bytes(event) + b"\n")
+            duplicate_events_raw = b"".join(duplicate_events)
+            (duplicate_pid / "events.jsonl").write_bytes(duplicate_events_raw)
+            duplicate_run = json.loads((duplicate_pid / "run.json").read_text(encoding="utf-8"))
+            duplicate_run["events_sha256"] = driver.digest_bytes(duplicate_events_raw)
+            duplicate_run["events_bytes"] = len(duplicate_events_raw)
+            duplicate_run_body = {key: value for key, value in duplicate_run.items() if key != "run_sha256"}
+            duplicate_run["run_sha256"] = driver.digest_object(duplicate_run_body)
+            duplicate_run_raw = driver.canonical_bytes(duplicate_run)
+            (duplicate_pid / "run.json").write_bytes(duplicate_run_raw)
+            duplicate_rejected = subprocess.run(
+                [sys.executable, str(READER_PATH), "verify",
+                 "--recipe", str(recipe_path), "--expected-recipe-sha256", frozen["recipe_sha256"],
+                 "--artifacts", str(duplicate_pid),
+                 "--expected-run-sha256", driver.digest_bytes(duplicate_run_raw),
+                 "--expected-events-sha256", driver.digest_bytes(duplicate_events_raw),
+                 "--expected-launch-sha256", run_artifacts["launch_record_sha256"],
+                 "--expected-process-binding-sha256", run_artifacts["process_binding_sha256"],
+                 "--expected-ready-sha256", run_artifacts["readiness_marker_sha256"]],
+                cwd="/", stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                timeout=20, check=False,
+            )
+            self.assertNotEqual(duplicate_rejected.returncode, 0, "independent reader accepted a self-resealed duplicate worker PID")
+            self.assertIn("duplicates a worker PID", duplicate_rejected.stderr.decode("utf-8", errors="replace"))
 
             tampered = root / "tampered-artifacts"
             shutil.copytree(artifacts, tampered)
@@ -586,7 +634,7 @@ except module.PressureError as error:
     assert receipt['cleanup_ok'] is True and receipt['scratch_file_removed'] is True
     assert all(row['alive_after_cleanup'] is False for row in receipt['worker_cleanup'])
     kinds = [json.loads(line)['kind'] for line in (root / 'events.jsonl').read_text(encoding='utf-8').splitlines()]
-    assert kinds == ['pressure_start', 'pressure_failure', 'pressure_cleanup']
+    assert kinds == ['worker_ownership', 'workers_authorized', 'pressure_start', 'pressure_failure', 'pressure_cleanup']
     print(json.dumps({'status': receipt['status'], 'cleanup_ok': receipt['cleanup_ok'], 'events': kinds}, sort_keys=True))
 else:
     raise AssertionError('injected event cap unexpectedly allowed a pressure sample')
@@ -604,6 +652,256 @@ else:
             self.assertTrue(cap_receipt["cleanup_ok"])
             self.assertTrue(cap_receipt["scratch_file_removed"])
             self.assertTrue((cap_artifacts / "events.jsonl").is_file())
+
+            fault_expectations = {
+                "before_owner_journal": [],
+                "after_owner_journal": ["worker_ownership"],
+                "zero_pre_capture_after_owner_journal": ["worker_ownership"],
+                "captured_then_zombie_after_owner_journal": ["worker_ownership"],
+                "captured_then_zombie_before_owner_journal": [],
+                "after_ack_before_start": ["worker_ownership", "workers_authorized", "pressure_start"],
+                "during_work": ["worker_ownership", "workers_authorized", "pressure_start"],
+            }
+            fault_wrapper = root / "run-pressure-ownership-fault.py"
+            fault_wrapper.write_text(
+                """import importlib.util, json, os, subprocess, sys, time
+from pathlib import Path
+driver_path, recipe_path, recipe_sha, launch_path, output_path, ready_path, checkpoint_path, stage = sys.argv[1:9]
+spec = importlib.util.spec_from_file_location('pressure_ownership_fault_driver', driver_path)
+module = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = module
+spec.loader.exec_module(module)
+OriginalWorkerSet = module.WorkerSet
+def pause(checkpoint):
+    value = {'schema': 'allocatbelt.pressure-worker-fault-checkpoint.test.v1', 'stage': stage, 'checkpoint': checkpoint}
+    raw = module.canonical_bytes(value)
+    descriptor = os.open(checkpoint_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        assert os.write(descriptor, raw) == len(raw)
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    while True:
+        time.sleep(0.05)
+class FaultWorkerSet(OriginalWorkerSet):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.unrelated_after_driver = None
+    def ownership_rows(self):
+        if stage in ('before_owner_journal', 'captured_then_zombie_before_owner_journal'):
+            pause('workers_ready_before_ownership_fsync')
+        return super().ownership_rows()
+    def grant_ownership(self, ownership_sha256):
+        if stage == 'zero_pre_capture_after_owner_journal':
+            # A later isolated zombie is intentionally outside the durable
+            # ownership roster. The parent may reap it, but must retain an
+            # unknown-inventory failure rather than treating it as a worker.
+            self.unrelated_after_driver = subprocess.Popen(
+                [sys.executable, '-c', 'pass'], stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+        if stage in ('after_owner_journal', 'zero_pre_capture_after_owner_journal', 'captured_then_zombie_after_owner_journal'):
+            pause('ownership_fsynced_before_worker_grant')
+        return super().grant_ownership(ownership_sha256)
+    def begin(self, start_ns, ownership_sha256, authorization_sha256):
+        if stage == 'after_ack_before_start':
+            pause('all_worker_acks_fsynced_before_work_start_grant')
+        super().begin(start_ns, ownership_sha256, authorization_sha256)
+        if stage == 'during_work':
+            pause('work_start_granted')
+module.WorkerSet = FaultWorkerSet
+module.run_pressure(Path(recipe_path), recipe_sha, Path(launch_path), Path(output_path), Path(ready_path))
+""",
+                encoding="utf-8",
+            )
+            parent_subreaper_previous = soak_supervisor._set_child_subreaper(True)
+            try:
+                for fault_index, (fault_stage, expected_kinds) in enumerate(fault_expectations.items(), start=1):
+                    fault_identity = dict(
+                        common_identity,
+                        nonce=uuid.uuid4().hex,
+                        run_id=f"pressure-run-fault-{fault_index}-{uuid.uuid4().hex[:8]}",
+                    )
+                    fault_request_value = dict(pressure_request_value, identity=fault_identity)
+                    fault_request = root / f"{fault_stage}-pressure-request.json"
+                    fault_recipe_path = root / f"{fault_stage}-pressure-recipe.json"
+                    fault_request.write_bytes(driver.canonical_bytes(fault_request_value))
+                    fault_freeze = subprocess.run(
+                        [sys.executable, str(DRIVER_PATH), "freeze", "--request", str(fault_request), "--output", str(fault_recipe_path)],
+                        cwd="/", stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                        timeout=20, check=False,
+                    )
+                    self.assertEqual(fault_freeze.returncode, 0, fault_freeze.stderr.decode("utf-8", errors="replace"))
+                    fault_recipe_info = json.loads(fault_freeze.stdout.decode("utf-8"))
+                    fault_recipe = json.loads(fault_recipe_path.read_text(encoding="utf-8"))
+                    fault_artifacts = root / f"{fault_stage}-pressure-artifacts"
+                    fault_checkpoint = root / f"{fault_stage}-checkpoint.json"
+                    zero_pre_capture = fault_stage == "zero_pre_capture_after_owner_journal"
+                    captured_then_zombie = fault_stage == "captured_then_zombie_after_owner_journal"
+                    captured_before_journal = fault_stage == "captured_then_zombie_before_owner_journal"
+                    unrelated = None
+                    if zero_pre_capture:
+                        unrelated = subprocess.Popen(
+                            [sys.executable, "-c", "import time; time.sleep(10)"],
+                            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                            start_new_session=True,
+                        )
+                    fault_process = subprocess.Popen(
+                        [
+                            sys.executable, str(fault_wrapper), str(DRIVER_PATH), str(fault_recipe_path),
+                            fault_recipe_info["recipe_sha256"], str(fault_artifacts / "launch-record.json"),
+                            str(fault_artifacts), str(fault_artifacts / "pressure-ready.json"),
+                            str(fault_checkpoint), fault_stage,
+                        ],
+                        cwd="/", stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                        start_new_session=True,
+                    )
+                    fault_start_ticks = soak_supervisor._proc_start_ticks(fault_process.pid)
+                    captured: dict[tuple[str, int | None], dict[str, Any]] = {}
+                    worker_keys = soak_supervisor._expected_pressure_worker_keys(fault_recipe["schedule"])
+                    try:
+                        deadline = time.monotonic() + 15
+                        while time.monotonic() < deadline and not fault_checkpoint.is_file():
+                            if fault_process.poll() is not None:
+                                stdout, stderr = fault_process.communicate()
+                                self.fail(
+                                    f"pressure ownership fault {fault_stage} exited before its checkpoint: "
+                                    f"{stderr.decode('utf-8', errors='replace')} {stdout.decode('utf-8', errors='replace')}"
+                                )
+                            if not zero_pre_capture:
+                                soak_supervisor._capture_pressure_worker_sessions(
+                                    fault_process.pid, fault_start_ticks, DRIVER_PATH,
+                                    fault_recipe_info["recipe_sha256"], fault_recipe["schedule"], captured,
+                                    fault_identity["nonce"], ownership_event_path=fault_artifacts / "events.jsonl",
+                                )
+                            time.sleep(0.02)
+                        self.assertTrue(fault_checkpoint.is_file(), f"pressure fault {fault_stage} missed its bounded checkpoint")
+                        if zero_pre_capture:
+                            self.assertEqual(captured, {}, "zero-pre-capture case recorded a worker before driver death")
+                        else:
+                            for _ in range(20):
+                                soak_supervisor._capture_pressure_worker_sessions(
+                                    fault_process.pid, fault_start_ticks, DRIVER_PATH,
+                                    fault_recipe_info["recipe_sha256"], fault_recipe["schedule"], captured,
+                                    fault_identity["nonce"], ownership_event_path=fault_artifacts / "events.jsonl",
+                                )
+                                if set(captured) == worker_keys:
+                                    break
+                                time.sleep(0.02)
+                            self.assertEqual(set(captured), worker_keys, f"fault {fault_stage} did not capture every exact spawned worker")
+                        checkpoint = json.loads(fault_checkpoint.read_text(encoding="utf-8"))
+                        self.assertEqual(checkpoint["stage"], fault_stage)
+                        if fault_stage == "during_work":
+                            time.sleep(0.8)
+                        fault_events_path = fault_artifacts / "events.jsonl"
+                        event_kinds = (
+                            [json.loads(line)["kind"] for line in fault_events_path.read_text(encoding="utf-8").splitlines()]
+                            if fault_events_path.exists() else []
+                        )
+                        self.assertEqual(event_kinds, expected_kinds)
+                        fault_process.kill()
+                        fault_process.wait(timeout=5)
+                        if zero_pre_capture or captured_then_zombie or captured_before_journal:
+                            zombie_deadline = time.monotonic() + 3
+                            expected_zombie_count = len(worker_keys) + (1 if zero_pre_capture else 0)
+                            while time.monotonic() < zombie_deadline:
+                                candidates = [
+                                    soak_supervisor._proc_process_identity(pid)
+                                    for pid in soak_supervisor._proc_child_pids(os.getpid(), "zero-pre-capture fixture")
+                                    if unrelated is None or pid != unrelated.pid
+                                ]
+                                candidates = [item for item in candidates if item is not None]
+                                if len(candidates) == expected_zombie_count and all(item["state"] == "Z" for item in candidates):
+                                    break
+                                time.sleep(0.02)
+                            self.assertEqual(len(candidates), expected_zombie_count)
+                            self.assertTrue(all(item["state"] == "Z" for item in candidates), "zero-pre-capture workers did not reach the adopted-zombie state")
+                        if captured_before_journal:
+                            self.assertEqual(fault_events_path.read_bytes(), b"", "the pre-journal fault unexpectedly emitted an ownership record")
+                        soak_supervisor._capture_pressure_worker_sessions(
+                            fault_process.pid, fault_start_ticks, DRIVER_PATH,
+                            fault_recipe_info["recipe_sha256"], fault_recipe["schedule"], captured,
+                            fault_identity["nonce"], ownership_event_path=fault_artifacts / "events.jsonl",
+                        )
+                        if zero_pre_capture or captured_then_zombie or captured_before_journal:
+                            soak_supervisor._capture_pressure_worker_sessions(
+                                fault_process.pid, fault_start_ticks, DRIVER_PATH,
+                                fault_recipe_info["recipe_sha256"], fault_recipe["schedule"], captured,
+                                fault_identity["nonce"], ownership_event_path=fault_artifacts / "events.jsonl",
+                            )
+                        self.assertTrue(
+                            soak_supervisor._cleanup_owned_pressure_workers(
+                                captured,
+                                fault_recipe["schedule"]["term_deadline_seconds"],
+                                fault_recipe["schedule"]["kill_deadline_seconds"],
+                            ),
+                            f"subreaper could not clean authenticated workers after {fault_stage}",
+                        )
+                        self.assertTrue(all(record["adopted_by_subreaper"] for record in captured.values()))
+                        self.assertTrue(all(record["reaped"] for record in captured.values()))
+                        if zero_pre_capture:
+                            self.assertEqual(
+                                {key for key in captured if key in worker_keys}, worker_keys,
+                                "durable ownership roster did not authenticate every orphaned pressure worker",
+                            )
+                            unknown = [record for record in captured.values() if record.get("unknown_adopted_zombie")]
+                            self.assertEqual(len(unknown), 1, "unrelated post-driver zombie was treated as an authenticated worker")
+                            self.assertFalse(
+                                soak_supervisor._pressure_worker_inventory_complete(captured, fault_recipe["schedule"]),
+                                "weakly identified adopted zombie made the worker inventory eligible",
+                            )
+                            self.assertIsNotNone(unrelated)
+                            self.assertIsNone(unrelated.poll(), "zombie fallback signalled an unrelated live child")
+                        elif captured_then_zombie:
+                            self.assertEqual(set(captured), worker_keys)
+                            self.assertFalse(any(record.get("unknown_adopted_zombie") for record in captured.values()))
+                            self.assertTrue(
+                                soak_supervisor._pressure_worker_inventory_complete(captured, fault_recipe["schedule"]),
+                                "exact owner journal identities were lost during live-to-zombie adoption",
+                            )
+                        elif captured_before_journal:
+                            self.assertEqual(set(captured), worker_keys)
+                            self.assertFalse(any(record.get("unknown_adopted_zombie") for record in captured.values()))
+                            self.assertTrue(
+                                soak_supervisor._pressure_worker_inventory_complete(captured, fault_recipe["schedule"]),
+                                "prior exact live capture was lost when the ownership journal never appeared",
+                            )
+                    finally:
+                        if fault_process.poll() is None:
+                            fault_process.kill()
+                            fault_process.wait(timeout=5)
+                        try:
+                            soak_supervisor._capture_pressure_worker_sessions(
+                                fault_process.pid, fault_start_ticks, DRIVER_PATH,
+                                fault_recipe_info["recipe_sha256"], fault_recipe["schedule"], captured,
+                                fault_identity["nonce"], ownership_event_path=fault_artifacts / "events.jsonl",
+                            )
+                            if captured:
+                                soak_supervisor._cleanup_owned_pressure_workers(
+                                    captured,
+                                    fault_recipe["schedule"]["term_deadline_seconds"],
+                                    fault_recipe["schedule"]["kill_deadline_seconds"],
+                                )
+                        finally:
+                            scratch_path = Path(fault_recipe["storage"]["pressure_scratch_path"]) / f".allocatbelt-pressure-{fault_identity['nonce']}.bin"
+                            try:
+                                scratch_path.unlink()
+                            except FileNotFoundError:
+                                pass
+                            if unrelated is not None and unrelated.poll() is None:
+                                unrelated.send_signal(signal.SIGTERM)
+                                unrelated.wait(timeout=3)
+                            for pipe in (fault_process.stdout, fault_process.stderr):
+                                if pipe is not None and not pipe.closed:
+                                    pipe.close()
+                print(json.dumps({
+                    "status": "pressure-worker-parent-death-fault-tests-passed",
+                    "faults": list(fault_expectations),
+                    "parent_owned_reaping": True,
+                }, sort_keys=True))
+            finally:
+                soak_supervisor._set_child_subreaper(parent_subreaper_previous)
 
             evidence_dir = os.environ.get("ALLOCATBELT_PRESSURE_TEST_EVIDENCE_DIR")
             if evidence_dir:

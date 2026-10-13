@@ -5,6 +5,8 @@ from __future__ import annotations
 import hashlib
 import importlib.machinery
 import importlib.util
+import contextlib
+import io
 import json
 import os
 from pathlib import Path
@@ -13,6 +15,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from types import SimpleNamespace
 import unittest
 from unittest import mock
 from typing import Any
@@ -28,6 +31,20 @@ loader = importlib.machinery.SourceFileLoader("soak_readback", str(SCRIPT))
 spec = importlib.util.spec_from_loader(loader.name, loader)
 module = importlib.util.module_from_spec(spec)
 loader.exec_module(module)
+campaign_loader = importlib.machinery.SourceFileLoader(
+    "campaign_for_soak_readback_tests",
+    str(SCRIPT.with_name("application-campaign.py")),
+)
+campaign_spec = importlib.util.spec_from_loader(campaign_loader.name, campaign_loader)
+campaign = importlib.util.module_from_spec(campaign_spec)
+campaign_loader.exec_module(campaign)
+pressure_loader = importlib.machinery.SourceFileLoader(
+    "pressure_readback_for_soak_tests",
+    str(SCRIPT.with_name("application-pressure-readback.py")),
+)
+pressure_spec = importlib.util.spec_from_loader(pressure_loader.name, pressure_loader)
+pressure_reader = importlib.util.module_from_spec(pressure_spec)
+pressure_loader.exec_module(pressure_reader)
 
 
 def canon(value):
@@ -517,6 +534,1137 @@ class Fixture:
 
 
 class SoakReadbackTests(unittest.TestCase):
+    def test_owned_worker_adoption_transition_survives_worker_exit_between_polls(self):
+        pid, start_ticks, driver_pid = 501, 9001, 600
+        sessions = {("cpu", 2): {
+            "pid": pid, "start_ticks": start_ticks, "pgid": pid, "session_id": pid,
+            "parent_pid": driver_pid, "adopted_by_subreaper": False, "reaped": False,
+            "role": "cpu", "cpu": 2,
+        }}
+        with mock.patch.object(module, "_PRESSURE_SUBREAPER_ACTIVE", True), \
+             mock.patch.object(module, "_proc_process_identity", return_value={
+                 "pid": pid, "start_ticks": start_ticks, "pgid": pid, "session_id": pid,
+                 "parent_pid": os.getpid(), "state": "Z",
+             }), \
+             mock.patch.object(module, "_proc_child_pids", return_value=[]):
+            module._capture_pressure_worker_sessions(
+                driver_pid, 7001, Path("/pinned/driver.py"), "a" * 64,
+                {"pressure_cpu_affinity": [2]}, sessions, "b" * 32,
+            )
+        self.assertEqual(sessions[("cpu", 2)]["parent_pid"], os.getpid())
+        self.assertTrue(sessions[("cpu", 2)]["adopted_by_subreaper"])
+
+    def test_source_v5_cleanup_does_not_treat_empty_post_exit_inventory_as_clean(self):
+        class ExitedDriver:
+            pid = 600
+
+            def poll(self):
+                return -signal.SIGKILL
+
+        schedule = {
+            "pressure_cpu_affinity": [2], "term_deadline_seconds": 1,
+            "kill_deadline_seconds": 1,
+        }
+        with mock.patch.object(module, "_PRESSURE_SUBREAPER_ACTIVE", True), \
+             mock.patch.object(module, "_capture_pressure_worker_sessions"), \
+             mock.patch.object(module, "_cleanup_owned_pressure_workers", return_value=True):
+            with self.assertRaisesRegex(module.SoakReadbackError, "complete worker inventory"):
+                module._stop_pressure_session(
+                    ExitedDriver(), 7001, Path("/pinned/driver.py"), "a" * 64,
+                    schedule, {}, "b" * 32,
+                )
+
+    def test_pressure_worker_capture_requires_exact_spawn_arguments_and_parent_identity(self):
+        schedule = {
+            "sample_interval_ms": 100, "duration_seconds": 30, "seed": 17,
+            "pressure_cpu_affinity": [2], "cpu_duty_basis_points": 8000,
+            "scratch_file_bytes": 4096, "disk_bytes_per_second": 65536,
+            "network_requests_per_second": 10, "network_payload_bytes": 64,
+        }
+        base = [
+            sys.executable.encode(), b"/pinned/driver.py", b"_worker",
+            b"--recipe-sha256", b"a" * 64,
+            b"--owner-nonce", b"b" * 32,
+            b"--driver-pid", b"600", b"--driver-start-ticks", b"7001",
+            b"--interval-ms", b"100", b"--duration-seconds", b"30", b"--seed", b"17",
+            b"--kind", b"cpu", b"--cpu", b"2", b"--duty-basis-points", b"8000",
+        ]
+        command = b"\0".join(base) + b"\0"
+        self.assertEqual(
+            module._parse_pressure_worker_argv(
+                command, Path("/pinned/driver.py"), "a" * 64, schedule,
+                "b" * 32, 600, 7001,
+            ),
+            ("cpu", 2),
+        )
+        with self.assertRaisesRegex(module.SoakReadbackError, "options differ"):
+            module._parse_pressure_worker_argv(
+                b"\0".join(base + [b"--surprise", b"true"]) + b"\0",
+                Path("/pinned/driver.py"), "a" * 64, schedule, "b" * 32, 600, 7001,
+            )
+        with self.assertRaisesRegex(module.SoakReadbackError, "start ticks differ"):
+            module._parse_pressure_worker_argv(
+                command, Path("/pinned/driver.py"), "a" * 64, schedule,
+                "b" * 32, 600, 7002,
+            )
+
+    def test_pressure_readback_rejects_supervisor_logs_inside_exact_artifact_dir(self):
+        with tempfile.TemporaryDirectory(prefix="allocatbelt-pressure-artifact-directory-") as temporary:
+            root = Path(temporary)
+            recipe_path = root / "pressure-recipe.json"
+            write_private(recipe_path, canon({"schema": "test.pressure.v1"}))
+            artifact_dir = root / "pressure"
+            artifact_dir.mkdir(mode=0o700)
+            for name in ("events.jsonl", "process-binding.json", "launch-record.json", "run.json", "pressure-ready.json"):
+                write_private(artifact_dir / name, b"{}\n")
+            write_private(artifact_dir / "pressure-driver.stderr.log", b"captured supervisor diagnostics\n")
+            with mock.patch.object(pressure_reader, "_validate_recipe", return_value={}), \
+                 mock.patch.object(pressure_reader, "_verify_script_hashes"), \
+                 mock.patch.object(pressure_reader, "_verify_raw_inputs"), \
+                 mock.patch.object(pressure_reader, "_validate_calibration"):
+                with self.assertRaisesRegex(pressure_reader.ReadbackError, "missing or unexpected files"):
+                    pressure_reader.verify_pressure(recipe_path, "a" * 64, artifact_dir, {})
+
+    def test_source_v5_manifest_raw_and_semantic_hash_roles_are_distinct(self):
+        manifest = {"schema": module.SOURCE_SCHEMA_V5, "source": {"host_id": "host-1"}}
+        manifest["manifest_sha256"] = digest_bytes(canon(manifest))
+        raw = canon(manifest)
+        raw_sha = digest_bytes(raw)
+        self.assertNotEqual(raw_sha, manifest["manifest_sha256"])
+        self.assertEqual(
+            module._validate_v5_manifest_digest_roles(manifest, raw, manifest["manifest_sha256"], raw_sha),
+            raw_sha,
+        )
+        with self.assertRaisesRegex(module.SoakReadbackError, "semantic digest"):
+            module._validate_v5_manifest_digest_roles(manifest, raw, raw_sha)
+        with self.assertRaisesRegex(module.SoakReadbackError, "raw manifest bytes"):
+            module._validate_v5_manifest_digest_roles(manifest, raw, manifest["manifest_sha256"], manifest["manifest_sha256"])
+
+    def test_foreign_source_manifest_runs_captured_full_calibration_verifier(self):
+        controller_pin = {"path": "scripts/application-campaign.py", "sha256": "a" * 64}
+        valid_calibration = {
+            "schema": campaign.CALIBRATION_SCHEMA,
+            "architecture": "x86_64",
+            "max_tenants": 1,
+            "max_waiters": 256,
+            "control_ceiling": 67_108_864,
+            "fixed_global_control_baseline": 2048,
+            "tenant_owner_control_bytes": 0,
+            "final_live_tenants": 0,
+            "final_global_control_bytes": 2048,
+        }
+
+        def source_manifest(host_id, calibration):
+            value = {
+                "host_id": host_id,
+                "qualification_harness": {"campaign_controller": controller_pin},
+                "resource_domain_calibration": {"record": calibration},
+            }
+            value["manifest_sha256"] = digest_bytes(canon(value))
+            raw = canon(value)
+            module._validate_v5_manifest_digest_roles(value, raw, value["manifest_sha256"])
+            return value
+
+        selected = source_manifest("host-1", dict(valid_calibration))
+        malformed_foreign_calibration = dict(valid_calibration)
+        malformed_foreign_calibration["max_waiters"] = 257
+        foreign = source_manifest("host-2", malformed_foreign_calibration)
+
+        class CapturedController:
+            CampaignError = campaign.CampaignError
+
+            def __init__(self):
+                self.verified_hosts = []
+
+            def verify_source_manifest(self, manifest, verify_artifacts=False):
+                self.assert_no_artifacts(verify_artifacts)
+                self.verified_hosts.append(manifest["host_id"])
+                campaign.validate_calibration_record(manifest["resource_domain_calibration"]["record"])
+
+            @staticmethod
+            def assert_no_artifacts(value):
+                if value is not False:
+                    raise ValueError("foreign V5 manifests must receive full structure validation without host artifact access")
+
+        captured = CapturedController()
+        with self.assertRaisesRegex(module.SoakReadbackError, "full verifier"):
+            module._verify_v5_manifest_set(captured, {"host-1": selected, "host-2": foreign}, controller_pin)
+        self.assertEqual(captured.verified_hosts, ["host-1", "host-2"])
+
+    def test_source_v5_pressure_schedule_encloses_full_soak_and_bounded_phases(self):
+        base_schedule = {
+            "seed": 17,
+            "duration_seconds": 30,
+            "sample_interval_ms": 100,
+            "startup_deadline_seconds": 10,
+            "total_deadline_seconds": 85,
+            "term_deadline_seconds": 30,
+            "kill_deadline_seconds": 15,
+            "minimum_overlap_seconds": 10,
+            "startup_ready_windows": 2,
+            "cpu_duty_basis_points": 8000,
+            "pressure_cpu_affinity": [1, 3],
+            "application_cpu_affinity": [0, 2],
+            "disk_bytes_per_second": 81_920,
+            "scratch_file_bytes": 4096,
+            "network_requests_per_second": 10,
+            "network_payload_bytes": 64,
+        }
+        request = {"schema": "allocatbelt.application-pressure-request.v1", "schedule": base_schedule}
+        request_before = canon(request)
+        result = module._derive_v5_pressure_schedule(
+            10_800, request,
+            {"duration_seconds": 30, "sample_interval_ms": 100, "seed": 17},
+        )
+        self.assertEqual(result["application_wall_timeout_seconds"], 11_050)
+        self.assertEqual(result["pressure_duration_seconds"], 11_061)
+        self.assertEqual(result["pressure_schedule"]["duration_seconds"], 11_061)
+        self.assertEqual(result["pressure_schedule"]["total_deadline_seconds"], 11_116)
+        expected = dict(base_schedule)
+        expected["duration_seconds"] = 11_061
+        expected["total_deadline_seconds"] = 11_116
+        self.assertEqual(result["pressure_schedule"], expected)
+        self.assertEqual(canon(request), request_before)
+        with self.assertRaisesRegex(module.SoakReadbackError, "sample interval"):
+            bad_schedule = dict(base_schedule, sample_interval_ms=333)
+            module._derive_v5_pressure_schedule(
+                10_800,
+                {"schema": request["schema"], "schedule": bad_schedule},
+                {"duration_seconds": 30, "sample_interval_ms": 333, "seed": 17},
+            )
+
+    def test_source_v5_validate_cli_serializes_exact_fifteen_field_composite(self):
+        with tempfile.TemporaryDirectory(prefix="allocatbelt-soak-v2-cli-composite-") as temporary:
+            output = Path(temporary) / "output"
+            output.mkdir(mode=0o700)
+            audit = {"recipe": {"schema": module.RECIPE_SCHEMA_V2}}
+            preflight = {"preflight_sha256": "a" * 64}
+            launch_sha = "b" * 64
+            postflight = {
+                "schema": module.POSTFLIGHT_SCHEMA,
+                "preflight_sha256": preflight["preflight_sha256"],
+                "recipe_sha256": "c" * 64,
+                "source_manifest_sha256": "d" * 64,
+                "source_tree_sha256": "e" * 64,
+                "build_sha256": "f" * 64,
+                "candidate_binary_sha256": "1" * 64,
+                "oracle_producer_binary_sha256": "2" * 64,
+                "reference_ring_sha256": "3" * 64,
+                "launch_receipt_sha256": launch_sha,
+                "inputs_unchanged": True,
+            }
+            postflight["postflight_sha256"] = digest_bytes(canon(postflight))
+            write_private(output / "soak-postflight.json", canon(postflight))
+            composite = {
+                "schema": module.RESULT_SCHEMA_V2,
+                "validated": True,
+                "passed": True,
+                "qualification_eligible": False,
+                "mode": "functional",
+                "identity": {"run_id": "run-v2"},
+                "source_manifest_sha256": "4" * 64,
+                "source_tree_sha256": "5" * 64,
+                "build_sha256": "6" * 64,
+                "candidate_binary_sha256": "7" * 64,
+                "resource_ceiling_sha256": "8" * 64,
+                "fixed_global_control_baseline": 2048,
+                "receipt_sha256": "9" * 64,
+                "validator_sha256": "a" * 64,
+                "monotonic_endpoints": {"started": [1, 2], "trace_ended": [3, 4], "drain_ended": [5, 6], "shutdown_ended": [7, 8], "postprocess_ended": [9, 10]},
+            }
+            args = SimpleNamespace(output_dir=output)
+            stdout = io.StringIO()
+            with mock.patch.object(module, "_current_audit", return_value=(audit, preflight)), \
+                 mock.patch.object(module, "_verify_launch_receipt", return_value=({"schema": "launch.v1"}, launch_sha)), \
+                 mock.patch.object(module, "_validate_artifacts", return_value=composite), \
+                 contextlib.redirect_stdout(stdout):
+                self.assertEqual(module.command_validate(args), 0)
+            saved = module._readback_json(output / "soak-readback.json", "saved SourceV5 composite")
+            self.assertEqual(saved, composite)
+            self.assertEqual(len(saved), 15)
+            self.assertNotIn("postflight_sha256", saved)
+            self.assertEqual(json.loads(stdout.getvalue())["validated"], True)
+
+    def test_pressure_readiness_marker_is_measured_pinned_and_published_atomically(self):
+        with tempfile.TemporaryDirectory(prefix="allocatbelt-pressure-ready-marker-") as temporary:
+            root = Path(temporary)
+            recipe = {
+                "identity": {"nonce": "a" * 32},
+                "readiness_thresholds": {
+                    "cpu_busy_min_basis_points": 7000,
+                    "disk_write_min_bytes_per_second": 1024,
+                    "disk_queue_or_stall_min_microseconds": 100,
+                    "loopback_requests_min_per_second": 10,
+                    "loopback_latency_p99_max_nanoseconds": 1_000_000,
+                    "loopback_tx_min_bytes_per_second": 2048,
+                    "loopback_rx_min_bytes_per_second": 2048,
+                },
+            }
+            body = {
+                "schema": "allocatbelt.application-pressure-ready.v1",
+                "recipe_sha256": "b" * 64,
+                "condition_sha256": "c" * 64,
+                "nonce": "a" * 32,
+                "ownership_protocol": module.SOURCE_V5_PRESSURE_OWNERSHIP_PROTOCOL,
+                "worker_ownership_sha256": "d" * 64,
+                "worker_authorization_sha256": "e" * 64,
+                "pressure_ready_monotonic_ns": time.monotonic_ns(),
+                "readiness": {
+                    "cpu_ready": True, "disk_ready": True, "loopback_ready": True, "all_ready": True,
+                    "cpu_busy_basis_points": 8000, "disk_write_bytes_per_second": 2048,
+                    "disk_queue_or_stall_microseconds": 200, "loopback_requests_per_second": 20,
+                    "loopback_latency_p99_upper_nanoseconds": 500_000,
+                    "loopback_tx_bytes_per_second": 4096, "loopback_rx_bytes_per_second": 4096,
+                },
+            }
+            marker = {**body, "ready_sha256": digest_bytes(canon(body))}
+            marker_path = root / "pressure-ready.json"
+            write_private(marker_path, canon(marker))
+            checked, raw_sha = module._read_pressure_ready(marker_path, recipe, "b" * 64, "c" * 64)
+            self.assertEqual(checked, marker)
+            self.assertEqual(raw_sha, digest_bytes(canon(marker)))
+
+            launch_path = root / "launch-record.json"
+            published_sha = module._atomic_json_publish(launch_path, {"schema": "test.v1", "pid": 123})
+            self.assertEqual(published_sha, digest_bytes(launch_path.read_bytes()))
+            with self.assertRaisesRegex(module.SoakReadbackError, "refusing to replace"):
+                module._atomic_json_publish(launch_path, {"schema": "test.v1", "pid": 124})
+
+    def test_external_launch_waits_for_pressure_readiness_before_app_popen(self):
+        with tempfile.TemporaryDirectory(prefix="allocatbelt-pressure-first-launch-") as temporary:
+            root = Path(temporary)
+            output = root / "output"
+            output.mkdir(mode=0o700)
+            driver = root / "pressure-driver.py"
+            driver.write_text("# pinned test driver\n", encoding="ascii")
+            app_binary = root / "soak-binary"
+            write_private(app_binary, b"soak binary", 0o700)
+            app_binary.chmod(0o700)
+            pressure_recipe_path = root / "pressure-recipe.json"
+            pressure_recipe = {
+                "schema": "test.pressure.v1", "recipe_sha256": "b" * 64,
+                "schedule": {
+                    "pressure_cpu_affinity": [2], "sample_interval_ms": 100,
+                    "duration_seconds": 2, "startup_deadline_seconds": 1,
+                    "term_deadline_seconds": 1, "kill_deadline_seconds": 1,
+                    "total_deadline_seconds": 10,
+                },
+            }
+            write_private(pressure_recipe_path, canon(pressure_recipe))
+            pressure_dir = output / "pressure"
+            events = []
+            pressure_process = SimpleNamespace(pid=600, returncode=None)
+
+            def wait_pressure(timeout=None):
+                events.append("pressure_exit")
+                pressure_process.returncode = 0
+                return 0
+
+            pressure_process.wait = wait_pressure
+            pressure_process.poll = lambda: pressure_process.returncode
+
+            def fake_popen(command, **kwargs):
+                self.assertEqual(command[1:3], [str(driver), "run"])
+                self.assertNotEqual(pressure_dir, output)
+                events.append("pressure_start")
+                return pressure_process
+
+            descriptor = {
+                "launch_enabled": True,
+                "argv": [str(app_binary), "--duration-seconds", "2"],
+                "binary_sha256": "c" * 64,
+                "pressure_recipe_path": str(pressure_recipe_path),
+                "pressure_recipe_sha256": pressure_recipe["recipe_sha256"],
+                "pressure_condition_sha256": "d" * 64,
+                "pressure_driver_path": str(driver),
+                "pressure_driver_sha256": hash_file(driver),
+                "pressure_output_dir": str(pressure_dir),
+                "pressure_launch_path": str(pressure_dir / "launch-record.json"),
+                "pressure_ready_path": str(pressure_dir / "pressure-ready.json"),
+                "application_wall_timeout_seconds": 11_050,
+                "pressure_duration_seconds": 11_061,
+                "terminal_path": str(output / "terminal-records.tsv"),
+                "samples_path": str(output / "resource-samples.tsv"),
+                "environment": {"TMPDIR": str(root / "tmp")},
+                "cwd": str(root),
+            }
+            audit = {
+                "launch_descriptor": descriptor,
+                "source": {
+                    "pressure_recipe": {"value": pressure_recipe, "reader": SimpleNamespace(), "recipe_sha256": pressure_recipe["recipe_sha256"], "condition_sha256": "d" * 64},
+                    "application_supervision": {"application_wall_timeout_seconds": 11_050, "pressure_duration_seconds": 11_061},
+                },
+                "recipe": {"pressure": {"recipe": {"path": str(pressure_recipe_path), "raw_sha256": hash_file(pressure_recipe_path)}}},
+                "identity": {"nonce": "e" * 32},
+                "source_root": str(root),
+                "duration_seconds": 2,
+                "sample_interval_ms": 100,
+            }
+            def fake_launch(command, cpu_set, stdout_path, stderr_path, timing_path, timeout, grace, monitored_files, *, environment, cwd, expected_executable_sha256, return_details, on_started, monitor, on_signal, on_cleanup, timeout_from_before_popen, timeout_includes_cleanup):
+                self.assertEqual(events, ["pressure_start", "ready"])
+                self.assertEqual(timeout, 11_050)
+                self.assertTrue(timeout_from_before_popen)
+                self.assertTrue(timeout_includes_cleanup)
+                app_process = SimpleNamespace(pid=700)
+                on_started(app_process, Path(command[0]), expected_executable_sha256, Path(command[0]).stat(), {2}, cwd, environment)
+                events.append("app_popen")
+                monitor(app_process)
+                on_cleanup({
+                    "schema": "allocatbelt.application-soak-process-cleanup.v1",
+                    "status": "verified", "pid": app_process.pid, "return_code": 0,
+                    "received_signal": None, "cleanup_error": None,
+                })
+                return {
+                    "status": 0, "child_return_code": 0, "timed_out": False,
+                    "artifact_budget_exceeded": False, "received_signal": None,
+                    "started_monotonic_ns": 1, "ended_monotonic_ns": 2,
+                    "binary_path": command[0], "binary_sha256": expected_executable_sha256,
+                    "binary_device": 1, "binary_inode": 2, "binary_size": 3,
+                    "requested_argv": command, "requested_argv_sha256": "f" * 64,
+                    "executed_argv": command, "executed_file_descriptor": "/proc/self/fd/200",
+                    "environment": environment, "environment_sha256": "a" * 64,
+                    "cwd": str(cwd), "cpu_set": cpu_set,
+                }
+
+            def capture_workers(_pid, _start_ticks, _path, _recipe_sha, _schedule, sessions, _expected_nonce, **_kwargs):
+                for role, pid in (("cpu", 501), ("disk", 502), ("loopback", 503)):
+                    key = (role, 2) if role == "cpu" else (role, None)
+                    sessions[key] = {
+                        "pid": pid, "start_ticks": pid, "pgid": pid, "session_id": pid,
+                        "parent_pid": 600, "role": role, "cpu": 2 if role == "cpu" else None,
+                    }
+
+            def ready(*_args, **kwargs):
+                kwargs["capture_workers"]()
+                events.append("ready")
+                return ({"schema": "ready"}, "1" * 64)
+
+            args = SimpleNamespace(
+                command=["--", *descriptor["argv"]], cpu_set="2", output_dir=output,
+                timeout_seconds=11_050, term_grace_seconds=1.5,
+            )
+            with mock.patch.object(module.subprocess, "Popen", side_effect=fake_popen), \
+                 mock.patch.object(module, "_wait_pressure_ready", side_effect=ready), \
+                 mock.patch.object(module, "_proc_start_ticks", return_value=123), \
+                 mock.patch.object(module, "_proc_process_identity", return_value={
+                     "pid": 700, "start_ticks": 701, "state": "S", "parent_pid": os.getpid(),
+                     "pgid": 700, "session_id": 700,
+                 }), \
+                 mock.patch.object(module, "_capture_pressure_worker_sessions", side_effect=capture_workers), \
+                 mock.patch.object(module, "_wait_pressure_workers_gone", return_value=True), \
+                 mock.patch.object(module, "_make_pressure_launch_binding", side_effect=lambda *_args: {"schema": "binding.v1"}), \
+                 mock.patch.object(module, "launch_process", side_effect=fake_launch), \
+                 mock.patch.object(module, "_launch_receipt_value", return_value={"schema": "launch.v1"}), \
+                 mock.patch.object(module, "_validate_pressure_proof", side_effect=lambda *_args: (events.append("pressure_proof") or {"raw_sha256": "2" * 64})):
+                status = module.command_launch_v2(
+                    args,
+                    audit,
+                    {"terminal_budget_bytes": 1024, "sample_budget_bytes": 1024},
+                    output,
+                )
+            self.assertEqual(status, 0)
+            self.assertEqual(events, ["pressure_start", "ready", "app_popen", "pressure_exit", "pressure_proof"])
+
+    def test_source_v5_pressure_proof_requires_durable_marker_and_matching_event_prefix(self):
+        with tempfile.TemporaryDirectory(prefix="allocatbelt-soak-v5-pressure-prefix-") as temporary:
+            root = Path(temporary)
+            pressure_dir = root / "pressure"
+            pressure_dir.mkdir(mode=0o700)
+            nonce = "a" * 32
+            recipe_sha = "b" * 64
+            condition_sha = "c" * 64
+            worker = {
+                "role": "cpu", "cpu": 2, "pid": 101, "start_ticks": 501,
+                "pgid": 101, "session_id": 101, "nonce": nonce,
+            }
+            owner_body = {
+                "schema": "allocatbelt.application-pressure-event.v1",
+                "kind": "worker_ownership", "recipe_sha256": recipe_sha,
+                "nonce": nonce, "monotonic_ns": 10, "workers": [worker],
+            }
+            owner_sha = digest_bytes(canon(owner_body))
+            owner_event = {**owner_body, "ownership_sha256": owner_sha}
+            authorization_body = {
+                "schema": "allocatbelt.application-pressure-event.v1",
+                "kind": "workers_authorized", "recipe_sha256": recipe_sha,
+                "nonce": nonce, "ownership_sha256": owner_sha,
+                "monotonic_ns": 11, "workers": [worker],
+            }
+            authorization_sha = digest_bytes(canon(authorization_body))
+            authorization_event = {**authorization_body, "authorization_sha256": authorization_sha}
+            start_event = {
+                "schema": "allocatbelt.application-pressure-event.v1",
+                "kind": "pressure_start", "sequence": -1,
+                "recipe_sha256": recipe_sha, "nonce": nonce,
+                "monotonic_ns": 12, "ownership_sha256": owner_sha,
+                "authorization_sha256": authorization_sha, "workers": [worker],
+            }
+            events_raw = b"".join(canon(item) for item in (owner_event, authorization_event, start_event))
+            write_private(pressure_dir / "events.jsonl", events_raw)
+            pressure_info = {
+                "value": {"identity": {"nonce": nonce}},
+                "recipe_sha256": recipe_sha,
+                "condition_sha256": condition_sha,
+            }
+            marker = {
+                "ownership_protocol": module.SOURCE_V5_PRESSURE_OWNERSHIP_PROTOCOL,
+                "worker_ownership_sha256": owner_sha,
+                "worker_authorization_sha256": authorization_sha,
+            }
+            ready_sha = "d" * 64
+            with mock.patch.object(module, "_read_pressure_ready", return_value=(marker, ready_sha)):
+                checked, captured_sha = module._require_source_v5_pressure_prefix(
+                    pressure_dir, pressure_info, ready_sha,
+                )
+            self.assertEqual(checked, marker)
+            self.assertEqual(captured_sha, ready_sha)
+
+            with mock.patch.object(module, "_read_pressure_ready", return_value=(
+                {**marker, "worker_authorization_sha256": "e" * 64}, ready_sha,
+            )):
+                with self.assertRaisesRegex(module.SoakReadbackError, "does not bind the durable ownership"):
+                    module._require_source_v5_pressure_prefix(pressure_dir, pressure_info, ready_sha)
+
+            pressure_info["reader"] = SimpleNamespace(verify_pressure=mock.Mock())
+            pressure_info["value"]["identity"]["nonce"] = nonce
+            audit = {
+                "source": {"pressure_recipe": pressure_info},
+                "recipe": {"pressure": {"recipe": {"path": str(root / "recipe.json")}}},
+            }
+            legacy_marker = {"schema": "allocatbelt.application-pressure-ready.v1"}
+            with mock.patch.object(module, "_pressure_output_hashes", return_value={
+                "run": "1" * 64, "events": "2" * 64, "launch": "3" * 64,
+                "process_binding": "4" * 64, "ready": ready_sha,
+            }), mock.patch.object(module, "_read_pressure_ready", return_value=(legacy_marker, ready_sha)):
+                with self.assertRaisesRegex(module.SoakReadbackError, "requires the durable worker ownership protocol"):
+                    module._validate_pressure_proof(root, audit)
+            pressure_info["reader"].verify_pressure.assert_not_called()
+
+    def test_external_v2_term_hup_cover_pressure_first_lifecycle_and_restore_handlers(self):
+        sentinel_handlers = {
+            signal.SIGTERM: lambda _signum, _frame: None,
+            signal.SIGHUP: lambda _signum, _frame: None,
+        }
+        original_handlers = {signum: signal.getsignal(signum) for signum in sentinel_handlers}
+        for signum, handler in sentinel_handlers.items():
+            signal.signal(signum, handler)
+        try:
+            stages = (
+                ("pressure_popen", signal.SIGTERM, False),
+                ("readiness", signal.SIGHUP, False),
+                ("app_popen", signal.SIGTERM, False),
+                ("final_driver_wait", signal.SIGHUP, False),
+                ("cleanup", signal.SIGTERM, False),
+                ("app_cleanup_failure", signal.SIGTERM, True),
+            )
+            for stage, signum, app_cleanup_failure in stages:
+                with self.subTest(stage=stage, signum=signum), tempfile.TemporaryDirectory(
+                    prefix=f"allocatbelt-soak-v2-signal-{stage}-"
+                ) as temporary:
+                    root = Path(temporary)
+                    output = root / "output"
+                    output.mkdir(mode=0o700)
+                    driver = root / "pressure-driver.py"
+                    driver.write_text("# pinned test driver\n", encoding="ascii")
+                    binary = root / "soak-binary"
+                    write_private(binary, b"soak binary", 0o700)
+                    pressure_recipe_path = root / "pressure-recipe.json"
+                    pressure_recipe = {
+                        "schema": "test.pressure.v1", "recipe_sha256": "b" * 64,
+                        "identity": {"nonce": "e" * 32},
+                        "schedule": {
+                            "pressure_cpu_affinity": [2], "sample_interval_ms": 100,
+                            "duration_seconds": 2, "startup_deadline_seconds": 1,
+                            "term_deadline_seconds": 1, "kill_deadline_seconds": 1,
+                            "total_deadline_seconds": 10,
+                        },
+                    }
+                    write_private(pressure_recipe_path, canon(pressure_recipe))
+
+                    class FakePressure:
+                        pid = 600
+
+                        def __init__(self):
+                            self.returncode = None
+
+                        def poll(self):
+                            return self.returncode
+
+                        def wait(self, timeout=None):
+                            if stage == "final_driver_wait" and self.returncode is None:
+                                os.kill(os.getpid(), signum)
+                            self.returncode = 0
+                            return 0
+
+                    pressure_process = FakePressure()
+                    descriptor = {
+                        "launch_enabled": True,
+                        "argv": [str(binary), "--duration-seconds", "2"],
+                        "binary_sha256": hash_file(binary),
+                        "pressure_recipe_path": str(pressure_recipe_path),
+                        "pressure_recipe_sha256": pressure_recipe["recipe_sha256"],
+                        "pressure_condition_sha256": "c" * 64,
+                        "pressure_driver_path": str(driver),
+                        "pressure_driver_sha256": hash_file(driver),
+                        "pressure_output_dir": str(output / "pressure"),
+                        "pressure_launch_path": str(output / "pressure" / "launch-record.json"),
+                        "pressure_ready_path": str(output / "pressure" / "pressure-ready.json"),
+                        "application_wall_timeout_seconds": 11_050,
+                        "pressure_duration_seconds": 11_061,
+                        "terminal_path": str(output / "terminal-records.tsv"),
+                        "samples_path": str(output / "resource-samples.tsv"),
+                        "environment": {"TMPDIR": str(root / "tmp")},
+                        "cwd": str(root),
+                    }
+                    audit = {
+                        "launch_descriptor": descriptor,
+                        "source": {
+                            "pressure_recipe": {
+                                "value": pressure_recipe, "reader": SimpleNamespace(),
+                                "recipe_sha256": pressure_recipe["recipe_sha256"],
+                                "condition_sha256": descriptor["pressure_condition_sha256"],
+                            },
+                            "application_supervision": {
+                                "application_wall_timeout_seconds": 11_050,
+                                "pressure_duration_seconds": 11_061,
+                            },
+                        },
+                        "recipe": {"pressure": {"recipe": {
+                            "path": str(pressure_recipe_path),
+                            "raw_sha256": hash_file(pressure_recipe_path),
+                        }}},
+                        "recipe_sha256": "f" * 64,
+                        "identity": {
+                            "campaign_id": "campaign-signal", "host_id": "host-signal",
+                            "run_id": f"run-{stage}", "nonce": "e" * 32,
+                        },
+                        "source_root": str(root), "duration_seconds": 2,
+                        "sample_interval_ms": 100,
+                    }
+                    args = SimpleNamespace(
+                        command=["--", *descriptor["argv"]], cpu_set="2",
+                        output_dir=output, timeout_seconds=11_050, term_grace_seconds=1.5,
+                    )
+                    events: list[str] = []
+                    sessions: dict[tuple[str, int | None], dict[str, Any]] = {}
+
+                    def fake_popen(_command, **_kwargs):
+                        events.append("pressure_popen")
+                        if stage == "pressure_popen":
+                            os.kill(os.getpid(), signum)
+                        return pressure_process
+
+                    def ready(*_args, **kwargs):
+                        kwargs["capture_workers"]()
+                        events.append("ready")
+                        if stage == "readiness":
+                            os.kill(os.getpid(), signum)
+                        return ({"schema": "ready"}, "1" * 64)
+
+                    def capture_workers(_pid, _start, _path, _recipe_sha, _schedule, target, _nonce, **_kwargs):
+                        for role, pid in (("cpu", 501), ("disk", 502), ("loopback", 503)):
+                            key = (role, 2) if role == "cpu" else (role, None)
+                            target[key] = {
+                                "pid": pid, "start_ticks": pid, "pgid": pid,
+                                "session_id": pid, "parent_pid": 600,
+                                "role": role, "cpu": 2 if role == "cpu" else None,
+                            }
+
+                    def fake_launch(
+                        command, _cpu_set, _stdout, _stderr, _timing, _timeout, _grace,
+                        _monitored, *, environment, cwd, expected_executable_sha256,
+                        return_details, on_started, monitor, on_signal, on_cleanup,
+                        timeout_from_before_popen, timeout_includes_cleanup,
+                    ):
+                        self.assertTrue(return_details)
+                        self.assertTrue(timeout_from_before_popen)
+                        self.assertTrue(timeout_includes_cleanup)
+                        self.assertTrue(callable(on_signal))
+                        app = SimpleNamespace(pid=700)
+                        on_started(app, Path(command[0]), expected_executable_sha256,
+                                   Path(command[0]).stat(), {2}, cwd, environment)
+                        events.append("app_popen")
+                        monitor(app)
+                        if stage in ("app_popen", "app_cleanup_failure"):
+                            os.kill(os.getpid(), signum)
+                        if stage == "app_cleanup_failure":
+                            raise module.SoakReadbackError("injected application reap failure")
+                        on_cleanup({
+                            "schema": "allocatbelt.application-soak-process-cleanup.v1",
+                            "status": "verified", "pid": app.pid,
+                            "return_code": 1 if stage == "cleanup" else 0,
+                            "received_signal": None, "cleanup_error": None,
+                        })
+                        return {
+                            "status": 1 if stage == "cleanup" else 0,
+                            "child_return_code": 1 if stage == "cleanup" else 0,
+                            "timed_out": False, "artifact_budget_exceeded": False,
+                            "received_signal": None, "started_monotonic_ns": 1,
+                            "ended_monotonic_ns": 2, "binary_path": command[0],
+                            "binary_sha256": expected_executable_sha256,
+                            "binary_device": 1, "binary_inode": 2, "binary_size": 3,
+                            "requested_argv": command, "requested_argv_sha256": "a" * 64,
+                            "executed_argv": command, "executed_file_descriptor": "/proc/self/fd/200",
+                            "environment": environment, "environment_sha256": "b" * 64,
+                            "cwd": str(cwd), "cpu_set": "2",
+                        }
+
+                    def stop_pressure(*_args, **_kwargs):
+                        events.append("pressure_cleanup")
+                        if stage == "cleanup":
+                            os.kill(os.getpid(), signum)
+                        pressure_process.returncode = 143
+
+                    with mock.patch.object(module.subprocess, "Popen", side_effect=fake_popen), \
+                         mock.patch.object(module, "_wait_pressure_ready", side_effect=ready), \
+                         mock.patch.object(module, "_proc_start_ticks", return_value=123), \
+                         mock.patch.object(module, "_proc_process_identity", return_value={
+                             "pid": 700, "start_ticks": 701, "state": "S",
+                             "parent_pid": os.getpid(), "pgid": 700, "session_id": 700,
+                         }), \
+                         mock.patch.object(module, "_capture_pressure_worker_sessions", side_effect=capture_workers), \
+                         mock.patch.object(module, "_stop_pressure_session", side_effect=stop_pressure), \
+                         mock.patch.object(module, "_wait_pressure_workers_gone", return_value=True), \
+                         mock.patch.object(module, "_make_pressure_launch_binding", return_value={"schema": "binding.v1"}), \
+                         mock.patch.object(module, "launch_process", side_effect=fake_launch), \
+                         mock.patch.object(module, "_launch_receipt_value", return_value={"schema": "launch.v1"}), \
+                         mock.patch.object(module, "_validate_pressure_proof") as validate_proof:
+                        if app_cleanup_failure:
+                            with self.assertRaisesRegex(module.SoakReadbackError, "application_cleanup='unverified'"):
+                                module.command_launch_v2(
+                                    args, audit,
+                                    {"terminal_budget_bytes": 1024, "sample_budget_bytes": 1024},
+                                    output,
+                                )
+                        else:
+                            status = module.command_launch_v2(
+                                args, audit,
+                                {"terminal_budget_bytes": 1024, "sample_budget_bytes": 1024},
+                                output,
+                            )
+                    if not app_cleanup_failure:
+                        self.assertEqual(status, 128 + signum)
+                    self.assertIn("pressure_cleanup", events)
+                    self.assertIsNotNone(pressure_process.returncode, "interrupted pressure child was not cleaned up")
+                    validate_proof.assert_not_called()
+                    receipt = json.loads((output / "soak-supervisor-interruption.json").read_text(encoding="utf-8"))
+                    self.assertEqual(receipt["schema"], "allocatbelt.application-soak-supervisor-interruption.v2")
+                    self.assertEqual(receipt["signal"], signum)
+                    self.assertEqual(receipt["exit_code"], 128 + signum)
+                    expected_app_state = "unverified" if app_cleanup_failure else "not_started" if stage in ("pressure_popen", "readiness") else "verified"
+                    self.assertEqual(receipt["application_cleanup"], expected_app_state)
+                    self.assertEqual(receipt["pressure_cleanup"], "verified")
+                    self.assertEqual(receipt["cleanup"], "unverified" if app_cleanup_failure else "verified")
+                    for restored_signal, expected_handler in sentinel_handlers.items():
+                        self.assertIs(signal.getsignal(restored_signal), expected_handler)
+        finally:
+            for signum, handler in original_handlers.items():
+                signal.signal(signum, handler)
+
+    def test_external_v2_real_app_term_and_hup_report_completed_cleanup(self):
+        available_cpu = min(os.sched_getaffinity(0))
+        original_handlers = {
+            signal.SIGTERM: signal.getsignal(signal.SIGTERM),
+            signal.SIGHUP: signal.getsignal(signal.SIGHUP),
+        }
+        original_popen = subprocess.Popen
+        for signum, fail_reap in ((signal.SIGTERM, False), (signal.SIGHUP, False), (signal.SIGTERM, True)):
+            with self.subTest(signum=signum), tempfile.TemporaryDirectory(
+                prefix=f"allocatbelt-soak-v2-real-signal-{signum}-"
+            ) as temporary:
+                root = Path(temporary)
+                output = root / "output"
+                output.mkdir(mode=0o700)
+                driver = root / "pressure-driver.py"
+                driver.write_text("# pinned test driver\n", encoding="ascii")
+                started = root / "app-started"
+                binary = root / "signal-soak.py"
+                code = (
+                    "#!/usr/bin/python3\nimport os,pathlib,signal,sys,time\n"
+                    + ("signal.signal(signal.SIGTERM, signal.SIG_IGN)\n" if fail_reap else "")
+                    + "pathlib.Path(sys.argv[1]).write_text(str(os.getpid()))\n"
+                    "time.sleep(0.3)\n"
+                    f"os.kill(os.getppid(), {int(signum)})\n"
+                    "time.sleep(60)\n"
+                )
+                write_private(binary, code.encode("ascii"), 0o700)
+                binary.chmod(0o700)
+                argv = [str(binary), str(started)]
+                pressure_recipe_path = root / "pressure-recipe.json"
+                pressure_recipe = {
+                    "schema": "test.pressure.v1", "recipe_sha256": "b" * 64,
+                    "identity": {"nonce": "e" * 32},
+                    "schedule": {
+                        "pressure_cpu_affinity": [available_cpu], "sample_interval_ms": 100,
+                        "duration_seconds": 2, "startup_deadline_seconds": 1,
+                        "term_deadline_seconds": 1, "kill_deadline_seconds": 1,
+                        "total_deadline_seconds": 10,
+                    },
+                }
+                write_private(pressure_recipe_path, canon(pressure_recipe))
+                pressure_process = SimpleNamespace(pid=600, returncode=None)
+                pressure_process.poll = lambda: pressure_process.returncode
+                descriptor = {
+                    "launch_enabled": True, "argv": argv,
+                    "binary_sha256": hash_file(binary),
+                    "pressure_recipe_path": str(pressure_recipe_path),
+                    "pressure_recipe_sha256": pressure_recipe["recipe_sha256"],
+                    "pressure_condition_sha256": "c" * 64,
+                    "pressure_driver_path": str(driver),
+                    "pressure_driver_sha256": hash_file(driver),
+                    "pressure_output_dir": str(output / "pressure"),
+                    "pressure_launch_path": str(output / "pressure" / "launch-record.json"),
+                    "pressure_ready_path": str(output / "pressure" / "pressure-ready.json"),
+                    "application_wall_timeout_seconds": 5.0,
+                    "pressure_duration_seconds": 16,
+                    "terminal_path": str(output / "terminal-records.tsv"),
+                    "samples_path": str(output / "resource-samples.tsv"),
+                    "environment": {"PATH": "/usr/bin:/bin", "TMPDIR": str(root)},
+                    "cwd": str(root),
+                }
+                audit = {
+                    "launch_descriptor": descriptor,
+                    "source": {
+                        "pressure_recipe": {
+                            "value": pressure_recipe, "reader": SimpleNamespace(),
+                            "recipe_sha256": pressure_recipe["recipe_sha256"],
+                            "condition_sha256": descriptor["pressure_condition_sha256"],
+                        },
+                        "application_supervision": {"application_wall_timeout_seconds": 5.0},
+                    },
+                    "recipe": {"pressure": {"recipe": {
+                        "path": str(pressure_recipe_path),
+                        "raw_sha256": hash_file(pressure_recipe_path),
+                    }}},
+                    "recipe_sha256": "f" * 64,
+                    "identity": {
+                        "campaign_id": "campaign-real-signal", "host_id": "host-real-signal",
+                        "run_id": f"run-real-signal-{int(signum)}", "nonce": "e" * 32,
+                    },
+                    "source_root": str(root), "duration_seconds": 2,
+                    "sample_interval_ms": 100,
+                }
+                args = SimpleNamespace(
+                    command=["--", *argv], cpu_set=str(available_cpu), output_dir=output,
+                    timeout_seconds=5.0, term_grace_seconds=1.5,
+                )
+                app_identity: dict[str, int] = {}
+
+                def fake_popen(command, **kwargs):
+                    if len(command) >= 3 and command[1:3] == [str(driver), "run"]:
+                        return pressure_process
+                    return original_popen(command, **kwargs)
+
+                def capture_workers(_pid, _start, _path, _recipe_sha, _schedule, sessions, nonce, **_kwargs):
+                    for role, pid in (("cpu", 501), ("disk", 502), ("loopback", 503)):
+                        key = (role, available_cpu) if role == "cpu" else (role, None)
+                        sessions[key] = {
+                            "pid": pid, "start_ticks": pid, "pgid": pid,
+                            "session_id": pid, "parent_pid": 600,
+                            "role": role, "cpu": available_cpu if role == "cpu" else None,
+                            "nonce": nonce,
+                        }
+
+                def ready(*_args, **kwargs):
+                    kwargs["capture_workers"]()
+                    return ({"schema": "ready"}, "1" * 64)
+
+                def stop_pressure(*_args, **_kwargs):
+                    pressure_process.returncode = 0
+
+                def make_binding(process, *_args):
+                    observed = module._proc_process_identity(process.pid)
+                    self.assertIsNotNone(observed)
+                    app_identity.update(pid=process.pid, start_ticks=observed["start_ticks"])
+                    return {"schema": "binding.v1"}
+
+                cleanup_patch = (
+                    mock.patch.object(module, "_bounded_reap", side_effect=module.SoakReadbackError("injected app reap failure"))
+                    if fail_reap else contextlib.nullcontext()
+                )
+                try:
+                    with mock.patch.object(module.subprocess, "Popen", side_effect=fake_popen), \
+                         mock.patch.object(module, "_wait_pressure_ready", side_effect=ready), \
+                         mock.patch.object(module, "_proc_start_ticks", return_value=123), \
+                         mock.patch.object(module, "_capture_pressure_worker_sessions", side_effect=capture_workers), \
+                         mock.patch.object(module, "_stop_pressure_session", side_effect=stop_pressure), \
+                         mock.patch.object(module, "_make_pressure_launch_binding", side_effect=make_binding), \
+                         mock.patch.object(module, "_launch_receipt_value", return_value={"schema": "launch.v1"}), \
+                         mock.patch.object(module, "_validate_pressure_proof") as validate_proof, \
+                         cleanup_patch:
+                        if fail_reap:
+                            with self.assertRaisesRegex(module.SoakReadbackError, "application_cleanup='failed'"):
+                                module.command_launch_v2(
+                                    args, audit,
+                                    {"terminal_budget_bytes": 1024, "sample_budget_bytes": 1024},
+                                    output,
+                                )
+                        else:
+                            status = module.command_launch_v2(
+                                args, audit,
+                                {"terminal_budget_bytes": 1024, "sample_budget_bytes": 1024},
+                                output,
+                            )
+                    if not fail_reap:
+                        self.assertEqual(status, 128 + signum)
+                    validate_proof.assert_not_called()
+                finally:
+                    if fail_reap and app_identity:
+                        observed = module._proc_process_identity(app_identity["pid"])
+                        if observed is not None and observed["start_ticks"] == app_identity["start_ticks"]:
+                            self.assertEqual(observed["pgid"], app_identity["pid"])
+                            self.assertEqual(observed["session_id"], app_identity["pid"])
+                            if observed["state"] not in ("Z", "X"):
+                                os.killpg(app_identity["pid"], signal.SIGKILL)
+                            try:
+                                os.waitpid(app_identity["pid"], 0)
+                            except ChildProcessError:
+                                pass
+                self.assertTrue(started.is_file(), "real app process did not reach its signal point")
+                self.assertIsNotNone(pressure_process.returncode)
+                validate_proof.assert_not_called()
+                receipt = json.loads((output / "soak-supervisor-interruption.json").read_text(encoding="utf-8"))
+                self.assertEqual(receipt["signal"], signum)
+                self.assertEqual(receipt["application_cleanup"], "failed" if fail_reap else "verified")
+                self.assertEqual(receipt["pressure_cleanup"], "verified")
+                self.assertEqual(receipt["cleanup"], "failed" if fail_reap else "verified")
+                for restored_signal, handler in original_handlers.items():
+                    self.assertIs(signal.getsignal(restored_signal), handler)
+
+    def test_external_v2_preserves_internal_timeout_and_artifact_limit_status(self):
+        available_cpu = min(os.sched_getaffinity(0))
+        original_handlers = {
+            signal.SIGTERM: signal.getsignal(signal.SIGTERM),
+            signal.SIGHUP: signal.getsignal(signal.SIGHUP),
+        }
+        original_popen = subprocess.Popen
+        for failure_mode, expected_status in (("timeout", 124), ("artifact_limit", 125)):
+            with self.subTest(failure_mode=failure_mode), tempfile.TemporaryDirectory(
+                prefix=f"allocatbelt-soak-v2-internal-{failure_mode}-"
+            ) as temporary:
+                root = Path(temporary)
+                output = root / "output"
+                output.mkdir(mode=0o700)
+                driver = root / "pressure-driver.py"
+                driver.write_text("# pinned test driver\n", encoding="ascii")
+                binary = root / "bounded-soak.py"
+                if failure_mode == "timeout":
+                    body = "#!/usr/bin/python3\nimport signal,time\nsignal.signal(signal.SIGTERM, signal.SIG_IGN)\ntime.sleep(5)\n"
+                else:
+                    body = (
+                        "#!/usr/bin/python3\nimport pathlib,signal,sys,time\n"
+                        "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+                        "pathlib.Path(sys.argv[1]).write_bytes(b'x'*4096)\n"
+                        "time.sleep(5)\n"
+                    )
+                write_private(binary, body.encode("ascii"), 0o700)
+                binary.chmod(0o700)
+                pressure_recipe_path = root / "pressure-recipe.json"
+                pressure_recipe = {
+                    "schema": "test.pressure.v1", "recipe_sha256": "b" * 64,
+                    "identity": {"nonce": "e" * 32},
+                    "schedule": {
+                        "pressure_cpu_affinity": [available_cpu], "sample_interval_ms": 100,
+                        "duration_seconds": 2, "startup_deadline_seconds": 1,
+                        "term_deadline_seconds": 1, "kill_deadline_seconds": 1,
+                        "total_deadline_seconds": 10,
+                    },
+                }
+                write_private(pressure_recipe_path, canon(pressure_recipe))
+                terminal_path = output / "terminal-records.tsv"
+                argv = [str(binary)] if failure_mode == "timeout" else [str(binary), str(terminal_path)]
+                pressure_process = SimpleNamespace(pid=600, returncode=None)
+                pressure_process.poll = lambda: pressure_process.returncode
+                descriptor = {
+                    "launch_enabled": True, "argv": argv,
+                    "binary_sha256": hash_file(binary),
+                    "pressure_recipe_path": str(pressure_recipe_path),
+                    "pressure_recipe_sha256": pressure_recipe["recipe_sha256"],
+                    "pressure_condition_sha256": "c" * 64,
+                    "pressure_driver_path": str(driver),
+                    "pressure_driver_sha256": hash_file(driver),
+                    "pressure_output_dir": str(output / "pressure"),
+                    "pressure_launch_path": str(output / "pressure" / "launch-record.json"),
+                    "pressure_ready_path": str(output / "pressure" / "pressure-ready.json"),
+                    "application_wall_timeout_seconds": 3.0,
+                    "pressure_duration_seconds": 11,
+                    "terminal_path": str(terminal_path),
+                    "samples_path": str(output / "resource-samples.tsv"),
+                    "environment": {"PATH": "/usr/bin:/bin", "TMPDIR": str(root)},
+                    "cwd": str(root),
+                }
+                audit = {
+                    "launch_descriptor": descriptor,
+                    "source": {
+                        "pressure_recipe": {
+                            "value": pressure_recipe, "reader": SimpleNamespace(),
+                            "recipe_sha256": pressure_recipe["recipe_sha256"],
+                            "condition_sha256": descriptor["pressure_condition_sha256"],
+                        },
+                        "application_supervision": {"application_wall_timeout_seconds": 3.0},
+                    },
+                    "recipe": {"pressure": {"recipe": {
+                        "path": str(pressure_recipe_path),
+                        "raw_sha256": hash_file(pressure_recipe_path),
+                    }}},
+                    "recipe_sha256": "f" * 64,
+                    "identity": {
+                        "campaign_id": "campaign-internal", "host_id": "host-internal",
+                        "run_id": f"run-{failure_mode}", "nonce": "e" * 32,
+                    },
+                    "source_root": str(root), "duration_seconds": 2,
+                    "sample_interval_ms": 100,
+                }
+                args = SimpleNamespace(
+                    command=["--", *argv], cpu_set=str(available_cpu), output_dir=output,
+                    timeout_seconds=3.0, term_grace_seconds=1.5,
+                )
+
+                def fake_popen(command, **kwargs):
+                    if len(command) >= 3 and command[1:3] == [str(driver), "run"]:
+                        return pressure_process
+                    return original_popen(command, **kwargs)
+
+                def capture_workers(_pid, _start, _path, _recipe_sha, _schedule, sessions, nonce, **_kwargs):
+                    for role, pid in (("cpu", 501), ("disk", 502), ("loopback", 503)):
+                        key = (role, available_cpu) if role == "cpu" else (role, None)
+                        sessions[key] = {
+                            "pid": pid, "start_ticks": pid, "pgid": pid,
+                            "session_id": pid, "parent_pid": 600,
+                            "role": role, "cpu": available_cpu if role == "cpu" else None,
+                            "nonce": nonce,
+                        }
+
+                def ready(*_args, **kwargs):
+                    kwargs["capture_workers"]()
+                    return ({"schema": "ready"}, "1" * 64)
+
+                def stop_pressure(*_args, **_kwargs):
+                    pressure_process.returncode = 0
+
+                with mock.patch.object(module.subprocess, "Popen", side_effect=fake_popen), \
+                     mock.patch.object(module, "_wait_pressure_ready", side_effect=ready), \
+                     mock.patch.object(module, "_proc_start_ticks", return_value=123), \
+                     mock.patch.object(module, "_capture_pressure_worker_sessions", side_effect=capture_workers), \
+                     mock.patch.object(module, "_stop_pressure_session", side_effect=stop_pressure), \
+                     mock.patch.object(module, "_make_pressure_launch_binding", return_value={"schema": "binding.v1"}), \
+                     mock.patch.object(module, "_launch_receipt_value", return_value={"schema": "launch.v1"}), \
+                     mock.patch.object(module, "_validate_pressure_proof") as validate_proof:
+                    status = module.command_launch_v2(
+                        args, audit,
+                        {"terminal_budget_bytes": 128, "sample_budget_bytes": 1024},
+                        output,
+                    )
+                self.assertEqual(status, expected_status)
+                self.assertIsNotNone(pressure_process.returncode)
+                self.assertFalse((output / "soak-supervisor-interruption.json").exists())
+                validate_proof.assert_not_called()
+                for signum, handler in original_handlers.items():
+                    self.assertIs(signal.getsignal(signum), handler)
+
+    def test_external_launch_is_refused_while_source_v5_readiness_is_false(self):
+        with tempfile.TemporaryDirectory(prefix="allocatbelt-soak-v2-disabled-") as temporary:
+            output = Path(temporary) / "output"
+            output.mkdir(mode=0o700)
+            preflight_path = output / "soak-preflight.json"
+            write_private(preflight_path, b"{}\n")
+            descriptor = {"launch_enabled": False, "argv": []}
+            audit = {
+                "recipe": {"schema": module.RECIPE_SCHEMA_V2},
+                "launch_enabled": False,
+                "launch_descriptor": descriptor,
+            }
+            args = SimpleNamespace(
+                command=["--", "should-not-run"], output_dir=output,
+                recipe=Path(temporary) / "recipe.json", recipe_sha256="1" * 64,
+                preflight=preflight_path, binary=Path(temporary) / "binary",
+            )
+            with mock.patch.object(module, "_current_audit", return_value=(audit, {"schema": "preflight"})), \
+                 mock.patch.object(module.subprocess, "Popen") as popen:
+                with self.assertRaisesRegex(module.SoakReadbackError, "remains launch-disabled"):
+                    module.command_launch(args)
+                popen.assert_not_called()
+
+    def test_external_pressure_samples_allow_policy_bounded_adaptive_controls(self):
+        with tempfile.TemporaryDirectory(prefix="allocatbelt-soak-external-samples-") as temporary:
+            fixture = Fixture(Path(temporary), profile="mixed", duration=2)
+            audit = fixture.audit()
+            audit["recipe"]["schema"] = module.RECIPE_SCHEMA_V2
+            audit["source"]["feedback_context"] = {
+                "controls": {
+                    "cpu": {"floor": 1, "ceiling": 4},
+                    "disk": {"floor": 64 * 1024**2, "ceiling": module.RATE_BYTES_PER_SECOND},
+                    "download": {"floor": 64 * 1024**2, "ceiling": module.RATE_BYTES_PER_SECOND},
+                },
+            }
+            _, _, sample_bytes = fixture.write_receipt_and_streams()
+            fields = sample_bytes.splitlines()[1].decode("ascii").split("\t")
+            row = {name: int(value) for name, value in zip(module.SAMPLE_HEADER, fields, strict=True)}
+            row["global_cpu_limit"] = 3
+            row["tenant_cpu_limit"] = 2
+            row["disk_rate_limit_bps"] = 128 * 1024**2
+            row["download_rate_limit_bps"] = 96 * 1024**2
+            module._check_numeric_sample(row, audit, 0)
+
+            row["tenant_cpu_limit"] = 5
+            with self.assertRaisesRegex(module.SoakReadbackError, "CPU limit is outside"):
+                module._check_numeric_sample(row, audit, 0)
+
+    def test_runtime_soak_v2_requires_exact_clock_brackets_and_nonselfeligibility(self):
+        with tempfile.TemporaryDirectory(prefix="allocatbelt-soak-v2-receipt-") as temporary:
+            fixture = Fixture(Path(temporary), profile="mixed", mode="functional", duration=2)
+            receipt, _terminal, _samples = fixture.write_receipt_and_streams()
+            audit = fixture.audit()
+            audit["recipe"]["schema"] = module.RECIPE_SCHEMA_V2
+            audit["identity"]["comparison_family"] = "external_pressure"
+            receipt["schema"] = module.RUNTIME_SOAK_SCHEMA_V2
+            receipt["comparison_family"] = "external_pressure"
+            receipt["mode"] = "soak"
+            receipt["qualification_eligible"] = False
+            receipt["feedback_started"] = True
+            receipt["feedback_worker_joined"] = True
+            receipt["feedback_worker_failure"] = None
+            receipt["feedback_trace_worker_joined"] = True
+            for phase, scalar_name in (
+                ("started", "started_monotonic_ns"),
+                ("trace_ended", "trace_ended_monotonic_ns"),
+                ("drain_ended", "drain_ended_monotonic_ns"),
+                ("shutdown_ended", "shutdown_ended_monotonic_ns"),
+                ("postprocess_ended", "postprocess_ended_monotonic_ns"),
+            ):
+                scalar = receipt[scalar_name]
+                receipt[f"{phase}_monotonic_lower_ns"] = scalar
+                receipt[f"{phase}_monotonic_upper_ns"] = scalar
+            receipt_path = fixture.output / "soak-receipt-v2.json"
+            write_private(receipt_path, canon(receipt))
+            checked, checked_sha, _ = module._validate_receipt_json(receipt_path, fixture.output, audit)
+            self.assertEqual(checked["schema"], module.RUNTIME_SOAK_SCHEMA_V2)
+            self.assertEqual(checked_sha, digest_bytes(canon(receipt)))
+            audit["source"]["feedback_context"] = {
+                "controls": {
+                    "cpu": {"floor": 1, "ceiling": 4},
+                    "disk": {"floor": 64 * 1024**2, "ceiling": module.RATE_BYTES_PER_SECOND},
+                    "download": {"floor": 64 * 1024**2, "ceiling": module.RATE_BYTES_PER_SECOND},
+                },
+            }
+            samples = module._parse_samples(fixture.output / "resource-samples.tsv", checked, audit, module.MAX_SAMPLE_BYTES)
+            phases = module._validate_phase_and_receipt(checked, audit, 12, samples)
+            self.assertFalse(phases["qualification_eligible"])
+            self.assertEqual(phases["monotonic_endpoints"]["started"], [receipt["started_monotonic_ns"]] * 2)
+
+            receipt["started_monotonic_ns"] += 1
+            broken_path = fixture.output / "soak-receipt-v2-broken.json"
+            write_private(broken_path, canon(receipt))
+            with self.assertRaisesRegex(module.SoakReadbackError, "scalar is not the lower"):
+                module._validate_receipt_json(broken_path, fixture.output, audit)
+
+            receipt["started_monotonic_ns"] -= 1
+            receipt["qualification_eligible"] = True
+            dishonest_path = fixture.output / "soak-receipt-v2-dishonest.json"
+            write_private(dishonest_path, canon(receipt))
+            with self.assertRaisesRegex(module.SoakReadbackError, "cannot author its own"):
+                module._validate_receipt_json(dishonest_path, fixture.output, audit)
+
     def test_oversubscribed_derives_two_slots_from_canonical_ordinary_policy(self):
         with tempfile.TemporaryDirectory(prefix="allocatbelt-soak-oversubscribed-") as temp:
             fixture = Fixture(Path(temp), profile="oversubscribed")
@@ -1089,6 +2237,61 @@ class SoakReadbackTests(unittest.TestCase):
             self.assertTrue(pid_file.exists())
             self.assertTrue(heartbeat.exists())
             self.assertTrue(self._wait_heartbeat_stopped(heartbeat))
+
+    def test_source_v5_wall_timeout_includes_popen_callback_time(self):
+        with tempfile.TemporaryDirectory(prefix="allocatbelt-soak-v2-pre-popen-timeout-") as temporary:
+            root = Path(temporary)
+            output = root / "output"
+            output.mkdir(mode=0o700)
+            before = time.monotonic()
+            details = module.launch_process(
+                [sys.executable, "-c", "import time; time.sleep(5)"],
+                str(min(os.sched_getaffinity(0))),
+                output / "stdout.log", output / "stderr.log", output / "time.txt",
+                timeout_seconds=1.1, term_grace_seconds=0.2, return_details=True,
+                on_started=lambda *_args: time.sleep(0.25),
+                timeout_from_before_popen=True, timeout_includes_cleanup=True,
+            )
+            self.assertTrue(details["timed_out"])
+            self.assertLess(time.monotonic() - before, 1.1)
+
+    def test_pressure_cleanup_waits_past_generic_grace_for_frozen_driver_term(self):
+        signals = []
+
+        class DelayedDriver:
+            pid = 600
+
+            def __init__(self):
+                self.returncode = None
+                self.exit_at = time.monotonic() + 1.7
+
+            def poll(self):
+                if self.returncode is None and time.monotonic() >= self.exit_at:
+                    self.returncode = 2
+                return self.returncode
+
+            def send_signal(self, signum):
+                signals.append(signum)
+
+            def wait(self, timeout=None):
+                if self.poll() is not None:
+                    return self.returncode
+                remaining = max(0.0, self.exit_at - time.monotonic())
+                if timeout is not None and timeout < remaining:
+                    time.sleep(timeout)
+                    raise subprocess.TimeoutExpired("pressure-driver", timeout)
+                time.sleep(remaining)
+                self.returncode = 2
+                return self.returncode
+
+        driver = DelayedDriver()
+        started = time.monotonic()
+        module._stop_pressure_session(
+            driver, None, Path("/captured/application-pressure-driver.py"), "b" * 64,
+            {"term_deadline_seconds": 2, "kill_deadline_seconds": 1}, {},
+        )
+        self.assertGreaterEqual(time.monotonic() - started, 1.5)
+        self.assertEqual(signals, [signal.SIGTERM])
 
     def test_early_signal_uses_its_own_escalation_clock(self):
         with tempfile.TemporaryDirectory(prefix="allocatbelt-soak-signal-") as temp:

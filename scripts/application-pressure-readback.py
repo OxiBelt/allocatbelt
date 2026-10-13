@@ -29,6 +29,7 @@ EVENT_SCHEMA = "allocatbelt.application-pressure-event.v1"
 RUN_SCHEMA = "allocatbelt.application-pressure-run.v1"
 READBACK_SCHEMA = "allocatbelt.application-pressure-readback.v1"
 PRESSURE_IO_SCHEMA = "allocatbelt.application-pressure-io-window.v1"
+OWNERSHIP_PROTOCOL = "allocatbelt.pressure-worker-ownership.v1"
 MAX_RECIPE_BYTES = 4 * 1024 * 1024
 MAX_MANIFEST_BYTES = 2 * 1024 * 1024
 MAX_LAUNCH_BYTES = 256 * 1024
@@ -37,7 +38,7 @@ MAX_EVENT_LINE_BYTES = 2 * 1024 * 1024
 EVENT_TERMINAL_RESERVE_BYTES = 2 * 1024 * 1024
 MAX_DURATION_SECONDS = 12000
 MAX_SAMPLE_COUNT = 120000
-MAX_EVENT_COUNT = 120004
+MAX_EVENT_COUNT = 120006
 MAX_WORKER_STDERR_RAW_BYTES = 8192
 MAX_BINARY_BYTES = 1024 * 1024 * 1024
 MAX_SOURCE_BYTES = 64 * 1024 * 1024
@@ -928,13 +929,104 @@ def _iter_events(
         stream.close()
 
 
-def _validate_worker_start(value: object, recipe: dict[str, Any]) -> dict[tuple[str, int | None], dict[str, Any]]:
-    start = exact(value, {
+def _validate_worker_ownership(value: object, recipe: dict[str, Any]) -> tuple[dict[tuple[str, int | None], dict[str, Any]], str, int]:
+    event = exact(value, {
+        "schema", "kind", "recipe_sha256", "nonce", "monotonic_ns", "workers", "ownership_sha256",
+    }, "durable pressure worker ownership event")
+    require(event["schema"] == EVENT_SCHEMA and event["kind"] == "worker_ownership", "worker ownership event identity differs")
+    require(event["recipe_sha256"] == recipe["recipe_sha256"] and event["nonce"] == recipe["identity"]["nonce"], "worker ownership event recipe/nonce differs")
+    ownership_time = uint(event["monotonic_ns"], "worker ownership journal time", positive=True)
+    body = {key: item for key, item in event.items() if key != "ownership_sha256"}
+    ownership_sha = sha256(event["ownership_sha256"], "worker ownership journal digest")
+    require(digest_object(body) == ownership_sha, "worker ownership journal self digest differs")
+    rows = event["workers"]
+    require(type(rows) is list and len(rows) == len(recipe["schedule"]["pressure_cpu_affinity"]) + 2, "worker ownership journal is sparse")
+    result: dict[tuple[str, int | None], dict[str, Any]] = {}
+    seen_pids: set[int] = set()
+    for row_value in rows:
+        row = exact(row_value, {"role", "cpu", "pid", "start_ticks", "pgid", "session_id", "nonce"}, "durable pressure worker identity")
+        role = text(row["role"], "owned worker role", 16)
+        cpu = row["cpu"]
+        if role == "cpu":
+            cpu = uint(cpu, "owned pressure worker CPU", maximum=65535)
+            require(cpu in recipe["schedule"]["pressure_cpu_affinity"], "owned pressure worker CPU is outside the frozen affinity")
+        else:
+            require(cpu is None and role in ("disk", "loopback"), "durable worker ownership role is unsupported")
+        pid = uint(row["pid"], "owned worker PID", positive=True, maximum=(1 << 31) - 1)
+        require(pid not in seen_pids, "durable worker ownership journal duplicates a worker PID")
+        seen_pids.add(pid)
+        ticks = uint(row["start_ticks"], "owned worker start ticks", positive=True)
+        pgid = uint(row["pgid"], "owned worker PGID", positive=True, maximum=(1 << 31) - 1)
+        sid = uint(row["session_id"], "owned worker session", positive=True, maximum=(1 << 31) - 1)
+        require(row["nonce"] == recipe["identity"]["nonce"] and pgid == pid and sid == pid, "durable worker ownership identity differs from its isolated session/nonce")
+        key = (role, cpu)
+        require(key not in result, "durable worker ownership journal duplicates a role")
+        result[key] = {**row, "pid": pid, "start_ticks": ticks, "pgid": pgid, "session_id": sid}
+    expected = {("cpu", cpu) for cpu in recipe["schedule"]["pressure_cpu_affinity"]} | {("disk", None), ("loopback", None)}
+    require(set(result) == expected, "durable worker ownership set differs from its frozen recipe")
+    return result, ownership_sha, ownership_time
+
+
+def _validate_workers_authorized(
+    value: object, recipe: dict[str, Any], ownership_rows: dict[tuple[str, int | None], dict[str, Any]],
+    ownership_sha256: str,
+) -> tuple[str, int]:
+    event = exact(value, {
+        "schema", "kind", "recipe_sha256", "nonce", "ownership_sha256", "monotonic_ns",
+        "workers", "authorization_sha256",
+    }, "durable pressure worker authorization event")
+    require(event["schema"] == EVENT_SCHEMA and event["kind"] == "workers_authorized", "worker authorization event identity differs")
+    require(event["recipe_sha256"] == recipe["recipe_sha256"] and event["nonce"] == recipe["identity"]["nonce"], "worker authorization event recipe/nonce differs")
+    require(event["ownership_sha256"] == ownership_sha256, "worker authorization event names a different ownership journal")
+    authorization_time = uint(event["monotonic_ns"], "worker authorization journal time", positive=True)
+    body = {key: item for key, item in event.items() if key != "authorization_sha256"}
+    authorization_sha = sha256(event["authorization_sha256"], "worker authorization journal digest")
+    require(digest_object(body) == authorization_sha, "worker authorization journal self digest differs")
+    rows = event["workers"]
+    require(type(rows) is list and len(rows) == len(ownership_rows), "worker authorization ACK set is sparse")
+    acknowledgements: dict[tuple[str, int | None], dict[str, Any]] = {}
+    for row_value in rows:
+        ack = exact(row_value, {
+            "schema", "event", "recipe_sha256", "nonce", "ownership_sha256", "role", "cpu",
+            "pid", "start_ticks", "pgid", "session_id", "ack_sha256",
+        }, "worker ownership acknowledgement row")
+        role = text(ack["role"], "ownership ACK role", 16)
+        cpu = uint(ack["cpu"], "ownership ACK CPU", maximum=65535) if role == "cpu" else None
+        key = (role, cpu)
+        require(key in ownership_rows and key not in acknowledgements, "worker authorization repeats or invents a role")
+        owner = ownership_rows[key]
+        ack_body = {name: item for name, item in ack.items() if name != "ack_sha256"}
+        require(
+            ack["schema"] == "allocatbelt.application-pressure-worker-ownership-ack.v1"
+            and ack["event"] == "ownership_ack"
+            and ack["recipe_sha256"] == recipe["recipe_sha256"]
+            and ack["nonce"] == recipe["identity"]["nonce"]
+            and ack["ownership_sha256"] == ownership_sha256
+            and all(ack[name] == owner[name] for name in ("role", "cpu", "pid", "start_ticks", "pgid", "session_id", "nonce"))
+            and sha256(ack["ack_sha256"], "worker ownership ACK self digest") == digest_object(ack_body),
+            "worker ACK differs from the durable ownership row",
+        )
+        acknowledgements[key] = ack
+    require(set(acknowledgements) == set(ownership_rows), "worker authorization ACK set differs from the durable ownership set")
+    return authorization_sha, authorization_time
+
+
+def _validate_worker_start(
+    value: object, recipe: dict[str, Any], ownership_sha256: str | None = None,
+    authorization_sha256: str | None = None,
+) -> dict[tuple[str, int | None], dict[str, Any]]:
+    keys = {
         "schema", "kind", "sequence", "recipe_sha256", "monotonic_ns", "workers",
         "storage_device", "network_namespace_inode",
-    }, "pressure start event")
+    }
+    strong = ownership_sha256 is not None or authorization_sha256 is not None
+    if strong:
+        keys |= {"nonce", "ownership_sha256", "authorization_sha256"}
+    start = exact(value, keys, "pressure start event")
     require(start["schema"] == EVENT_SCHEMA and start["kind"] == "pressure_start" and start["sequence"] == -1, "pressure start event identity differs")
     require(start["recipe_sha256"] == recipe["recipe_sha256"], "pressure start event belongs to another recipe")
+    if strong:
+        require(start["nonce"] == recipe["identity"]["nonce"] and start["ownership_sha256"] == ownership_sha256 and start["authorization_sha256"] == authorization_sha256, "pressure start event is not bound to its durable ownership/authorization journals")
     uint(start["monotonic_ns"], "pressure start time", positive=True)
     require(start["storage_device"] == recipe["storage"]["application_device"], "pressure start device differs from recipe")
     require(start["network_namespace_inode"] == recipe["network"]["network_namespace_inode"], "pressure start network namespace differs")
@@ -960,6 +1052,8 @@ def _validate_worker_start(value: object, recipe: dict[str, Any]) -> dict[tuple[
         output[key] = {**worker, "pid": pid, "start_ticks": ticks}
     expected = {("cpu", cpu) for cpu in recipe["schedule"]["pressure_cpu_affinity"]} | {("disk", None), ("loopback", None)}
     require(set(output) == expected, "pressure worker set differs from frozen resource schedule")
+    if strong:
+        require(ownership_sha256 is not None and authorization_sha256 is not None, "strong pressure start omitted its ownership protocol digests")
     return output
 
 
@@ -1152,12 +1246,20 @@ def verify_pressure(
     require(ready_at <= binding["observed_monotonic_ns"], "application was observed before measured readiness")
     ready, _, ready_sha = read_canonical(artifacts / "pressure-ready.json", "pressure ready marker", 64 * 1024)
     require(ready_sha == expected["ready"], "pressure ready marker raw digest differs from separately supplied expected hash")
-    ready = exact(ready, {
+    ready_keys = {
         "schema", "recipe_sha256", "condition_sha256", "nonce", "pressure_ready_monotonic_ns", "readiness", "ready_sha256",
-    }, "pressure ready marker")
+    }
+    strong_ready = "ownership_protocol" in ready
+    if strong_ready:
+        ready_keys |= {"ownership_protocol", "worker_ownership_sha256", "worker_authorization_sha256"}
+    ready = exact(ready, ready_keys, "pressure ready marker")
     ready_body = {key: value for key, value in ready.items() if key != "ready_sha256"}
     require(ready["schema"] == "allocatbelt.application-pressure-ready.v1" and ready["recipe_sha256"] == expected_recipe_sha and ready["condition_sha256"] == recipe_info["condition_sha256"] and ready["nonce"] == recipe_info["identity"]["nonce"], "pressure ready marker identity differs")
     require(sha256(ready["ready_sha256"], "pressure ready digest") == digest_object(ready_body), "pressure ready marker self digest is invalid")
+    if strong_ready:
+        require(ready["ownership_protocol"] == OWNERSHIP_PROTOCOL, "pressure readiness marker does not identify the required durable worker protocol")
+        sha256(ready["worker_ownership_sha256"], "ready worker ownership journal digest")
+        sha256(ready["worker_authorization_sha256"], "ready worker authorization journal digest")
     require(ready["pressure_ready_monotonic_ns"] == ready_at and ready["readiness"] == binding["readiness_snapshot"], "pressure ready marker differs from the process binding")
     run_value, _, run_sha = read_canonical(artifacts / "run.json", "pressure run receipt", MAX_MANIFEST_BYTES)
     require(run_sha == expected["run"], "run receipt raw digest differs from separately supplied expected hash")
@@ -1168,9 +1270,32 @@ def verify_pressure(
         artifacts / "events.jsonl", expected["events"], run["events_bytes"],
         recipe_info["artifact_budget"]["maximum_event_bytes"], event_state,
     )
-    start_event = next(events, None)
-    require(type(start_event) is dict and start_event.get("kind") == "pressure_start", "event stream does not start with pressure worker identities")
-    workers = _validate_worker_start(start_event, recipe)
+    first_event = next(events, None)
+    require(type(first_event) is dict, "pressure event stream is empty")
+    if first_event.get("kind") == "worker_ownership":
+        owner_rows, ownership_sha, ownership_time = _validate_worker_ownership(first_event, recipe)
+        authorization_event = next(events, None)
+        require(type(authorization_event) is dict, "pressure event stream omits the worker authorization journal")
+        authorization_sha, authorization_time = _validate_workers_authorized(authorization_event, recipe, owner_rows, ownership_sha)
+        start_event = next(events, None)
+        require(type(start_event) is dict and start_event.get("kind") == "pressure_start", "pressure event stream omits its post-authorization start record")
+        workers = _validate_worker_start(start_event, recipe, ownership_sha, authorization_sha)
+        start_time = uint(start_event["monotonic_ns"], "pressure start time", positive=True)
+        require(ownership_time <= authorization_time <= start_time, "durable pressure ownership and authorization records are out of order")
+        require(
+            all(
+                (role, cpu) in owner_rows
+                and all(start_workers[name] == owner_rows[(role, cpu)][name] for name in ("pid", "start_ticks", "pgid", "session_id"))
+                for (role, cpu), start_workers in workers.items()
+            ),
+            "pressure start workers differ from the durable pre-ACK ownership set",
+        )
+        require(strong_ready and ready["worker_ownership_sha256"] == ownership_sha and ready["worker_authorization_sha256"] == authorization_sha, "pressure readiness marker does not bind the durable worker ownership/ACK journals")
+    else:
+        require(first_event.get("kind") == "pressure_start", "legacy pressure event stream does not start with pressure worker identities")
+        require(not strong_ready, "strong pressure readiness marker is paired with a legacy event stream")
+        start_event = first_event
+        workers = _validate_worker_start(start_event, recipe)
     require(all(item["pid"] != process["pid"] for item in workers.values()), "application PID is also listed as a pressure worker")
     _validate_cleanup(run, workers, recipe)
     timeline = _validate_event_timeline(events, start_event, recipe, process, binding, run, workers)

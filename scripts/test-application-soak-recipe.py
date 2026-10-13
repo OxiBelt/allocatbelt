@@ -32,6 +32,9 @@ def load_exact(path: Path, name: str) -> types.ModuleType:
 builder = load_exact(BUILDER_PATH, "application_soak_recipe_tests")
 campaign = load_exact(SCRIPTS / "application-campaign.py", "campaign_for_soak_recipe_tests")
 soak_reader = load_exact(SCRIPTS / "application-soak-readback.py", "soak_reader_for_recipe_tests")
+campaign_inputs = load_exact(SCRIPTS / "application-campaign-inputs.py", "campaign_inputs_for_soak_recipe_tests")
+feedback_reader = load_exact(SCRIPTS / "application-feedback-readback.py", "feedback_reader_for_soak_recipe_tests")
+campaign_test_fixtures = load_exact(SCRIPTS / "test-application-campaign.py", "campaign_test_fixtures_for_soak_recipe_tests")
 
 
 def digest(data: bytes) -> str:
@@ -436,7 +439,479 @@ class SourceV4Fixture:
         )
 
 
+class SourceV5CliFixture:
+    """Small, fully pinned SourceV5 input set for real build/preflight CLIs.
+
+    Its binaries and numeric collector charge are synthetic fixture values.
+    Missing capacity evidence keeps both campaign readiness and launch false.
+    """
+
+    def __init__(self, temporary_root: Path):
+        self.root = temporary_root / "source-v5"
+        self.root.mkdir(mode=0o700)
+        self.input_root = temporary_root / "input-v5"
+        (self.input_root / "source").mkdir(mode=0o700, parents=True)
+        self.oracle_root = temporary_root / "oracle-v5"
+        self.oracle_root.mkdir(mode=0o700)
+        self.output = temporary_root / "output-v5"
+        self.output.mkdir(mode=0o700)
+        (self.root / ".gitignore").write_text("target/\n", encoding="ascii")
+        (self.root / "Cargo.lock").write_text("# bounded SourceV5 CLI fixture lock\n", encoding="ascii")
+
+        source_paths = set(feedback_reader.CONSTRUCTION_PROBE_SOURCE_REFERENCES.values())
+        source_paths.update(campaign_inputs.HARNESS_PATHS.values())
+        source_paths.update({
+            "Cargo.lock", "scripts/application-campaign-inputs.py",
+            "scripts/application-source-inventory.py", "scripts/application-runtime-readback.py",
+            campaign_inputs.FEEDBACK_RUNTIME_PATH, campaign_inputs.FEEDBACK_POLICY_PATH,
+            campaign_inputs.FEEDBACK_SENSOR_PATH,
+        })
+        for relative in sorted(source_paths, key=lambda item: item.encode("utf-8")):
+            if relative == "Cargo.lock":
+                continue
+            source = SCRIPTS.parent / relative
+            target = self.root / relative
+            target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            shutil.copyfile(source, target)
+            target.chmod(stat.S_IMODE(source.stat().st_mode))
+
+        self._git(["git", "init", "-q", str(self.root)])
+        self._git(["git", "-C", str(self.root), "config", "user.email", "fixture@example.invalid"])
+        self._git(["git", "-C", str(self.root), "config", "user.name", "SourceV5 CLI Fixture"])
+        self._git(["git", "-C", str(self.root), "add", "."])
+        self._git(
+            ["git", "-C", str(self.root), "commit", "-q", "-m", "bounded SourceV5 CLI fixture"],
+            env={**os.environ, "GIT_AUTHOR_DATE": "2002-01-01T00:00:00Z", "GIT_COMMITTER_DATE": "2002-01-01T00:00:00Z"},
+        )
+        self.git_commit = self._git(["git", "-C", str(self.root), "rev-parse", "HEAD"], text=True).stdout.strip()
+        self.source_tree_sha256, self.source_files = campaign.source_inventory(self.root)
+        self.cargo_lock_sha256 = self._hash(self.root / "Cargo.lock")
+        self.runtime_validator_sha256 = self._hash(self.root / "scripts/application-runtime-readback.py")
+        self.host_ids = ("host-1", "host-2", "host-3")
+
+        target = self.root / "target/fixture"
+        target.mkdir(mode=0o700, parents=True)
+        self.calibration_record = {
+            "schema": campaign.CALIBRATION_SCHEMA,
+            "architecture": "x86_64",
+            "max_tenants": campaign.RUNTIME_FIXED_CONTROL_MAX_TENANTS,
+            "max_waiters": campaign.RUNTIME_FIXED_CONTROL_MAX_WAITERS,
+            "control_ceiling": campaign.RUNTIME_APPLICATION_CONTROL_CEILING,
+            "fixed_global_control_baseline": 8192,
+            "tenant_owner_control_bytes": 0,
+            "final_live_tenants": 0,
+            "final_global_control_bytes": 8192,
+        }
+        calibration_binary = target / "resource-domain-calibration"
+        calibration_output = target / "resource-domain-calibration.json"
+        write_file(calibration_binary, b"synthetic fixture calibration executable\n", 0o700)
+        write_file(calibration_output, campaign.canonical_bytes(self.calibration_record))
+        calibration_binary.chmod(0o700)
+
+        harness = {
+            name: {"path": relative, "sha256": self._hash(self.root / relative)}
+            for name, relative in campaign_inputs.HARNESS_PATHS.items()
+        }
+        fixed_policy = campaign.fixed_runtime_policy_artifact(self.runtime_validator_sha256)
+        feedback_policy = campaign_inputs.build_feedback_policy_artifact(self.root, self.source_files, harness)
+        self.feedback_policy = feedback_policy
+        probe = self._construction_probe(fixed_policy, feedback_policy)
+        probe_raw = feedback_reader.canonical_bytes(probe)
+        self.construction_probe_path = self.input_root / "feedback-policy-probe.json"
+        write_file(self.construction_probe_path, probe_raw)
+        self.construction_probe_sha256 = digest(probe_raw)
+
+        self.artifacts: dict[str, dict[str, str]] = {}
+        for allocator in builder.ALLOCATORS:
+            binary_path = target / f"application-{allocator}"
+            if allocator == "allocatbelt":
+                code = (
+                    "#!/usr/bin/env python3\nimport sys\n"
+                    "expected = ['--emit-feedback-policy-only', '--workload', 'mixed', '--profile', 'mixed']\n"
+                    "if sys.argv[1:] != expected: raise SystemExit(91)\n"
+                    f"sys.stdout.buffer.write({probe_raw!r})\n"
+                ).encode("ascii")
+                write_file(binary_path, code, 0o700)
+            else:
+                write_file(binary_path, b"#!/bin/sh\nexit 0\n", 0o700)
+            binary_path.chmod(0o700)
+            self.artifacts[allocator] = {
+                "path": binary_path.relative_to(self.root).as_posix(), "sha256": self._hash(binary_path),
+            }
+        self.soak_binary = target / "application-soak-allocatbelt"
+        write_file(self.soak_binary, b"#!/bin/sh\nexit 0\n", 0o700)
+        self.soak_binary.chmod(0o700)
+        self.analysis_binary = target / "application-analyze"
+        write_file(self.analysis_binary, b"synthetic fixture analyzer\n", 0o700)
+        self.analysis_binary.chmod(0o700)
+
+        rustc_verbose = subprocess.check_output(["rustc", "-Vv"], cwd=self.root, text=True).splitlines()
+        cargo_version = subprocess.check_output(["cargo", "-V"], cwd=self.root, text=True).strip()
+        rustc_release = rustc_verbose[0].split()[1]
+        self.manifests: dict[str, dict[str, Any]] = {}
+        self.manifest_paths: dict[str, Path] = {}
+        self.manifest_raw_shas: dict[str, str] = {}
+        for host_id in self.host_ids:
+            build = {
+                "host_id": host_id, "rustc_release": rustc_release,
+                "rustc_verbose": rustc_verbose, "cargo_version": cargo_version,
+                "target_triple": "x86_64-unknown-linux-gnu", "target_cpu": "x86-64-v3",
+                "profile": "release", "features_sha256": "1" * 64,
+                "build_inputs_sha256": "2" * 64,
+            }
+            calibration = {
+                "binary": {"path": calibration_binary.relative_to(self.root).as_posix(), "sha256": self._hash(calibration_binary)},
+                "output": {"path": calibration_output.relative_to(self.root).as_posix(), "sha256": self._hash(calibration_output)},
+                "record": self.calibration_record,
+                "source": {
+                    "git_commit": self.git_commit, "source_tree_sha256": self.source_tree_sha256,
+                    "cargo_lock_sha256": self.cargo_lock_sha256,
+                },
+                "build": build,
+                "build_sha256": campaign.digest_object(build),
+            }
+            manifest = {
+                "schema": campaign.SOURCE_SCHEMA_V5,
+                "source": {
+                    "git_commit": self.git_commit,
+                    "source_tree_sha256": self.source_tree_sha256,
+                    "cargo_lock_sha256": self.cargo_lock_sha256,
+                    "files": self.source_files,
+                },
+                "build": build,
+                "artifacts": self.artifacts,
+                "soak_artifacts": {"allocatbelt": {
+                    "path": self.soak_binary.relative_to(self.root).as_posix(),
+                    "sha256": self._hash(self.soak_binary),
+                }},
+                "analysis_artifact": {
+                    "path": self.analysis_binary.relative_to(self.root).as_posix(),
+                    "sha256": self._hash(self.analysis_binary),
+                },
+                "fixed_runtime_policy": fixed_policy,
+                "runtime_readback_validator": {
+                    "path": "scripts/application-runtime-readback.py",
+                    "sha256": self.runtime_validator_sha256,
+                },
+                "resource_domain_calibration": calibration,
+                "qualification_harness": harness,
+                "feedback_policy": feedback_policy,
+            }
+            manifest["manifest_sha256"] = campaign.digest_object(manifest)
+            self.manifests[host_id] = manifest
+            manifest_path = self.input_root / "source" / f"{host_id}.json"
+            write_file(manifest_path, campaign.canonical_bytes(manifest))
+            self.manifest_paths[host_id] = manifest_path
+            self.manifest_raw_shas[host_id] = self._hash(manifest_path)
+
+        self.spec, _old_sources = campaign_test_fixtures.spec_fixture()
+        self.spec["schema"] = campaign.SPEC_SCHEMA_V3
+        self.spec["campaign_id"] = "campaign-source-v5-cli-fixture"
+        self.spec["runner_sha256"] = harness["soak_runner"]["sha256"]
+        for host in self.spec["hosts"]:
+            host["controls"]["cpu_set"] = str(min(os.sched_getaffinity(0)))
+            host["host_fingerprint_sha256"] = digest(campaign.canonical_bytes(host["controls"]))
+        self.spec["source_manifests"] = [
+            {"host_id": host_id, "relative_path": f"source/{host_id}.json", "sha256": self.manifests[host_id]["manifest_sha256"]}
+            for host_id in self.host_ids
+        ]
+        self.spec["runtime_binding"] = {
+            "resource_domain": "owning_global_tenant",
+            "resource_policy_sha256": fixed_policy["policy_sha256"],
+            "feedback_policy_sha256": feedback_policy["policy_sha256"],
+            "feedback_match": "external_same_policy",
+            "source_state": "complete",
+        }
+        self.spec["soak"]["driver_sha256"] = harness["soak_runner"]["sha256"]
+        self.spec["qualification_inputs"] = self._qualification_inputs()
+        campaign_test_fixtures.add_frozen_rates(self.spec, include_oracles=True)
+        self.spec_path = self.input_root / "campaign-spec.json"
+        self._write_json(self.spec_path, self.spec)
+        self.spec_sha256 = self._hash(self.spec_path)
+
+        sources = dict(self.manifests)
+        self.plan = campaign.freeze_plan(self.spec, sources, input_root=self.input_root)
+        self.plan_path = self.input_root / "campaign-plan.json"
+        self._write_json(self.plan_path, self.plan)
+        self.plan_file_sha256 = self._hash(self.plan_path)
+        self.plan_sha256 = self.plan["plan_sha256"]
+        self.job = next(
+            item for item in self.plan["jobs"]["soak"]
+            if item["host_id"] == "host-1" and item["workload"] == "mixed" and item["profile"] == "mixed"
+        )
+
+        self.ring_path = self.oracle_root / "soak-reference.tsv"
+        self.ring_path.write_bytes(self._ring_bytes())
+        self.ring_sha256 = self._hash(self.ring_path)
+
+    @staticmethod
+    def _git(args: list[str], *, text: bool = False, env: dict[str, str] | None = None):
+        return subprocess.run(args, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=text, env=env, timeout=30)
+
+    @staticmethod
+    def _hash(path: Path) -> str:
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+
+    @staticmethod
+    def _write_json(path: Path, value: dict[str, Any]) -> None:
+        write_file(path, campaign.canonical_bytes(value))
+
+    def _construction_probe(self, fixed_policy: dict[str, Any], feedback: dict[str, Any]) -> dict[str, Any]:
+        context = feedback["policy"]["contexts"]["mixed/mixed"]
+        workload = fixed_policy["policy"]["workloads"]["mixed"]
+        global_ceilings = dict(workload["domain_ceiling"])
+        global_ceilings["cpu"] = context["workers"]
+        rate_buckets = {
+            direction: {
+                "ceiling_bytes_per_second": item["ceiling_bytes_per_second"],
+                "ceiling_burst_bytes": item["ceiling_burst_bytes"],
+                "max_reservations": item["max_reservations"],
+            }
+            for direction, item in fixed_policy["policy"]["byte_buckets"].items()
+        }
+        meter_model = {
+            **feedback_reader.CONSTRUCTION_PROBE_METER_SOURCE_MODEL,
+            "http_client_window": 8,
+            "http_handler_window": 8,
+        }
+        return {
+            "schema": feedback_reader.CONSTRUCTION_PROBE_SCHEMA,
+            "context": {"workload": "mixed", "profile": "mixed", "workers": context["workers"]},
+            "reader_context": {
+                "version": feedback["policy"]["version"],
+                **feedback["policy"]["reader_contract"],
+            },
+            "rust_control_context": {
+                "algorithm": feedback["policy"]["algorithm"],
+                "controls": context["controls"],
+                "global_ceilings": global_ceilings,
+                "tenant_ceilings": global_ceilings,
+                "scope_limits": {
+                    "managed_memory": workload["scope_limits"]["managed_memory_limit"],
+                    "disk_operations": workload["scope_limits"]["disk_operation_limit"],
+                    "network_operations": workload["scope_limits"]["network_operation_limit"],
+                },
+                "rate_buckets": rate_buckets,
+                "required_byte_sources": {"disk": True, "download": True},
+            },
+            # Test-only synthetic composition values. The pinned campaign
+            # controller deliberately keeps runtime composition unready.
+            "collector": {"control_charge_bytes": 4096, "task_lease_count": 1},
+            "baseline": {"expected_global_control_baseline": self.calibration_record["fixed_global_control_baseline"]},
+            "meter_source_bounds": feedback_reader.meter_source_bounds_for_workload("mixed"),
+            "meter_source_model": meter_model,
+            "source_references": feedback_reader.CONSTRUCTION_PROBE_SOURCE_REFERENCES,
+        }
+
+    def _pin_file(self, relative: str, raw: bytes) -> dict[str, str]:
+        path = self.input_root / relative
+        write_file(path, raw)
+        return {"relative_path": relative, "raw_sha256": digest(raw)}
+
+    def _qualification_inputs(self) -> dict[str, Any]:
+        capacities: list[dict[str, Any]] = []
+        conditions: list[dict[str, Any]] = []
+        templates_root = self.input_root / "qualification"
+        for host_id in self.host_ids:
+            for cell in self.spec["cells"]:
+                workload = cell["workload"]
+                profile = cell["profile"]
+                suffix = f"{host_id}-{workload}-{profile}"
+                calibration_id = f"capacity-{suffix}"
+                request_pin = self._pin_file(
+                    f"qualification/capacity/{suffix}-request.json",
+                    campaign.canonical_bytes({"schema": "fixture.capacity-request.v1", "workload": workload, "profile": profile}),
+                )
+                context_pin = self._pin_file(
+                    f"qualification/capacity/{suffix}-context.json",
+                    campaign.canonical_bytes({"schema": "fixture.capacity-context.v1", "workload": workload, "profile": profile}),
+                )
+                capacities.append({
+                    "host_id": host_id, "workload": workload, "profile": profile,
+                    "calibration_id": calibration_id,
+                    "calibrator": {"allocator": "allocatbelt", "executor": "bounded"},
+                    "request_template": request_pin, "context_template": context_pin,
+                    "evidence": None,
+                })
+                condition_id = f"condition-{suffix}"
+                condition_schedule = {"duration_seconds": 30, "sample_interval_ms": 100, "seed": 17}
+                raw_schedule = {
+                    "seed": 17, "duration_seconds": 30, "sample_interval_ms": 100,
+                    "startup_deadline_seconds": 10, "total_deadline_seconds": 85,
+                    "term_deadline_seconds": 30, "kill_deadline_seconds": 15,
+                    "minimum_overlap_seconds": 30, "startup_ready_windows": 2,
+                    "cpu_duty_basis_points": 7000, "pressure_cpu_affinity": [2],
+                    "application_cpu_affinity": [min(os.sched_getaffinity(0))],
+                    "disk_bytes_per_second": 65_536, "scratch_file_bytes": 65_536,
+                    "network_requests_per_second": 10, "network_payload_bytes": 64,
+                }
+                request_value = {
+                    "schema": "allocatbelt.application-pressure-request.v1",
+                    "identity": {
+                        "host_id": host_id, "run_id": f"template-{suffix}",
+                        "pair_id": f"pair-{suffix}", "condition_id": condition_id,
+                        "member": "template", "nonce": "a" * 32,
+                        "allocator": "allocatbelt", "executor": "allocatbelt",
+                    },
+                    "files": {
+                        "source_manifest": {"path": "/template/source-manifest.json", "sha256": "b" * 64},
+                        "application_binary": {"path": "/template/application", "sha256": "c" * 64},
+                        "policy": {"path": "/template/policy.json", "sha256": "d" * 64},
+                        "application_capacity_calibration": {"path": "/template/capacity.tsv", "sha256": "e" * 64},
+                    },
+                    "process": {"executable_path": "/template/application", "application_tmpdir_path": "/template/tmp"},
+                    "storage": {
+                        "application_io_paths": ["/template/work", "/template/tmp"],
+                        "pressure_scratch_path": "/template/tmp", "output_minimum_free_bytes": 67_108_864,
+                    },
+                    "schedule": raw_schedule,
+                }
+                condition_pin = self._pin_file(
+                    f"qualification/pressure/{suffix}-request.json", campaign.canonical_bytes(request_value),
+                )
+                pressure_calibration = {
+                    "calibration_id": f"pressure-calibration-{suffix}",
+                    "artifact": self._pin_file(
+                        f"qualification/pressure/{suffix}-calibration.json",
+                        campaign.canonical_bytes({"schema": "fixture.pressure-calibration.v1", "condition_id": condition_id}),
+                    ),
+                    "receipt": self._pin_file(
+                        f"qualification/pressure/{suffix}-calibration-receipt.json",
+                        campaign.canonical_bytes({"schema": "fixture.pressure-calibration-receipt.v1", "condition_id": condition_id}),
+                    ),
+                    "validator_sha256": self.manifests[host_id]["qualification_harness"]["pressure_validator"]["sha256"],
+                }
+                conditions.append({
+                    "host_id": host_id, "condition_id": condition_id,
+                    "condition_sha256": condition_pin["raw_sha256"],
+                    "capacity_key": {
+                        "host_id": host_id, "workload": workload,
+                        "profile": profile, "calibration_id": calibration_id,
+                    },
+                    "condition": condition_pin,
+                    "pressure_calibration": pressure_calibration,
+                    "readiness_thresholds": {
+                        "minimum_overlap_seconds": 30,
+                        "minimum_ready_samples": 300,
+                        "maximum_sample_gap_ms": 200,
+                    },
+                    "schedule": condition_schedule,
+                })
+        return {"capacity_templates": capacities, "pressure_conditions": conditions}
+
+    def _ring_bytes(self) -> bytes:
+        rate = 2000
+        arrivals = rate * 2
+        rows = [
+            f"schema\t{soak_reader.RING_SCHEMA}",
+            f"source_sha256\t{self.source_tree_sha256}",
+            f"binary_sha256\t{self.manifests['host-1']['soak_artifacts']['allocatbelt']['sha256']}",
+            "profile\tmixed", "workload\tmixed", "mode\topen_loop",
+            f"average_rate_per_second\t{rate}", f"pulse_rate_per_second\t{rate}",
+            f"arrivals\t{arrivals}", "trace_duration_ns\t2000000000",
+            "kernel_config\tinterleave=cpu,memory,http,disk",
+            "id\tscheduled_ns\tworkload\texpected_checksum",
+        ]
+        families = ("cpu", "memory", "http", "disk")
+        rows.extend(
+            f"{index}\t{index * 1_000_000_000 // rate}\t{families[index % 4]}\t{1000 + index}"
+            for index in range(arrivals)
+        )
+        return ("\n".join(rows) + "\n").encode("ascii")
+
+
 class SoakRecipeTests(unittest.TestCase):
+    def test_source_v5_builder_and_parent_preflight_clis_use_full_launch_disabled_plan(self):
+        with tempfile.TemporaryDirectory(prefix="allocatbelt-soak-v5-cli-") as temporary:
+            fixture = SourceV5CliFixture(Path(temporary))
+            recipe_path = fixture.output / "parent-recipe.json"
+            build = subprocess.run(
+                [
+                    sys.executable, str(BUILDER_PATH), "build",
+                    "--spec", str(fixture.spec_path), "--spec-sha256", fixture.spec_sha256,
+                    "--plan", str(fixture.plan_path), "--plan-sha256", fixture.plan_sha256,
+                    "--plan-file-sha256", fixture.plan_file_sha256,
+                    "--job-run-id", fixture.job["run_id"],
+                    "--source-root", str(fixture.root), "--oracle-root", str(fixture.oracle_root),
+                    "--ring-relative-path", fixture.ring_path.relative_to(fixture.oracle_root).as_posix(),
+                    "--ring-sha256", fixture.ring_sha256,
+                    "--mode", "functional", "--duration-seconds", "2",
+                    "--terminal-budget-bytes", str(2 * 1024 * 1024),
+                    "--sample-budget-bytes", str(2 * 1024 * 1024),
+                    "--construction-probe", str(fixture.construction_probe_path),
+                    "--construction-probe-sha256", fixture.construction_probe_sha256,
+                    "--output", str(recipe_path),
+                ],
+                cwd="/", stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                timeout=180, check=False,
+            )
+            self.assertEqual(build.returncode, 0, build.stderr.decode("utf-8", errors="replace"))
+            receipt = json.loads(build.stdout.decode("utf-8"))
+            self.assertFalse(receipt["launch_enabled"])
+            self.assertFalse(receipt["capacity_evidence_ready"])
+            self.assertFalse(receipt["feedback_runtime_composition_ready"])
+            recipe = json.loads(recipe_path.read_text(encoding="utf-8"))
+            self.assertEqual(recipe["schema"], soak_reader.RECIPE_SCHEMA_V2)
+            self.assertIsNone(recipe["pressure"]["recipe"])
+            self.assertFalse(recipe["qualification"]["launch_enabled"])
+
+            host = fixture.spec["hosts"][0]
+            source = fixture.manifests[fixture.job["host_id"]]
+            cell = next(
+                item for item in fixture.spec["cells"]
+                if item["workload"] == "mixed" and item["profile"] == "mixed"
+            )
+            preflight = subprocess.run(
+                [
+                    sys.executable, str(fixture.root / "scripts/application-soak-readback.py"), "preflight",
+                    "--recipe", str(recipe_path), "--recipe-sha256", receipt["recipe_sha256"],
+                    "--binary", str(fixture.soak_binary), "--output-dir", str(fixture.output),
+                    "--runner-path", str(fixture.root / builder.SOAK_RUNNER_PATH),
+                    "--cpu-set", host["controls"]["cpu_set"],
+                    "--campaign-id", fixture.spec["campaign_id"], "--host-id", fixture.job["host_id"],
+                    "--run-id", fixture.job["run_id"], "--allocator", "allocatbelt", "--executor", "bounded",
+                    "--profile", "mixed", "--source-sha256", source["source"]["source_tree_sha256"],
+                    "--binary-sha256", source["soak_artifacts"]["allocatbelt"]["sha256"],
+                    "--resource-ceiling-sha256", cell["resource_ceiling_sha256"],
+                    "--mode", "functional", "--duration-seconds", "2",
+                ],
+                cwd="/", stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                timeout=180, check=False,
+            )
+            self.assertEqual(preflight.returncode, 0, preflight.stderr.decode("utf-8", errors="replace"))
+            preflight_value = json.loads(preflight.stdout.decode("utf-8"))
+            self.assertFalse(preflight_value["launch_enabled"])
+            self.assertTrue((fixture.output / "soak-preflight.json").is_file())
+
+    def test_source_v5_builder_derives_same_pressure_enclosing_horizon(self):
+        base_schedule = {
+            "seed": 17, "duration_seconds": 30, "sample_interval_ms": 100,
+            "startup_deadline_seconds": 10, "total_deadline_seconds": 85,
+            "term_deadline_seconds": 30, "kill_deadline_seconds": 15,
+            "minimum_overlap_seconds": 10, "startup_ready_windows": 2,
+            "cpu_duty_basis_points": 8000, "pressure_cpu_affinity": [1, 3],
+            "application_cpu_affinity": [0, 2], "disk_bytes_per_second": 81_920,
+            "scratch_file_bytes": 4096, "network_requests_per_second": 10,
+            "network_payload_bytes": 64,
+        }
+        request = {"schema": "allocatbelt.application-pressure-request.v1", "schedule": base_schedule}
+        condition_schedule = {"duration_seconds": 30, "sample_interval_ms": 100, "seed": 17}
+        result = builder._derive_v5_pressure_schedule(10_800, request, condition_schedule)
+        self.assertEqual(result["application_wall_timeout_seconds"], 11_050)
+        self.assertEqual(result["pressure_duration_seconds"], 11_061)
+        self.assertEqual(result["pressure_schedule"]["total_deadline_seconds"], 11_116)
+        reader_result = soak_reader._derive_v5_pressure_schedule(10_800, request, condition_schedule)
+        self.assertEqual(result, reader_result)
+
+    def test_source_v5_nonce_instantiation_is_bound_to_job_member_and_ordinal(self):
+        template_nonce = "a" * 32
+        first = builder.process_nonce(template_nonce, "campaign-1", "campaign-host-mixed-soak", "soak", 1)
+        self.assertEqual(len(first), 32)
+        self.assertEqual(first, builder.process_nonce(template_nonce, "campaign-1", "campaign-host-mixed-soak", "soak", 1))
+        self.assertNotEqual(first, builder.process_nonce(template_nonce, "campaign-1", "campaign-host-mixed-soak-2", "soak", 1))
+        self.assertNotEqual(first, builder.process_nonce(template_nonce, "campaign-1", "campaign-host-mixed-soak", "candidate", 1))
+        self.assertNotEqual(first, builder.process_nonce(template_nonce, "campaign-1", "campaign-host-mixed-soak", "soak", 2))
+
     def test_stable_recipe_reads_do_not_block_on_regular_to_fifo_swap(self):
         with tempfile.TemporaryDirectory(prefix="allocatbelt-soak-recipe-fifo-") as temporary:
             root = Path(temporary)
