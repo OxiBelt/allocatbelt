@@ -1187,6 +1187,47 @@ class ApplicationCampaignTests(unittest.TestCase):
         with self.assertRaisesRegex(campaign.CampaignError, "joined global Control"):
             campaign.fixed_pressure_predecessor_receipt(pressure_job, incomplete_join, spec, source)
 
+    def test_final_global_usage_survives_numeric_snapshot_and_is_required_for_v5(self) -> None:
+        spec, sources = spec_fixture()
+        source = sources["host-1"]
+        job = {
+            "run_id": "numeric-final-01", "host_id": "host-1", "family": "cpu", "profile": "steady",
+            "mode": "capacity", "load_percent": None, "comparison_kind": "allocator",
+            "baseline_allocator": "mimalloc-secure", "allocator": "allocatbelt",
+            "pair_kind": "allocator-match", "ordinal": 1, "comparison_family": "fixed_policy",
+            "phase": "confirmation", "workload": "cpu", "rate_per_second": None, "arrivals": None,
+        }
+        binding = campaign.build_runtime_process_bindings(job, spec, source)[0]
+        _, fields, expected, _, _ = runtime_fixture_for(binding, source, include_artifacts=True)
+        calibration = source["resource_domain_calibration"]["record"]
+        snapshot = campaign.numeric_runtime_snapshot(fields, expected)
+        self.assertEqual(snapshot["schema"], "allocatbelt.application-runtime-numeric-snapshot.v2")
+        dimensions = campaign.runtime_readback_module().APP_DIMENSIONS
+        self.assertEqual(snapshot["after_release"]["global_used_application"], {name: 0 for name in dimensions})
+        campaign.validate_numeric_runtime_snapshot(snapshot, expected, calibration, require_final_usage=True)
+        for dimension in dimensions:
+            for invalid in (1, True, 1.0, -1):
+                forged = copy.deepcopy(snapshot)
+                forged["after_release"]["global_used_application"][dimension] = invalid
+                with self.subTest(dimension=dimension, value=invalid), self.assertRaises(campaign.CampaignError):
+                    campaign.validate_numeric_runtime_snapshot(forged, expected, calibration, require_final_usage=True)
+            incomplete = dict(fields)
+            del incomplete[f"after_release.global.used.{dimension}"]
+            with self.assertRaisesRegex(campaign.CampaignError, "incomplete final global"):
+                campaign.numeric_runtime_snapshot(incomplete, expected)
+        legacy_fields = dict(fields)
+        for dimension in dimensions:
+            del legacy_fields[f"after_release.global.used.{dimension}"]
+        legacy = campaign.numeric_runtime_snapshot(legacy_fields, expected)
+        self.assertEqual(legacy["schema"], "allocatbelt.application-runtime-numeric-snapshot.v1")
+        campaign.validate_numeric_runtime_snapshot(legacy, expected, calibration)
+        with self.assertRaisesRegex(campaign.CampaignError, "lacks final global"):
+            campaign.validate_numeric_runtime_snapshot(legacy, expected, calibration, require_final_usage=True)
+        mislabeled = copy.deepcopy(snapshot)
+        mislabeled["schema"] = legacy["schema"]
+        with self.assertRaises(campaign.CampaignError):
+            campaign.validate_numeric_runtime_snapshot(mislabeled, expected, calibration)
+
     def test_exact_process_descriptor_set_rejects_replayed_and_missing_aa_rows(self) -> None:
         spec, sources = spec_fixture()
         source = sources["host-1"]

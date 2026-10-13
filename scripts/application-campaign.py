@@ -1593,6 +1593,7 @@ def fixed_pressure_predecessor_receipt(
         validate_numeric_runtime_snapshot(
             readback["numeric_snapshot"], expected, calibration_record,
             source["runtime_readback_validator"]["sha256"],
+            require_final_usage=source.get("schema") == SOURCE_SCHEMA_V5,
         )
         readback_snapshots.append({
             "pair": binding["pair"],
@@ -2718,26 +2719,48 @@ def numeric_runtime_snapshot(
                 )
             }
         stages[stage] = stage_snapshot
+    final_usage_keys = {
+        dimension: f"after_release.global.used.{dimension}"
+        for dimension in module.APP_DIMENSIONS
+    }
+    present_usage_keys = set(final_usage_keys.values()) & fields.keys()
+    require(
+        not present_usage_keys or present_usage_keys == set(final_usage_keys.values()),
+        "runtime numeric snapshot has incomplete final global application usage",
+    )
+    final_usage = bool(present_usage_keys)
+    after_release = {
+        "global_live_tenants": parse_uint(fields["after_release.global.live_tenants"], "global_live_tenants"),
+        "global_used_control": parse_uint(fields["after_release.global.used.control"], "global_used_control"),
+        "expected_global_control_baseline": parse_uint(fields["after_release.expected_global_control_baseline"], "expected_global_control_baseline"),
+    }
+    if final_usage:
+        after_release["global_used_application"] = {
+            dimension: parse_uint(fields[key], f"final global {dimension} usage")
+            for dimension, key in final_usage_keys.items()
+        }
     return {
-        "schema": "allocatbelt.application-runtime-numeric-snapshot.v1",
+        "schema": f"allocatbelt.application-runtime-numeric-snapshot.v{2 if final_usage else 1}",
         "identity": identity,
         "configuration": configuration,
         "stages": stages,
-        "after_release": {
-            "global_live_tenants": parse_uint(fields["after_release.global.live_tenants"], "global_live_tenants"),
-            "global_used_control": parse_uint(fields["after_release.global.used.control"], "global_used_control"),
-            "expected_global_control_baseline": parse_uint(fields["after_release.expected_global_control_baseline"], "expected_global_control_baseline"),
-        },
+        "after_release": after_release,
     }
 
 
 def validate_numeric_runtime_snapshot(
     snapshot: dict[str, Any], expected: dict[str, Any], calibration: dict[str, Any],
-    validator_sha256: str | None = None,
+    validator_sha256: str | None = None, *, require_final_usage: bool = False,
 ) -> None:
     module = runtime_readback_module(validator_sha256)
     exact_keys(snapshot, {"schema", "identity", "configuration", "stages", "after_release"}, "fixed predecessor numeric snapshot")
-    require(snapshot.get("schema") == "allocatbelt.application-runtime-numeric-snapshot.v1", "fixed predecessor numeric snapshot has an unknown schema")
+    schema = snapshot.get("schema")
+    require(schema in (
+        "allocatbelt.application-runtime-numeric-snapshot.v1",
+        "allocatbelt.application-runtime-numeric-snapshot.v2",
+    ), "fixed predecessor numeric snapshot has an unknown schema")
+    final_usage = schema == "allocatbelt.application-runtime-numeric-snapshot.v2"
+    require(not require_final_usage or final_usage, "fixed predecessor numeric snapshot lacks final global application usage")
     exact_keys(snapshot["identity"], {
         "report_nonce", "run_id", "allocator", "executor", "comparison_family",
         "resource_ceiling_sha256", "policy_sha256", "profile", "workload",
@@ -2748,7 +2771,12 @@ def validate_numeric_runtime_snapshot(
         "fixed_global_control_baseline", "domain_ceiling", "scope_limits", "setup_global_control",
     }, "fixed predecessor numeric snapshot configuration")
     exact_keys(snapshot["stages"], set(module.STAGES), "fixed predecessor numeric snapshot stages")
-    exact_keys(snapshot["after_release"], {"global_live_tenants", "global_used_control", "expected_global_control_baseline"}, "fixed predecessor final numeric snapshot")
+    final_keys = {"global_live_tenants", "global_used_control", "expected_global_control_baseline"}
+    if final_usage:
+        final_keys.add("global_used_application")
+    exact_keys(snapshot["after_release"], final_keys, "fixed predecessor final numeric snapshot")
+    if final_usage:
+        exact_keys(snapshot["after_release"]["global_used_application"], set(module.APP_DIMENSIONS), "fixed predecessor final global application usage")
     _require_u64_leaves(snapshot["configuration"], "fixed predecessor configuration", {"mode"})
     _require_u64_leaves(snapshot["stages"], "fixed predecessor stages")
     _require_u64_leaves(snapshot["after_release"], "fixed predecessor after-release")
@@ -2785,11 +2813,14 @@ def validate_numeric_runtime_snapshot(
     require(snapshot["configuration"]["scope_limits"] == contract["scope_limits"], "fixed predecessor snapshot scope limits differ from its recipe")
     require(baseline <= snapshot["configuration"]["setup_global_control"] <= baseline + contract["ceilings"]["control"], "fixed predecessor setup global Control exceeds its independently bounded baseline")
     require(snapshot["configuration"]["setup_global_control"] - baseline >= snapshot["stages"]["setup"]["tenant"]["used"]["control"], "fixed predecessor setup global Control does not cover tenant Control use")
-    require(snapshot["after_release"] == {
+    expected_after_release = {
         "global_live_tenants": 0,
         "global_used_control": baseline,
         "expected_global_control_baseline": baseline,
-    }, "fixed predecessor final numeric Control/live-tenant cleanup differs")
+    }
+    if final_usage:
+        expected_after_release["global_used_application"] = {dimension: 0 for dimension in module.APP_DIMENSIONS}
+    require(snapshot["after_release"] == expected_after_release, "fixed predecessor final numeric resource cleanup differs")
     for stage in module.STAGES:
         row = snapshot["stages"][stage]
         exact_keys(row, {"global", "tenant", "scope", "scope_used", "io"}, f"fixed predecessor {stage} numeric snapshot")
