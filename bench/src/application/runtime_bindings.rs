@@ -13,7 +13,9 @@ use allocatbelt::runtime::resource_domain::{
 #[cfg(feature = "resource-feedback")]
 use allocatbelt::runtime::resource_feedback::ResourceFeedbackService;
 #[cfg(feature = "resource-feedback")]
-use allocatbelt::runtime::resource_feedback::{FeedbackHistoryConfig, FeedbackMetricsHandle};
+use allocatbelt::runtime::resource_feedback::{
+  FeedbackHistoryConfig, FeedbackMetricsHandle, FeedbackWorkerFailure,
+};
 #[cfg(feature = "resource-feedback")]
 use allocatbelt::runtime::resource_feedback_actuator::{
   CpuFeedbackTarget, RuntimeFeedbackActuator,
@@ -24,7 +26,7 @@ use allocatbelt::runtime::resource_feedback_meter::{IoFeedbackMeter, IoFeedbackM
 use allocatbelt::runtime::resource_feedback_policy::{
   ACTUATION_COOLDOWN, FEEDBACK_POLICY_VERSION, FeedbackControlConfig, FeedbackResource,
   MAX_DENSE_SAMPLE_GAP, REQUIRED_BREACH_SAMPLES, ResourceFeedbackPolicyConfig, SAMPLE_INTERVAL,
-  TELEMETRY_FRESHNESS,
+  TELEMETRY_FRESHNESS, TelemetryStatus,
 };
 #[cfg(feature = "resource-feedback")]
 use allocatbelt::runtime::resource_feedback_sensor::{
@@ -1251,9 +1253,215 @@ impl ApplicationRunBindings {
   }
 
   #[cfg(feature = "resource-feedback")]
+  pub(crate) fn wait_for_feedback_startup_observation(&self) -> Result<Instant, String> {
+    if !self.mode().feedback_enabled() {
+      return Err("fixed-policy runs do not wait for feedback startup telemetry".into());
+    }
+    let metrics = self
+      .feedback
+      .metrics
+      .as_ref()
+      .ok_or_else(|| "feedback startup metrics handle is missing".to_owned())?;
+    let deadline = Instant::now()
+      .checked_add(SAMPLE_INTERVAL + MAX_DENSE_SAMPLE_GAP)
+      .ok_or_else(|| "feedback startup observation deadline overflow".to_owned())?;
+    loop {
+      if Instant::now() >= deadline {
+        return Err(
+          "feedback service did not accept fresh dense CPU telemetry before the startup deadline"
+            .into(),
+        );
+      }
+      let snapshot = metrics.snapshot();
+      if let Some(failure) = snapshot.worker_failure {
+        return Err(format!(
+          "feedback worker failed before production: {failure:?}"
+        ));
+      }
+      if snapshot.stop_requested || snapshot.shutdown_complete {
+        return Err("feedback service stopped before startup telemetry was accepted".into());
+      }
+      if let Some(sample_at) = snapshot.last_sample_at {
+        let cpu = snapshot.control(FeedbackResource::CpuConcurrency);
+        if cpu.policy_faulted {
+          return Err("CPU feedback policy faulted before production".into());
+        }
+        let plan_published_for_sample = snapshot
+          .last_plan_at
+          .is_some_and(|plan_at| plan_at >= sample_at);
+        let now = Instant::now();
+        if snapshot.sample_count > 0
+          && plan_published_for_sample
+          && cpu.telemetry == TelemetryStatus::Fresh
+          && cpu.utilization_basis_points.is_some()
+          && now
+            .checked_duration_since(sample_at)
+            .is_some_and(|age| age <= TELEMETRY_FRESHNESS)
+        {
+          if Instant::now() >= deadline {
+            return Err(
+              "feedback service did not accept fresh dense CPU telemetry before the startup deadline"
+                .into(),
+            );
+          }
+          return Ok(sample_at);
+        }
+      }
+      if Instant::now() >= deadline {
+        return Err(
+          "feedback service did not accept fresh dense CPU telemetry before the startup deadline"
+            .into(),
+        );
+      }
+      std::thread::sleep(Duration::from_millis(1));
+    }
+  }
+
+  #[cfg(feature = "resource-feedback")]
+  pub(crate) fn wait_for_feedback_observation_after(
+    &self,
+    minimum_sample_lower_ns: u128,
+    mut map_bounds: impl FnMut(Instant) -> Result<(u128, u128), String>,
+  ) -> Result<Instant, String> {
+    if !self.mode().feedback_enabled() {
+      return Err("post-drain feedback observation was supplied to a fixed-policy run".into());
+    }
+    let metrics = self
+      .feedback
+      .metrics
+      .as_ref()
+      .ok_or_else(|| "post-drain feedback metrics handle is missing".to_owned())?;
+    let deadline = Instant::now()
+      .checked_add(SAMPLE_INTERVAL + MAX_DENSE_SAMPLE_GAP)
+      .ok_or_else(|| "post-drain feedback observation deadline overflow".to_owned())?;
+    loop {
+      if Instant::now() >= deadline {
+        return Err(
+          "feedback service did not accept a fresh dense CPU sample after the drain clock bracket before the finite deadline"
+            .into(),
+        );
+      }
+      let snapshot = metrics.snapshot();
+      if let Some(failure) = snapshot.worker_failure {
+        return Err(format!(
+          "feedback worker failed while waiting for a post-drain observation: {failure:?}"
+        ));
+      }
+      if snapshot.stop_requested || snapshot.shutdown_complete {
+        return Err(
+          "feedback service stopped before its post-drain observation was accepted".into(),
+        );
+      }
+      if snapshot.sample_count > 0 {
+        let cpu = snapshot.control(FeedbackResource::CpuConcurrency);
+        if cpu.policy_faulted {
+          return Err("CPU feedback policy faulted before the post-drain observation".into());
+        }
+        if let Some(sample_at) = snapshot.last_sample_at {
+          let plan_published_for_sample = snapshot
+            .last_plan_at
+            .is_some_and(|plan_at| plan_at >= sample_at);
+          let fresh = Instant::now()
+            .checked_duration_since(sample_at)
+            .is_some_and(|age| age <= TELEMETRY_FRESHNESS);
+          if fresh
+            && plan_published_for_sample
+            && cpu.telemetry == TelemetryStatus::Fresh
+            && cpu.utilization_basis_points.is_some()
+          {
+            let (sample_lower_ns, sample_upper_ns) = map_bounds(sample_at)?;
+            if sample_lower_ns > sample_upper_ns {
+              return Err("post-drain feedback sample clock bracket is inverted".into());
+            }
+            if Instant::now() >= deadline {
+              return Err(
+                "feedback service did not accept a fresh dense CPU sample after the drain clock bracket before the finite deadline"
+                  .into(),
+              );
+            }
+            if sample_lower_ns >= minimum_sample_lower_ns {
+              return Ok(sample_at);
+            }
+          }
+        }
+      }
+      if Instant::now() >= deadline {
+        return Err(
+          "feedback service did not accept a fresh dense CPU sample after the drain clock bracket before the finite deadline"
+            .into(),
+        );
+      }
+      std::thread::sleep(Duration::from_millis(1));
+    }
+  }
+
+  #[cfg(feature = "resource-feedback")]
+  pub(crate) fn validate_feedback_startup_observation(
+    &self,
+    sample_at: Instant,
+    production_start: Instant,
+    sample_bounds: Option<(u128, u128)>,
+    production_bounds: Option<(u128, u128)>,
+  ) -> Result<(), String> {
+    if !self.mode().feedback_enabled() {
+      return Err("startup feedback observation was supplied to a fixed-policy run".into());
+    }
+    let Some(age) = production_start.checked_duration_since(sample_at) else {
+      return Err("feedback startup sample occurred after production start".into());
+    };
+    if age > TELEMETRY_FRESHNESS {
+      return Err("feedback startup CPU telemetry was stale at production start".into());
+    }
+    match (sample_bounds, production_bounds) {
+      (Some((sample_lower, sample_upper)), Some((start_lower, start_upper)))
+        if sample_lower <= sample_upper
+          && start_lower <= start_upper
+          && sample_upper <= start_lower => {}
+      (None, None) => {}
+      (Some(_), Some(_)) => {
+        return Err(
+          "feedback sample clock bracket overlaps or follows production-start bracket".into(),
+        );
+      }
+      _ => return Err("feedback startup clock bounds were only partially captured".into()),
+    }
+    // Startup telemetry is admitted by `wait_for_feedback_startup_observation`
+    // before production begins. Re-reading live metrics here would make the
+    // post-run check depend on later sensor state (which can legitimately be
+    // Missing after the workload has ended), instead of the captured startup
+    // sample and its clock relationship to production.
+    Ok(())
+  }
+
+  #[cfg(feature = "resource-feedback")]
+  pub(crate) fn feedback_shutdown_status(&self) -> Option<(bool, Option<FeedbackWorkerFailure>)> {
+    self.feedback.metrics.as_ref().map(|metrics| {
+      let snapshot = metrics.snapshot();
+      (snapshot.shutdown_complete, snapshot.worker_failure)
+    })
+  }
+
+  #[cfg(feature = "resource-feedback")]
   pub(super) fn start_feedback_trace(
     &self,
     run_mode: super::Mode,
+  ) -> Result<Option<super::feedback_trace::FeedbackTraceCollector>, String> {
+    self.start_feedback_trace_inner(run_mode.label(), false)
+  }
+
+  #[cfg(feature = "resource-feedback")]
+  pub(crate) fn start_feedback_trace_for_mode(
+    &self,
+    run_mode: &'static str,
+  ) -> Result<Option<super::feedback_trace::FeedbackTraceCollector>, String> {
+    self.start_feedback_trace_inner(run_mode, true)
+  }
+
+  #[cfg(feature = "resource-feedback")]
+  fn start_feedback_trace_inner(
+    &self,
+    run_mode: &'static str,
+    require_trace: bool,
   ) -> Result<Option<super::feedback_trace::FeedbackTraceCollector>, String> {
     let trace_directory = std::env::var_os("ALLOCATBELT_APP_FEEDBACK_TRACE_DIR");
     if !self.mode().feedback_enabled() {
@@ -1265,11 +1473,13 @@ impl ApplicationRunBindings {
     }
     let pressure_qualification = self.feedback.calibrations.pressure_qualification;
     let Some(trace_directory) = trace_directory else {
-      return if pressure_qualification {
-        Err("pressure qualification requires ALLOCATBELT_APP_FEEDBACK_TRACE_DIR".into())
-      } else {
-        Ok(None)
-      };
+      if pressure_qualification {
+        return Err("pressure qualification requires ALLOCATBELT_APP_FEEDBACK_TRACE_DIR".into());
+      }
+      if require_trace {
+        return Err("external soak requires ALLOCATBELT_APP_FEEDBACK_TRACE_DIR".into());
+      }
+      return Ok(None);
     };
 
     // Reserve the collector's fixed payload and task slot before cloning any
@@ -1310,7 +1520,7 @@ impl ApplicationRunBindings {
     super::feedback_trace::FeedbackTraceCollector::start(
       trace_directory,
       pressure_qualification,
-      run_mode.label(),
+      run_mode,
       inputs,
       admission,
     )
@@ -1799,7 +2009,7 @@ pub(crate) struct ApplicationTaskAdmission {
 }
 
 impl ApplicationTaskAdmission {
-  #[cfg(test)]
+  #[cfg(all(test, feature = "resource-feedback"))]
   pub(super) fn for_tenant(tenant: TenantDomain) -> Self {
     Self { tenant }
   }

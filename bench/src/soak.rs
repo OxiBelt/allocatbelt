@@ -16,6 +16,11 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
 
+#[cfg(feature = "resource-feedback")]
+use crate::application::feedback_trace::{
+  FeedbackTraceCollector, FeedbackTraceFinalizer, FeedbackTracePhase,
+};
+use crate::application::runtime_bindings::ApplicationMode;
 use allocatbelt::runtime::asynchronous::{
   AsyncConfig, AsyncError, AsyncHandle, AsyncJob, AsyncJoinError, AsyncShutdown,
 };
@@ -31,6 +36,8 @@ use allocatbelt::runtime::reactor::ReactorConfig;
 use allocatbelt::runtime::resource_domain::{
   DomainError, DomainReservation, DomainResource, DomainResources, DomainSnapshot, TenantDomain,
 };
+#[cfg(feature = "resource-feedback")]
+use allocatbelt::runtime::resource_feedback::FeedbackWorkerFailure;
 use allocatbelt::runtime::time::TimerHandle;
 use allocatbelt::runtime::{
   Config as BlockingConfig, MultiShutdown, MultiThreadBuilder, Resources, ShutdownMode,
@@ -51,11 +58,35 @@ const MAX_REFERENCE_ROWS: usize = 65_536;
 const MIN_REFERENCE_ROWS: usize = 8;
 const MAX_ROOT_FUTURE_BYTES: usize = 64 * 1024;
 const SAMPLE_SCRATCH_CONTROL_BYTES: usize = 16 * 1024;
+#[cfg(feature = "resource-feedback")]
+const MAX_EXTERNAL_RECEIPT_JSON_BYTES: usize = 16 * 1024;
 const REFERENCE_HEADER: &str = "id\tscheduled_ns\tworkload\texpected_checksum";
 const TERMINAL_HEADER: &str =
   "global_id\treference_work_id\tfamily\tstatus\tobserved_checksum\tring_expected_checksum";
 const SAMPLE_HEADER: &str = "monotonic_ns\trss_kib\tglobal_cpu_ceiling\tglobal_cpu_limit\tglobal_cpu_used\tglobal_memory_ceiling\tglobal_memory_limit\tglobal_memory_used\tglobal_disk_ceiling\tglobal_disk_limit\tglobal_disk_used\tglobal_network_ceiling\tglobal_network_limit\tglobal_network_used\tglobal_tasks_ceiling\tglobal_tasks_limit\tglobal_tasks_used\tglobal_control_ceiling\tglobal_control_limit\tglobal_control_used\ttenant_cpu_ceiling\ttenant_cpu_limit\ttenant_cpu_used\ttenant_memory_ceiling\ttenant_memory_limit\ttenant_memory_used\ttenant_disk_ceiling\ttenant_disk_limit\ttenant_disk_used\ttenant_network_ceiling\ttenant_network_limit\ttenant_network_used\ttenant_tasks_ceiling\ttenant_tasks_limit\ttenant_tasks_used\ttenant_control_ceiling\ttenant_control_limit\ttenant_control_used\tscope_memory_limit\tscope_memory_used\tscope_disk_limit\tscope_disk_used\tscope_network_limit\tscope_network_used\tdisk_rate_limit_bps\tdisk_rate_burst_bytes\tdisk_rate_ceiling_bps\tdisk_rate_ceiling_burst_bytes\tdisk_rate_max_reservations\tdisk_rate_available_bytes\tdisk_rate_reserved_bytes\tdisk_rate_reservations\tupload_rate_limit_bps\tupload_rate_burst_bytes\tupload_rate_ceiling_bps\tupload_rate_ceiling_burst_bytes\tupload_rate_max_reservations\tupload_rate_available_bytes\tupload_rate_reserved_bytes\tupload_rate_reservations\tdownload_rate_limit_bps\tdownload_rate_burst_bytes\tdownload_rate_ceiling_bps\tdownload_rate_ceiling_burst_bytes\tdownload_rate_max_reservations\tdownload_rate_available_bytes\tdownload_rate_reserved_bytes\tdownload_rate_reservations";
 const SOAK_KERNEL_CONFIG: &str = "interleave=cpu,memory,http,disk";
+
+#[cfg(feature = "resource-feedback")]
+struct FixedJsonBuffer<'a> {
+  bytes: &'a mut [u8],
+  length: usize,
+}
+
+#[cfg(feature = "resource-feedback")]
+impl std::fmt::Write for FixedJsonBuffer<'_> {
+  fn write_str(&mut self, value: &str) -> std::fmt::Result {
+    let end = self
+      .length
+      .checked_add(value.len())
+      .ok_or(std::fmt::Error)?;
+    let Some(destination) = self.bytes.get_mut(self.length..end) else {
+      return Err(std::fmt::Error);
+    };
+    destination.copy_from_slice(value.as_bytes());
+    self.length = end;
+    Ok(())
+  }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct SoakArgs {
@@ -66,6 +97,7 @@ struct SoakArgs {
   output_dir: Option<PathBuf>,
   profile: String,
   resource_ceiling_sha256: String,
+  comparison_mode: ApplicationMode,
 }
 
 #[derive(Debug)]
@@ -184,7 +216,288 @@ struct OutputFiles {
   report: Option<File>,
   terminals: Option<File>,
   samples: Option<File>,
+  incomplete_marker: &'static str,
   committed: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FeedbackSoakStatus {
+  started: bool,
+  joined: bool,
+  worker_failure: Option<&'static str>,
+  trace_worker_joined: bool,
+}
+
+#[derive(Clone, Copy)]
+enum SoakTracePhase {
+  #[cfg(feature = "resource-feedback")]
+  ProductionStart,
+  ProductionEnd,
+  DrainEnd,
+  RssBefore,
+  RssAfterDrain,
+  ShutdownEnd,
+  RssAfterShutdown,
+}
+
+#[cfg(feature = "resource-feedback")]
+type SoakTraceFinalizer = FeedbackTraceFinalizer;
+#[cfg(not(feature = "resource-feedback"))]
+type SoakTraceFinalizer = ();
+
+#[derive(Default)]
+struct SoakFeedbackTrace {
+  #[cfg(feature = "resource-feedback")]
+  collector: Option<FeedbackTraceCollector>,
+}
+
+struct SoakSessionResult {
+  stats: SoakStats,
+  feedback_finalizer: Option<SoakTraceFinalizer>,
+  feedback_status: Option<FeedbackSoakStatus>,
+}
+
+impl SoakFeedbackTrace {
+  #[cfg(feature = "resource-feedback")]
+  fn start_external(
+    bindings: &crate::application::runtime_bindings::ApplicationRunBindings,
+  ) -> Result<Self, String> {
+    if !bindings.mode().feedback_enabled() {
+      return Err("external soak feedback was selected but the runtime is fixed-policy".into());
+    }
+    if !bindings.feedback_started() {
+      return Err("external soak feedback service did not start".into());
+    }
+    let collector = bindings
+      .start_feedback_trace_for_mode("soak")?
+      .ok_or_else(|| "external soak requires a feedback trace collector".to_owned())?;
+    Ok(Self {
+      collector: Some(collector),
+    })
+  }
+
+  fn mark_phase(
+    &self,
+    phase: SoakTracePhase,
+    at: Instant,
+    rss: Option<crate::application::ProcessMemory>,
+  ) -> Result<(), String> {
+    #[cfg(feature = "resource-feedback")]
+    if let Some(collector) = &self.collector {
+      let phase = match phase {
+        SoakTracePhase::ProductionStart => FeedbackTracePhase::ProductionStart,
+        SoakTracePhase::ProductionEnd => FeedbackTracePhase::ProductionEnd,
+        SoakTracePhase::DrainEnd => FeedbackTracePhase::DrainEnd,
+        SoakTracePhase::RssBefore => FeedbackTracePhase::RssBefore,
+        SoakTracePhase::RssAfterDrain => FeedbackTracePhase::RssAfterDrain,
+        SoakTracePhase::ShutdownEnd => FeedbackTracePhase::ShutdownEnd,
+        SoakTracePhase::RssAfterShutdown => FeedbackTracePhase::RssAfterShutdown,
+      };
+      return collector.mark_phase(phase, at, rss);
+    }
+    let _ = self;
+    let _ = (phase, at, rss);
+    Ok(())
+  }
+
+  #[cfg(feature = "resource-feedback")]
+  fn mark_phase_with_bounds(
+    &self,
+    phase: SoakTracePhase,
+    at: Instant,
+    rss: Option<crate::application::ProcessMemory>,
+  ) -> Result<Option<MonotonicBounds>, String> {
+    if let Some(collector) = &self.collector {
+      let trace_phase = feedback_trace_phase(phase);
+      collector.mark_phase(trace_phase, at, rss)?;
+      let (lower_ns, upper_ns) = collector.monotonic_bounds(at)?;
+      return Ok(Some(MonotonicBounds { lower_ns, upper_ns }));
+    }
+    let _ = (self, phase, at, rss);
+    Ok(None)
+  }
+
+  #[cfg(feature = "resource-feedback")]
+  fn monotonic_bounds(&self, at: Instant) -> Result<Option<MonotonicBounds>, String> {
+    if let Some(collector) = &self.collector {
+      let (lower_ns, upper_ns) = collector.monotonic_bounds(at)?;
+      return Ok(Some(MonotonicBounds { lower_ns, upper_ns }));
+    }
+    Ok(None)
+  }
+
+  #[cfg(feature = "resource-feedback")]
+  fn has_collector(&self) -> bool {
+    self.collector.is_some()
+  }
+
+  #[cfg(not(feature = "resource-feedback"))]
+  fn has_collector(&self) -> bool {
+    false
+  }
+
+  fn capture_endpoint(&self, phase: SoakTracePhase) -> Result<EndpointTimestamp, String> {
+    #[cfg(feature = "resource-feedback")]
+    if self.has_collector() {
+      let at = Instant::now();
+      let bounds = self
+        .mark_phase_with_bounds(phase, at, None)?
+        .ok_or_else(|| "external soak trace clock bounds are unavailable".to_owned())?;
+      return Ok(EndpointTimestamp {
+        scalar_ns: bounds.lower_ns,
+        bounds: Some(bounds),
+      });
+    }
+
+    // Preserve fixed-policy v1 timestamp ordering and source.
+    let scalar_ns = monotonic_ns()?;
+    self.mark_phase(phase, Instant::now(), None)?;
+    Ok(EndpointTimestamp {
+      scalar_ns,
+      bounds: None,
+    })
+  }
+
+  fn stop_for_finalization(&mut self) -> Result<Option<SoakTraceFinalizer>, String> {
+    #[cfg(feature = "resource-feedback")]
+    {
+      self
+        .collector
+        .take()
+        .map(FeedbackTraceCollector::stop_for_finalization)
+        .transpose()
+    }
+    #[cfg(not(feature = "resource-feedback"))]
+    {
+      let _ = self;
+      Ok(None)
+    }
+  }
+}
+
+#[cfg(feature = "resource-feedback")]
+fn feedback_trace_phase(phase: SoakTracePhase) -> FeedbackTracePhase {
+  match phase {
+    SoakTracePhase::ProductionStart => FeedbackTracePhase::ProductionStart,
+    SoakTracePhase::ProductionEnd => FeedbackTracePhase::ProductionEnd,
+    SoakTracePhase::DrainEnd => FeedbackTracePhase::DrainEnd,
+    SoakTracePhase::RssBefore => FeedbackTracePhase::RssBefore,
+    SoakTracePhase::RssAfterDrain => FeedbackTracePhase::RssAfterDrain,
+    SoakTracePhase::ShutdownEnd => FeedbackTracePhase::ShutdownEnd,
+    SoakTracePhase::RssAfterShutdown => FeedbackTracePhase::RssAfterShutdown,
+  }
+}
+
+fn mark_finalizer_phase(
+  finalizer: Option<&SoakTraceFinalizer>,
+  phase: SoakTracePhase,
+  at: Instant,
+  rss: Option<crate::application::ProcessMemory>,
+) -> Result<(), String> {
+  #[cfg(feature = "resource-feedback")]
+  if let Some(finalizer) = finalizer {
+    let phase = match phase {
+      SoakTracePhase::ProductionStart => FeedbackTracePhase::ProductionStart,
+      SoakTracePhase::ProductionEnd => FeedbackTracePhase::ProductionEnd,
+      SoakTracePhase::DrainEnd => FeedbackTracePhase::DrainEnd,
+      SoakTracePhase::RssBefore => FeedbackTracePhase::RssBefore,
+      SoakTracePhase::RssAfterDrain => FeedbackTracePhase::RssAfterDrain,
+      SoakTracePhase::ShutdownEnd => FeedbackTracePhase::ShutdownEnd,
+      SoakTracePhase::RssAfterShutdown => FeedbackTracePhase::RssAfterShutdown,
+    };
+    return finalizer.mark_phase(phase, at, rss);
+  }
+  let _ = (finalizer, phase, at, rss);
+  Ok(())
+}
+
+#[cfg(feature = "resource-feedback")]
+fn finish_feedback_finalizer(
+  finalizer: Option<SoakTraceFinalizer>,
+  at: Option<Instant>,
+) -> Result<Option<MonotonicBounds>, String> {
+  let Some(finalizer) = finalizer else {
+    return Ok(None);
+  };
+  let Some(at) = at else {
+    finalizer.finish()?;
+    return Ok(None);
+  };
+  let (lower_ns, upper_ns) = finalizer.finish_at(at)?;
+  Ok(Some(MonotonicBounds { lower_ns, upper_ns }))
+}
+
+#[cfg(not(feature = "resource-feedback"))]
+fn finish_feedback_finalizer(
+  finalizer: Option<SoakTraceFinalizer>,
+  _at: Option<Instant>,
+) -> Result<Option<MonotonicBounds>, String> {
+  let _ = finalizer;
+  Ok(None)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct MonotonicBounds {
+  lower_ns: u128,
+  upper_ns: u128,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct EndpointTimestamp {
+  /// The external receipt represents each bracket by its lower endpoint.
+  scalar_ns: u128,
+  #[cfg_attr(not(feature = "resource-feedback"), allow(dead_code))]
+  bounds: Option<MonotonicBounds>,
+}
+
+impl SoakStats {
+  fn record_endpoint(&mut self, phase: SoakTracePhase, endpoint: EndpointTimestamp) {
+    match phase {
+      #[cfg(feature = "resource-feedback")]
+      SoakTracePhase::ProductionStart => {
+        self.started_monotonic_ns = endpoint.scalar_ns;
+        self.started_monotonic_bounds = endpoint.bounds;
+      }
+      SoakTracePhase::ProductionEnd => {
+        self.trace_ended_monotonic_ns = endpoint.scalar_ns;
+        self.trace_ended_monotonic_bounds = endpoint.bounds;
+      }
+      SoakTracePhase::DrainEnd => {
+        self.drain_ended_monotonic_ns = endpoint.scalar_ns;
+        self.drain_ended_monotonic_bounds = endpoint.bounds;
+      }
+      SoakTracePhase::ShutdownEnd => {
+        self.shutdown_ended_monotonic_ns = endpoint.scalar_ns;
+        self.shutdown_ended_monotonic_bounds = endpoint.bounds;
+      }
+      SoakTracePhase::RssBefore
+      | SoakTracePhase::RssAfterDrain
+      | SoakTracePhase::RssAfterShutdown => {}
+    }
+  }
+}
+
+fn application_mode_from_value(value: Option<&str>) -> Result<ApplicationMode, String> {
+  ApplicationMode::from_comparison_family(value)
+}
+
+fn application_mode_from_environment() -> Result<ApplicationMode, String> {
+  match std::env::var("ALLOCATBELT_APP_COMPARISON_FAMILY") {
+    Ok(value) => application_mode_from_value(Some(&value)),
+    Err(std::env::VarError::NotPresent) => application_mode_from_value(None),
+    Err(std::env::VarError::NotUnicode(_)) => {
+      Err("ALLOCATBELT_APP_COMPARISON_FAMILY is not valid Unicode".into())
+    }
+  }
+}
+
+#[cfg(feature = "resource-feedback")]
+fn feedback_failure_label(failure: FeedbackWorkerFailure) -> &'static str {
+  match failure {
+    FeedbackWorkerFailure::Panicked => "panicked",
+    FeedbackWorkerFailure::ClockExhausted => "clock_exhausted",
+    FeedbackWorkerFailure::PayloadCleanupPanicked => "payload_cleanup_panicked",
+  }
 }
 
 #[derive(Default)]
@@ -202,6 +515,16 @@ struct SoakStats {
   shutdown_ended_monotonic_ns: u128,
   postprocess_ended_monotonic_ns: u128,
   ended_monotonic_ns: u128,
+  #[cfg_attr(not(feature = "resource-feedback"), allow(dead_code))]
+  started_monotonic_bounds: Option<MonotonicBounds>,
+  #[cfg_attr(not(feature = "resource-feedback"), allow(dead_code))]
+  trace_ended_monotonic_bounds: Option<MonotonicBounds>,
+  #[cfg_attr(not(feature = "resource-feedback"), allow(dead_code))]
+  drain_ended_monotonic_bounds: Option<MonotonicBounds>,
+  #[cfg_attr(not(feature = "resource-feedback"), allow(dead_code))]
+  shutdown_ended_monotonic_bounds: Option<MonotonicBounds>,
+  #[cfg_attr(not(feature = "resource-feedback"), allow(dead_code))]
+  postprocess_ended_monotonic_bounds: Option<MonotonicBounds>,
   qualified_horizon: bool,
 }
 
@@ -219,6 +542,8 @@ struct ReceiptData<'a> {
   global: DomainSnapshot,
   tenant: DomainSnapshot,
   baseline_control: usize,
+  #[cfg(feature = "resource-feedback")]
+  feedback: Option<FeedbackSoakStatus>,
 }
 
 struct OperationContext {
@@ -317,6 +642,7 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<SoakArgs, String
     .or_else(|| std::env::var("ALLOCATBELT_SOAK_RESOURCE_CEILING_SHA256").ok())
     .ok_or_else(|| "--resource-ceiling-sha256 is required".to_owned())?;
   validate_sha256(&ceiling, "resource ceiling")?;
+  let comparison_mode = application_mode_from_environment()?;
   let duration = Duration::from_secs(duration_seconds);
   let sample_interval = Duration::from_millis(interval_ms);
   if interval_ms != SAMPLE_INTERVAL_MS {
@@ -351,6 +677,7 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<SoakArgs, String
     output_dir,
     profile,
     resource_ceiling_sha256: ceiling,
+    comparison_mode,
   })
 }
 
@@ -437,7 +764,11 @@ impl SoakIdentity {
 }
 
 impl OutputFiles {
-  fn create(identity: &SoakIdentity, ring: &ReferenceRing) -> Result<Self, String> {
+  fn create(
+    identity: &SoakIdentity,
+    ring: &ReferenceRing,
+    comparison_mode: ApplicationMode,
+  ) -> Result<Self, String> {
     let paths = [
       identity.report.clone(),
       identity.terminals.clone(),
@@ -456,6 +787,11 @@ impl OutputFiles {
       report: None,
       terminals: None,
       samples: None,
+      incomplete_marker: if comparison_mode.feedback_enabled() {
+        "allocatbelt.runtime-soak-incomplete.v2"
+      } else {
+        "allocatbelt.runtime-soak-incomplete.v1"
+      },
       committed: false,
     };
     output.report = Some(
@@ -467,7 +803,8 @@ impl OutputFiles {
         .report
         .as_mut()
         .ok_or("receipt stream was not opened")?,
-      "allocatbelt.runtime-soak-incomplete.v1"
+      "{}",
+      output.incomplete_marker,
     )
     .map_err(|error| format!("soak incomplete marker write failed: {error}"))?;
     output
@@ -657,6 +994,18 @@ impl OutputFiles {
   }
 
   fn complete(&mut self, receipt: ReceiptData<'_>) -> Result<(), String> {
+    #[cfg(feature = "resource-feedback")]
+    if receipt.args.comparison_mode.feedback_enabled() {
+      return self.complete_external(receipt);
+    }
+    #[cfg(not(feature = "resource-feedback"))]
+    if receipt.args.comparison_mode.feedback_enabled() {
+      return Err("external-pressure soak receipt requires the resource-feedback feature".into());
+    }
+    self.complete_fixed(receipt)
+  }
+
+  fn complete_fixed(&mut self, receipt: ReceiptData<'_>) -> Result<(), String> {
     let ReceiptData {
       identity,
       args,
@@ -671,6 +1020,7 @@ impl OutputFiles {
       global,
       tenant,
       baseline_control,
+      ..
     } = receipt;
     let mut file = open_exclusive_private(&self.report_temp_path)
       .map_err(|error| format!("exclusive soak receipt temp create failed: {error}"))?;
@@ -761,6 +1111,370 @@ impl OutputFiles {
     Ok(())
   }
 
+  #[cfg(feature = "resource-feedback")]
+  fn complete_external(&mut self, receipt: ReceiptData<'_>) -> Result<(), String> {
+    let ReceiptData {
+      identity,
+      args,
+      ring_sha256,
+      ring_rows,
+      ring_average_rate_per_second,
+      stats,
+      terminal_sha,
+      sample_sha,
+      first_hour_median_kib,
+      final_hour_median_kib,
+      global,
+      tenant,
+      baseline_control,
+      feedback,
+    } = receipt;
+    let feedback = feedback
+      .ok_or_else(|| "external soak receipt has no captured feedback service status".to_owned())?;
+    if !feedback.started
+      || !feedback.joined
+      || feedback.worker_failure.is_some()
+      || !feedback.trace_worker_joined
+    {
+      return Err("external soak feedback service or trace worker did not join".into());
+    }
+    let started_bounds = stats.started_monotonic_bounds.ok_or_else(|| {
+      "external soak receipt omitted the production-start clock bounds".to_owned()
+    })?;
+    let trace_ended_bounds = stats
+      .trace_ended_monotonic_bounds
+      .ok_or_else(|| "external soak receipt omitted the production-end clock bounds".to_owned())?;
+    let drain_ended_bounds = stats
+      .drain_ended_monotonic_bounds
+      .ok_or_else(|| "external soak receipt omitted the drain-end clock bounds".to_owned())?;
+    let shutdown_ended_bounds = stats
+      .shutdown_ended_monotonic_bounds
+      .ok_or_else(|| "external soak receipt omitted the shutdown-end clock bounds".to_owned())?;
+    let postprocess_ended_bounds = stats
+      .postprocess_ended_monotonic_bounds
+      .ok_or_else(|| "external soak receipt omitted the postprocess clock bounds".to_owned())?;
+    for (scalar, bounds) in [
+      (stats.started_monotonic_ns, started_bounds),
+      (stats.trace_ended_monotonic_ns, trace_ended_bounds),
+      (stats.drain_ended_monotonic_ns, drain_ended_bounds),
+      (stats.shutdown_ended_monotonic_ns, shutdown_ended_bounds),
+      (
+        stats.postprocess_ended_monotonic_ns,
+        postprocess_ended_bounds,
+      ),
+    ] {
+      if bounds.lower_ns > bounds.upper_ns || scalar != bounds.lower_ns {
+        return Err(
+          "external soak scalar timestamp is not the lower endpoint of its TraceClock bracket"
+            .into(),
+        );
+      }
+    }
+    let terminal_name = safe_basename(&self.paths[1])?;
+    let sample_name = safe_basename(&self.paths[2])?;
+    use crate::application::feedback_policy_probe as json;
+    let receipt_value = json::json_object([
+      (
+        "schema",
+        json::json_string_value("allocatbelt.runtime-soak.v2"),
+      ),
+      (
+        "campaign_id",
+        json::json_string_value(identity.campaign_id.as_str()),
+      ),
+      (
+        "host_id",
+        json::json_string_value(identity.host_id.as_str()),
+      ),
+      ("run_id", json::json_string_value(identity.run_id.as_str())),
+      ("nonce", json::json_string_value(identity.nonce.as_str())),
+      (
+        "allocator",
+        json::json_string_value(identity.allocator.as_str()),
+      ),
+      (
+        "executor",
+        json::json_string_value(identity.executor.as_str()),
+      ),
+      ("workload", json::json_string_value("mixed")),
+      ("profile", json::json_string_value(args.profile.as_str())),
+      (
+        "comparison_family",
+        json::json_string_value("external_pressure"),
+      ),
+      ("mode", json::json_string_value("soak")),
+      ("qualification_eligible", json::json_bool(false)),
+      (
+        "source_sha256",
+        json::json_string_value(identity.source_sha256.as_str()),
+      ),
+      (
+        "binary_sha256",
+        json::json_string_value(identity.binary_sha256.as_str()),
+      ),
+      (
+        "resource_ceiling_sha256",
+        json::json_string_value(identity.resource_ceiling_sha256.as_str()),
+      ),
+      (
+        "reference_ring_sha256",
+        json::json_string_value(digest_hex(ring_sha256)),
+      ),
+      ("reference_ring_rows", json::json_usize(ring_rows)?),
+      (
+        "reference_average_rate_per_second",
+        json::json_u64(ring_average_rate_per_second),
+      ),
+      ("duration_seconds", json::json_u64(args.duration.as_secs())),
+      (
+        "sample_interval_ms",
+        json::json_u128(args.sample_interval.as_millis()),
+      ),
+      ("warmup_seconds", json::json_u64(WARMUP_SECONDS)),
+      ("logical_window", json::json_usize(WINDOW)?),
+      ("attempted", json::json_u64(stats.attempted)),
+      ("completed", json::json_u64(stats.completed)),
+      ("errors", json::json_u64(stats.errors)),
+      ("lost", json::json_u64(stats.lost)),
+      ("terminal_records", json::json_u64(stats.completed)),
+      (
+        "terminal_stream_sha256",
+        json::json_string_value(digest_hex(terminal_sha)),
+      ),
+      (
+        "terminal_stream_relative_path",
+        json::json_string_value(terminal_name),
+      ),
+      ("resource_samples_count", json::json_u64(stats.sample_count)),
+      (
+        "resource_samples_sha256",
+        json::json_string_value(digest_hex(sample_sha)),
+      ),
+      (
+        "resource_samples_relative_path",
+        json::json_string_value(sample_name),
+      ),
+      (
+        "first_post_warmup_hour_rss_median_kib",
+        first_hour_median_kib.map_or_else(json::json_null, json::json_u64),
+      ),
+      (
+        "final_hour_rss_median_kib",
+        final_hour_median_kib.map_or_else(json::json_null, json::json_u64),
+      ),
+      ("feedback_started", json::json_bool(feedback.started)),
+      ("feedback_worker_joined", json::json_bool(feedback.joined)),
+      (
+        "feedback_worker_failure",
+        feedback
+          .worker_failure
+          .map_or_else(json::json_null, json::json_string_value),
+      ),
+      (
+        "feedback_trace_worker_joined",
+        json::json_bool(feedback.trace_worker_joined),
+      ),
+      (
+        "qualified_horizon",
+        json::json_bool(stats.qualified_horizon),
+      ),
+      (
+        "started_monotonic_ns",
+        json::json_u128(stats.started_monotonic_ns),
+      ),
+      (
+        "started_monotonic_lower_ns",
+        json::json_u128(started_bounds.lower_ns),
+      ),
+      (
+        "started_monotonic_upper_ns",
+        json::json_u128(started_bounds.upper_ns),
+      ),
+      (
+        "trace_ended_monotonic_ns",
+        json::json_u128(stats.trace_ended_monotonic_ns),
+      ),
+      (
+        "trace_ended_monotonic_lower_ns",
+        json::json_u128(trace_ended_bounds.lower_ns),
+      ),
+      (
+        "trace_ended_monotonic_upper_ns",
+        json::json_u128(trace_ended_bounds.upper_ns),
+      ),
+      (
+        "drain_ended_monotonic_ns",
+        json::json_u128(stats.drain_ended_monotonic_ns),
+      ),
+      (
+        "drain_ended_monotonic_lower_ns",
+        json::json_u128(drain_ended_bounds.lower_ns),
+      ),
+      (
+        "drain_ended_monotonic_upper_ns",
+        json::json_u128(drain_ended_bounds.upper_ns),
+      ),
+      (
+        "shutdown_ended_monotonic_ns",
+        json::json_u128(stats.shutdown_ended_monotonic_ns),
+      ),
+      (
+        "shutdown_ended_monotonic_lower_ns",
+        json::json_u128(shutdown_ended_bounds.lower_ns),
+      ),
+      (
+        "shutdown_ended_monotonic_upper_ns",
+        json::json_u128(shutdown_ended_bounds.upper_ns),
+      ),
+      (
+        "postprocess_ended_monotonic_ns",
+        json::json_u128(stats.postprocess_ended_monotonic_ns),
+      ),
+      (
+        "postprocess_ended_monotonic_lower_ns",
+        json::json_u128(postprocess_ended_bounds.lower_ns),
+      ),
+      (
+        "postprocess_ended_monotonic_upper_ns",
+        json::json_u128(postprocess_ended_bounds.upper_ns),
+      ),
+      (
+        "ended_monotonic_ns",
+        json::json_u128(stats.ended_monotonic_ns),
+      ),
+      (
+        "actual_trace_duration_ns",
+        json::json_u128(
+          stats
+            .trace_ended_monotonic_ns
+            .saturating_sub(stats.started_monotonic_ns),
+        ),
+      ),
+      (
+        "drain_duration_ns",
+        json::json_u128(
+          stats
+            .drain_ended_monotonic_ns
+            .saturating_sub(stats.trace_ended_monotonic_ns),
+        ),
+      ),
+      (
+        "shutdown_duration_ns",
+        json::json_u128(
+          stats
+            .shutdown_ended_monotonic_ns
+            .saturating_sub(stats.drain_ended_monotonic_ns),
+        ),
+      ),
+      (
+        "postprocess_after_shutdown_ns",
+        json::json_u128(
+          stats
+            .postprocess_ended_monotonic_ns
+            .saturating_sub(stats.shutdown_ended_monotonic_ns),
+        ),
+      ),
+      (
+        "production_cpu_started_ns",
+        json::json_u128(stats.production_cpu_started_ns),
+      ),
+      (
+        "production_cpu_ended_ns",
+        json::json_u128(stats.production_cpu_ended_ns),
+      ),
+      (
+        "production_cpu_ns",
+        json::json_u128(
+          stats
+            .production_cpu_ended_ns
+            .saturating_sub(stats.production_cpu_started_ns),
+        ),
+      ),
+      (
+        "final_global_live_tenants",
+        json::json_usize(global.live_tenants)?,
+      ),
+      (
+        "final_global_cpu_used",
+        json::json_usize(global.used.get(DomainResource::Cpu))?,
+      ),
+      (
+        "final_global_memory_used",
+        json::json_usize(global.used.get(DomainResource::Memory))?,
+      ),
+      (
+        "final_global_disk_used",
+        json::json_usize(global.used.get(DomainResource::Disk))?,
+      ),
+      (
+        "final_global_network_used",
+        json::json_usize(global.used.get(DomainResource::Network))?,
+      ),
+      (
+        "final_global_tasks_used",
+        json::json_usize(global.used.get(DomainResource::Tasks))?,
+      ),
+      (
+        "final_global_control_used",
+        json::json_usize(global.used.get(DomainResource::Control))?,
+      ),
+      (
+        "fixed_global_control_baseline",
+        json::json_usize(baseline_control)?,
+      ),
+      (
+        "final_tenant_cpu_used",
+        json::json_usize(tenant.used.get(DomainResource::Cpu))?,
+      ),
+      (
+        "final_tenant_memory_used",
+        json::json_usize(tenant.used.get(DomainResource::Memory))?,
+      ),
+      (
+        "final_tenant_disk_used",
+        json::json_usize(tenant.used.get(DomainResource::Disk))?,
+      ),
+      (
+        "final_tenant_network_used",
+        json::json_usize(tenant.used.get(DomainResource::Network))?,
+      ),
+      (
+        "final_tenant_tasks_used",
+        json::json_usize(tenant.used.get(DomainResource::Tasks))?,
+      ),
+      (
+        "final_tenant_control_used",
+        json::json_usize(tenant.used.get(DomainResource::Control))?,
+      ),
+      ("final_scope_memory_used", json::json_u64(0)),
+      ("final_scope_disk_used", json::json_u64(0)),
+      ("final_scope_network_used", json::json_u64(0)),
+    ])?;
+    let mut json_bytes = [0u8; MAX_EXTERNAL_RECEIPT_JSON_BYTES];
+    let json_length = {
+      let mut output = FixedJsonBuffer {
+        bytes: &mut json_bytes,
+        length: 0,
+      };
+      json::write_canonical_json(&receipt_value, &mut output)?;
+      output.length
+    };
+    drop(receipt_value);
+    let mut file = open_exclusive_private(&self.report_temp_path)
+      .map_err(|error| format!("exclusive soak receipt temp create failed: {error}"))?;
+    file
+      .write_all(&json_bytes[..json_length])
+      .map_err(|error| format!("canonical external soak receipt write failed: {error}"))?;
+    file
+      .sync_all()
+      .map_err(|error| format!("external soak receipt temp sync failed: {error}"))?;
+    drop(file);
+    std::fs::rename(&self.report_temp_path, &self.paths[0])
+      .map_err(|error| format!("atomic external soak receipt publish failed: {error}"))?;
+    self.report.take();
+    Ok(())
+  }
+
   fn commit(&mut self) {
     self.committed = true;
   }
@@ -770,7 +1484,7 @@ impl Drop for OutputFiles {
   fn drop(&mut self) {
     if !self.committed {
       if let Some(report) = self.report.as_mut() {
-        let _ = writeln!(report, "\nallocatbelt.runtime-soak-incomplete.v1");
+        let _ = writeln!(report, "\n{}", self.incomplete_marker);
         let _ = report.sync_all();
       }
       if let Some(terminals) = self.terminals.as_mut() {
@@ -1345,11 +2059,12 @@ fn compress(state: &mut [u32; 8], block: &[u8; 64]) {
 }
 
 fn run_soak(args: SoakArgs, identity: SoakIdentity) -> Result<(), String> {
-  validate_fixed_policy_request(
-    std::env::var("ALLOCATBELT_APP_COMPARISON_FAMILY")
-      .ok()
-      .as_deref(),
-  )?;
+  if application_mode_from_environment()? != args.comparison_mode {
+    return Err("soak comparison family changed after argument validation".into());
+  }
+  if args.comparison_mode.feedback_enabled() {
+    validate_external_feedback_identity(&args, &identity)?;
+  }
   let workers = if args.profile == "oversubscribed" {
     2
   } else {
@@ -1384,10 +2099,10 @@ fn run_soak(args: SoakArgs, identity: SoakIdentity) -> Result<(), String> {
     .map_err(|error| format!("RSS median storage exceeded Control admission: {error:?}"))?;
   let mut first_hour_rss = reserve_u64_vec(median_value_count)?;
   let mut final_hour_rss = reserve_u64_vec(median_value_count)?;
-  let mut outputs = OutputFiles::create(&identity, &charged_ring.ring)?;
+  let mut outputs = OutputFiles::create(&identity, &charged_ring.ring, args.comparison_mode)?;
   let readback_domain = application_domain.readback_domain();
   let fixed_global_control_baseline = application_domain.fixed_global_control_baseline();
-  let result = run_native_session(
+  let session = run_native_session(
     &application_domain,
     &args,
     &charged_ring.ring,
@@ -1395,7 +2110,13 @@ fn run_soak(args: SoakArgs, identity: SoakIdentity) -> Result<(), String> {
     &mut first_hour_rss,
     &mut final_hour_rss,
   );
-  let mut stats = result?;
+  let mut session = session?;
+  let mut stats = session.stats;
+  if args.comparison_mode.feedback_enabled() != session.feedback_finalizer.is_some()
+    || args.comparison_mode.feedback_enabled() != session.feedback_status.is_some()
+  {
+    return Err("soak runtime feedback status differs from the selected comparison family".into());
+  }
   verify_reference_ring_unchanged(&args.reference_path, &mut charged_ring.ring)?;
   let (terminal_sha, sample_sha) = outputs.seal_streams()?;
   let first_hour_median = median(&mut first_hour_rss);
@@ -1415,12 +2136,30 @@ fn run_soak(args: SoakArgs, identity: SoakIdentity) -> Result<(), String> {
   drop(metadata_charge);
   tenant.close();
   drop(application_domain);
+  if let Some(finalizer) = session.feedback_finalizer.as_ref() {
+    let rss_after_shutdown = crate::application::sample_process_memory()?;
+    let at = Instant::now();
+    mark_finalizer_phase(
+      Some(finalizer),
+      SoakTracePhase::RssAfterShutdown,
+      at,
+      Some(rss_after_shutdown),
+    )?;
+  }
+  let postprocess_at = args.comparison_mode.feedback_enabled().then(Instant::now);
+  if let Some(bounds) =
+    finish_feedback_finalizer(session.feedback_finalizer.take(), postprocess_at)?
+  {
+    stats.postprocess_ended_monotonic_ns = bounds.lower_ns;
+    stats.postprocess_ended_monotonic_bounds = Some(bounds);
+  } else {
+    stats.postprocess_ended_monotonic_ns = monotonic_ns()?;
+  }
   let tenant_final = tenant
     .snapshot()
     .map_err(|error| format!("final tenant readback failed: {error:?}"))?;
   drop(tenant);
   let global_final = readback_domain.snapshot();
-  stats.postprocess_ended_monotonic_ns = monotonic_ns()?;
   stats.ended_monotonic_ns = stats.postprocess_ended_monotonic_ns;
   stats.qualified_horizon = qualifies_horizon(
     args.duration,
@@ -1446,6 +2185,8 @@ fn run_soak(args: SoakArgs, identity: SoakIdentity) -> Result<(), String> {
     global: global_final,
     tenant: tenant_final,
     baseline_control: fixed_global_control_baseline,
+    #[cfg(feature = "resource-feedback")]
+    feedback: session.feedback_status,
   })?;
   drop(identity);
   drop(args);
@@ -1454,14 +2195,38 @@ fn run_soak(args: SoakArgs, identity: SoakIdentity) -> Result<(), String> {
   Ok(())
 }
 
-fn validate_fixed_policy_request(value: Option<&str>) -> Result<(), String> {
-  match value {
-    None | Some("fixed_policy") => Ok(()),
-    Some("external_pressure") => {
-      Err("external-pressure comparison is unsupported by the fixed-policy soak v1 contract".into())
+fn validate_external_feedback_identity(
+  args: &SoakArgs,
+  identity: &SoakIdentity,
+) -> Result<(), String> {
+  for (name, expected) in [
+    ("ALLOCATBELT_APP_REPORT_NONCE", identity.nonce.as_str()),
+    ("ALLOCATBELT_APP_RUN_ID", identity.run_id.as_str()),
+    ("ALLOCATBELT_APP_EXECUTOR", identity.executor.as_str()),
+    ("ALLOCATBELT_APP_ALLOCATOR", identity.allocator.as_str()),
+    ("ALLOCATBELT_APP_WORKLOAD", "mixed"),
+    ("ALLOCATBELT_APP_PROFILE", args.profile.as_str()),
+    (
+      "ALLOCATBELT_APP_SOURCE_SHA256",
+      identity.source_sha256.as_str(),
+    ),
+    (
+      "ALLOCATBELT_APP_BINARY_SHA256",
+      identity.binary_sha256.as_str(),
+    ),
+  ] {
+    match std::env::var(name) {
+      Ok(value) if value == expected => {}
+      Ok(_) => return Err(format!("{name} differs from the pinned soak identity")),
+      Err(std::env::VarError::NotPresent) => {
+        return Err(format!("{name} is required for external soak feedback"));
+      }
+      Err(std::env::VarError::NotUnicode(_)) => {
+        return Err(format!("{name} is not valid Unicode"));
+      }
     }
-    Some(_) => Err("soak v1 supports only the fixed_policy comparison family".into()),
   }
+  Ok(())
 }
 
 fn fixed_metadata_charge(args: &SoakArgs, identity: &SoakIdentity) -> Result<usize, String> {
@@ -1473,6 +2238,8 @@ fn fixed_metadata_charge(args: &SoakArgs, identity: &SoakIdentity) -> Result<usi
     .and_then(|value| value.checked_add(std::mem::size_of::<OperationContext>()))
     .and_then(|value| value.checked_add(std::mem::size_of::<SampleAccumulator<'static>>()))
     .and_then(|value| value.checked_add(std::mem::size_of::<ReceiptData<'static>>()))
+    .and_then(|value| value.checked_add(std::mem::size_of::<OutputFiles>()))
+    .and_then(|value| value.checked_add(std::mem::size_of::<SoakSessionResult>()))
     .and_then(|value| value.checked_add(std::mem::size_of::<[Option<TerminalSlot>; WINDOW]>()))
     .and_then(|value| value.checked_add(std::mem::size_of::<SoakStats>()))
     // Precharge the caller-owned poll frame and bounded RSS/I/O-row/hash scratch
@@ -1885,7 +2652,7 @@ fn run_native_session(
   outputs: &mut OutputFiles,
   first_hour_rss: &mut Vec<u64>,
   final_hour_rss: &mut Vec<u64>,
-) -> Result<SoakStats, String> {
+) -> Result<SoakSessionResult, String> {
   let workers = if args.profile == "oversubscribed" {
     2
   } else {
@@ -1919,13 +2686,30 @@ fn run_native_session(
   .disk_rate(rate_config)
   .upload_rate(rate_config)
   .download_rate(rate_config);
+  #[cfg(feature = "resource-feedback")]
+  let builder = if args.comparison_mode.feedback_enabled() {
+    let factory = application_domain
+      .feedback_factory()?
+      .ok_or_else(|| "external soak omitted its feedback service factory".to_owned())?;
+    builder.feedback_sources(factory)
+  } else {
+    builder
+  };
   let mut driver = builder
     .build()
     .map_err(|error| format!("owning soak runtime startup failed: {error}"))?;
   let mut scope = None;
   let mut run_bindings = None;
-  let run_result = (|| {
+  let mut feedback_trace = SoakFeedbackTrace::default();
+  let run_result: Result<SoakStats, String> = (|| {
     let bindings = application_domain.for_native(&driver)?;
+    if bindings.mode() != args.comparison_mode {
+      return Err("soak runtime comparison family differs from its frozen arguments".into());
+    }
+    #[cfg(feature = "resource-feedback")]
+    if args.comparison_mode.feedback_enabled() {
+      feedback_trace = SoakFeedbackTrace::start_external(&bindings)?;
+    }
     let resources = bindings.resources();
     let io = bindings.io();
     let child_scope = driver
@@ -1950,11 +2734,63 @@ fn run_native_session(
     let net = NetHandle::new(blocking_handle, resources.clone(), reactor.clone(), 1)
       .map_err(|error| format!("soak network handle startup failed: {error}"))?;
     let (listener, address) = native_listener(&reactor)?;
-    let mut stats = SoakStats {
-      started_monotonic_ns: monotonic_ns()?,
-      ..SoakStats::default()
+    #[cfg(feature = "resource-feedback")]
+    let startup_observation = if args.comparison_mode.feedback_enabled() {
+      Some(bindings.wait_for_feedback_startup_observation()?)
+    } else {
+      None
     };
+    #[cfg(not(feature = "resource-feedback"))]
+    if args.comparison_mode.feedback_enabled() {
+      return Err("external-pressure soak requires the resource-feedback feature".into());
+    }
+    if args.comparison_mode.feedback_enabled() {
+      let rss_before = crate::application::sample_process_memory()?;
+      feedback_trace.mark_phase(SoakTracePhase::RssBefore, Instant::now(), Some(rss_before))?;
+    }
+    let mut stats = SoakStats::default();
+    if !args.comparison_mode.feedback_enabled() {
+      stats.started_monotonic_ns = monotonic_ns()?;
+    }
     let started = Instant::now();
+    if args.comparison_mode.feedback_enabled() {
+      #[cfg(feature = "resource-feedback")]
+      {
+        let startup_sample = startup_observation
+          .ok_or_else(|| "external soak startup telemetry observation is missing".to_owned())?;
+        let production_bounds = feedback_trace
+          .monotonic_bounds(started)?
+          .ok_or_else(|| "external soak trace clock bounds are unavailable".to_owned())?;
+        let sample_bounds = feedback_trace
+          .monotonic_bounds(startup_sample)?
+          .ok_or_else(|| "external soak startup TraceClock is unavailable".to_owned())?;
+        bindings.validate_feedback_startup_observation(
+          startup_sample,
+          started,
+          Some((sample_bounds.lower_ns, sample_bounds.upper_ns)),
+          Some((production_bounds.lower_ns, production_bounds.upper_ns)),
+        )?;
+        let bounds = feedback_trace
+          .mark_phase_with_bounds(SoakTracePhase::ProductionStart, started, None)?
+          .ok_or_else(|| "external soak production-start TraceClock is unavailable".to_owned())?;
+        if bounds != production_bounds {
+          return Err(
+            "soak production-start TraceClock changed across one captured Instant".into(),
+          );
+        }
+        stats.record_endpoint(
+          SoakTracePhase::ProductionStart,
+          EndpointTimestamp {
+            scalar_ns: bounds.lower_ns,
+            bounds: Some(bounds),
+          },
+        );
+      }
+      #[cfg(not(feature = "resource-feedback"))]
+      {
+        return Err("external-pressure soak requires the resource-feedback feature".into());
+      }
+    }
     let cpu_start = process_cpu_time_ns();
     {
       let mut samples = SampleAccumulator {
@@ -1984,6 +2820,7 @@ fn run_native_session(
       started,
       stats,
       cpu_start,
+      &feedback_trace,
     );
     if std::mem::size_of_val(&future) > MAX_ROOT_FUTURE_BYTES {
       return Err("soak root future exceeded its precharged 64 KiB Control bound".into());
@@ -1992,18 +2829,130 @@ fn run_native_session(
       .block_on(future)
       .map_err(|error| format!("soak root future failed: {error}"));
     run_bindings = Some(bindings);
-    driven?
+    let stats = driven??;
+    if args.comparison_mode.feedback_enabled() {
+      let rss_after_drain = crate::application::sample_process_memory()?;
+      feedback_trace.mark_phase(
+        SoakTracePhase::RssAfterDrain,
+        Instant::now(),
+        Some(rss_after_drain),
+      )?;
+      let drain_upper_ns = stats
+        .drain_ended_monotonic_bounds
+        .ok_or_else(|| "external soak omitted its drain-end clock bracket".to_owned())?
+        .upper_ns;
+      #[cfg(feature = "resource-feedback")]
+      {
+        let trace = &feedback_trace;
+        run_bindings
+          .as_ref()
+          .ok_or_else(|| "external soak lost its feedback bindings after drain".to_owned())?
+          .wait_for_feedback_observation_after(drain_upper_ns, |sample_at| {
+            trace
+              .monotonic_bounds(sample_at)?
+              .map(|bounds| (bounds.lower_ns, bounds.upper_ns))
+              .ok_or_else(|| "external soak post-drain sample lost its TraceClock".to_owned())
+          })?;
+      }
+      #[cfg(not(feature = "resource-feedback"))]
+      {
+        let _ = drain_upper_ns;
+        return Err("external-pressure soak requires the resource-feedback feature".into());
+      }
+    }
+    Ok(stats)
   })();
   let shutdown_result = shutdown_native(&mut driver, scope.take());
+  let feedback_shutdown_result = if args.comparison_mode.feedback_enabled() {
+    run_bindings.as_mut().map_or(Ok(()), |bindings| {
+      bindings.shutdown_feedback(Duration::from_secs(60))
+    })
+  } else {
+    Ok(())
+  };
+  let timer_shutdown_result = if args.comparison_mode.feedback_enabled() {
+    run_bindings
+      .as_mut()
+      .map_or(Ok(()), |bindings| bindings.shutdown_auxiliary_timer())
+  } else {
+    Ok(())
+  };
+  let mut shutdown_endpoint = None;
+  let shutdown_phase_result = if args.comparison_mode.feedback_enabled() {
+    if feedback_trace.has_collector() {
+      match feedback_trace.capture_endpoint(SoakTracePhase::ShutdownEnd) {
+        Ok(endpoint) => {
+          shutdown_endpoint = Some(endpoint);
+          Ok(())
+        }
+        Err(error) => Err(error),
+      }
+    } else {
+      feedback_trace.mark_phase(SoakTracePhase::ShutdownEnd, Instant::now(), None)
+    }
+  } else {
+    Ok(())
+  };
+  let feedback_finalizer = feedback_trace.stop_for_finalization()?;
+  let feedback_status: Option<FeedbackSoakStatus> = if args.comparison_mode.feedback_enabled() {
+    #[cfg(feature = "resource-feedback")]
+    {
+      let bindings = run_bindings
+        .as_ref()
+        .ok_or_else(|| "external soak lost its owning runtime bindings".to_owned())?;
+      let (joined, worker_failure) = bindings.feedback_shutdown_status().ok_or_else(|| {
+        "external soak feedback metrics were not retained through shutdown".to_owned()
+      })?;
+      Some(FeedbackSoakStatus {
+        started: bindings.feedback_started(),
+        joined,
+        worker_failure: worker_failure.map(feedback_failure_label),
+        trace_worker_joined: feedback_finalizer.is_some(),
+      })
+    }
+    #[cfg(not(feature = "resource-feedback"))]
+    {
+      return Err("external-pressure soak requires the resource-feedback feature".into());
+    }
+  } else {
+    None
+  };
+  let feedback_health_result = if args.comparison_mode.feedback_enabled() {
+    run_bindings.as_ref().map_or(Ok(()), |bindings| {
+      bindings.validate_feedback_health("after_shutdown")
+    })
+  } else {
+    Ok(())
+  };
   let quiet_result = run_bindings.as_ref().map_or(Ok(()), validate_runtime_quiet);
   drop(run_bindings);
   drop(driver);
   let mut stats = run_result?;
   shutdown_result?;
+  feedback_shutdown_result?;
+  timer_shutdown_result?;
+  shutdown_phase_result?;
+  feedback_health_result?;
   quiet_result?;
-  stats.shutdown_ended_monotonic_ns = monotonic_ns()?;
+  if let Some(endpoint) = shutdown_endpoint {
+    stats.record_endpoint(SoakTracePhase::ShutdownEnd, endpoint);
+  } else {
+    stats.shutdown_ended_monotonic_ns = monotonic_ns()?;
+  }
   stats.ended_monotonic_ns = stats.shutdown_ended_monotonic_ns;
-  Ok(stats)
+  if let Some(status) = feedback_status
+    && (!status.started
+      || !status.joined
+      || status.worker_failure.is_some()
+      || !status.trace_worker_joined)
+  {
+    return Err("external soak feedback or trace worker did not finish cleanly".into());
+  }
+  Ok(SoakSessionResult {
+    stats,
+    feedback_finalizer,
+    feedback_status,
+  })
 }
 
 fn validate_runtime_quiet(
@@ -2110,6 +3059,7 @@ async fn drive_window(
   started: Instant,
   mut stats: SoakStats,
   cpu_start: u128,
+  feedback_trace: &SoakFeedbackTrace,
 ) -> Result<SoakStats, String> {
   let events = Arc::new(EventQueue::new());
   let stop = Arc::new(StopSignal::new());
@@ -2152,7 +3102,8 @@ async fn drive_window(
     if !stopping && Instant::now() >= deadline {
       stopping = true;
       stop.close_http_admission();
-      stats.trace_ended_monotonic_ns = monotonic_ns()?;
+      let endpoint = feedback_trace.capture_endpoint(SoakTracePhase::ProductionEnd)?;
+      stats.record_endpoint(SoakTracePhase::ProductionEnd, endpoint);
     }
     if !stopping {
       while let Some(index) = slots.iter().position(Option::is_none) {
@@ -2237,8 +3188,15 @@ async fn drive_window(
       slots.iter().all(Option::is_none),
       acceptor_finished,
     ) {
-      stats.drain_ended_monotonic_ns = monotonic_ns()?;
-      stats.production_cpu_ended_ns = process_cpu_time_ns();
+      if feedback_trace.has_collector() {
+        stats.production_cpu_ended_ns = process_cpu_time_ns();
+        let endpoint = feedback_trace.capture_endpoint(SoakTracePhase::DrainEnd)?;
+        stats.record_endpoint(SoakTracePhase::DrainEnd, endpoint);
+      } else {
+        stats.drain_ended_monotonic_ns = monotonic_ns()?;
+        stats.production_cpu_ended_ns = process_cpu_time_ns();
+        feedback_trace.mark_phase(SoakTracePhase::DrainEnd, Instant::now(), None)?;
+      }
       break;
     }
 
@@ -2342,7 +3300,8 @@ async fn drive_window(
         if now_elapsed >= args.duration && !stopping {
           stopping = true;
           stop.close_http_admission();
-          stats.trace_ended_monotonic_ns = monotonic_ns()?;
+          let endpoint = feedback_trace.capture_endpoint(SoakTracePhase::ProductionEnd)?;
+          stats.record_endpoint(SoakTracePhase::ProductionEnd, endpoint);
         }
         if final_sample_due && stopping && Instant::now() >= drain_deadline {
           return Err("soak drain exceeded its five-second bound".into());

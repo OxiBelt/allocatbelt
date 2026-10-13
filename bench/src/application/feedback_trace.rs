@@ -128,7 +128,7 @@ const SAMPLE_HEADER: &str = concat!(
 
 #[derive(Clone, Copy, Debug)]
 #[repr(usize)]
-pub(super) enum FeedbackTracePhase {
+pub(crate) enum FeedbackTracePhase {
   ProductionStart = 0,
   ProductionEnd = 1,
   DrainEnd = 2,
@@ -446,13 +446,14 @@ struct TraceWorkerStartup {
   started_at: Instant,
 }
 
-pub(super) struct FeedbackTraceCollector {
+pub(crate) struct FeedbackTraceCollector {
   owner: Option<Arc<TraceOwner>>,
   worker: Option<JoinHandle<()>>,
   result: mpsc::Receiver<TraceWorkerResult>,
+  clock: TraceClock,
 }
 
-pub(super) struct FeedbackTraceFinalizer {
+pub(crate) struct FeedbackTraceFinalizer {
   owner: Option<Arc<TraceOwner>>,
   output: Option<TraceWorkerOutput>,
 }
@@ -478,6 +479,7 @@ impl FeedbackTraceCollector {
   ) -> Result<Self, String> {
     let directory = TraceDirectory::validate(directory).map_err(TraceFailure::description)?;
     let clock = TraceClock::capture().map_err(|_| TraceFailure::Clock.description())?;
+    let collector_clock = clock;
     let buffers = Box::new(TraceBuffers::new(identity));
     let event_path = directory.path.join("feedback-events.jsonl");
     let sample_path = directory.path.join("resource-samples.tsv");
@@ -532,10 +534,11 @@ impl FeedbackTraceCollector {
       owner: Some(owner),
       worker: Some(worker),
       result,
+      clock: collector_clock,
     })
   }
 
-  pub(super) fn mark_phase(
+  pub(crate) fn mark_phase(
     &self,
     phase: FeedbackTracePhase,
     at: Instant,
@@ -548,7 +551,16 @@ impl FeedbackTraceCollector {
     mark_phase_owner(owner, phase, Some(at), rss, true).map_err(TraceFailure::description)
   }
 
-  pub(super) fn stop_for_finalization(mut self) -> Result<FeedbackTraceFinalizer, String> {
+  /// Maps the same captured event Instant used by `mark_phase` through the
+  /// exact TraceClock anchor written to the manifest.
+  pub(crate) fn monotonic_bounds(&self, at: Instant) -> Result<(u128, u128), String> {
+    self
+      .clock
+      .bounds(at)
+      .map_err(|_| TraceFailure::Clock.description())
+  }
+
+  pub(crate) fn stop_for_finalization(mut self) -> Result<FeedbackTraceFinalizer, String> {
     let owner = self
       .owner
       .as_ref()
@@ -586,7 +598,7 @@ impl FeedbackTraceCollector {
 }
 
 impl FeedbackTraceFinalizer {
-  pub(super) fn mark_phase(
+  pub(crate) fn mark_phase(
     &self,
     phase: FeedbackTracePhase,
     at: Instant,
@@ -599,15 +611,40 @@ impl FeedbackTraceFinalizer {
     mark_phase_owner(owner, phase, Some(at), rss, true).map_err(TraceFailure::description)
   }
 
-  pub(super) fn finish(mut self) -> Result<(), String> {
+  /// Maps a captured Instant through the worker's TraceClock, which is the
+  /// anchor used for both the event and its manifest phase bracket.
+  pub(crate) fn monotonic_bounds(&self, at: Instant) -> Result<(u128, u128), String> {
+    self
+      .output
+      .as_ref()
+      .ok_or_else(|| "feedback trace completion data is missing".to_owned())?
+      .clock
+      .bounds(at)
+      .map_err(|_| TraceFailure::Clock.description())
+  }
+
+  /// Marks owner release and returns that event's exact shared-clock bracket.
+  pub(crate) fn finish_at(self, at: Instant) -> Result<(u128, u128), String> {
+    self
+      .finish_inner(Some(at))?
+      .ok_or_else(|| "feedback trace release bounds are unavailable".to_owned())
+  }
+
+  pub(crate) fn finish(self) -> Result<(), String> {
+    self.finish_inner(None).map(|_| ())
+  }
+
+  fn finish_inner(mut self, release_at: Option<Instant>) -> Result<Option<(u128, u128)>, String> {
     let owner = self
       .owner
       .as_ref()
       .ok_or_else(|| "feedback trace owner is missing".to_owned())?;
+    let at = release_at.unwrap_or_else(Instant::now);
+    let bounds = release_at.map(|_| self.monotonic_bounds(at)).transpose()?;
     mark_phase_owner(
       owner,
       FeedbackTracePhase::OwnerRelease,
-      Some(Instant::now()),
+      Some(at),
       None,
       true,
     )
@@ -633,7 +670,7 @@ impl FeedbackTraceFinalizer {
         .map_err(|error| TraceFailure::ManifestWrite(error.kind()).description())?;
     }
     self.owner.take();
-    Ok(())
+    Ok(bounds)
   }
 }
 
@@ -1456,6 +1493,27 @@ mod tests {
       .expect("manifest artifact hash")
   }
 
+  fn manifest_phase_bounds(manifest: &str, phase: &str) -> (u128, u128) {
+    let line = manifest
+      .lines()
+      .find(|line| line.starts_with(&format!("phase\t{phase}\t")))
+      .expect("manifest phase bounds");
+    let mut fields = line.split('\t');
+    assert_eq!(fields.next(), Some("phase"));
+    assert_eq!(fields.next(), Some(phase));
+    let lower = fields
+      .next()
+      .expect("phase lower bound")
+      .parse()
+      .expect("numeric phase lower bound");
+    let upper = fields
+      .next()
+      .expect("phase upper bound")
+      .parse()
+      .expect("numeric phase upper bound");
+    (lower, upper)
+  }
+
   fn sha256(bytes: &[u8]) -> [u8; 64] {
     let mut hash = FeedbackTraceHasher::new();
     hash.update(bytes);
@@ -1503,24 +1561,29 @@ mod tests {
       "the collector owns one separately charged Task lease"
     );
 
+    let rss_before_at = Instant::now();
     collector
       .mark_phase(
         FeedbackTracePhase::RssBefore,
-        Instant::now(),
+        rss_before_at,
         Some(rss_marker()),
       )
       .unwrap();
     let production_start = Instant::now();
+    let production_start_bounds = collector.monotonic_bounds(production_start).unwrap();
     collector
       .mark_phase(FeedbackTracePhase::ProductionStart, production_start, None)
       .unwrap();
     runtime.wait_for_samples(3);
     let production_end = Instant::now();
+    let production_end_bounds = collector.monotonic_bounds(production_end).unwrap();
     collector
       .mark_phase(FeedbackTracePhase::ProductionEnd, production_end, None)
       .unwrap();
+    let drain_end = Instant::now();
+    let drain_end_bounds = collector.monotonic_bounds(drain_end).unwrap();
     collector
-      .mark_phase(FeedbackTracePhase::DrainEnd, Instant::now(), None)
+      .mark_phase(FeedbackTracePhase::DrainEnd, drain_end, None)
       .unwrap();
     collector
       .mark_phase(
@@ -1538,8 +1601,10 @@ mod tests {
       .used
       .get(DomainResource::Tasks);
     assert!(tasks_with_collector_after_shutdown > 0);
+    let shutdown_end = Instant::now();
+    let shutdown_end_bounds = collector.monotonic_bounds(shutdown_end).unwrap();
     collector
-      .mark_phase(FeedbackTracePhase::ShutdownEnd, Instant::now(), None)
+      .mark_phase(FeedbackTracePhase::ShutdownEnd, shutdown_end, None)
       .unwrap();
     let finalizer = collector.stop_for_finalization().unwrap();
     let control_with_finalizer = runtime.domain.snapshot().used.get(DomainResource::Control);
@@ -1554,14 +1619,20 @@ mod tests {
       tasks_with_collector_after_shutdown - 1,
       "finalization releases the collector Task lease before final ledger checks"
     );
+    let rss_after_shutdown_at = Instant::now();
     finalizer
       .mark_phase(
         FeedbackTracePhase::RssAfterShutdown,
-        Instant::now(),
+        rss_after_shutdown_at,
         Some(rss_marker()),
       )
       .unwrap();
-    finalizer.finish().unwrap();
+    let owner_release = Instant::now();
+    let owner_release_bounds = finalizer.monotonic_bounds(owner_release).unwrap();
+    assert_eq!(
+      finalizer.finish_at(owner_release).unwrap(),
+      owner_release_bounds
+    );
     assert_eq!(
       runtime.domain.snapshot().used.get(DomainResource::Control),
       control_with_finalizer - control_charge_bytes()
@@ -1569,6 +1640,26 @@ mod tests {
 
     let manifest = fs::read_to_string(fixture.0.join("feedback-trace-manifest.tsv"))
       .expect("completed manifest");
+    assert_eq!(
+      manifest_phase_bounds(&manifest, "production_start"),
+      production_start_bounds
+    );
+    assert_eq!(
+      manifest_phase_bounds(&manifest, "production_end"),
+      production_end_bounds
+    );
+    assert_eq!(
+      manifest_phase_bounds(&manifest, "drain_end"),
+      drain_end_bounds
+    );
+    assert_eq!(
+      manifest_phase_bounds(&manifest, "shutdown_end"),
+      shutdown_end_bounds
+    );
+    assert_eq!(
+      manifest_phase_bounds(&manifest, "owner_release"),
+      owner_release_bounds
+    );
     let event_path = fixture.0.join("feedback-events.jsonl");
     let event_bytes = fs::read(&event_path).expect("event stream");
     let sample_bytes = fs::read(fixture.0.join("resource-samples.tsv")).expect("sample stream");

@@ -1,5 +1,202 @@
 use super::*;
 
+#[cfg(feature = "resource-feedback")]
+fn feedback_startup_domain(workload: Workload) -> ApplicationDomain {
+  ApplicationDomain::new_with_calibrations(
+    workload,
+    2,
+    ApplicationMode::ExternalPressure,
+    FeedbackCalibrations::default(),
+  )
+  .expect("external-pressure startup domain")
+}
+
+#[cfg(feature = "resource-feedback")]
+fn feedback_startup_window(bindings: &ApplicationRunBindings) -> (Instant, Instant) {
+  let sample_at = bindings
+    .wait_for_feedback_startup_observation()
+    .expect("accepted fresh dense CPU startup sample");
+  let production_start = Instant::now();
+  assert!(sample_at < production_start);
+  assert!(
+    bindings
+      .validate_feedback_startup_observation(
+        sample_at,
+        production_start,
+        Some((100, 131)),
+        Some((130, 200)),
+      )
+      .is_err(),
+    "overlapping clock uncertainty must not be tolerated"
+  );
+  (sample_at, production_start)
+}
+
+#[cfg(feature = "resource-feedback")]
+fn wait_for_feedback_sample_after_drain(bindings: &ApplicationRunBindings) {
+  let anchor = Instant::now()
+    .checked_sub(Duration::from_secs(60))
+    .expect("test clock anchor fits the monotonic clock range");
+  let drain_end = Instant::now();
+  let drain_upper = drain_end
+    .checked_duration_since(anchor)
+    .expect("drain marker follows test clock anchor")
+    .as_nanos();
+  let sample_at = bindings
+    .wait_for_feedback_observation_after(drain_upper, |at| {
+      let sample_ns = at
+        .checked_duration_since(anchor)
+        .ok_or_else(|| "sample predates test clock anchor".to_owned())?
+        .as_nanos();
+      Ok((sample_ns, sample_ns))
+    })
+    .expect("accepted fresh CPU sample after drain");
+  let sample_ns = sample_at
+    .checked_duration_since(anchor)
+    .expect("accepted sample follows test clock anchor")
+    .as_nanos();
+  assert!(sample_ns >= drain_upper);
+}
+
+#[cfg(feature = "resource-feedback")]
+#[test]
+fn startup_barrier_waits_for_accepted_fresh_cpu_in_both_binding_paths() {
+  let tokio_domain = feedback_startup_domain(Workload::Cpu);
+  let tokio_baseline = tokio_domain.fixed_global_control_baseline();
+  let tokio_readback = tokio_domain.readback_domain();
+  let mut tokio_bindings = tokio_domain.for_tokio().expect("Tokio pressure bindings");
+  let (tokio_sample, tokio_production) = feedback_startup_window(&tokio_bindings);
+  wait_for_feedback_sample_after_drain(&tokio_bindings);
+  tokio_bindings
+    .shutdown_feedback(Duration::from_secs(5))
+    .expect("Tokio feedback shutdown");
+  tokio_bindings
+    .validate_feedback_startup_observation(tokio_sample, tokio_production, None, None)
+    .expect("post-run validation uses the captured startup sample, not later metrics");
+  tokio_bindings
+    .shutdown_auxiliary_timer()
+    .expect("Tokio auxiliary timer shutdown");
+  drop(tokio_bindings);
+  drop(tokio_domain);
+  assert_eq!(
+    tokio_readback.snapshot().used.get(DomainResource::Control),
+    tokio_baseline
+  );
+
+  let native_domain = feedback_startup_domain(Workload::Cpu);
+  let native_baseline = native_domain.fixed_global_control_baseline();
+  let factory = native_domain
+    .feedback_factory()
+    .expect("native pressure factory")
+    .expect("external workload factory");
+  let rate = native_domain.rate_config();
+  let mut driver = allocatbelt::runtime::MultiThreadBuilder::new(
+    allocatbelt::runtime::asynchronous::AsyncConfig {
+      workers: 2,
+      max_outstanding: 8,
+      max_scopes: 2,
+    },
+  )
+  .resources(native_domain.local_limits())
+  .resource_domain(native_domain.tenant())
+  .timer(2)
+  .rate_timer_registrations(256)
+  .disk_rate(rate)
+  .upload_rate(rate)
+  .download_rate(rate)
+  .feedback_sources(factory)
+  .build()
+  .expect("native pressure driver");
+  let mut native_bindings = native_domain
+    .for_native(&driver)
+    .expect("native pressure bindings");
+  let (native_sample, native_production) = feedback_startup_window(&native_bindings);
+  wait_for_feedback_sample_after_drain(&native_bindings);
+  driver
+    .request_shutdown(allocatbelt::runtime::MultiShutdown {
+      tasks: allocatbelt::runtime::asynchronous::AsyncShutdown::Drain,
+      blocking: allocatbelt::runtime::ShutdownMode::Drain,
+      processes: allocatbelt::runtime::process::ProcessShutdownMode::Wait,
+    })
+    .expect("native driver shutdown request");
+  let deadline = Instant::now() + Duration::from_secs(5);
+  loop {
+    match driver
+      .drive_shutdown_step()
+      .expect("native shutdown progress")
+    {
+      allocatbelt::runtime::ShutdownProgress::Complete => break,
+      allocatbelt::runtime::ShutdownProgress::Pending => {
+        assert!(
+          Instant::now() < deadline,
+          "native driver shutdown timed out"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+      }
+    }
+  }
+  native_bindings
+    .shutdown_feedback(Duration::from_secs(5))
+    .expect("native feedback service joined with its owning driver");
+  native_bindings
+    .validate_feedback_startup_observation(native_sample, native_production, None, None)
+    .expect("post-run validation uses the captured startup sample, not later metrics");
+  drop(native_bindings);
+  drop(driver);
+  let native_readback = native_domain.readback_domain();
+  drop(native_domain);
+  assert_eq!(
+    native_readback.snapshot().used.get(DomainResource::Control),
+    native_baseline
+  );
+}
+
+#[cfg(feature = "resource-feedback")]
+#[test]
+fn post_drain_feedback_wait_does_not_accept_a_sample_after_its_deadline() {
+  let domain = feedback_startup_domain(Workload::Cpu);
+  let baseline = domain.fixed_global_control_baseline();
+  let readback = domain.readback_domain();
+  let mut bindings = domain.for_tokio().expect("Tokio pressure bindings");
+  let anchor = Instant::now()
+    .checked_sub(Duration::from_secs(60))
+    .expect("test clock anchor fits the monotonic clock range");
+  let drain_end = Instant::now();
+  let drain_upper = drain_end
+    .checked_duration_since(anchor)
+    .expect("drain marker follows test clock anchor")
+    .as_nanos();
+  let bounds = |at: Instant| {
+    let timestamp = at
+      .checked_duration_since(anchor)
+      .ok_or_else(|| "sample predates test clock anchor".to_owned())?
+      .as_nanos();
+    Ok((timestamp, timestamp))
+  };
+  bindings
+    .wait_for_feedback_observation_after(drain_upper, &bounds)
+    .expect("a fresh post-drain sample is accepted within the bounded wait");
+  let error = bindings
+    .wait_for_feedback_observation_after(drain_upper, |sample_at| {
+      std::thread::sleep(SAMPLE_INTERVAL + MAX_DENSE_SAMPLE_GAP + Duration::from_millis(50));
+      bounds(sample_at)
+    })
+    .expect_err("mapping that consumes the deadline must not admit a late sample");
+  assert!(error.contains("deadline"));
+  bindings
+    .shutdown_feedback(Duration::from_secs(5))
+    .expect("Tokio feedback shutdown");
+  bindings
+    .shutdown_auxiliary_timer()
+    .expect("Tokio auxiliary timer shutdown");
+  drop(bindings);
+  drop(domain);
+  assert_eq!(
+    readback.snapshot().used.get(DomainResource::Control),
+    baseline
+  );
+}
+
 #[test]
 fn comparison_family_defaults_fixed_and_pressure_requires_the_feature() {
   assert_eq!(

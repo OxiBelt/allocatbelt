@@ -586,6 +586,16 @@ fn run_bounded(options: Options, settings: Settings, plan: ArrivalPlan) -> Resul
   if setup_started.elapsed() > super::SETUP_DEADLINE {
     return Err("HTTP setup exceeded its 120 second finite deadline".into());
   }
+  #[cfg(feature = "resource-feedback")]
+  let startup_feedback_observation = if run_bindings.mode().feedback_enabled() {
+    Some(run_bindings.wait_for_feedback_startup_observation()?)
+  } else {
+    None
+  };
+  #[cfg(feature = "resource-feedback")]
+  if startup_feedback_observation.is_some() && setup_started.elapsed() > super::SETUP_DEADLINE {
+    return Err("HTTP startup feedback wait exceeded the finite setup deadline".into());
+  }
   let producer_handle = async_handle.clone();
   let producer_resources = resources.clone();
   let producer_net = net.clone();
@@ -619,6 +629,23 @@ fn run_bounded(options: Options, settings: Settings, plan: ArrivalPlan) -> Resul
     .map_err(|_| "HTTP producer panicked".to_owned())?;
   let producer = producer_result?;
   #[cfg(feature = "resource-feedback")]
+  if let Some(sample_at) = startup_feedback_observation {
+    let (sample_bounds, production_bounds) = if let Some(trace) = feedback_trace.as_ref() {
+      (
+        Some(trace.monotonic_bounds(sample_at)?),
+        Some(trace.monotonic_bounds(producer.started_at)?),
+      )
+    } else {
+      (None, None)
+    };
+    run_bindings.validate_feedback_startup_observation(
+      sample_at,
+      producer.started_at,
+      sample_bounds,
+      production_bounds,
+    )?;
+  }
+  #[cfg(feature = "resource-feedback")]
   if let Some(trace) = feedback_trace.as_ref() {
     trace.mark_phase(
       FeedbackTracePhase::ProductionStart,
@@ -647,9 +674,14 @@ fn run_bounded(options: Options, settings: Settings, plan: ArrivalPlan) -> Resul
     .map_err(|error| format!("allocatbelt accept task output join failed: {error}"))?
     .map_err(|error| format!("allocatbelt accept task failed: {error}"))?;
   #[cfg(feature = "resource-feedback")]
-  if let Some(trace) = feedback_trace.as_ref() {
-    trace.mark_phase(FeedbackTracePhase::DrainEnd, Instant::now(), None)?;
-  }
+  let feedback_drain_upper_ns = if let Some(trace) = feedback_trace.as_ref() {
+    let drain_end = Instant::now();
+    let (_, drain_upper_ns) = trace.monotonic_bounds(drain_end)?;
+    trace.mark_phase(FeedbackTracePhase::DrainEnd, drain_end, None)?;
+    Some(drain_upper_ns)
+  } else {
+    None
+  };
   #[cfg(feature = "resource-feedback")]
   let collector_task_lease_count = usize::from(feedback_trace.is_some());
   #[cfg(not(feature = "resource-feedback"))]
@@ -683,6 +715,13 @@ fn run_bounded(options: Options, settings: Settings, plan: ArrivalPlan) -> Resul
       Instant::now(),
       Some(rss_after_drain),
     )?;
+  }
+
+  #[cfg(feature = "resource-feedback")]
+  if let (Some(drain_upper_ns), Some(trace)) = (feedback_drain_upper_ns, feedback_trace.as_ref()) {
+    run_bindings.wait_for_feedback_observation_after(drain_upper_ns, |sample_at| {
+      trace.monotonic_bounds(sample_at)
+    })?;
   }
 
   let shutdown_started = Instant::now();
@@ -967,6 +1006,16 @@ fn run_tokio(options: Options, settings: Settings, plan: ArrivalPlan) -> Result<
   if setup_started.elapsed() > super::SETUP_DEADLINE {
     return Err("HTTP setup exceeded its 120 second finite deadline".into());
   }
+  #[cfg(feature = "resource-feedback")]
+  let startup_feedback_observation = if run_bindings.mode().feedback_enabled() {
+    Some(run_bindings.wait_for_feedback_startup_observation()?)
+  } else {
+    None
+  };
+  #[cfg(feature = "resource-feedback")]
+  if startup_feedback_observation.is_some() && setup_started.elapsed() > super::SETUP_DEADLINE {
+    return Err("HTTP startup feedback wait exceeded the finite setup deadline".into());
+  }
   let producer_handle = handle.clone();
   let producer_resources = resources.clone();
   let producer_slots = task_slots.clone();
@@ -1003,6 +1052,23 @@ fn run_tokio(options: Options, settings: Settings, plan: ArrivalPlan) -> Result<
     .map_err(|_| "HTTP producer panicked".to_owned())?;
   let producer = producer_result?;
   #[cfg(feature = "resource-feedback")]
+  if let Some(sample_at) = startup_feedback_observation {
+    let (sample_bounds, production_bounds) = if let Some(trace) = feedback_trace.as_ref() {
+      (
+        Some(trace.monotonic_bounds(sample_at)?),
+        Some(trace.monotonic_bounds(producer.started_at)?),
+      )
+    } else {
+      (None, None)
+    };
+    run_bindings.validate_feedback_startup_observation(
+      sample_at,
+      producer.started_at,
+      sample_bounds,
+      production_bounds,
+    )?;
+  }
+  #[cfg(feature = "resource-feedback")]
   if let Some(trace) = feedback_trace.as_ref() {
     trace.mark_phase(
       FeedbackTracePhase::ProductionStart,
@@ -1030,9 +1096,14 @@ fn run_tokio(options: Options, settings: Settings, plan: ArrivalPlan) -> Result<
     .map_err(|error| format!("Tokio accept task join failed: {error}"))?
     .map_err(|error| format!("Tokio accept task failed: {error}"))?;
   #[cfg(feature = "resource-feedback")]
-  if let Some(trace) = feedback_trace.as_ref() {
-    trace.mark_phase(FeedbackTracePhase::DrainEnd, Instant::now(), None)?;
-  }
+  let feedback_drain_upper_ns = if let Some(trace) = feedback_trace.as_ref() {
+    let drain_end = Instant::now();
+    let (_, drain_upper_ns) = trace.monotonic_bounds(drain_end)?;
+    trace.mark_phase(FeedbackTracePhase::DrainEnd, drain_end, None)?;
+    Some(drain_upper_ns)
+  } else {
+    None
+  };
   #[cfg(feature = "resource-feedback")]
   let collector_task_lease_count = usize::from(feedback_trace.is_some());
   #[cfg(not(feature = "resource-feedback"))]
@@ -1066,6 +1137,13 @@ fn run_tokio(options: Options, settings: Settings, plan: ArrivalPlan) -> Result<
       Instant::now(),
       Some(rss_after_drain),
     )?;
+  }
+
+  #[cfg(feature = "resource-feedback")]
+  if let (Some(drain_upper_ns), Some(trace)) = (feedback_drain_upper_ns, feedback_trace.as_ref()) {
+    run_bindings.wait_for_feedback_observation_after(drain_upper_ns, |sample_at| {
+      trace.monotonic_bounds(sample_at)
+    })?;
   }
 
   let shutdown_started = Instant::now();

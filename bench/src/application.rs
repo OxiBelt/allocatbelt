@@ -33,10 +33,10 @@ use allocatbelt_app_ports::memory::{self, MemoryConfig, MemoryOutput};
 pub(crate) mod disk_lane;
 #[cfg(feature = "resource-feedback")]
 #[path = "application/feedback_policy_probe.rs"]
-mod feedback_policy_probe;
+pub(crate) mod feedback_policy_probe;
 #[cfg(feature = "resource-feedback")]
 #[path = "application/feedback_trace.rs"]
-mod feedback_trace;
+pub(crate) mod feedback_trace;
 #[path = "application/http.rs"]
 mod http;
 #[path = "application/runtime_bindings.rs"]
@@ -1318,6 +1318,16 @@ fn run_with_plan(
     return Err("application setup exceeded its 120 second finite deadline".into());
   }
   let mut runtime_readback = RuntimeBindingWriter::begin(options, plan, &run_bindings)?;
+  #[cfg(feature = "resource-feedback")]
+  let startup_feedback_observation = if run_bindings.mode().feedback_enabled() {
+    Some(run_bindings.wait_for_feedback_startup_observation()?)
+  } else {
+    None
+  };
+  #[cfg(feature = "resource-feedback")]
+  if startup_feedback_observation.is_some() && setup_started.elapsed() > SETUP_DEADLINE {
+    return Err("application startup feedback wait exceeded the finite setup deadline".into());
+  }
   let producer_states = id_states;
   let producer_resources = resources.clone();
   let producer_task_lease = run_bindings.reserve_task()?;
@@ -1347,6 +1357,23 @@ fn run_with_plan(
     .join()
     .map_err(|_| "application producer panicked".to_owned())?;
   #[cfg(feature = "resource-feedback")]
+  if let Some(sample_at) = startup_feedback_observation {
+    let (sample_bounds, production_bounds) = if let Some(trace) = feedback_trace.as_ref() {
+      (
+        Some(trace.monotonic_bounds(sample_at)?),
+        Some(trace.monotonic_bounds(producer.started_at)?),
+      )
+    } else {
+      (None, None)
+    };
+    run_bindings.validate_feedback_startup_observation(
+      sample_at,
+      producer.started_at,
+      sample_bounds,
+      production_bounds,
+    )?;
+  }
+  #[cfg(feature = "resource-feedback")]
   if let Some(trace) = feedback_trace.as_ref() {
     trace.mark_phase(
       FeedbackTracePhase::ProductionStart,
@@ -1374,9 +1401,14 @@ fn run_with_plan(
   #[cfg(not(feature = "resource-feedback"))]
   let collector_task_lease_count = 0;
   #[cfg(feature = "resource-feedback")]
-  if let Some(trace) = feedback_trace.as_ref() {
-    trace.mark_phase(FeedbackTracePhase::DrainEnd, Instant::now(), None)?;
-  }
+  let feedback_drain_upper_ns = if let Some(trace) = feedback_trace.as_ref() {
+    let drain_end = Instant::now();
+    let (_, drain_upper_ns) = trace.monotonic_bounds(drain_end)?;
+    trace.mark_phase(FeedbackTracePhase::DrainEnd, drain_end, None)?;
+    Some(drain_upper_ns)
+  } else {
+    None
+  };
   let production_cpu_ended_ns = process_cpu_time_ns();
   let drain_readback = runtime_readback.as_mut().map_or(Ok(()), |readback| {
     readback.capture_after_drain(&run_bindings, collector_task_lease_count)
@@ -1413,6 +1445,13 @@ fn run_with_plan(
   if last_observed.saturating_duration_since(producer.production_end) > execution_deadlines().drain
   {
     return Err("application drain exceeded its finite deadline".into());
+  }
+
+  #[cfg(feature = "resource-feedback")]
+  if let (Some(drain_upper_ns), Some(trace)) = (feedback_drain_upper_ns, feedback_trace.as_ref()) {
+    run_bindings.wait_for_feedback_observation_after(drain_upper_ns, |sample_at| {
+      trace.monotonic_bounds(sample_at)
+    })?;
   }
 
   let shutdown_started = Instant::now();

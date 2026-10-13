@@ -7,7 +7,7 @@
 //! emitted.
 
 use std::collections::BTreeMap;
-use std::fmt::Write as _;
+use std::fmt;
 use std::time::Duration;
 
 use allocatbelt::runtime::managed::ResourceLimits;
@@ -28,13 +28,16 @@ const CPU_REDUCTION_RULE: &str = "floor_current_limit_over_10_zero_is_quantized"
 const CPU_RECOVERY_INCREMENT: u64 = 1;
 const NETWORK_SENSOR_SOURCE: &str = "download_application_bytes_only";
 const METER_SOURCE_LIFETIME: &str = "registered_endpoint_owner";
+const MAX_CANONICAL_JSON_FIELDS: usize = 128;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-enum JsonValue {
+pub(crate) enum JsonValue {
   Object(BTreeMap<String, JsonValue>),
   String(String),
   Number(u64),
+  Number128(u128),
   Bool(bool),
+  Null,
 }
 
 fn object<const N: usize>(pairs: [(&str, JsonValue); N]) -> JsonValue {
@@ -66,52 +69,109 @@ fn duration_ns(value: Duration) -> Result<JsonValue, String> {
     .map_err(|_| "feedback policy timing does not fit u64 nanoseconds".to_owned())
 }
 
-fn write_json_string(value: &str, output: &mut String) {
-  output.push('"');
+fn write_json_string(value: &str, output: &mut impl fmt::Write) -> fmt::Result {
+  output.write_char('"')?;
   for character in value.chars() {
     match character {
-      '"' => output.push_str("\\\""),
-      '\\' => output.push_str("\\\\"),
-      '\u{08}' => output.push_str("\\b"),
-      '\u{09}' => output.push_str("\\t"),
-      '\u{0a}' => output.push_str("\\n"),
-      '\u{0c}' => output.push_str("\\f"),
-      '\u{0d}' => output.push_str("\\r"),
+      '"' => output.write_str("\\\"")?,
+      '\\' => output.write_str("\\\\")?,
+      '\u{08}' => output.write_str("\\b")?,
+      '\u{09}' => output.write_str("\\t")?,
+      '\u{0a}' => output.write_str("\\n")?,
+      '\u{0c}' => output.write_str("\\f")?,
+      '\u{0d}' => output.write_str("\\r")?,
       character if character.is_ascii_control() => {
-        let _ = write!(output, "\\u{:04x}", u32::from(character));
+        write!(output, "\\u{:04x}", u32::from(character))?;
       }
-      character if character.is_ascii() => output.push(character),
+      character if character.is_ascii() => output.write_char(character)?,
       character => {
         let mut units = [0_u16; 2];
         for unit in character.encode_utf16(&mut units).iter() {
-          let _ = write!(output, "\\u{unit:04x}");
+          write!(output, "\\u{unit:04x}")?;
         }
       }
     }
   }
-  output.push('"');
+  output.write_char('"')
 }
 
-fn write_json(value: &JsonValue, output: &mut String) {
+fn write_json(value: &JsonValue, output: &mut impl fmt::Write) -> fmt::Result {
   match value {
     JsonValue::Object(fields) => {
-      output.push('{');
+      output.write_char('{')?;
       for (index, (key, child)) in fields.iter().enumerate() {
         if index != 0 {
-          output.push(',');
+          output.write_char(',')?;
         }
-        write_json_string(key, output);
-        output.push(':');
-        write_json(child, output);
+        write_json_string(key, output)?;
+        output.write_char(':')?;
+        write_json(child, output)?;
       }
-      output.push('}');
+      output.write_char('}')
     }
     JsonValue::String(value) => write_json_string(value, output),
     JsonValue::Number(value) => {
-      let _ = write!(output, "{value}");
+      write!(output, "{value}")
     }
-    JsonValue::Bool(value) => output.push_str(if *value { "true" } else { "false" }),
+    JsonValue::Number128(value) => write!(output, "{value}"),
+    JsonValue::Bool(value) => output.write_str(if *value { "true" } else { "false" }),
+    JsonValue::Null => output.write_str("null"),
   }
+}
+
+pub(crate) fn json_object(
+  pairs: impl IntoIterator<Item = (&'static str, JsonValue)>,
+) -> Result<JsonValue, String> {
+  let mut fields = BTreeMap::new();
+  let mut count = 0usize;
+  for (key, value) in pairs {
+    count = count
+      .checked_add(1)
+      .ok_or_else(|| "canonical JSON field count overflow".to_owned())?;
+    if count > MAX_CANONICAL_JSON_FIELDS {
+      return Err("canonical JSON object exceeds its fixed field bound".into());
+    }
+    if fields.insert(key.to_owned(), value).is_some() {
+      return Err(format!("canonical JSON object repeats key {key}"));
+    }
+  }
+  Ok(JsonValue::Object(fields))
+}
+
+pub(crate) fn json_string_value(value: impl Into<String>) -> JsonValue {
+  JsonValue::String(value.into())
+}
+
+pub(crate) fn json_u64(value: u64) -> JsonValue {
+  JsonValue::Number(value)
+}
+
+pub(crate) fn json_usize(value: usize) -> Result<JsonValue, String> {
+  u64::try_from(value)
+    .map(JsonValue::Number)
+    .map_err(|_| "canonical JSON integer does not fit u64".to_owned())
+}
+
+pub(crate) fn json_u128(value: u128) -> JsonValue {
+  JsonValue::Number128(value)
+}
+
+pub(crate) fn json_bool(value: bool) -> JsonValue {
+  JsonValue::Bool(value)
+}
+
+pub(crate) fn json_null() -> JsonValue {
+  JsonValue::Null
+}
+
+pub(crate) fn write_canonical_json(
+  value: &JsonValue,
+  output: &mut impl fmt::Write,
+) -> Result<(), String> {
+  write_json(value, output).map_err(|_| "canonical JSON output buffer is full".to_owned())?;
+  output
+    .write_char('\n')
+    .map_err(|_| "canonical JSON output buffer is full".to_owned())
 }
 
 fn context_workers(profile: Profile) -> usize {
@@ -476,8 +536,7 @@ fn context_args(args: impl Iterator<Item = String>) -> Result<(Workload, Profile
 
 fn canonical_json(value: &JsonValue) -> String {
   let mut output = String::new();
-  write_json(value, &mut output);
-  output.push('\n');
+  write_canonical_json(value, &mut output).expect("String accepts canonical JSON output");
   output
 }
 
@@ -518,6 +577,23 @@ mod tests {
       JsonValue::Object(fields) => fields.len(),
       _ => panic!("expected an object"),
     }
+  }
+
+  #[test]
+  fn shared_json_writer_sorts_keys_encodes_typed_values_and_rejects_duplicates() {
+    let value = json_object([
+      ("z", json_u128(u128::MAX)),
+      ("null", json_null()),
+      ("a", json_bool(false)),
+    ])
+    .expect("unique canonical object keys");
+    let mut output = String::new();
+    write_canonical_json(&value, &mut output).expect("canonical JSON string");
+    assert_eq!(
+      output,
+      format!("{{\"a\":false,\"null\":null,\"z\":{}}}\n", u128::MAX)
+    );
+    assert!(json_object([("duplicate", json_null()), ("duplicate", json_bool(true))]).is_err());
   }
 
   #[test]

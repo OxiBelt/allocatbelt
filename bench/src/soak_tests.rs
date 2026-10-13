@@ -299,7 +299,12 @@ fn http_test_outputs(label: &str) -> (PathBuf, super::OutputFiles) {
     file_sha256: [0; 32],
     average_rate_per_second: 4,
   };
-  let outputs = super::OutputFiles::create(&identity, &ring).expect("create HTTP test streams");
+  let outputs = super::OutputFiles::create(
+    &identity,
+    &ring,
+    crate::application::runtime_bindings::ApplicationMode::Fixed,
+  )
+  .expect("create HTTP test streams");
   (directory, outputs)
 }
 
@@ -589,11 +594,23 @@ fn cli_accepts_short_functional_horizon_but_keeps_reference_and_identity_pins_re
   ])
   .expect("short test horizon");
   assert_eq!(parsed.duration, std::time::Duration::from_secs(1));
-  assert!(super::validate_fixed_policy_request(None).is_ok());
-  assert!(super::validate_fixed_policy_request(Some("fixed_policy")).is_ok());
-  let pressure_error = super::validate_fixed_policy_request(Some("external_pressure"))
-    .expect_err("pressure comparison is outside the fixed-policy soak contract");
-  assert!(pressure_error.contains("unsupported"));
+  assert_eq!(
+    super::application_mode_from_value(None).expect("fixed default mode"),
+    crate::application::runtime_bindings::ApplicationMode::Fixed
+  );
+  assert_eq!(
+    super::application_mode_from_value(Some("fixed_policy")).expect("fixed mode"),
+    crate::application::runtime_bindings::ApplicationMode::Fixed
+  );
+  #[cfg(feature = "resource-feedback")]
+  assert_eq!(
+    super::application_mode_from_value(Some("external_pressure"))
+      .expect("external mode with feature"),
+    crate::application::runtime_bindings::ApplicationMode::ExternalPressure
+  );
+  #[cfg(not(feature = "resource-feedback"))]
+  assert!(super::application_mode_from_value(Some("external_pressure")).is_err());
+  assert!(super::application_mode_from_value(Some("unexpected")).is_err());
   assert!(
     parse_args([
       "--duration-seconds".into(),
@@ -658,13 +675,205 @@ fn failed_soak_preserves_streams_and_keeps_an_incomplete_marker() {
     file_sha256: [0; 32],
     average_rate_per_second: 4,
   };
-  drop(super::OutputFiles::create(&identity, &ring).expect("create partial streams"));
+  drop(
+    super::OutputFiles::create(
+      &identity,
+      &ring,
+      crate::application::runtime_bindings::ApplicationMode::Fixed,
+    )
+    .expect("create partial streams"),
+  );
   let report = fs::read_to_string(directory.join("receipt.json")).expect("read failure marker");
   assert!(report.contains("allocatbelt.runtime-soak-incomplete.v1"));
   assert!(directory.join("terminals.tsv").is_file());
   assert!(directory.join("samples.tsv").is_file());
   assert!(!directory.join("receipt.incomplete.tmp").exists());
   fs::remove_dir_all(directory).expect("remove partial artifacts");
+}
+
+#[test]
+fn external_soak_output_uses_a_distinct_v2_incomplete_marker() {
+  let directory = temp_path("external-partial");
+  fs::create_dir(&directory).expect("create external partial output directory");
+  #[cfg(unix)]
+  {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))
+      .expect("set external partial output mode");
+  }
+  let identity = super::SoakIdentity {
+    report: directory.join("receipt.json"),
+    terminals: directory.join("terminals.tsv"),
+    samples: directory.join("samples.tsv"),
+    campaign_id: "external-partial".into(),
+    host_id: "host".into(),
+    run_id: "run".into(),
+    allocator: "allocatbelt".into(),
+    executor: "bounded".into(),
+    source_sha256: "a".repeat(64),
+    binary_sha256: "b".repeat(64),
+    resource_ceiling_sha256: "c".repeat(64),
+    nonce: "d".repeat(32),
+  };
+  let ring = super::ReferenceRing {
+    bytes: Vec::new(),
+    expected: vec![0; 8],
+    file_sha256: [0; 32],
+    average_rate_per_second: 4,
+  };
+  drop(
+    super::OutputFiles::create(
+      &identity,
+      &ring,
+      crate::application::runtime_bindings::ApplicationMode::ExternalPressure,
+    )
+    .expect("create external incomplete streams"),
+  );
+  let report = fs::read_to_string(directory.join("receipt.json")).expect("read marker");
+  assert!(report.contains("allocatbelt.runtime-soak-incomplete.v2"));
+  assert!(!report.contains("allocatbelt.runtime-soak-incomplete.v1"));
+  fs::remove_dir_all(directory).expect("remove external partial artifacts");
+}
+
+#[cfg(feature = "resource-feedback")]
+#[test]
+fn external_soak_receipt_is_v2_functional_only_and_records_actual_feedback_status() {
+  let directory = temp_path("external-receipt");
+  fs::create_dir(&directory).expect("create external output directory");
+  #[cfg(unix)]
+  {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))
+      .expect("set external output mode");
+  }
+  let identity = super::SoakIdentity {
+    report: directory.join("receipt.json"),
+    terminals: directory.join("terminal-records.tsv"),
+    samples: directory.join("resource-samples.tsv"),
+    campaign_id: "external-campaign".into(),
+    host_id: "host".into(),
+    run_id: "external-run".into(),
+    allocator: "allocatbelt".into(),
+    executor: "bounded".into(),
+    source_sha256: "a".repeat(64),
+    binary_sha256: "b".repeat(64),
+    resource_ceiling_sha256: "c".repeat(64),
+    nonce: "d".repeat(32),
+  };
+  let ring_bytes = canonical_ring_text(8).into_bytes();
+  let ring = super::ReferenceRing {
+    expected: (0..8).map(canonical_expected).collect(),
+    file_sha256: sha256_digest(&ring_bytes),
+    bytes: ring_bytes,
+    average_rate_per_second: 4,
+  };
+  let comparison_mode = crate::application::runtime_bindings::ApplicationMode::ExternalPressure;
+  let mut outputs = super::OutputFiles::create(&identity, &ring, comparison_mode)
+    .expect("create external output streams");
+  let (terminal_sha, sample_sha) = outputs.seal_streams().expect("seal output streams");
+  let (domain, tenant) = test_domain();
+  let global = domain.snapshot();
+  let tenant_snapshot = tenant.snapshot().expect("tenant snapshot");
+  let baseline_control = global.used.get(DomainResource::Control);
+  let args = super::SoakArgs {
+    duration: Duration::from_secs(2),
+    sample_interval: Duration::from_millis(100),
+    reference_path: directory.join("reference.tsv"),
+    reference_sha256: super::digest_hex(&ring.file_sha256),
+    output_dir: Some(directory.clone()),
+    profile: "mixed".into(),
+    resource_ceiling_sha256: "c".repeat(64),
+    comparison_mode,
+  };
+  let stats = super::SoakStats {
+    started_monotonic_ns: 100,
+    trace_ended_monotonic_ns: 2_000_000_100,
+    drain_ended_monotonic_ns: 2_000_000_200,
+    shutdown_ended_monotonic_ns: 2_000_000_300,
+    postprocess_ended_monotonic_ns: 2_000_000_400,
+    ended_monotonic_ns: 2_000_000_400,
+    started_monotonic_bounds: Some(super::MonotonicBounds {
+      lower_ns: 100,
+      upper_ns: 230,
+    }),
+    trace_ended_monotonic_bounds: Some(super::MonotonicBounds {
+      lower_ns: 2_000_000_100,
+      upper_ns: 2_000_000_230,
+    }),
+    drain_ended_monotonic_bounds: Some(super::MonotonicBounds {
+      lower_ns: 2_000_000_200,
+      upper_ns: 2_000_000_330,
+    }),
+    shutdown_ended_monotonic_bounds: Some(super::MonotonicBounds {
+      lower_ns: 2_000_000_300,
+      upper_ns: 2_000_000_430,
+    }),
+    postprocess_ended_monotonic_bounds: Some(super::MonotonicBounds {
+      lower_ns: 2_000_000_400,
+      upper_ns: 2_000_000_530,
+    }),
+    ..super::SoakStats::default()
+  };
+  outputs
+    .complete(super::ReceiptData {
+      identity: &identity,
+      args: &args,
+      ring_sha256: &ring.file_sha256,
+      ring_rows: ring.expected.len(),
+      ring_average_rate_per_second: ring.average_rate_per_second,
+      stats: &stats,
+      terminal_sha: &terminal_sha,
+      sample_sha: &sample_sha,
+      first_hour_median_kib: None,
+      final_hour_median_kib: None,
+      global,
+      tenant: tenant_snapshot,
+      baseline_control,
+      feedback: Some(super::FeedbackSoakStatus {
+        started: true,
+        joined: true,
+        worker_failure: None,
+        trace_worker_joined: true,
+      }),
+    })
+    .expect("publish external receipt");
+  outputs.commit();
+  drop(outputs);
+  let receipt = fs::read_to_string(directory.join("receipt.json")).expect("read external receipt");
+  assert!(receipt.starts_with("{\"actual_trace_duration_ns\":"));
+  assert!(receipt.ends_with("}\n"));
+  assert!(receipt.contains("\"schema\":\"allocatbelt.runtime-soak.v2\""));
+  assert!(receipt.contains("\"comparison_family\":\"external_pressure\""));
+  assert!(receipt.contains("\"mode\":\"soak\""));
+  assert!(receipt.contains("\"qualification_eligible\":false"));
+  assert!(receipt.contains("\"feedback_started\":true"));
+  assert!(receipt.contains("\"feedback_worker_joined\":true"));
+  assert!(receipt.contains("\"feedback_worker_failure\":null"));
+  assert!(receipt.contains("\"feedback_trace_worker_joined\":true"));
+  assert!(receipt.contains("\"fixed_global_control_baseline\":"));
+  for (phase, scalar) in [
+    ("started", 100),
+    ("trace_ended", 2_000_000_100),
+    ("drain_ended", 2_000_000_200),
+    ("shutdown_ended", 2_000_000_300),
+    ("postprocess_ended", 2_000_000_400),
+  ] {
+    assert_eq!(
+      receipt_uint(&receipt, &format!("{phase}_monotonic_lower_ns")),
+      scalar
+    );
+    assert_eq!(
+      receipt_uint(&receipt, &format!("{phase}_monotonic_upper_ns")),
+      scalar + 130
+    );
+    assert_eq!(
+      receipt_uint(&receipt, &format!("{phase}_monotonic_ns")),
+      scalar
+    );
+  }
+  drop(tenant);
+  drop(domain);
+  fs::remove_dir_all(directory).expect("remove external output artifacts");
 }
 
 #[test]
@@ -1179,6 +1388,7 @@ fn short_native_soak_progresses_past_one_window_and_emits_reference_receipts() {
     output_dir: Some(directory.clone()),
     profile: "mixed".into(),
     resource_ceiling_sha256: "c".repeat(64),
+    comparison_mode: crate::application::runtime_bindings::ApplicationMode::Fixed,
   };
   super::run_soak(args, identity).expect("run one-second native soak");
 
@@ -1187,6 +1397,8 @@ fn short_native_soak_progresses_past_one_window_and_emits_reference_receipts() {
   assert!(!receipt.contains("allocatbelt.runtime-soak-incomplete.v1"));
   assert!(receipt.contains("\"schema\":\"allocatbelt.runtime-soak.v1\""));
   assert!(receipt.contains("\"qualified_horizon\":false"));
+  assert!(!receipt.contains("_monotonic_lower_ns"));
+  assert!(!receipt.contains("_monotonic_upper_ns"));
   assert!(receipt.contains("\"errors\":0"));
   assert!(receipt.contains("\"lost\":0"));
   assert!(receipt.contains("\"final_global_live_tenants\":0"));
