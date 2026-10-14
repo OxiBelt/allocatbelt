@@ -904,7 +904,7 @@ def _source5_context_calibration_request_v2(value: object) -> dict[str, Any]:
     schedule = _schedule(request["schedule"], calibration=True)
     try:
         condition_pin, condition = reader._verify_condition_file_v2(condition_pin, key, identity["condition_id"], schedule)
-        source_stack = reader._source5_stack(source_pin, source_root)
+        source_stack = reader._source5_stack(source_pin, str(source_root))
         observed_pin, observed = reader._verify_observed_host_pin_v2(observed_host_pin, key["host_id"])
         capacity = reader._verify_capacity_bundle_v2(source_stack, capacity_bundle, source_pin, observed)
         policy_context = reader._verify_context_policy_bundle_v2(source_stack, context_policy_pin, capacity, source_pin)

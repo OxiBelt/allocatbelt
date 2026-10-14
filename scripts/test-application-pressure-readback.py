@@ -471,6 +471,59 @@ def run_genuine_scope_fixture(path: Path) -> dict[str, Any]:
 
 
 class PressureReadbackV2Tests(unittest.TestCase):
+    def test_driver_context_preflight_passes_canonical_source_root_text_to_reader(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="pressure-v2-source-boundary-") as temporary:
+            root = Path(temporary)
+            pins = {}
+            for name in ("source", "policy", "capacity", "condition", "bundle", "host", "request", "receipt"):
+                path = root / name
+                raw = readback.canonical_bytes({"fixture": name})
+                path.write_bytes(raw)
+                pins[name] = {"path": str(path), "raw_sha256": readback.sha256_bytes(raw)}
+            key = {"host_id": "host", "workload": "mixed", "profile": "mixed", "calibration_id": "capacity"}
+            request = {
+                "schema": driver.CALIBRATION_REQUEST_SCHEMA_V2,
+                "identity": {"host_id": "host", "run_id": "run", "condition_id": "condition", "nonce": "a" * 32},
+                "files": {
+                    name: {"path": pins[pin]["path"], "sha256": pins[pin]["raw_sha256"]}
+                    for name, pin in (("source_manifest", "source"), ("policy", "policy"), ("application_capacity_calibration", "capacity"))
+                },
+                "storage": {},
+                "schedule": {
+                    "seed": 7, "duration_seconds": 30, "sample_interval_ms": 100,
+                    "startup_deadline_seconds": 2, "total_deadline_seconds": 40,
+                    "term_deadline_seconds": 2, "kill_deadline_seconds": 2,
+                    "minimum_overlap_seconds": 30, "startup_ready_windows": 1,
+                    "cpu_duty_basis_points": 7000, "pressure_cpu_affinity": [0],
+                    "application_cpu_affinity": [0], "disk_bytes_per_second": 1024 * 1024,
+                    "scratch_file_bytes": 65536, "network_requests_per_second": 100,
+                    "network_payload_bytes": 256,
+                },
+                "scope": {
+                    "schema": driver.CALIBRATION_SCOPE_SCHEMA_V2, "condition": pins["condition"],
+                    "source_root": str(root), "source_manifest": pins["source"],
+                    "context_policy": pins["bundle"], "observed_host": pins["host"], "capacity_key": key,
+                    "capacity_bundle_pins": {
+                        "schema": driver.CAPACITY_BUNDLE_PIN_SCHEMA_V2, "capacity_key": key,
+                        "source_manifest": pins["source"], "request": pins["request"],
+                        "artifact": pins["capacity"], "receipt": pins["receipt"],
+                    },
+                },
+            }
+
+            def reader_source_boundary(_pin: dict[str, Any], source_root: object) -> None:
+                self.assertEqual(readback.absolute_path(source_root, "SourceV5 source root"), root)
+                raise readback.ReadbackError("source boundary reached with canonical text")
+
+            with patch.object(driver, "_load_scope_readback_module", return_value=readback), \
+                 patch.object(readback, "_verify_condition_file_v2", return_value=(pins["condition"], {})), \
+                 patch.object(readback, "_source5_stack", side_effect=reader_source_boundary) as source_check, \
+                 patch.object(readback, "_verify_capacity_bundle_v2") as capacity_check:
+                with self.assertRaisesRegex(driver.PressureError, "source boundary reached with canonical text"):
+                    driver._source5_context_calibration_request_v2(request)
+                source_check.assert_called_once_with(pins["source"], str(root))
+                capacity_check.assert_not_called()
+
     def test_numeric_context_projection_ignores_only_member_references(self) -> None:
         policy = {
             "schema": readback.SOURCE5_PRESSURE_POLICY_SCHEMA,
