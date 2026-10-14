@@ -25,6 +25,329 @@ fn wait_until(predicate: impl Fn() -> bool, message: &str) {
   }
 }
 
+struct PendingAdmissionProbe {
+  polls: Arc<AtomicUsize>,
+  drops: Arc<AtomicUsize>,
+}
+
+impl Future for PendingAdmissionProbe {
+  type Output = ();
+
+  fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
+    self.polls.fetch_add(1, Ordering::SeqCst);
+    Poll::Pending
+  }
+}
+
+impl Drop for PendingAdmissionProbe {
+  fn drop(&mut self) {
+    self.drops.fetch_add(1, Ordering::SeqCst);
+  }
+}
+
+fn pending_admission_probe() -> (PendingAdmissionProbe, Arc<AtomicUsize>, Arc<AtomicUsize>) {
+  let polls = Arc::new(AtomicUsize::new(0));
+  let drops = Arc::new(AtomicUsize::new(0));
+  (
+    PendingAdmissionProbe {
+      polls: Arc::clone(&polls),
+      drops: Arc::clone(&drops),
+    },
+    polls,
+    drops,
+  )
+}
+
+type AdmissionGate = Arc<(Mutex<bool>, Condvar)>;
+type AdmissionArrivals = Arc<(Mutex<usize>, Condvar)>;
+type AdmissionHook = Arc<dyn Fn() + Send + Sync>;
+
+fn admission_gate_hook() -> (AdmissionGate, AdmissionGate, Arc<AtomicBool>, AdmissionHook) {
+  let entered = Arc::new((Mutex::new(false), Condvar::new()));
+  let release = Arc::new((Mutex::new(false), Condvar::new()));
+  let timed_out = Arc::new(AtomicBool::new(false));
+  let hook_entered = Arc::clone(&entered);
+  let hook_release = Arc::clone(&release);
+  let hook_timed_out = Arc::clone(&timed_out);
+  let hook: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+    let (lock, cv) = &*hook_entered;
+    *lock.lock().unwrap_or_else(|error| error.into_inner()) = true;
+    cv.notify_all();
+    let (lock, cv) = &*hook_release;
+    let mut open = lock.lock().unwrap_or_else(|error| error.into_inner());
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while !*open {
+      let remaining = deadline.saturating_duration_since(Instant::now());
+      if remaining.is_zero() {
+        hook_timed_out.store(true, Ordering::SeqCst);
+        return;
+      }
+      let (next, timeout) = cv
+        .wait_timeout(open, remaining)
+        .unwrap_or_else(|error| error.into_inner());
+      open = next;
+      if timeout.timed_out() && !*open {
+        hook_timed_out.store(true, Ordering::SeqCst);
+        return;
+      }
+    }
+  });
+  (entered, release, timed_out, hook)
+}
+
+fn spawn_pair_barrier_hook() -> (AdmissionArrivals, Arc<AtomicBool>, AdmissionHook) {
+  let arrivals = Arc::new((Mutex::new(0usize), Condvar::new()));
+  let timed_out = Arc::new(AtomicBool::new(false));
+  let hook_arrivals = Arc::clone(&arrivals);
+  let hook_timed_out = Arc::clone(&timed_out);
+  let hook: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+    let (lock, cv) = &*hook_arrivals;
+    let mut count = lock.lock().unwrap_or_else(|error| error.into_inner());
+    *count = count.saturating_add(1);
+    cv.notify_all();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while *count < 2 {
+      let remaining = deadline.saturating_duration_since(Instant::now());
+      if remaining.is_zero() {
+        hook_timed_out.store(true, Ordering::SeqCst);
+        return;
+      }
+      let (next, timeout) = cv
+        .wait_timeout(count, remaining)
+        .unwrap_or_else(|error| error.into_inner());
+      count = next;
+      if timeout.timed_out() && *count < 2 {
+        hook_timed_out.store(true, Ordering::SeqCst);
+        return;
+      }
+    }
+  });
+  (arrivals, timed_out, hook)
+}
+
+fn wait_for_admission_hook(entered: &Arc<(Mutex<bool>, Condvar)>) -> bool {
+  let (lock, cv) = &**entered;
+  let mut reached = lock.lock().unwrap_or_else(|error| error.into_inner());
+  let deadline = Instant::now() + Duration::from_secs(3);
+  while !*reached {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+      return false;
+    }
+    let (next, timeout) = cv
+      .wait_timeout(reached, remaining)
+      .unwrap_or_else(|error| error.into_inner());
+    reached = next;
+    if timeout.timed_out() && !*reached {
+      return false;
+    }
+  }
+  true
+}
+
+fn release_admission_hook(release: &Arc<(Mutex<bool>, Condvar)>) {
+  let (lock, cv) = &**release;
+  *lock.lock().unwrap_or_else(|error| error.into_inner()) = true;
+  cv.notify_all();
+}
+
+fn join_spawn_thread<T: Send + 'static>(
+  handle: std::thread::JoinHandle<T>,
+  label: &'static str,
+) -> T {
+  let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+  std::thread::spawn(move || {
+    let _ = sender.send(handle.join());
+  });
+  match receiver.recv_timeout(Duration::from_secs(5)) {
+    Ok(Ok(value)) => value,
+    Ok(Err(_)) => panic!("{label} thread panicked"),
+    Err(_) => panic!("{label} thread join timed out"),
+  }
+}
+
+#[test]
+fn concurrent_spawns_select_distinct_slots_after_the_shared_snapshot() {
+  let runtime = runtime(1, 2, 1);
+  let (arrivals, hook_timed_out, hook) = spawn_pair_barrier_hook();
+  runtime.shared.set_spawn_admission_test_hook(hook);
+
+  let (first_future, _first_polls, first_drops) = pending_admission_probe();
+  let (second_future, _second_polls, second_drops) = pending_admission_probe();
+  let first_handle = runtime.handle();
+  let first_thread = std::thread::spawn(move || first_handle.spawn(first_future));
+  let second_handle = runtime.handle();
+  let second_thread = std::thread::spawn(move || second_handle.spawn(second_future));
+  let first = join_spawn_thread(first_thread, "first spawn");
+  let second = join_spawn_thread(second_thread, "second spawn");
+  assert!(!hook_timed_out.load(Ordering::SeqCst));
+  assert_eq!(
+    *arrivals.0.lock().unwrap_or_else(|error| error.into_inner()),
+    2
+  );
+  let first = first.unwrap_or_else(|error| panic!("first spawn rejected: {}", error.kind));
+  let second = second.unwrap_or_else(|error| panic!("second spawn rejected: {}", error.kind));
+
+  runtime
+    .shutdown(AsyncShutdown::CancelPending)
+    .unwrap_or_else(|error| panic!("shutdown failed: {error}"));
+  assert!(matches!(block_on(first), Err(AsyncJoinError::Cancelled)));
+  assert!(matches!(block_on(second), Err(AsyncJoinError::Cancelled)));
+  assert_eq!(first_drops.load(Ordering::SeqCst), 1);
+  assert_eq!(second_drops.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn concurrent_spawn_with_one_slot_returns_full_and_preserves_the_rejected_future() {
+  let runtime = runtime(1, 1, 1);
+  let (arrivals, hook_timed_out, hook) = spawn_pair_barrier_hook();
+  runtime.shared.set_spawn_admission_test_hook(hook);
+
+  let (first_future, first_polls, first_drops) = pending_admission_probe();
+  let (second_future, second_polls, second_drops) = pending_admission_probe();
+  let first_handle = runtime.handle();
+  let first_thread = std::thread::spawn(move || first_handle.spawn(first_future));
+  let second_handle = runtime.handle();
+  let second_thread = std::thread::spawn(move || second_handle.spawn(second_future));
+  let outcomes = [
+    (
+      join_spawn_thread(first_thread, "first spawn"),
+      first_polls,
+      first_drops,
+    ),
+    (
+      join_spawn_thread(second_thread, "second spawn"),
+      second_polls,
+      second_drops,
+    ),
+  ];
+  assert!(!hook_timed_out.load(Ordering::SeqCst));
+  assert_eq!(
+    *arrivals.0.lock().unwrap_or_else(|error| error.into_inner()),
+    2
+  );
+
+  let mut admitted = Vec::new();
+  let mut rejected = 0;
+  for (outcome, polls, drops) in outcomes {
+    match outcome {
+      Ok(job) => admitted.push((job, drops)),
+      Err(error) => {
+        assert_eq!(error.kind, super::AsyncError::Full);
+        assert_eq!(polls.load(Ordering::SeqCst), 0);
+        let future = error.into_future();
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+        drop(future);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        rejected += 1;
+      }
+    }
+  }
+  assert_eq!(admitted.len(), 1);
+  assert_eq!(rejected, 1);
+
+  runtime
+    .shutdown(AsyncShutdown::CancelPending)
+    .unwrap_or_else(|error| panic!("shutdown failed: {error}"));
+  for (job, drops) in admitted {
+    assert!(matches!(block_on(job), Err(AsyncJoinError::Cancelled)));
+    assert_eq!(drops.load(Ordering::SeqCst), 1);
+  }
+}
+
+#[test]
+fn scope_close_after_domain_reservation_rolls_back_and_returns_the_future() {
+  use crate::runtime::resource_domain::{DomainResource, DomainResources, ResourceDomain};
+
+  let ceiling = DomainResources::ZERO
+    .with(DomainResource::Cpu, 2)
+    .with(DomainResource::Tasks, 4)
+    .with(DomainResource::Control, 1 << 20);
+  let domain = ResourceDomain::with_waiters(ceiling, 1, 4).unwrap();
+  let tenant = domain.tenant(ceiling).unwrap();
+  let resources = ResourceScope::from_tenant(ResourceLimits::default(), tenant);
+  let runtime = runtime(1, 2, 2);
+  let before_scope = domain.snapshot().used;
+  let scope = runtime
+    .scope_with_resources(&resources)
+    .unwrap_or_else(|error| panic!("resource scope creation failed: {error}"));
+  let scope_baseline = domain.snapshot().used;
+  let (entered, release, hook_timed_out, hook) = admission_gate_hook();
+  runtime.shared.set_spawn_admission_test_hook(hook);
+
+  let (future, polls, drops) = pending_admission_probe();
+  let handle = scope.handle();
+  let spawn_thread = std::thread::spawn(move || handle.spawn(future));
+  if !wait_for_admission_hook(&entered) {
+    release_admission_hook(&release);
+    match join_spawn_thread(spawn_thread, "scope-close spawn") {
+      Ok(job) => drop(job),
+      Err(error) => drop(error.into_future()),
+    }
+    block_on(scope.close());
+    runtime
+      .shutdown(AsyncShutdown::CancelPending)
+      .unwrap_or_else(|error| panic!("shutdown failed: {error}"));
+    panic!("scope-close spawn did not reach final admission");
+  }
+  let reserved = domain.snapshot().used;
+  assert_eq!(
+    reserved.get(DomainResource::Tasks),
+    scope_baseline.get(DomainResource::Tasks) + 1
+  );
+  assert!(reserved.get(DomainResource::Control) > scope_baseline.get(DomainResource::Control));
+
+  block_on(scope.close());
+  release_admission_hook(&release);
+  let error = join_spawn_thread(spawn_thread, "scope-close spawn").unwrap_err();
+  assert!(!hook_timed_out.load(Ordering::SeqCst));
+  assert_eq!(error.kind, super::AsyncError::Closed);
+  assert_eq!(polls.load(Ordering::SeqCst), 0);
+  let future = error.into_future();
+  assert_eq!(drops.load(Ordering::SeqCst), 0);
+  drop(future);
+  assert_eq!(drops.load(Ordering::SeqCst), 1);
+  assert_eq!(domain.snapshot().used, before_scope);
+  runtime
+    .shutdown(AsyncShutdown::Drain)
+    .unwrap_or_else(|error| panic!("shutdown failed: {error}"));
+}
+
+#[test]
+fn runtime_close_after_spawn_reservation_returns_the_unpolled_future() {
+  let runtime = runtime(1, 1, 1);
+  let (entered, release, hook_timed_out, hook) = admission_gate_hook();
+  runtime.shared.set_spawn_admission_test_hook(hook);
+
+  let (future, polls, drops) = pending_admission_probe();
+  let handle = runtime.handle();
+  let spawn_thread = std::thread::spawn(move || handle.spawn(future));
+  if !wait_for_admission_hook(&entered) {
+    release_admission_hook(&release);
+    match join_spawn_thread(spawn_thread, "runtime-close spawn") {
+      Ok(job) => drop(job),
+      Err(error) => drop(error.into_future()),
+    }
+    runtime
+      .shutdown(AsyncShutdown::CancelPending)
+      .unwrap_or_else(|error| panic!("shutdown failed: {error}"));
+    panic!("runtime-close spawn did not reach final admission");
+  }
+  runtime
+    .shutdown(AsyncShutdown::CancelPending)
+    .unwrap_or_else(|error| panic!("shutdown failed: {error}"));
+  release_admission_hook(&release);
+
+  let error = join_spawn_thread(spawn_thread, "runtime-close spawn").unwrap_err();
+  assert!(!hook_timed_out.load(Ordering::SeqCst));
+  assert_eq!(error.kind, super::AsyncError::Closed);
+  assert_eq!(polls.load(Ordering::SeqCst), 0);
+  let future = error.into_future();
+  assert_eq!(drops.load(Ordering::SeqCst), 0);
+  drop(future);
+  assert_eq!(drops.load(Ordering::SeqCst), 1);
+}
+
 #[test]
 fn ready_async_job_waits_at_zero_budget_and_keeps_its_output() {
   let runtime = runtime(1, 4, 2);

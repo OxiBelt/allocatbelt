@@ -81,6 +81,9 @@ pub(super) struct Shared {
   /// Inactive helpers and restoring threads wait here; `work` waiters are
   /// dispatchers.
   handoff: Condvar,
+  /// Deterministic admission interleavings; absent from non-test builds.
+  #[cfg(all(test, not(loom)))]
+  spawn_admission_test_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
   _control: ControlCharge,
 }
 
@@ -275,6 +278,8 @@ impl Shared {
         }),
         work: Condvar::new(),
         handoff: Condvar::new(),
+        #[cfg(all(test, not(loom)))]
+        spawn_admission_test_hook: Mutex::new(None),
         _control: control,
       }),
       root,
@@ -283,6 +288,26 @@ impl Shared {
 
   fn lock(&self) -> MutexGuard<'_, State> {
     self.state.lock().unwrap_or_else(PoisonError::into_inner)
+  }
+
+  #[cfg(all(test, not(loom)))]
+  pub(super) fn set_spawn_admission_test_hook(&self, hook: Arc<dyn Fn() + Send + Sync>) {
+    *self
+      .spawn_admission_test_hook
+      .lock()
+      .unwrap_or_else(PoisonError::into_inner) = Some(hook);
+  }
+
+  #[cfg(all(test, not(loom)))]
+  fn before_spawn_admission_for_test(&self) {
+    let hook = self
+      .spawn_admission_test_hook
+      .lock()
+      .unwrap_or_else(PoisonError::into_inner)
+      .clone();
+    if let Some(hook) = hook {
+      hook();
+    }
   }
 
   fn invoke_hook(
@@ -610,7 +635,7 @@ impl Shared {
     F: Future + Send + 'static,
     F::Output: Send + 'static,
   {
-    let (index, generation, scope_cell) = {
+    let scope_cell = {
       let state = self.lock();
       if state.closed {
         return Err(AsyncSpawnError::new(AsyncError::Closed, future));
@@ -621,17 +646,14 @@ impl Shared {
       if scope_cell.protocol.is_closed() {
         return Err(AsyncSpawnError::new(AsyncError::Closed, future));
       }
-      let Some(index) = state
-        .tasks
-        .iter()
-        .position(|slot| slot.task.is_none() && !slot.protocol.admitted())
-      else {
+      if !state.tasks.iter().any(|slot| {
+        slot.task.is_none()
+          && !slot.protocol.admitted()
+          && slot.protocol.next_generation().is_some()
+      }) {
         return Err(AsyncSpawnError::new(AsyncError::Full, future));
-      };
-      let Some(generation) = state.tasks[index].protocol.next_generation() else {
-        return Err(AsyncSpawnError::new(AsyncError::Full, future));
-      };
-      (index, generation, scope_cell)
+      }
+      scope_cell
     };
 
     let tenant = scope_cell.tenant.as_ref();
@@ -674,7 +696,9 @@ impl Shared {
       drop(domain);
       return Err(AsyncSpawnError::new(AsyncError::TaskIdExhausted, future));
     };
-    let task_ref = TaskRef { index, generation };
+    #[cfg(all(test, not(loom)))]
+    // Resource reservations are complete, and no scheduler lock is held.
+    self.before_spawn_admission_for_test();
     let mut state = self.lock();
     if state.closed {
       drop(state);
@@ -691,14 +715,26 @@ impl Shared {
       drop(domain);
       return Err(AsyncSpawnError::new(AsyncError::Closed, future));
     }
-    if !Arc::ptr_eq(current_scope, &scope_cell)
-      || state.tasks[index].task.is_some()
-      || state.tasks[index].protocol.next_generation() != Some(generation)
-    {
+    if !Arc::ptr_eq(current_scope, &scope_cell) {
       drop(state);
       drop(domain);
       return Err(AsyncSpawnError::new(AsyncError::Full, future));
     }
+    let Some((index, generation)) = state.tasks.iter().enumerate().find_map(|(index, slot)| {
+      if slot.task.is_none() && !slot.protocol.admitted() {
+        slot
+          .protocol
+          .next_generation()
+          .map(|generation| (index, generation))
+      } else {
+        None
+      }
+    }) else {
+      drop(state);
+      drop(domain);
+      return Err(AsyncSpawnError::new(AsyncError::Full, future));
+    };
+    let task_ref = TaskRef { index, generation };
     let (task, job) = Task::create(
       future,
       task_id,
@@ -1638,6 +1674,83 @@ mod tests {
   use crate::runtime::managed::{ResourceLimits, ResourceScope};
   use crate::runtime::resource_domain::{DomainResource, DomainResources, ResourceDomain};
   use std::future::Future;
+
+  fn shared_with_task_slots(max_outstanding: usize) -> (Arc<Shared>, ScopeRef) {
+    let metrics = RuntimeMetrics::try_new(
+      1,
+      [AsyncThreadContext {
+        role: super::super::thread_options::AsyncThreadRole::Worker,
+        index: 0,
+        physical_index: 0,
+      }],
+      1,
+      None,
+    )
+    .unwrap_or_else(|error| panic!("metrics allocation failed: {error:?}"));
+    Shared::new(
+      AsyncConfig {
+        workers: 1,
+        max_outstanding,
+        max_scopes: 1,
+      },
+      0,
+      None,
+      super::super::ControlledThreadOptions::unbounded(AsyncThreadOptions::default()),
+      metrics,
+    )
+    .unwrap_or_else(|error| panic!("shared construction failed: {error}"))
+  }
+
+  #[test]
+  fn exhausted_task_generation_is_skipped_without_hiding_other_slots() {
+    let (shared, root) = shared_with_task_slots(2);
+    {
+      let mut state = shared.lock();
+      state.tasks[0].protocol.admit(u64::MAX);
+      state.tasks[0].protocol.finish_cancel();
+    }
+
+    let job = shared
+      .spawn(root, std::future::pending::<()>())
+      .unwrap_or_else(|error| panic!("usable task slot was hidden: {}", error.kind));
+    {
+      let state = shared.lock();
+      assert_eq!(state.tasks[0].protocol.generation(), u64::MAX);
+      assert!(!state.tasks[0].protocol.admitted());
+      assert_eq!(state.tasks[1].protocol.generation(), 1);
+      assert!(state.tasks[1].protocol.admitted());
+    }
+    drop(job);
+    shared.close(true);
+    drop(shared);
+  }
+
+  #[test]
+  fn all_exhausted_task_generations_return_full_without_admission() {
+    let (shared, root) = shared_with_task_slots(2);
+    {
+      let mut state = shared.lock();
+      for slot in &mut state.tasks {
+        slot.protocol.admit(u64::MAX);
+        slot.protocol.finish_cancel();
+      }
+    }
+
+    let error = shared
+      .spawn(root, std::future::pending::<()>())
+      .err()
+      .unwrap_or_else(|| panic!("table with no usable generation admitted a task"));
+    assert_eq!(error.kind, AsyncError::Full);
+    {
+      let state = shared.lock();
+      assert!(state.tasks.iter().all(|slot| {
+        slot.protocol.generation() == u64::MAX && !slot.protocol.admitted() && slot.task.is_none()
+      }));
+    }
+    drop(error.into_future());
+    shared.close(true);
+    drop(shared);
+  }
 
   #[test]
   fn scope_close_stays_pending_until_zero_count_slot_reclamation() {
