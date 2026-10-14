@@ -534,6 +534,45 @@ mod tests {
   }
 
   #[test]
+  fn refills_and_lowering_keep_live_admissions_within_owner_ceilings() {
+    let limit = bucket(100, 100, 2);
+    let start = limit.shared.lock().unwrap().last;
+    let first = limit.reserve_at(100, start).unwrap();
+    let second = limit
+      .reserve_at(100, start + Duration::from_secs(1))
+      .unwrap();
+    limit
+      .shared
+      .lock()
+      .unwrap()
+      .refill(start + Duration::from_secs(2));
+    let full = limit.snapshot();
+    assert_eq!(full.available_bytes, 100);
+    assert_eq!(full.reserved_bytes, 200);
+    assert_eq!(full.reservations, 2);
+    assert_eq!(
+      limit
+        .reserve_at(1, start + Duration::from_secs(2))
+        .unwrap_err(),
+      ByteRateError::ReservationsFull
+    );
+    first.commit(60).unwrap();
+    limit
+      .set_limits_at(1, 50, start + Duration::from_secs(2))
+      .unwrap();
+    let lowered = limit.snapshot();
+    assert_eq!(lowered.available_bytes, 50);
+    assert_eq!(lowered.reserved_bytes, 100);
+    assert_eq!(lowered.reservations, 1);
+    assert_eq!(lowered.ceiling_burst_bytes, 100);
+    drop(second);
+    let settled = limit.snapshot();
+    assert_eq!(settled.available_bytes, 50);
+    assert_eq!(settled.reserved_bytes, 0);
+    assert_eq!(settled.reservations, 0);
+  }
+
+  #[test]
   fn reconfiguration_preserves_old_reservation_and_never_mints() {
     let limit = bucket(10, 100, 2);
     let start = limit.shared.lock().unwrap().last;

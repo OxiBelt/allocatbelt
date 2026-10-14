@@ -3090,7 +3090,15 @@ def _validate_resource_sample_rows(
             require(row[prefix + "ceiling_burst_bytes"] == bucket["ceiling_burst_bytes"], f"{direction} bucket burst ceiling differs from expectation")
             require(row[prefix + "max_reservations"] == bucket["max_reservations"], f"{direction} bucket reservation cap differs from expectation")
             require(row[prefix + "bytes_per_second"] <= bucket["ceiling_bytes_per_second"] and row[prefix + "burst_bytes"] <= bucket["ceiling_burst_bytes"], f"{direction} bucket exceeds its hard rate/burst cap")
-            require(row[prefix + "available_bytes"] + row[prefix + "reserved_bytes"] <= row[prefix + "burst_bytes"], f"{direction} bucket credits exceed its burst")
+            # Admission tokens refill while earlier I/O owners retain their bytes.
+            # Reconfiguration can lower the current burst below an old admission.
+            available = row[prefix + "available_bytes"]
+            reserved = row[prefix + "reserved_bytes"]
+            owners = row[prefix + "reservations"]
+            require(available <= row[prefix + "burst_bytes"],
+                    f"{direction} available bucket credits exceed its burst")
+            require(owners <= reserved <= owners * bucket["ceiling_burst_bytes"],
+                    f"{direction} retained bucket credits exceed their owner bounds")
             require(row[prefix + "reservations"] <= bucket["max_reservations"], f"{direction} bucket exceeds its reservation cap")
         require(row["upload_rate_bytes_per_second"] == policy["rate_buckets"]["upload"]["ceiling_bytes_per_second"], "upload control changed despite being fixed")
 

@@ -1763,6 +1763,52 @@ class FeedbackReadbackTests(unittest.TestCase):
         with self.assertRaisesRegex(reader.ValidationError, "credits"):
             self.fixture.verify()
 
+    def test_refilled_bucket_retains_multiple_original_admissions(self) -> None:
+        rows = self.fixture.samples_path.read_text(encoding="ascii").splitlines()
+        header = rows[1].split("\t")
+        values = rows[2].split("\t")
+        burst = int(values[header.index("disk_rate_ceiling_burst_bytes")])
+        values[header.index("disk_rate_available_bytes")] = str(burst)
+        values[header.index("disk_rate_reserved_bytes")] = str(2 * burst)
+        values[header.index("disk_rate_reservations")] = "2"
+        rows[2] = "\t".join(values)
+        self.fixture.repin("samples", ("\n".join(rows) + "\n").encode("ascii"))
+        self.assertTrue(self.fixture.verify()["validated"])
+
+    def test_lowered_burst_preserves_original_owner_ceiling(self) -> None:
+        rows = self.fixture.samples_path.read_text(encoding="ascii").splitlines()
+        header = rows[1].split("\t")
+        values = rows[2].split("\t")
+        burst = int(values[header.index("disk_rate_ceiling_burst_bytes")])
+        values[header.index("disk_rate_burst_bytes")] = str(burst // 2)
+        values[header.index("disk_rate_available_bytes")] = str(burst // 2)
+        values[header.index("disk_rate_reserved_bytes")] = str(burst)
+        values[header.index("disk_rate_reservations")] = "1"
+        rows[2] = "\t".join(values)
+        self.fixture.repin("samples", ("\n".join(rows) + "\n").encode("ascii"))
+        self.assertTrue(self.fixture.verify()["validated"])
+
+    def test_impossible_available_and_retained_balances_are_rejected(self) -> None:
+        mutations = (
+            ("available", {"available_bytes": lambda burst: burst + 1}, "available bucket credits"),
+            ("owner-cap", {"reserved_bytes": lambda burst: burst + 1, "reservations": lambda _: 1}, "owner bounds"),
+            ("zero-owner", {"reserved_bytes": lambda _: 1, "reservations": lambda _: 0}, "owner bounds"),
+            ("empty-owner", {"reserved_bytes": lambda _: 1, "reservations": lambda _: 2}, "owner bounds"),
+        )
+        for name, fields, diagnostic in mutations:
+            with self.subTest(name=name):
+                self.fixture = Fixture(Path(self.temp.name) / name)
+                rows = self.fixture.samples_path.read_text(encoding="ascii").splitlines()
+                header = rows[1].split("\t")
+                values = rows[2].split("\t")
+                burst = int(values[header.index("disk_rate_ceiling_burst_bytes")])
+                for field, value in fields.items():
+                    values[header.index("disk_rate_" + field)] = str(value(burst))
+                rows[2] = "\t".join(values)
+                self.fixture.repin("samples", ("\n".join(rows) + "\n").encode("ascii"))
+                with self.assertRaisesRegex(reader.ValidationError, diagnostic):
+                    self.fixture.verify()
+
     def test_expectation_rejects_unknown_fields_and_missing_pressure_proofs(self) -> None:
         body = json.loads(self.fixture.expectation_bytes)
         body.pop("recipe_sha256")

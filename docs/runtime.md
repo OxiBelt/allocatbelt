@@ -1736,6 +1736,13 @@ a burst ceiling rises. Fractional replenishment survives short real intervals;
 full-bucket clamping discards accumulated surplus. Shared clones observe the
 same reservation count and byte balance.
 
+Available admission tokens are bounded by the current burst. Live owners keep
+their admitted bytes while tokens refill; lowering a burst does not revoke
+those owners. Their total retained bytes are bounded by their count times the
+construction-time burst ceiling, with the count bounded by the construction-time
+reservation cap. Zero-byte admission creates no owner. Trace verification checks
+these bounds separately rather than adding available and retained balances.
+
 These buckets account application-byte admission, not physical disk traffic,
 wire bandwidth or operation-slot permits. `runtime::rate_io::RateLimitedIo`
 reserves available credit before each initialized stream poll and refunds
