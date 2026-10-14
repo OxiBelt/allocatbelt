@@ -90,10 +90,15 @@ phase endpoints (`started`, `trace_ended`, `drain_ended`, `shutdown_ended`, and
 the lower-endpoint scalar, chronology and bounded phase durations. It also
 reuses the terminal-ID/checksum, 100 ms sample cadence, first/final 36,000-row
 RSS windows, upper-median five-percent growth bound, hard resource ceilings,
-scope limits, byte-credit conservation, reservation caps, final zero charges,
+scope limits, byte-credit bounds, reservation caps, final zero charges,
 and fixed global Control-baseline checks. CPU, disk and download controls may
 move within the construction-probe policy bounds; the separate feedback v3
 reader reconstructs their complete transitions from the feedback trace.
+
+Available byte credits are bounded by the current burst. Retained bytes are
+bounded by the number of live reservation owners times the construction burst
+ceiling, with at least one byte per owner. Tokens may refill while earlier
+owners remain live, so retained bytes and available tokens have separate bounds.
 
 `qualification_eligible` describes only this independently audited soak
 component. A full feedback qualification also requires the separate pressure

@@ -121,6 +121,30 @@ def receipt_text(fields, schema=module.SCHEMA):
 
 
 class ReadbackTests(unittest.TestCase):
+    def test_refilled_tokens_and_two_live_owners_validate_at_setup(self):
+        for executor in ("allocatbelt", "tokio-1.53.1"):
+            with self.subTest(executor=executor):
+                fields, expected = fixture(executor=executor, workload="disk")
+                burst = expected["contract"]["byte_buckets"]["disk"]["ceiling_burst_bytes"]
+                fields["setup.io.disk_available_bytes"] = str(burst)
+                fields["setup.io.disk_reserved_bytes"] = str(2 * burst)
+                fields["setup.io.disk_reservations"] = "2"
+                self.assertTrue(module.validate_runtime_readback(fields, expected)["validated"])
+
+    def test_runtime_receipt_rejects_impossible_independent_bucket_balances(self):
+        for name, available, reserved, owners in (
+            ("available", 65537, 0, 0), ("owner-cap", 0, 65537, 1),
+            ("zero-owner", 0, 1, 0), ("empty-owner", 0, 1, 2),
+            ("owner-count", 0, 65, 65),
+        ):
+            with self.subTest(case=name):
+                fields, expected = fixture(workload="disk")
+                fields["setup.io.disk_available_bytes"] = str(available)
+                fields["setup.io.disk_reserved_bytes"] = str(reserved)
+                fields["setup.io.disk_reservations"] = str(owners)
+                with self.assertRaises(module.ReadbackError):
+                    module.validate_runtime_readback(fields, expected)
+
     def test_zero_control_baseline_is_refused(self):
         value = recipe()
         value["fixed_global_control_baseline"] = 0

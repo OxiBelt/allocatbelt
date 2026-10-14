@@ -2773,8 +2773,9 @@ def _check_numeric_sample(row: dict[str, int], audit: dict[str, Any], index: int
         available = row[names["available"]]
         reserved = row[names["reserved"]]
         reservations = row[names["reservations"]]
-        require(available <= bucket["burst_bytes"] and reserved <= bucket["burst_bytes"], f"sample {index} {direction} byte credits exceed the burst")
-        require(available + reserved <= bucket["burst_bytes"], f"sample {index} {direction} available/reserved credit is not conserved")
+        require(available <= row[names["burst"]], f"sample {index} {direction} available credits exceed the burst")
+        require(reservations <= reserved <= reservations * bucket["ceiling_burst_bytes"],
+                f"sample {index} {direction} retained credits exceed owner bounds")
         require(reservations <= bucket["max_reservations"], f"sample {index} {direction} reservation owners exceed their cap")
         require((reserved == 0) == (reservations == 0), f"sample {index} {direction} reserved bytes and owner count disagree")
 
@@ -2834,8 +2835,9 @@ def _check_numeric_sample_v2(row: dict[str, int], audit: dict[str, Any], index: 
         require(row[names["ceiling_burst"]] == bucket["ceiling_burst_bytes"], f"sample {index} {direction} hard burst ceiling differs")
         require(row[names["max_reservations"]] == bucket["max_reservations"], f"sample {index} {direction} reservation cap differs")
         available, reserved, reservations = row[names["available"]], row[names["reserved"]], row[names["reservations"]]
-        require(available <= bucket["burst_bytes"] and reserved <= bucket["burst_bytes"], f"sample {index} {direction} credits exceed the hard burst")
-        require(available + reserved <= bucket["burst_bytes"], f"sample {index} {direction} credit accounting is not conserved")
+        require(available <= row[names["burst"]], f"sample {index} {direction} available credits exceed the burst")
+        require(reservations <= reserved <= reservations * bucket["ceiling_burst_bytes"],
+                f"sample {index} {direction} retained credits exceed owner bounds")
         require(reservations <= bucket["max_reservations"], f"sample {index} {direction} reservations exceed their fixed cap")
         require((reserved == 0) == (reservations == 0), f"sample {index} {direction} reserved bytes and reservation count disagree")
 

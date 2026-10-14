@@ -562,8 +562,9 @@ def validate_runtime_readback(
             reserved = integer(fields, reserved_key)
             reservations = integer(fields, reservations_key)
             max_reservations = integer(fields, max_reservations_key)
-            require(available <= burst and reserved <= burst, f"byte credits exceed capacity: {direction}")
-            require(available + reserved <= burst, f"byte credit conservation failed: {direction}")
+            require(available <= burst, f"available byte credits exceed capacity: {direction}")
+            require(reservations <= reserved <= reservations * bucket["ceiling_burst_bytes"],
+                    f"retained byte credits exceed owner bounds: {direction}")
             require(
                 max_reservations == bucket["max_reservations"],
                 f"reservation capacity changed: {direction}",

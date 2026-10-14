@@ -2575,6 +2575,55 @@ class SoakReadbackTests(unittest.TestCase):
             with self.assertRaisesRegex(module.SoakReadbackError, "pinned external ring"):
                 module._parse_terminal_stream(terminal_path, receipt, audit["ring"], fixture.recipe["runtime"]["terminal_budget_bytes"])
 
+    def test_soak_samples_accept_refill_while_two_original_owners_remain(self):
+        for version in (module.RECIPE_SCHEMA, module.RECIPE_SCHEMA_V2):
+            with tempfile.TemporaryDirectory(prefix="soak-refilled-owners-") as temp:
+                fixture = Fixture(Path(temp), profile="mixed", mode="functional", duration=2)
+                audit = fixture.audit()
+                receipt, _, raw = fixture.write_receipt_and_streams()
+                if version == module.RECIPE_SCHEMA_V2:
+                    audit["recipe"]["schema"] = version
+                    audit["source"]["feedback_context"] = {"controls": {
+                        "cpu": {"floor": 1, "ceiling": 4},
+                        "disk": {"floor": 64 * 1024**2, "ceiling": module.RATE_BYTES_PER_SECOND},
+                        "download": {"floor": 64 * 1024**2, "ceiling": module.RATE_BYTES_PER_SECOND},
+                    }}
+                lines = raw.decode("ascii").splitlines()
+                header = lines[0].split("\t")
+                values = lines[1].split("\t")
+                burst = audit["source"]["byte_buckets"]["disk"]["ceiling_burst_bytes"]
+                values[header.index("disk_rate_available_bytes")] = str(burst)
+                values[header.index("disk_rate_reserved_bytes")] = str(2 * burst)
+                values[header.index("disk_rate_reservations")] = "2"
+                lines[1] = "\t".join(values)
+                changed = ("\n".join(lines) + "\n").encode("ascii")
+                path = fixture.output / "resource-samples.tsv"
+                path.unlink()
+                write_private(path, changed)
+                receipt["resource_samples_sha256"] = digest_bytes(changed)
+                module._parse_samples(path, receipt, audit, fixture.recipe["runtime"]["sample_budget_bytes"])
+
+    def test_soak_samples_reject_owner_and_token_overcommit_in_both_versions(self):
+        with tempfile.TemporaryDirectory(prefix="soak-invalid-balances-") as temp:
+            fixture = Fixture(Path(temp), profile="mixed", mode="functional", duration=2)
+            audit = fixture.audit()
+            _, _, raw = fixture.write_receipt_and_streams()
+            header, values = (line.split("\t") for line in raw.decode("ascii").splitlines()[:2])
+            row = dict(zip(header, map(int, values), strict=True))
+            for version in (module.RECIPE_SCHEMA, module.RECIPE_SCHEMA_V2):
+                audit["recipe"]["schema"] = version
+                audit["source"]["feedback_context"] = {"controls": {
+                    "cpu": {"floor": 1, "ceiling": 4},
+                    "disk": {"floor": 64 * 1024**2, "ceiling": module.RATE_BYTES_PER_SECOND},
+                    "download": {"floor": 64 * 1024**2, "ceiling": module.RATE_BYTES_PER_SECOND},
+                }}
+                burst = audit["source"]["byte_buckets"]["disk"]["ceiling_burst_bytes"]
+                for available, reserved, owners in ((burst + 1, 0, 0), (0, burst + 1, 1), (0, 1, 0), (0, 1, 2), (0, 65, 65)):
+                    bad = dict(row, disk_rate_available_bytes=available,
+                               disk_rate_reserved_bytes=reserved, disk_rate_reservations=owners)
+                    with self.subTest(version=version, balance=(available, reserved, owners)), self.assertRaises(module.SoakReadbackError):
+                        module._check_numeric_sample(bad, audit, 0)
+
     def test_resource_limits_and_credit_conservation_are_checked(self):
         with tempfile.TemporaryDirectory(prefix="allocatbelt-soak-sample-") as temp:
             fixture = Fixture(Path(temp))
@@ -2593,7 +2642,7 @@ class SoakReadbackTests(unittest.TestCase):
             sample_path.unlink()
             write_private(sample_path, bad_samples)
             receipt["resource_samples_sha256"] = digest_bytes(bad_samples)
-            with self.assertRaisesRegex(module.SoakReadbackError, "credit is not conserved"):
+            with self.assertRaisesRegex(module.SoakReadbackError, "retained credits exceed owner bounds"):
                 module._parse_samples(sample_path, receipt, audit, fixture.recipe["runtime"]["sample_budget_bytes"])
 
     def test_qualified_recipe_cannot_use_a_short_horizon_and_rss_windows_are_exact(self):
