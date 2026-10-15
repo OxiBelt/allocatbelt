@@ -1064,7 +1064,9 @@ def _source5_offline_inventory_closure(
     for index, value in enumerate(inventory):
         require(type(value) is dict and type(value.get("kind")) is str,
                 f"{label} inventory entry[{index}] is malformed")
-        relative_text = text(value.get("path"), f"{label} inventory path[{index}]", 4096)
+        relative_text = value.get("path")
+        require(type(relative_text) is str and 0 < len(relative_text) <= 4096,
+                f"{label} inventory path[{index}] must be bounded text")
         relative = PurePosixPath(relative_text)
         require(not relative.is_absolute() and relative.parts and
                 ".." not in relative.parts and relative.as_posix() == relative_text and
