@@ -911,6 +911,44 @@ class ApplicationCampaignTests(unittest.TestCase):
             self.assertNotEqual(campaign.sha256_file(stdout_path), process_row["stdout_sha256"])
             self.assertEqual(metrics["runtime_readback"]["numeric_snapshot"]["after_release"]["global_live_tenants"], 0)
 
+            # Reuse this synthetic numeric row through the actual capture view;
+            # no output remains available at its recorded origin pathname.
+            fixed_path = SCRIPT.with_name("application-fixed-pair.py")
+            fixed_spec = importlib.util.spec_from_file_location("campaign_captured_fixed_pair", fixed_path)
+            assert fixed_spec is not None and fixed_spec.loader is not None
+            fixed = importlib.util.module_from_spec(fixed_spec)
+            sys.modules[fixed_spec.name] = fixed
+            fixed_spec.loader.exec_module(fixed)
+            originals = sorted(path for path in pair_dir.iterdir() if path.is_file())
+            stage = pair_dir / "capture-stage"
+            stage.mkdir(mode=0o700)
+            references = {}
+            for index, origin in enumerate(originals):
+                raw = ("\t".join(row_header) + "\n" + "\t".join(row[name] for name in row_header) + "\n").encode("utf-8") if origin == stdout_path else origin.read_bytes()
+                local = stage / f"{index:06d}"
+                local.write_bytes(raw)
+                local.chmod(0o400)
+                references[str(origin)] = {
+                    "origin_path": str(origin), "path": str(local),
+                    "role": "fixed_pair_artifact", "host_id": job["host_id"],
+                    "raw_sha256": campaign.hashlib.sha256(raw).hexdigest(), "semantic_sha256": None,
+                    "byte_count": len(raw), "maximum_bytes": fixed.MAX_PAIR_OUTPUT_BYTES,
+                }
+            for origin in originals:
+                origin.unlink()
+            view = fixed.CapturedFixedPairArtifactsV1(references, stage)
+            original_reader = campaign.read_stable_bytes
+            def refuse_origin(path, label, maximum):
+                if path.parent == pair_dir:
+                    raise AssertionError("captured metric extraction read an origin output")
+                return original_reader(path, label, maximum)
+            with mock.patch.object(campaign, "read_stable_bytes", side_effect=refuse_origin):
+                captured_metrics = campaign.extract_process_metrics(
+                    pair_dir, process_row, job, source, spec, Path(temporary), artifact_view=view,
+                )
+            self.assertEqual(captured_metrics, metrics)
+            self.assertTrue(all(not path.exists() for path in originals))
+
     def test_public_analyzer_constructs_all_capacity_and_latency_suite_endpoints(self) -> None:
         spec, _sources = spec_fixture()
         add_frozen_rates(spec, include_oracles=True)

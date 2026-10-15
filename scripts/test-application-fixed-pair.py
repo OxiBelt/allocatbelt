@@ -202,7 +202,9 @@ def _run_synthetic_receipt_case(
     return json.loads(raw.decode("utf-8")), launched, attempts
 
 
-def _verify_fixture_probe_offline(root: Path, fixture: object, reader: types.ModuleType) -> None:
+def _verify_fixture_probe_offline(
+    root: Path, fixture: object, reader: types.ModuleType, *, captured: bool = False,
+) -> None:
     source = fixture.source
     identity = fixture.identity
     probe_path = fixture.construction_probe_path
@@ -258,6 +260,12 @@ def _verify_fixture_probe_offline(root: Path, fixture: object, reader: types.Mod
         "loaded_modules": {"feedback_reader": reader},
         "modules": {"feedback_reader": {"sha256": reader_sha}}, "source": source,
     }
+    if captured:
+        paths = [probe_path, replay_stdout_path, stderr_path, replay_stderr_path]
+        stage, references = _stage_replay_test_files(root, paths)
+        for path in paths:
+            path.unlink()
+        context["artifact_view"] = FIXED.CapturedFixedPairArtifactsV1(references, stage)
     overlay = {"job": {"value": {"workload": identity["workload"], "profile": identity["profile"]}}}
     with patch.object(FIXED, "_verify_tmpdir_storage"):
         FIXED._verify_construction_probe(context, overlay, member, receipt, overlay_sha)
@@ -1293,7 +1301,10 @@ class FixedPairPureContractTests(unittest.TestCase):
                 if context.get("write_runtime_bindings") is True:
                     FIXED.write_exclusive(runtime_path, raw, "offline fixture runtime bindings")
                 else:
-                    stored, stored_sha, _info = FIXED.read_stable(runtime_path, "offline fixture runtime bindings", FIXED.MAX_RUNTIME_BYTES)
+                    if context.get("artifact_view") is None:
+                        stored, stored_sha, _info = FIXED.read_stable(runtime_path, "offline fixture runtime bindings", FIXED.MAX_RUNTIME_BYTES)
+                    else:
+                        stored, stored_sha = context["artifact_view"].read(runtime_path, "offline fixture runtime bindings", FIXED.MAX_RUNTIME_BYTES)
                     FIXED.require(stored == raw and stored_sha == digest, "fixture runtime binding bytes changed")
                 return bindings, manifest, raw, digest
 
@@ -1381,6 +1392,474 @@ class FixedPairPureContractTests(unittest.TestCase):
             self.assertTrue(result["verified"])
             self.assertEqual(result["status"], "failed_or_invalid")
             self.assertFalse(result["qualification_eligible"])
+
+            # Keep the genuine strict-host receipt emitted above, and move only
+            # this failed pair's raw outputs into the readback boundary shape.
+            # Source reconstruction is still the explicit synthetic fixture;
+            # no APP was dispatched and this is not a numeric success witness.
+            stage_root = root / "capture-stage"
+            stage_root.mkdir(mode=0o700)
+            references = {}
+            origins = [pair_output / name for name in output_tree["files"]]
+            origins += [Path(execution_receipt_pin["path"]),
+                        Path(host_verification_pin["path"])]
+            for index, origin in enumerate(origins):
+                raw = origin.read_bytes()
+                local = stage_root / f"{index:06d}"
+                local.write_bytes(raw)
+                local.chmod(0o400)
+                references[str(origin)] = {
+                    "origin_path": str(origin), "path": str(local),
+                    "role": "fixed_pair_receipt", "host_id": selected_host,
+                    "raw_sha256": FIXED.sha256_bytes(raw), "semantic_sha256": None,
+                    "byte_count": len(raw), "maximum_bytes": FIXED.MAX_PAIR_OUTPUT_BYTES,
+                }
+            for origin in origins:
+                origin.unlink()
+            unrelated_origin = str(root / "other-job-probe-v2" / "tmp" / "payload")
+            unrelated_capture = stage_root / "unrelated-probe-v2"
+            unrelated_capture.write_bytes(b"unrelated authenticated whole-job object")
+            unrelated_capture.chmod(0o400)
+            unrelated_raw = unrelated_capture.read_bytes()
+            references[unrelated_origin] = {
+                "origin_path": unrelated_origin, "path": str(unrelated_capture),
+                "role": "opaque_trace", "host_id": selected_host,
+                "raw_sha256": FIXED.sha256_bytes(unrelated_raw), "semantic_sha256": None,
+                "byte_count": len(unrelated_raw), "maximum_bytes": FIXED.MAX_TMPDIR_BYTES,
+            }
+            with (
+                patch.object(FIXED, "_live_network_namespace_inode", side_effect=AssertionError("captured replay sampled local netns")),
+                patch.object(FIXED.os, "sched_getaffinity", side_effect=AssertionError("captured replay sampled local affinity")),
+                patch.object(FIXED, "_mount_identity", side_effect=AssertionError("captured replay sampled local mountinfo")),
+            ):
+                prepared = FIXED.prepare_captured_fixed_pair_replay_v1(
+                    overlay_pin, execution_receipt_pin, host_verification_pin,
+                    references, stage_root,
+                )
+                self.assertTrue(prepared["envelope_verified"])
+                self.assertFalse(prepared["full_replay_verified"])
+                self.assertFalse(prepared["qualification_eligible"])
+                self.assertEqual(prepared["host_verification_pin"], host_verification_pin)
+                self.assertEqual(prepared["artifact_view"].output_tree(), output_tree)
+            self.assertTrue(all(not path.exists() for path in origins))
+            with (
+                patch.object(FIXED, "_load_pinned_module", side_effect=load_controller),
+                patch.object(FIXED, "_module_pins", side_effect=captured_module_pins),
+                patch.object(FIXED, "_runtime_bindings_for_job", side_effect=runtime_bindings),
+                patch.object(FIXED, "_construct_members", side_effect=members),
+                patch.object(FIXED, "_snapshot_source_inputs", return_value={"fixture_source_snapshot": True}),
+                patch.object(FIXED, "_live_network_namespace_inode", side_effect=AssertionError("captured replay sampled local netns")),
+                patch.object(FIXED.os, "sched_getaffinity", side_effect=AssertionError("captured replay sampled local affinity")),
+                patch.object(FIXED, "_mount_identity", side_effect=AssertionError("captured replay sampled local mountinfo")),
+                patch.object(FIXED.subprocess, "Popen", side_effect=AssertionError("captured replay launched a process")),
+            ):
+                captured = FIXED.verify_fixed_pair_overlay_captured_v1(
+                    overlay_pin, execution_receipt_pin, host_verification_pin,
+                    references, stage_root,
+                )
+            original_verification = {key: value for key, value in result.items()
+                                     if key != "host_verification_sha256"}
+            self.assertEqual(captured["verification"], original_verification)
+            self.assertEqual(captured["overlay"], overlay)
+            self.assertTrue(captured["full_replay_verified"])
+            self.assertFalse(captured["qualification_eligible"])
+            original_component = {
+                "schema": "allocatbelt.application-source5-fixed-component.v1",
+                "overlay": {"path": overlay_pin["path"], "raw_sha256": overlay_pin["sha256"]},
+                "receipt": {"path": execution_receipt_pin["path"], "raw_sha256": execution_receipt_pin["sha256"]},
+                "verification": original_verification,
+            }
+            captured_component = {**original_component, "verification": captured["verification"]}
+            self.assertEqual(FIXED.canonical_bytes(captured_component), FIXED.canonical_bytes(original_component))
+            self.assertTrue(all(not path.exists() for path in origins))
+            unbound_origin = str(pair_output / "unbound.json")
+            unbound_local = stage_root / "unbound-capture"
+            unbound_local.write_bytes(b"{}\n")
+            unbound_local.chmod(0o400)
+            references[unbound_origin] = {
+                "origin_path": unbound_origin, "path": str(unbound_local),
+                "role": "fixed_pair_artifact", "host_id": selected_host,
+                "raw_sha256": FIXED.sha256_bytes(b"{}\n"), "semantic_sha256": None,
+                "byte_count": 3, "maximum_bytes": FIXED.MAX_PAIR_OUTPUT_BYTES,
+            }
+            with self.assertRaisesRegex(FIXED.FixedPairError, "undeclared member under the fixed output root"):
+                FIXED.prepare_captured_fixed_pair_replay_v1(
+                    overlay_pin, execution_receipt_pin, host_verification_pin,
+                    references, stage_root,
+                )
+
+
+def _stage_replay_test_files(root: Path, paths: list[Path]):
+    """Build real0400 captures for synthetic raw-reader unit fixtures only."""
+    stage = root / "reader-stage"
+    stage.mkdir(mode=0o700)
+    references = {}
+    for index, origin in enumerate(paths):
+        raw = origin.read_bytes()
+        local = stage / f"{index:06d}"
+        local.write_bytes(raw)
+        local.chmod(0o400)
+        references[str(origin)] = {
+            "origin_path": str(origin), "path": str(local),
+            "role": "fixed_pair_artifact", "host_id": "host-a",
+            "raw_sha256": FIXED.sha256_bytes(raw), "semantic_sha256": None,
+            "byte_count": len(raw), "maximum_bytes": FIXED.MAX_PAIR_OUTPUT_BYTES,
+        }
+    return stage, references
+
+
+class CapturedFixedPairReplayTests(unittest.TestCase):
+    def test_full_cardinality_open_loop_ids_replay_captures_with_resident_oracle(self):
+        # This is a synthetic numeric-reader fixture, not an executed APP pair.
+        # Keep the existing Spec fixture's full standalone arrival minimum.
+        with tempfile.TemporaryDirectory(prefix="fixed-capture-open-loop-") as temporary:
+            root = Path(temporary).resolve()
+            fixtures = _load_source_module("fixed_captured_open_loop_fixtures", SCRIPT.with_name("test-application-campaign.py"))
+            controller = fixtures.campaign
+            spec, sources = fixtures.spec_fixture()
+            source = sources["host-1"]
+            cell = next(item for item in spec["cells"] if item["family"] == "cpu" and item["profile"] == "steady")
+            count = cell["arrivals"]
+            self.assertEqual(count, 100_000)
+            self.assertEqual(count, spec["protocol"]["standalone_min_successes"])
+            rate = count
+            duration = count * 1_000_000_000 // rate
+            checksum = 77
+            digest = sum(checksum ^ index for index in range(count)) & ((1 << 64) - 1)
+            oracle_root = root / "oracles"
+            oracle_root.mkdir(mode=0o700)
+            oracle_path = oracle_root / "cpu-steady.tsv"
+            source_sha = source["source"]["source_tree_sha256"]
+            binary_sha = source["artifacts"]["allocatbelt"]["sha256"]
+            header = [
+                "schema\tallocatbelt-app-oracle-v2", f"source_sha256\t{source_sha}",
+                f"binary_sha256\t{binary_sha}", "profile\tsteady", "workload\tcpu",
+                "mode\topen_loop", f"average_rate_per_second\t{rate}",
+                f"pulse_rate_per_second\t{rate}", f"arrivals\t{count}",
+                f"trace_duration_ns\t{duration}", f"kernel_config\t{controller.oracle_kernel_config('cpu')}",
+                "id\tscheduled_ns\tworkload\texpected_checksum",
+            ]
+            oracle_path.write_text("\n".join(header) + "\n" + "".join(
+                f"{index}\t{index * 1_000_000_000 // rate}\tcpu\t{checksum}\n"
+                for index in range(count)), encoding="utf-8")
+            oracle = {"relative_path": oracle_path.name, "allocator": "allocatbelt",
+                      "sha256": FIXED.sha256_bytes(oracle_path.read_bytes())}
+            job = {"host_id": "host-1", "phase": "confirmation", "ordinal": 2,
+                   "run_id": "captured-open-loop-reader-fixture", "family": "cpu", "workload": "cpu",
+                   "profile": "steady", "allocator": "allocatbelt", "comparison_family": "fixed_policy",
+                   "comparison_kind": "executor", "pair_kind": "matched", "mode": "open_loop",
+                   "load_percent": 90, "rate_per_second": rate, "arrivals": count, "oracle": oracle}
+            binding = controller.build_runtime_process_bindings(job, spec, source)[0]
+            self.assertEqual((binding["pair"], binding["executor"]), ("bounded", "bounded"))
+            pair = root / "pair"
+            pair.mkdir(mode=0o700)
+            prefix = "bounded-bounded"
+            row_header = ("schema allocator executor workload mode async_workers blocking_workers topology logical_window global_task_limit retained_window arrival_rate_per_second requested_arrivals attempted admitted rejected_full rejected_resource completed_on_time completed_late errors cancellations unresolved lost result_digest expected_digest capacity_publications_per_second successful_throughput_through_drain_per_second setup_ns timer_pair_median_ns wall_through_drain_ns drain_tail_ns response_p50_ns response_p95_ns response_p99_ns producer_lateness_mean_ns producer_lateness_max_ns max_observed_managed_bytes retained_managed_bytes managed_limit_bytes disk_limit_ops network_limit_ops final_managed_bytes final_disk_ops final_network_ops rss_before_kib rss_after_drain_kib rss_after_shutdown_kib hwm_before_kib hwm_after_drain_kib hwm_after_shutdown_kib shutdown_ns rejected_logical_window rejected_backend_full").split()
+            row = {name: "0" for name in row_header}
+            row.update(schema="2", allocator="allocatbelt", executor="allocatbelt", workload="cpu", mode="open_loop",
+                       arrival_rate_per_second=str(rate), requested_arrivals=str(count), attempted=str(count),
+                       admitted=str(count), completed_on_time=str(count), result_digest=str(digest), expected_digest=str(digest),
+                       successful_throughput_through_drain_per_second=str(rate), response_p50_ns="100",
+                       response_p95_ns="100", response_p99_ns="100", rss_after_drain_kib="100", rss_after_shutdown_kib="100")
+            stdout = pair / f"{prefix}.stdout.tsv"
+            stdout.write_text("\t".join(row_header) + "\n" + "\t".join(row[name] for name in row_header) + "\n", encoding="utf-8")
+            metadata = {"execution_scope": "qualification", "comparison_family": "fixed_policy",
+                        "report_nonce_bounded_bounded": binding["report_nonce"],
+                        "policy_sha256_bounded_bounded": binding["policy_sha256"],
+                        "resource_ceiling_sha256_bounded_bounded": binding["resource_ceiling_sha256"],
+                        "fixed_global_control_baseline_bounded_bounded": str(binding["fixed_global_control_baseline"])}
+            (pair / "metadata.tsv").write_text("key\tvalue\n" + "".join(f"{key}\t{value}\n" for key, value in sorted(metadata.items())), encoding="utf-8")
+            identity = {"report_nonce": binding["report_nonce"], "run_id": job["run_id"],
+                        "executor": "allocatbelt", "allocator": "allocatbelt", "workload": "cpu", "profile": "steady",
+                        "source_sha256": source_sha, "binary_sha256": binary_sha}
+            phases = {"production_trace": duration, "production_cpu_started_ns": 100,
+                      "production_cpu_ended_ns": 100 + count * 200, "production_through_drain_cpu_ns": count * 200,
+                      "successful_completions": count, "cpu_ns_per_successful_completion": 200}
+            shutdown = pair / f"{prefix}.shutdown.tsv"
+            shutdown.write_text("schema\tallocatbelt-app-phase-v1\t\n" +
+                                "".join(f"identity\t{key}\t{value}\n" for key, value in identity.items()) +
+                                "".join(f"phase\t{key}\t{value}\n" for key, value in phases.items()), encoding="utf-8")
+            ids = pair / f"{prefix}.ids.tsv"
+            ids.write_text("schema\tallocatbelt-app-arrivals-v3\nidentity\t" + "\t".join(
+                [binding["report_nonce"], job["run_id"], "allocatbelt", "allocatbelt", "cpu", "steady", source_sha, binary_sha]) +
+                "\nid\tworkload\tscheduled_ns\tcompletion_ns\tterminal\tchecksum\texpected_checksum\n" + "".join(
+                    f"{index}\tcpu\t{index * 1_000_000_000 // rate}\t{index * 1_000_000_000 // rate + 100}\tcompleted\t{checksum}\t{checksum}\n"
+                    for index in range(count)), encoding="utf-8")
+            _metric, _fields, expected, validation, receipt_text = fixtures.runtime_fixture_for(binding, source, include_artifacts=True)
+            runtime = pair / f"{prefix}.runtime.tsv"
+            expectation = pair / f"{prefix}.expectation.json"
+            validation_path = pair / f"{prefix}.validation.json"
+            runtime.write_text(receipt_text, encoding="utf-8")
+            expectation.write_bytes(controller.runtime_readback_module().canonical_bytes(expected))
+            validation_path.write_bytes(controller.canonical_bytes(validation))
+            process = {"pair": "bounded", "executor": "bounded", "allocator": "allocatbelt",
+                       "stdout": stdout.name, "stdout_sha256": controller.sha256_file(stdout),
+                       "shutdown_sha256": controller.sha256_file(shutdown), "capacity_family_sha256": "not_applicable",
+                       "ids_sha256": controller.sha256_file(ids), "runtime_readback": runtime.name,
+                       "runtime_readback_sha256": controller.sha256_file(runtime), "runtime_expectation": expectation.name,
+                       "runtime_expectation_sha256": controller.sha256_file(expectation), "runtime_validation": validation_path.name,
+                       "runtime_validation_sha256": controller.sha256_file(validation_path),
+                       "runtime_recipe_sha256": binding["recipe_sha256"], "resource_ceiling_sha256": binding["resource_ceiling_sha256"],
+                       "policy_sha256": binding["policy_sha256"], "fixed_global_control_baseline": str(binding["fixed_global_control_baseline"]),
+                       "validator_sha256": source["runtime_readback_validator"]["sha256"], "source_manifest_sha256": source["manifest_sha256"],
+                       "calibration_binary_sha256": source["resource_domain_calibration"]["binary"]["sha256"],
+                       "calibration_output_sha256": source["resource_domain_calibration"]["output"]["sha256"]}
+            baseline = controller.extract_process_metrics(pair, process, job, source, spec, oracle_root)
+            paths = sorted(pair.iterdir())
+            stage, references = _stage_replay_test_files(root, paths)
+            for path in paths:
+                path.unlink()
+            view = FIXED.CapturedFixedPairArtifactsV1(references, stage)
+            old_read, old_snapshot = controller.read_stable_bytes, controller.stable_file_snapshot
+            def no_origin_read(path, label, maximum):
+                if path.parent == pair:
+                    raise AssertionError("captured open-loop metrics read origin output")
+                return old_read(path, label, maximum)
+            def no_origin_snapshot(path, label, maximum):
+                if path.parent == pair:
+                    raise AssertionError("captured ID stream read origin output")
+                return old_snapshot(path, label, maximum)
+            with patch.object(controller, "read_stable_bytes", side_effect=no_origin_read), patch.object(controller, "stable_file_snapshot", side_effect=no_origin_snapshot):
+                captured = controller.extract_process_metrics(pair, process, job, source, spec, oracle_root, artifact_view=view)
+            self.assertEqual(captured, baseline)
+            self.assertEqual(captured["completed"], count)
+            self.assertEqual(captured["family_successes"], {"cpu": count})
+            self.assertEqual(captured["ids_path"], ids.name)
+            self.assertTrue(oracle_path.is_file())
+            self.assertTrue(all(not path.exists() for path in paths))
+            local_ids = Path(references[str(ids)]["path"])
+            raw = local_ids.read_bytes()
+            changed = raw.replace(b"0\tcpu\t0\t100\tcompleted\t77\t77\n",
+                                  b"0\tcpu\t0\t100\tcompleted\t77\t78\n", 1)
+            self.assertNotEqual(changed, raw)
+            local_ids.chmod(0o600)
+            local_ids.write_bytes(changed)
+            local_ids.chmod(0o400)
+            forged_sha = FIXED.sha256_bytes(changed)
+            references[str(ids)] = {**references[str(ids)], "raw_sha256": forged_sha,
+                                     "byte_count": len(changed)}
+            forged_process = {**process, "ids_sha256": forged_sha}
+            view = FIXED.CapturedFixedPairArtifactsV1(references, stage)
+            with self.assertRaisesRegex(controller.CampaignError, "per-ID oracle/timestamp mismatch at 0"):
+                controller.extract_process_metrics(pair, forged_process, job, source, spec, oracle_root, artifact_view=view)
+
+    def test_fixed_probe_replay_delegates_capture_to_pinned_feedback_reader(self):
+        with tempfile.TemporaryDirectory(prefix="fixed-capture-probe-") as temporary:
+            root = Path(temporary).resolve()
+            fixture = FEEDBACK_FIXTURES.Fixture(root / "fixture", "disk", profile="steady")
+            fixture.install_v4_source_v5()
+            reader = _load_source_module("fixed_captured_probe_delegate", SCRIPT.with_name("application-feedback-readback.py"))
+            _verify_fixture_probe_offline(root / "fixture", fixture, reader, captured=True)
+            self.assertFalse(fixture.construction_probe_path.exists())
+
+    def test_runtime_v2_numeric_replay_uses_captured_bytes_without_writes(self):
+        with tempfile.TemporaryDirectory(prefix="fixed-capture-runtime-") as temporary:
+            root = Path(temporary).resolve()
+            context, bindings = _real_binding_case(root, write_expectations=True)
+            fixtures = _load_source_module("fixed_captured_runtime_fixtures", SCRIPT.with_name("test-application-campaign.py"))
+            member = context["members"][0]
+            _metric, fields, _expected, validation, receipt_text = fixtures.runtime_fixture_for(
+                member["runtime_binding"], context["source"], include_artifacts=True,
+            )
+            outputs = member["outputs"]
+            receipt_path = Path(outputs["runtime_readback"])
+            validation_path = Path(outputs["runtime_validation"])
+            receipt_path.write_text(receipt_text, encoding="utf-8")
+            validation_path.write_bytes(context["loaded_modules"]["runtime_reader"].canonical_bytes(validation))
+            for path in (receipt_path, validation_path):
+                path.chmod(0o600)
+            baseline = FIXED._validate_runtime_v2(context, member)
+            paths = [receipt_path, Path(outputs["runtime_expectation"]), validation_path]
+            stage, references = _stage_replay_test_files(root, paths)
+            for path in paths:
+                path.unlink()
+            context["artifact_view"] = FIXED.CapturedFixedPairArtifactsV1(references, stage)
+            with (
+                patch.object(FIXED, "write_exclusive", side_effect=AssertionError("captured replay wrote an output")),
+                patch.object(FIXED, "read_stable", side_effect=AssertionError("captured runtime replay read an origin")),
+            ):
+                observed = FIXED._validate_runtime_v2(context, member)
+            self.assertEqual(observed, baseline)
+            self.assertEqual(observed[0]["after_release"]["global_live_tenants"], 0)
+            self.assertEqual(observed[0]["after_release"]["global_used_control"], context["source"]["resource_domain_calibration"]["record"]["fixed_global_control_baseline"])
+            self.assertTrue(all(not path.exists() for path in paths))
+            validation_reference = references.pop(str(validation_path))
+            context["artifact_view"] = FIXED.CapturedFixedPairArtifactsV1(references, stage)
+            with patch.object(FIXED, "write_exclusive", side_effect=AssertionError("missing validation was regenerated")):
+                with self.assertRaisesRegex(FIXED.FixedPairError, "refuses to create a missing runtime validation"):
+                    FIXED._validate_runtime_v2(context, member)
+            references[str(validation_path)] = validation_reference
+            fields["after_release.global.used.control"] = str(context["source"]["resource_domain_calibration"]["record"]["fixed_global_control_baseline"] + 1)
+            reader = context["loaded_modules"]["runtime_reader"]
+            forged_raw = (f"schema\t{reader.SCHEMA}\n" + "".join(f"{key}\t{value}\n" for key, value in sorted(fields.items()))).encode("utf-8")
+            local = Path(references[str(receipt_path)]["path"])
+            local.chmod(0o600)
+            local.write_bytes(forged_raw)
+            local.chmod(0o400)
+            references[str(receipt_path)] = {**references[str(receipt_path)],
+                                            "raw_sha256": FIXED.sha256_bytes(forged_raw),
+                                            "byte_count": len(forged_raw)}
+            context["artifact_view"] = FIXED.CapturedFixedPairArtifactsV1(references, stage)
+            with self.assertRaisesRegex(FIXED.FixedPairError, "final owner cleanup mismatch: after_release.global.used.control"):
+                FIXED._validate_runtime_v2(context, member)
+
+    def test_feedback_probe_reader_consumes_capture_and_rejects_repinned_semantic_drift(self):
+        with tempfile.TemporaryDirectory(prefix="fixed-capture-feedback-") as temporary:
+            root = Path(temporary).resolve()
+            fixture = FEEDBACK_FIXTURES.Fixture(root / "fixture", "disk", profile="steady")
+            fixture.install_v4_source_v5()
+            reader = _load_source_module("fixed_captured_feedback_reader", SCRIPT.with_name("application-feedback-readback.py"))
+            origin = fixture.construction_probe_path
+            stage, references = _stage_replay_test_files(root, [origin])
+            origin.unlink()
+            view = FIXED.CapturedFixedPairArtifactsV1(references, stage)
+            with patch.object(reader, "read_canonical", side_effect=AssertionError("captured feedback reader opened origin")):
+                observed = reader.validate_construction_probe(fixture.expectation, fixture.source, artifact_reader=view.read)
+            self.assertEqual(observed, fixture.construction_probe_pin["raw_sha256"])
+            local = Path(references[str(origin)]["path"])
+            probe = json.loads(local.read_bytes())
+            probe["rust_control_context"]["required_byte_sources"]["disk"] = False
+            raw = reader.canonical_bytes(probe)
+            local.chmod(0o600)
+            local.write_bytes(raw)
+            local.chmod(0o400)
+            references[str(origin)] = {**references[str(origin)], "raw_sha256": FIXED.sha256_bytes(raw), "byte_count": len(raw)}
+            recipe = copy.deepcopy(fixture.expectation)
+            recipe["construction_probe"]["raw_sha256"] = FIXED.sha256_bytes(raw)
+            view = FIXED.CapturedFixedPairArtifactsV1(references, stage)
+            with self.assertRaisesRegex(reader.ValidationError, "required byte sources"):
+                reader.validate_construction_probe(recipe, fixture.source, artifact_reader=view.read)
+
+
+class CapturedFixedPairArtifactViewTests(unittest.TestCase):
+    """Physical capture checks; synthetic origin metadata is never host proof."""
+
+    @contextlib.contextmanager
+    def _case(self):
+        with tempfile.TemporaryDirectory(prefix="fixed-capture-primitives-") as temporary:
+            root = Path(temporary).resolve()
+            stage = root / "stage"
+            stage.mkdir(mode=0o700)
+            output = root / "absent-origin" / "pair"
+            host = root / "absent-origin" / "host-receipt.json"
+            data = b"original output bytes\n"
+            origin = output / "app-events.jsonl"
+            originals = {
+                origin: data,
+                output / "fixed-pair-execution-receipt.json": b"execution envelope\n",
+                host: b"strict host envelope\n",
+            }
+            references = {}
+            for index, (name, raw) in enumerate(originals.items()):
+                local = stage / f"{index:06d}"
+                local.write_bytes(raw)
+                local.chmod(0o400)
+                references[str(name)] = {
+                    "origin_path": str(name), "path": str(local),
+                    "role": "fixed_pair_artifact", "host_id": "host-a",
+                    "raw_sha256": FIXED.sha256_bytes(raw), "semantic_sha256": None,
+                    "byte_count": len(raw), "maximum_bytes": FIXED.MAX_PAIR_OUTPUT_BYTES,
+                }
+            fact = {"sha256": FIXED.sha256_bytes(data), "size": len(data),
+                    "device": 123456789, "inode": 987654321, "mode": 0o600}
+            inventory = {"files": {"app-events.jsonl": fact}, "total_bytes": len(data),
+                         "maximum_bytes": FIXED.MAX_PAIR_OUTPUT_BYTES}
+            overlay = {"output_root": str(output), "members": [], "host_id": "host-a",
+                       "runtime_bindings": {"pin": {"path": str(output / ".fixed-pair-runtime-bindings.json")}}}
+            yield stage, origin, host, data, references, overlay, {"output_artifacts": inventory}
+
+    def test_nonexistent_origins_and_original_metadata_remain_separate(self):
+        with self._case() as (stage, origin, host, data, references, overlay, receipt):
+            view = FIXED.CapturedFixedPairArtifactsV1(references, stage)
+            view.bind_output_inventory(overlay, receipt, str(host))
+            self.assertEqual(view.read(origin, "output", len(data))[0], data)
+            with view.open_snapshot(origin, "text stream", len(data)) as (snapshot, _sha, _size):
+                with io.TextIOWrapper(snapshot, encoding="utf-8") as text:
+                    self.assertEqual(text.read(), data.decode("utf-8"))
+            self.assertEqual(view.output_tree(), receipt["output_artifacts"])
+            self.assertFalse(origin.exists())
+            local_info = Path(references[str(origin)]["path"]).stat()
+            self.assertEqual(stat.S_IMODE(local_info.st_mode), 0o400)
+            self.assertNotEqual(local_info.st_ino, receipt["output_artifacts"]["files"]["app-events.jsonl"]["inode"])
+
+    def test_physical_mode_symlink_and_hardlink_are_rejected(self):
+        for variant in ("mode", "symlink", "hardlink"):
+            with self.subTest(variant=variant), self._case() as case:
+                stage, origin, _host, data, references, _overlay, _receipt = case
+                local = Path(references[str(origin)]["path"])
+                if variant == "mode":
+                    local.chmod(0o600)
+                elif variant == "symlink":
+                    actual = stage / "actual"
+                    local.rename(actual)
+                    local.symlink_to(actual.name)
+                else:
+                    os.link(local, stage / "second-link")
+                with self.assertRaises((FIXED.FixedPairError, OSError)):
+                    view = FIXED.CapturedFixedPairArtifactsV1(references, stage)
+                    view.read(origin, "output", len(data))
+
+    def test_corrupt_same_size_payload_is_rejected(self):
+        with self._case() as (stage, origin, _host, data, references, _overlay, _receipt):
+            local = Path(references[str(origin)]["path"])
+            local.chmod(0o600)
+            local.write_bytes(b"!" * len(data))
+            local.chmod(0o400)
+            view = FIXED.CapturedFixedPairArtifactsV1(references, stage)
+            with self.assertRaisesRegex(FIXED.FixedPairError, "raw bytes differ"):
+                view.read(origin, "output", len(data))
+
+    def test_reader_ceiling_is_checked_before_open(self):
+        with self._case() as (stage, origin, _host, data, references, _overlay, _receipt):
+            view = FIXED.CapturedFixedPairArtifactsV1(references, stage)
+            with patch.object(FIXED.os, "open", side_effect=AssertionError("over-ceiling IO")):
+                with self.assertRaisesRegex(FIXED.FixedPairError, "original reader byte ceiling"):
+                    view.read(origin, "output", len(data) - 1)
+
+    def test_missing_or_undeclared_inventory_members_are_rejected(self):
+        for variant in ("missing", "extra"):
+            with self.subTest(variant=variant), self._case() as case:
+                stage, origin, host, _data, references, overlay, receipt = case
+                if variant == "missing":
+                    del references[str(origin)]
+                else:
+                    extra = str(origin.parent / "undeclared.txt")
+                    references[extra] = {**references[str(origin)], "origin_path": extra,
+                                         "path": str(stage / "extra")}
+                    Path(references[extra]["path"]).write_bytes(b"")
+                    Path(references[extra]["path"]).chmod(0o400)
+                view = FIXED.CapturedFixedPairArtifactsV1(references, stage)
+                with self.assertRaisesRegex(FIXED.FixedPairError, "exact origin inventory|unexpected pair output"):
+                    view.bind_output_inventory(overlay, receipt, str(host))
+
+    def test_capture_mutation_during_replay_is_rejected(self):
+        with self._case() as (stage, origin, _host, data, references, _overlay, _receipt):
+            view = FIXED.CapturedFixedPairArtifactsV1(references, stage)
+            local = Path(references[str(origin)]["path"])
+            with self.assertRaisesRegex(FIXED.FixedPairError, "changed during replay"):
+                with view.open_snapshot(origin, "output", len(data)) as (stream, _sha, _size):
+                    self.assertEqual(stream.read(), data)
+                    local.chmod(0o600)
+
+    def test_origin_names_are_pure_bounded_canonical_names(self):
+        for value in ("relative", "/a/../b", "/a//b", "/a\\b", "/a\nb", "/a\tb", "/a\x7fb", "/" + "x" * 4096):
+            with self.subTest(value=value[:80]):
+                with self.assertRaises(FIXED.FixedPairError):
+                    FIXED._captured_origin_path(value, "origin")
+        self.assertEqual(str(FIXED._captured_origin_path("/absent/origin", "origin")), "/absent/origin")
+
+    def test_binding_closes_access_to_unrelated_capture_rows(self):
+        with self._case() as (stage, origin, host, data, references, overlay, receipt):
+            unrelated = str(origin.parent.parent / "other-pair" / "output")
+            local = stage / "unrelated"
+            local.write_bytes(data)
+            local.chmod(0o400)
+            references[unrelated] = {**references[str(origin)], "origin_path": unrelated,
+                                      "path": str(local)}
+            view = FIXED.CapturedFixedPairArtifactsV1(references, stage)
+            view.bind_output_inventory(overlay, receipt, str(host))
+            with self.assertRaisesRegex(FIXED.FixedPairError, "absent from the exact admitted capture"):
+                view.read(unrelated, "unrelated", len(data))
 
 
 if __name__ == "__main__":

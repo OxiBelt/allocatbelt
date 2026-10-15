@@ -9,6 +9,7 @@ component evidence only; this module never enables campaign readiness.
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 import errno
 import fcntl
 import hashlib
@@ -30,6 +31,7 @@ OVERLAY_SCHEMA = "allocatbelt.application-fixed-pair-execution-overlay.v1"
 RECEIPT_SCHEMA = "allocatbelt.application-fixed-pair-execution-receipt.v1"
 HOST_VERIFICATION_SCHEMA = "allocatbelt.application-fixed-pair-host-verification.v1"
 HOST_VERIFICATION_IDENTITY_SCHEMA = "allocatbelt.application-fixed-pair-host-verification-identity.v1"
+CAPTURED_REPLAY_CONTEXT_SCHEMA_V1 = "allocatbelt.application-fixed-pair-captured-replay-context.v1"
 EVIDENCE_PATH_MAP_SCHEMA = "allocatbelt.application-pressure-evidence-path-map.v1"
 PROBE_SCHEMA = "allocatbelt.application-fixed-pair-construction-probe.v1"
 APP_STARTED_SCHEMA = "allocatbelt.application-fixed-pair-app-start.v1"
@@ -345,8 +347,27 @@ def _write_tsv(path: Path, header: list[str], rows: list[list[str]], label: str)
     return write_exclusive(path, raw, label)
 
 
-def _read_tsv(path: Path, label: str, max_bytes: int) -> tuple[list[str], list[dict[str, str]], bytes, str]:
-    raw, checksum, _info = read_stable(path, label, max_bytes)
+def _read_pair_artifact(
+    path: Path, label: str, maximum: int,
+    artifact_view: CapturedFixedPairArtifactsV1 | None = None,
+) -> tuple[bytes, str]:
+    if artifact_view is not None:
+        return artifact_view.read(path, label, maximum)
+    raw, checksum, _info = read_stable(path, label, maximum)
+    return raw, checksum
+
+
+def _pair_artifact_exists(path: Path, artifact_view: CapturedFixedPairArtifactsV1 | None) -> bool:
+    if artifact_view is not None:
+        return artifact_view.has_file(path)
+    return path.exists() or path.is_symlink()
+
+
+def _read_tsv(
+    path: Path, label: str, max_bytes: int, *,
+    artifact_view: CapturedFixedPairArtifactsV1 | None = None,
+) -> tuple[list[str], list[dict[str, str]], bytes, str]:
+    raw, checksum = _read_pair_artifact(path, label, max_bytes, artifact_view)
     require(raw.endswith(b"\n") and b"\r" not in raw and b"\x00" not in raw, f"{label} framing is invalid")
     try:
         lines = raw.decode("utf-8").splitlines()
@@ -967,8 +988,12 @@ def _runtime_bindings_for_job(context: dict[str, Any]) -> tuple[list[dict[str, A
     if context.get("write_runtime_bindings") is True:
         write_exclusive(output_path, raw, "original runtime binding manifest")
     else:
-        stored, stored_sha, info = read_stable(output_path, "original runtime binding manifest", MAX_RUNTIME_BYTES)
-        require(info.st_uid == os.getuid() and stat.S_IMODE(info.st_mode) == 0o600, "original runtime binding manifest permissions are not private")
+        view = context.get("artifact_view")
+        if view is None:
+            stored, stored_sha, info = read_stable(output_path, "original runtime binding manifest", MAX_RUNTIME_BYTES)
+            require(info.st_uid == os.getuid() and stat.S_IMODE(info.st_mode) == 0o600, "original runtime binding manifest permissions are not private")
+        else:
+            stored, stored_sha = view.read(output_path, "original runtime binding manifest", MAX_RUNTIME_BYTES)
         require(stored_sha == checksum and stored == raw, "pinned runtime binding manifest differs from the exact PlanV3 recipes")
     return bindings, manifest, raw, checksum
 
@@ -977,12 +1002,14 @@ def _construct_overlay(
     original_pins: dict[str, Any], execution_pins: dict[str, Any], exact_job: dict[str, Any],
     observed_host_pin: object, output_root_value: object, *, create_output: bool, write_runtime_bindings: bool,
     offline_facts: dict[str, Any] | None = None,
+    artifact_view: CapturedFixedPairArtifactsV1 | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     context = _load_source_inputs(
         original_pins, execution_pins, exact_job, observed_host_pin, output_root_value,
         create_output=create_output, offline_facts=offline_facts,
     )
     context["write_runtime_bindings"] = write_runtime_bindings
+    context["artifact_view"] = artifact_view
     bindings, binding_manifest, binding_raw, binding_sha = _runtime_bindings_for_job(context)
     members = _construct_members(context, bindings)
     context["members"] = members
@@ -1118,11 +1145,17 @@ def _derive_overlay_inputs(overlay: dict[str, Any]) -> tuple[dict[str, Any], dic
     return original_pins, execution_pins, job["value"], observed["pin"], overlay["output_root"]
 
 
-def _read_overlay_raw(overlay_pin: object) -> tuple[dict[str, Any], bytes, str, Path]:
+def _read_overlay_raw(
+    overlay_pin: object, *, artifact_view: CapturedFixedPairArtifactsV1 | None = None,
+) -> tuple[dict[str, Any], bytes, str, Path]:
     pin = exact(overlay_pin, {"path", "sha256"}, "fixed-pair overlay raw pin")
-    path = _safe_absolute(pin["path"], "fixed-pair overlay path")
-    raw, raw_sha, info = read_stable(path, "fixed-pair execution overlay", MAX_PLAN_BYTES)
-    require(info.st_uid == os.getuid() and stat.S_IMODE(info.st_mode) == 0o600, "fixed-pair execution overlay permissions are not private")
+    if artifact_view is None:
+        path = _safe_absolute(pin["path"], "fixed-pair overlay path")
+        raw, raw_sha, info = read_stable(path, "fixed-pair execution overlay", MAX_PLAN_BYTES)
+        require(info.st_uid == os.getuid() and stat.S_IMODE(info.st_mode) == 0o600, "fixed-pair execution overlay permissions are not private")
+    else:
+        path = _captured_origin_path(pin["path"], "fixed-pair overlay origin")
+        raw, raw_sha = artifact_view.read(path, "fixed-pair execution overlay", MAX_PLAN_BYTES)
     require(is_sha(pin["sha256"]) and raw_sha == pin["sha256"], "fixed-pair overlay differs from its raw pin")
     try:
         overlay = json.loads(raw.decode("utf-8"))
@@ -1141,13 +1174,15 @@ def _read_overlay_raw(overlay_pin: object) -> tuple[dict[str, Any], bytes, str, 
 
 def _read_overlay_with_host_facts(
     overlay_pin: object, offline_facts: dict[str, Any] | None = None,
+    *, artifact_view: CapturedFixedPairArtifactsV1 | None = None,
 ) -> tuple[dict[str, Any], bytes, str, dict[str, Any], dict[str, Any]]:
-    overlay, raw, raw_sha, path = _read_overlay_raw(overlay_pin)
+    overlay, raw, raw_sha, path = _read_overlay_raw(overlay_pin, artifact_view=artifact_view)
     original_pins, execution_pins, job, host_pin, output_root = _derive_overlay_inputs(overlay)
     require(path == Path(output_root) / "fixed-pair-execution-overlay.json", "overlay path differs from its immutable output-root location")
     reconstructed, context = _construct_overlay(
         original_pins, execution_pins, job, host_pin, output_root,
         create_output=False, write_runtime_bindings=False, offline_facts=offline_facts,
+        artifact_view=artifact_view,
     )
     require(canonical_bytes(reconstructed) == raw, "fixed-pair overlay differs from independent SourceV5/PlanV3 reconstruction")
     return overlay, raw, raw_sha, context, reconstructed
@@ -2451,7 +2486,7 @@ def _snapshot_source_inputs(context: dict[str, Any]) -> dict[str, Any]:
     host_raw, host_sha, _host_info = read_stable(Path(context["host_pin"]["path"]), "observed host contract after execution", MAX_MANIFEST_BYTES)
     require(host_sha == context["host_pin"]["sha256"], "observed host contract changed after execution")
     runtime_path = context["output_root"] / ".fixed-pair-runtime-bindings.json"
-    runtime_raw, runtime_sha, _runtime_info = read_stable(runtime_path, "original runtime bindings after execution", MAX_RUNTIME_BYTES)
+    runtime_raw, runtime_sha = _read_pair_artifact(runtime_path, "original runtime bindings after execution", MAX_RUNTIME_BYTES, context.get("artifact_view"))
     expected_runtime = context["runtime_bindings_raw"]
     require(runtime_raw == expected_runtime and runtime_sha == context["runtime_bindings_sha256"], "original runtime binding manifest changed after execution")
     return {
@@ -2471,7 +2506,11 @@ def _snapshot_source_inputs(context: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _hash_output_tree(overlay: dict[str, Any]) -> dict[str, Any]:
+def _hash_output_tree(
+    overlay: dict[str, Any], *, artifact_view: CapturedFixedPairArtifactsV1 | None = None,
+) -> dict[str, Any]:
+    if artifact_view is not None:
+        return artifact_view.output_tree()
     root = Path(overlay["output_root"])
     temporary_roots = [
         Path(item["tmpdir"]["path"]) for item in overlay["members"]
@@ -2532,9 +2571,13 @@ def _validate_runtime_v2(
     receipt_path = Path(outputs["runtime_readback"])
     expectation_path = Path(outputs["runtime_expectation"])
     validation_path = Path(outputs["runtime_validation"])
-    raw, receipt_sha, _info = read_stable(receipt_path, "APP runtime binding receipt", MAX_RUNTIME_BYTES)
-    require(expectation_path.is_file() and not expectation_path.is_symlink(), "fixed APP runtime expectation is missing")
-    expected_raw, expected_sha, _expected_info = read_stable(expectation_path, "fixed APP runtime expectation", MAX_RUNTIME_BYTES)
+    view = context.get("artifact_view")
+    raw, receipt_sha = _read_pair_artifact(receipt_path, "APP runtime binding receipt", MAX_RUNTIME_BYTES, view)
+    if view is None:
+        require(expectation_path.is_file() and not expectation_path.is_symlink(), "fixed APP runtime expectation is missing")
+    else:
+        require(view.has_file(expectation_path), "captured fixed APP runtime expectation is missing")
+    expected_raw, expected_sha = _read_pair_artifact(expectation_path, "fixed APP runtime expectation", MAX_RUNTIME_BYTES, view)
     expected = member["runtime_expectation"]["value"]
     require(expected_raw == reader.canonical_bytes(expected) and expected_sha == member["runtime_expectation"]["sha256"], "stored fixed APP expectation differs from the original runtime recipe")
     try:
@@ -2557,10 +2600,11 @@ def _validate_runtime_v2(
     require(after_release["global_used_control"] == baseline and after_release["expected_global_control_baseline"] == baseline, "runtime-v2 Control release differs from the source-calibrated baseline")
     require(after_release["global_used_application"] == {name: 0 for name in reader.APP_DIMENSIONS}, "runtime-v2 receipt retains final global CPU/memory/disk/network/Task usage")
     validation_raw = reader.canonical_bytes(validation)
-    if validation_path.exists() or validation_path.is_symlink():
-        stored_validation, stored_sha, _validation_info = read_stable(validation_path, "fixed APP runtime validation", MAX_RUNTIME_BYTES)
+    if _pair_artifact_exists(validation_path, view):
+        stored_validation, stored_sha = _read_pair_artifact(validation_path, "fixed APP runtime validation", MAX_RUNTIME_BYTES, view)
         require(stored_validation == validation_raw, "fixed APP runtime validation output differs from the pinned reader")
     else:
+        require(view is None, "captured replay refuses to create a missing runtime validation receipt")
         stored_sha = write_exclusive(validation_path, validation_raw, "fixed APP runtime validation")
     expected_validation = {
         "schema": reader.EXPECTATION_SCHEMA,
@@ -2942,8 +2986,10 @@ def _allowed_output_paths(overlay: dict[str, Any]) -> set[str]:
     return allowed
 
 
-def _verify_output_allowlist(overlay: dict[str, Any]) -> None:
-    output_tree = _hash_output_tree(overlay)
+def _verify_output_allowlist(
+    overlay: dict[str, Any], *, artifact_view: CapturedFixedPairArtifactsV1 | None = None,
+) -> None:
+    output_tree = _hash_output_tree(overlay, artifact_view=artifact_view)
     allowed = _allowed_output_paths(overlay)
     unexpected = set(output_tree["files"]) - allowed
     require(not unexpected, f"fixed-pair output tree contains unbound files: {sorted(unexpected)}")
@@ -3251,6 +3297,7 @@ def _verify_construction_probe(
     context: dict[str, Any], overlay: dict[str, Any], member: dict[str, Any], probe: dict[str, Any], overlay_sha256: str,
     *, offline_facts: dict[str, Any] | None = None,
 ) -> None:
+    view = context.get("artifact_view")
     require(probe.get("schema") == PROBE_SCHEMA and probe.get("role") == "uncalibrated_construction_only", "construction probe receipt role is malformed")
     require(probe.get("overlay_sha256") == overlay_sha256 and probe.get("member_ordinal") == member["ordinal"] and probe.get("descriptor") == member["descriptor"], "construction probe receipt differs from its frozen member")
     require(probe.get("binary") == member["binary"], "construction probe executable differs from the selected normal APP")
@@ -3264,16 +3311,16 @@ def _verify_construction_probe(
     _verify_cleanup_record(replay["cleanup"], "construction probe replay", require_success=True)
     for label in ("stdout", "stderr"):
         artifact = exact(probe[label], {"path", "sha256", "bytes"}, f"construction probe {label} pin")
-        raw, actual, _info = read_stable(Path(artifact["path"]), f"construction probe {label}", MAX_PROBE_STDOUT_BYTES if label == "stdout" else MAX_PROBE_STDERR_BYTES)
+        raw, actual = _read_pair_artifact(Path(artifact["path"]), f"construction probe {label}", MAX_PROBE_STDOUT_BYTES if label == "stdout" else MAX_PROBE_STDERR_BYTES, view)
         require(actual == artifact["sha256"] and len(raw) == artifact["bytes"], f"construction probe {label} differs from its raw output pin")
         require(label != "stderr" or len(raw) == 0, "construction probe wrote stderr")
     for label in ("stdout", "stderr"):
         artifact = exact(replay[label], {"path", "sha256", "bytes"}, f"construction probe replay {label} pin")
-        raw, actual, _info = read_stable(Path(artifact["path"]), f"construction probe replay {label}", MAX_PROBE_STDOUT_BYTES if label == "stdout" else MAX_PROBE_STDERR_BYTES)
+        raw, actual = _read_pair_artifact(Path(artifact["path"]), f"construction probe replay {label}", MAX_PROBE_STDOUT_BYTES if label == "stdout" else MAX_PROBE_STDERR_BYTES, view)
         require(actual == artifact["sha256"] and len(raw) == artifact["bytes"], f"construction probe replay {label} differs from its raw output pin")
         require(label != "stderr" or len(raw) == 0, "construction probe replay wrote stderr")
-    first_raw, first_sha, _info = read_stable(Path(probe["stdout"]["path"]), "actual construction probe JSON", MAX_PROBE_STDOUT_BYTES)
-    replay_raw, replay_sha, _replay_info = read_stable(Path(replay["stdout"]["path"]), "repeated construction probe JSON", MAX_PROBE_STDOUT_BYTES)
+    first_raw, first_sha = _read_pair_artifact(Path(probe["stdout"]["path"]), "actual construction probe JSON", MAX_PROBE_STDOUT_BYTES, view)
+    replay_raw, replay_sha = _read_pair_artifact(Path(replay["stdout"]["path"]), "repeated construction probe JSON", MAX_PROBE_STDOUT_BYTES, view)
     require(first_raw == replay_raw and first_sha == replay_sha and replay["byte_equal"] is True, "construction probe rerun is not byte-equal")
     try:
         probe_value = json.loads(first_raw.decode("utf-8"))
@@ -3289,7 +3336,13 @@ def _verify_construction_probe(
     require(recipe["app_capacity_artifact_sha256"] is None and recipe["external_pressure_proof"] is None and recipe["final_runtime_binding"] is None, "construction probe expectation contains an unrelated calibration or pressure quartet")
     require(recipe["identity"]["process_id"] == probe["pid"] and recipe["construction_probe"]["raw_sha256"] == first_sha, "feedback reader expectation is not bound to the actual construction-probe PID/stdout")
     try:
-        actual_probe_sha = context["loaded_modules"]["feedback_reader"].validate_construction_probe(recipe, context["source"])
+        reader = context["loaded_modules"]["feedback_reader"]
+        if view is None:
+            actual_probe_sha = reader.validate_construction_probe(recipe, context["source"])
+        else:
+            actual_probe_sha = reader.validate_construction_probe(
+                recipe, context["source"], artifact_reader=view.read,
+            )
     except Exception as error:
         raise FixedPairError(f"pinned SourceV5 feedback reader rejected offline construction-probe replay: {error}") from error
     require(actual_probe_sha == first_sha, "pinned feedback reader returned a different construction-probe digest")
@@ -3311,19 +3364,27 @@ def _verify_construction_probe(
 def _verify_fixed_pair_overlay_replay(
     overlay_pin: dict[str, Any], receipt_pin: dict[str, Any],
     offline_facts: dict[str, Any] | None = None,
+    *, artifact_view: CapturedFixedPairArtifactsV1 | None = None,
 ) -> dict[str, Any]:
     """Shared raw artifact replay; host mode comes only from its caller."""
+    require(artifact_view is None or offline_facts is not None,
+            "captured fixed replay requires original strict-host receipt facts")
     if offline_facts is None:
         overlay, _overlay_raw, overlay_sha, context, _reconstructed = _read_overlay(overlay_pin)
     else:
         overlay, _overlay_raw, overlay_sha, context, _reconstructed = _read_overlay_with_host_facts(
-            overlay_pin, offline_facts,
+            overlay_pin, offline_facts, artifact_view=artifact_view,
         )
     pin = exact(receipt_pin, {"path", "sha256"}, "fixed-pair receipt raw pin")
-    receipt_path = _safe_absolute(pin["path"], "fixed-pair receipt path")
+    receipt_path = (_safe_absolute(pin["path"], "fixed-pair receipt path")
+                    if artifact_view is None else
+                    _captured_origin_path(pin["path"], "fixed-pair receipt origin"))
     require(receipt_path == Path(overlay["output_root"]) / "fixed-pair-execution-receipt.json", "fixed-pair receipt path differs from its private output root")
-    raw, actual_receipt_sha, receipt_info = read_stable(receipt_path, "fixed-pair execution receipt", MAX_RECEIPT_BYTES)
-    require(receipt_info.st_uid == os.getuid() and stat.S_IMODE(receipt_info.st_mode) == 0o600, "fixed-pair execution receipt permissions are not private")
+    if artifact_view is None:
+        raw, actual_receipt_sha, receipt_info = read_stable(receipt_path, "fixed-pair execution receipt", MAX_RECEIPT_BYTES)
+        require(receipt_info.st_uid == os.getuid() and stat.S_IMODE(receipt_info.st_mode) == 0o600, "fixed-pair execution receipt permissions are not private")
+    else:
+        raw, actual_receipt_sha = artifact_view.read(receipt_path, "fixed-pair execution receipt", MAX_RECEIPT_BYTES)
     require(is_sha(pin["sha256"]) and actual_receipt_sha == pin["sha256"], "fixed-pair receipt differs from its raw pin")
     try:
         receipt = json.loads(raw.decode("utf-8"))
@@ -3357,13 +3418,14 @@ def _verify_fixed_pair_overlay_replay(
     require(type(receipt["construction_probes"]) is list and type(receipt["member_attempts"]) is list and type(receipt["errors"]) is list, "fixed-pair receipt lists are malformed")
     require(type(receipt["process_rows"]) is list and type(receipt["process_metrics"]) is list and type(receipt["process_validation_errors"]) is list, "fixed-pair process replay records are malformed")
     require(len(receipt["member_attempts"]) <= 2 and len(receipt["process_rows"]) == len(receipt["member_attempts"]), "fixed-pair receipt has a process row without one attempted original member")
-    _verify_output_allowlist(overlay)
-    output_tree = _hash_output_tree(overlay)
+    _verify_output_allowlist(overlay, artifact_view=artifact_view)
+    output_tree = _hash_output_tree(overlay, artifact_view=artifact_view)
     require(receipt["output_artifacts"] == output_tree, "fixed-pair output artifact tree differs from its receipt hashes/bounds")
     if offline_facts is not None and receipt["status"] == "valid_pair":
         for member in overlay["members"]:
             validation_path = Path(member["outputs"]["runtime_validation"])
-            require(validation_path.is_file() and not validation_path.is_symlink(),
+            require((validation_path.is_file() and not validation_path.is_symlink())
+                    if artifact_view is None else artifact_view.has_file(validation_path),
                     "offline fixed-pair replay refuses to create a missing runtime validation receipt")
 
     if receipt["status"] == "valid_pair":
@@ -3393,18 +3455,21 @@ def _verify_fixed_pair_overlay_replay(
 
     process_path = Path(overlay["output_root"]) / "processes.tsv"
     if receipt["processes_sha256"] is not None:
-        header, parsed_rows, _process_raw, actual_process_sha = _read_tsv(process_path, "fixed-pair process ledger", MAX_RUNTIME_BYTES)
+        header, parsed_rows, _process_raw, actual_process_sha = _read_tsv(process_path, "fixed-pair process ledger", MAX_RUNTIME_BYTES, artifact_view=artifact_view)
         require(actual_process_sha == receipt["processes_sha256"] and header == receipt["process_header"], "fixed-pair process ledger raw pin or closed header differs")
         require(parsed_rows == receipt["process_rows"], "fixed-pair process rows differ from the immutable sidecar representation")
     else:
         parsed_rows = []
-        require(not process_path.exists() and not process_path.is_symlink(), "fixed-pair receipt omitted an existing process ledger pin")
+        require(not _pair_artifact_exists(process_path, artifact_view), "fixed-pair receipt omitted an existing process ledger pin")
     if receipt["metadata_sha256"] is not None:
-        metadata_raw, metadata_sha, _metadata_info = read_stable(Path(overlay["output_root"]) / "metadata.tsv", "fixed-pair metadata", MAX_RUNTIME_BYTES)
+        metadata_raw, metadata_sha = _read_pair_artifact(Path(overlay["output_root"]) / "metadata.tsv", "fixed-pair metadata", MAX_RUNTIME_BYTES, artifact_view)
         require(metadata_sha == receipt["metadata_sha256"], "fixed-pair metadata raw pin differs")
         require(metadata_raw.startswith(b"key\tvalue\n"), "fixed-pair metadata schema differs")
     else:
-        require(not (Path(overlay["output_root"]) / "metadata.tsv").exists(), "fixed-pair receipt omitted an existing metadata pin")
+        metadata_path = Path(overlay["output_root"]) / "metadata.tsv"
+        require(not metadata_path.exists() if artifact_view is None else
+                not artifact_view.has_file(metadata_path),
+                "fixed-pair receipt omitted an existing metadata pin")
 
     recomputed_metrics: list[dict[str, Any] | None] = []
     recomputed_errors: list[str | None] = []
@@ -3431,17 +3496,21 @@ def _verify_fixed_pair_overlay_replay(
             require(argv_value == member["argv"], "process row argv differs from the exact original APP command")
             expected_p99 = "eligible" if overlay["job"]["value"]["mode"] == "open_loop" else "not_applicable"
             require(row["p99_qualification"] == expected_p99, "process row p99 label differs from validated original-mode eligibility")
-            time_raw, _time_sha, _time_info = read_stable(Path(overlay["output_root"]) / row["time_report"], "direct APP time report", MAX_TIME_BYTES)
+            time_raw, _time_sha = _read_pair_artifact(Path(overlay["output_root"]) / row["time_report"], "direct APP time report", MAX_TIME_BYTES, artifact_view)
             timing = json.loads(time_raw.decode("utf-8"))
             require(time_raw == canonical_bytes(timing) and timing.get("schema") == DIRECT_TIME_SCHEMA and timing.get("time_source") == "monotonic_direct_supervisor", "direct APP time report is not the separately named/versioned monotonic record")
             attempt = attempts_by_ordinal[member["ordinal"]]
             require(timing.get("pid") == attempt["start"]["pid"] and timing.get("exit_code") == 0, "direct APP time report differs from actual process identity/status")
             snapshot, _receipt_sha, _validation_sha, _runtime_raw = _validate_runtime_v2(context, member)
             require(snapshot == attempt["runtime_snapshot"], "offline runtime-v2 snapshot differs from the captured APP owner-release proof")
-            metrics = context["controller"].extract_process_metrics(
-                context["output_root"], row, overlay["job"]["value"], context["source"], context["spec"],
-                context["campaign_artifacts_root"],
-            )
+            metric_arguments = (context["output_root"], row, overlay["job"]["value"], context["source"],
+                                context["spec"], context["campaign_artifacts_root"])
+            if artifact_view is None:
+                metrics = context["controller"].extract_process_metrics(*metric_arguments)
+            else:
+                metrics = context["controller"].extract_process_metrics(
+                    *metric_arguments, artifact_view=artifact_view,
+                )
             recomputed_metrics.append(metrics)
             recomputed_errors.append(None)
         require(receipt["process_metrics"] == recomputed_metrics and receipt["process_validation_errors"] == recomputed_errors, "stored process metrics differ from independent SourceV5 artifact replay")
@@ -3656,6 +3725,345 @@ def _validate_host_verification_receipt(
             host["network_namespace_inode"] == overlay["sources"]["observed_host"]["network_namespace_inode"],
             "strict fixed-pair host facts differ from the original overlay observation")
     return receipt
+
+
+def _captured_origin_path(value: object, label: str) -> Path:
+    """Validate an origin name without resolving or statting the origin host."""
+    require(type(value) is str and 0 < len(value.encode("utf-8")) <= 4096 and
+            "\\" not in value and not any(ord(item) < 32 or ord(item) == 127 for item in value),
+            f"{label} is not bounded path text")
+    pure = PurePosixPath(value)
+    require(pure.anchor == "/" and pure.as_posix() == value and
+            all(part not in (".", "..") for part in pure.parts),
+            f"{label} is not a normalized absolute origin name")
+    return Path(value)
+
+
+class CapturedFixedPairArtifactsV1:
+    """Read exact0400 capture references without inventing origin stat facts.
+
+    References are supplied by the caller's signed-manifest readback boundary.
+    The replay preparer subsequently restricts access to the original pair's
+    receipt-bound inventory. Physical metadata always describes the capture.
+    """
+
+    def __init__(self, references: object, stage_root: Path):
+        root = _safe_absolute(str(stage_root), "fixed capture stage root")
+        require(root.resolve(strict=True) == root,
+                "fixed capture stage root traverses an alias")
+        info = root.lstat()
+        require(stat.S_ISDIR(info.st_mode) and info.st_uid == os.getuid() and
+                stat.S_IMODE(info.st_mode) == 0o700,
+                "fixed capture stage root is not an owned0700 directory")
+        require(type(references) is dict and
+                0 < len(references) <= MAX_OUTPUT_FILES + 64,
+                "fixed capture references exceed the finite file count")
+        self._references = {}
+        local_paths = set()
+        for origin, value in references.items():
+            origin_path = _captured_origin_path(origin, "fixed capture origin")
+            row = exact(value, {
+                "origin_path", "path", "role", "host_id", "raw_sha256",
+                "semantic_sha256", "byte_count", "maximum_bytes",
+            }, "fixed capture reference")
+            path = _safe_absolute(row["path"], "fixed capture local path")
+            require(row["origin_path"] == str(origin_path) and
+                    path.parent == root and path != origin_path and
+                    str(path) not in local_paths and is_sha(row["raw_sha256"]) and
+                    type(row["role"]) is str and 0 < len(row["role"]) <= 128 and
+                    type(row["host_id"]) is str and 0 < len(row["host_id"]) <= 128 and
+                    (row["semantic_sha256"] is None or is_sha(row["semantic_sha256"])) and
+                    type(row["byte_count"]) is int and 0 <= row["byte_count"] <= (1 << 64) - 1 and
+                    type(row["maximum_bytes"]) is int and
+                    row["byte_count"] <= row["maximum_bytes"] <= (1 << 64) - 1,
+                    "fixed capture reference has an alias or malformed byte pin")
+            local_paths.add(str(path))
+            self._references[str(origin_path)] = dict(row)
+        self.stage_root = root
+        self._stage_identity = self._local_identity(info)
+        self._admitted = set(self._references)
+        self._origin_files = None
+        self._output_root = None
+        self._directories = set()
+
+    @staticmethod
+    def _local_identity(info: os.stat_result) -> tuple[int, ...]:
+        return (info.st_dev, info.st_ino, info.st_mode, info.st_uid,
+                info.st_nlink, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+
+    @contextmanager
+    def open_snapshot(self, origin: object, label: str, maximum: int):
+        origin_text = str(_captured_origin_path(str(origin), f"{label} capture origin"))
+        require(origin_text in self._admitted,
+                f"{label} is absent from the exact admitted capture")
+        row = self._references[origin_text]
+        require(type(maximum) is int and 0 <= row["byte_count"] <= maximum,
+                f"{label} exceeds its original reader byte ceiling")
+        path = Path(row["path"])
+        root_descriptor = os.open(self.stage_root, os.O_RDONLY | os.O_DIRECTORY |
+                                  os.O_NOFOLLOW | os.O_CLOEXEC)
+        descriptor = None
+        stream = None
+        try:
+            require(self._stage_identity == self._local_identity(os.fstat(root_descriptor)) ==
+                    self._local_identity(self.stage_root.lstat()),
+                    f"{label} capture stage root changed")
+            before_path = os.stat(path.name, dir_fd=root_descriptor, follow_symlinks=False)
+            descriptor = os.open(path.name, os.O_RDONLY | os.O_NOFOLLOW |
+                                 os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=root_descriptor)
+            before = os.fstat(descriptor)
+            require(self._local_identity(before) == self._local_identity(before_path) and
+                    stat.S_ISREG(before.st_mode) and before.st_uid == os.getuid() and
+                    stat.S_IMODE(before.st_mode) == 0o400 and before.st_nlink == 1 and
+                    before.st_size == row["byte_count"],
+                    f"{label} capture is not its exact owned0400 regular file")
+            digest = hashlib.sha256()
+            remaining = row["byte_count"]
+            while remaining:
+                block = os.read(descriptor, min(1024 * 1024, remaining))
+                require(bool(block), f"{label} capture was shortened")
+                remaining -= len(block)
+                digest.update(block)
+            require(os.read(descriptor, 1) == b"" and
+                    digest.hexdigest() == row["raw_sha256"],
+                    f"{label} capture raw bytes differ from their exact pin")
+            os.lseek(descriptor, 0, os.SEEK_SET)
+            stream = os.fdopen(os.dup(descriptor), "rb")
+            yield stream, digest.hexdigest(), row["byte_count"]
+            require(self._local_identity(before) ==
+                    self._local_identity(os.fstat(descriptor)) ==
+                    self._local_identity(os.stat(path.name, dir_fd=root_descriptor,
+                                                 follow_symlinks=False)) and
+                    self._stage_identity == self._local_identity(os.fstat(root_descriptor)) ==
+                    self._local_identity(self.stage_root.lstat()),
+                    f"{label} capture changed during replay")
+        finally:
+            if stream is not None:
+                stream.close()
+            if descriptor is not None:
+                os.close(descriptor)
+            os.close(root_descriptor)
+
+    def read(self, origin: object, label: str, maximum: int) -> tuple[bytes, str]:
+        with self.open_snapshot(origin, label, maximum) as (stream, digest, size):
+            raw = stream.read(maximum + 1)
+            require(len(raw) == size <= maximum,
+                    f"{label} capture read changed its exact byte count")
+            return raw, digest
+
+    def has_file(self, origin: object) -> bool:
+        """Membership is manifest/receipt authority, never ambient origin IO."""
+        return str(_captured_origin_path(str(origin), "captured artifact name")) in self._admitted
+
+    def bind_output_inventory(
+        self, overlay: dict[str, Any], receipt: dict[str, Any],
+        host_receipt_path: str,
+    ) -> None:
+        output_root = _captured_origin_path(overlay["output_root"], "captured pair output root")
+        inventory = exact(receipt["output_artifacts"], {
+            "files", "total_bytes", "maximum_bytes",
+        }, "captured origin output inventory")
+        require(type(inventory["files"]) is dict and
+                len(inventory["files"]) <= MAX_OUTPUT_FILES and
+                inventory["maximum_bytes"] == MAX_PAIR_OUTPUT_BYTES,
+                "captured origin output inventory exceeds the unchanged owner bounds")
+        allowed = _allowed_output_paths(overlay)
+        expected = set()
+        directories = {str(output_root)}
+        original = {}
+        total = 0
+        for relative, value in inventory["files"].items():
+            relative = _safe_relative(relative, "captured origin output name")
+            require(relative in allowed, "captured origin inventory has an undeclared output")
+            fact = exact(value, {"sha256", "size", "device", "inode", "mode"},
+                         "captured origin output facts")
+            require(is_sha(fact["sha256"]) and type(fact["size"]) is int and
+                    0 <= fact["size"] <= MAX_PAIR_OUTPUT_BYTES and
+                    type(fact["device"]) is int and 0 <= fact["device"] < 1 << 64 and
+                    type(fact["inode"]) is int and 0 < fact["inode"] < 1 << 64 and
+                    type(fact["mode"]) is int and fact["mode"] == 0o600,
+                    "captured origin output facts are malformed")
+            origin = str(output_root / relative)
+            row = self._references.get(origin)
+            require(row is not None and row["raw_sha256"] == fact["sha256"] and
+                    row["byte_count"] == fact["size"],
+                    "capture does not contain its exact origin inventory row")
+            total += fact["size"]
+            require(total <= MAX_PAIR_OUTPUT_BYTES,
+                    "captured origin inventory exceeds its aggregate owner cap")
+            expected.add(origin)
+            original[relative] = dict(fact)
+            parent = (output_root / relative).parent
+            while parent == output_root or output_root in parent.parents:
+                directories.add(str(parent))
+                if parent == output_root:
+                    break
+                parent = parent.parent
+        require(type(inventory["total_bytes"]) is int and inventory["total_bytes"] == total,
+                "captured origin inventory byte sum differs")
+        expected.add(str(output_root / "fixed-pair-execution-receipt.json"))
+        host_origin = _captured_origin_path(host_receipt_path, "captured strict host receipt")
+        require(host_origin != output_root and output_root not in host_origin.parents,
+                "captured strict host receipt must be outside the immutable pair output tree")
+        expected.add(str(host_origin))
+        require(expected <= set(self._references) and not any(
+                    origin not in expected and
+                    (Path(origin) == output_root or output_root in Path(origin).parents)
+                    for origin in self._references
+                ), "capture has missing or unexpected pair output members")
+        require(all(self._references[origin]["host_id"] == overlay["host_id"]
+                    for origin in expected),
+                "capture member belongs to a different original host")
+        self._admitted = expected
+        self._origin_files = original
+        self._output_root = output_root
+        self._directories = directories
+
+    def output_tree(self) -> dict[str, Any]:
+        require(type(self._origin_files) is dict and self._output_root is not None,
+                "capture has not bound its original output inventory")
+        files = {}
+        total = 0
+        for relative, fact in self._origin_files.items():
+            raw, digest = self.read(self._output_root / relative,
+                                    "captured pair output", MAX_PAIR_OUTPUT_BYTES)
+            require(digest == fact["sha256"] and len(raw) == fact["size"],
+                    "captured output differs from its original receipt bytes")
+            # device/inode/mode are authenticated ORIGIN facts, never claimed
+            # to be the metadata of the separate physical0400 capture.
+            files[relative] = {**fact, "sha256": digest, "size": len(raw)}
+            total += len(raw)
+        return {"files": files, "total_bytes": total,
+                "maximum_bytes": MAX_PAIR_OUTPUT_BYTES}
+
+
+def prepare_captured_fixed_pair_replay_v1(
+    overlay_pin: object, receipt_pin: object, host_verification_pin: object,
+    references: object, stage_root: Path,
+) -> dict[str, Any]:
+    """Validate captured envelopes/host facts; full numeric replay is separate."""
+    overlay_pin = exact(overlay_pin, {"path", "sha256"}, "captured overlay pin")
+    receipt_pin = exact(receipt_pin, {"path", "sha256"}, "captured execution receipt pin")
+    host_pin = exact(host_verification_pin, {
+        "path", "raw_sha256", "host_verification_sha256",
+    }, "captured strict host receipt pin")
+    require(type(references) is dict, "captured fixed references must be an exact origin map")
+    bootstrap_origins = {
+        str(_captured_origin_path(pin["path"], "captured fixed envelope origin"))
+        for pin in (overlay_pin, receipt_pin, host_pin)
+    }
+    require(bootstrap_origins <= references.keys(), "capture omits an exact fixed envelope")
+    view = CapturedFixedPairArtifactsV1(
+        {origin: references[origin] for origin in bootstrap_origins}, stage_root,
+    )
+
+    def document(pin, digest_field, label, maximum):
+        require(is_sha(pin[digest_field]), f"{label} raw pin is malformed")
+        raw, digest = view.read(pin["path"], label, maximum)
+        require(digest == pin[digest_field], f"{label} raw pin differs")
+        try:
+            value = json.loads(raw)
+        except (UnicodeError, json.JSONDecodeError, RecursionError) as error:
+            raise FixedPairError(f"{label} is not bounded canonical JSON") from error
+        require(type(value) is dict and raw == canonical_bytes(value),
+                f"{label} is not canonical JSON")
+        return value, raw, digest
+
+    overlay, _overlay_raw, overlay_sha = document(
+        overlay_pin, "sha256", "captured fixed overlay", MAX_PLAN_BYTES,
+    )
+    receipt, _receipt_raw, receipt_sha = document(
+        receipt_pin, "sha256", "captured fixed receipt", MAX_RECEIPT_BYTES,
+    )
+    host, _host_raw, _host_sha = document(
+        host_pin, "raw_sha256", "captured strict host receipt", MAX_RECEIPT_BYTES,
+    )
+    require(overlay.get("schema") == OVERLAY_SCHEMA and
+            receipt.get("schema") == RECEIPT_SCHEMA and
+            receipt.get("campaign_id") == overlay.get("campaign_id") and
+            receipt.get("host_id") == overlay.get("host_id") and
+            receipt.get("run_id") == overlay["job"]["value"]["run_id"] and
+            overlay_pin["path"] == str(Path(overlay["output_root"]) /
+                                       "fixed-pair-execution-overlay.json") and
+            receipt_pin["path"] == str(Path(overlay["output_root"]) /
+                                       "fixed-pair-execution-receipt.json") and
+            receipt.get("overlay_sha256") == overlay_sha and
+            receipt.get("receipt_sha256") == sha256_bytes(canonical_bytes({
+                key: value for key, value in receipt.items() if key != "receipt_sha256"
+            })), "captured fixed envelopes differ from their original identity or self pin")
+    host = _validate_host_verification_receipt(
+        host, host_pin, overlay, overlay_sha, receipt_sha, receipt,
+    )
+    mount = _validate_output_mount_attestation(
+        host["host_verification"]["output_mount"], Path(overlay["output_root"]),
+    )
+    require(_mount_static(mount) == overlay["sources"]["output_mount"] and
+            mount["available_bytes"] >= MAX_PAIR_OUTPUT_BYTES + 2 * MAX_TMPDIR_BYTES and
+            mount["available_inodes"] >= 2 * MAX_TMPDIR_INODES + 64,
+            "captured strict host mount differs from the original bounded output facts")
+    spec_pin = exact(overlay["spec"], {"pin", "semantic_sha256"},
+                     "captured fixed SpecV3 binding")
+    _path, spec, _raw, _sha = read_json_pin(spec_pin["pin"],
+                                         "resident original SpecV3", MAX_SPEC_BYTES)
+    require(sha256_bytes(canonical_bytes(spec)) == spec_pin["semantic_sha256"],
+            "captured fixed SpecV3 semantic pin differs")
+    facts = {"schema": host["schema"],
+             "host_verification": host["host_verification"]}
+    _offline_host_observation(facts, overlay["sources"]["observed_host"]["pin"],
+                              spec, overlay["host_id"])
+    inventory = exact(receipt["output_artifacts"], {
+        "files", "total_bytes", "maximum_bytes",
+    }, "captured fixed receipt inventory")
+    require(type(inventory["files"]) is dict and len(inventory["files"]) <= MAX_OUTPUT_FILES,
+            "captured fixed receipt inventory exceeds its finite file count")
+    output_root = _captured_origin_path(overlay["output_root"], "captured fixed output origin")
+    origins = bootstrap_origins | {
+        str(output_root / _safe_relative(name, "captured fixed inventory name"))
+        for name in inventory["files"]
+    }
+    require(origins <= references.keys(), "capture omits an exact fixed inventory member")
+    require(not any(
+        (candidate := _captured_origin_path(origin, "whole-job capture origin")) == output_root or
+        (output_root in candidate.parents and origin not in origins)
+        for origin in references
+    ), "whole-job capture contains an undeclared member under the fixed output root")
+    # A whole-job read view may additionally contain unrelated ProbeV2 objects.
+    # Only the genuine strict receipt's exact fixed subset enters this view.
+    view = CapturedFixedPairArtifactsV1(
+        {origin: references[origin] for origin in origins}, stage_root,
+    )
+    view.bind_output_inventory(overlay, receipt, host_pin["path"])
+    return {"schema": CAPTURED_REPLAY_CONTEXT_SCHEMA_V1,
+            "artifact_view": view, "overlay": overlay,
+            "execution_receipt": receipt, "host_verification_receipt": host,
+            "host_verification_pin": dict(host_pin), "offline_facts": facts,
+            "envelope_verified": True, "full_replay_verified": False,
+            "qualification_eligible": False}
+
+
+def verify_fixed_pair_overlay_captured_v1(
+    overlay_pin: object, receipt_pin: object, host_verification_pin: object,
+    references: object, stage_root: Path,
+) -> dict[str, Any]:
+    """Replay exact captured bytes using genuine original strict-host facts.
+
+    The caller authenticates references against its signed archive manifest.
+    Resident immutable Source/Spec/Plan/binaries/oracles and the retained empty
+    owned TMP directories are verified independently. The original component
+    verification projection remains byte-for-byte compatible with live replay.
+    """
+    prepared = prepare_captured_fixed_pair_replay_v1(
+        overlay_pin, receipt_pin, host_verification_pin, references, stage_root,
+    )
+    view = prepared["artifact_view"]
+    verification = _verify_fixed_pair_overlay_replay(
+        overlay_pin, receipt_pin, prepared["offline_facts"], artifact_view=view,
+    )
+    return {"schema": CAPTURED_REPLAY_CONTEXT_SCHEMA_V1,
+            "verification": verification, "overlay": prepared["overlay"],
+            "execution_receipt": prepared["execution_receipt"],
+            "host_verification_pin": prepared["host_verification_pin"],
+            "full_replay_verified": True, "qualification_eligible": False}
 
 
 def _load_cli_input(path: Path, label: str) -> dict[str, Any]:

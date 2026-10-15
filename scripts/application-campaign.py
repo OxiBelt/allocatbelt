@@ -2675,15 +2675,31 @@ def require_exact_pair_process_rows(process_rows: list[dict[str, str]], job: dic
 
 def process_artifact_bytes(
     pair_dir: Path, process_row: dict[str, str], path_field: str, sha_field: str,
+    *, artifact_view: Any = None,
 ) -> tuple[Path, bytes, str]:
     name = process_row.get(path_field, "")
     require(name and Path(name).name == name and name not in (".", ".."), f"process ledger {path_field} is not a basename")
     path = pair_dir / name
-    require(not path.is_symlink() and path.is_file(), f"process artifact is missing or symlinked: {path_field}")
+    if artifact_view is None:
+        require(not path.is_symlink() and path.is_file(), f"process artifact is missing or symlinked: {path_field}")
+    else:
+        require(artifact_view.has_file(path), f"captured process artifact is missing: {path_field}")
     maximum = MAX_STDOUT_ARTIFACT_BYTES if path_field == "stdout" else MAX_READBACK_ARTIFACT_BYTES
-    raw, actual = read_stable_bytes(path, f"process artifact {path_field}", maximum)
+    raw, actual = _process_artifact_read(path, f"process artifact {path_field}", maximum, artifact_view)
     require(is_sha256(process_row.get(sha_field)) and actual == process_row[sha_field], f"process artifact hash mismatch: {path_field}")
     return path, raw, actual
+
+
+def _process_artifact_read(
+    path: Path, label: str, maximum: int, artifact_view: Any = None,
+) -> tuple[bytes, str]:
+    if artifact_view is None:
+        return read_stable_bytes(path, label, maximum)
+    raw, actual = artifact_view.read(path, label, maximum)
+    require(type(raw) is bytes and len(raw) <= maximum and
+            is_sha256(actual) and hashlib.sha256(raw).hexdigest() == actual,
+            f"captured {label} bytes differ from their raw pin or finite ceiling")
+    return raw, actual
 
 
 class _BytesArtifactPath:
@@ -2914,6 +2930,7 @@ def validate_runtime_process_artifacts(
     job: dict[str, Any],
     source: dict[str, Any],
     spec: dict[str, Any],
+    *, artifact_view: Any = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     validator_pin = source["runtime_readback_validator"]
     module = runtime_readback_module(validator_pin["sha256"])
@@ -2921,10 +2938,11 @@ def validate_runtime_process_artifacts(
     expected = module.build_fixed_expectation(binding["recipe"])
     require(validator_pin["path"] == RUNTIME_VALIDATOR_RELATIVE_PATH, "runtime readback validator path differs from the frozen source artifact")
     validator_sha = validator_pin["sha256"]
-    stdout_path, stdout_raw, stdout_sha = process_artifact_bytes(pair_dir, process_row, "stdout", "stdout_sha256")
-    receipt_path, receipt_raw, receipt_sha = process_artifact_bytes(pair_dir, process_row, "runtime_readback", "runtime_readback_sha256")
-    expectation_path, expectation_raw, expectation_sha = process_artifact_bytes(pair_dir, process_row, "runtime_expectation", "runtime_expectation_sha256")
-    validation_path, validation_raw, validation_sha = process_artifact_bytes(pair_dir, process_row, "runtime_validation", "runtime_validation_sha256")
+    artifact_options = {} if artifact_view is None else {"artifact_view": artifact_view}
+    stdout_path, stdout_raw, stdout_sha = process_artifact_bytes(pair_dir, process_row, "stdout", "stdout_sha256", **artifact_options)
+    receipt_path, receipt_raw, receipt_sha = process_artifact_bytes(pair_dir, process_row, "runtime_readback", "runtime_readback_sha256", **artifact_options)
+    expectation_path, expectation_raw, expectation_sha = process_artifact_bytes(pair_dir, process_row, "runtime_expectation", "runtime_expectation_sha256", **artifact_options)
+    validation_path, validation_raw, validation_sha = process_artifact_bytes(pair_dir, process_row, "runtime_validation", "runtime_validation_sha256", **artifact_options)
     require(receipt_path.suffix == ".tsv" and expectation_path.suffix == ".json" and validation_path.suffix == ".json", "runtime readback artifact suffix differs from the frozen layout")
     require(expectation_sha == binding["expectation_sha256"], "runtime expectation hash differs from the controller's frozen recipe")
     stored_expectation = parse_json_object_bytes(expectation_raw, "runtime expectation", MAX_READBACK_ARTIFACT_BYTES)
@@ -2976,8 +2994,10 @@ def validate_runtime_process_artifacts(
     return readback, {"stdout_sha256": stdout_sha, "runtime_readback_sha256": receipt_sha, "stdout_bytes": stdout_raw}
 
 
-def qualification_pair_metadata(pair_dir: Path) -> tuple[dict[str, str], str]:
-    raw, digest = read_stable_bytes(pair_dir / "metadata.tsv", "runner metadata", MAX_READBACK_ARTIFACT_BYTES)
+def qualification_pair_metadata(
+    pair_dir: Path, *, artifact_view: Any = None,
+) -> tuple[dict[str, str], str]:
+    raw, digest = _process_artifact_read(pair_dir / "metadata.tsv", "runner metadata", MAX_READBACK_ARTIFACT_BYTES, artifact_view)
     header, rows = read_tsv_bytes(raw, "runner metadata")
     require(header == ["key", "value"], "runner metadata header differs")
     metadata: dict[str, str] = {}
@@ -2995,8 +3015,10 @@ def extract_process_metrics(
     source: dict[str, Any],
     spec: dict[str, Any],
     campaign_artifacts: Path,
+    *, artifact_view: Any = None,
 ) -> dict[str, Any]:
-    metadata_map, metadata_sha = qualification_pair_metadata(pair_dir)
+    artifact_options = {} if artifact_view is None else {"artifact_view": artifact_view}
+    metadata_map, metadata_sha = qualification_pair_metadata(pair_dir, **artifact_options)
     process_id = process_row["pair"]
     executor = process_row["executor"]
     require(executor in ("bounded", "tokio"), f"unknown pair executor: {executor}")
@@ -3007,7 +3029,7 @@ def extract_process_metrics(
     require(Path(stdout_name).name == stdout_name and stdout_name.endswith(".stdout.tsv"), "runner stdout reference is not a basename")
     stdout_path = pair_dir / stdout_name
     runtime_readback, runtime_artifact_evidence = validate_runtime_process_artifacts(
-        pair_dir, process_row, job, source, spec
+        pair_dir, process_row, job, source, spec, **artifact_options
     )
     header, rows = read_tsv_bytes(runtime_artifact_evidence["stdout_bytes"], str(stdout_path), 1)
     expected_header = ("schema allocator executor workload mode async_workers blocking_workers topology logical_window global_task_limit retained_window arrival_rate_per_second requested_arrivals attempted admitted rejected_full rejected_resource completed_on_time completed_late errors cancellations unresolved lost result_digest expected_digest capacity_publications_per_second successful_throughput_through_drain_per_second setup_ns timer_pair_median_ns wall_through_drain_ns drain_tail_ns response_p50_ns response_p95_ns response_p99_ns producer_lateness_mean_ns producer_lateness_max_ns max_observed_managed_bytes retained_managed_bytes managed_limit_bytes disk_limit_ops network_limit_ops final_managed_bytes final_disk_ops final_network_ops rss_before_kib rss_after_drain_kib rss_after_shutdown_kib hwm_before_kib hwm_after_drain_kib hwm_after_shutdown_kib shutdown_ns rejected_logical_window rejected_backend_full").split()
@@ -3023,7 +3045,7 @@ def extract_process_metrics(
         require(parse_uint(row["managed_limit_bytes"], "managed limit") > 0, "managed resource ceiling is missing for managed-memory workload")
     cpu_pair = f"{process_id}-{executor}.shutdown.tsv"
     shutdown_path = pair_dir / cpu_pair
-    shutdown_raw, shutdown_sha = read_stable_bytes(shutdown_path, "phase sidecar", MAX_READBACK_ARTIFACT_BYTES)
+    shutdown_raw, shutdown_sha = _process_artifact_read(shutdown_path, "phase sidecar", MAX_READBACK_ARTIFACT_BYTES, artifact_view)
     try:
         shutdown_lines = shutdown_raw.decode("utf-8").splitlines()
     except UnicodeError as error:
@@ -3096,7 +3118,7 @@ def extract_process_metrics(
     if job["mode"] == "capacity" and job["workload"] == "mixed":
         family_name = stdout_name.removesuffix(".stdout.tsv") + ".capacity-families.tsv"
         family_path = pair_dir / family_name
-        family_raw, family_sha = read_stable_bytes(family_path, "capacity family sidecar", MAX_READBACK_ARTIFACT_BYTES)
+        family_raw, family_sha = _process_artifact_read(family_path, "capacity family sidecar", MAX_READBACK_ARTIFACT_BYTES, artifact_view)
         require(family_sha == process_row["capacity_family_sha256"], "capacity family sidecar hash differs from the process ledger")
         try:
             family_lines = family_raw.decode("utf-8").splitlines()
@@ -3135,7 +3157,10 @@ def extract_process_metrics(
     if job["mode"] == "open_loop":
         ids_name = stdout_name.removesuffix(".stdout.tsv") + ".ids.tsv"
         ids_path = pair_dir / ids_name
-        require(not ids_path.is_symlink() and ids_path.is_file(), "per-ID sidecar is missing or symlinked")
+        if artifact_view is None:
+            require(not ids_path.is_symlink() and ids_path.is_file(), "per-ID sidecar is missing or symlinked")
+        else:
+            require(artifact_view.has_file(ids_path), "captured per-ID sidecar is missing")
         nonce = metadata_map.get(f"report_nonce_{process_id}_{executor}")
         expected_binary_sha = source["artifacts"][process_allocator]["sha256"]
         expected_identity = ["identity", nonce, job["run_id"], label, process_allocator, job["workload"], job["profile"], source["source"]["source_tree_sha256"], expected_binary_sha]
@@ -3148,7 +3173,8 @@ def extract_process_metrics(
         digest = 0
         rejected = errors = complete_count = 0
         on_time = 0
-        with stable_file_snapshot(ids_path, "per-ID sidecar", MAX_TRACE_ARTIFACT_BYTES) as (snapshot, ids_sha, _size):
+        snapshot_reader = stable_file_snapshot if artifact_view is None else artifact_view.open_snapshot
+        with snapshot_reader(ids_path, "per-ID sidecar", MAX_TRACE_ARTIFACT_BYTES) as (snapshot, ids_sha, _size):
             require(ids_sha == process_row["ids_sha256"], "per-ID sidecar hash differs from the process ledger")
             with io.TextIOWrapper(snapshot, encoding="utf-8") as stream:
                 require(read_bounded_text_line(stream, "per-ID schema") == "schema\tallocatbelt-app-arrivals-v3", "per-ID schema differs")

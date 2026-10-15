@@ -2883,6 +2883,7 @@ def _validate_calibrated_construction_evidence(
 
 def validate_construction_probe(
     recipe: dict[str, Any], source_manifest_value: dict[str, Any],
+    *, artifact_reader: Callable[[Path, str, int], tuple[bytes, str]] | None = None,
 ) -> str:
     """Validate a v2 probe against a checked expectation and source manifest."""
     require(recipe.get("schema") in (EXPECTATION_SCHEMA_V2, EXPECTATION_SCHEMA_V3, EXPECTATION_SCHEMA_V4), "construction probe validation requires expectation v2, v3, or v4")
@@ -2919,9 +2920,18 @@ def validate_construction_probe(
         digest(artifact["sha256"], "construction probe source artifact SHA-256") == pin["binary_sha256"],
         "construction probe binary differs from its source-manifest artifact",
     )
-    probe, probe_sha = read_canonical(
-        Path(pin["path"]), "construction policy probe", MAX_CONSTRUCTION_PROBE_BYTES, pin["raw_sha256"],
-    )
+    if artifact_reader is None:
+        probe, probe_sha = read_canonical(
+            Path(pin["path"]), "construction policy probe", MAX_CONSTRUCTION_PROBE_BYTES, pin["raw_sha256"],
+        )
+    else:
+        raw, probe_sha = artifact_reader(Path(pin["path"]), "construction policy probe", MAX_CONSTRUCTION_PROBE_BYTES)
+        require(type(raw) is bytes and len(raw) <= MAX_CONSTRUCTION_PROBE_BYTES and
+                probe_sha == pin["raw_sha256"] == sha256_bytes(raw),
+                "captured construction policy probe raw bytes differ from their pin or ceiling")
+        probe = parse_json(raw, "captured construction policy probe", MAX_CONSTRUCTION_PROBE_BYTES)
+        require(raw == canonical_bytes(probe),
+                "captured construction policy probe is not canonical JSON")
     exact(probe, {
         "schema", "context", "reader_context", "rust_control_context", "collector",
         "baseline", "meter_source_bounds", "meter_source_model", "source_references",
