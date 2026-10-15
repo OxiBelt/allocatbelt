@@ -293,6 +293,15 @@ class CompositionContractTests(unittest.TestCase):
                 reader.CAPACITY_FLOOR_POLICY_ID,
                 "required native ProbeV2 gate must pin the selected capacity-floor rule in every SourceV5 manifest",
             )
+        self.assertIs(
+            type(floor_policy_descriptor), dict,
+            "this SourceV5 replay case requires a selected floor descriptor; default ProbeV2 needs a separate genuine unselected SourceV5 case",
+        )
+        capacity_floor_policy_id = floor_policy_descriptor.get("policy_id")
+        self.assertEqual(
+            capacity_floor_policy_id, reader.CAPACITY_FLOOR_POLICY_ID,
+            "composition fixture requires the selected SourceV5 floor policy supported by ProbeV2",
+        )
         source_manifest_raw_before = reader.canonical_bytes(source_manifest)
         source_manifest_sha_before = reader.sha256_bytes(source_manifest_raw_before)
         values = dict(line.split("\t") for line in Path(bundle["artifact"]["path"]).read_text(encoding="ascii").splitlines())
@@ -311,6 +320,7 @@ class CompositionContractTests(unittest.TestCase):
                 "--host-id", _feedback.identity["host_id"], "--source-sha256",
                 _feedback.source["source"]["source_tree_sha256"],
             ]
+            command.extend(["--capacity-floor-policy-id", capacity_floor_policy_id])
             process = subprocess.Popen(command, cwd=SOURCE_ROOT, stdin=subprocess.DEVNULL,
                                         stdout=subprocess.PIPE, stderr=subprocess.PIPE, close_fds=True)
             probe_pid = process.pid
@@ -363,6 +373,7 @@ class CompositionContractTests(unittest.TestCase):
             self.assertEqual(
                 reader.validate_calibrated_construction_probe_v2(
                     probe_pin, source_manifest, bundle["artifact"], identity,
+                    capacity_floor_policy_id=capacity_floor_policy_id,
                 ),
                 probe_pin["raw_sha256"],
             )
@@ -371,7 +382,7 @@ class CompositionContractTests(unittest.TestCase):
             self.assertEqual(reader.digest_object(source_manifest), source_manifest_sha_before)
             self.assertEqual(_feedback.source_path.read_bytes(), source_manifest_raw_before)
 
-            if allocator == reader.APPLICATION_ALLOCATOR_LABELS[0] and floor_policy_descriptor is not None:
+            if allocator == reader.APPLICATION_ALLOCATOR_LABELS[0]:
                 # This fresh synthetic artifact keeps the captured source/run
                 # identity and changes only the two independent byte rates.
                 # It exercises the actual ProbeV2 CLI and reader, not a lowered
@@ -386,13 +397,17 @@ class CompositionContractTests(unittest.TestCase):
                 low_capacity_path = self.root / "capacity-low-relative-floor.tsv"
                 _write(low_capacity_path, low_capacity_raw)
                 low_capacity_pin = {"path": str(low_capacity_path), "raw_sha256": _sha(low_capacity_raw)}
+                self.assertLess(
+                    4_617_956, reader.CAPACITY_RATE_FLOOR,
+                    "the selected relative-floor witness must remain below the legacy static floor",
+                )
                 selected_command = [
                     str(binary), "--emit-feedback-policy-only", "--workload", "mixed", "--profile", "mixed",
                     "--capacity-calibration-file", low_capacity_pin["path"],
                     "--capacity-calibration-sha256", low_capacity_pin["raw_sha256"],
                     "--host-id", _feedback.identity["host_id"], "--source-sha256",
                     _feedback.source["source"]["source_tree_sha256"],
-                    "--capacity-floor-policy-id", reader.CAPACITY_FLOOR_POLICY_ID,
+                    "--capacity-floor-policy-id", capacity_floor_policy_id,
                 ]
                 selected_process = subprocess.run(
                     selected_command, cwd=SOURCE_ROOT, stdin=subprocess.DEVNULL,
@@ -411,7 +426,7 @@ class CompositionContractTests(unittest.TestCase):
                 }
                 resolved = reader.resolve_calibrated_feedback_policy_v5(
                     source_manifest, selected_probe, low_capacity_pin, identity,
-                    capacity_floor_policy_id=reader.CAPACITY_FLOOR_POLICY_ID,
+                    capacity_floor_policy_id=capacity_floor_policy_id,
                 )
                 self.assertEqual(resolved["controls"]["disk"]["floor"], 461795)
                 self.assertEqual(resolved["controls"]["download"]["floor"], 461795)
@@ -420,7 +435,7 @@ class CompositionContractTests(unittest.TestCase):
                 self.assertEqual(
                     reader.validate_calibrated_construction_probe_v2(
                         selected_probe_pin, source_manifest, low_capacity_pin, identity,
-                        capacity_floor_policy_id=reader.CAPACITY_FLOOR_POLICY_ID,
+                        capacity_floor_policy_id=capacity_floor_policy_id,
                     ),
                     selected_probe_pin["raw_sha256"],
                 )
@@ -429,20 +444,20 @@ class CompositionContractTests(unittest.TestCase):
                         source_manifest, selected_probe, low_capacity_pin, identity,
                         capacity_floor_policy_id="unknown_floor_policy",
                     )
-                with self.assertRaises(reader.ValidationError):
+                with self.assertRaisesRegex(reader.ValidationError, "unexpected key set"):
                     reader.resolve_calibrated_feedback_policy_v5(
                         source_manifest, selected_probe, low_capacity_pin, identity,
                     )
                 mismatched_selector = json.loads(json.dumps(selected_probe))
                 mismatched_selector["capacity_floor_policy_id"] = "unknown_floor_policy"
-                with self.assertRaises(reader.ValidationError):
+                with self.assertRaisesRegex(reader.ValidationError, "top-level capacity-floor ID differs"):
                     reader.resolve_calibrated_feedback_policy_v5(
                         source_manifest, mismatched_selector, low_capacity_pin, identity,
-                        capacity_floor_policy_id=reader.CAPACITY_FLOOR_POLICY_ID,
+                        capacity_floor_policy_id=capacity_floor_policy_id,
                     )
 
             request = {
-                "schema": composition.REQUEST_SCHEMA,
+                "schema": composition.REQUEST_SCHEMA_V2,
                 "source_root": str(SOURCE_ROOT),
                 "source_manifest": _feedback.source_pin,
                 "context": {
@@ -452,6 +467,7 @@ class CompositionContractTests(unittest.TestCase):
                 "construction_probe": probe_pin,
                 "capacity_bundle": bundle,
             }
+            request["capacity_floor_policy_id"] = capacity_floor_policy_id
             request_path = self.root / f"composition-request-{allocator}.json"
             request_raw = composition.canonical(request)
             _write(request_path, request_raw)
@@ -468,6 +484,15 @@ class CompositionContractTests(unittest.TestCase):
             policy, _, policy_sha = composition._read_canonical(policy_path, "resolved policy", _sha(policy_path.read_bytes()))
             receipt, _, _ = composition._read_canonical(composition_receipt_path, "composition receipt", _sha(composition_receipt_path.read_bytes()))
             self.assertEqual(policy["context"]["allocator"], allocator)
+            self.assertEqual(policy["schema"], composition.POLICY_SCHEMA_V2)
+            self.assertEqual(receipt["schema"], composition.RECEIPT_SCHEMA_V2)
+            self.assertEqual(policy["capacity_floor_policy_id"], capacity_floor_policy_id)
+            self.assertEqual(policy["policy"]["capacity_floor_policy_id"], capacity_floor_policy_id)
+            self.assertEqual(receipt["capacity_floor_policy_id"], capacity_floor_policy_id)
+            with self.assertRaisesRegex(composition.CompositionError, "unknown"):
+                composition._validate_resolve_request({
+                    **request, "capacity_floor_policy_id": "unknown_floor_policy",
+                })
             self.assertEqual(policy["policy"]["controls"]["disk"]["initial"], reader.CAPACITY_RATE_ROOF)
             self.assertEqual(policy["policy"]["controls"]["download"]["initial"], reader.CAPACITY_RATE_ROOF)
             self.assertEqual(policy["policy"]["rate_buckets"]["disk"]["initial_bytes_per_second"], reader.CAPACITY_RATE_ROOF)
@@ -475,55 +500,6 @@ class CompositionContractTests(unittest.TestCase):
             self.assertFalse(receipt["execution_ready"])
             self.assertFalse(receipt["qualification_eligible"])
             self.assertFalse(receipt["controller_chronology_proven"])
-            if allocator == reader.APPLICATION_ALLOCATOR_LABELS[0] and floor_policy_descriptor is not None:
-                selected_command = [
-                    str(binary), "--emit-feedback-policy-only", "--workload", "mixed", "--profile", "mixed",
-                    "--capacity-calibration-file", bundle["artifact"]["path"],
-                    "--capacity-calibration-sha256", bundle["artifact"]["raw_sha256"],
-                    "--host-id", _feedback.identity["host_id"], "--source-sha256",
-                    _feedback.source["source"]["source_tree_sha256"],
-                    "--capacity-floor-policy-id", reader.CAPACITY_FLOOR_POLICY_ID,
-                ]
-                selected_process = subprocess.run(
-                    selected_command, cwd=SOURCE_ROOT, stdin=subprocess.DEVNULL,
-                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30, check=False,
-                )
-                self.assertEqual(selected_process.returncode, 0, selected_process.stderr.decode("utf-8", "replace"))
-                selected_probe_path = self.root / "calibrated-probe-selected-policy.json"
-                _write(selected_probe_path, selected_process.stdout)
-                selected_request = json.loads(json.dumps(request))
-                selected_request["schema"] = composition.REQUEST_SCHEMA_V2
-                selected_request["capacity_floor_policy_id"] = reader.CAPACITY_FLOOR_POLICY_ID
-                selected_request["construction_probe"] = {
-                    "path": str(selected_probe_path), "raw_sha256": _sha(selected_process.stdout),
-                    "allocator": allocator, "binary_sha256": binary_sha,
-                }
-                selected_request_path = self.root / "composition-request-selected-policy.json"
-                _write(selected_request_path, composition.canonical(selected_request))
-                selected_policy_path = self.root / "resolved-policy-selected-policy.json"
-                selected_receipt_path = self.root / "composition-receipt-selected-policy.json"
-                selected_status = composition.main([
-                    "resolve", "--request", str(selected_request_path),
-                    "--policy-output", str(selected_policy_path),
-                    "--receipt-output", str(selected_receipt_path),
-                ])
-                self.assertEqual(selected_status, 0)
-                selected_policy, _, _ = composition._read_canonical(
-                    selected_policy_path, "selected resolved policy", _sha(selected_policy_path.read_bytes()),
-                )
-                selected_receipt, _, _ = composition._read_canonical(
-                    selected_receipt_path, "selected composition receipt", _sha(selected_receipt_path.read_bytes()),
-                )
-                self.assertEqual(selected_policy["schema"], composition.POLICY_SCHEMA_V2)
-                self.assertEqual(selected_policy["capacity_floor_policy_id"], reader.CAPACITY_FLOOR_POLICY_ID)
-                self.assertEqual(selected_policy["policy"]["capacity_floor_policy_id"], reader.CAPACITY_FLOOR_POLICY_ID)
-                self.assertEqual(selected_receipt["schema"], composition.RECEIPT_SCHEMA_V2)
-                self.assertEqual(selected_receipt["capacity_floor_policy_id"], reader.CAPACITY_FLOOR_POLICY_ID)
-                self.assertFalse(selected_receipt["execution_ready"])
-                with self.assertRaisesRegex(composition.CompositionError, "unknown"):
-                    composition._validate_resolve_request({
-                        **selected_request, "capacity_floor_policy_id": "unknown_floor_policy",
-                    })
             if allocator == reader.APPLICATION_ALLOCATOR_LABELS[0]:
                 observed_host_path = Path(observed_host_env).resolve(strict=True)
                 def probe_storage_budget(receipt_bytes: int = reader.MAX_PROBE_CAPTURE_RECEIPT_BYTES) -> dict[str, int]:
@@ -774,6 +750,7 @@ class CompositionContractTests(unittest.TestCase):
                     with self.assertRaises((reader.ValidationError, composition.CompositionError)):
                         reader.validate_calibrated_construction_probe_v2_offline(
                             probe_pin, request["source_manifest"], bundle["artifact"], identity,
+                            capacity_floor_policy_id=capacity_floor_policy_id,
                             replay_context=failed_context,
                         )
                 missing_source_map = json.loads(json.dumps(offline_replay_context))
@@ -837,6 +814,7 @@ class CompositionContractTests(unittest.TestCase):
                         with self.assertRaisesRegex(reader.ValidationError, "path map"):
                             reader.validate_calibrated_construction_probe_v2_offline(
                                 probe_pin, request["source_manifest"], bundle["artifact"], identity,
+                                capacity_floor_policy_id=capacity_floor_policy_id,
                                 replay_context=incomplete_context,
                             )
                 with mock.patch.object(subprocess, "Popen", side_effect=AssertionError("offline replay attempted Popen")), \
@@ -849,6 +827,7 @@ class CompositionContractTests(unittest.TestCase):
                     self.assertEqual(
                         reader.validate_calibrated_construction_probe_v2_offline(
                             probe_pin, request["source_manifest"], bundle["artifact"], identity,
+                            capacity_floor_policy_id=capacity_floor_policy_id,
                             replay_context=offline_replay_context,
                         ),
                         probe_pin["raw_sha256"],
@@ -879,6 +858,7 @@ class CompositionContractTests(unittest.TestCase):
                     with self.assertRaisesRegex(reader.ValidationError, "unexpected key set"):
                         reader.validate_calibrated_construction_probe_v2_offline(
                             probe_pin, request["source_manifest"], bundle["artifact"], identity,
+                            capacity_floor_policy_id=capacity_floor_policy_id,
                             replay_context=failed_schema_context,
                         )
             finalize_request = {
@@ -926,12 +906,15 @@ class CompositionContractTests(unittest.TestCase):
             finalized, _, _ = composition._read_canonical(
                 finalize_expectation_path, "finalized expectation", _sha(finalize_expectation_path.read_bytes()),
             )
+            self.assertEqual(finalized["schema"], reader.EXPECTATION_SCHEMA_V6)
+            self.assertEqual(finalized["policy"]["capacity_floor_policy_id"], capacity_floor_policy_id)
             self.assertEqual(finalized["identity"]["process_id"], probe_pid)
             self.assertEqual(finalized["identity"]["run_id"], f"construction-probe-fixture-{allocator}")
             self.assertFalse(finalized["recipe_sha256"] == "0" * 64)
             finalization_receipt, _, _ = composition._read_canonical(
                 finalize_receipt_path, "finalization receipt", _sha(finalize_receipt_path.read_bytes()),
             )
+            self.assertEqual(finalization_receipt["schema"], composition.FINALIZE_RECEIPT_SCHEMA)
             self.assertFalse(finalization_receipt["execution_ready"])
             self.assertFalse(finalization_receipt["qualification_eligible"])
             self.assertFalse(finalization_receipt["controller_chronology_proven"])
@@ -1066,6 +1049,7 @@ class CompositionContractTests(unittest.TestCase):
                             ):
                                 reader.validate_calibrated_construction_probe_v2_offline(
                                     probe_pin, request["source_manifest"], bundle["artifact"], identity,
+                                    capacity_floor_policy_id=capacity_floor_policy_id,
                                     replay_context=environment_context,
                                 )
 
@@ -1092,6 +1076,7 @@ class CompositionContractTests(unittest.TestCase):
                                                         "strict environment has an unexpected key set"):
                                 reader.validate_calibrated_construction_probe_v2_offline(
                                     probe_pin, request["source_manifest"], bundle["artifact"], identity,
+                                    capacity_floor_policy_id=capacity_floor_policy_id,
                                     replay_context=extra_environment_context,
                                 )
 
@@ -1262,6 +1247,7 @@ class CompositionContractTests(unittest.TestCase):
                             ):
                                 reader.validate_calibrated_construction_probe_v2_offline(
                                     probe_pin, request["source_manifest"], bundle["artifact"], identity,
+                                    capacity_floor_policy_id=capacity_floor_policy_id,
                                     replay_context=directory_map_context,
                                 )
                     finally:
@@ -1341,10 +1327,10 @@ class CompositionContractTests(unittest.TestCase):
 
 
             mutations = (
-                ("capacity below floor", lambda item: item.update({"disk.bytes_per_second": str(reader.CAPACITY_RATE_FLOOR - 1)}), reader.CAPACITY_RATE_FLOOR - 1, "application_bytes_per_second"),
-                ("missing relevant source", lambda item: item.update({"disk.bytes_per_second": "missing", "disk.units": "missing"}), None, "missing"),
+                ("capacity zero", lambda item: item.update({"disk.bytes_per_second": "0"}), 0, "application_bytes_per_second", "not a canonical positive integer"),
+                ("missing relevant source", lambda item: item.update({"disk.bytes_per_second": "missing", "disk.units": "missing"}), None, "missing", "required application-byte capacity source is missing"),
             )
-            for label, mutate, probe_rate, probe_units in mutations:
+            for label, mutate, probe_rate, probe_units, expected_error in mutations:
                 artifact_fields = dict(values)
                 mutate(artifact_fields)
                 altered_raw = "".join(f"{key}\t{artifact_fields[key]}\n" for key in sorted(artifact_fields)).encode("ascii")
@@ -1355,13 +1341,19 @@ class CompositionContractTests(unittest.TestCase):
                 altered_probe["capacity_calibration"]["artifact_sha256"] = _sha(altered_raw)
                 altered_probe["capacity_calibration"]["disk"]["bytes_per_second"] = probe_rate
                 altered_probe["capacity_calibration"]["disk"]["units"] = probe_units
-                with self.assertRaises(reader.ValidationError, msg=label):
-                    reader.resolve_calibrated_feedback_policy_v5(source_manifest, altered_probe, altered_pin, identity)
+                with self.assertRaisesRegex(reader.ValidationError, expected_error, msg=label):
+                    reader.resolve_calibrated_feedback_policy_v5(
+                        source_manifest, altered_probe, altered_pin, identity,
+                        capacity_floor_policy_id=capacity_floor_policy_id,
+                    )
 
             forged = json.loads(json.dumps(probe))
             forged["capacity_calibration"]["resolution"]["controls"]["disk"]["initial"] += 1
             with self.assertRaises(reader.ValidationError):
-                reader.resolve_calibrated_feedback_policy_v5(source_manifest, forged, bundle["artifact"], identity)
+                reader.resolve_calibrated_feedback_policy_v5(
+                    source_manifest, forged, bundle["artifact"], identity,
+                    capacity_floor_policy_id=capacity_floor_policy_id,
+                )
             forged = json.loads(json.dumps(probe))
             forged["after_release"]["live_tenants"] = True
             with self.assertRaises(reader.ValidationError):
@@ -1388,7 +1380,10 @@ class CompositionContractTests(unittest.TestCase):
                     malformed = json.loads(json.dumps(probe))
                     mutate(malformed)
                     with self.assertRaises(reader.ValidationError, msg=label):
-                        reader.resolve_calibrated_feedback_policy_v5(source_manifest, malformed, bundle["artifact"], identity)
+                        reader.resolve_calibrated_feedback_policy_v5(
+                            source_manifest, malformed, bundle["artifact"], identity,
+                            capacity_floor_policy_id=capacity_floor_policy_id,
+                        )
                 duplicate = b'{"schema":"a","schema":"b"}\n'
                 with self.assertRaises(reader.ValidationError):
                     reader.parse_json(duplicate, "duplicate probe", 128)
