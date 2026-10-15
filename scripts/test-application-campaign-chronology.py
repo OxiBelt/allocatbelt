@@ -43,6 +43,13 @@ if [[ -n "${CHRONOLOGY_RUNNER_WAIT_FLAG:-}" && -e "$CHRONOLOGY_RUNNER_WAIT_FLAG"
   if [[ "$wait_mode" == escaped-normal || "$wait_mode" == escaped-timeout ||
         "$wait_mode" == escaped-interrupt ]]; then
     python3 -c 'import os,signal,sys,time; os.setpgid(0,0); signal.signal(signal.SIGTERM,signal.SIG_IGN); tail=open("/proc/self/stat").read().rsplit(")",1)[1].split(); open(sys.argv[2],"w").write(str(os.getpid())+":"+tail[19]+"\n"); exec("while os.path.exists(sys.argv[1]): time.sleep(0.01)")' "$CHRONOLOGY_RUNNER_WAIT_FLAG" "${CHRONOLOGY_RUNNER_PID_MARKER}.escaped" &
+    # The normal-exit case must establish the escaped process before its
+    # parent exits; otherwise correct early group cleanup can win this race.
+    for ((ready_attempt=0; ready_attempt<1000; ready_attempt++)); do
+      [[ -s "${CHRONOLOGY_RUNNER_PID_MARKER}.escaped" ]] && break
+      sleep 0.01
+    done
+    [[ -s "${CHRONOLOGY_RUNNER_PID_MARKER}.escaped" ]] || exit 72
     if [[ "$wait_mode" == escaped-normal ]]; then
       exit 0
     fi
