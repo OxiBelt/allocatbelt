@@ -9,6 +9,7 @@ finalization step requires the caller's actual positive application PID.
 from __future__ import annotations
 
 import argparse
+import copy
 import hashlib
 import json
 import os
@@ -424,7 +425,7 @@ def _source_policy_context(source: dict[str, Any], context: dict[str, Any]) -> d
     contexts = feedback_body["contexts"]
     require(type(contexts) is dict and context_key in contexts, "SourceV5 feedback policy omits the selected context")
     value = exact(contexts[context_key], {"workers", "minimum_dense_observations", "controls"}, "SourceV5 feedback policy context")
-    return value
+    return copy.deepcopy(value)
 
 
 def _make_policy_document(

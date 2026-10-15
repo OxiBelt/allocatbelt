@@ -174,6 +174,34 @@ class CompositionContractTests(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
 
+    def test_source_policy_context_does_not_mutate_pinned_source(self) -> None:
+        for schema in (
+            "allocatbelt.application-feedback-policy-artifact.v1",
+            "allocatbelt.application-feedback-policy-artifact.v2",
+        ):
+            with self.subTest(schema=schema):
+                body = {
+                    "schema": schema, "version": "runtime-feedback-policy-v1",
+                    "reader_contract": {}, "algorithm": {}, "source_pins": {},
+                    "contexts": {"mixed/mixed": {
+                        "workers": 4, "minimum_dense_observations": 1,
+                        "controls": {"disk": {"floor": 1}},
+                    }},
+                }
+                if schema.endswith(".v2"):
+                    body["capacity_floor_policy"] = {"policy_id": reader.CAPACITY_FLOOR_POLICY_ID}
+                source = {"feedback_policy": {
+                    "schema": schema, "policy": body,
+                    "policy_sha256": reader.digest_object(body),
+                }}
+                original = composition.canonical(source)
+                context = composition._source_policy_context(
+                    source, {"workload": "mixed", "profile": "mixed"},
+                )
+                context["capacity_floor_policy_id"] = reader.CAPACITY_FLOOR_POLICY_ID
+                context["controls"]["disk"]["floor"] = 2
+                self.assertEqual(composition.canonical(source), original)
+
     def test_resolver_request_requires_the_full_producer_bundle_and_has_no_pid_field(self) -> None:
         request = {
             "schema": composition.REQUEST_SCHEMA,
