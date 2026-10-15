@@ -854,11 +854,16 @@ def _preflight_probe_capture_tree(
 
 def _absolute_paths(value: object) -> set[str]:
     paths: set[str] = set()
+    path_keys = {
+        "path", "source_root", "output_root", "binary_path", "executable_path", "cwd",
+        "tmpdir", "trace_directory", "directory", "root", "tmpdir_path",
+        "application_tmpdir_path", "pressure_scratch_path", "mount_point",
+    }
 
     def visit(current: object, argv_context: bool = False) -> None:
         if type(current) is dict:
             for key, item in current.items():
-                if key in {"path", "source_root", "output_root", "binary_path", "executable_path", "cwd", "tmpdir", "trace_directory"} and type(item) is str and item.startswith("/"):
+                if key in path_keys and type(item) is str and item.startswith("/"):
                     paths.add(item)
                 elif key == "environment" and type(item) is dict:
                     temp = item.get("TMPDIR")

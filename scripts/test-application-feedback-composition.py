@@ -175,6 +175,24 @@ class CompositionContractTests(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
 
+    def test_composition_and_reader_close_the_same_capture_paths(self) -> None:
+        capture = {
+            "output_mount": {"mount_point": "/", "mount_root": "/metadata-only"},
+            "tmpdir_final": {"root": "/capture/tmp", "tmpdir_path": "/capture/tmp"},
+            "inventory": [{"directory": "/capture", "path": "/capture/stdout.bin"}],
+            "application_tmpdir_path": "/capture/app-tmp",
+            "pressure_scratch_path": "/capture/scratch",
+            "environment": {"TMPDIR": "/capture/tmp"},
+            "probe_argv": ["/source/app", "--capacity", "/capture/capacity.tsv"],
+            "description": "/not-an-evidence-path",
+        }
+        expected = {
+            "/", "/capture", "/capture/tmp", "/capture/stdout.bin",
+            "/capture/app-tmp", "/capture/scratch", "/source/app", "/capture/capacity.tsv",
+        }
+        self.assertEqual(composition._absolute_paths(capture), expected)
+        self.assertEqual(reader._absolute_json_paths(capture), expected)
+
     def test_source_policy_context_does_not_mutate_pinned_source(self) -> None:
         for schema in (
             "allocatbelt.application-feedback-policy-artifact.v1",
@@ -230,7 +248,7 @@ class CompositionContractTests(unittest.TestCase):
             composition._validate_resolve_request(unknown_floor)
         missing_floor = json.loads(json.dumps(selected))
         missing_floor.pop("capacity_floor_policy_id")
-        with self.assertRaisesRegex(composition.CompositionError, "missing keys"):
+        with self.assertRaisesRegex(composition.CompositionError, "unexpected key set"):
             composition._validate_resolve_request(missing_floor)
         hash_only = json.loads(json.dumps(request))
         hash_only["capacity_bundle"].pop("request")
