@@ -9,11 +9,13 @@ import hashlib
 import importlib.machinery
 import importlib.util
 import json
+import os
 import stat
 import tempfile
 import types
 import unittest
 from pathlib import Path
+from unittest import mock
 from unittest.mock import patch
 
 
@@ -832,14 +834,17 @@ class Source5PreparationInputTests(unittest.TestCase):
                     **host_binding_body,
                     "binding_sha256": hashlib.sha256(preparation._canonical(host_binding_body)).hexdigest(),
                 }
-                output = preparation.export_capacity_pilot({
+                pilot_pins = {
                     "preparation": {"path": str(input_root / "preparation.json"), "sha256": "e" * 64},
                     "spec": {"path": str(spec_path), "sha256": hashlib.sha256(spec_raw).hexdigest()},
                     "plan": {"path": str(plan_path), "sha256": hashlib.sha256(plan_raw).hexdigest()},
                     "source_root": str(source_root), "input_root": str(input_root),
                     "campaign_artifacts_root": str(artifact_root),
                     "prepared_host_binding": host_binding, "output": None,
-                }, record_values, selected_host)
+                }
+                output = preparation.export_capacity_pilot(
+                    pilot_pins, record_values, selected_host,
+                )
 
             self.assertEqual(output["pair_count"], 360)
             self.assertEqual(output["context_allocator_count"], 15 * len(campaign.ALLOCATORS))
@@ -847,7 +852,7 @@ class Source5PreparationInputTests(unittest.TestCase):
             self.assertEqual(output["prepared_host_binding"], host_binding)
             self.assertTrue(all(row["prepared_host_binding_sha256"] == host_binding["binding_sha256"]
                                 for row in output["pair_evidence"]))
-            self.assertIsNone(output["path"])
+            self.assertEqual(output["path"], pilot_pins["output"])
             self.assertFalse(any(path.name.startswith(".capacity-pilot-replay-") for path in input_root.iterdir()))
 
     def test_pilot_export_rejects_other_valid_spec_or_plan_generation(self) -> None:
@@ -1806,13 +1811,16 @@ class CapturedCapacityPilotExportTests(unittest.TestCase):
 
         return CaptureProvider()
 
-    def _run_public_exporter(self, *, fault=None, compare=False):
+    def _run_public_exporter(self, *, fault=None, compare=False, complete=False,
+                             before_publication=None,
+                             before_publication_state=None):
         method = Source5PreparationInputTests.test_public_exporter_derives_rate_matrix_after_each_original_job_replay
         namespace = method.__globals__
         original_loader = namespace["load_script"]
         result = {
             "outputs": [], "pilots": [], "provider": None, "exception": None,
             "preparation": None, "output_path": None,
+            "before_publication": before_publication,
         }
 
         def patched_loader(path, name):
@@ -1828,11 +1836,12 @@ class CapturedCapacityPilotExportTests(unittest.TestCase):
             real_export = module.export_capacity_pilot
 
             def export_wrapper(pins, records, selected_host):
-                pins = dict(pins)
                 if not compare:
                     output_path = Path(pins["input_root"]) / "must-not-publish-pilot.json"
                     pins["output"] = str(output_path)
                     result["output_path"] = output_path
+                    if before_publication_state is not None:
+                        before_publication_state["output_path"] = output_path
                 expected_jobs = [
                     module.json.loads(Path(row["overlay"]["path"]).read_bytes())["job"]["value"]
                     for row in records
@@ -1840,7 +1849,7 @@ class CapturedCapacityPilotExportTests(unittest.TestCase):
                 if fault == "wrong_order":
                     records[0], records[1] = records[1], records[0]
                     record_count = 2
-                elif compare or fault == "snapshot_exit":
+                elif compare or complete or fault == "snapshot_exit":
                     record_count = len(records)
                 else:
                     record_count = 1
@@ -1865,13 +1874,18 @@ class CapturedCapacityPilotExportTests(unittest.TestCase):
                     captured = self._export_once(
                         module, fixed_owner, real_export, pins, records,
                         selected_host, provider, result,
+                        before_publication=before_publication,
                     )
                     result["outputs"] = [legacy, captured]
+                    result["captured_result"] = captured
                     return captured
-                return self._export_once(
+                captured = self._export_once(
                     module, fixed_owner, real_export, pins, records,
                     selected_host, provider, result,
+                    before_publication=before_publication,
                 )
+                result["captured_result"] = captured
+                return captured
 
             module.export_capacity_pilot = export_wrapper
             return module
@@ -1885,7 +1899,7 @@ class CapturedCapacityPilotExportTests(unittest.TestCase):
         return result
 
     def _export_once(self, module, fixed_owner, export_fn, pins, records,
-                     selected_host, provider, result):
+                     selected_host, provider, result, *, before_publication=None):
         real_module_type = types.ModuleType
 
         def module_factory(name):
@@ -2016,16 +2030,35 @@ class CapturedCapacityPilotExportTests(unittest.TestCase):
                 raise AssertionError("captured pilot reopened an original pair output")
             return original_read(pin, label, maximum)
 
-        with patch.object(types, "ModuleType", side_effect=module_factory), \
-             patch.object(module, "_canonical", side_effect=recording_canonical):
-            if provider is None:
-                return export_fn(pins, records, selected_host)
-            with patch.object(module, "_read_pinned_json",
-                              side_effect=deny_captured_origin):
-                return export_fn(
-                    pins, records, selected_host,
-                    captured_read_provider=provider,
-                )
+        try:
+            with patch.object(types, "ModuleType", side_effect=module_factory), \
+                 patch.object(module, "_canonical", side_effect=recording_canonical):
+                if provider is None:
+                    return export_fn(pins, records, selected_host)
+                with patch.object(module, "_read_pinned_json",
+                                  side_effect=deny_captured_origin):
+                    return export_fn(
+                        pins, records, selected_host,
+                        captured_read_provider=provider,
+                        before_publication=before_publication,
+                    )
+        finally:
+            # Observe the real output before the nested base fixture removes
+            # its TemporaryDirectory; post-cleanup absence is not evidence.
+            output_path = result.get("output_path")
+            if output_path is not None:
+                observation = {"parent_exists": output_path.parent.is_dir(),
+                               "exists": False, "raw": None}
+                try:
+                    info = output_path.lstat()
+                except FileNotFoundError:
+                    pass
+                else:
+                    self.assertTrue(stat.S_ISREG(info.st_mode))
+                    observation["exists"] = True
+                    observation["raw"] = output_path.read_bytes()
+                    observation["identity"] = (info.st_dev, info.st_ino)
+                result["output_observation"] = observation
 
     def _assert_refusal_before_publication(self, fault, *, runtime_error=False):
         result = self._run_public_exporter(fault=fault)
@@ -2038,7 +2071,8 @@ class CapturedCapacityPilotExportTests(unittest.TestCase):
         else:
             self.assertIsInstance(error, result["preparation"].PreparationError)
         self.assertIsNotNone(result["output_path"])
-        self.assertFalse(result["output_path"].exists())
+        self.assertTrue(result["output_observation"]["parent_exists"])
+        self.assertFalse(result["output_observation"]["exists"])
         provider = result["provider"]
         if provider is not None:
             self.assertEqual(provider.active, 0)
@@ -2086,10 +2120,157 @@ class CapturedCapacityPilotExportTests(unittest.TestCase):
         self.assertIsInstance(
             result["exception"], result["preparation"].PreparationError,
         )
-        self.assertFalse(result["output_path"].exists())
+        self.assertTrue(result["output_observation"]["parent_exists"])
+        self.assertFalse(result["output_observation"]["exists"])
         self.assertEqual(len(result["provider"].opened), 360)
         self.assertEqual(result["provider"].opened, result["provider"].closed)
         self.assertEqual(result["provider"].active, 0)
+
+    def test_before_publication_hook_sees_exact_bytes_after_rate_check(self):
+        observations = {}
+        ordered = []
+        configured_output = {}
+        campaign_module = Source5PreparationInputTests.test_public_exporter_derives_rate_matrix_after_each_original_job_replay.__globals__["campaign"]
+        original_freeze_rates = campaign_module.freeze_rates
+
+        def recorded_freeze_rates(*args, **kwargs):
+            result = original_freeze_rates(*args, **kwargs)
+            ordered.append("numeric_validator")
+            return result
+
+        def before_publication(raw, prospective):
+            ordered.append("before_publication")
+            result_path = configured_output["output_path"]
+            self.assertEqual(prospective["path"], str(result_path))
+            with self.assertRaises(FileNotFoundError):
+                result_path.lstat()
+            self.assertEqual(hashlib.sha256(raw).hexdigest(), prospective["raw_sha256"])
+            self.assertEqual(prospective["pair_count"], 360)
+            observations["raw"] = raw
+            observations["dto"] = copy.deepcopy(prospective)
+            prospective["host_id"] = "mutated-private-copy"
+            prospective["pair_evidence"][0]["run_id"] = "mutated-nested-copy"
+            return None
+
+        with mock.patch.object(campaign_module, "freeze_rates",
+                               side_effect=recorded_freeze_rates):
+            result = self._run_public_exporter(
+                complete=True, before_publication=before_publication,
+                before_publication_state=configured_output,
+            )
+        self.assertIsNone(result["exception"], str(result["exception"]))
+        self.assertEqual(ordered[-2:], ["numeric_validator", "before_publication"])
+        self.assertEqual(result["captured_result"]["path"], str(configured_output["output_path"]))
+        self.assertTrue(result["output_observation"]["parent_exists"])
+        self.assertTrue(result["output_observation"]["exists"])
+        self.assertEqual(result["output_observation"]["raw"], observations["raw"])
+        self.assertEqual(hashlib.sha256(result["output_observation"]["raw"]).hexdigest(),
+                         observations["dto"]["raw_sha256"])
+        self.assertEqual(result["captured_result"]["host_id"],
+                         result["output_rows"][0]["overlay"]["job"]["value"]["host_id"])
+        self.assertNotEqual(result["captured_result"]["pair_evidence"][0]["run_id"],
+                            "mutated-nested-copy")
+        self.assertEqual(result["provider"].opened, result["provider"].closed)
+        self.assertEqual(result["provider"].active, 0)
+
+    def test_hook_exception_or_non_none_return_prevents_publication(self):
+        def fail_before_publish(_raw, _prospective):
+            raise RuntimeError("prepublication rejected")
+
+        rejected = self._run_public_exporter(
+            complete=True, before_publication=fail_before_publish,
+        )
+        self.assertIsInstance(rejected["exception"], RuntimeError)
+        self.assertTrue(rejected["output_observation"]["parent_exists"])
+        self.assertFalse(rejected["output_observation"]["exists"])
+        self.assertEqual(rejected["provider"].opened, rejected["provider"].closed)
+
+        returned = self._run_public_exporter(
+            complete=True,
+            before_publication=lambda _raw, _prospective: True,
+        )
+        self.assertIsInstance(returned["exception"], returned["preparation"].PreparationError)
+        self.assertTrue(returned["output_observation"]["parent_exists"])
+        self.assertFalse(returned["output_observation"]["exists"])
+        self.assertEqual(returned["provider"].opened, returned["provider"].closed)
+
+    def test_noncallable_hook_is_rejected_before_captured_views(self):
+        result = self._run_public_exporter(before_publication="not callable")
+        self.assertIsInstance(result["exception"], result["preparation"].PreparationError)
+        self.assertTrue(result["output_observation"]["parent_exists"])
+        self.assertFalse(result["output_observation"]["exists"])
+        self.assertEqual(result["provider"].opened, [])
+        self.assertEqual(result["provider"].closed, [])
+
+    def test_new_output_inode_is_removed_after_writer_io_failure(self):
+        module = load_script(
+            SCRIPT_DIR / "application-source5-input-preparation.py",
+            "capacity_pilot_writer_cleanup_target",
+        )
+        with tempfile.TemporaryDirectory(prefix="capacity-pilot-writer-cleanup-") as temporary:
+            root = Path(temporary)
+            root.chmod(0o700)
+            destination = root / "pilot.json"
+            original_write = os.write
+            writes = 0
+
+            def partial_then_fail(fd, raw):
+                nonlocal writes
+                writes += 1
+                if writes == 1:
+                    return original_write(fd, raw[: max(1, len(raw) // 3)])
+                raise OSError("injected short publication write")
+
+            with mock.patch.object(module.os, "write", side_effect=partial_then_fail):
+                with self.assertRaisesRegex(OSError, "injected"):
+                    module._write_private_json_new(
+                        destination, {"schema": "writer-cleanup"}, root / "source",
+                    )
+            self.assertFalse(destination.exists())
+            self.assertEqual(list(root.iterdir()), [])
+
+    def test_new_output_inode_is_removed_after_readback_failure(self):
+        module = load_script(
+            SCRIPT_DIR / "application-source5-input-preparation.py",
+            "capacity_pilot_writer_readback_cleanup_target",
+        )
+        with tempfile.TemporaryDirectory(prefix="capacity-pilot-readback-cleanup-") as temporary:
+            root = Path(temporary)
+            root.chmod(0o700)
+            destination = root / "pilot.json"
+            with mock.patch.object(module.os, "read",
+                                   side_effect=OSError("injected readback failure")):
+                with self.assertRaisesRegex(OSError, "readback failure"):
+                    module._write_private_json_new(
+                        destination, {"schema": "writer-readback-cleanup"}, root / "source",
+                    )
+            self.assertFalse(destination.exists())
+            self.assertEqual(list(root.iterdir()), [])
+
+    def test_existing_identical_private_output_is_never_replaced_or_deleted(self):
+        module = load_script(
+            SCRIPT_DIR / "application-source5-input-preparation.py",
+            "capacity_pilot_existing_output_target",
+        )
+        with tempfile.TemporaryDirectory(prefix="capacity-pilot-existing-output-") as temporary:
+            root = Path(temporary)
+            root.chmod(0o700)
+            destination = root / "pilot.json"
+            body = {"schema": "existing-identical"}
+            raw = module._canonical(body)
+            destination.write_bytes(raw)
+            destination.chmod(0o600)
+            digest = module._write_private_json_new(
+                destination, body, root / "source", allow_existing_identical=True,
+            )
+            self.assertEqual(digest, hashlib.sha256(raw).hexdigest())
+            self.assertEqual(destination.read_bytes(), raw)
+            with self.assertRaises(module.PreparationError):
+                module._write_private_json_new(
+                    destination, {"schema": "different"}, root / "source",
+                    allow_existing_identical=True,
+                )
+            self.assertEqual(destination.read_bytes(), raw)
 
 
 class CapturedCapacityPilotProviderCohortTests(unittest.TestCase):

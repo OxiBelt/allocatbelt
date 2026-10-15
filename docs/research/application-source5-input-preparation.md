@@ -579,6 +579,20 @@ closes the view before advancing to the next job or publishing the pilot.
 Read and context-exit failures propagate; captured failures cannot fall back
 to origin reads. Omitting the provider preserves the original offline path.
 
+The optional Python callback `before_publication(pilot_raw, prospective_result)`
+runs after all pair views close and the numerical rate validator succeeds,
+before any pilot file is written. It receives the exact canonical bytes and
+an independent deep copy of the prospective result, including the requested
+output path. It must return `None`; an exception or another return value
+prevents publication. This lets a Source-owned caller complete its journal,
+archive and storage checks without another replay pass. Omitting the callback
+preserves the existing call behavior and pilot bytes.
+
+The private JSON writer holds the parent directory descriptor across exclusive
+creation and readback. A write, sync or readback failure removes only the inode
+created by that call. An already-existing identical immutable output is
+preserved.
+
 The completion and completion-replay Python APIs forward the optional
 `captured_pilot_read_providers` map. An explicit map must cover exactly the
 three verified hosts with a callable `open_view` for each host. Selection is

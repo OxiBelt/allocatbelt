@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import copy
 import hashlib
 import json
 import os
@@ -634,8 +635,11 @@ def _write_private_json_new(
     path: Path, value: dict[str, Any], source_root: Path, *, allow_existing_identical: bool = False,
 ) -> str:
     _require(path.is_absolute(), "new artifact path must be absolute")
+    parent = path.parent
+    name = path.name
+    _require(name not in {"", ".", ".."},
+             "new artifact path must name one exact child file")
     try:
-        parent = path.parent
         parent_info = parent.lstat()
         resolved_parent = parent.resolve(strict=True)
     except OSError as error:
@@ -643,38 +647,151 @@ def _write_private_json_new(
     _require(stat.S_ISDIR(parent_info.st_mode) and resolved_parent == parent and
              stat.S_IMODE(parent_info.st_mode) == 0o700 and parent_info.st_uid == os.getuid(),
              "new artifact parent must be an owned real mode-0700 directory")
-    _require(not path.is_symlink(), "new artifact destination may not be a symlink")
     _require(not _within(source_root, path), "new artifact destination must be outside SourceV5")
     raw = _canonical(value)
+    checksum = _sha256(raw)
     _require(len(raw) <= MAX_REQUEST_BYTES, "new preparation artifact exceeds its finite size bound")
-    if path.exists():
-        _require(allow_existing_identical, "immutable artifact destination already exists")
-        existing, info = _read_stable(path, "existing immutable artifact", len(raw))
-        _require(stat.S_IMODE(info.st_mode) == 0o600 and info.st_uid == os.getuid() and existing == raw,
-                 "existing immutable artifact differs from the exact replayed bytes or private mode")
-        return _sha256(raw)
+    directory_fd = -1
     try:
-        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0), 0o600)
+        directory_fd = os.open(
+            parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) |
+            getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+        )
     except OSError as error:
-        raise PreparationError(f"cannot create immutable new artifact: {error}") from error
+        raise PreparationError(f"cannot safely open new artifact parent: {error}") from error
+    created_fd = -1
+    created_identity: tuple[int, int] | None = None
+
+    def same_named_parent() -> bool:
+        try:
+            named = parent.lstat()
+            resolved = parent.resolve(strict=True)
+            check_fd = os.open(
+                parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) |
+                getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+            )
+        except OSError:
+            return False
+        try:
+            checked = os.fstat(check_fd)
+            anchored = os.fstat(directory_fd)
+            return (stat.S_ISDIR(named.st_mode) and resolved == parent and
+                    (named.st_dev, named.st_ino) == (anchored.st_dev, anchored.st_ino) ==
+                    (checked.st_dev, checked.st_ino))
+        finally:
+            os.close(check_fd)
+
+    def read_named_file(maximum: int) -> tuple[bytes, os.stat_result]:
+        try:
+            before = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+            _require(stat.S_ISREG(before.st_mode), "new artifact destination may not be a symlink")
+            read_fd = os.open(
+                name, os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) |
+                getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0),
+                dir_fd=directory_fd,
+            )
+        except OSError as error:
+            raise PreparationError(f"cannot safely open new artifact for readback: {error}") from error
+        try:
+            opened = os.fstat(read_fd)
+            key = lambda info: (info.st_dev, info.st_ino, info.st_mode, info.st_size,
+                                info.st_mtime_ns, info.st_ctime_ns)
+            _require(stat.S_ISREG(opened.st_mode) and key(opened) == key(before) and
+                     0 <= opened.st_size <= maximum,
+                     "new artifact changed while opening or exceeds its size bound")
+            chunks: list[bytes] = []
+            count = 0
+            while count < opened.st_size:
+                block = os.read(read_fd, min(1024 * 1024, opened.st_size - count))
+                _require(bool(block), "new artifact was truncated during its stable readback")
+                chunks.append(block)
+                count += len(block)
+            after_fd = os.fstat(read_fd)
+            after_name = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+            _require(key(opened) == key(after_fd) == key(after_name) and
+                     count == opened.st_size,
+                     "new artifact changed during its stable readback")
+            return b"".join(chunks), after_fd
+        finally:
+            os.close(read_fd)
+
     try:
-        os.fchmod(fd, 0o600)
+        anchored_parent = os.fstat(directory_fd)
+        _require(stat.S_ISDIR(anchored_parent.st_mode) and
+                 (anchored_parent.st_dev, anchored_parent.st_ino) ==
+                     (parent_info.st_dev, parent_info.st_ino) and same_named_parent(),
+                 "new artifact parent changed while opening its anchored directory")
+        try:
+            existing = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            existing = None
+        if existing is not None:
+            _require(allow_existing_identical and stat.S_ISREG(existing.st_mode),
+                     "immutable artifact destination already exists or is not regular")
+            existing_raw, info = read_named_file(len(raw))
+            _require(stat.S_IMODE(info.st_mode) == 0o600 and info.st_uid == os.getuid() and
+                     info.st_nlink == 1 and existing_raw == raw and same_named_parent(),
+                     "existing immutable artifact differs from the exact replayed bytes or private mode")
+            return checksum
+        try:
+            created_fd = os.open(
+                name, os.O_WRONLY | os.O_CREAT | os.O_EXCL |
+                getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+                0o600, dir_fd=directory_fd,
+            )
+        except OSError as error:
+            raise PreparationError(f"cannot create immutable new artifact: {error}") from error
+        created_info = os.fstat(created_fd)
+        created_identity = (created_info.st_dev, created_info.st_ino)
+        _require(stat.S_ISREG(created_info.st_mode) and created_info.st_uid == os.getuid() and
+                 created_info.st_nlink == 1,
+                 "new artifact descriptor is not the exact private regular inode")
+        os.fchmod(created_fd, 0o600)
         offset = 0
         while offset < len(raw):
-            count = os.write(fd, raw[offset:])
+            count = os.write(created_fd, raw[offset:])
             _require(count > 0, "new artifact write stopped before completion")
             offset += count
-        os.fsync(fd)
+        os.fsync(created_fd)
+        written_info = os.fstat(created_fd)
+        _require((written_info.st_dev, written_info.st_ino) == created_identity and
+                 stat.S_ISREG(written_info.st_mode) and written_info.st_uid == os.getuid() and
+                 stat.S_IMODE(written_info.st_mode) == 0o600 and written_info.st_nlink == 1 and
+                 written_info.st_size == len(raw) and same_named_parent(),
+                 "new artifact or its parent changed before durable publication")
+        os.fsync(directory_fd)
+        written, readback_info = read_named_file(len(raw))
+        _require(written == raw and
+                 (readback_info.st_dev, readback_info.st_ino) == created_identity and
+                 stat.S_IMODE(readback_info.st_mode) == 0o600 and
+                 readback_info.st_uid == os.getuid() and readback_info.st_nlink == 1 and
+                 same_named_parent(),
+                 "new immutable artifact differs from its canonical bytes or reserved inode")
+        os.close(created_fd)
+        created_fd = -1
+        return checksum
+    except BaseException:
+        if created_identity is not None:
+            try:
+                current = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+                if (current.st_dev, current.st_ino) == created_identity:
+                    os.unlink(name, dir_fd=directory_fd)
+                    os.fsync(directory_fd)
+            except OSError:
+                # Retain safety over cleanup: never unlink a pathname whose
+                # inode cannot be proven to be the one this call created.
+                pass
+        raise
     finally:
-        os.close(fd)
-    dir_fd = os.open(parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0))
-    try:
-        os.fsync(dir_fd)
-    finally:
-        os.close(dir_fd)
-    written, _info = _read_stable(path, "new immutable artifact", len(raw))
-    _require(written == raw, "new immutable artifact differs from its canonical bytes")
-    return _sha256(raw)
+        if created_fd >= 0:
+            try:
+                os.close(created_fd)
+            except OSError:
+                pass
+        try:
+            os.close(directory_fd)
+        except OSError:
+            pass
 
 
 def _within(root: Path, path: Path) -> bool:
@@ -1524,7 +1641,7 @@ def _verify_capacity_pilot_captured_pair(
 
 def export_capacity_pilot(
     preparation_final_pins: dict[str, Any], verified_fixed_records: list[dict[str, Any]], host_id: str,
-    *, captured_read_provider: Any = None,
+    *, captured_read_provider: Any = None, before_publication: Any = None,
 ) -> dict[str, Any]:
     """Replay six original fixed-pair receipts per context/allocator and export the rate pilot.
 
@@ -1534,6 +1651,8 @@ def export_capacity_pilot(
     and identity path map. The offline verifier replays the original generation
     before either APP member contributes to the rate pilot.
     """
+    _require(before_publication is None or callable(before_publication),
+             "capacity-pilot before-publication hook must be absent or callable")
     pins = _exact(preparation_final_pins, {
         "preparation", "spec", "plan", "source_root", "input_root", "campaign_artifacts_root",
         "prepared_host_binding", "output",
@@ -1735,10 +1854,9 @@ def export_capacity_pilot(
         raise PreparationError(f"exported six-pair capacity pilot does not satisfy the unchanged numerical rate validator: {error}") from error
     output_value = pins["output"]
     output = None if output_value is None else Path(output_value)
-    if output is not None:
-        _write_private_json_new(output, pilot, source_root, allow_existing_identical=True)
-    raw_sha = _sha256(_canonical(pilot))
-    return {
+    pilot_raw = _canonical(pilot)
+    raw_sha = _sha256(pilot_raw)
+    prospective_result = {
         "path": None if output is None else str(output), "raw_sha256": raw_sha,
         "semantic_sha256": campaign.digest_object(pilot),
         "prepared_host_binding": prepared_host_binding,
@@ -1746,6 +1864,13 @@ def export_capacity_pilot(
         "context_allocator_count": len(cells), "spec_preregistration_sha256": pilot["spec_sha256"],
         "pair_evidence": raw_pair_records,
     }
+    if before_publication is not None:
+        hook_result = before_publication(pilot_raw, copy.deepcopy(prospective_result))
+        _require(hook_result is None,
+                 "capacity-pilot before-publication hook must return None")
+    if output is not None:
+        _write_private_json_new(output, pilot, source_root, allow_existing_identical=True)
+    return prospective_result
 
 
 def _replay_prepared_capacity_inputs(
