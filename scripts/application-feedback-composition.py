@@ -1804,18 +1804,21 @@ def _build_calibrated_feedback_expectation_v5(
         "minimum_production_seconds": header["minimum_production_seconds"],
         "minimum_pressure_overlap_seconds": header["minimum_pressure_overlap_seconds"],
     }
-    reader._validate_expectation_body(body)
-    if replay_context is None:
-        reader.validate_calibrated_construction_probe_v2(
-            probe_pin, verified_source, artifact_pin, identity, policy["policy"],
-            policy.get("capacity_floor_policy_id"),
-        )
-    else:
-        reader.validate_calibrated_construction_probe_v2_offline(
-            probe_pin, source_pin, artifact_pin, probe_identity,
-            replay_context=replay_context, expected_policy=policy["policy"],
-            capacity_floor_policy_id=policy.get("capacity_floor_policy_id"),
-        )
+    try:
+        reader._validate_expectation_body(body)
+        if replay_context is None:
+            reader.validate_calibrated_construction_probe_v2(
+                probe_pin, verified_source, artifact_pin, identity, policy["policy"],
+                policy.get("capacity_floor_policy_id"),
+            )
+        else:
+            reader.validate_calibrated_construction_probe_v2_offline(
+                probe_pin, source_pin, artifact_pin, probe_identity,
+                replay_context=replay_context, expected_policy=policy["policy"],
+                capacity_floor_policy_id=policy.get("capacity_floor_policy_id"),
+            )
+    except reader.ValidationError as error:
+        raise CompositionError(f"captured feedback reader rejected finalization: {error}") from error
     return body
 
 
