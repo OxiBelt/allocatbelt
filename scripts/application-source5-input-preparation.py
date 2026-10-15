@@ -9,6 +9,7 @@ rate, oracle, or qualification evidence.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hashlib
 import json
 import os
@@ -868,8 +869,100 @@ def _verify_pilot_overlay_generation(
              "fixed-pair Spec host and prepared capacity-host context differ from the declared versioned bridge")
 
 
+@contextlib.contextmanager
+def _capacity_pilot_read_window(provider: Any, job: dict[str, Any]):
+    """Keep one byte-only capture window; providers cannot suppress failures."""
+    if provider is None:
+        yield None
+        return
+    _require(callable(getattr(provider, "open_view", None)),
+             "captured capacity-pilot provider has no explicit read window")
+    manager = provider.open_view(
+        json.loads(_canonical(job)), "exploration", use="capacity_pilot_export",
+    )
+    view = manager.__enter__()
+    try:
+        _require(type(view) is dict and type(view.get("objects")) is dict and
+                 type(view.get("stage_root")) is str,
+                 "captured capacity-pilot window has no exact file references")
+        yield view
+    except BaseException:
+        manager.__exit__(*sys.exc_info())
+        raise
+    else:
+        manager.__exit__(None, None, None)
+
+
+def _capacity_pilot_envelope_reader(
+    fixed: Any, view: dict[str, Any] | None,
+    overlay_pin: dict[str, Any], receipt_pin: dict[str, Any], host_pin: dict[str, Any],
+) -> Any:
+    if view is None:
+        return None
+    origins = {overlay_pin["path"], receipt_pin["path"], host_pin["path"]}
+    _require(len(origins) == 3 and all(type(path) is str for path in origins) and
+             origins <= set(view["objects"]),
+             "captured capacity-pilot window omits an exact envelope origin")
+    return fixed.CapturedFixedPairArtifactsV1(
+        {origin: view["objects"][origin] for origin in origins},
+        Path(view["stage_root"]),
+    )
+
+
+def _read_capacity_pilot_envelope(
+    pin: dict[str, Any], label: str, reader: Any,
+) -> tuple[dict[str, Any], bytes, str]:
+    if reader is None:
+        return _read_pinned_json(pin, label)
+    raw, checksum = reader.read(pin["path"], label, MAX_REQUEST_BYTES)
+    _require(checksum == pin["sha256"] == _sha256(raw),
+             f"{label} differs from its caller-pinned raw SHA-256")
+    try:
+        value = json.loads(raw.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError, RecursionError) as error:
+        raise PreparationError(f"{label} is not bounded UTF-8 JSON: {error}") from error
+    _require(type(value) is dict and _canonical(value) == raw,
+             f"{label} is not canonical JSON")
+    return value, raw, checksum
+
+
+def _verify_capacity_pilot_captured_pair(
+    fixed: Any, view: dict[str, Any], overlay_pin: dict[str, Any],
+    receipt_pin: dict[str, Any], host_pin: dict[str, Any],
+    overlay: dict[str, Any], overlay_raw_sha: str,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    replay = fixed.verify_fixed_pair_overlay_captured_v1(
+        overlay_pin, receipt_pin, host_pin,
+        view["objects"], Path(view["stage_root"]),
+    )
+    _exact(replay, {
+        "schema", "verification", "overlay", "execution_receipt",
+        "host_verification_pin", "full_replay_verified", "qualification_eligible",
+    }, "captured capacity-pilot owner replay")
+    verification = _exact(replay["verification"], {
+        "schema", "verified", "status", "qualification_eligible",
+        "receipt_sha256", "overlay_sha256", "run_id",
+    }, "captured capacity-pilot component projection")
+    _require(replay["schema"] == fixed.CAPTURED_REPLAY_CONTEXT_SCHEMA_V1 and
+             replay["full_replay_verified"] is True and
+             replay["qualification_eligible"] is False and
+             replay["overlay"] == overlay and
+             replay["host_verification_pin"] == host_pin and
+             verification["schema"] == fixed.RECEIPT_SCHEMA and
+             verification["overlay_sha256"] == overlay_raw_sha and
+             verification["receipt_sha256"] == receipt_pin["sha256"] and
+             verification["run_id"] == overlay["job"]["value"]["run_id"],
+             "captured capacity-pilot replay changed its original envelope or host pin")
+    # This is a local compatibility check projection, never a replacement
+    # component or digest. The owner's exact seven-field result is untouched.
+    return ({**verification,
+             "host_verification_sha256": replay["host_verification_pin"]["host_verification_sha256"]},
+            replay["execution_receipt"])
+
+
 def export_capacity_pilot(
     preparation_final_pins: dict[str, Any], verified_fixed_records: list[dict[str, Any]], host_id: str,
+    *, captured_read_provider: Any = None,
 ) -> dict[str, Any]:
     """Replay six original fixed-pair receipts per context/allocator and export the rate pilot.
 
@@ -947,85 +1040,98 @@ def export_capacity_pilot(
         host_verification_pin = _exact(record["host_verification"], {
             "path", "raw_sha256", "host_verification_sha256",
         }, f"fixed-pair strict host-verification receipt pin[{index}]")
-        overlay, overlay_raw, overlay_raw_sha = _read_pinned_json(overlay_pin, f"original fixed-pair overlay[{index}]")
-        _require(overlay.get("schema") == "allocatbelt.application-fixed-pair-execution-overlay.v1",
-                 f"fixed-pair overlay[{index}] has an unsupported schema")
-        job_record = overlay.get("job")
-        _require(type(job_record) is dict and type(job_record.get("value")) is dict,
-                 f"fixed-pair overlay[{index}] has no original scheduled job")
-        job = job_record["value"]
-        expected_job = expected_by_run.get(job.get("run_id"))
-        _require(expected_job is not None and _canonical(job) == _canonical(expected_job),
-                 f"fixed-pair overlay[{index}] is not one exact original exploration capacity-pilot job")
-        _require(job["run_id"] == expected_jobs[index]["run_id"],
-                 "fixed-pair records do not preserve the original PlanV3 job order")
-        try:
-            _verify_pilot_overlay_generation(
-                overlay, expected_job, spec, Path(pins["spec"]["path"]), spec_raw_sha,
-                plan, Path(pins["plan"]["path"]), plan_raw_sha, preparation, sources,
-                source_root, input_root, campaign, inputs, campaign.source_inventory_module(), fixed,
-                prepared_host_binding, campaign_artifacts_root,
+        with _capacity_pilot_read_window(captured_read_provider, expected_jobs[index]) as captured_view:
+            envelope_reader = _capacity_pilot_envelope_reader(
+                fixed, captured_view, overlay_pin, receipt_pin, host_verification_pin,
             )
-            verified = fixed.verify_fixed_pair_overlay_offline(
-                overlay_pin, receipt_pin, host_verification_pin, record["evidence_path_map"],
-            )
-        except Exception as error:
-            raise PreparationError(f"original fixed-pair receipt[{index}] failed generation-bound offline replay: {error}") from error
-        _require(verified.get("verified") is True and verified.get("status") == "valid_pair" and
-                 verified.get("qualification_eligible") is False and
-                 verified.get("host_verification_sha256") == host_verification_pin["host_verification_sha256"],
-                 f"original capacity-pilot fixed pair[{index}] is not a verified valid component receipt")
-        receipt_value, receipt_raw, receipt_raw_sha = _read_pinned_json(receipt_pin, f"original fixed-pair receipt[{index}]")
-        _require(verified.get("receipt_sha256") == receipt_raw_sha,
-                 f"fixed-pair receipt[{index}] replay did not bind the exact raw receipt")
-        run_id = job["run_id"]
-        _require(run_id not in raw_pair_pins, "fixed-pair receipts repeat an original capacity-pilot run ID")
-        _require(receipt_value.get("run_id") == run_id and receipt_value.get("host_id") == host_id and
-                 receipt_value.get("status") == "valid_pair",
-                 f"fixed-pair receipt[{index}] identity/status differs from its original job")
-        metrics = receipt_value.get("process_metrics")
-        rows = receipt_value.get("process_rows")
-        _require(type(metrics) is list and len(metrics) == 2 and type(rows) is list and len(rows) == 2,
-                 f"fixed-pair receipt[{index}] lacks both independently replayed APP members")
-        metric_by_executor = {item.get("executor"): item for item in metrics if type(item) is dict}
-        row_by_executor = {item.get("executor"): item for item in rows if type(item) is dict}
-        _require(set(metric_by_executor) == {"bounded", "tokio"} and set(row_by_executor) == {"bounded", "tokio"},
-                 f"fixed-pair receipt[{index}] is not one bounded/Tokio pair")
-        pair: dict[str, Any] = {
-            "ordinal": job["ordinal"],
-            "bounded_status": "valid", "tokio_status": "valid",
-            "raw_pair_sha256": _sha256(_canonical({
-                "overlay_raw_sha256": overlay_raw_sha,
-                "receipt_raw_sha256": receipt_raw_sha,
-                "verified_receipt_sha256": verified["receipt_sha256"],
-                "host_verification_raw_sha256": host_verification_pin["raw_sha256"],
-                "host_verification_sha256": host_verification_pin["host_verification_sha256"],
-                "prepared_host_binding_sha256": prepared_host_binding["binding_sha256"],
-                "run_id": run_id,
-            })),
-        }
-        for executor in ("bounded", "tokio"):
-            row = row_by_executor[executor]
-            metric = metric_by_executor[executor]
-            _require(row.get("allocator") == job["allocator"] and row.get("mode") == "capacity" and
-                     metric.get("allocator") == job["allocator"] and metric.get("mode") == "capacity",
-                     f"fixed-pair receipt[{index}] APP allocator/mode differs from its capacity-pilot job")
+            overlay, overlay_raw, overlay_raw_sha = _read_capacity_pilot_envelope(overlay_pin, f"original fixed-pair overlay[{index}]", envelope_reader)
+            _require(overlay.get("schema") == "allocatbelt.application-fixed-pair-execution-overlay.v1",
+                     f"fixed-pair overlay[{index}] has an unsupported schema")
+            job_record = overlay.get("job")
+            _require(type(job_record) is dict and type(job_record.get("value")) is dict,
+                     f"fixed-pair overlay[{index}] has no original scheduled job")
+            job = job_record["value"]
+            expected_job = expected_by_run.get(job.get("run_id"))
+            _require(expected_job is not None and _canonical(job) == _canonical(expected_job),
+                     f"fixed-pair overlay[{index}] is not one exact original exploration capacity-pilot job")
+            _require(job["run_id"] == expected_jobs[index]["run_id"],
+                     "fixed-pair records do not preserve the original PlanV3 job order")
             try:
-                on_time = _row_uint(row, "completed_on_time", f"{executor} on-time")
-                late = _row_uint(row, "completed_late", f"{executor} late")
-                attempted = _row_uint(row, "attempted", f"{executor} attempted", positive=True)
-                admitted = _row_uint(row, "admitted", f"{executor} admitted", positive=True)
-                rejected = _row_uint(row, "rejected_full", f"{executor} full rejects") + _row_uint(
-                    row, "rejected_resource", f"{executor} resource rejects",
+                _verify_pilot_overlay_generation(
+                    overlay, expected_job, spec, Path(pins["spec"]["path"]), spec_raw_sha,
+                    plan, Path(pins["plan"]["path"]), plan_raw_sha, preparation, sources,
+                    source_root, input_root, campaign, inputs, campaign.source_inventory_module(), fixed,
+                    prepared_host_binding, campaign_artifacts_root,
                 )
-            except PreparationError:
-                raise
-            _require(on_time > 0 and admitted == on_time + late and attempted == admitted + rejected and rejected == 0 and
-                     metric.get("completed_on_time") == on_time and metric.get("completed_late") == late,
-                     f"fixed-pair receipt[{index}] {executor} capacity accounting does not reconcile")
-            for field, number in (("on_time", on_time), ("late", late), ("attempted", attempted),
-                                  ("admitted", admitted), ("rejected", rejected)):
-                pair[f"{executor}_{field}"] = number
+                if captured_view is None:
+                    verified = fixed.verify_fixed_pair_overlay_offline(
+                        overlay_pin, receipt_pin, host_verification_pin, record["evidence_path_map"],
+                    )
+                    captured_receipt = None
+                else:
+                    verified, captured_receipt = _verify_capacity_pilot_captured_pair(
+                        fixed, captured_view, overlay_pin, receipt_pin,
+                        host_verification_pin, overlay, overlay_raw_sha,
+                    )
+            except Exception as error:
+                raise PreparationError(f"original fixed-pair receipt[{index}] failed generation-bound offline replay: {error}") from error
+            _require(verified.get("verified") is True and verified.get("status") == "valid_pair" and
+                     verified.get("qualification_eligible") is False and
+                     verified.get("host_verification_sha256") == host_verification_pin["host_verification_sha256"],
+                     f"original capacity-pilot fixed pair[{index}] is not a verified valid component receipt")
+            receipt_value, receipt_raw, receipt_raw_sha = _read_capacity_pilot_envelope(receipt_pin, f"original fixed-pair receipt[{index}]", envelope_reader)
+            _require(verified.get("receipt_sha256") == receipt_raw_sha,
+                     f"fixed-pair receipt[{index}] replay did not bind the exact raw receipt")
+            _require(captured_receipt is None or captured_receipt == receipt_value,
+                     f"fixed-pair receipt[{index}] differs from the captured owner's execution receipt")
+            run_id = job["run_id"]
+            _require(run_id not in raw_pair_pins, "fixed-pair receipts repeat an original capacity-pilot run ID")
+            _require(receipt_value.get("run_id") == run_id and receipt_value.get("host_id") == host_id and
+                     receipt_value.get("status") == "valid_pair",
+                     f"fixed-pair receipt[{index}] identity/status differs from its original job")
+            metrics = receipt_value.get("process_metrics")
+            rows = receipt_value.get("process_rows")
+            _require(type(metrics) is list and len(metrics) == 2 and type(rows) is list and len(rows) == 2,
+                     f"fixed-pair receipt[{index}] lacks both independently replayed APP members")
+            metric_by_executor = {item.get("executor"): item for item in metrics if type(item) is dict}
+            row_by_executor = {item.get("executor"): item for item in rows if type(item) is dict}
+            _require(set(metric_by_executor) == {"bounded", "tokio"} and set(row_by_executor) == {"bounded", "tokio"},
+                     f"fixed-pair receipt[{index}] is not one bounded/Tokio pair")
+            pair: dict[str, Any] = {
+                "ordinal": job["ordinal"],
+                "bounded_status": "valid", "tokio_status": "valid",
+                "raw_pair_sha256": _sha256(_canonical({
+                    "overlay_raw_sha256": overlay_raw_sha,
+                    "receipt_raw_sha256": receipt_raw_sha,
+                    "verified_receipt_sha256": verified["receipt_sha256"],
+                    "host_verification_raw_sha256": host_verification_pin["raw_sha256"],
+                    "host_verification_sha256": host_verification_pin["host_verification_sha256"],
+                    "prepared_host_binding_sha256": prepared_host_binding["binding_sha256"],
+                    "run_id": run_id,
+                })),
+            }
+            for executor in ("bounded", "tokio"):
+                row = row_by_executor[executor]
+                metric = metric_by_executor[executor]
+                _require(row.get("allocator") == job["allocator"] and row.get("mode") == "capacity" and
+                         metric.get("allocator") == job["allocator"] and metric.get("mode") == "capacity",
+                         f"fixed-pair receipt[{index}] APP allocator/mode differs from its capacity-pilot job")
+                try:
+                    on_time = _row_uint(row, "completed_on_time", f"{executor} on-time")
+                    late = _row_uint(row, "completed_late", f"{executor} late")
+                    attempted = _row_uint(row, "attempted", f"{executor} attempted", positive=True)
+                    admitted = _row_uint(row, "admitted", f"{executor} admitted", positive=True)
+                    rejected = _row_uint(row, "rejected_full", f"{executor} full rejects") + _row_uint(
+                        row, "rejected_resource", f"{executor} resource rejects",
+                    )
+                except PreparationError:
+                    raise
+                _require(on_time > 0 and admitted == on_time + late and attempted == admitted + rejected and rejected == 0 and
+                         metric.get("completed_on_time") == on_time and metric.get("completed_late") == late,
+                         f"fixed-pair receipt[{index}] {executor} capacity accounting does not reconcile")
+                for field, number in (("on_time", on_time), ("late", late), ("attempted", attempted),
+                                      ("admitted", admitted), ("rejected", rejected)):
+                    pair[f"{executor}_{field}"] = number
         key = (job["family"], job["profile"], job["allocator"], job["ordinal"])
         _require(key not in rows_by_key, f"capacity-pilot original ordinal is duplicated: {key}")
         rows_by_key[key] = pair
@@ -1402,6 +1508,17 @@ def verify_prepared_capacity_generation_bounded(
     return replayed
 
 
+def _capacity_pilot_provider_map(
+    providers: object, host_ids: list[str],
+) -> Any:
+    if providers is None:
+        return None
+    checked = _exact(providers, set(host_ids), "captured capacity-pilot provider cohort")
+    _require(all(callable(getattr(value, "open_view", None)) for value in checked.values()),
+             "captured capacity-pilot cohort contains an absent read provider")
+    return types.MappingProxyType(dict(checked))
+
+
 def complete_prepared_inputs(
     preparation_pin: dict[str, Any],
     capacity_completion_pins: list[dict[str, Any]],
@@ -1412,6 +1529,7 @@ def complete_prepared_inputs(
     final_plan_pin: dict[str, Any],
     *, write_completion: bool = True,
     resource_budget_pins: dict[str, Any] | None = None,
+    captured_pilot_read_providers: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Bridge independently replayed preparation evidence into final frozen inputs."""
     (
@@ -1433,6 +1551,10 @@ def complete_prepared_inputs(
         prep_path,
     ) = _replay_prepared_capacity_inputs(
         preparation_pin, capacity_completion_pins, resource_budget_pins,
+    )
+
+    captured_pilot_providers = _capacity_pilot_provider_map(
+        captured_pilot_read_providers, host_ids,
     )
 
     final_spec, final_spec_raw, final_spec_raw_sha = _read_pinned_json(final_spec_pin, "final completed SpecV3")
@@ -1748,6 +1870,8 @@ def complete_prepared_inputs(
         _require(initial_spec_identity is None or initial_spec_identity == identity,
                  "host capacity pilots do not preserve one common original SpecV3/PlanV3 generation")
         initial_spec_identity = identity
+        pilot_replay_kwargs = ({} if captured_pilot_providers is None else
+                               {"captured_read_provider": captured_pilot_providers[host_id]})
         replayed_pin = export_capacity_pilot({
             "preparation": preparation_pin,
             "spec": initial_spec_pin,
@@ -1757,7 +1881,7 @@ def complete_prepared_inputs(
             "campaign_artifacts_root": pilot_input["campaign_artifacts_root"],
             "prepared_host_binding": pilot_input["prepared_host_binding"],
             "output": None,
-        }, pilot_input["verified_fixed_records"], host_id)
+        }, pilot_input["verified_fixed_records"], host_id, **pilot_replay_kwargs)
         _require(replayed_pin["raw_sha256"] == pilot_raw_sha and
                  replayed_pin["semantic_sha256"] == campaign.digest_object(pilot),
                  f"{host_id} pilot manifest differs from complete replay of its original fixed-pair receipts")
@@ -1945,6 +2069,7 @@ def complete_prepared_inputs_bounded(
     oracle_pins: list[dict[str, Any]],
     final_spec_pin: dict[str, Any], final_plan_pin: dict[str, Any],
     *, write_completion: bool = True,
+    captured_pilot_read_providers: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Bridge only independently replayed v2 bounded capacity completions."""
     _require(type(capacity_completion_pins) is list and len(capacity_completion_pins) == 3,
@@ -1961,10 +2086,13 @@ def complete_prepared_inputs_bounded(
                             {"path", "raw_sha256", "semantic_sha256"},
                             f"{host_id} bounded resource budget pin")
         bounded_capacity_inputs.append({**item, "resource_budget_pin": budget_pin})
+    captured_kwargs = ({} if captured_pilot_read_providers is None else
+                       {"captured_pilot_read_providers": captured_pilot_read_providers})
     return complete_prepared_inputs(
         preparation_pin, bounded_capacity_inputs, pressure_calibration_pins,
         pilot_pins, oracle_pins, final_spec_pin, final_plan_pin,
         write_completion=write_completion, resource_budget_pins=resource_budget_pins,
+        **captured_kwargs,
     )
 
 
@@ -2098,7 +2226,8 @@ def _prepared_input_replay_arguments(completion: dict[str, Any]) -> dict[str, li
 
 def verify_prepared_inputs_completion(
     completion_pin: dict[str, Any], provenance_pins: dict[str, Any],
-    source_root: Path, input_root: Path,
+    source_root: Path, input_root: Path, *,
+    captured_pilot_read_providers: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Read-only replay of a frozen preparation-completion receipt.
 
@@ -2160,6 +2289,8 @@ def verify_prepared_inputs_completion(
     replay_arguments = _prepared_input_replay_arguments(completion)
     try:
         replay_kwargs = {"write_completion": False}
+        if captured_pilot_read_providers is not None:
+            replay_kwargs["captured_pilot_read_providers"] = captured_pilot_read_providers
         if bounded_completion:
             _require(replay_arguments.get("resource_budget_pins") == completion["resource_budgets"],
                      "prepared-input bounded budget map differs from its per-host capacity records")

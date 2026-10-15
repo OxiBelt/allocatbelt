@@ -537,6 +537,26 @@ adapter's `binding_sha256`. The exporter writes
 a new canonical mode-0600 manifest under an owned mode-0700 parent and returns
 its raw and semantic digests.
 
+For archived pair bytes, the Python API accepts
+`captured_read_provider=provider`. For each original job it opens
+`provider.open_view(job, "exploration", use="capacity_pilot_export")` and
+requires a context manager yielding `objects` and `stage_root`. The view
+contains the unchanged captured fixed-owner references. The exporter reads
+the three envelope pins through the bounded capture reader, then passes the
+complete object set to the Source-pinned captured fixed-pair verifier. It
+closes the view before advancing to the next job or publishing the pilot.
+Read and context-exit failures propagate; captured failures cannot fall back
+to origin reads. Omitting the provider preserves the original offline path.
+
+The completion and completion-replay Python APIs forward the optional
+`captured_pilot_read_providers` map. An explicit map must cover exactly the
+three verified hosts with a callable `open_view` for each host. Selection is
+copied before replay so caller map mutation cannot redirect a host's reads.
+This interface supplies bytes; authenticated archive/journal authority must
+come from the separate Source-owned wrapper. The fixed owner still requires
+its resident original inputs and retained directory context. These APIs do
+not establish cross-host replay portability or qualification readiness.
+
 For a read-only completion replay, supply `output: null`. The exporter still
 reconstructs and validates all 360 original pairs and recomputes the pilot
 bytes, but creates no replay file under the frozen input tree. Completion

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import copy
+from contextlib import contextmanager
 import hashlib
 import importlib.machinery
 import importlib.util
@@ -1243,6 +1244,615 @@ class Source5PreparationInputTests(unittest.TestCase):
                     preparation.build_prepared_host_binding(
                         prep_pin, spec_pin, overlay_pin, source_root, input_root, host_id,
                     )
+
+
+class CapturedCapacityPilotExportTests(unittest.TestCase):
+    """Exercise captured pilot IO with synthetic generation/owner boundaries.
+
+    The 360 planned rows and rate validator are the existing public exporter
+    fixture. Its Source preparation and fixed-owner numeric replay remain
+    explicit stubs. Capture IO is real: exact bytes are staged in private 0400
+    files, original output paths are removed, and the adopted fixed-pair reader
+    verifies the raw pins and receipt-derived origin file identities. This is
+    component plumbing evidence, not an APP, host, or qualification run. The
+    strict host envelope and returned owner projection are test-only fixtures,
+    not verified host facts.
+    """
+
+    _PUBLIC_METHOD = (
+        "test_public_exporter_derives_rate_matrix_after_each_original_job_replay"
+    )
+
+    def _prepare_records(
+        self, preparation, fixed_owner, records, expected_jobs, *,
+        fault=None, record_count=None,
+    ):
+        count = len(records) if record_count is None else record_count
+        output_rows = []
+        for index, record in enumerate(records[:count]):
+            overlay_path = Path(record["overlay"]["path"])
+            overlay = preparation.json.loads(overlay_path.read_bytes())
+            if fault == "wrong_job" and index == 0:
+                overlay["job"]["value"] = expected_jobs[1]
+            elif fault == "wrong_host" and index == 0:
+                overlay["job"]["value"]["host_id"] = "foreign-host"
+            job = overlay["job"]["value"]
+            pair_root = overlay_path.parent / f"captured-pair-output-{index:03d}"
+            pair_root.mkdir(mode=0o700)
+            pair_root.chmod(0o700)
+            runtime_path = pair_root / ".fixed-pair-runtime-bindings.json"
+            event_path = pair_root / "app-events.jsonl"
+            output_bytes = {
+                str(runtime_path): f"runtime binding bytes {index}\n".encode(),
+                str(event_path): f"captured event bytes {index}\n".encode(),
+            }
+            facts = {}
+            for path_text, raw in output_bytes.items():
+                path = Path(path_text)
+                path.write_bytes(raw)
+                path.chmod(0o600)
+                info = path.stat()
+                facts[path.relative_to(pair_root).as_posix()] = {
+                    "sha256": hashlib.sha256(raw).hexdigest(),
+                    "size": len(raw), "device": info.st_dev,
+                    "inode": info.st_ino, "mode": stat.S_IMODE(info.st_mode),
+                }
+            overlay.update({
+                "host_id": job["host_id"],
+                "output_root": str(pair_root), "members": [],
+                "runtime_bindings": {"pin": {"path": str(runtime_path)}},
+            })
+            overlay_raw = campaign.canonical_bytes(overlay)
+            overlay_path.write_bytes(overlay_raw)
+            overlay_path.chmod(0o600)
+            record["overlay"]["sha256"] = hashlib.sha256(overlay_raw).hexdigest()
+
+            old_receipt_path = Path(record["receipt"]["path"])
+            receipt = preparation.json.loads(old_receipt_path.read_bytes())
+            receipt_body = {
+                key: value for key, value in receipt.items()
+                if key not in {"receipt_sha256", "output_artifacts"}
+            }
+            receipt_body["output_artifacts"] = {
+                "files": facts,
+                "total_bytes": sum(row["size"] for row in facts.values()),
+                "maximum_bytes": fixed_owner.MAX_PAIR_OUTPUT_BYTES,
+            }
+            receipt = {
+                **receipt_body,
+                "receipt_sha256": hashlib.sha256(
+                    campaign.canonical_bytes(receipt_body),
+                ).hexdigest(),
+            }
+            receipt_raw = campaign.canonical_bytes(receipt)
+            receipt_path = pair_root / "fixed-pair-execution-receipt.json"
+            receipt_path.write_bytes(receipt_raw)
+            receipt_path.chmod(0o600)
+            old_receipt_path.unlink()
+            record["receipt"] = {
+                "path": str(receipt_path),
+                "sha256": hashlib.sha256(receipt_raw).hexdigest(),
+            }
+
+            host_path = Path(record["host_verification"]["path"])
+            host_body = {
+                "schema": fixed_owner.HOST_VERIFICATION_SCHEMA,
+                "strict_verified": True, "qualification_eligible": False,
+                "execution_ready": False, "campaign_chronology_complete": False,
+                "overlay_raw_sha256": record["overlay"]["sha256"],
+                "execution_receipt_raw_sha256": record["receipt"]["sha256"],
+                "execution_receipt_sha256": receipt["receipt_sha256"],
+                "status": "valid_pair", "run_id": job["run_id"],
+            }
+            if fault == "swapped_host_receipt" and index == 0:
+                host_body["run_id"] = "another-original-run"
+            host_doc = {
+                **host_body,
+                "receipt_sha256": hashlib.sha256(
+                    campaign.canonical_bytes(host_body),
+                ).hexdigest(),
+            }
+            host_raw = campaign.canonical_bytes(host_doc)
+            host_path.write_bytes(host_raw)
+            host_path.chmod(0o600)
+            record["host_verification"] = {
+                "path": str(host_path),
+                "raw_sha256": hashlib.sha256(host_raw).hexdigest(),
+                "host_verification_sha256": host_doc["receipt_sha256"],
+            }
+            output_rows.append({
+                "overlay": overlay, "overlay_raw": overlay_raw,
+                "receipt": receipt, "receipt_raw": receipt_raw,
+                "host": host_doc, "host_raw": host_raw,
+                "output_root": pair_root, "output_bytes": output_bytes,
+                "run_id": job["run_id"],
+            })
+        return output_rows
+
+    def _provider(self, preparation, fixed_owner, records, expected_jobs,
+                  output_rows, *, fault=None):
+        class CaptureProvider:
+            def __init__(self):
+                self.opened = []
+                self.closed = []
+                self.active = 0
+                self.active_index = None
+                self.maximum_active = 0
+                self.next_index = 0
+                self.fault = fault
+                self.output_rows = output_rows
+                self.snapshot_fault_index = len(output_rows) - 1
+                self.snapshot_fault_origin = (
+                    list(output_rows[-1]["output_bytes"])[-1]
+                    if output_rows else None
+                )
+
+            def open_view(self, job, phase, *, use):
+                if self.fault == "provider_exception":
+                    raise RuntimeError("injected captured provider failure")
+                if phase != "exploration" or use != "capacity_pilot_export":
+                    raise AssertionError("captured pilot requested the wrong IO purpose")
+                index = self.next_index
+                if preparation._canonical(job) != preparation._canonical(expected_jobs[index]):
+                    raise AssertionError("captured provider received a nonoriginal job order")
+                return self.Window(self, index, job)
+
+            def _reader_type(self):
+                base = fixed_owner.CapturedFixedPairArtifactsV1
+                provider = self
+                if self.fault != "snapshot_exit":
+                    return base
+
+                class SnapshotExitReader(base):
+                    @contextmanager
+                    def open_snapshot(self, origin, label, maximum):
+                        with super().open_snapshot(origin, label, maximum) as snapshot:
+                            yield snapshot
+                            if (provider.active_index == provider.snapshot_fault_index and
+                                    str(origin) == provider.snapshot_fault_origin):
+                                local = Path(self._references[str(origin)]["path"])
+                                before = local.read_bytes()
+                                changed = before[:-1] + bytes([before[-1] ^ 1])
+                                local.chmod(0o600)
+                                local.write_bytes(changed)
+                                local.chmod(0o400)
+
+                return SnapshotExitReader
+
+            def _stage_view(self, index):
+                record = records[index]
+                output = self.output_rows[index]
+                overlay_origin = record["overlay"]["path"]
+                receipt_origin = record["receipt"]["path"]
+                host_origin = record["host_verification"]["path"]
+                rows = [
+                    (overlay_origin, output["overlay_raw"], "fixed_pair_artifact", None),
+                    (receipt_origin, output["receipt_raw"], "component_receipt",
+                     output["receipt"]["receipt_sha256"]),
+                    (host_origin, output["host_raw"], "fixed_pair_host_receipt",
+                     record["host_verification"]["host_verification_sha256"]),
+                    *[(path, raw, "normal_app_output", None)
+                      for path, raw in output["output_bytes"].items()],
+                ]
+                scope = tempfile.TemporaryDirectory(
+                    prefix="capacity-pilot-capture-window-",
+                )
+                stage_root = Path(scope.name) / "stage"
+                stage_root.mkdir(mode=0o700)
+                stage_root.chmod(0o700)
+                references = {}
+                try:
+                    for ref_index, (origin, raw, role, semantic) in enumerate(rows):
+                        if self.fault == "missing_host_receipt" and index == 0 and origin == host_origin:
+                            continue
+                        if (self.fault == "missing_runtime_output" and index == 0 and
+                                ".fixed-pair-runtime-bindings.json" in origin):
+                            continue
+                        local_raw = raw
+                        if self.fault == "altered_raw_pin" and index == 0 and origin == overlay_origin:
+                            local_raw = raw[:-1] + bytes([raw[-1] ^ 1])
+                        local = stage_root / f"{ref_index:06d}"
+                        local.write_bytes(local_raw)
+                        local.chmod(0o400)
+                        references[origin] = {
+                            "origin_path": origin, "path": str(local),
+                            "role": role, "host_id": output["overlay"]["job"]["value"]["host_id"],
+                            "raw_sha256": hashlib.sha256(raw).hexdigest(),
+                            "semantic_sha256": semantic,
+                            "byte_count": len(local_raw),
+                            "maximum_bytes": fixed_owner.MAX_PAIR_OUTPUT_BYTES,
+                        }
+                        if self.fault == "byte_bound" and index == 0 and role == "normal_app_output":
+                            references[origin]["maximum_bytes"] = len(local_raw) - 1
+                    if self.fault == "extra_under_root" and index == 0:
+                        extra_origin = str(output["output_root"] / "unexpected.json")
+                        local = stage_root / f"{len(references):06d}"
+                        local.write_bytes(b"unexpected captured pair member")
+                        local.chmod(0o400)
+                        extra_raw = local.read_bytes()
+                        references[extra_origin] = {
+                            "origin_path": extra_origin, "path": str(local),
+                            "role": "normal_app_output",
+                            "host_id": output["overlay"]["job"]["value"]["host_id"],
+                            "raw_sha256": hashlib.sha256(extra_raw).hexdigest(),
+                            "semantic_sha256": None, "byte_count": len(extra_raw),
+                            "maximum_bytes": fixed_owner.MAX_PAIR_OUTPUT_BYTES,
+                        }
+                    for path_text in [overlay_origin, receipt_origin, host_origin,
+                                      *output["output_bytes"]]:
+                        path = Path(path_text)
+                        if path.exists():
+                            path.unlink()
+                    return scope, {
+                        "stage_root": str(stage_root), "objects": references,
+                    }
+                except BaseException:
+                    scope.cleanup()
+                    raise
+
+            class Window:
+                def __init__(self, owner, index, job):
+                    self.owner = owner
+                    self.index = index
+                    self.job = job
+                    self.scope = None
+
+                def __enter__(self):
+                    owner = self.owner
+                    if owner.active:
+                        raise AssertionError("capacity-pilot read windows overlapped")
+                    owner.active = 1
+                    owner.active_index = self.index
+                    owner.maximum_active = max(owner.maximum_active, owner.active)
+                    owner.opened.append(self.job["run_id"])
+                    try:
+                        self.scope, view = owner._stage_view(self.index)
+                        owner.next_index += 1
+                        return view
+                    except BaseException:
+                        owner.active = 0
+                        owner.active_index = None
+                        raise
+
+                def __exit__(self, exc_type, exc, tb):
+                    owner = self.owner
+                    owner.closed.append(self.job["run_id"])
+                    owner.active = 0
+                    owner.active_index = None
+                    if self.scope is not None:
+                        self.scope.cleanup()
+                    if owner.fault == "window_exit_failure" and self.index == 0 and exc_type is None:
+                        raise RuntimeError("injected captured window exit failure")
+                    return False
+
+        return CaptureProvider()
+
+    def _run_public_exporter(self, *, fault=None, compare=False):
+        method = Source5PreparationInputTests.test_public_exporter_derives_rate_matrix_after_each_original_job_replay
+        namespace = method.__globals__
+        original_loader = namespace["load_script"]
+        result = {
+            "outputs": [], "pilots": [], "provider": None, "exception": None,
+            "preparation": None, "output_path": None,
+        }
+
+        def patched_loader(path, name):
+            module = original_loader(path, name)
+            if Path(path).name != "application-source5-input-preparation.py":
+                return module
+            fixed_owner = original_loader(
+                Path(path).with_name("application-fixed-pair.py"),
+                f"captured_pilot_fixed_owner_{name}",
+            )
+            result["preparation"] = module
+            result["fixed_owner"] = fixed_owner
+            real_export = module.export_capacity_pilot
+
+            def export_wrapper(pins, records, selected_host):
+                pins = dict(pins)
+                if not compare:
+                    output_path = Path(pins["input_root"]) / "must-not-publish-pilot.json"
+                    pins["output"] = str(output_path)
+                    result["output_path"] = output_path
+                expected_jobs = [
+                    module.json.loads(Path(row["overlay"]["path"]).read_bytes())["job"]["value"]
+                    for row in records
+                ]
+                if fault == "wrong_order":
+                    records[0], records[1] = records[1], records[0]
+                    record_count = 2
+                elif compare or fault == "snapshot_exit":
+                    record_count = len(records)
+                else:
+                    record_count = 1
+                output_rows = self._prepare_records(
+                    module, fixed_owner, records, expected_jobs,
+                    fault=fault, record_count=record_count,
+                )
+                result["output_rows"] = output_rows
+                if fault == "prepared_binding":
+                    pins["prepared_host_binding"] = dict(pins["prepared_host_binding"])
+                    pins["prepared_host_binding"]["binding_sha256"] = "0" * 64
+                provider = self._provider(
+                    module, fixed_owner, records, expected_jobs, output_rows,
+                    fault=fault,
+                )
+                result["provider"] = provider
+                if compare:
+                    legacy = self._export_once(
+                        module, fixed_owner, real_export, pins, records,
+                        selected_host, None, result,
+                    )
+                    captured = self._export_once(
+                        module, fixed_owner, real_export, pins, records,
+                        selected_host, provider, result,
+                    )
+                    result["outputs"] = [legacy, captured]
+                    return captured
+                return self._export_once(
+                    module, fixed_owner, real_export, pins, records,
+                    selected_host, provider, result,
+                )
+
+            module.export_capacity_pilot = export_wrapper
+            return module
+
+        with patch.dict(namespace, {"load_script": patched_loader}):
+            test_case = Source5PreparationInputTests(self._PUBLIC_METHOD)
+            try:
+                getattr(test_case, self._PUBLIC_METHOD)()
+            except Exception as error:
+                result["exception"] = error
+        return result
+
+    def _export_once(self, module, fixed_owner, export_fn, pins, records,
+                     selected_host, provider, result):
+        real_module_type = types.ModuleType
+
+        def module_factory(name):
+            if name != "synthetic_fixed_pair_replay":
+                return real_module_type(name)
+            fake = real_module_type(name)
+            reader_type = fixed_owner.CapturedFixedPairArtifactsV1
+            if provider is not None and provider.fault == "snapshot_exit":
+                capture_provider = provider
+                base_reader = reader_type
+
+                class SnapshotExitReader(base_reader):
+                    @contextmanager
+                    def open_snapshot(self, origin, label, maximum):
+                        with super().open_snapshot(origin, label, maximum) as snapshot:
+                            yield snapshot
+                            if (capture_provider.active_index ==
+                                    capture_provider.snapshot_fault_index and
+                                    str(origin) ==
+                                    capture_provider.snapshot_fault_origin):
+                                local = Path(self._references[str(origin)]["path"])
+                                before = local.read_bytes()
+                                changed = before[:-1] + bytes([before[-1] ^ 1])
+                                local.chmod(0o600)
+                                local.write_bytes(changed)
+                                local.chmod(0o400)
+
+                reader_type = SnapshotExitReader
+            fake.CapturedFixedPairArtifactsV1 = reader_type
+            fake.CAPTURED_REPLAY_CONTEXT_SCHEMA_V1 = fixed_owner.CAPTURED_REPLAY_CONTEXT_SCHEMA_V1
+            fake.RECEIPT_SCHEMA = fixed_owner.RECEIPT_SCHEMA
+
+            def offline_verify(overlay_pin, receipt_pin, host_pin, _path_map):
+                return {
+                    "verified": True, "status": "valid_pair",
+                    "qualification_eligible": False,
+                    "receipt_sha256": receipt_pin["sha256"],
+                    "host_verification_sha256": host_pin["host_verification_sha256"],
+                }
+
+            def captured_verify(overlay_pin, receipt_pin, host_pin,
+                                references, stage_root):
+                view = fake.CapturedFixedPairArtifactsV1(
+                    references, Path(stage_root),
+                )
+                overlay_raw, overlay_sha = view.read(
+                    overlay_pin["path"], "pilot fixture overlay",
+                    module.MAX_REQUEST_BYTES,
+                )
+                receipt_raw, receipt_sha = view.read(
+                    receipt_pin["path"], "pilot fixture receipt",
+                    module.MAX_REQUEST_BYTES,
+                )
+                host_raw, host_sha = view.read(
+                    host_pin["path"], "pilot fixture host receipt",
+                    module.MAX_REQUEST_BYTES,
+                )
+                if (overlay_sha != overlay_pin["sha256"] or
+                        receipt_sha != receipt_pin["sha256"] or
+                        host_sha != host_pin["raw_sha256"]):
+                    raise fixed_owner.FixedPairError(
+                        "captured pilot fixture envelope pin differs",
+                    )
+                overlay = module.json.loads(overlay_raw)
+                receipt = module.json.loads(receipt_raw)
+                host = module.json.loads(host_raw)
+                host_body = {key: value for key, value in host.items()
+                             if key != "receipt_sha256"}
+                if (host.get("schema") != fixed_owner.HOST_VERIFICATION_SCHEMA or
+                        host.get("run_id") != overlay["job"]["value"]["run_id"] or
+                        host.get("receipt_sha256") != fixed_owner.sha256_bytes(
+                            fixed_owner.canonical_bytes(host_body),
+                        ) or host.get("receipt_sha256") !=
+                            host_pin["host_verification_sha256"]):
+                    raise fixed_owner.FixedPairError(
+                        "captured pilot strict host receipt differs",
+                    )
+                view.bind_output_inventory(overlay, receipt, host_pin["path"])
+                if view.output_tree() != receipt["output_artifacts"]:
+                    raise fixed_owner.FixedPairError(
+                        "captured pilot output inventory differs",
+                    )
+                verification = {
+                    "schema": fixed_owner.RECEIPT_SCHEMA,
+                    "verified": True, "status": "valid_pair",
+                    "qualification_eligible": False,
+                    "receipt_sha256": receipt_pin["sha256"],
+                    "overlay_sha256": overlay_sha,
+                    "run_id": overlay["job"]["value"]["run_id"],
+                }
+                captured_receipt = receipt
+                if provider.fault == "receipt_parity" and provider.active_index == 0:
+                    captured_receipt = dict(receipt)
+                    captured_receipt["status"] = "failed_or_invalid"
+                return {
+                    "schema": fixed_owner.CAPTURED_REPLAY_CONTEXT_SCHEMA_V1,
+                    "verification": verification, "overlay": overlay,
+                    "execution_receipt": captured_receipt,
+                    "host_verification_pin": host_pin,
+                    "full_replay_verified": True,
+                    "qualification_eligible": False,
+                }
+
+            fake.verify_fixed_pair_overlay_offline = offline_verify
+            fake.verify_fixed_pair_overlay_captured_v1 = captured_verify
+            return fake
+
+        original_canonical = module._canonical
+
+        def recording_canonical(value, *args, **kwargs):
+            raw = original_canonical(value, *args, **kwargs)
+            if type(value) is dict and value.get("schema") == module.PILOT_SCHEMA:
+                result["pilots"].append(raw)
+            return raw
+
+        original_read = module._read_pinned_json
+        record_origins = set()
+        for row in records:
+            for key in ("overlay", "receipt", "host_verification"):
+                pin = row.get(key)
+                if type(pin) is dict and type(pin.get("path")) is str:
+                    record_origins.add(pin["path"])
+        for row in result.get("output_rows", []):
+            record_origins.update(row["output_bytes"])
+
+        def deny_captured_origin(pin, label, maximum=module.MAX_REQUEST_BYTES):
+            if provider is not None and pin.get("path") in record_origins:
+                raise AssertionError("captured pilot reopened an original pair output")
+            return original_read(pin, label, maximum)
+
+        with patch.object(types, "ModuleType", side_effect=module_factory), \
+             patch.object(module, "_canonical", side_effect=recording_canonical):
+            if provider is None:
+                return export_fn(pins, records, selected_host)
+            with patch.object(module, "_read_pinned_json",
+                              side_effect=deny_captured_origin):
+                return export_fn(
+                    pins, records, selected_host,
+                    captured_read_provider=provider,
+                )
+
+    def _assert_refusal_before_publication(self, fault, *, runtime_error=False):
+        result = self._run_public_exporter(fault=fault)
+        error = result["exception"]
+        self.assertIsNotNone(error, f"fault {fault} unexpectedly returned a pilot")
+        if runtime_error:
+            self.assertIsInstance(error, RuntimeError)
+        elif fault == "altered_raw_pin":
+            self.assertIsInstance(error, result["fixed_owner"].FixedPairError)
+        else:
+            self.assertIsInstance(error, result["preparation"].PreparationError)
+        self.assertIsNotNone(result["output_path"])
+        self.assertFalse(result["output_path"].exists())
+        provider = result["provider"]
+        if provider is not None:
+            self.assertEqual(provider.active, 0)
+            self.assertEqual(provider.opened, provider.closed)
+
+    def test_captured_export_matches_legacy_bytes_and_closes_360_windows(self):
+        result = self._run_public_exporter(compare=True)
+        self.assertIsNone(result["exception"], str(result["exception"]))
+        legacy, captured = result["outputs"]
+        self.assertEqual(legacy, captured)
+        self.assertEqual(len(result["pilots"]), 2)
+        self.assertEqual(result["pilots"][0], result["pilots"][1])
+        self.assertEqual(legacy["pair_count"], 360)
+        self.assertEqual(len(legacy["pair_evidence"]), 360)
+        provider = result["provider"]
+        expected = [row["run_id"] for row in captured["pair_evidence"]]
+        self.assertEqual(provider.opened, expected)
+        self.assertEqual(provider.closed, expected)
+        self.assertEqual(provider.maximum_active, 1)
+        self.assertEqual(provider.active, 0)
+        self.assertNotIn("capacity-pilot-capture-window",
+                         result["preparation"]._canonical(captured).decode("ascii"))
+
+    def test_captured_export_rejects_identity_receipt_and_object_faults(self):
+        for fault in (
+            "wrong_job", "wrong_host", "wrong_order",
+            "missing_host_receipt", "swapped_host_receipt",
+            "altered_raw_pin", "extra_under_root",
+            "missing_runtime_output", "receipt_parity", "byte_bound",
+            "prepared_binding",
+        ):
+            with self.subTest(fault=fault):
+                self._assert_refusal_before_publication(fault)
+
+    def test_provider_and_window_exit_errors_are_not_suppressed(self):
+        self._assert_refusal_before_publication(
+            "provider_exception", runtime_error=True,
+        )
+        self._assert_refusal_before_publication(
+            "window_exit_failure", runtime_error=True,
+        )
+
+    def test_final_capture_snapshot_exit_failure_prevents_publication(self):
+        result = self._run_public_exporter(fault="snapshot_exit")
+        self.assertIsInstance(
+            result["exception"], result["preparation"].PreparationError,
+        )
+        self.assertFalse(result["output_path"].exists())
+        self.assertEqual(len(result["provider"].opened), 360)
+        self.assertEqual(result["provider"].opened, result["provider"].closed)
+        self.assertEqual(result["provider"].active, 0)
+
+
+class CapturedCapacityPilotProviderCohortTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.preparation = load_script(
+            SCRIPT_DIR / "application-source5-input-preparation.py",
+            "captured_capacity_pilot_provider_cohort_target",
+        )
+
+    def test_validated_host_provider_selection_survives_caller_map_mutation(self):
+        class Provider:
+            def open_view(self, *args, **kwargs):
+                raise AssertionError("validating provider selection must not open a view")
+
+        hosts = ["host-a", "host-b", "host-c"]
+        providers = {host: Provider() for host in hosts}
+        selected = self.preparation._capacity_pilot_provider_map(providers, hosts)
+        original = providers["host-a"]
+        providers["host-a"] = providers["host-b"]
+        self.assertIs(selected["host-a"], original)
+        self.assertIsNot(selected["host-a"], selected["host-b"])
+        with self.assertRaises(TypeError):
+            selected["host-a"] = providers["host-b"]
+
+    def test_partial_or_invalid_explicit_cohort_cannot_fall_back_to_origin_reads(self):
+        class Provider:
+            def open_view(self, *args, **kwargs):
+                raise AssertionError("invalid provider cohort must be rejected before IO")
+
+        hosts = ["host-a", "host-b", "host-c"]
+        providers = {host: Provider() for host in hosts}
+        mutants = [
+            {host: value for host, value in providers.items() if host != "host-c"},
+            {**providers, "other-host": Provider()},
+            {**providers, "host-c": None},
+            {**providers, "host-c": types.SimpleNamespace(open_view=False)},
+        ]
+        for mutant in mutants:
+            with self.subTest(keys=tuple(mutant)):
+                with self.assertRaises(self.preparation.PreparationError):
+                    self.preparation._capacity_pilot_provider_map(mutant, hosts)
 
 
 if __name__ == "__main__":
