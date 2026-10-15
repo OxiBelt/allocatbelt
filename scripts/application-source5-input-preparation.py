@@ -50,6 +50,7 @@ MAX_REQUEST_BYTES = 64 * 1024 * 1024
 MAX_MANIFEST_BYTES = 16 * 1024 * 1024
 MAX_PLAN_BYTES = 256 * 1024 * 1024
 MAX_SOURCE_BYTES = 64 * 1024 * 1024
+MAX_U64 = (1 << 64) - 1
 
 
 class PreparationError(ValueError):
@@ -551,12 +552,82 @@ def _row_uint(row: dict[str, Any], field: str, label: str, *, positive: bool = F
     if type(value) is str:
         _require(value.isascii() and value.isdigit() and (value == "0" or not value.startswith("0")),
                  f"{label} row count is not a canonical unsigned integer")
+        _require(len(value) <= 20,
+                 f"{label} row count exceeds its unsigned 64-bit source bound")
         parsed = int(value)
     else:
         _require(type(value) is int, f"{label} row count is malformed")
         parsed = value
-    _require(parsed >= 0 and (not positive or parsed > 0), f"{label} row count is outside its allowed range")
+    _require(0 <= parsed <= MAX_U64 and (not positive or parsed > 0),
+             f"{label} row count is outside its unsigned 64-bit allowed range")
     return parsed
+
+
+def capacity_pilot_maximum_bytes(
+    spec: dict[str, Any], host_id: str, allocators: Any,
+    spec_preregistration_sha256: str,
+) -> int:
+    """Return the exact canonical bound for one original 15×4×6 pilot file.
+
+    The canonical size template preserves the selected Spec's actual
+    family/profile and host strings, the Source-pinned allocator order, the
+    original six ordinal values, valid status/hash fields, and maximum-width
+    unsigned-counter slots. Rejected counters remain zero because the capacity
+    exporter admits only zero-rejection pairs; this template is a byte bound,
+    not a synthetic pilot result.
+    """
+    _require(type(spec) is dict and
+             spec.get("schema") == "allocatbelt.application-campaign-spec.v3" and
+             spec.get("rates") == [] and spec.get("oracles") == [],
+             "capacity pilot byte bound requires the original empty-rate/oracle SpecV3")
+    matching_hosts = [host for host in spec.get("hosts", [])
+                      if type(host) is dict and host.get("host_id") == host_id]
+    _require(type(host_id) is str and len(matching_hosts) == 1,
+             "capacity pilot byte bound requires one known original host")
+    _require(type(allocators) in (tuple, list) and len(allocators) == 4 and
+             all(type(name) is str and name for name in allocators) and
+             len(set(allocators)) == 4,
+             "capacity pilot byte bound requires the exact four distinct Source allocators")
+    _require(type(spec_preregistration_sha256) is str and
+             len(spec_preregistration_sha256) == 64 and
+             all(character in "0123456789abcdef"
+                 for character in spec_preregistration_sha256),
+             "capacity pilot byte bound requires the exact preregistration digest")
+    cells = spec.get("cells")
+    _require(type(cells) is list and len(cells) == 15 and all(
+        type(cell) is dict and type(cell.get("family")) is str and
+        type(cell.get("profile")) is str and cell["family"] and cell["profile"]
+        for cell in cells
+    ) and len({(cell["family"], cell["profile"]) for cell in cells}) == 15,
+             "capacity pilot byte bound requires the exact fifteen original Spec cells")
+    pairs = []
+    maximum = MAX_U64
+    for ordinal in range(1, 7):
+        pairs.append({
+            "ordinal": ordinal,
+            "bounded_status": "valid", "tokio_status": "valid",
+            "raw_pair_sha256": "f" * 64,
+            "bounded_on_time": maximum, "bounded_late": maximum,
+            "bounded_attempted": maximum, "bounded_admitted": maximum,
+            "bounded_rejected": 0,
+            "tokio_on_time": maximum, "tokio_late": maximum,
+            "tokio_attempted": maximum, "tokio_admitted": maximum,
+            "tokio_rejected": 0,
+        })
+    pilot = {
+        "schema": PILOT_SCHEMA,
+        "spec_sha256": spec_preregistration_sha256,
+        "host_id": host_id,
+        "cells": [
+            {"family": cell["family"], "profile": cell["profile"],
+             "allocator": allocator, "pairs": pairs}
+            for cell in cells for allocator in allocators
+        ],
+    }
+    _require(len(pilot["cells"]) == 15 * 4 and
+             sum(len(cell["pairs"]) for cell in pilot["cells"]) == 15 * 4 * 6,
+             "capacity pilot byte bound changed its original 15×4×6 schedule")
+    return len(_canonical(pilot))
 
 
 def _write_private_json_new(

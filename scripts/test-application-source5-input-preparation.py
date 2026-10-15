@@ -2134,5 +2134,95 @@ class CapturedCapacityPilotProviderCohortTests(unittest.TestCase):
                     self.preparation._capacity_pilot_provider_map(mutant, hosts)
 
 
+class CapacityPilotByteBoundTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.preparation = load_script(
+            SCRIPT_DIR / "application-source5-input-preparation.py",
+            "capacity_pilot_byte_bound_target",
+        )
+        cls.source_fixtures = load_script(
+            SCRIPT_DIR / "test-application-campaign-inputs.py",
+            "capacity_pilot_byte_bound_source_fixtures",
+        )
+
+    def test_source_bound_matches_full_15_by_4_by_6_max_width_witness(self):
+        spec, _sources = self.source_fixtures.spec_v3_fixture()
+        campaign = self.source_fixtures.campaign
+        host_id = spec["hosts"][0]["host_id"]
+        spec_digest = campaign.preregistration_digest(spec)
+        bound = self.preparation.capacity_pilot_maximum_bytes(
+            spec, host_id, campaign.ALLOCATORS, spec_digest,
+        )
+        pairs = []
+        maximum = (1 << 64) - 1
+        for ordinal in range(1, 7):
+            pairs.append({
+                "ordinal": ordinal,
+                "bounded_status": "valid", "tokio_status": "valid",
+                "raw_pair_sha256": "f" * 64,
+                "bounded_on_time": maximum, "bounded_late": maximum,
+                "bounded_attempted": maximum, "bounded_admitted": maximum,
+                "bounded_rejected": 0,
+                "tokio_on_time": maximum, "tokio_late": maximum,
+                "tokio_attempted": maximum, "tokio_admitted": maximum,
+                "tokio_rejected": 0,
+            })
+        witness = {
+            "schema": self.preparation.PILOT_SCHEMA,
+            "spec_sha256": spec_digest,
+            "host_id": host_id,
+            "cells": [
+                {"family": cell["family"], "profile": cell["profile"],
+                 "allocator": allocator, "pairs": pairs}
+                for cell in spec["cells"] for allocator in campaign.ALLOCATORS
+            ],
+        }
+        self.assertEqual(len(witness["cells"]), 15 * 4)
+        self.assertEqual(sum(len(cell["pairs"]) for cell in witness["cells"]), 15 * 4 * 6)
+        self.assertEqual(bound, len(self.preparation._canonical(witness)))
+
+    def test_pilot_bound_rejects_changed_host_cell_or_allocator_cardinality(self):
+        spec, _sources = self.source_fixtures.spec_v3_fixture()
+        campaign = self.source_fixtures.campaign
+        host_id = spec["hosts"][0]["host_id"]
+        digest = campaign.preregistration_digest(spec)
+        with self.assertRaisesRegex(
+                self.preparation.PreparationError, "one known original host"):
+            self.preparation.capacity_pilot_maximum_bytes(
+                spec, "not-a-host", campaign.ALLOCATORS, digest,
+            )
+        with self.assertRaisesRegex(
+                self.preparation.PreparationError, "four distinct Source allocators"):
+            self.preparation.capacity_pilot_maximum_bytes(
+                spec, host_id, campaign.ALLOCATORS[:-1], digest,
+            )
+        changed = {**spec, "cells": spec["cells"][:-1]}
+        with self.assertRaisesRegex(
+                self.preparation.PreparationError, "fifteen original Spec cells"):
+            self.preparation.capacity_pilot_maximum_bytes(
+                changed, host_id, campaign.ALLOCATORS, digest,
+            )
+
+    def test_exported_unsigned_row_counts_stop_at_u64_before_use(self):
+        maximum = (1 << 64) - 1
+        row = {"count": maximum}
+        self.assertEqual(
+            self.preparation._row_uint(row, "count", "test count"), maximum,
+        )
+        self.assertEqual(
+            self.preparation._row_uint(
+                {"count": str(maximum)}, "count", "test count",
+            ), maximum,
+        )
+        for value in (maximum + 1, str(maximum + 1), "9" * 21):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(
+                        self.preparation.PreparationError, "64-bit"):
+                    self.preparation._row_uint(
+                        {"count": value}, "count", "test count",
+                    )
+
+
 if __name__ == "__main__":
     unittest.main()

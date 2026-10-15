@@ -527,6 +527,16 @@ validator computes six-pair medians across four allocators and both executors,
 then applies the existing 70/90-percent flooring. The pilot is rate input
 evidence; it is not a qualification result.
 
+Before reserving the pilot output, the Source-owned
+`capacity_pilot_maximum_bytes(spec, host_id, allocators,
+spec_preregistration_sha256)` helper constructs the canonical 15-cell ×
+4-allocator × 6-ordinal maximum-width witness. It uses the exact Spec family,
+profile and host strings, valid status/hash fields, twenty-digit widths for
+the eight non-rejected counters, and exact zero for the two rejected counters.
+`_row_uint` rejects any counter above `2**64 - 1` before the exporter performs
+pair reconciliation or rate arithmetic; the rejected counters must still be
+zero.
+
 ```python
 pilot_pin = export_capacity_pilot(
     {
