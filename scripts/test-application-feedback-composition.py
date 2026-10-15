@@ -1224,7 +1224,10 @@ class CompositionContractTests(unittest.TestCase):
             self.assertFalse(finalization_receipt["qualification_eligible"])
             self.assertFalse(finalization_receipt["controller_chronology_proven"])
             if offline_finalized is not None:
-                self.assertEqual(offline_finalized, finalized)
+                offline_finalized_raw, _offline_finalized_sha = reader.build_pressure_expectation_recipe(
+                    offline_finalized,
+                )
+                self.assertEqual(offline_finalized_raw, finalize_expectation_path.read_bytes())
                 # These empty files and zero-event trace rows are path-map
                 # shape fixtures only. The API must stop before reading them
                 # as pressure evidence because no full pressure replay request
