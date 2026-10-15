@@ -8,6 +8,7 @@ from contextlib import contextmanager
 import hashlib
 import importlib.machinery
 import importlib.util
+import json
 import stat
 import tempfile
 import types
@@ -1223,7 +1224,9 @@ class Source5PreparationInputTests(unittest.TestCase):
             overlay_pin = {"path": str(overlay_path), "sha256": hashlib.sha256(overlay_raw).hexdigest()}
             with patch.object(preparation, "read_preparation_intent",
                               return_value=(preparation_value, sources, campaign_v3, inputs_v3)):
-                with self.assertRaisesRegex(preparation.PreparationError, "do not share exact host controls/affinity/namespace"):
+                with self.assertRaisesRegex(
+                        preparation.PreparationError,
+                        "fixed Spec host record differs from the canonical selected SpecV3 host"):
                     preparation.build_prepared_host_binding(
                         prep_pin, spec_pin, overlay_pin, source_root, input_root, host_id,
                     )
@@ -1240,10 +1243,286 @@ class Source5PreparationInputTests(unittest.TestCase):
             overlay_pin = {"path": str(overlay_path), "sha256": hashlib.sha256(overlay_raw).hexdigest()}
             with patch.object(preparation, "read_preparation_intent",
                               return_value=(preparation_value, sources, campaign_v3, inputs_v3)):
-                with self.assertRaisesRegex(preparation.PreparationError, "do not share exact host controls/affinity/namespace"):
+                with self.assertRaisesRegex(
+                        preparation.PreparationError,
+                        "fixed overlay and prepared capacity context differ on host identity/controls"):
                     preparation.build_prepared_host_binding(
                         prep_pin, spec_pin, overlay_pin, source_root, input_root, host_id,
                     )
+
+
+class MaterializedPreparedHostBindingTests(unittest.TestCase):
+    """Use synthetic Spec/Source fixtures without fabricating an overlay or host fact."""
+
+    def _fixture(self, root: Path):
+        preparation = load_script(
+            SCRIPT_DIR / "application-source5-input-preparation.py",
+            "source5_materialized_host_binding_target",
+        )
+        source_fixtures = load_script(
+            SCRIPT_DIR / "test-application-campaign-inputs.py",
+            "source5_materialized_host_binding_source_fixtures",
+        )
+        spec, sources = source_fixtures.spec_v3_fixture()
+        campaign_v3 = source_fixtures.campaign
+        inputs_v3 = source_fixtures.inputs
+        host_id = spec["hosts"][0]["host_id"]
+        input_root = root / "inputs"
+        input_root.mkdir(mode=0o700)
+        source_root = root / "source"
+        source_root.mkdir(mode=0o700)
+        spec_path = input_root / "initial-spec.json"
+        spec_raw = campaign_v3.canonical_bytes(spec)
+        spec_path.write_bytes(spec_raw)
+        spec_path.chmod(0o600)
+
+        selected_host = next(item for item in spec["hosts"]
+                             if item["host_id"] == host_id)
+        controls = selected_host["controls"]
+        observed = {
+            "schema": "allocatbelt.application-capacity-host-context.v1",
+            "host_id": host_id, "boot_id_sha256": "a" * 64,
+            "controls_sha256": selected_host["host_fingerprint_sha256"],
+            "controls": controls, "kernel_release": controls["kernel_release"],
+            "cpu_model": controls["cpu_model"], "cpu_affinity": [0],
+            "network_namespace_inode": 77,
+        }
+        observed_path = input_root / "capacity-host-context.json"
+        observed_raw = campaign_v3.canonical_bytes(observed)
+        observed_path.write_bytes(observed_raw)
+        observed_path.chmod(0o600)
+
+        source_pins = {}
+        for selected in spec["hosts"]:
+            selected_id = selected["host_id"]
+            source = sources[selected_id]
+            source_ref = next(row for row in spec["source_manifests"]
+                              if row["host_id"] == selected_id)
+            source_pins[selected_id] = {"manifest": {
+                "relative_path": source_ref["relative_path"],
+                "raw_sha256": hashlib.sha256(
+                    campaign_v3.canonical_bytes(source),
+                ).hexdigest(),
+                "semantic_sha256": source_ref["sha256"],
+                "source_tree_sha256": source["source"]["source_tree_sha256"],
+            }}
+        preparation_value = {
+            "core": inputs_v3.preparation_core_from_spec(spec),
+            "source_pins": source_pins,
+            "observed_hosts": {host_id: {
+                "relative_path": "capacity-host-context.json",
+                "raw_sha256": hashlib.sha256(observed_raw).hexdigest(),
+            }},
+        }
+        preparation_pin = {
+            "path": str(input_root / "preparation.json"),
+            "sha256": "b" * 64,
+        }
+        spec_pin = {
+            "path": str(spec_path),
+            "sha256": hashlib.sha256(spec_raw).hexdigest(),
+        }
+        return (preparation, preparation_value, sources, campaign_v3,
+                inputs_v3, preparation_pin, spec_pin, source_root,
+                input_root, host_id, spec)
+
+    def _read_preparation(self, fixture):
+        preparation, value, sources, campaign_v3, inputs_v3 = fixture[:5]
+        return patch.object(
+            preparation, "read_preparation_intent",
+            return_value=(value, sources, campaign_v3, inputs_v3),
+        )
+
+    def _materialize(self, fixture):
+        preparation, _, _, _, _, preparation_pin, spec_pin, source_root, \
+            input_root, host_id, _spec = fixture
+        with self._read_preparation(fixture):
+            return preparation.materialize_prepared_host_binding(
+                preparation_pin, spec_pin, source_root, input_root, host_id,
+            )
+
+    def _verify(self, fixture):
+        preparation, _, _, _, _, preparation_pin, spec_pin, source_root, \
+            input_root, host_id, _spec = fixture
+        with self._read_preparation(fixture):
+            return preparation.verify_prepared_host_binding(
+                preparation_pin, spec_pin, source_root, input_root, host_id,
+            )
+
+    def test_materializer_and_readonly_verifier_share_the_existing_binding(self):
+        with tempfile.TemporaryDirectory(prefix="source5-spec-host-materializer-") as temp:
+            fixture = self._fixture(Path(temp))
+            preparation, _, _, campaign_v3, _, _, _, _, input_root, host_id, spec = fixture
+            result = self._materialize(fixture)
+            self.assertEqual(set(result), {
+                "fixed_spec_host_pin", "prepared_host_binding",
+            })
+            host = next(item for item in spec["hosts"]
+                        if item["host_id"] == host_id)
+            expected_raw = campaign_v3.canonical_bytes(host)
+            spec_host_pin = result["fixed_spec_host_pin"]
+            self.assertEqual(spec_host_pin, {
+                "path": str(input_root / "fixed-spec-hosts" / f"{host_id}.json"),
+                "raw_sha256": hashlib.sha256(expected_raw).hexdigest(),
+            })
+            path = Path(spec_host_pin["path"])
+            self.assertEqual(path.read_bytes(), expected_raw)
+            self.assertEqual(stat.S_IMODE(path.stat(follow_symlinks=False).st_mode), 0o600)
+            self.assertEqual(path.stat(follow_symlinks=False).st_nlink, 1)
+            self.assertEqual(
+                stat.S_IMODE(path.parent.stat(follow_symlinks=False).st_mode),
+                0o700,
+            )
+            binding = result["prepared_host_binding"]
+            self.assertEqual(binding["schema"],
+                             preparation.PREPARED_FIXED_HOST_BINDING_SCHEMA)
+            self.assertEqual(binding["fixed_spec_host_pin"], {
+                "path": spec_host_pin["path"],
+                "raw_sha256": spec_host_pin["raw_sha256"],
+            })
+            self.assertEqual(
+                binding["prepared_host_context_pin"]["path"],
+                str(input_root / "capacity-host-context.json"),
+            )
+            self.assertEqual(
+                binding["prepared_host_context_pin"]["raw_sha256"],
+                fixture[1]["observed_hosts"][host_id]["raw_sha256"],
+            )
+            self.assertNotEqual(
+                binding["fixed_spec_host_pin"]["path"],
+                binding["prepared_host_context_pin"]["path"],
+            )
+            self.assertEqual(self._materialize(fixture), result)
+            self.assertEqual(self._verify(fixture), result)
+            self.assertFalse(any(
+                child.name.endswith("overlay.json")
+                for child in input_root.iterdir()
+            ))
+
+    def test_readonly_verifier_never_creates_a_missing_spec_host_file(self):
+        with tempfile.TemporaryDirectory(prefix="source5-spec-host-readonly-") as temp:
+            fixture = self._fixture(Path(temp))
+            input_root = fixture[8]
+            with self.assertRaisesRegex(
+                    fixture[0].PreparationError, "is missing"):
+                self._verify(fixture)
+            self.assertFalse((input_root / "fixed-spec-hosts").exists())
+
+    def test_readonly_verifier_rejects_changed_spec_host_without_restoration(self):
+        with tempfile.TemporaryDirectory(prefix="source5-spec-host-mutated-") as temp:
+            fixture = self._fixture(Path(temp))
+            result = self._materialize(fixture)
+            path = Path(result["fixed_spec_host_pin"]["path"])
+            altered = b"{}\n"
+            path.write_bytes(altered)
+            path.chmod(0o600)
+            with self.assertRaisesRegex(
+                    fixture[0].PreparationError,
+                    "differs from its exact raw pin|bytes/mode/link identity differ"):
+                self._verify(fixture)
+            self.assertEqual(path.read_bytes(), altered)
+
+    def test_materializer_refuses_conflicting_existing_file_without_replacement(self):
+        with tempfile.TemporaryDirectory(prefix="source5-spec-host-conflict-") as temp:
+            fixture = self._fixture(Path(temp))
+            input_root = fixture[8]
+            directory = input_root / "fixed-spec-hosts"
+            directory.mkdir(mode=0o700)
+            wrong = directory / f"{fixture[9]}.json"
+            wrong_raw = b"{}\n"
+            wrong.write_bytes(wrong_raw)
+            wrong.chmod(0o600)
+            with self.assertRaisesRegex(
+                    fixture[0].PreparationError,
+                    "existing immutable artifact differs"):
+                self._materialize(fixture)
+            self.assertEqual(wrong.read_bytes(), wrong_raw)
+
+    def test_source_validator_rejects_changed_capacity_controls_before_write(self):
+        with tempfile.TemporaryDirectory(prefix="source5-spec-host-controls-") as temp:
+            fixture = self._fixture(Path(temp))
+            preparation, prep_value, _sources, campaign_v3, _inputs_v3 = fixture[:5]
+            input_root, host_id = fixture[8], fixture[9]
+            observed_row = prep_value["observed_hosts"][host_id]
+            observed_path = input_root / observed_row["relative_path"]
+            observed = json.loads(observed_path.read_text(encoding="utf-8"))
+            observed["controls_sha256"] = "0" * 64
+            observed_raw = campaign_v3.canonical_bytes(observed)
+            observed_path.write_bytes(observed_raw)
+            observed_path.chmod(0o600)
+            observed_row["raw_sha256"] = hashlib.sha256(observed_raw).hexdigest()
+            with self.assertRaisesRegex(
+                    preparation.PreparationError,
+                    "does not match its frozen controls"):
+                self._materialize(fixture)
+            self.assertFalse((input_root / "fixed-spec-hosts").exists())
+
+    def test_materializer_rejects_swapped_parent_without_writing_outside_input_root(self):
+        with tempfile.TemporaryDirectory(prefix="source5-spec-host-parent-swap-") as temp:
+            root = Path(temp)
+            fixture = self._fixture(root)
+            preparation, input_root = fixture[0], fixture[8]
+            outside = root / "outside"
+            outside.mkdir(mode=0o700)
+            directory = input_root / "fixed-spec-hosts"
+            original_check = preparation._assert_fixed_spec_host_directory_names
+            swapped = False
+
+            def swap_before_parent_recheck(*args):
+                nonlocal swapped
+                if not swapped:
+                    displaced = input_root / "fixed-spec-hosts-displaced"
+                    directory.rename(displaced)
+                    directory.symlink_to(outside, target_is_directory=True)
+                    swapped = True
+                return original_check(*args)
+
+            with patch.object(
+                    preparation, "_assert_fixed_spec_host_directory_names",
+                    side_effect=swap_before_parent_recheck):
+                with self.assertRaisesRegex(
+                        preparation.PreparationError,
+                        "fixed Spec host directory was replaced"):
+                    self._materialize(fixture)
+            self.assertTrue(swapped)
+            self.assertEqual(list(outside.iterdir()), [])
+            self.assertFalse((outside / f"{fixture[9]}.json").exists())
+
+    def test_materializer_anchors_openat_and_removes_new_inode_after_parent_swap(self):
+        with tempfile.TemporaryDirectory(prefix="source5-spec-host-openat-swap-") as temp:
+            root = Path(temp)
+            fixture = self._fixture(root)
+            preparation, input_root, host_id = fixture[0], fixture[8], fixture[9]
+            outside = root / "outside"
+            outside.mkdir(mode=0o700)
+            directory = input_root / "fixed-spec-hosts"
+            displaced = input_root / "fixed-spec-hosts-displaced"
+            original_open = preparation.os.open
+            intercepted = False
+
+            def swap_at_create(file, flags, mode=0o777, *, dir_fd=None):
+                nonlocal intercepted
+                if (not intercepted and file == f"{host_id}.json" and
+                        flags & preparation.os.O_CREAT):
+                    self.assertIsNotNone(dir_fd)
+                    self.assertTrue(flags & preparation.os.O_EXCL)
+                    self.assertTrue(flags & preparation.os.O_NOFOLLOW)
+                    directory.rename(displaced)
+                    directory.symlink_to(outside, target_is_directory=True)
+                    intercepted = True
+                if dir_fd is None:
+                    return original_open(file, flags, mode)
+                return original_open(file, flags, mode, dir_fd=dir_fd)
+
+            with patch.object(preparation.os, "open", side_effect=swap_at_create):
+                with self.assertRaisesRegex(
+                        preparation.PreparationError,
+                        "fixed Spec host directory was replaced"):
+                    self._materialize(fixture)
+            self.assertTrue(intercepted)
+            self.assertTrue(directory.is_symlink())
+            self.assertEqual(list(outside.iterdir()), [])
+            self.assertEqual(list(displaced.iterdir()), [])
 
 
 class CapturedCapacityPilotExportTests(unittest.TestCase):

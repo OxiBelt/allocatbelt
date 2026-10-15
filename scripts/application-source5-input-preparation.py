@@ -648,70 +648,401 @@ def _validate_prepared_fixed_host_binding(value: Any) -> dict[str, Any]:
     return binding
 
 
-def _prepared_fixed_host_binding_for_overlay(
-    preparation: dict[str, Any], spec: dict[str, Any], overlay: dict[str, Any],
-    inputs: Any, input_root: Path, host_id: str,
+def _prepared_host_binding_inputs(
+    preparation_pin: dict[str, Any], spec_pin: dict[str, Any],
+    source_root: Path, input_root: Path, host_id: str,
+) -> tuple[dict[str, Any], dict[str, dict[str, Any]], Any, Any,
+           dict[str, Any], dict[str, str]]:
+    """Load the exact resident preparation and empty-rate Spec generation once."""
+    source_root = _safe_root(Path(source_root), "SourceV5 root")
+    input_root = _safe_root(Path(input_root), "preparation input root")
+    _require(not _within(source_root, input_root),
+             "preparation input root must remain outside SourceV5")
+    preparation, sources, campaign_module, inputs = read_preparation_intent(
+        preparation_pin, source_root, input_root,
+    )
+    spec_pin_value = _exact(spec_pin, {"path", "sha256"},
+                            "original SpecV3 raw pin")
+    spec, _spec_raw, spec_sha = _read_pinned_json(
+        spec_pin_value, "original empty-rate SpecV3",
+    )
+    _require(spec_sha == spec_pin_value["sha256"] and
+             spec.get("schema") == campaign_module.SPEC_SCHEMA_V3 and
+             spec.get("rates") == [] and spec.get("oracles") == [],
+             "prepared host binding requires the raw-pinned original empty-rate/oracle SpecV3")
+    try:
+        core = inputs.preparation_core_from_spec(spec)
+        _require(core == preparation["core"],
+                 "original SpecV3 differs from the frozen preparation core")
+    except Exception as error:
+        raise PreparationError(
+            f"cannot project original SpecV3 onto preparation core: {error}",
+        ) from error
+    _verify_spec_source_refs(spec, preparation, sources)
+    _require(host_id in sources and any(
+        type(item) is dict and item.get("host_id") == host_id
+        for item in spec.get("hosts", [])
+    ), "prepared host binding selected an unknown SpecV3 host")
+    return preparation, sources, campaign_module, inputs, spec, spec_pin_value
+
+
+def _fixed_spec_host_path(input_root: Path, host_id: str) -> Path:
+    _require(type(host_id) is str and bool(host_id) and
+             host_id not in {".", ".."} and "/" not in host_id and
+             "\\" not in host_id and "\x00" not in host_id,
+             "fixed Spec host ID is not a safe deterministic child name")
+    return input_root / "fixed-spec-hosts" / f"{host_id}.json"
+
+
+def _directory_identity(info: os.stat_result) -> tuple[int, int, int, int]:
+    return info.st_dev, info.st_ino, info.st_mode, info.st_uid
+
+
+def _assert_fixed_spec_host_directory_names(
+    input_root: Path, root_fd: int, directory_fd: int,
+    root_identity: tuple[int, int, int, int],
+    directory_identity: tuple[int, int, int, int],
+) -> None:
+    """Prove both open directory descriptors still name their expected paths."""
+    try:
+        root_path_info = input_root.lstat()
+        directory_path_info = os.stat(
+            "fixed-spec-hosts", dir_fd=root_fd, follow_symlinks=False,
+        )
+        resolved_root = input_root.resolve(strict=True)
+        opened_root_info = os.fstat(root_fd)
+        opened_directory_info = os.fstat(directory_fd)
+    except OSError as error:
+        raise PreparationError(
+            f"fixed Spec host parent changed during its anchored operation: {error}",
+        ) from error
+    _require(
+        stat.S_ISDIR(root_path_info.st_mode) and resolved_root == input_root and
+        _directory_identity(root_path_info) == root_identity ==
+        _directory_identity(opened_root_info),
+        "preparation input root changed during its fixed Spec host operation",
+    )
+    _require(
+        stat.S_ISDIR(directory_path_info.st_mode) and
+        _directory_identity(directory_path_info) == directory_identity ==
+        _directory_identity(opened_directory_info),
+        "fixed Spec host directory was replaced during its anchored operation",
+    )
+
+
+@contextlib.contextmanager
+def _open_fixed_spec_host_directory(input_root: Path, *, create: bool):
+    """Hold no-follow descriptors for the input root and its fixed-host child."""
+    input_root = _safe_root(Path(input_root), "preparation input root")
+    directory_name = "fixed-spec-hosts"
+    directory_path = input_root / directory_name
+    directory_flags = (
+        os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) |
+        getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    )
+    root_fd = -1
+    directory_fd = -1
+    created = False
+    try:
+        try:
+            root_fd = os.open(input_root, directory_flags)
+        except OSError as error:
+            raise PreparationError(
+                f"preparation input root cannot be safely opened: {error}",
+            ) from error
+        root_info = os.fstat(root_fd)
+        try:
+            root_path_info = input_root.lstat()
+            _require(
+                stat.S_ISDIR(root_path_info.st_mode) and
+                input_root.resolve(strict=True) == input_root and
+                _directory_identity(root_info) == _directory_identity(root_path_info),
+                "preparation input root changed before fixed Spec host access",
+            )
+        except OSError as error:
+            raise PreparationError(
+                f"preparation input root changed before fixed Spec host access: {error}",
+            ) from error
+        root_identity = _directory_identity(root_info)
+        if create:
+            try:
+                os.mkdir(directory_name, 0o700, dir_fd=root_fd)
+                created = True
+                os.fsync(root_fd)
+            except FileExistsError:
+                pass
+            except OSError as error:
+                raise PreparationError(
+                    f"cannot create fixed Spec host directory: {error}",
+                ) from error
+        try:
+            directory_fd = os.open(directory_name, directory_flags, dir_fd=root_fd)
+        except FileNotFoundError as error:
+            raise PreparationError("fixed Spec host directory is missing") from error
+        except OSError as error:
+            raise PreparationError(
+                f"fixed Spec host directory is not a real nonsymlink directory: {error}",
+            ) from error
+        directory_info = os.fstat(directory_fd)
+        _require(
+            stat.S_ISDIR(directory_info.st_mode) and
+            directory_info.st_uid == os.getuid(),
+            "fixed Spec host directory must be owned mode-0700 storage",
+        )
+        if created and stat.S_IMODE(directory_info.st_mode) != 0o700:
+            os.fchmod(directory_fd, 0o700)
+            os.fsync(directory_fd)
+            directory_info = os.fstat(directory_fd)
+        _require(
+            stat.S_IMODE(directory_info.st_mode) == 0o700,
+            "fixed Spec host directory must be owned mode-0700 storage",
+        )
+        directory_identity = _directory_identity(directory_info)
+        _assert_fixed_spec_host_directory_names(
+            input_root, root_fd, directory_fd, root_identity, directory_identity,
+        )
+        yield (root_fd, directory_fd, root_identity, directory_identity,
+               directory_path)
+    finally:
+        if directory_fd >= 0:
+            os.close(directory_fd)
+        if root_fd >= 0:
+            os.close(root_fd)
+
+
+def _read_fixed_spec_host_at(
+    input_root: Path, root_fd: int, directory_fd: int,
+    root_identity: tuple[int, int, int, int],
+    directory_identity: tuple[int, int, int, int], name: str,
+) -> tuple[dict[str, Any], bytes, str, os.stat_result]:
+    """Read the deterministic JSON file relative to the held directory fd."""
+    _assert_fixed_spec_host_directory_names(
+        input_root, root_fd, directory_fd, root_identity, directory_identity,
+    )
+    try:
+        named_before = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        _require(stat.S_ISREG(named_before.st_mode),
+                 "fixed Spec host record must be a regular nonsymlink file")
+        fd = os.open(
+            name,
+            os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) |
+            getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0),
+            dir_fd=directory_fd,
+        )
+    except FileNotFoundError as error:
+        raise PreparationError(f"fixed Spec host record is missing: {error}") from error
+    except OSError as error:
+        raise PreparationError(f"cannot safely open fixed Spec host record: {error}") from error
+    try:
+        before = os.fstat(fd)
+        identity = lambda value: (
+            value.st_dev, value.st_ino, value.st_mode, value.st_size,
+            value.st_mtime_ns, value.st_ctime_ns, value.st_nlink, value.st_uid,
+        )
+        _require(
+            stat.S_ISREG(before.st_mode) and identity(before) == identity(named_before) and
+            0 <= before.st_size <= MAX_MANIFEST_BYTES,
+            "fixed Spec host record changed while opening or exceeds its bound",
+        )
+        chunks: list[bytes] = []
+        count = 0
+        while count < before.st_size:
+            block = os.read(fd, min(1024 * 1024, before.st_size - count))
+            _require(bool(block), "fixed Spec host record was truncated during its stable read")
+            chunks.append(block)
+            count += len(block)
+        raw = b"".join(chunks)
+        after = os.fstat(fd)
+        named_after = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        _require(
+            len(raw) == before.st_size and identity(before) == identity(after) and
+            identity(after) == identity(named_after),
+            "fixed Spec host record changed during its stable read",
+        )
+    finally:
+        os.close(fd)
+    _assert_fixed_spec_host_directory_names(
+        input_root, root_fd, directory_fd, root_identity, directory_identity,
+    )
+    try:
+        value = json.loads(raw.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError, RecursionError) as error:
+        raise PreparationError(f"fixed Spec host record is not bounded UTF-8 JSON: {error}") from error
+    _require(type(value) is dict and _canonical(value) == raw,
+             "fixed Spec host record is not canonical JSON")
+    return value, raw, _sha256(raw), after
+
+
+def _write_fixed_spec_host_at(
+    input_root: Path, source_root: Path, root_fd: int, directory_fd: int,
+    root_identity: tuple[int, int, int, int],
+    directory_identity: tuple[int, int, int, int], name: str, raw: bytes,
+) -> str:
+    """Create/read back one immutable child without resolving its parent path."""
+    _require(not _within(source_root, input_root / "fixed-spec-hosts" / name),
+             "fixed Spec host destination must be outside SourceV5")
+    _require(len(raw) <= MAX_MANIFEST_BYTES,
+             "fixed Spec host record exceeds its finite size bound")
+    _assert_fixed_spec_host_directory_names(
+        input_root, root_fd, directory_fd, root_identity, directory_identity,
+    )
+    try:
+        os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        exists = True
+    except FileNotFoundError:
+        exists = False
+    except OSError as error:
+        raise PreparationError(
+            f"cannot safely inspect fixed Spec host record: {error}",
+        ) from error
+    if exists:
+        existing, existing_raw, _existing_sha, info = _read_fixed_spec_host_at(
+            input_root, root_fd, directory_fd, root_identity,
+            directory_identity, name,
+        )
+        del existing
+        _require(
+            stat.S_IMODE(info.st_mode) == 0o600 and info.st_uid == os.getuid() and
+            info.st_nlink == 1 and existing_raw == raw,
+            "existing immutable artifact differs from the exact replayed bytes or private mode",
+        )
+        return _sha256(raw)
+
+    fd = -1
+    created_identity: tuple[int, int, int, int, int, int, int, int] | None = None
+    created_inode: tuple[int, int] | None = None
+    try:
+        _assert_fixed_spec_host_directory_names(
+            input_root, root_fd, directory_fd, root_identity, directory_identity,
+        )
+        try:
+            fd = os.open(
+                name,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL |
+                getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+                0o600, dir_fd=directory_fd,
+            )
+        except OSError as error:
+            raise PreparationError(f"cannot create immutable fixed Spec host record: {error}") from error
+        opened = os.fstat(fd)
+        created_inode = (opened.st_dev, opened.st_ino)
+        os.fchmod(fd, 0o600)
+        offset = 0
+        while offset < len(raw):
+            count = os.write(fd, raw[offset:])
+            _require(count > 0, "fixed Spec host record write stopped before completion")
+            offset += count
+        os.fsync(fd)
+        info = os.fstat(fd)
+        created_identity = (
+            info.st_dev, info.st_ino, info.st_mode, info.st_size,
+            info.st_mtime_ns, info.st_ctime_ns, info.st_nlink, info.st_uid,
+        )
+    except BaseException:
+        if fd >= 0:
+            os.close(fd)
+            fd = -1
+        try:
+            named = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+            if created_inode == (named.st_dev, named.st_ino):
+                os.unlink(name, dir_fd=directory_fd)
+                os.fsync(directory_fd)
+        except OSError:
+            pass
+        raise
+    finally:
+        if fd >= 0:
+            os.close(fd)
+    try:
+        _assert_fixed_spec_host_directory_names(
+            input_root, root_fd, directory_fd, root_identity, directory_identity,
+        )
+        os.fsync(directory_fd)
+        written, written_raw, _written_sha, info = _read_fixed_spec_host_at(
+            input_root, root_fd, directory_fd, root_identity,
+            directory_identity, name,
+        )
+        del written
+        _require(
+            written_raw == raw and stat.S_IMODE(info.st_mode) == 0o600 and
+            info.st_uid == os.getuid() and info.st_nlink == 1,
+            "new immutable fixed Spec host record differs from its canonical bytes",
+        )
+    except BaseException:
+        try:
+            named = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+            identity = (
+                named.st_dev, named.st_ino, named.st_mode, named.st_size,
+                named.st_mtime_ns, named.st_ctime_ns, named.st_nlink, named.st_uid,
+            )
+            if identity == created_identity:
+                os.unlink(name, dir_fd=directory_fd)
+                os.fsync(directory_fd)
+        except OSError:
+            pass
+        raise
+    return _sha256(raw)
+
+
+def _prepared_fixed_host_binding_for_spec_host(
+    preparation: dict[str, Any], spec: dict[str, Any], inputs: Any,
+    input_root: Path, host_id: str,
+    fixed_spec_host_pin: dict[str, Any],
+    *, prepared_context: tuple[Path, dict[str, Any], str] | None = None,
+    fixed_spec_host_record: tuple[dict[str, Any], bytes, str] | None = None,
 ) -> dict[str, Any]:
-    """Bind the legacy Spec host record and separate Source5 capacity observation."""
+    """Bind one canonical Spec.host record to the separate capacity observation."""
     matches = [item for item in spec.get("hosts", [])
                if type(item) is dict and item.get("host_id") == host_id]
-    _require(len(matches) == 1 and host_id == overlay.get("host_id"),
-             "fixed-pair and prepared generations do not share one selected SpecV3 host")
+    _require(len(matches) == 1,
+             "prepared generation does not have one selected SpecV3 host")
     spec_host = matches[0]
-    prepared_record = _exact(preparation.get("observed_hosts", {}).get(host_id),
-                             {"relative_path", "raw_sha256"},
-                             f"{host_id} prepared capacity-host-context pin")
-    prepared_path = _safe_child(input_root, prepared_record["relative_path"],
-                                f"{host_id} prepared capacity-host-context")
-    prepared_value, _prepared_raw, prepared_sha = _read_json(
-        prepared_path, f"{host_id} prepared capacity-host-context", MAX_MANIFEST_BYTES,
-        prepared_record["raw_sha256"],
+    prepared_path, prepared_value, prepared_sha = (
+        _read_prepared_capacity_host_context(
+            preparation, inputs, input_root, spec_host, host_id,
+        ) if prepared_context is None else prepared_context
     )
-    _require(prepared_sha == prepared_record["raw_sha256"],
-             "prepared capacity-host-context raw pin changed")
-    try:
-        inputs._validate_observed_host_structure(prepared_value, spec_host, host_id)
-    except Exception as error:
-        raise PreparationError(f"{host_id} prepared capacity-host-context failed the unchanged SourceV5 host validator: {error}") from error
 
-    source_scope = _exact(overlay.get("sources"), {
-        "manifests", "selected", "campaign_artifacts_root", "observed_host",
-        "historical_runner_sha256", "output_mount",
-    }, "fixed-pair source host bindings")
-    fixed_observed = _exact(source_scope["observed_host"], {
-        "pin", "host_fingerprint_sha256", "controls_sha256", "process_affinity",
-        "network_namespace_inode",
-    }, "fixed-pair legacy Spec host observation")
-    fixed_pin = _exact(fixed_observed["pin"], {"path", "sha256"},
-                       "fixed-pair legacy Spec host raw pin")
+    fixed_pin = _exact(fixed_spec_host_pin, {"path", "raw_sha256"},
+                       "fixed SpecV3 host-record pin")
     fixed_path = Path(fixed_pin["path"])
     _require(fixed_path.is_absolute() and _within(input_root, fixed_path),
-             "fixed-pair Spec host record is outside the original private input tree")
+             "fixed Spec host record is outside the original private input tree")
     fixed_relative = fixed_path.relative_to(input_root).as_posix()
-    pinned_fixed_path = _safe_child(input_root, fixed_relative, "fixed-pair Spec host record")
-    _require(str(pinned_fixed_path) == fixed_pin["path"],
-             "fixed-pair Spec host path is not a normalized identity path")
-    fixed_value, fixed_raw, fixed_sha = _read_json(
-        pinned_fixed_path, "fixed-pair Spec host record", MAX_MANIFEST_BYTES, fixed_pin["sha256"],
+    pinned_fixed_path = (
+        input_root / fixed_relative if fixed_spec_host_record is not None else
+        _safe_child(input_root, fixed_relative, "fixed Spec host record")
     )
-    spec_host_semantic = _sha256(_canonical(spec_host))
-    _require(fixed_value == spec_host and fixed_raw == _canonical(spec_host) and
-             fixed_sha == fixed_pin["sha256"] and
-             fixed_observed["host_fingerprint_sha256"] == spec_host["host_fingerprint_sha256"] and
-             fixed_observed["controls_sha256"] == prepared_value["controls_sha256"] ==
-             _sha256(_canonical(spec_host["controls"])) and
-             fixed_observed["process_affinity"] == prepared_value["cpu_affinity"] and
-             fixed_observed["network_namespace_inode"] == prepared_value["network_namespace_inode"],
-             "fixed Spec host record and prepared capacity-host observation do not share exact host controls/affinity/namespace")
+    _require(str(pinned_fixed_path) == fixed_pin["path"],
+             "fixed Spec host path is not a normalized identity path")
+    if fixed_spec_host_record is None:
+        fixed_value, fixed_raw, fixed_sha = _read_json(
+            pinned_fixed_path, "fixed Spec host record", MAX_MANIFEST_BYTES,
+            fixed_pin["raw_sha256"],
+        )
+    else:
+        fixed_value, fixed_raw, fixed_sha = fixed_spec_host_record
+        _require(fixed_sha == fixed_pin["raw_sha256"] == _sha256(fixed_raw) and
+                 _canonical(fixed_value) == fixed_raw,
+                 "fixed Spec host record differs from its exact raw pin")
+    spec_host_raw = _canonical(spec_host)
+    _require(fixed_value == spec_host and fixed_raw == spec_host_raw and
+             fixed_sha == fixed_pin["raw_sha256"],
+             "fixed Spec host record differs from the canonical selected SpecV3 host")
+    controls_sha = _sha256(_canonical(spec_host["controls"]))
+    _require(spec_host["host_fingerprint_sha256"] == controls_sha ==
+             prepared_value["controls_sha256"],
+             "fixed Spec host and prepared capacity context disagree on controls")
     body = {
         "schema": PREPARED_FIXED_HOST_BINDING_SCHEMA,
         "host_id": host_id,
-        "fixed_spec_host_pin": {"path": str(pinned_fixed_path), "raw_sha256": fixed_sha},
+        "fixed_spec_host_pin": {"path": str(pinned_fixed_path),
+                                 "raw_sha256": fixed_sha},
         "prepared_host_context_pin": {"path": str(prepared_path), "raw_sha256": prepared_sha},
-        "spec_host_semantic_sha256": spec_host_semantic,
+        "spec_host_semantic_sha256": _sha256(spec_host_raw),
         "boot_id_sha256": prepared_value["boot_id_sha256"],
-        "kernel_release": prepared_value["kernel_release"],
-        "controls_sha256": prepared_value["controls_sha256"],
+        "kernel_release": spec_host["controls"]["kernel_release"],
+        "controls_sha256": controls_sha,
         "process_affinity": list(prepared_value["cpu_affinity"]),
         "network_namespace_inode": prepared_value["network_namespace_inode"],
     }
@@ -720,27 +1051,49 @@ def _prepared_fixed_host_binding_for_overlay(
     })
 
 
+def _prepared_fixed_host_binding_for_overlay(
+    preparation: dict[str, Any], spec: dict[str, Any], overlay: dict[str, Any],
+    inputs: Any, input_root: Path, host_id: str,
+) -> dict[str, Any]:
+    """Bind the legacy overlay host facts to the shared Spec/capacity bridge."""
+    _require(host_id == overlay.get("host_id"),
+             "fixed-pair overlay and prepared generations select different hosts")
+    source_scope = _exact(overlay.get("sources"), {
+        "manifests", "selected", "campaign_artifacts_root", "observed_host",
+        "historical_runner_sha256", "output_mount",
+    }, "fixed-pair source host bindings")
+    fixed_observed = _exact(source_scope["observed_host"], {
+        "pin", "host_fingerprint_sha256", "controls_sha256", "process_affinity",
+        "network_namespace_inode",
+    }, "fixed-pair legacy Spec host observation")
+    overlay_pin = _exact(fixed_observed["pin"], {"path", "sha256"},
+                         "fixed-pair legacy Spec host raw pin")
+    binding = _prepared_fixed_host_binding_for_spec_host(
+        preparation, spec, inputs, input_root, host_id,
+        {"path": overlay_pin["path"], "raw_sha256": overlay_pin["sha256"]},
+    )
+    spec_host = next(item for item in spec["hosts"]
+                     if item["host_id"] == host_id)
+    _require(fixed_observed["host_fingerprint_sha256"] ==
+             spec_host["host_fingerprint_sha256"] ==
+                 binding["controls_sha256"] and
+             fixed_observed["controls_sha256"] == binding["controls_sha256"] and
+             fixed_observed["process_affinity"] == binding["process_affinity"] and
+             fixed_observed["network_namespace_inode"] ==
+                 binding["network_namespace_inode"],
+             "fixed overlay and prepared capacity context differ on host identity/controls")
+    return binding
+
+
 def build_prepared_host_binding(
     preparation_pin: dict[str, Any], spec_pin: dict[str, Any], overlay_pin: dict[str, Any],
     source_root: Path, input_root: Path, host_id: str,
 ) -> dict[str, Any]:
     """Build the versioned bridge between original Spec host and prep observation bytes."""
-    source_root = _safe_root(source_root, "SourceV5 root")
-    input_root = _safe_root(input_root, "preparation input root")
-    preparation, sources, campaign, inputs = read_preparation_intent(
-        preparation_pin, source_root, input_root,
+    (preparation, sources, campaign, inputs, spec,
+     spec_pin_value) = _prepared_host_binding_inputs(
+        preparation_pin, spec_pin, source_root, input_root, host_id,
     )
-    spec_pin_value = _exact(spec_pin, {"path", "sha256"}, "original SpecV3 raw pin")
-    spec, _spec_raw, spec_sha = _read_pinned_json(spec_pin_value, "original empty-rate SpecV3")
-    _require(spec.get("schema") == campaign.SPEC_SCHEMA_V3 and
-             spec.get("rates") == [] and spec.get("oracles") == [],
-             "prepared host binding requires the original empty-rate/oracle SpecV3")
-    try:
-        _require(inputs.preparation_core_from_spec(spec) == preparation["core"],
-                 "original SpecV3 differs from the frozen preparation core")
-    except Exception as error:
-        raise PreparationError(f"cannot project original SpecV3 onto preparation core: {error}") from error
-    _verify_spec_source_refs(spec, preparation, sources)
     overlay, _overlay_raw, _overlay_sha = _read_pinned_json(overlay_pin, "original fixed-pair overlay")
     _exact(overlay, {
         "schema", "campaign_id", "host_id", "spec", "plan", "sources", "execution_source",
@@ -759,6 +1112,144 @@ def build_prepared_host_binding(
     return _prepared_fixed_host_binding_for_overlay(
         preparation, spec, overlay, inputs, input_root, host_id,
     )
+
+
+def _materialized_spec_host_record_at(
+    input_root: Path, spec: dict[str, Any], host_id: str,
+    root_fd: int, directory_fd: int,
+    root_identity: tuple[int, int, int, int],
+    directory_identity: tuple[int, int, int, int],
+) -> tuple[dict[str, str], tuple[dict[str, Any], bytes, str]]:
+    path = _fixed_spec_host_path(input_root, host_id)
+    value, raw, raw_sha256, info = _read_fixed_spec_host_at(
+        input_root, root_fd, directory_fd, root_identity,
+        directory_identity, path.name,
+    )
+    spec_host = next((item for item in spec.get("hosts", [])
+                      if type(item) is dict and item.get("host_id") == host_id), None)
+    _require(type(spec_host) is dict and value == spec_host and
+             stat.S_ISREG(info.st_mode) and
+             info.st_uid == os.getuid() and stat.S_IMODE(info.st_mode) == 0o600 and
+             info.st_nlink == 1 and
+             raw == _canonical(spec_host),
+             f"{host_id} materialized Spec host bytes/mode/link identity differ")
+    return ({"path": str(path), "raw_sha256": raw_sha256},
+            (value, raw, raw_sha256))
+
+
+def _read_prepared_capacity_host_context(
+    preparation: dict[str, Any], inputs: Any, input_root: Path,
+    spec_host: dict[str, Any], host_id: str,
+) -> tuple[Path, dict[str, Any], str]:
+    prepared_record = _exact(preparation.get("observed_hosts", {}).get(host_id),
+                             {"relative_path", "raw_sha256"},
+                             f"{host_id} prepared capacity-host-context pin")
+    prepared_path = _safe_child(input_root, prepared_record["relative_path"],
+                                f"{host_id} prepared capacity-host-context")
+    prepared_value, _prepared_raw, prepared_sha = _read_json(
+        prepared_path, f"{host_id} prepared capacity-host-context",
+        MAX_MANIFEST_BYTES, prepared_record["raw_sha256"],
+    )
+    _require(prepared_sha == prepared_record["raw_sha256"],
+             "prepared capacity-host-context raw pin changed")
+    try:
+        inputs._validate_observed_host_structure(prepared_value, spec_host, host_id)
+    except Exception as error:
+        raise PreparationError(
+            f"{host_id} prepared capacity-host-context failed the unchanged SourceV5 host validator: {error}",
+        ) from error
+    return prepared_path, prepared_value, prepared_sha
+
+
+def materialize_prepared_host_binding(
+    preparation_pin: dict[str, Any], spec_pin: dict[str, Any],
+    source_root: Path, input_root: Path, host_id: str,
+) -> dict[str, Any]:
+    """Materialize the selected Spec host and bind it to the capacity observation.
+
+    This preparatory operation writes only the canonical ``Spec.host`` value at
+    its deterministic private input-root path. It does not create or synthesize
+    a fixed-pair overlay.
+    """
+    (preparation, _sources, campaign_module, inputs, spec,
+     _spec_pin_value) = _prepared_host_binding_inputs(
+        preparation_pin, spec_pin, source_root, input_root, host_id,
+    )
+    source_root = _safe_root(Path(source_root), "SourceV5 root")
+    input_root = _safe_root(Path(input_root), "preparation input root")
+    spec_host = next((item for item in spec["hosts"]
+                      if item["host_id"] == host_id), None)
+    _require(type(spec_host) is dict,
+             "selected SpecV3 host disappeared before materialization")
+    # Validate observed-host controls and canonical Spec.host bytes before
+    # creating the resident directory or any file beneath it.
+    prepared_context = _read_prepared_capacity_host_context(
+        preparation, inputs, input_root, spec_host, host_id,
+    )
+    expected_raw = _canonical(spec_host)
+    _require(campaign_module.canonical_bytes(spec_host) == expected_raw,
+             "selected SpecV3 host canonical encoding changed")
+    path = _fixed_spec_host_path(input_root, host_id)
+    fixed_pin = {"path": str(path), "raw_sha256": _sha256(expected_raw)}
+    binding = _prepared_fixed_host_binding_for_spec_host(
+        preparation, spec, inputs, input_root, host_id, fixed_pin,
+        prepared_context=prepared_context,
+        fixed_spec_host_record=(spec_host, expected_raw, fixed_pin["raw_sha256"]),
+    )
+    with _open_fixed_spec_host_directory(input_root, create=True) as (
+            root_fd, directory_fd, root_identity, directory_identity,
+            directory_path):
+        _require(path.parent == directory_path and fixed_pin["path"] == str(path),
+                 "materialized Spec host escaped its deterministic private directory")
+        _write_fixed_spec_host_at(
+            input_root, source_root, root_fd, directory_fd,
+            root_identity, directory_identity, path.name, expected_raw,
+        )
+        actual_pin, actual_record = _materialized_spec_host_record_at(
+            input_root, spec, host_id, root_fd, directory_fd,
+            root_identity, directory_identity,
+        )
+        _require(actual_pin == fixed_pin and actual_record ==
+                 (spec_host, expected_raw, fixed_pin["raw_sha256"]),
+                 "materialized Spec host changed before its returned pin")
+    return {"fixed_spec_host_pin": fixed_pin,
+            "prepared_host_binding": binding}
+
+
+def verify_prepared_host_binding(
+    preparation_pin: dict[str, Any], spec_pin: dict[str, Any],
+    source_root: Path, input_root: Path, host_id: str,
+) -> dict[str, Any]:
+    """Read-only verification of a pre-materialized Spec host binding."""
+    (preparation, _sources, _campaign, inputs, spec,
+     _spec_pin_value) = _prepared_host_binding_inputs(
+        preparation_pin, spec_pin, source_root, input_root, host_id,
+    )
+    input_root = _safe_root(Path(input_root), "preparation input root")
+    path = _fixed_spec_host_path(input_root, host_id)
+    spec_host = next((item for item in spec["hosts"]
+                      if item["host_id"] == host_id), None)
+    _require(type(spec_host) is dict,
+             "selected SpecV3 host disappeared before verification")
+    prepared_context = _read_prepared_capacity_host_context(
+        preparation, inputs, input_root, spec_host, host_id,
+    )
+    with _open_fixed_spec_host_directory(input_root, create=False) as (
+            root_fd, directory_fd, root_identity, directory_identity,
+            directory_path):
+        _require(path.parent == directory_path,
+                 "read-only prepared host binding changed its deterministic Spec host path")
+        fixed_pin, fixed_record = _materialized_spec_host_record_at(
+            input_root, spec, host_id, root_fd, directory_fd,
+            root_identity, directory_identity,
+        )
+        binding = _prepared_fixed_host_binding_for_spec_host(
+            preparation, spec, inputs, input_root, host_id, fixed_pin,
+            prepared_context=prepared_context,
+            fixed_spec_host_record=fixed_record,
+        )
+    return {"fixed_spec_host_pin": fixed_pin,
+            "prepared_host_binding": binding}
 
 
 def _verify_pilot_overlay_generation(

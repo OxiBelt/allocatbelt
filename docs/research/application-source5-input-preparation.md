@@ -473,8 +473,8 @@ replace missing or invalid originals.
 
 The fixed-pair overlay retains its original `observed_host.pin` to the exact
 SpecV3 host-record bytes. It is not substituted with the separately pinned
-preparation host-context file. Build one closed adapter for the initial host
-generation from an original pair overlay:
+preparation host-context file. The legacy `build_prepared_host_binding` API
+still derives the adapter from an original pair overlay:
 
 ```python
 prepared_host_binding = build_prepared_host_binding(
@@ -486,6 +486,27 @@ prepared_host_binding = build_prepared_host_binding(
     host_id,
 )
 ```
+
+For the preparatory Source5 lane, the adapter is required before the first
+capacity-pilot owner read, so preparation materializes only the selected
+canonical `SpecV3.host` subobject at
+`<input_root>/fixed-spec-hosts/<host_id>.json`. The new
+`materialize_prepared_host_binding(preparation_pin, spec_pin, source_root,
+input_root, host_id)` API uses exclusive creation, mode 0600, and exact-byte
+reopen; an existing file is accepted only when its canonical bytes are
+identical. It validates the pinned capacity-host controls before creating any
+directory, holds no-follow descriptors for the input root and its child for
+the complete create/readback operation, and compares the named directory
+identities before and after file IO. File creation, fsync, and reopen use the
+held child descriptor and a basename rather than resolving the parent again.
+A swapped or symlinked parent is rejected before a file can be written through
+it. It returns the separate `fixed_spec_host_pin` raw pin and the same
+11-field `prepared_host_binding` adapter. The read-only
+`verify_prepared_host_binding` API returns the same two values and rejects a
+missing or changed file without creating or restoring it. The materialized
+Spec host is a global resident input at the catalogue's `observed_host` role,
+separate from the original capacity-host-context pin and outside per-job
+archive closure.
 
 The adapter schema is
 `allocatbelt.application-source5-fixed-pair-host-binding.v1`. Its closed
