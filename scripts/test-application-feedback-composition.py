@@ -42,6 +42,7 @@ reader = _load("feedback_composition_reader_target", SCRIPT_DIR / "application-f
 composition = _load("feedback_composition_target", SCRIPT_DIR / "application-feedback-composition.py")
 capacity = _load("feedback_composition_capacity_target", SCRIPT_DIR / "application-byte-capacity.py")
 feedback_fixtures = _load("feedback_composition_feedback_fixtures", SCRIPT_DIR / "test-application-feedback-readback.py")
+source_inventory = _load("feedback_composition_source_inventory", SCRIPT_DIR / "application-source-inventory.py")
 
 
 def _sha(raw: bytes) -> str:
@@ -238,6 +239,252 @@ class CompositionContractTests(unittest.TestCase):
         pid_before_launch = dict(request, process_id=12345)
         with self.assertRaisesRegex(composition.CompositionError, "unexpected key set"):
             composition._validate_resolve_request(pid_before_launch)
+
+    def test_source5_offline_inventory_closure_preserves_typed_nested_symlink(self) -> None:
+        root = self.root / "source-tree"
+        (root / "vendor" / "deep").mkdir(parents=True)
+        license_path = root / "LICENSE"
+        link_path = root / "vendor" / "deep" / "LICENSE"
+        license_raw = b"license fixture\n"
+        target = "../../LICENSE"
+        license_path.write_bytes(license_raw)
+        link_path.symlink_to(target)
+
+        def inventory(link_target: str = target, *, include_middle: bool = False) -> list[dict[str, Any]]:
+            target_bytes = link_target.encode("utf-8")
+            records: list[dict[str, Any]] = [
+                {
+                    "path": "LICENSE", "kind": "file", "mode": "100644",
+                    "sha256": _sha(license_raw), "size": len(license_raw),
+                },
+                {
+                    "path": "vendor/deep/LICENSE", "kind": "symlink", "mode": "120000",
+                    "target": link_target, "sha256": _sha(target_bytes), "size": len(target_bytes),
+                },
+            ]
+            if include_middle:
+                middle_target = "../../LICENSE"
+                middle_raw = middle_target.encode("utf-8")
+                records.append({
+                    "path": "vendor/deep/middle", "kind": "symlink", "mode": "120000",
+                    "target": middle_target, "sha256": _sha(middle_raw), "size": len(middle_raw),
+                })
+            return sorted(records, key=lambda item: item["path"].encode("utf-8"))
+
+        def replay_context(paths: list[Path]) -> tuple[Any, Any]:
+            entries = [
+                {"origin": str(path), "local": str(path)}
+                for path in sorted(set(paths), key=lambda item: str(item))
+            ]
+            value = {
+                "schema": reader.FEEDBACK_OFFLINE_CONTEXT_SCHEMA,
+                "evidence_path_map": {"schema": reader.EVIDENCE_PATH_MAP_SCHEMA, "entries": entries},
+                "probe_capture_pin": {
+                    "path": str(self.root / "capture.json"),
+                    "raw_sha256": "a" * 64, "receipt_sha256": "b" * 64,
+                },
+                "capacity_bundle": {
+                    "request": {"path": str(self.root / "request.json"), "raw_sha256": "c" * 64},
+                    "artifact": {"path": str(self.root / "capacity.tsv"), "raw_sha256": "d" * 64},
+                    "receipt": {"path": str(self.root / "receipt.json"), "raw_sha256": "e" * 64},
+                },
+            }
+            return reader._validate_feedback_offline_context(value), composition._offline_context(value)
+
+        valid_records = inventory()
+        paths = [root, license_path, link_path]
+        reader_context, composition_context = replay_context(paths)
+        self.assertEqual(reader_context["mapped_files"], frozenset({str(license_path)}))
+        self.assertEqual(reader_context["mapped_symlinks"], frozenset({str(link_path)}))
+        self.assertEqual(composition_context["mapped_files"], frozenset({str(license_path)}))
+        self.assertEqual(composition_context["mapped_symlinks"], frozenset({str(link_path)}))
+        reader._source5_offline_inventory_closure(
+            root, valid_records, set(), reader_context, "test SourceV5",
+        )
+        composition._source5_offline_inventory_closure(
+            root, valid_records, set(), composition_context, "test SourceV5",
+        )
+        inventory_document = {"schema": source_inventory.SCHEMA, "entries": valid_records}
+        self.assertEqual(source_inventory.validate_records(inventory_document), valid_records)
+
+        link_path.unlink()
+        link_path.symlink_to("../../../abcd")
+        outside_contexts = replay_context(paths)
+        for module, context in zip((reader, composition), outside_contexts):
+            with self.assertRaisesRegex(
+                (reader.ValidationError, composition.CompositionError),
+                "literal target/hash/size differs from its SourceV5 typed record",
+            ):
+                module._source5_offline_inventory_closure(
+                    root, valid_records, set(), context, "test SourceV5",
+                )
+
+        unindexed_chain_target = root / "middlex"
+        unindexed_chain_target.symlink_to("LICENSE")
+        link_path.unlink()
+        link_path.symlink_to("../../middlex")
+        chained_live_contexts = replay_context(paths)
+        for module, context in zip((reader, composition), chained_live_contexts):
+            with self.assertRaisesRegex(
+                (reader.ValidationError, composition.CompositionError),
+                "literal target/hash/size differs from its SourceV5 typed record",
+            ):
+                module._source5_offline_inventory_closure(
+                    root, valid_records, set(), context, "test SourceV5",
+                )
+
+        link_path.unlink()
+        link_path.symlink_to("../../../outside")
+        escaping_records = inventory("../../../outside")
+        escaping_contexts = replay_context(paths)
+        for module, context in zip((reader, composition), escaping_contexts):
+            module._source5_offline_inventory_closure(
+                root, escaping_records, set(), context, "test SourceV5",
+            )
+        with self.assertRaises(source_inventory.InventoryError):
+            source_inventory.validate_records({
+                "schema": source_inventory.SCHEMA, "entries": escaping_records,
+            })
+
+        middle_path = root / "vendor" / "deep" / "middle"
+        middle_path.symlink_to("../../LICENSE")
+        link_path.unlink()
+        link_path.symlink_to("middle")
+        chained_records = inventory("middle", include_middle=True)
+        chain_contexts = replay_context([root, license_path, link_path, middle_path])
+        for module, context in zip((reader, composition), chain_contexts):
+            module._source5_offline_inventory_closure(
+                root, chained_records, set(), context, "test SourceV5",
+            )
+        with self.assertRaises(source_inventory.InventoryError):
+            source_inventory.validate_records({
+                "schema": source_inventory.SCHEMA, "entries": chained_records,
+            })
+
+        (root / "vendor" / "deep" / "LICENSE").unlink()
+        (root / "vendor" / "deep" / "LICENSE").symlink_to("middle")
+        license_path.unlink()
+        license_path.symlink_to(self.root / "replacement-target")
+        (self.root / "replacement-target").write_bytes(b"replacement\n")
+        replaced_contexts = replay_context([root, license_path, link_path, middle_path])
+        for module, context in zip((reader, composition), replaced_contexts):
+            with self.assertRaisesRegex(
+                (reader.ValidationError, composition.CompositionError), "path map symlinks differ",
+            ):
+                module._source5_offline_inventory_closure(
+                    root, valid_records, set(), context, "test SourceV5",
+                )
+
+    def test_required_native_source5_symlink_literal_change_is_rejected(self) -> None:
+        capture_mode = os.environ.get("ALLOCATBELT_FEEDBACK_V5_NATIVE_CAPTURE_REQUIRED", "0")
+        manifest_env = os.environ.get("ALLOCATBELT_FEEDBACK_V5_SOURCE_MANIFEST")
+        observed_host_env = os.environ.get("ALLOCATBELT_FEEDBACK_V5_OBSERVED_HOST")
+        if capture_mode == "0" and not manifest_env and not observed_host_env:
+            self.skipTest("ordinary fixture mode only; no native symlink acceptance is claimed")
+        self.assertEqual(
+            capture_mode, "1",
+            "the native symlink identity regression requires REQUIRED=1 and cannot be accepted as a skip",
+        )
+        self.assertTrue(manifest_env and Path(manifest_env).is_file(),
+                        "native symlink regression needs the raw-pinned SourceV5 manifest")
+        self.assertTrue(observed_host_env and Path(observed_host_env).is_file(),
+                        "native symlink regression needs the pinned observed-host context")
+        manifest_path = Path(manifest_env).resolve(strict=True)
+        manifest_raw = manifest_path.read_bytes()
+        source_manifest = reader.parse_json(
+            manifest_raw, "native symlink SourceV5 manifest", reader.MAX_SOURCE_MANIFEST_BYTES,
+        )
+        self.assertEqual(manifest_raw, reader.canonical_bytes(source_manifest))
+        self.assertEqual(source_manifest["schema"], reader.SOURCE_MANIFEST_SCHEMA_V5)
+        self.assertEqual(
+            source_manifest["manifest_sha256"],
+            reader.digest_object({key: value for key, value in source_manifest.items()
+                                  if key != "manifest_sha256"}),
+        )
+        host_path = Path(observed_host_env).resolve(strict=True)
+        host_raw = host_path.read_bytes()
+        observed_host = reader.parse_json(
+            host_raw, "native symlink observed-host context", reader.MAX_SOURCE_MANIFEST_BYTES,
+        )
+        self.assertEqual(host_raw, reader.canonical_bytes(observed_host))
+        self.assertEqual(observed_host["schema"], "allocatbelt.application-capacity-host-context.v1")
+
+        inventory = source_manifest["source"]["files"]
+        native_link = next(
+            record for record in inventory
+            if record.get("kind") == "symlink" and record.get("path") == "crates/allocatbelt/LICENSE"
+        )
+        self.assertEqual(native_link["target"], "../../LICENSE")
+        expected_target = native_link["target"].encode("utf-8")
+        self.assertEqual(native_link["size"], len(expected_target))
+        self.assertGreaterEqual(len(expected_target), len(b"../../../"))
+        substituted_target = b"../../../" + b"x" * (
+            len(expected_target) - len(b"../../../")
+        )
+        self.assertEqual(len(substituted_target), len(expected_target))
+        self.assertNotEqual(substituted_target, expected_target)
+
+        mapped_files: set[Path] = {manifest_path, host_path}
+        mapped_directories: set[Path] = {SOURCE_ROOT.resolve(strict=True)}
+        mapped_symlinks: set[Path] = set()
+        for record in inventory:
+            path = SOURCE_ROOT.joinpath(*Path(record["path"]).parts)
+            if record["kind"] == "symlink":
+                self.assertTrue(stat.S_ISLNK(path.lstat().st_mode), f"typed symlink is missing: {path}")
+                mapped_symlinks.add(path)
+            else:
+                self.assertTrue(path.is_file() and not path.is_symlink(),
+                                f"typed regular file is missing or linked: {path}")
+                mapped_files.add(path)
+        source_artifact_paths = {
+            str(SOURCE_ROOT.joinpath(*Path(item["path"]).parts))
+            for item in source_manifest["artifacts"].values()
+        }
+        for path_text in source_artifact_paths:
+            path = Path(path_text)
+            self.assertTrue(path.is_file() and not path.is_symlink(),
+                            f"SourceV5 artifact is missing or linked: {path}")
+            mapped_files.add(path)
+        mapped_paths = mapped_files | mapped_directories | mapped_symlinks
+        context_value = {
+            "schema": reader.FEEDBACK_OFFLINE_CONTEXT_SCHEMA,
+            "evidence_path_map": {
+                "schema": reader.EVIDENCE_PATH_MAP_SCHEMA,
+                "entries": [
+                    {"origin": str(path), "local": str(path)}
+                    for path in sorted(mapped_paths, key=lambda item: str(item))
+                ],
+            },
+            "probe_capture_pin": {
+                "path": str(self.root / "capture.json"),
+                "raw_sha256": "a" * 64, "receipt_sha256": "b" * 64,
+            },
+            "capacity_bundle": {
+                "request": {"path": str(self.root / "request.json"), "raw_sha256": "c" * 64},
+                "artifact": {"path": str(self.root / "capacity.tsv"), "raw_sha256": "d" * 64},
+                "receipt": {"path": str(self.root / "receipt.json"), "raw_sha256": "e" * 64},
+            },
+        }
+        checked_contexts = (
+            (reader, reader._validate_feedback_offline_context(context_value)),
+            (composition, composition._offline_context(context_value)),
+        )
+        real_readlink = os.readlink
+
+        def substitute_pinned_link(path: Any, *args: Any, **kwargs: Any) -> Any:
+            actual = real_readlink(path, *args, **kwargs)
+            return substituted_target if actual == expected_target else actual
+
+        for module, checked_context in checked_contexts:
+            with mock.patch.object(os, "readlink", side_effect=substitute_pinned_link):
+                with self.assertRaisesRegex(
+                    (reader.ValidationError, composition.CompositionError),
+                    "literal target/hash/size differs from its SourceV5 typed record",
+                ):
+                    module._source5_offline_inventory_closure(
+                        SOURCE_ROOT, inventory, source_artifact_paths,
+                        checked_context, "native SourceV5",
+                    )
 
     def test_final_expectation_parser_requires_capacity_artifact_and_actual_positive_pid(self) -> None:
         fixture = feedback_fixtures.Fixture(self.root / "feedback", "mixed")
@@ -712,6 +959,7 @@ class CompositionContractTests(unittest.TestCase):
                 )
                 mapped_files: set[Path] = set()
                 mapped_directories: set[Path] = set()
+                mapped_symlinks: set[Path] = set()
 
                 def add_mapped_path(path_value: str | Path) -> None:
                     path = Path(path_value).resolve(strict=True)
@@ -720,6 +968,13 @@ class CompositionContractTests(unittest.TestCase):
                     else:
                         self.assertTrue(path.is_file(), f"unexpected offline input type: {path}")
                         mapped_files.add(path)
+
+                def add_mapped_source_symlink(path_value: str | Path) -> None:
+                    path = Path(path_value)
+                    self.assertTrue(stat.S_ISLNK(path.lstat().st_mode),
+                                    f"expected typed SourceV5 symlink: {path}")
+                    self.assertEqual(path.parent.resolve(strict=True), path.parent)
+                    mapped_symlinks.add(path)
 
                 mapped_directories.update({SOURCE_ROOT.resolve(strict=True), self.root.resolve(strict=True),
                                            observed_host_path.parent, capture_directory.resolve(strict=True),
@@ -732,7 +987,11 @@ class CompositionContractTests(unittest.TestCase):
                 add_mapped_path(policy_path)
                 add_mapped_path(composition_receipt_path)
                 for record in source_manifest["source"]["files"]:
-                    add_mapped_path(SOURCE_ROOT.joinpath(*Path(record["path"]).parts))
+                    source_path = SOURCE_ROOT.joinpath(*Path(record["path"]).parts)
+                    if record["kind"] == "symlink":
+                        add_mapped_source_symlink(source_path)
+                    else:
+                        add_mapped_path(source_path)
                 for artifact in source_manifest["artifacts"].values():
                     add_mapped_path(SOURCE_ROOT.joinpath(*Path(artifact["path"]).parts))
                 for pin_value in bundle.values():
@@ -755,7 +1014,7 @@ class CompositionContractTests(unittest.TestCase):
                 trace_directory = Path(capacity_request_value["trace_directory"]).resolve(strict=True)
                 for name in composition.CAPACITY_TRACE_FILES:
                     add_mapped_path(trace_directory / name)
-                map_paths = mapped_files | mapped_directories
+                map_paths = mapped_files | mapped_directories | mapped_symlinks
                 offline_replay_context = {
                     "schema": reader.FEEDBACK_OFFLINE_CONTEXT_SCHEMA,
                     "evidence_path_map": {

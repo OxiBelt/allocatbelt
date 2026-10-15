@@ -610,6 +610,7 @@ def _offline_context(value: object) -> dict[str, Any]:
     mapped: set[str] = set()
     directories: set[str] = set()
     files: set[str] = set()
+    symlinks: set[str] = set()
     for index, entry_value in enumerate(mapping["entries"]):
         entry = exact(entry_value, {"origin", "local"}, f"feedback path map entry[{index}]")
         origin = absolute_path(entry["origin"], f"feedback evidence origin[{index}]")
@@ -619,17 +620,24 @@ def _offline_context(value: object) -> dict[str, Any]:
                 "feedback evidence map must contain sorted unique identity paths")
         previous = origin_text
         try:
-            require(local.resolve(strict=True) == local, "feedback evidence map path traverses a symlink or alias")
+            require(local.parent.resolve(strict=True) == local.parent,
+                    "feedback evidence map path parent traverses a symlink or alias")
             info = local.lstat()
+            if not stat.S_ISLNK(info.st_mode):
+                require(local.resolve(strict=True) == local,
+                        "feedback evidence map path traverses a symlink or alias")
         except OSError as error:
             raise CompositionError(f"feedback evidence map path is unavailable: {error}") from error
-        require(stat.S_ISDIR(info.st_mode) or stat.S_ISREG(info.st_mode),
-                f"feedback evidence map entry[{index}] is not a regular file or directory")
+        require(stat.S_ISDIR(info.st_mode) or stat.S_ISREG(info.st_mode) or
+                stat.S_ISLNK(info.st_mode),
+                f"feedback evidence map entry[{index}] is not a regular file, directory, or typed symlink")
         mapped.add(origin_text)
         if stat.S_ISDIR(info.st_mode):
             directories.add(origin_text)
         elif stat.S_ISREG(info.st_mode):
             files.add(origin_text)
+        else:
+            symlinks.add(origin_text)
     capture = exact(context["probe_capture_pin"], {"path", "raw_sha256", "receipt_sha256"},
                     "offline ProbeV2 capture receipt pin")
     absolute_path(capture["path"], "offline ProbeV2 capture receipt path")
@@ -654,7 +662,7 @@ def _offline_context(value: object) -> dict[str, Any]:
     return types.MappingProxyType({
         "schema": context["schema"], "evidence_path_map": frozen_mapping,
         "mapped_paths": frozenset(mapped), "mapped_directories": frozenset(directories),
-        "mapped_files": frozenset(files),
+        "mapped_files": frozenset(files), "mapped_symlinks": frozenset(symlinks),
         "probe_capture_pin": frozen_capture, "capacity_bundle": frozen_bundle,
     })
 
@@ -918,6 +926,176 @@ def _preflight_capacity_request_trace(
         digest(raw_sha, f"offline capacity {name} trace raw SHA-256")
 
 
+def _verify_source5_symlink_literal(
+    source_root: Path, relative: PurePosixPath, record: object, label: str,
+) -> None:
+    """Compare one mapped symlink's bounded literal bytes without following it."""
+    value = exact(record, {"path", "kind", "mode", "target", "sha256", "size"},
+                  f"{label} symlink inventory record")
+    require(value["path"] == relative.as_posix() and value["kind"] == "symlink" and
+            value["mode"] == "120000",
+            f"{label} symlink record path/kind/mode is invalid")
+    target = value["target"]
+    require(type(target) is str, f"{label} symlink target is malformed")
+    try:
+        expected_target = target.encode("utf-8", "strict")
+    except UnicodeEncodeError as error:
+        raise CompositionError(f"{label} symlink target is not UTF-8") from error
+    expected_size = uint(value["size"], f"{label} symlink target size")
+    expected_sha = digest(value["sha256"], f"{label} symlink target SHA-256")
+    require(0 < len(expected_target) <= 4096 and expected_size == len(expected_target) and
+            sha256(expected_target) == expected_sha,
+            f"{label} symlink target hash/size differs from its typed record")
+    try:
+        components = [part.encode("utf-8", "strict") for part in relative.parts]
+    except UnicodeEncodeError as error:
+        raise CompositionError(f"{label} symlink path is not UTF-8") from error
+    require(bool(components), f"{label} symlink path has no leaf")
+
+    directory_flags = (
+        os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) |
+        getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    )
+    root_fd = -1
+    parent_fd = -1
+    verify_parent_fd = -1
+
+    def stat_key(info: os.stat_result) -> tuple[int, int, int, int, int, int]:
+        return (
+            info.st_dev, info.st_ino, info.st_mode, info.st_size,
+            info.st_mtime_ns, info.st_ctime_ns,
+        )
+
+    def open_parent() -> tuple[int, tuple[tuple[int, int, int, int, int, int], ...]]:
+        current = os.dup(root_fd)
+        identities: list[tuple[int, int, int, int, int, int]] = []
+        try:
+            for component in components[:-1]:
+                try:
+                    child = os.open(component, directory_flags, dir_fd=current)
+                except OSError as error:
+                    raise CompositionError(
+                        f"{label} symlink parent is missing or not a real directory: {error}"
+                    ) from error
+                try:
+                    info = os.fstat(child)
+                    require(stat.S_ISDIR(info.st_mode) and not stat.S_ISLNK(info.st_mode),
+                            f"{label} symlink parent is not a real directory")
+                    identities.append(stat_key(info))
+                except BaseException:
+                    os.close(child)
+                    raise
+                os.close(current)
+                current = child
+            return current, tuple(identities)
+        except BaseException:
+            os.close(current)
+            raise
+
+    try:
+        require(source_root.resolve(strict=True) == source_root,
+                f"{label} source root traverses a symlink or alias")
+        root_path_before = source_root.lstat()
+        require(stat.S_ISDIR(root_path_before.st_mode) and not stat.S_ISLNK(root_path_before.st_mode),
+                f"{label} source root is not a real directory")
+        root_fd = os.open(os.fsencode(str(source_root)), directory_flags)
+        root_before = os.fstat(root_fd)
+        require(stat_key(root_before) == stat_key(root_path_before),
+                f"{label} source root changed while opening")
+
+        parent_fd, parent_ids = open_parent()
+        parent_before = os.fstat(parent_fd)
+        leaf = components[-1]
+        link_before = os.stat(leaf, dir_fd=parent_fd, follow_symlinks=False)
+        require(stat.S_ISLNK(link_before.st_mode),
+                f"{label} typed symlink path is not a symlink")
+        actual_target = os.readlink(leaf, dir_fd=parent_fd)
+        require(type(actual_target) is bytes and len(actual_target) <= 4096 and
+                link_before.st_size == len(actual_target) == expected_size,
+                f"{label} literal symlink target exceeds its finite byte bound or size pin")
+        link_after = os.stat(leaf, dir_fd=parent_fd, follow_symlinks=False)
+        parent_after = os.fstat(parent_fd)
+
+        verify_parent_fd, verify_parent_ids = open_parent()
+        verify_parent_before = os.fstat(verify_parent_fd)
+        verify_link_before = os.stat(leaf, dir_fd=verify_parent_fd, follow_symlinks=False)
+        verify_target = os.readlink(leaf, dir_fd=verify_parent_fd)
+        verify_link_after = os.stat(leaf, dir_fd=verify_parent_fd, follow_symlinks=False)
+        require(verify_link_before.st_size == len(verify_target) == expected_size,
+                f"{label} rechecked symlink target size differs from its typed record")
+        verify_parent_after = os.fstat(verify_parent_fd)
+        root_after = os.fstat(root_fd)
+        root_path_after = source_root.lstat()
+        require(source_root.resolve(strict=True) == source_root,
+                f"{label} source root moved through an alias")
+        require(parent_ids == verify_parent_ids and
+                stat_key(parent_before) == stat_key(parent_after) ==
+                stat_key(verify_parent_before) == stat_key(verify_parent_after),
+                f"{label} symlink parent changed during literal capture")
+        require(stat_key(link_before) == stat_key(link_after) ==
+                stat_key(verify_link_before) == stat_key(verify_link_after) and
+                actual_target == verify_target,
+                f"{label} symlink changed during literal capture")
+        require(stat_key(root_before) == stat_key(root_after) == stat_key(root_path_after),
+                f"{label} source root changed during literal capture")
+    except OSError as error:
+        raise CompositionError(f"cannot safely capture {label} symlink literal: {error}") from error
+    finally:
+        for descriptor in (verify_parent_fd, parent_fd, root_fd):
+            if descriptor >= 0:
+                os.close(descriptor)
+
+    require(actual_target == expected_target and len(actual_target) == expected_size and
+            sha256(actual_target) == expected_sha,
+            f"{label} literal target/hash/size differs from its SourceV5 typed record")
+
+
+def _source5_offline_inventory_closure(
+    source_root: Path, inventory: object, artifact_paths: set[str],
+    context: dict[str, Any], label: str,
+) -> None:
+    """Close typed SourceV5 regular/link paths before the captured verifier runs."""
+    require(type(inventory) is list and len(inventory) <= 16_384,
+            f"{label} typed inventory is malformed or exceeds the path-map bound")
+    records: dict[str, str] = {}
+    source_files: set[str] = set()
+    source_symlinks: set[str] = set()
+    symlink_records: list[tuple[PurePosixPath, dict[str, Any]]] = []
+    for index, value in enumerate(inventory):
+        require(type(value) is dict and type(value.get("kind")) is str,
+                f"{label} inventory entry[{index}] is malformed")
+        relative_text = text(value.get("path"), f"{label} inventory path[{index}]", 4096)
+        relative = PurePosixPath(relative_text)
+        require(not relative.is_absolute() and relative.parts and
+                ".." not in relative.parts and relative.as_posix() == relative_text and
+                "\\" not in relative_text,
+                f"{label} inventory path[{index}] is not portable")
+        kind = value["kind"]
+        require(kind in ("file", "symlink"),
+                f"{label} inventory kind[{index}] is unsupported")
+        require(relative_text not in records,
+                f"{label} inventory repeats {relative_text}")
+        records[relative_text] = kind
+        absolute = str(source_root.joinpath(*relative.parts))
+        if kind == "file":
+            source_files.add(absolute)
+            continue
+        source_symlinks.add(absolute)
+        symlink_records.append((relative, value))
+
+    checked_artifacts = {str(absolute_path(path, f"{label} artifact path"))
+                         for path in artifact_paths}
+    require(not checked_artifacts.intersection(source_files | source_symlinks),
+            f"{label} artifact aliases a typed source path")
+    require(set(context["mapped_symlinks"]) == source_symlinks,
+            f"{label} path map symlinks differ from the typed inventory")
+    _require_mapped(context, source_symlinks, f"{label} symlink member")
+    _require_mapped_files(context, source_files | checked_artifacts,
+                          f"{label} regular inventory/artifact member")
+    for relative, record in symlink_records:
+        _verify_source5_symlink_literal(source_root, relative, record, label)
+
+
 def _preflight_probe_replay(
     request: dict[str, Any], replay_context: dict[str, Any],
 ) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -946,15 +1124,7 @@ def _preflight_probe_replay(
     _require_mapped(replay_context, _absolute_paths(source), "nested SourceV5 manifest evidence")
     inventory = source.get("source", {}).get("files")
     require(type(inventory) is list, "offline SourceV5 typed inventory is missing")
-    nested_source_paths: set[str] = set()
-    for index, record in enumerate(inventory):
-        require(type(record) is dict and type(record.get("path")) is str,
-                f"offline SourceV5 inventory entry[{index}] is malformed")
-        relative = PurePosixPath(record["path"])
-        require(not relative.is_absolute() and ".." not in relative.parts and
-                relative.as_posix() == record["path"],
-                f"offline SourceV5 inventory path[{index}] is not portable")
-        nested_source_paths.add(str(source_root.joinpath(*relative.parts)))
+    artifact_paths: set[str] = set()
     artifacts = source.get("artifacts")
     require(type(artifacts) is dict, "offline SourceV5 artifact table is malformed")
     for artifact_value in artifacts.values():
@@ -964,8 +1134,10 @@ def _preflight_probe_replay(
         require(not relative.is_absolute() and ".." not in relative.parts and
                 relative.as_posix() == artifact_value["path"],
                 "offline SourceV5 artifact path is not portable")
-        nested_source_paths.add(str(source_root.joinpath(*relative.parts)))
-    _require_mapped_files(replay_context, nested_source_paths, "SourceV5 typed source/artifact member")
+        artifact_paths.add(str(source_root.joinpath(*relative.parts)))
+    _source5_offline_inventory_closure(
+        source_root, inventory, artifact_paths, replay_context, "offline SourceV5",
+    )
 
     capture_pin = replay_context["probe_capture_pin"]
     _require_mapped_files(replay_context, {capture_pin["path"]}, "ProbeV2 capture receipt")
@@ -1535,6 +1707,7 @@ def compose_calibrated_policy_v5_offline(
     require(context_capacity == value["capacity_bundle"],
             "offline replay context capacity pins differ from the original composition request")
     source_preflight, _capture_preflight = _preflight_probe_replay(value, checked_context)
+    # Load the captured SourceV5 verifier only after the complete mapped closure passes.
     reader, producer, source, context, identity = _load_verified_inputs(value)
     require(source_preflight.get("manifest_sha256") == source.get("manifest_sha256") and
             source_preflight.get("source", {}).get("source_tree_sha256") ==
