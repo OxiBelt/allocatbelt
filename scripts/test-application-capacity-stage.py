@@ -1307,7 +1307,14 @@ class CapacityStageCliTests(unittest.TestCase):
                         input_context_mode)
         input_context = json.loads(input_context_original)
         self.assertIsInstance(input_context.get("storage"), dict)
-        input_context["storage"]["root_path"] = str(input_storage_root)
+        storage_fs, storage_device = stage._mount_context(input_storage_root)
+        storage_stat = input_storage_root.stat()
+        self.assertEqual(storage_device,
+                         f"{os.major(storage_stat.st_dev)}:{os.minor(storage_stat.st_dev)}")
+        input_context["storage"].update({
+            "root_path": str(input_storage_root),
+            "filesystem_type": storage_fs, "device_major_minor": storage_device,
+        })
         input_context_raw = canonical(input_context)
         write_file(input_context_path, input_context_raw, input_context_mode)
         input_storage_template["context_template"]["raw_sha256"] = sha(input_context_raw)

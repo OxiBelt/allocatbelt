@@ -14,6 +14,38 @@ qualification, or Soak result.
 
 ## Source and host inputs
 
+The Python API can seal the independently replayed three-host capacity cohort
+before final rates, oracles, or a final campaign completion exist:
+
+```python
+generation_pin = preparation.build_prepared_capacity_generation_bounded(
+    preparation_pin, capacity_completion_pins, resource_budget_pins,
+    source_root, input_root, input_root / "prepared-capacity-generation.json",
+)
+generation = preparation.verify_prepared_capacity_generation_bounded(
+    generation_pin, preparation_pin, source_root, input_root,
+)
+```
+
+`capacity_completion_pins` retains the existing ordered three-host inputs:
+`host_id`, `completion_pin`, `verification_receipt_pin`, and
+`evidence_path_map`. `resource_budget_pins` is the exact caller-frozen host
+map. Both calls replay all 45 original capacity contexts through the
+Source-pinned bounded stage verifier. The read-only
+`replay_prepared_capacity_inputs_bounded` API returns the same canonical
+generation without writing it.
+
+The receipt uses the distinct schema
+`allocatbelt.application-source5-prepared-capacity-generation.v1`. It binds
+the preparation intent, ordered capacity records, resource budgets, and
+`generation_sha256`; `complete` covers capacity only and
+`qualification_eligible` remains false. Its fixed output location is inside
+the private input root. Verification reconstructs every producer input and
+compares the complete canonical receipt. It grants no exploration launch or
+final campaign readiness. Existing final-completion schemas reuse the same
+capacity replay and still require their full pilot, oracle, and pressure
+evidence.
+
 Prepare a private mode-0700 input tree outside SourceV5. It contains the
 canonical preparation request, all three real SourceV5 manifests, all three
 observed host-context files, capacity request/context templates, and pressure

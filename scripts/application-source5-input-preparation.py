@@ -1080,18 +1080,11 @@ def export_capacity_pilot(
     }
 
 
-def complete_prepared_inputs(
-    preparation_pin: dict[str, Any],
-    capacity_completion_pins: list[dict[str, Any]],
-    pressure_calibration_pins: list[dict[str, Any]],
-    pilot_pins: list[dict[str, Any]],
-    oracle_pins: list[dict[str, Any]],
-    final_spec_pin: dict[str, Any],
-    final_plan_pin: dict[str, Any],
-    *, write_completion: bool = True,
-    resource_budget_pins: dict[str, Any] | None = None,
-) -> dict[str, Any]:
-    """Bridge independently replayed preparation evidence into final frozen inputs."""
+def _replay_prepared_capacity_inputs(
+    preparation_pin: dict[str, Any], capacity_completion_pins: list[dict[str, Any]],
+    resource_budget_pins: dict[str, Any] | None,
+) -> tuple:
+    """Share the original complete pre-Spec capacity replay without a final gate."""
     prep_ref = _exact(preparation_pin, {"path", "sha256"}, "preparation input pin")
     prep_path = Path(prep_ref["path"])
     _require(prep_path.is_absolute(), "preparation input path must be absolute")
@@ -1262,6 +1255,185 @@ def complete_prepared_inputs(
     }
     _require(set(capacity_by_host) == set(host_ids) and set(capacity_entries) == expected_context_keys,
              "capacity preparation completions do not cover all three hosts and 45 contexts")
+
+    return (
+        prep_ref,
+        input_root,
+        source_root,
+        preparation,
+        sources,
+        campaign,
+        inputs,
+        host_ids,
+        bounded_preparation,
+        capacity_by_host,
+        completion_pin_by_host,
+        capacity_entries,
+        capacity_completions,
+        completion_resource_budget_pins,
+        expected_context_keys,
+        prep_path,
+    )
+
+
+PREPARED_CAPACITY_GENERATION_SCHEMA = \
+    "allocatbelt.application-source5-prepared-capacity-generation.v1"
+
+
+def replay_prepared_capacity_inputs_bounded(
+    preparation_pin: dict[str, Any],
+    capacity_completion_pins: list[dict[str, Any]],
+    resource_budget_pins: dict[str, Any],
+    source_root: Path, input_root: Path,
+) -> dict[str, Any]:
+    """Replay the genuine three-host capacity cohort before rates or oracles exist.
+
+    Completeness here covers only the original 45 capacity contexts. It does
+    not authorize exploration, establish a final input generation, or pass
+    any application qualification gate.
+    """
+    checked_source = _safe_root(source_root, "capacity generation SourceV5 root")
+    checked_input = _safe_root(input_root, "capacity generation input root")
+    preparation_ref = _exact(preparation_pin, {"path", "sha256"},
+                             "capacity generation preparation pin")
+    _require(checked_source == _safe_root(SOURCE_ROOT, "active SourceV5 root") and
+             Path(preparation_ref["path"]).is_absolute() and
+             Path(preparation_ref["path"]).parent == checked_input,
+             "capacity generation differs from its actual Source/input roots")
+    _require(type(capacity_completion_pins) is list and len(capacity_completion_pins) == 3 and
+             type(resource_budget_pins) is dict and len(resource_budget_pins) == 3,
+             "capacity generation requires all three caller-frozen bounded host inputs")
+    bounded_inputs = []
+    for index, value in enumerate(capacity_completion_pins):
+        item = _exact(value, {
+            "host_id", "completion_pin", "verification_receipt_pin", "evidence_path_map",
+        }, f"capacity generation input[{index}]")
+        budget_pin = _exact(resource_budget_pins.get(item["host_id"]), {
+            "path", "raw_sha256", "semantic_sha256",
+        }, f"capacity generation {item['host_id']} resource budget pin")
+        bounded_inputs.append({**item, "resource_budget_pin": budget_pin})
+    replay = _replay_prepared_capacity_inputs(
+        preparation_ref, bounded_inputs, resource_budget_pins,
+    )
+    (prep_ref, replay_input, replay_source, preparation, _sources, _campaign, _inputs,
+     host_ids, bounded, _capacity_by_host, _completion_pins, _entries,
+     capacity_rows, verified_budgets, _expected_contexts, _preparation_path) = replay
+    _require(bounded is True and checked_source == replay_source and
+             checked_input == replay_input and
+             set(verified_budgets) == set(host_ids),
+             "capacity generation changed its bounded Source/input cohort")
+    body = {
+        "schema": PREPARED_CAPACITY_GENERATION_SCHEMA,
+        "campaign_id": preparation["core"]["campaign_id"],
+        "preparation": {"path": prep_ref["path"], "raw_sha256": prep_ref["sha256"],
+                        "semantic_sha256": preparation["preparation_sha256"]},
+        "capacity_preparations": capacity_rows,
+        "resource_budgets": {host: verified_budgets[host] for host in host_ids},
+        "complete": True, "qualification_eligible": False,
+    }
+    return {**body, "generation_sha256": _sha256(_canonical(body))}
+
+
+def build_prepared_capacity_generation_bounded(
+    preparation_pin: dict[str, Any],
+    capacity_completion_pins: list[dict[str, Any]],
+    resource_budget_pins: dict[str, Any],
+    source_root: Path, input_root: Path, output: Path,
+) -> dict[str, Any]:
+    """Persist one independently replayed capacity-only preparation receipt."""
+    checked_input = _safe_root(input_root, "capacity generation input root")
+    _require(output == checked_input / "prepared-capacity-generation.json",
+             "capacity generation output is outside its fixed private input location")
+    value = replay_prepared_capacity_inputs_bounded(
+        preparation_pin, capacity_completion_pins, resource_budget_pins,
+        source_root, checked_input,
+    )
+    raw = _canonical(value)
+    _require(len(raw) <= MAX_PLAN_BYTES,
+             "capacity generation exceeds its finite metadata bound")
+    _write_private_json_new(output, value, source_root, allow_existing_identical=True)
+    return {"path": str(output), "raw_sha256": _sha256(raw),
+            "semantic_sha256": value["generation_sha256"]}
+
+
+def verify_prepared_capacity_generation_bounded(
+    generation_pin: dict[str, Any], preparation_pin: dict[str, Any],
+    source_root: Path, input_root: Path,
+) -> dict[str, Any]:
+    """Recompute the capacity-only receipt from every original producer input."""
+    pin = _exact(generation_pin, {"path", "raw_sha256", "semantic_sha256"},
+                 "prepared capacity generation pin")
+    checked_input = _safe_root(input_root, "capacity generation input root")
+    _require(pin["path"] == str(checked_input / "prepared-capacity-generation.json"),
+             "capacity generation receipt is outside its fixed private input location")
+    value, raw, raw_sha = _read_pinned_json(
+        {"path": pin["path"], "sha256": pin["raw_sha256"]},
+        "prepared capacity generation", MAX_PLAN_BYTES,
+    )
+    _exact(value, {"schema", "campaign_id", "preparation", "capacity_preparations",
+                   "resource_budgets", "complete", "qualification_eligible",
+                   "generation_sha256"}, "prepared capacity generation")
+    body = {key: item for key, item in value.items() if key != "generation_sha256"}
+    _require(value["schema"] == PREPARED_CAPACITY_GENERATION_SCHEMA and
+             value["complete"] is True and value["qualification_eligible"] is False and
+             raw == _canonical(value) and raw_sha == pin["raw_sha256"] and
+             value["generation_sha256"] == pin["semantic_sha256"] == _sha256(_canonical(body)),
+             "capacity generation schema, flags or raw/semantic pin differs")
+    rows = value["capacity_preparations"]
+    _require(type(rows) is list and len(rows) == 3,
+             "capacity generation omits an original host")
+    capacity_inputs = []
+    for index, row in enumerate(rows):
+        _exact(row, {"host_id", "completion", "host_verification", "evidence_path_map",
+                     "completion_sha256", "ledger", "capacity_preparation_templates_sha256",
+                     "entries", "resource_budget", "resource_monitor"},
+               f"capacity generation host[{index}]")
+        capacity_inputs.append({
+            "host_id": row["host_id"], "completion_pin": row["completion"],
+            "verification_receipt_pin": row["host_verification"],
+            "evidence_path_map": row["evidence_path_map"],
+        })
+    replayed = replay_prepared_capacity_inputs_bounded(
+        preparation_pin, capacity_inputs, value["resource_budgets"],
+        source_root, checked_input,
+    )
+    _require(_canonical(replayed) == raw,
+             "capacity generation differs from full original bounded capacity replay")
+    return replayed
+
+
+def complete_prepared_inputs(
+    preparation_pin: dict[str, Any],
+    capacity_completion_pins: list[dict[str, Any]],
+    pressure_calibration_pins: list[dict[str, Any]],
+    pilot_pins: list[dict[str, Any]],
+    oracle_pins: list[dict[str, Any]],
+    final_spec_pin: dict[str, Any],
+    final_plan_pin: dict[str, Any],
+    *, write_completion: bool = True,
+    resource_budget_pins: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Bridge independently replayed preparation evidence into final frozen inputs."""
+    (
+        prep_ref,
+        input_root,
+        source_root,
+        preparation,
+        sources,
+        campaign,
+        inputs,
+        host_ids,
+        bounded_preparation,
+        capacity_by_host,
+        completion_pin_by_host,
+        capacity_entries,
+        capacity_completions,
+        completion_resource_budget_pins,
+        expected_context_keys,
+        prep_path,
+    ) = _replay_prepared_capacity_inputs(
+        preparation_pin, capacity_completion_pins, resource_budget_pins,
+    )
 
     final_spec, final_spec_raw, final_spec_raw_sha = _read_pinned_json(final_spec_pin, "final completed SpecV3")
     final_plan, final_plan_raw, final_plan_raw_sha = _read_pinned_json(final_plan_pin, "final completed PlanV3", MAX_PLAN_BYTES)
