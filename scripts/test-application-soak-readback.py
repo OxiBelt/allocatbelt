@@ -3420,5 +3420,103 @@ class SoakReadbackTests(unittest.TestCase):
             self.assertTrue(self._wait_heartbeat_stopped(heartbeat))
 
 
+
+class CapturedSoakInputTests(unittest.TestCase):
+    """Leaf IO checks use actual fixed-reader0400 snapshots, not origin stats."""
+
+    def _fixture(self, root: Path, raw: bytes):
+        stage = root / "stage"
+        stage.mkdir(mode=0o700)
+        stored = stage / "sample"
+        stored.write_bytes(raw)
+        stored.chmod(0o400)
+        origin = root / "reclaimed" / "resource-samples.tsv"
+        refs = {str(origin): {
+            "origin_path": str(origin), "path": str(stored),
+            "role": "soak_artifact", "host_id": "host",
+            "raw_sha256": hashlib.sha256(raw).hexdigest(),
+            "semantic_sha256": None, "byte_count": len(raw),
+            "maximum_bytes": len(raw),
+        }}
+        return origin, stored, fixed_pair.CapturedFixedPairArtifactsV1(refs, stage)
+
+    def test_captured_lines_hash_exact_bytes_without_origin_stat(self):
+        raw = b"header\nfirst\nlast\n"
+        with tempfile.TemporaryDirectory() as temporary:
+            origin, stored, view = self._fixture(Path(temporary), raw)
+            self.assertFalse(origin.exists())
+            with module.StableInput(origin, "captured sample", len(raw), artifact_view=view) as stream:
+                self.assertIsNone(stream.fd)
+                self.assertIsNone(stream.before)
+                self.assertEqual(stream.size, len(raw))
+                self.assertEqual([stream.readline() for _ in range(4)],
+                                 [b"header\n", b"first\n", b"last\n", b""])
+                self.assertEqual(stream.finish(), hashlib.sha256(raw).hexdigest())
+                self.assertTrue(stream.finished)
+                self.assertIsNone(stream.stream)
+            self.assertTrue(stored.exists())
+
+    def test_captured_json_retains_duplicate_key_rejection(self):
+        for raw, valid in [(b'{"value":1}\n', True), (b'{"value":1,"value":2}\n', False)]:
+            with self.subTest(valid=valid), tempfile.TemporaryDirectory() as temporary:
+                origin, _stored, view = self._fixture(Path(temporary), raw)
+                if valid:
+                    result, checksum, body = module.read_json(origin, "captured JSON", len(raw), artifact_view=view)
+                    self.assertEqual(result, {"value": 1})
+                    self.assertEqual(body, raw)
+                    self.assertEqual(checksum, hashlib.sha256(raw).hexdigest())
+                else:
+                    with self.assertRaises(module.SoakReadbackError):
+                        module.read_json(origin, "captured JSON", len(raw), artifact_view=view)
+
+    def test_missing_or_corrupt_capture_never_selects_existing_origin(self):
+        for kind in ("missing", "corrupt"):
+            with self.subTest(kind=kind), tempfile.TemporaryDirectory() as temporary:
+                raw = b"expected\n"
+                origin, stored, view = self._fixture(Path(temporary), raw)
+                origin.parent.mkdir(mode=0o700)
+                origin.write_bytes(raw)
+                if kind == "missing":
+                    stored.unlink()
+                else:
+                    stored.chmod(0o600)
+                    stored.write_bytes(b"changed!\n")
+                    stored.chmod(0o400)
+                with self.assertRaises((OSError, ValueError)):
+                    module.read_stable_bytes(origin, "corrupt captured sample", len(raw), artifact_view=view)
+                self.assertEqual(origin.read_bytes(), raw)
+
+    def test_capture_limit_fails_before_file_open(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            origin, _stored, view = self._fixture(Path(temporary), b"bounded\n")
+            with mock.patch.object(fixed_pair.os, "open", side_effect=AssertionError("oversize capture opened")):
+                with self.assertRaisesRegex(ValueError, "ceiling"):
+                    module.read_stable_bytes(origin, "oversize sample", 1, artifact_view=view)
+
+    def test_partial_consumption_cannot_finish_and_releases_descriptor(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            origin, _stored, view = self._fixture(Path(temporary), b"first\nlast\n")
+            before = len(list(Path('/proc/self/fd').iterdir()))
+            with self.assertRaisesRegex(module.SoakReadbackError, "not completely read"):
+                with module.StableInput(origin, "partial sample", 100, artifact_view=view) as stream:
+                    self.assertEqual(stream.readline(), b"first\n")
+                    stream.finish()
+            self.assertEqual(len(list(Path('/proc/self/fd').iterdir())), before)
+
+    def test_mutation_after_open_is_rejected_and_releases_descriptor(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            raw = b"first\nlast\n"
+            origin, stored, view = self._fixture(Path(temporary), raw)
+            before = len(list(Path('/proc/self/fd').iterdir()))
+            with self.assertRaisesRegex(ValueError, "changed"):
+                with module.StableInput(origin, "changed sample", 100, artifact_view=view) as stream:
+                    self.assertEqual(stream.read(), raw)
+                    stored.chmod(0o600)
+                    stored.write_bytes(raw)
+                    stored.chmod(0o400)
+                    stream.finish()
+            self.assertEqual(len(list(Path('/proc/self/fd').iterdir())), before)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

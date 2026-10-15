@@ -284,7 +284,8 @@ def _fingerprint(info: os.stat_result) -> tuple[int, int, int, int, int]:
 class StableInput:
     """Read a bounded regular file through one no-follow descriptor and hash those bytes."""
 
-    def __init__(self, path: Path, label: str, maximum: int):
+    def __init__(self, path: Path, label: str, maximum: int, *,
+                 artifact_view: Any | None = None):
         self.path = path
         self.label = label
         self.maximum = maximum
@@ -295,8 +296,28 @@ class StableInput:
         self.consumed = 0
         self.hasher = hashlib.sha256()
         self.finished = False
+        self.artifact_view = artifact_view
+        self._capture_manager: Any | None = None
+        self._capture_entered = False
+        self._capture_sha256: str | None = None
 
     def __enter__(self) -> StableInput:
+        if self.artifact_view is not None:
+            try:
+                snapshot = getattr(self.artifact_view, "open_snapshot", None)
+                require(callable(snapshot), f"{self.label} has no explicit capture snapshot reader")
+                self._capture_manager = snapshot(self.path, self.label, self.maximum)
+                captured = self._capture_manager.__enter__()
+                self._capture_entered = True
+                self.stream, checksum, size = captured
+                require(type(size) is int and 0 <= size <= self.maximum,
+                        f"{self.label} capture exceeds its finite byte bound")
+                self._capture_sha256 = digest(checksum, f"{self.label} capture raw pin")
+                self.size = size
+                return self
+            except BaseException:
+                self.close()
+                raise
         try:
             path_info = self.path.lstat()
             require(stat.S_ISREG(path_info.st_mode), f"{self.label} must be a regular non-symlink file")
@@ -348,8 +369,19 @@ class StableInput:
         return line
 
     def finish(self) -> str:
-        require(self.fd is not None and self.before is not None, f"{self.label} is not open")
         require(self.consumed == self.size, f"{self.label} was not completely read")
+        if self.artifact_view is not None:
+            require(self._capture_entered and self.stream is not None,
+                    f"{self.label} capture is not open")
+            checksum = self.hasher.hexdigest()
+            require(self.stream.read(1) == b"" and checksum == self._capture_sha256,
+                    f"{self.label} capture consumed bytes differ from its exact raw pin")
+            # The capture owner checks its actual file/stage metadata on exit.
+            # No original-host descriptor or stat result is fabricated here.
+            self.close()
+            self.finished = True
+            return checksum
+        require(self.fd is not None and self.before is not None, f"{self.label} is not open")
         try:
             descriptor_after = os.fstat(self.fd)
             path_after = self.path.lstat()
@@ -362,6 +394,13 @@ class StableInput:
         return self.hasher.hexdigest()
 
     def close(self) -> None:
+        if self._capture_entered:
+            manager = self._capture_manager
+            self._capture_entered = False
+            self._capture_manager = None
+            self.stream = None
+            manager.__exit__(None, None, None)
+            return
         if self.stream is not None:
             self.stream.close()
             self.stream = None
@@ -376,8 +415,10 @@ class StableInput:
         self.close()
 
 
-def read_stable_bytes(path: Path, label: str, maximum: int) -> tuple[bytes, str]:
-    with StableInput(path, label, maximum) as source:
+def read_stable_bytes(
+    path: Path, label: str, maximum: int, *, artifact_view: Any | None = None,
+) -> tuple[bytes, str]:
+    with StableInput(path, label, maximum, artifact_view=artifact_view) as source:
         blocks = bytearray()
         while source.consumed < source.size:
             blocks.extend(source.read(min(1024 * 1024, source.size - source.consumed)))
@@ -385,8 +426,10 @@ def read_stable_bytes(path: Path, label: str, maximum: int) -> tuple[bytes, str]
     return bytes(blocks), checksum
 
 
-def read_json(path: Path, label: str, maximum: int) -> tuple[dict[str, Any], str, bytes]:
-    raw, checksum = read_stable_bytes(path, label, maximum)
+def read_json(
+    path: Path, label: str, maximum: int, *, artifact_view: Any | None = None,
+) -> tuple[dict[str, Any], str, bytes]:
+    raw, checksum = read_stable_bytes(path, label, maximum, artifact_view=artifact_view)
     try:
         value = json.loads(
             raw.decode("utf-8"),
