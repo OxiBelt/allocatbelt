@@ -324,7 +324,16 @@ def _stat_key(info: os.stat_result) -> tuple[int, int, int, int, int, int]:
     return (info.st_dev, info.st_ino, info.st_mode, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
 
 
-def read_stable(path: Path, label: str, maximum: int) -> tuple[bytes, str]:
+def read_stable(
+    path: Path, label: str, maximum: int, *, artifact_view: Any = None,
+) -> tuple[bytes, str]:
+    if artifact_view is not None:
+        require(artifact_view.has_file(path), f"{label} is absent from the exact captured refs")
+        raw, checksum = artifact_view.read(path, label, maximum)
+        require(type(raw) is bytes and len(raw) <= maximum and
+                digest(checksum, f"{label} captured raw digest") == sha256_bytes(raw),
+                f"{label} captured bytes differ from their raw digest or bound")
+        return raw, checksum
     try:
         require(path.resolve(strict=True) == path, f"{label} traverses a symlink or alias")
         before_path = path.lstat()
@@ -349,8 +358,14 @@ def read_stable(path: Path, label: str, maximum: int) -> tuple[bytes, str]:
         os.close(fd)
 
 
-def read_canonical(path: Path, label: str, maximum: int, expected_sha: str | None = None) -> tuple[dict[str, Any], str]:
-    raw, raw_sha = read_stable(path, label, maximum)
+def read_canonical(
+    path: Path, label: str, maximum: int, expected_sha: str | None = None,
+    *, artifact_view: Any = None,
+) -> tuple[dict[str, Any], str]:
+    if artifact_view is None:
+        raw, raw_sha = read_stable(path, label, maximum)
+    else:
+        raw, raw_sha = read_stable(path, label, maximum, artifact_view=artifact_view)
     value = parse_json(raw, label, maximum)
     require(raw == canonical_bytes(value), f"{label} is not canonical JSON")
     if expected_sha is not None:
@@ -407,6 +422,7 @@ class BoundedLines:
             raise ValidationError(f"cannot safely open {label}: {error}") from error
         self.before = os.fstat(self.fd)
         require(stat.S_ISREG(self.before.st_mode) and 0 <= self.before.st_size <= maximum_bytes, f"{label} is not a bounded regular file")
+        self.byte_count = self.before.st_size
         self.maximum_bytes = maximum_bytes
         self.hash = hashlib.sha256()
         self.bytes_read = 0
@@ -439,6 +455,69 @@ class BoundedLines:
         require(_stat_key(self.before) == _stat_key(after_fd) == _stat_key(after_path), f"{self.label} changed during streaming read")
         require(self.bytes_read == self.before.st_size, f"{self.label} size differs from bytes consumed")
         return self.hash.hexdigest()
+
+
+class CapturedBoundedLines:
+    """Consume one exact captured trace stream; metadata describes no origin stat."""
+
+    def __init__(
+        self, origin: Path, label: str, maximum_bytes: int, maximum_line: int,
+        artifact_view: Any,
+    ):
+        require(origin.name in TRACE_FILES, f"invalid captured trace filename for {label}")
+        require(artifact_view.has_file(origin), f"{label} is absent from the exact captured refs")
+        self.label, self.maximum_bytes, self.maximum_line = label, maximum_bytes, maximum_line
+        self._snapshot = artifact_view.open_snapshot(origin, label, maximum_bytes)
+        self._stream = None
+        self._entered = False
+        self.byte_count = 0
+        self.bytes_read = 0
+        self.lines = 0
+        self.hash = hashlib.sha256()
+        self._expected_sha = None
+
+    def __enter__(self) -> "CapturedBoundedLines":
+        try:
+            self._stream, checksum, size = self._snapshot.__enter__()
+            self._entered = True
+            require(type(size) is int and 0 <= size <= self.maximum_bytes,
+                    f"{self.label} captured stream exceeds its reader byte bound")
+            self._expected_sha = digest(checksum, f"{self.label} captured stream raw SHA-256")
+            self.byte_count = size
+            return self
+        except BaseException:
+            if self._entered:
+                self._snapshot.__exit__(*sys.exc_info())
+            raise
+
+    def __exit__(self, *error: object) -> None:
+        self._snapshot.__exit__(*error)
+
+    def __iter__(self) -> Iterator[bytes]:
+        require(self._stream is not None, f"{self.label} captured stream is not open")
+        while True:
+            line = self._stream.readline(self.maximum_line + 1)
+            if not line:
+                break
+            require(type(line) is bytes and len(line) <= self.maximum_line,
+                    f"{self.label} contains an oversized line")
+            require(line.endswith(b"\n"), f"{self.label} has a partial final record")
+            require(b"\r" not in line and b"\x00" not in line,
+                    f"{self.label} has invalid framing")
+            self.bytes_read += len(line)
+            require(self.bytes_read <= self.maximum_bytes,
+                    f"{self.label} exceeded its byte bound while reading")
+            self.lines += 1
+            self.hash.update(line)
+            yield line[:-1]
+
+    def finish(self, _directory_fd: int | None = None) -> str:
+        require(self._stream is not None and self.bytes_read == self.byte_count,
+                f"{self.label} size differs from bytes consumed")
+        checksum = self.hash.hexdigest()
+        require(checksum == self._expected_sha,
+                f"{self.label} captured stream differs from its exact raw digest")
+        return checksum
 
 
 def build_pressure_expectation_recipe(spec: object) -> tuple[bytes, str]:
@@ -4696,12 +4775,12 @@ def _verify_feedback_replay(
         require(manifest["artifacts"]["feedback-events.jsonl"]["sha256"] == artifact_pins["feedback-events.jsonl"], "manifest event digest differs from separately pinned raw SHA-256")
         require(manifest["artifacts"]["resource-samples.tsv"]["sha256"] == artifact_pins["resource-samples.tsv"], "manifest sample digest differs from separately pinned raw SHA-256")
         with BoundedLines(root_fd, "feedback-events.jsonl", "feedback events", MAX_EVENT_FILE_BYTES, MAX_EVENT_LINE_BYTES) as events_file:
-            require(events_file.before.st_size == manifest["artifacts"]["feedback-events.jsonl"]["bytes"], "event file size differs from manifest")
+            require(events_file.byte_count == manifest["artifacts"]["feedback-events.jsonl"]["bytes"], "event file size differs from manifest")
             events_sha, model, event_info = _validate_event_stream(
                 events_file, root_fd, recipe, manifest, artifact_pins["feedback-events.jsonl"],
             )
         with BoundedLines(root_fd, "resource-samples.tsv", "resource samples", MAX_SAMPLE_FILE_BYTES, MAX_SAMPLE_LINE_BYTES) as samples_file:
-            require(samples_file.before.st_size == manifest["artifacts"]["resource-samples.tsv"]["bytes"], "resource sample file size differs from manifest")
+            require(samples_file.byte_count == manifest["artifacts"]["resource-samples.tsv"]["bytes"], "resource sample file size differs from manifest")
             samples_sha = _validate_resource_sample_rows(
                 samples_file, root_fd, recipe, manifest, artifact_pins["resource-samples.tsv"], model, event_info,
             )

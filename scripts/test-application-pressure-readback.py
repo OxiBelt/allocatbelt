@@ -1180,12 +1180,32 @@ class PressurePairHostReceiptSchemaTests(unittest.TestCase):
             node.name: node for node in reader_tree.body
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
         }
-        offline = reader_functions["verify_source5_soak_pressure_offline"]
+        offline = reader_functions["_verify_source5_soak_pressure_offline_impl"]
         assert_call_shapes(offline, reader_functions, {
             "read_canonical": readback.read_canonical,
             "_validate_recipe": readback._validate_recipe,
             "verify_pressure": readback.verify_pressure,
         })
+        for wrapper_name, bounded_v3 in (
+            ("verify_source5_soak_pressure_offline", False),
+            ("verify_source5_soak_pressure_offline_v3", True),
+        ):
+            wrapper = reader_functions[wrapper_name]
+            assert_call_shapes(wrapper, reader_functions, {
+                "_verify_source5_soak_pressure_offline_impl":
+                    readback._verify_source5_soak_pressure_offline_impl,
+            })
+            public = getattr(readback, wrapper_name)
+            arguments = (object(), object(), object())
+            keywords = {"evidence_path_map": object(), "source_root": object()}
+            inspect.signature(public).bind(*arguments, **keywords)
+            marker = object()
+            with patch.object(readback, "_verify_source5_soak_pressure_offline_impl",
+                              autospec=True, return_value=marker) as implementation:
+                self.assertIs(public(*arguments, **keywords), marker)
+                implementation.assert_called_once_with(
+                    *arguments, **keywords, bounded_v3=bounded_v3,
+                )
 
         test_tree = ast.parse(Path(__file__).read_text(encoding="utf-8"))
         test_functions = {

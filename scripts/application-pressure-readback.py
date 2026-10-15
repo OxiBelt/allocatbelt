@@ -374,8 +374,17 @@ def _stat_key(info: os.stat_result) -> tuple[int, int, int, int, int, int]:
     return (info.st_dev, info.st_ino, info.st_mode, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
 
 
-def read_stable(path: Path, label: str, maximum: int) -> tuple[bytes, str]:
+def read_stable(
+    path: Path, label: str, maximum: int, *, artifact_view: Any = None,
+) -> tuple[bytes, str]:
     path = _checked_evidence_path(path)
+    if artifact_view is not None:
+        require(artifact_view.has_file(path), f"{label} is absent from the exact captured refs")
+        raw, checksum = artifact_view.read(path, label, maximum)
+        require(type(raw) is bytes and len(raw) <= maximum and
+                sha256(checksum, f"{label} captured raw digest") == sha256_bytes(raw),
+                f"{label} captured bytes differ from their raw digest or bound")
+        return raw, checksum
     try:
         require(path.resolve(strict=True) == path, f"{label} path traverses a symlink or alias")
         path_info = path.lstat()
@@ -403,8 +412,13 @@ def read_stable(path: Path, label: str, maximum: int) -> tuple[bytes, str]:
         os.close(descriptor)
 
 
-def read_canonical(path: Path, label: str, maximum: int) -> tuple[dict[str, Any], bytes, str]:
-    raw, digest = read_stable(path, label, maximum)
+def read_canonical(
+    path: Path, label: str, maximum: int, *, artifact_view: Any = None,
+) -> tuple[dict[str, Any], bytes, str]:
+    if artifact_view is None:
+        raw, digest = read_stable(path, label, maximum)
+    else:
+        raw, digest = read_stable(path, label, maximum, artifact_view=artifact_view)
     value = parse_object(raw, label, maximum)
     require(raw == canonical_bytes(value), f"{label} is not canonical JSON")
     return value, raw, digest
@@ -2445,10 +2459,58 @@ def _validate_calibration_v2_recipe(recipe: dict[str, Any], *, offline_context: 
     }
 
 
+def _pressure_event_records(
+    stream: Any, expected_bytes: int, maximum_bytes: int, state: dict[str, Any],
+) -> Iterator[dict[str, Any]]:
+    digest = hashlib.sha256()
+    total = 0
+    event_count = 0
+    while True:
+        line = stream.readline(MAX_EVENT_LINE_BYTES + 1)
+        if not line:
+            break
+        require(len(line) <= MAX_EVENT_LINE_BYTES and line.endswith(b"\n"), f"pressure event line {event_count} is sparse or oversized")
+        require(b"\r" not in line and b"\0" not in line, f"pressure event line {event_count} has invalid framing")
+        total += len(line)
+        require(total <= maximum_bytes and total <= expected_bytes, "pressure event stream exceeded its frozen byte budget")
+        digest.update(line)
+        value = parse_object(line[:-1], f"pressure event[{event_count}]", MAX_EVENT_LINE_BYTES)
+        require(line == canonical_bytes(value), f"pressure event line {event_count} is not canonical")
+        event_count += 1
+        require(event_count <= MAX_EVENT_COUNT, "pressure event count exceeds its hard bound")
+        state["event_count"] = event_count
+        yield value
+    return digest.hexdigest(), total, event_count
+
+
+def _finish_pressure_events(
+    actual: str, total: int, event_count: int, expected_sha: str,
+    state: dict[str, Any],
+) -> None:
+    require(actual == expected_sha, "pressure events differ from separately supplied raw digest")
+    require(1 <= event_count <= MAX_EVENT_COUNT, "pressure event count is outside its hard bound")
+    state["events_sha256"] = actual
+    state["events_bytes"] = total
+
+
 def _iter_events(
     path: Path, expected_sha: str, expected_bytes: int, maximum_bytes: int,
-    state: dict[str, Any],
+    state: dict[str, Any], *, artifact_view: Any = None,
 ) -> Iterator[dict[str, Any]]:
+    if artifact_view is not None:
+        path = _checked_evidence_path(path)
+        require(artifact_view.has_file(path), "pressure events are absent from the exact captured refs")
+        with artifact_view.open_snapshot(path, "pressure events", maximum_bytes) as (stream, raw_sha, byte_count):
+            require(type(byte_count) is int and 0 <= byte_count <= maximum_bytes and
+                    byte_count == expected_bytes and raw_sha == expected_sha,
+                    "captured pressure event size/raw pin differs from its frozen budget/receipt")
+            actual, total, event_count = yield from _pressure_event_records(
+                stream, expected_bytes, maximum_bytes, state,
+            )
+            require(total == byte_count == expected_bytes,
+                    "captured pressure event bytes differ from their exact snapshot size")
+        _finish_pressure_events(actual, total, event_count, expected_sha, state)
+        return
     try:
         require(path.resolve(strict=True) == path, "pressure events path traverses a symlink or alias")
         path_info = path.lstat()
@@ -2461,32 +2523,13 @@ def _iter_events(
         before = os.fstat(stream.fileno())
         require(stat.S_ISREG(before.st_mode) and _stat_key(before) == _stat_key(path_info), "pressure events changed while opening")
         require(0 <= before.st_size <= maximum_bytes and before.st_size == expected_bytes, "pressure event size differs from its frozen budget/receipt")
-        digest = hashlib.sha256()
-        total = 0
-        event_count = 0
-        while True:
-            line = stream.readline(MAX_EVENT_LINE_BYTES + 1)
-            if not line:
-                break
-            require(len(line) <= MAX_EVENT_LINE_BYTES and line.endswith(b"\n"), f"pressure event line {event_count} is sparse or oversized")
-            require(b"\r" not in line and b"\0" not in line, f"pressure event line {event_count} has invalid framing")
-            total += len(line)
-            require(total <= maximum_bytes and total <= expected_bytes, "pressure event stream exceeded its frozen byte budget")
-            digest.update(line)
-            value = parse_object(line[:-1], f"pressure event[{event_count}]", MAX_EVENT_LINE_BYTES)
-            require(line == canonical_bytes(value), f"pressure event line {event_count} is not canonical")
-            event_count += 1
-            require(event_count <= MAX_EVENT_COUNT, "pressure event count exceeds its hard bound")
-            state["event_count"] = event_count
-            yield value
+        actual, total, event_count = yield from _pressure_event_records(
+            stream, expected_bytes, maximum_bytes, state,
+        )
         after_fd = os.fstat(stream.fileno())
         after_path = path.lstat()
         require(_stat_key(before) == _stat_key(after_fd) == _stat_key(after_path) and total == before.st_size == expected_bytes, "pressure event file changed during streaming verification")
-        actual = digest.hexdigest()
-        require(actual == expected_sha, "pressure events differ from separately supplied raw digest")
-        require(1 <= event_count <= MAX_EVENT_COUNT, "pressure event count is outside its hard bound")
-        state["events_sha256"] = actual
-        state["events_bytes"] = total
+        _finish_pressure_events(actual, total, event_count, expected_sha, state)
     finally:
         stream.close()
 
