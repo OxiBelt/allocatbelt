@@ -289,6 +289,7 @@ fn calibrated_mixed_application_domain() -> ApplicationDomain {
       sha256: &sha256,
       host_id: "agent-9700x",
       source_sha256: &source_sha256,
+      capacity_floor_policy_id: None,
     },
   );
   std::fs::remove_file(path).expect("remove temporary calibration input after loading");
@@ -1056,6 +1057,70 @@ fn calibrated_feedback_clips_bucket_roofs_but_keeps_raw_sensor_denominators() {
 
 #[cfg(feature = "resource-feedback")]
 #[test]
+fn capacity_relative_floor_uses_checked_floor_rounding_and_preserves_the_static_default() {
+  for (capacity, expected) in [
+    (1, 1),
+    (9, 1),
+    (10, 1),
+    (19, 1),
+    (20, 2),
+    (4_617_956, 461_795),
+    (
+      APPLICATION_RATE_CEILING_BYTES_PER_SECOND * 2,
+      FEEDBACK_RATE_FLOOR,
+    ),
+  ] {
+    assert_eq!(
+      capacity_relative_floor(FEEDBACK_RATE_FLOOR, capacity)
+        .expect("checked capacity-relative floor"),
+      expected,
+    );
+  }
+
+  let (_domain, mut calibrated) = loaded_test_calibrations("mixed", "4617956", "4617956");
+  calibrated.capacity_floor_policy = CapacityFloorPolicy::CapacityRelativeTenth;
+  let resolved = resolve_application_feedback(Workload::Mixed, 4, &calibrated)
+    .expect("explicit relative policy resolves an independently measured capacity");
+  assert_eq!(
+    resolved.capacity_floor_policy_id,
+    Some(CAPACITY_FLOOR_POLICY_ID)
+  );
+  assert_eq!(resolved.policy.disk_rate.floor, 461_795);
+  assert_eq!(resolved.policy.network_rate.floor, 461_795);
+  assert_eq!(resolved.policy.disk_rate.initial, 4_617_956);
+  assert_eq!(resolved.policy.disk_rate.ceiling, 4_617_956);
+  assert_eq!(resolved.policy.network_rate.initial, 4_617_956);
+  assert_eq!(resolved.policy.network_rate.ceiling, 4_617_956);
+  assert_eq!(resolved.rates.disk.burst_bytes, RATE_BURST_BYTES);
+  assert_eq!(resolved.rates.download.burst_bytes, RATE_BURST_BYTES);
+  assert_eq!(resolved.rates.disk.max_reservations, RATE_RESERVATIONS);
+  assert_eq!(resolved.rates.download.max_reservations, RATE_RESERVATIONS);
+
+  let (_domain, static_default) = loaded_test_calibrations("mixed", "4617956", "4617956");
+  assert_eq!(
+    static_default.capacity_floor_policy,
+    CapacityFloorPolicy::StaticDefault
+  );
+  assert!(resolve_application_feedback(Workload::Mixed, 4, &static_default).is_err());
+  assert_eq!(feedback_policy(4).disk_rate.floor, FEEDBACK_RATE_FLOOR);
+}
+
+#[cfg(feature = "resource-feedback")]
+#[test]
+fn capacity_relative_floor_activation_requires_pressure_and_a_validated_artifact() {
+  let relative = CapacityFloorPolicy::CapacityRelativeTenth;
+  assert!(validate_capacity_floor_activation(relative, false, Some(true)).is_err());
+  assert!(validate_capacity_floor_activation(relative, true, Some(false)).is_err());
+  assert!(validate_capacity_floor_activation(relative, true, None).is_ok());
+  assert!(validate_capacity_floor_activation(relative, true, Some(true)).is_ok());
+  assert!(
+    validate_capacity_floor_activation(CapacityFloorPolicy::StaticDefault, false, Some(false))
+      .is_ok()
+  );
+}
+
+#[cfg(feature = "resource-feedback")]
+#[test]
 fn calibrated_feedback_rejects_relevant_missing_and_below_floor_sources() {
   let (_domain, missing_disk) = loaded_test_calibrations("disk", "missing", "missing");
   assert!(resolve_application_feedback(Workload::Disk, 2, &missing_disk).is_err());
@@ -1068,6 +1133,12 @@ fn calibrated_feedback_rejects_relevant_missing_and_below_floor_sources() {
 
   let (_domain, download_below_floor) = loaded_test_calibrations("http", "missing", "1000000");
   assert!(resolve_application_feedback(Workload::Http, 2, &download_below_floor).is_err());
+
+  let (_domain, measured_download_below_default) =
+    loaded_test_calibrations("http", "missing", "4617956");
+  assert!(
+    resolve_application_feedback(Workload::Http, 2, &measured_download_below_default).is_err()
+  );
 
   let (_domain, missing_mixed_download) = loaded_test_calibrations("mixed", "750000000", "missing");
   assert!(resolve_application_feedback(Workload::Mixed, 4, &missing_mixed_download).is_err());

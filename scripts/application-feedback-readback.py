@@ -16,6 +16,7 @@ import copy
 import hashlib
 import json
 import os
+import platform
 import re
 import selectors
 import signal
@@ -23,6 +24,7 @@ import stat
 import subprocess
 import sys
 import time
+import types
 from pathlib import Path, PurePosixPath
 from typing import Any, BinaryIO, Callable, Iterator
 
@@ -32,6 +34,7 @@ EXPECTATION_SCHEMA_V2 = "allocatbelt.application-feedback-expectation.v2"
 EXPECTATION_SCHEMA_V3 = "allocatbelt.application-feedback-expectation.v3"
 EXPECTATION_SCHEMA_V4 = "allocatbelt.application-feedback-expectation.v4"
 EXPECTATION_SCHEMA_V5 = "allocatbelt.application-feedback-expectation.v5"
+EXPECTATION_SCHEMA_V6 = "allocatbelt.application-feedback-expectation.v6"
 EXPECTATION_SCHEMA = EXPECTATION_SCHEMA_V2
 CONSTRUCTION_PROBE_SCHEMA = "allocatbelt.application-feedback-policy-probe.v1"
 TRACE_MANIFEST_SCHEMA = "allocatbelt.application-feedback-trace-manifest.v1"
@@ -44,6 +47,7 @@ SOURCE_MANIFEST_SCHEMA_V5 = "allocatbelt.application-source-manifest.v5"
 SOURCE_V5_CONTROLLER_PATH = "scripts/application-campaign.py"
 SOURCE_V5_CAMPAIGN_INPUTS_PATH = "scripts/application-campaign-inputs.py"
 PRESSURE_READBACK_SCHEMA = "allocatbelt.application-pressure-readback.v1"
+PRESSURE_READBACK_SCHEMA_V2 = "allocatbelt.application-pressure-readback.v2"
 RUNTIME_BINDING_SCHEMA_V1 = "allocatbelt.application-runtime-binding.v1"
 RUNTIME_BINDING_SCHEMA_V2 = "allocatbelt.application-runtime-binding.v2"
 RUNTIME_SOAK_SCHEMA_V2 = "allocatbelt.runtime-soak.v2"
@@ -98,6 +102,42 @@ MAX_SOAK_BINDING_BYTES = 256 * 1024
 MAX_CONSTRUCTION_PROBE_BYTES = 512 * 1024
 MAX_PROBE_OUTPUT_BYTES = 512 * 1024
 MAX_APP_BINARY_BYTES = 512 * 1024 * 1024
+PROBE_CAPTURE_RECEIPT_SCHEMA = "allocatbelt.application-feedback-probe-capture.v2"
+FEEDBACK_OFFLINE_CONTEXT_SCHEMA = "allocatbelt.application-feedback-offline-replay-context.v1"
+EVIDENCE_PATH_MAP_SCHEMA = "allocatbelt.application-pressure-evidence-path-map.v1"
+PRESSURE_PAIR_REPLAY_REQUEST_SCHEMA = "allocatbelt.application-feedback-pressure-pair-replay-request.v1"
+CAPACITY_REQUEST_SCHEMA_V1 = "allocatbelt.application-byte-capacity-request.v1"
+CAPACITY_TRACE_FILES = (
+    "feedback-trace-manifest.tsv", "feedback-events.jsonl", "resource-samples.tsv",
+)
+MAX_OFFLINE_PATH_MAP_ENTRIES = 16_384
+MAX_OFFLINE_NESTED_JSON_BYTES = 256 * 1024 * 1024
+MAX_PROBE_CAPTURE_RECEIPT_BYTES = 16 * 1024 * 1024
+MAX_PROBE_OWNER_RESULT_BYTES = 16 * 1024 * 1024
+MAX_PROBE_TMPDIR_INVENTORY_BYTES = 16 * 1024 * 1024
+MAX_PROBE_CAPTURE_FAILURE_BYTES = 64 * 1024
+PROBE_OWNER_RESULT_SCHEMA = "allocatbelt.application-feedback-probe-owner-result.v1"
+PROBE_TMPDIR_INVENTORY_SCHEMA = "allocatbelt.application-feedback-probe-tmpdir-inventory.v1"
+PROBE_CAPTURE_FAILURE_SCHEMA = "allocatbelt.application-feedback-probe-capture-failure.v1"
+PROBE_CAPTURE_RECEIPT_FIELDS = {
+    "schema", "source_manifest", "capacity_bundle", "capacity_tsv", "probe_pin", "binary", "observed_host",
+    "origin_facts", "probe_argv", "environment", "cwd", "affinity", "netns", "capture_timeout_ns",
+    "start_callback_count", "start_callback_proof", "start", "owner_result_pin",
+    "tmpdir_inventory_pin", "stdout", "stderr", "exit_status", "output_matches_probe", "stderr_empty",
+    "storage_budget", "output_mount", "tmpdir_initial", "tmpdir_final",
+    "owner_modules", "qualification_eligible", "execution_ready", "controller_chronology_proven",
+    "receipt_sha256",
+}
+DIRECT_CAPTURE_FIELDS = {
+    "status", "child_return_code", "start", "binary_path", "binary_sha256", "binary_device",
+    "binary_inode", "binary_size", "requested_argv", "requested_argv_sha256", "environment",
+    "environment_sha256", "cwd", "cpu_affinity", "network_namespace_inode", "received_signal",
+    "supervision", "timing", "started_monotonic_ns", "ended_monotonic_ns",
+}
+APP_CAPTURE_OWNER_START_FIELDS = {
+    "pid", "start_ticks", "requested_argv", "requested_argv_sha256", "environment_sha256",
+}
+APP_CAPTURE_START_ROLE_FIELDS = {"schema", "role", "owner_proof", "start_sha256"}
 PROBE_TERM_GRACE_SECONDS = 0.2
 PROBE_KILL_GRACE_SECONDS = 1.0
 PROBE_REAP_GRACE_SECONDS = 0.25
@@ -246,6 +286,33 @@ def digest(value: object, label: str) -> str:
     return result
 
 
+def validate_probe_capture_receipt_envelope(
+    raw: object, expected_raw_sha256: object, expected_receipt_sha256: object,
+) -> dict[str, Any]:
+    """Validate raw and semantic digest roles for one closed ProbeV2 receipt envelope."""
+    require(type(raw) is bytes, "ProbeV2 capture envelope must be raw bytes")
+    expected_raw = digest(expected_raw_sha256, "ProbeV2 capture envelope raw SHA-256")
+    expected_semantic = digest(expected_receipt_sha256, "ProbeV2 capture envelope semantic SHA-256")
+    require(len(raw) <= MAX_PROBE_CAPTURE_RECEIPT_BYTES,
+            "ProbeV2 capture envelope exceeds its finite byte bound")
+    actual_raw = sha256_bytes(raw)
+    require(actual_raw == expected_raw,
+            "ProbeV2 capture envelope raw SHA-256 differs from its pin")
+    receipt = parse_json(raw, "ProbeV2 capture receipt", MAX_PROBE_CAPTURE_RECEIPT_BYTES)
+    require(canonical_bytes(receipt) == raw,
+            "ProbeV2 capture receipt is not canonical JSON")
+    exact(receipt, PROBE_CAPTURE_RECEIPT_FIELDS, "ProbeV2 capture receipt")
+    body = {key: item for key, item in receipt.items() if key != "receipt_sha256"}
+    require(receipt["schema"] == PROBE_CAPTURE_RECEIPT_SCHEMA and
+            digest(receipt["receipt_sha256"], "ProbeV2 capture receipt digest") ==
+            expected_semantic == digest_object(body) and
+            receipt["qualification_eligible"] is False and
+            receipt["execution_ready"] is False and
+            receipt["controller_chronology_proven"] is False,
+            "ProbeV2 capture receipt schema, semantic digest or eligibility flags differ")
+    return receipt
+
+
 def absolute_path(value: object, label: str) -> Path:
     raw = text(value, label, 4096)
     path = Path(raw)
@@ -261,7 +328,8 @@ def read_stable(path: Path, label: str, maximum: int) -> tuple[bytes, str]:
     try:
         require(path.resolve(strict=True) == path, f"{label} traverses a symlink or alias")
         before_path = path.lstat()
-        require(stat.S_ISREG(before_path.st_mode), f"{label} must be a regular nonsymlink file")
+        require(stat.S_ISREG(before_path.st_mode) and before_path.st_uid == os.getuid(),
+                f"{label} must be an owned regular nonsymlink file")
         fd = os.open(path, os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
     except OSError as error:
         raise ValidationError(f"cannot safely open {label}: {error}") from error
@@ -388,13 +456,14 @@ def _validate_expectation_body(value: object) -> dict[str, Any]:
     require(type(value) is dict, "feedback expectation must be one JSON object")
     schema = value.get("schema")
     require(
-        schema in (EXPECTATION_SCHEMA_V1, EXPECTATION_SCHEMA_V2, EXPECTATION_SCHEMA_V3, EXPECTATION_SCHEMA_V4, EXPECTATION_SCHEMA_V5),
+        schema in (EXPECTATION_SCHEMA_V1, EXPECTATION_SCHEMA_V2, EXPECTATION_SCHEMA_V3, EXPECTATION_SCHEMA_V4, EXPECTATION_SCHEMA_V5, EXPECTATION_SCHEMA_V6),
         "unsupported feedback expectation schema",
     )
-    expectation_v2 = schema in (EXPECTATION_SCHEMA_V2, EXPECTATION_SCHEMA_V3, EXPECTATION_SCHEMA_V4, EXPECTATION_SCHEMA_V5)
+    expectation_v2 = schema in (EXPECTATION_SCHEMA_V2, EXPECTATION_SCHEMA_V3, EXPECTATION_SCHEMA_V4, EXPECTATION_SCHEMA_V5, EXPECTATION_SCHEMA_V6)
     expectation_v3 = schema == EXPECTATION_SCHEMA_V3
     expectation_v4 = schema == EXPECTATION_SCHEMA_V4
-    expectation_v5 = schema == EXPECTATION_SCHEMA_V5
+    expectation_v5 = schema in (EXPECTATION_SCHEMA_V5, EXPECTATION_SCHEMA_V6)
+    expectation_v6 = schema == EXPECTATION_SCHEMA_V6
     recipe_keys = {
         "schema", "mode", "identity", "policy", "app_capacity_artifact_sha256",
         "host_binding", "external_pressure_proof", "final_runtime_binding",
@@ -472,7 +541,19 @@ def _validate_expectation_body(value: object) -> dict[str, Any]:
         "rate_buckets", "collector",
     }
     policy_keys.add("meter_source_bounds" if expectation_v2 else "meter_sources")
+    if expectation_v6:
+        policy_keys.update({"capacity_floor_policy_id", "capacity_floor_policy"})
     policy = exact(recipe["policy"], policy_keys, "feedback policy expectation")
+    selected_floor_policy_id = policy.get("capacity_floor_policy_id")
+    if selected_floor_policy_id is not None:
+        descriptor = _validate_capacity_floor_policy_descriptor(
+            policy.get("capacity_floor_policy"),
+        )
+        require(selected_floor_policy_id == descriptor["policy_id"] == CAPACITY_FLOOR_POLICY_ID,
+                "feedback expectation floor policy ID differs from its source-published descriptor")
+        require(recipe["mode"] == "pressure_validation" and
+                identity["pressure_qualification"] is True,
+                "capacity-relative floors require the explicit external-pressure opt-in")
     require(policy["version"] == "runtime-feedback-policy-v1", "unsupported feedback policy version")
     for key, expected in (("sample_interval_ns", 100_000_000), ("max_dense_gap_ns", 200_000_000),
                           ("telemetry_freshness_ns", 500_000_000), ("required_breach_samples", 3),
@@ -626,6 +707,30 @@ def _validate_meter_source_bounds(
     return validated
 
 
+def _validate_capacity_floor_policy_descriptor(value: object) -> dict[str, Any]:
+    descriptor = exact(value, {
+        "capacity_divisor", "minimum_floor_bytes_per_second", "policy_id",
+        "probe_activation", "rule", "rule_version", "runtime_activation",
+        "static_floor_bytes_per_second", "static_rate_roof_bytes_per_second",
+    }, "SourceV5 calibrated capacity-floor policy")
+    numeric = {
+        "capacity_divisor": CAPACITY_FLOOR_DIVISOR,
+        "minimum_floor_bytes_per_second": CAPACITY_FLOOR_MINIMUM_BYTES_PER_SECOND,
+        "static_floor_bytes_per_second": CAPACITY_RATE_FLOOR,
+        "static_rate_roof_bytes_per_second": CAPACITY_RATE_ROOF,
+    }
+    for field, expected in numeric.items():
+        require(uint(descriptor[field], f"capacity floor policy {field}", positive=True) == expected,
+                f"capacity floor policy {field} differs from the independent reader contract")
+    require(descriptor["policy_id"] == CAPACITY_FLOOR_POLICY_ID and
+            descriptor["probe_activation"] == CAPACITY_FLOOR_PROBE_ACTIVATION and
+            descriptor["rule"] == CAPACITY_FLOOR_RULE and
+            descriptor["rule_version"] == CAPACITY_RESOLUTION_VERSION and
+            descriptor["runtime_activation"] == CAPACITY_FLOOR_RUNTIME_ACTIVATION,
+            "capacity floor policy ID, arithmetic, or activation differs from the independent reader contract")
+    return descriptor
+
+
 def _source_v5_base_feedback_policy(
     recipe: dict[str, Any], source_manifest_value: dict[str, Any], probe: dict[str, Any],
 ) -> tuple[dict[str, Any], dict[str, Any], int]:
@@ -636,9 +741,23 @@ def _source_v5_base_feedback_policy(
         {"schema", "policy", "policy_sha256"},
         "SourceV5 feedback policy artifact",
     )
-    feedback_body = exact(feedback_artifact["policy"], {
+    require(feedback_artifact["schema"] in (
+        "allocatbelt.application-feedback-policy-artifact.v1",
+        "allocatbelt.application-feedback-policy-artifact.v2",
+    ), "unsupported SourceV5 feedback policy artifact schema")
+    feedback_body_keys = {
         "schema", "version", "reader_contract", "algorithm", "contexts", "source_pins",
-    }, "SourceV5 feedback policy body")
+    }
+    if feedback_artifact["schema"] == "allocatbelt.application-feedback-policy-artifact.v2":
+        feedback_body_keys.add("capacity_floor_policy")
+    feedback_body = exact(feedback_artifact["policy"], feedback_body_keys,
+                          "SourceV5 feedback policy body")
+    require(feedback_body["schema"] == feedback_artifact["schema"] and
+            digest(feedback_artifact["policy_sha256"], "SourceV5 feedback policy digest") ==
+            digest_object(feedback_body),
+            "SourceV5 feedback policy artifact/body schema or digest differs")
+    if "capacity_floor_policy" in feedback_body:
+        _validate_capacity_floor_policy_descriptor(feedback_body["capacity_floor_policy"])
     context_key = f"{identity['workload']}/{identity['profile']}"
     contexts = feedback_body["contexts"]
     require(type(contexts) is dict and context_key in contexts, "SourceV5 feedback policy omits the V4 workload/profile context")
@@ -739,10 +858,19 @@ def _validate_v4_policy_source_projection(
         require(policy[key] == projected, f"V4 expectation policy {key} differs from verified SourceV5 inputs")
 
 
-CAPACITY_RESOLUTION_RULE = "clip_relevant_initial_and_ceiling_to_raw_capacity"
-CAPACITY_RESOLUTION_VERSION = "application-feedback-capacity-resolution-v1"
+CAPACITY_RESOLUTION_RULE = "clip_relevant_initial_and_ceiling_to_raw_capacity_and_explicit_floor"
+CAPACITY_RESOLUTION_VERSION = "application-feedback-capacity-resolution-v2"
+CAPACITY_RESOLUTION_STATIC_RULE = "clip_relevant_initial_and_ceiling_to_raw_capacity"
+CAPACITY_RESOLUTION_STATIC_VERSION = "application-feedback-capacity-resolution-v1"
 CAPACITY_RATE_ROOF = 16 * 1024**3
 CAPACITY_RATE_FLOOR = 64 * 1024**2
+CAPACITY_FLOOR_POLICY_ID = "application_capacity_relative_tenth_v1"
+CAPACITY_FLOOR_RULE = "max_one_min_static_floor_capacity_div_ten"
+CAPACITY_FLOOR_DIVISOR = 10
+CAPACITY_FLOOR_MINIMUM_BYTES_PER_SECOND = 1
+CAPACITY_FLOOR_PROBE_ACTIVATION = "explicit_policy_id_and_capacity_artifact"
+CAPACITY_FLOOR_RUNTIME_ACTIVATION = "explicit_pressure_qualification_and_policy_id_and_capacity_artifact"
+CALIBRATED_PROBE_SCHEMA_V2 = "allocatbelt.application-feedback-policy-probe.v2"
 CAPACITY_ARTIFACT_FIELDS = {
     "schema", "calibration_id", "host_id", "profile", "workload", "source_sha256",
     "disk.bytes_per_second", "disk.units", "disk.provenance",
@@ -830,7 +958,7 @@ def _static_policy_from_source_v5(
 
 def resolve_calibrated_feedback_policy_v5(
     source_manifest: dict[str, Any], probe: dict[str, Any], capacity_artifact_pin: object,
-    identity: dict[str, Any],
+    identity: dict[str, Any], *, capacity_floor_policy_id: str | None = None,
 ) -> dict[str, Any]:
     """Resolve only the relevant application-byte rates against SourceV5 limits."""
     require(type(source_manifest) is dict and source_manifest.get("schema") == SOURCE_MANIFEST_SCHEMA_V5, "calibrated feedback resolution requires SourceV5")
@@ -848,12 +976,18 @@ def resolve_calibrated_feedback_policy_v5(
     app_artifact = exact(source_manifest["artifacts"].get(identity["allocator"]), {"path", "sha256"}, "SourceV5 calibrated APP artifact")
     require(digest(app_artifact["sha256"], "SourceV5 calibrated APP artifact SHA-256") == identity["binary_sha256"], "calibrated identity binary differs from SourceV5 APP artifact")
     _validate_v2_workload_profile(identity.get("workload"), identity.get("profile"))
-    exact(probe, {
+    probe_keys = {
         "schema", "context", "reader_context", "rust_control_context", "collector", "baseline",
         "capacity_calibration", "construction", "after_release", "meter_source_bounds",
         "meter_source_model", "source_references",
-    }, "calibrated construction probe v2")
-    require(probe["schema"] == "allocatbelt.application-feedback-policy-probe.v2", "unsupported calibrated construction probe schema")
+    }
+    if capacity_floor_policy_id is not None:
+        probe_keys.add("capacity_floor_policy_id")
+    exact(probe, probe_keys, "calibrated construction probe v2")
+    require(probe["schema"] == CALIBRATED_PROBE_SCHEMA_V2, "unsupported calibrated construction probe schema")
+    require(capacity_floor_policy_id is None or
+            capacity_floor_policy_id == CAPACITY_FLOOR_POLICY_ID,
+            "requested capacity floor policy ID is unknown")
     context = exact(probe["context"], {"workload", "profile", "workers"}, "calibrated probe context")
     require(context["workload"] == identity["workload"] and context["profile"] == identity["profile"], "calibrated probe context differs from feedback identity")
     workers = uint(context["workers"], "calibrated probe workers", positive=True, maximum=4)
@@ -888,10 +1022,34 @@ def resolve_calibrated_feedback_policy_v5(
     }, "calibrated feedback algorithm differs from SourceV5")
 
     capacity, capacity_sha = _read_capacity_artifact_v5(capacity_artifact_pin)
-    calibration = exact(probe["capacity_calibration"], {
+    calibration_keys = {
         "artifact_sha256", "calibration_id", "disk", "download", "hash_scope", "host_id",
         "identity", "profile", "resolution", "schema", "source_sha256", "verification_scope", "workload",
-    }, "calibrated capacity context")
+    }
+    if capacity_floor_policy_id is not None:
+        calibration_keys.add("capacity_floor_policy_id")
+    calibration = exact(probe["capacity_calibration"], calibration_keys,
+                        "calibrated capacity context")
+    if capacity_floor_policy_id is not None:
+        require(probe.get("capacity_floor_policy_id") == capacity_floor_policy_id,
+                "ProbeV2 top-level capacity-floor ID differs from the frozen caller selection")
+        require(calibration.get("capacity_floor_policy_id") == capacity_floor_policy_id,
+                "ProbeV2 capacity calibration floor ID differs from the frozen caller selection")
+    else:
+        require("capacity_floor_policy_id" not in probe and
+                "capacity_floor_policy_id" not in calibration,
+                "default ProbeV2 must preserve its original no-selector shape")
+    source_feedback_body = source_manifest["feedback_policy"]["policy"]
+    floor_policy_descriptor = source_feedback_body.get("capacity_floor_policy")
+    if capacity_floor_policy_id is not None:
+        floor_policy_descriptor = _validate_capacity_floor_policy_descriptor(
+            floor_policy_descriptor,
+        )
+        require(floor_policy_descriptor["policy_id"] == capacity_floor_policy_id,
+                "selected floor policy ID is not published by the pinned SourceV5 policy")
+    else:
+        require("capacity_floor_policy" not in source_feedback_body,
+                "default ProbeV2 cannot resolve a SourceV5 selected-floor artifact")
     require(calibration["schema"] == "allocatbelt.app-byte-capacity.v1", "calibrated capacity schema differs")
     require(digest(calibration["artifact_sha256"], "probe capacity artifact SHA") == capacity_sha, "probe capacity artifact SHA differs from the pinned raw bytes")
     require(calibration["calibration_id"] == capacity["calibration_id"], "probe calibration ID differs from the capacity artifact")
@@ -919,7 +1077,9 @@ def resolve_calibrated_feedback_policy_v5(
             require(direction_value["units"] == "application_bytes_per_second", f"probe {direction} units differ from raw artifact")
         if relevant[direction]:
             require(rate != "missing", f"required application-byte capacity source is missing: {direction}")
-            require(int(rate) >= CAPACITY_RATE_FLOOR, f"{direction} application-byte capacity is below the feedback floor")
+            if capacity_floor_policy_id is None:
+                require(int(rate) >= CAPACITY_RATE_FLOOR,
+                        f"{direction} application-byte capacity is below the static feedback floor")
         else:
             require(rate == "missing", f"irrelevant {direction} capacity source must remain missing")
 
@@ -938,16 +1098,52 @@ def resolve_calibrated_feedback_policy_v5(
     expected_controls = expected["controls"]
     for direction, resource in (("disk", "disk"), ("download", "download")):
         if relevant[direction]:
-            resolved = min(int(capacity[f"{direction}.bytes_per_second"]), CAPACITY_RATE_ROOF)
+            raw_capacity = int(capacity[f"{direction}.bytes_per_second"])
+            resolved = min(raw_capacity, CAPACITY_RATE_ROOF)
             expected_controls[resource]["initial"] = resolved
             expected_controls[resource]["ceiling"] = resolved
             expected["rate_buckets"][direction]["initial_bytes_per_second"] = resolved
             expected["rate_buckets"][direction]["ceiling_bytes_per_second"] = resolved
+            if capacity_floor_policy_id is not None:
+                floor = max(
+                    floor_policy_descriptor["minimum_floor_bytes_per_second"],
+                    min(
+                        floor_policy_descriptor["static_floor_bytes_per_second"],
+                        raw_capacity // floor_policy_descriptor["capacity_divisor"],
+                    ),
+                )
+                require(floor <= resolved,
+                        f"{direction} capacity-relative floor exceeds its resolved initial rate")
+                expected_controls[resource]["floor"] = floor
 
-    resolution = exact(calibration["resolution"], {
-        "controls", "rate_buckets", "rule", "rule_version", "static_rate_roof_bytes_per_second", "upload_controlled",
-    }, "calibrated capacity resolution")
-    require(resolution["rule"] == CAPACITY_RESOLUTION_RULE and resolution["rule_version"] == CAPACITY_RESOLUTION_VERSION, "calibrated capacity resolution version/rule differs")
+    resolution_keys = {
+        "controls", "rate_buckets", "rule", "rule_version",
+        "static_rate_roof_bytes_per_second", "upload_controlled",
+    }
+    if capacity_floor_policy_id is not None:
+        resolution_keys.update({"capacity_floor_policy", "capacity_floor_policy_id"})
+    resolution = exact(calibration["resolution"], resolution_keys,
+                       "calibrated capacity resolution")
+    expected_resolution_rule = (
+        CAPACITY_RESOLUTION_RULE if capacity_floor_policy_id is not None
+        else CAPACITY_RESOLUTION_STATIC_RULE
+    )
+    expected_resolution_version = (
+        CAPACITY_RESOLUTION_VERSION if capacity_floor_policy_id is not None
+        else CAPACITY_RESOLUTION_STATIC_VERSION
+    )
+    require(resolution["rule"] == expected_resolution_rule and
+            resolution["rule_version"] == expected_resolution_version,
+            "calibrated capacity resolution version/rule differs")
+    if capacity_floor_policy_id is None:
+        require("capacity_floor_policy" not in resolution and
+                "capacity_floor_policy_id" not in resolution,
+                "default calibrated policy must preserve its original resolution shape")
+    else:
+        require(resolution["capacity_floor_policy_id"] == capacity_floor_policy_id,
+                "ProbeV2 resolution floor policy ID differs from its capacity context")
+        require(resolution["capacity_floor_policy"] == floor_policy_descriptor,
+                "ProbeV2 capacity-floor parameters differ from the pinned SourceV5 policy")
     require(uint(resolution["static_rate_roof_bytes_per_second"], "calibrated static rate roof", positive=True) == CAPACITY_RATE_ROOF, "calibrated static rate roof differs")
     require(type(resolution["upload_controlled"]) is bool and resolution["upload_controlled"] is False, "calibrated resolution changes upload control")
     resolution_controls = exact(resolution["controls"], set(RESOURCES), "calibrated resolution controls")
@@ -976,6 +1172,9 @@ def resolve_calibrated_feedback_policy_v5(
         require(_uint_map(rust_context[owner], set(DOMAIN), f"calibrated {owner}") == expected[owner], f"calibrated {owner} differs from SourceV5")
     require(_uint_map(rust_context["scope_limits"], {"managed_memory", "disk_operations", "network_operations"}, "calibrated scope limits") == expected["scope_limits"], "calibrated scope limits differ from SourceV5")
     require(rust_context["rate_buckets"] == expected["rate_buckets"], "calibrated Rust rate buckets differ from independent capacity resolution")
+    if capacity_floor_policy_id is not None:
+        expected["capacity_floor_policy"] = floor_policy_descriptor
+        expected["capacity_floor_policy_id"] = capacity_floor_policy_id
     return expected
 
 
@@ -1313,13 +1512,20 @@ def _capture_bounded_process(
                     pass
 
 
-def _run_feedback_probe(binary: Path, source_root: Path, identity: dict[str, Any], capacity_path: Path, capacity_sha: str) -> bytes:
+def _run_feedback_probe(
+    binary: Path, source_root: Path, identity: dict[str, Any], capacity_path: Path,
+    capacity_sha: str, capacity_floor_policy_id: str | None = None,
+) -> bytes:
     argv = [
         str(binary), "--emit-feedback-policy-only", "--workload", identity["workload"],
         "--profile", identity["profile"], "--capacity-calibration-file", str(capacity_path),
         "--capacity-calibration-sha256", capacity_sha, "--host-id", identity["host_id"],
         "--source-sha256", identity["source_sha256"],
     ]
+    if capacity_floor_policy_id is not None:
+        require(capacity_floor_policy_id == CAPACITY_FLOOR_POLICY_ID,
+                "captured probe capacity floor policy ID is unknown")
+        argv.extend(["--capacity-floor-policy-id", capacity_floor_policy_id])
     exit_code, stdout, stderr = _capture_bounded_process(
         argv, source_root, "pinned SourceV5 APP probe",
     )
@@ -1331,8 +1537,27 @@ def _run_feedback_probe(binary: Path, source_root: Path, identity: dict[str, Any
 def validate_calibrated_construction_probe_v2(
     probe_pin: object, source_manifest: dict[str, Any], capacity_artifact_pin: object,
     identity: dict[str, Any], expected_policy: dict[str, Any] | None = None,
+    capacity_floor_policy_id: str | None = None,
 ) -> str:
     """Fully verify SourceV5 and rerun its exact APP binary's calibrated probe."""
+    probe_sha, probe, binary, source_root, capacity_sha, capacity_path = _check_calibrated_construction_probe_v2_inputs(
+        probe_pin, source_manifest, capacity_artifact_pin, identity, expected_policy,
+        capacity_floor_policy_id,
+    )
+    rerun = _run_feedback_probe(
+        binary, source_root, identity, capacity_path, capacity_sha,
+        capacity_floor_policy_id,
+    )
+    require(rerun == canonical_bytes(probe), "pinned construction probe bytes differ from stdout from the exact SourceV5 APP artifact")
+    return probe_sha
+
+
+def _check_calibrated_construction_probe_v2_inputs(
+    probe_pin: object, source_manifest: dict[str, Any], capacity_artifact_pin: object,
+    identity: dict[str, Any], expected_policy: dict[str, Any] | None = None,
+    capacity_floor_policy_id: str | None = None,
+) -> tuple[str, dict[str, Any], Path, Path, str, Path]:
+    """Check every static V2 source/policy input without launching an APP."""
     require(source_manifest.get("schema") == SOURCE_MANIFEST_SCHEMA_V5, "calibrated construction probe requires SourceV5")
     pin = exact(probe_pin, {"path", "raw_sha256", "allocator", "binary_sha256"}, "calibrated construction probe pin")
     absolute_path(pin["path"], "calibrated construction probe path")
@@ -1341,7 +1566,10 @@ def validate_calibrated_construction_probe_v2(
     digest(pin["binary_sha256"], "calibrated probe binary SHA-256")
     require(pin["binary_sha256"] == identity["binary_sha256"], "calibrated probe binary differs from feedback identity")
     probe, probe_sha = read_canonical(Path(pin["path"]), "calibrated construction probe v2", MAX_CONSTRUCTION_PROBE_BYTES, pin["raw_sha256"])
-    resolved_policy = resolve_calibrated_feedback_policy_v5(source_manifest, probe, capacity_artifact_pin, identity)
+    resolved_policy = resolve_calibrated_feedback_policy_v5(
+        source_manifest, probe, capacity_artifact_pin, identity,
+        capacity_floor_policy_id=capacity_floor_policy_id,
+    )
     if expected_policy is not None:
         require(expected_policy == resolved_policy, "V5 feedback expectation differs from independently resolved SourceV5/capacity policy")
     source = source_manifest.get("source")
@@ -1358,8 +1586,1037 @@ def validate_calibrated_construction_probe_v2(
     _fields, capacity_sha = _read_capacity_artifact_v5(capacity_artifact_pin)
     _validate_calibrated_construction_evidence(source_manifest, probe, identity)
     capacity_path = absolute_path(exact(capacity_artifact_pin, {"path", "raw_sha256"}, "V5 capacity artifact pin")["path"], "V5 capacity artifact path")
-    rerun = _run_feedback_probe(binary, source_root, identity, capacity_path, capacity_sha)
-    require(rerun == canonical_bytes(probe), "pinned construction probe bytes differ from stdout from the exact SourceV5 APP artifact")
+    return probe_sha, probe, binary, source_root, capacity_sha, capacity_path
+
+
+def _validate_feedback_offline_context(value: object) -> dict[str, Any]:
+    try:
+        snapshot = json.loads(canonical_bytes(value).decode("ascii"))
+    except (TypeError, ValueError, UnicodeError) as error:
+        raise ValidationError(f"feedback offline replay context is not closed JSON: {error}") from error
+    context = exact(snapshot, {
+        "schema", "evidence_path_map", "probe_capture_pin", "capacity_bundle",
+    }, "feedback offline replay context")
+    require(context["schema"] == FEEDBACK_OFFLINE_CONTEXT_SCHEMA,
+            "unsupported feedback offline replay context schema")
+    mapping = exact(context["evidence_path_map"], {"schema", "entries"}, "feedback evidence path map")
+    require(mapping["schema"] == EVIDENCE_PATH_MAP_SCHEMA and
+            type(mapping["entries"]) is list and
+            1 <= len(mapping["entries"]) <= MAX_OFFLINE_PATH_MAP_ENTRIES,
+            "feedback evidence path map schema or entry count is invalid")
+    previous = ""
+    local_paths: set[str] = set()
+    directories: set[str] = set()
+    files: set[str] = set()
+    for index, entry_value in enumerate(mapping["entries"]):
+        entry = exact(entry_value, {"origin", "local"}, f"feedback path map entry[{index}]")
+        origin = absolute_path(entry["origin"], f"feedback evidence origin[{index}]")
+        local = absolute_path(entry["local"], f"feedback evidence local[{index}]")
+        origin_text, local_text = str(origin), str(local)
+        require(origin_text > previous, "feedback path map origins must be sorted and unique")
+        previous = origin_text
+        require(origin == local and local_text not in local_paths,
+                "feedback path map must contain unique identity paths only")
+        try:
+            require(local.resolve(strict=True) == local, "feedback evidence path traverses a symlink or alias")
+            info = local.lstat()
+        except OSError as error:
+            raise ValidationError(f"feedback evidence map path is unavailable: {error}") from error
+        require(stat.S_ISDIR(info.st_mode) or stat.S_ISREG(info.st_mode),
+                f"feedback evidence map entry[{index}] is not a regular file or directory")
+        local_paths.add(local_text)
+        if stat.S_ISDIR(info.st_mode):
+            directories.add(origin_text)
+        elif stat.S_ISREG(info.st_mode):
+            files.add(origin_text)
+    capture_pin = exact(context["probe_capture_pin"], {
+        "path", "raw_sha256", "receipt_sha256",
+    }, "calibrated probe capture receipt pin")
+    absolute_path(capture_pin["path"], "calibrated probe capture receipt path")
+    digest(capture_pin["raw_sha256"], "calibrated probe capture receipt raw SHA-256")
+    digest(capture_pin["receipt_sha256"], "calibrated probe capture receipt digest")
+    bundle = exact(context["capacity_bundle"], {"request", "artifact", "receipt"},
+                   "offline capacity producer bundle")
+    for name, pin_value in bundle.items():
+        pin = exact(pin_value, {"path", "raw_sha256"}, f"offline capacity {name} pin")
+        absolute_path(pin["path"], f"offline capacity {name} path")
+        digest(pin["raw_sha256"], f"offline capacity {name} raw SHA-256")
+    require(len({bundle[name]["path"] for name in bundle}) == 3,
+            "offline capacity producer paths must be distinct")
+    frozen_mapping = types.MappingProxyType({
+        "schema": mapping["schema"],
+        "entries": tuple(types.MappingProxyType(dict(entry)) for entry in mapping["entries"]),
+    })
+    frozen_capture = types.MappingProxyType(dict(capture_pin))
+    frozen_bundle = types.MappingProxyType({
+        name: types.MappingProxyType(dict(bundle[name])) for name in bundle
+    })
+    return types.MappingProxyType({
+        "schema": context["schema"], "evidence_path_map": frozen_mapping,
+        "mapped_directories": frozenset(directories), "mapped_paths": frozenset(local_paths),
+        "mapped_files": frozenset(files),
+        "probe_capture_pin": frozen_capture, "capacity_bundle": frozen_bundle,
+    })
+
+
+def _require_offline_paths(context: dict[str, Any], paths: set[str], label: str) -> None:
+    mapped = context["mapped_paths"]
+    for raw_path in paths:
+        path = absolute_path(raw_path, f"{label} path")
+        path_text = str(path)
+        require(path_text in mapped,
+                f"feedback evidence path map omits exact {label}: {path_text}")
+
+
+def _require_offline_files(context: dict[str, Any], paths: set[str], label: str) -> None:
+    _require_offline_paths(context, paths, label)
+    for raw_path in paths:
+        require(raw_path in context["mapped_files"],
+                f"feedback evidence path map does not mark {label} as a file: {raw_path}")
+
+
+def _require_offline_directories(context: dict[str, Any], paths: set[str], label: str) -> None:
+    _require_offline_paths(context, paths, label)
+    for raw_path in paths:
+        require(raw_path in context["mapped_directories"],
+                f"feedback evidence path map does not mark {label} as a directory: {raw_path}")
+
+
+def _sha256_stable_file(path: Path, label: str, maximum: int) -> tuple[int, str]:
+    try:
+        require(path.resolve(strict=True) == path, f"{label} traverses a symlink or alias")
+        before_path = path.lstat()
+        require(stat.S_ISREG(before_path.st_mode), f"{label} must be a regular nonsymlink file")
+        descriptor = os.open(
+            path, os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) |
+            getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0),
+        )
+    except OSError as error:
+        raise ValidationError(f"cannot safely open {label}: {error}") from error
+    try:
+        before = os.fstat(descriptor)
+        key = lambda item: (item.st_dev, item.st_ino, item.st_mode, item.st_size,
+                            item.st_mtime_ns, item.st_ctime_ns)
+        require(stat.S_ISREG(before.st_mode) and before.st_uid == os.getuid() and
+                key(before) == key(before_path) and
+                0 <= before.st_size <= maximum,
+                f"{label} changed while opening or exceeds its finite byte bound")
+        digest_state = hashlib.sha256()
+        remaining = before.st_size
+        while remaining:
+            block = os.read(descriptor, min(1024 * 1024, remaining))
+            require(block, f"{label} was truncated during hashing")
+            digest_state.update(block)
+            remaining -= len(block)
+        after_fd, after_path = os.fstat(descriptor), path.lstat()
+        require(key(before) == key(after_fd) == key(after_path), f"{label} changed during hashing")
+        return before.st_size, digest_state.hexdigest()
+    finally:
+        os.close(descriptor)
+
+
+def _preflight_probe_capture_tree(
+    capture: dict[str, Any], context: dict[str, Any], capture_path: Path,
+) -> list[dict[str, Any]]:
+    """Close the mapped output/TMPDIR trees before reading descendants or loading dependencies."""
+    stdout_pin = exact(capture["stdout"], {"path", "raw_sha256"}, "offline ProbeV2 stdout pin")
+    stderr_pin = exact(capture["stderr"], {"path", "raw_sha256"}, "offline ProbeV2 stderr pin")
+    owner_pin = exact(capture["owner_result_pin"], {
+        "path", "raw_sha256", "owner_result_sha256",
+    }, "offline ProbeV2 owner-result pin")
+    inventory_pin = exact(capture["tmpdir_inventory_pin"], {
+        "path", "raw_sha256", "inventory_sha256",
+    }, "offline ProbeV2 TMPDIR inventory pin")
+    for label, pin in (("stdout", stdout_pin), ("stderr", stderr_pin),
+                       ("owner result", owner_pin), ("TMPDIR inventory", inventory_pin)):
+        absolute_path(pin["path"], f"offline ProbeV2 {label} path")
+        digest(pin["raw_sha256"], f"offline ProbeV2 {label} raw SHA-256")
+    digest(owner_pin["owner_result_sha256"], "offline ProbeV2 owner-result semantic SHA-256")
+    digest(inventory_pin["inventory_sha256"], "offline ProbeV2 TMPDIR inventory semantic SHA-256")
+    initial = exact(capture["tmpdir_initial"], {
+        "path", "device", "inode", "mode", "mount", "available_bytes", "available_inodes",
+        "bytes_limit", "inode_limit",
+    }, "offline ProbeV2 initial TMPDIR proof")
+    final = exact(capture["tmpdir_final"], {
+        "path", "device", "inode", "mode", "mount", "bytes_used", "file_count", "directory_count",
+        "bytes_limit", "inode_limit", "available_bytes", "available_inodes",
+    }, "offline ProbeV2 final TMPDIR proof")
+    tmp_path = absolute_path(initial["path"], "offline ProbeV2 TMPDIR path")
+    output_path = absolute_path(str(stdout_pin["path"]), "offline ProbeV2 output root")
+    output_directory = output_path.parent
+    expected_output_files = {
+        str(capture_path), str(Path(stderr_pin["path"])), str(Path(owner_pin["path"])),
+        str(Path(inventory_pin["path"])), str(output_path),
+    }
+    require(Path(stderr_pin["path"]).parent == output_directory and
+            Path(owner_pin["path"]).parent == output_directory and capture_path.parent == output_directory and
+            Path(inventory_pin["path"]).parent == output_directory and
+            tmp_path.parent == output_directory,
+            "offline ProbeV2 output/TMPDIR paths do not share their captured private root")
+    _require_offline_directories(context, {str(output_directory), str(tmp_path)},
+                                 "ProbeV2 output/TMPDIR root")
+    _require_offline_files(context, expected_output_files, "ProbeV2 output/receipt member")
+    try:
+        require(output_directory.resolve(strict=True) == output_directory and
+                tmp_path.resolve(strict=True) == tmp_path,
+                "offline ProbeV2 output/TMPDIR traverses an alias")
+        output_info = output_directory.lstat()
+        tmp_info = tmp_path.lstat()
+        with os.scandir(output_directory) as entries:
+            output_names = {entry.name for entry in entries}
+    except OSError as error:
+        raise ValidationError(f"cannot inspect copied ProbeV2 output/TMPDIR root: {error}") from error
+    require(stat.S_ISDIR(output_info.st_mode) and not stat.S_ISLNK(output_info.st_mode) and
+            output_info.st_uid == os.getuid() and stat.S_IMODE(output_info.st_mode) == 0o700 and
+            stat.S_ISDIR(tmp_info.st_mode) and not stat.S_ISLNK(tmp_info.st_mode) and
+            tmp_info.st_uid == os.getuid() and stat.S_IMODE(tmp_info.st_mode) == 0o700,
+            "copied ProbeV2 output/TMPDIR roots are not owned private directories")
+    require(output_names == {
+        "tmp", "stdout.bin", "stderr.bin", "owner-result.json", "tmpdir-inventory.json",
+        "capture-receipt.json",
+    }, "copied ProbeV2 output root has an unpinned or missing member")
+    inventory_value, inventory_raw_sha = read_canonical(
+        Path(inventory_pin["path"]), "offline ProbeV2 TMPDIR inventory sidecar",
+        MAX_PROBE_TMPDIR_INVENTORY_BYTES, inventory_pin["raw_sha256"],
+    )
+    exact(inventory_value, {"schema", "entries", "inventory_sha256"},
+          "offline ProbeV2 TMPDIR inventory sidecar")
+    inventory_body = {key: item for key, item in inventory_value.items()
+                      if key != "inventory_sha256"}
+    require(inventory_value["schema"] == PROBE_TMPDIR_INVENTORY_SCHEMA and
+            inventory_raw_sha == inventory_pin["raw_sha256"] and
+            inventory_value["inventory_sha256"] == inventory_pin["inventory_sha256"] ==
+            digest_object(inventory_body),
+            "offline ProbeV2 TMPDIR inventory sidecar digest differs from its receipt pin")
+    budget = exact(capture["storage_budget"], {
+        "tmpdir_bytes", "tmpdir_inodes", "stdout_bytes", "stderr_bytes",
+        "owner_result_bytes", "inventory_bytes", "failure_bytes", "receipt_bytes", "output_inodes",
+    }, "offline ProbeV2 storage budget")
+    inode_limit = uint(budget["tmpdir_inodes"], "offline ProbeV2 TMPDIR inode limit", positive=True)
+    byte_limit = uint(budget["tmpdir_bytes"], "offline ProbeV2 TMPDIR byte limit", positive=True)
+    require(inode_limit <= 4096 and byte_limit <= 1024 * 1024 * 1024,
+            "offline ProbeV2 TMPDIR bounds exceed the fixed finite limits")
+    require(budget["owner_result_bytes"] == MAX_PROBE_OWNER_RESULT_BYTES and
+            budget["inventory_bytes"] == MAX_PROBE_TMPDIR_INVENTORY_BYTES and
+            budget["failure_bytes"] == MAX_PROBE_CAPTURE_FAILURE_BYTES and
+            0 < budget["receipt_bytes"] <= MAX_PROBE_CAPTURE_RECEIPT_BYTES and
+            7 <= budget["output_inodes"] <= 4096,
+            "offline ProbeV2 output budget differs from its finite sidecar bounds")
+    inventory = inventory_value["entries"]
+    require(type(inventory) is list and len(inventory) <= inode_limit,
+            "offline ProbeV2 TMPDIR inventory exceeds its finite inode bound")
+    expected: dict[str, dict[str, Any]] = {}
+    total_bytes = 0
+    paths_in_order: list[str] = []
+    for index, item_value in enumerate(inventory):
+        item = exact(item_value, {"path", "kind", "uid", "mode", "size", "raw_sha256"},
+                     f"offline ProbeV2 TMPDIR inventory[{index}]")
+        item_path = absolute_path(item["path"], f"offline ProbeV2 TMPDIR inventory path[{index}]")
+        item_text = str(item_path)
+        try:
+            relative = item_path.relative_to(tmp_path)
+        except ValueError as error:
+            raise ValidationError("offline ProbeV2 TMPDIR inventory escapes its root") from error
+        require(relative.parts and item_text not in expected and item["kind"] in ("file", "directory") and
+                type(item["uid"]) is int and item["uid"] >= 0 and item["uid"] == os.getuid() and
+                type(item["mode"]) is int and 0 <= item["mode"] <= 0o7777,
+                "offline ProbeV2 TMPDIR inventory identity/type is malformed")
+        if item["kind"] == "file":
+            size = uint(item["size"], f"offline ProbeV2 TMPDIR file size[{index}]")
+            raw_sha = digest(item["raw_sha256"], f"offline ProbeV2 TMPDIR file SHA[{index}]")
+            total_bytes += size
+            _require_offline_files(context, {item_text}, "ProbeV2 TMPDIR file descendant")
+        else:
+            require(item["size"] is None and item["raw_sha256"] is None,
+                    "offline ProbeV2 TMPDIR directory inventory carries file content fields")
+            _require_offline_directories(context, {item_text}, "ProbeV2 TMPDIR directory descendant")
+        expected[item_text] = item
+        paths_in_order.append(item_text)
+    require(paths_in_order == sorted(paths_in_order) and total_bytes <= byte_limit and
+            len(canonical_bytes(inventory)) <= MAX_PROBE_TMPDIR_INVENTORY_BYTES,
+            "offline ProbeV2 TMPDIR inventory is unordered or exceeds its finite bound")
+    require(initial["path"] == final["path"] == str(tmp_path) and
+            initial["mode"] == final["mode"] == 0o700 and
+            initial["device"] == final["device"] and initial["inode"] == final["inode"] and
+            initial["bytes_limit"] == final["bytes_limit"] == byte_limit and
+            initial["inode_limit"] == final["inode_limit"] == inode_limit and
+            final["bytes_used"] == total_bytes and
+            final["file_count"] == sum(1 for item in inventory if item["kind"] == "file") and
+            final["directory_count"] == sum(1 for item in inventory if item["kind"] == "directory"),
+            "offline ProbeV2 TMPDIR inventory totals differ from its original strict proof")
+    owner_result, owner_result_raw_sha = read_canonical(
+        Path(owner_pin["path"]), "offline FixedR8 owner-result sidecar",
+        MAX_PROBE_OWNER_RESULT_BYTES, owner_pin["raw_sha256"],
+    )
+    exact(owner_result, {
+        "schema", "direct", "start_callback_count", "start_callback_proofs",
+        "owner_result_sha256",
+    }, "offline FixedR8 owner-result sidecar")
+    owner_result_body = {key: item for key, item in owner_result.items()
+                         if key != "owner_result_sha256"}
+    require(owner_result["schema"] == PROBE_OWNER_RESULT_SCHEMA and
+            owner_result_raw_sha == owner_pin["raw_sha256"] and
+            owner_result["owner_result_sha256"] == owner_pin["owner_result_sha256"] ==
+            digest_object(owner_result_body),
+            "offline FixedR8 owner-result sidecar digest differs from its receipt pin")
+
+    pending = [tmp_path]
+    observed: dict[str, os.stat_result] = {}
+    while pending:
+        current = pending.pop()
+        try:
+            with os.scandir(current) as entries:
+                names: list[str] = []
+                for entry in entries:
+                    require(len(observed) + len(names) < inode_limit,
+                            "copied ProbeV2 TMPDIR directory exceeds its finite inode bound")
+                    names.append(entry.name)
+        except OSError as error:
+            raise ValidationError(f"cannot enumerate copied ProbeV2 TMPDIR {current}: {error}") from error
+        for name in names:
+            child = current / name
+            child_text = str(child)
+            item = expected.get(child_text)
+            require(item is not None,
+                    f"evidence path map omits exact ProbeV2 TMPDIR descendant: {child_text}")
+            try:
+                info = child.lstat()
+            except OSError as error:
+                raise ValidationError(f"cannot inspect mapped ProbeV2 TMPDIR descendant: {error}") from error
+            actual_kind = "directory" if stat.S_ISDIR(info.st_mode) else "file" if stat.S_ISREG(info.st_mode) else "special"
+            require(not stat.S_ISLNK(info.st_mode) and actual_kind == item["kind"] and
+                    info.st_uid == item["uid"] == os.getuid() and
+                    stat.S_IMODE(info.st_mode) == item["mode"] and
+                    (item["kind"] == "directory" or info.st_size == item["size"]),
+                    "copied ProbeV2 TMPDIR descendant differs from its closed inventory")
+            observed[child_text] = info
+            if item["kind"] == "directory":
+                pending.append(child)
+            require(len(observed) <= inode_limit,
+                    "copied ProbeV2 TMPDIR traversal exceeds its finite inode bound")
+    require(set(observed) == set(expected),
+            "copied ProbeV2 TMPDIR is missing a declared inventory descendant")
+    for item_path, item in expected.items():
+        if item["kind"] == "file":
+            size, raw_sha = _sha256_stable_file(
+                Path(item_path), "copied ProbeV2 TMPDIR file", byte_limit,
+            )
+            require(size == item["size"] and raw_sha == item["raw_sha256"],
+                    "copied ProbeV2 TMPDIR file bytes differ from its strict inventory")
+
+
+def _probe_capture_receipt_budget_bound(receipt: dict[str, Any]) -> int:
+    """Recompute the strict capture's maximum-width canonical receipt envelope."""
+    template = copy.deepcopy(receipt)
+    max_u64 = U64_MAX
+    argv = template["probe_argv"]
+    environment = template["environment"]
+    start_proof = {
+        "pid": (1 << 31) - 1,
+        "start_ticks": max_u64,
+        "requested_argv": argv,
+        "requested_argv_sha256": "f" * 64,
+        "environment_sha256": "f" * 64,
+    }
+    role_body = {
+        "schema": "allocatbelt.application-feedback-probe-start-role.v1",
+        "role": "calibrated_construction_probe",
+        "owner_proof": start_proof,
+    }
+    template["start_callback_count"] = 1
+    template["start_callback_proof"] = start_proof
+    template["start"] = {**role_body, "start_sha256": "f" * 64}
+    template["owner_result_pin"]["raw_sha256"] = "f" * 64
+    template["owner_result_pin"]["owner_result_sha256"] = "f" * 64
+    template["tmpdir_inventory_pin"]["raw_sha256"] = "f" * 64
+    template["tmpdir_inventory_pin"]["inventory_sha256"] = "f" * 64
+    template["stdout"]["raw_sha256"] = "f" * 64
+    template["stderr"]["raw_sha256"] = "f" * 64
+    template["exit_status"] = -((1 << 63) - 1)
+    budget = template["storage_budget"]
+    final_tmp = template["tmpdir_final"]
+    final_tmp["device"] = max_u64
+    final_tmp["inode"] = max_u64
+    final_tmp["bytes_used"] = budget["tmpdir_bytes"]
+    final_tmp["file_count"] = budget["tmpdir_inodes"]
+    final_tmp["directory_count"] = budget["tmpdir_inodes"]
+    final_tmp["available_bytes"] = max_u64
+    final_tmp["available_inodes"] = max_u64
+    template["receipt_sha256"] = "f" * 64
+    return len(canonical_bytes(template))
+
+
+def _absolute_json_paths(value: object) -> set[str]:
+    paths: set[str] = set()
+    path_keys = {
+        "path", "source_root", "output_root", "binary_path", "executable_path", "cwd",
+        "tmpdir", "trace_directory", "directory", "root", "tmpdir_path",
+        "application_tmpdir_path", "pressure_scratch_path", "mount_point",
+    }
+
+    def visit(current: object, argv_context: bool = False) -> None:
+        if type(current) is dict:
+            for key, item in current.items():
+                if key in path_keys and type(item) is str and item.startswith("/"):
+                    paths.add(item)
+                elif key == "environment" and type(item) is dict:
+                    temp = item.get("TMPDIR")
+                    if type(temp) is str and temp.startswith("/"):
+                        paths.add(temp)
+                    visit(item)
+                else:
+                    visit(item, key in {"argv", "requested_argv", "executed_argv", "probe_argv"})
+        elif type(current) is list:
+            for item in current:
+                visit(item, argv_context)
+        elif argv_context and type(current) is str and current.startswith("/"):
+            paths.add(current)
+
+    visit(value)
+    return paths
+
+
+def _preflight_capacity_request_trace(
+    request: object, context: dict[str, Any],
+) -> dict[str, Any]:
+    request_value = exact(request, {
+        "schema", "calibration_id", "identity", "source_manifest", "validation",
+        "expectation", "expectation_sha256", "validator_sha256", "trace_directory",
+        "context", "minimum_interval_seconds",
+    }, "offline capacity producer request")
+    require(request_value["schema"] == CAPACITY_REQUEST_SCHEMA_V1,
+            "unsupported offline capacity producer request schema")
+    for name in ("source_manifest", "validation", "expectation", "context"):
+        pin = exact(request_value[name], {"path", "sha256"},
+                    f"offline capacity {name} pin")
+        absolute_path(pin["path"], f"offline capacity {name} path")
+        digest(pin["sha256"], f"offline capacity {name} raw SHA-256")
+        _require_offline_files(context, {pin["path"]}, f"offline capacity {name} input")
+    digest(request_value["expectation_sha256"], "offline capacity expectation SHA-256")
+    digest(request_value["validator_sha256"], "offline capacity validator SHA-256")
+    exact(request_value["identity"], {
+        "host_id", "run_id", "report_nonce", "process_id", "allocator", "executor",
+        "workload", "profile", "mode", "source_sha256", "binary_sha256",
+        "pressure_qualification",
+    }, "offline capacity identity")
+    trace_directory = absolute_path(request_value["trace_directory"],
+                                    "offline capacity trace directory")
+    _require_offline_directories(context, {str(trace_directory)},
+                                 "capacity V4 trace directory")
+    trace_files = {str(trace_directory / name) for name in CAPACITY_TRACE_FILES}
+    _require_offline_files(context, trace_files, "capacity V4 trace member")
+    validation_pin = exact(request_value["validation"], {"path", "sha256"},
+                           "offline capacity validation receipt pin")
+    validation_path = absolute_path(validation_pin["path"],
+                                    "offline capacity validation receipt path")
+    _require_offline_files(context, {str(validation_path)},
+                           "capacity validation receipt")
+    validation, _validation_sha = read_canonical(
+        validation_path, "offline capacity validation receipt", MAX_EXPECTATION_BYTES,
+        digest(validation_pin["sha256"], "offline capacity validation receipt raw SHA-256"),
+    )
+    exact(validation, {
+        "schema", "mode", "validated", "qualification_eligible", "expectation_raw_sha256",
+        "validator_sha256", "identity", "raw_artifact_sha256", "production_window",
+        "final_runtime_binding",
+    }, "offline capacity validation receipt")
+    require(validation["schema"] == READBACK_SCHEMA and
+            validation["mode"] == "capacity_calibration" and
+            validation["validated"] is True and
+            validation["qualification_eligible"] is False,
+            "offline capacity validation receipt is not a validated ineligible calibration result")
+    raw_trace_pins = exact(validation["raw_artifact_sha256"],
+                           {"manifest", "events", "samples"},
+                           "offline capacity trace raw pins")
+    for name, raw_sha in raw_trace_pins.items():
+        digest(raw_sha, f"offline capacity {name} trace raw SHA-256")
+    return {
+        "trace_directory": str(trace_directory),
+        "validation": validation,
+        "trace_files": frozenset(trace_files),
+    }
+
+
+def _captured_source5_module(
+    source_manifest: dict[str, Any], relative_path: str, label: str, maximum: int,
+) -> tuple[types.ModuleType, str]:
+    source = source_manifest.get("source")
+    record = _source_v5_regular_record(source, relative_path, label)
+    raw = _capture_source_v5_sibling(relative_path, record, label)
+    path = Path(__file__).resolve().parent.parent.joinpath(*PurePosixPath(relative_path).parts)
+    name = f"feedback_source5_{relative_path.rsplit('/', 1)[-1].replace('-', '_')}_{record['sha256']}"
+    module = types.ModuleType(name)
+    module.__file__ = str(path)
+    module.__package__ = ""
+    try:
+        exec(compile(raw, str(path), "exec", dont_inherit=True), module.__dict__)
+    except (SyntaxError, ValueError, TypeError) as error:
+        raise ValidationError(f"pinned {label} cannot be compiled from captured bytes: {error}") from error
+    require(len(raw) <= maximum, f"pinned {label} exceeds its finite module bound")
+    return module, record["sha256"]
+
+
+def _preflight_offline_probe_evidence(
+    source_manifest: dict[str, Any], source_pin: dict[str, Any], probe_pin: dict[str, Any],
+    capacity_pin: dict[str, Any], context: dict[str, Any],
+) -> None:
+    source_root = Path(__file__).resolve().parent.parent
+    paths = {
+        source_pin["path"], probe_pin["path"], capacity_pin["path"],
+        context["probe_capture_pin"]["path"],
+        *(context["capacity_bundle"][name]["path"] for name in context["capacity_bundle"]),
+        str(source_root),
+    }
+    _require_offline_paths(context, paths, "pinned calibrated probe input")
+    _require_offline_directories(context, {str(source_root)}, "SourceV5 source root")
+    _require_offline_files(context, {
+        source_pin["path"], probe_pin["path"], capacity_pin["path"],
+        context["probe_capture_pin"]["path"],
+        *(context["capacity_bundle"][name]["path"] for name in context["capacity_bundle"]),
+    }, "pinned calibrated probe input")
+    source = exact(source_manifest.get("source"), {
+        "git_commit", "source_tree_sha256", "cargo_lock_sha256", "files",
+    }, "offline SourceV5 typed inventory")
+    require(type(source["files"]) is list, "offline SourceV5 inventory is not a list")
+    relative_paths: set[str] = set()
+    for index, record_value in enumerate(source["files"]):
+        record = exact(record_value, {"path", "kind", "mode", "sha256", "size"},
+                       f"offline SourceV5 inventory entry[{index}]")
+        relative = PurePosixPath(text(record["path"], "offline SourceV5 inventory path", 4096))
+        require(not relative.is_absolute() and ".." not in relative.parts and
+                relative.as_posix() == record["path"], "offline SourceV5 inventory path is not portable")
+        relative_paths.add(str(source_root.joinpath(*relative.parts)))
+    artifact_paths: set[str] = set()
+    artifacts = source_manifest.get("artifacts")
+    require(type(artifacts) is dict, "offline SourceV5 artifacts are malformed")
+    for artifact_value in artifacts.values():
+        artifact = exact(artifact_value, {"path", "sha256"}, "offline SourceV5 artifact")
+        relative = PurePosixPath(text(artifact["path"], "offline SourceV5 artifact path", 4096))
+        require(not relative.is_absolute() and ".." not in relative.parts and
+                relative.as_posix() == artifact["path"], "offline SourceV5 artifact path is not portable")
+        artifact_paths.add(str(source_root.joinpath(*relative.parts)))
+    _require_offline_files(context, relative_paths | artifact_paths, "SourceV5 inventory/artifact member")
+    owner_paths = {
+        str(source_root / "scripts/application-fixed-pair.py"),
+        str(source_root / "scripts/application-soak-readback.py"),
+    }
+    _require_offline_files(context, owner_paths, "owned probe-capture module")
+    _require_offline_paths(context, _absolute_json_paths(source_manifest),
+                           "nested SourceV5 evidence")
+    capture_pin = context["probe_capture_pin"]
+    _require_offline_files(context, {capture_pin["path"]}, "ProbeV2 capture receipt")
+    capture_path = absolute_path(capture_pin["path"], "offline ProbeV2 capture receipt path")
+    capture_output_root = capture_path.parent
+    _require_offline_directories(context, {str(capture_output_root)},
+                                 "ProbeV2 captured output root")
+    try:
+        require(capture_output_root.resolve(strict=True) == capture_output_root,
+                "offline ProbeV2 output root traverses an alias")
+        capture_output_info = capture_output_root.lstat()
+    except OSError as error:
+        raise ValidationError(f"cannot inspect copied ProbeV2 output root: {error}") from error
+    require(stat.S_ISDIR(capture_output_info.st_mode) and
+            not stat.S_ISLNK(capture_output_info.st_mode) and
+            capture_output_info.st_uid == os.getuid() and
+            stat.S_IMODE(capture_output_info.st_mode) == 0o700,
+            "copied ProbeV2 output root is not an owned private directory")
+    capture_raw, _capture_sha = read_stable(
+        capture_path, "offline ProbeV2 capture receipt", MAX_PROBE_CAPTURE_RECEIPT_BYTES,
+    )
+    capture = validate_probe_capture_receipt_envelope(
+        capture_raw, capture_pin["raw_sha256"], capture_pin["receipt_sha256"],
+    )
+    _require_offline_paths(context, _absolute_json_paths(capture),
+                           "nested ProbeV2 capture evidence")
+    _preflight_probe_capture_tree(capture, context, capture_path)
+    probe, _probe_raw_sha = read_canonical(
+        Path(probe_pin["path"]), "offline calibrated ProbeV2", MAX_CONSTRUCTION_PROBE_BYTES,
+        probe_pin["raw_sha256"],
+    )
+    _require_offline_paths(context, _absolute_json_paths(probe), "nested ProbeV2 evidence")
+    request_pin = context["capacity_bundle"]["request"]
+    _require_offline_files(context, {request_pin["path"]}, "capacity producer request")
+    request, _request_raw_sha = read_canonical(
+        Path(request_pin["path"]), "offline byte-capacity request", MAX_EXPECTATION_BYTES,
+        request_pin["raw_sha256"],
+    )
+    _require_offline_paths(context, _absolute_json_paths(request),
+                           "nested byte-capacity request evidence")
+    _preflight_capacity_request_trace(request, context)
+    expectation_pin = exact(request.get("expectation"), {"path", "sha256"},
+                            "offline capacity expectation pin")
+    _require_offline_files(context, {expectation_pin["path"]}, "nested capacity expectation")
+    capacity_expectation, _capacity_expectation_sha = read_canonical(
+        Path(expectation_pin["path"]), "offline capacity expectation",
+        MAX_EXPECTATION_BYTES, expectation_pin["sha256"],
+    )
+    _require_offline_paths(context, _absolute_json_paths(capacity_expectation),
+                           "nested capacity expectation evidence")
+    capacity_receipt_pin = context["capacity_bundle"]["receipt"]
+    _require_offline_files(context, {capacity_receipt_pin["path"]}, "capacity producer receipt")
+    capacity_receipt, _capacity_receipt_sha = read_canonical(
+        Path(capacity_receipt_pin["path"]), "offline capacity producer receipt",
+        MAX_EXPECTATION_BYTES, capacity_receipt_pin["raw_sha256"],
+    )
+    _require_offline_paths(context, _absolute_json_paths(capacity_receipt),
+                           "nested capacity receipt evidence")
+    stdout_pin = exact(capture["stdout"], {"path", "raw_sha256"},
+                       "offline ProbeV2 stdout pin")
+    stderr_pin = exact(capture["stderr"], {"path", "raw_sha256"},
+                       "offline ProbeV2 stderr pin")
+    _require_offline_files(context, {stdout_pin["path"], stderr_pin["path"]},
+                           "offline ProbeV2 raw output")
+    stdout, stdout_sha = read_stable(Path(stdout_pin["path"]), "offline ProbeV2 stdout", MAX_PROBE_OUTPUT_BYTES)
+    stderr, stderr_sha = read_stable(Path(stderr_pin["path"]), "offline ProbeV2 stderr", MAX_PROBE_OUTPUT_BYTES)
+    require(stdout_sha == stdout_pin["raw_sha256"] == probe_pin["raw_sha256"] and
+            stdout == canonical_bytes(probe) and stderr_sha == stderr_pin["raw_sha256"] and not stderr,
+            "offline ProbeV2 receipt does not retain the original exact stdout and empty stderr")
+
+
+def _verify_capacity_bundle_v5_offline(
+    source_manifest: dict[str, Any], source_pin: dict[str, Any], identity: dict[str, Any],
+    capacity_pin: dict[str, Any], context: dict[str, Any],
+) -> None:
+    bundle = context["capacity_bundle"]
+    require(bundle["artifact"] == capacity_pin,
+            "offline capacity artifact pin differs from the feedback expectation")
+    artifact_fields, _artifact_sha = _read_capacity_artifact_v5(capacity_pin)
+    target_context = {
+        "host_id": identity["host_id"], "workload": identity["workload"],
+        "profile": identity["profile"], "calibration_id": artifact_fields["calibration_id"],
+    }
+    pinned_reader, _reader_sha = _captured_source5_module(
+        source_manifest, "scripts/application-feedback-readback.py", "feedback validator",
+        MAX_SOURCE_MANIFEST_BYTES,
+    )
+    composer, _composer_sha = _captured_source5_module(
+        source_manifest, "scripts/application-feedback-composition.py", "feedback composition validator",
+        MAX_SOURCE_MANIFEST_BYTES,
+    )
+    producer, _producer_sha = _captured_source5_module(
+        source_manifest, "scripts/application-byte-capacity.py", "byte-capacity producer",
+        MAX_SOURCE_MANIFEST_BYTES,
+    )
+    bundle_pins = {name: dict(bundle[name]) for name in ("request", "artifact", "receipt")}
+    try:
+        composer._verify_capacity_request_binding(
+            pinned_reader, producer, source_manifest, target_context, identity,
+            dict(source_pin), bundle_pins,
+        )
+    except Exception as error:
+        raise ValidationError(f"SourceV5-pinned capacity producer scope replay failed: {error}") from error
+
+
+def validate_calibrated_construction_probe_v2_offline(
+    probe_pin: object, source_manifest_pin: object, capacity_artifact_pin: object,
+    identity: dict[str, Any], *, replay_context: object,
+    expected_policy: dict[str, Any] | None = None,
+    capacity_floor_policy_id: str | None = None,
+) -> str:
+    """Replay the original SourceV5 ProbeV2 using captured origin-host bytes only."""
+    context = _validate_feedback_offline_context(replay_context)
+    try:
+        pin_snapshot = json.loads(canonical_bytes(probe_pin).decode("ascii"))
+        source_pin_snapshot = json.loads(canonical_bytes(source_manifest_pin).decode("ascii"))
+        capacity_snapshot = json.loads(canonical_bytes(capacity_artifact_pin).decode("ascii"))
+        identity_snapshot = json.loads(canonical_bytes(identity).decode("ascii"))
+        policy_snapshot = None if expected_policy is None else json.loads(canonical_bytes(expected_policy).decode("ascii"))
+    except (TypeError, ValueError, UnicodeError) as error:
+        raise ValidationError(f"offline calibrated probe inputs are not closed JSON: {error}") from error
+    identity = identity_snapshot
+    expected_policy = policy_snapshot
+    pin = exact(pin_snapshot, {"path", "raw_sha256", "allocator", "binary_sha256"},
+                "offline calibrated construction probe pin")
+    capacity_pin = exact(capacity_snapshot, {"path", "raw_sha256"},
+                         "offline V5 capacity artifact pin")
+    source_pin = exact(source_pin_snapshot, {"path", "raw_sha256"},
+                       "offline SourceV5 manifest pin")
+    source_root = Path(__file__).resolve().parent.parent
+    _require_offline_directories(context, {str(source_root)}, "SourceV5 source root")
+    _require_offline_files(context, {source_pin["path"]}, "SourceV5 manifest")
+    source_manifest, _source_raw_sha = read_canonical(
+        Path(source_pin["path"]), "offline SourceV5 manifest", MAX_SOURCE_MANIFEST_BYTES,
+        digest(source_pin["raw_sha256"], "offline SourceV5 raw SHA-256"),
+    )
+    _preflight_offline_probe_evidence(source_manifest, source_pin, pin, capacity_pin, context)
+    source_recipe = {
+        "schema": EXPECTATION_SCHEMA_V5, "mode": "pressure_validation", "identity": identity,
+    }
+    _verify_source_manifest_v5(source_manifest, source_recipe)
+    probe_sha, probe, binary, source_root, _capacity_sha, capacity_path = _check_calibrated_construction_probe_v2_inputs(
+        pin, source_manifest, capacity_pin, identity, expected_policy,
+        capacity_floor_policy_id,
+    )
+    _verify_capacity_bundle_v5_offline(source_manifest, source_pin, identity, capacity_pin, context)
+    receipt_pin = context["probe_capture_pin"]
+    receipt_raw, receipt_raw_sha = read_stable(
+        Path(receipt_pin["path"]), "strict origin-host calibrated probe receipt",
+        MAX_PROBE_CAPTURE_RECEIPT_BYTES,
+    )
+    receipt = validate_probe_capture_receipt_envelope(
+        receipt_raw, receipt_pin["raw_sha256"], receipt_pin["receipt_sha256"],
+    )
+    receipt_info = Path(receipt_pin["path"]).lstat()
+    require(stat.S_ISREG(receipt_info.st_mode) and receipt_info.st_uid == os.getuid() and
+            stat.S_IMODE(receipt_info.st_mode) == 0o600,
+            "origin-host calibrated probe receipt is not a fresh owned mode-0600 file")
+    expected_source = {
+        "path": source_pin["path"], "raw_sha256": digest(source_pin["raw_sha256"], "SourceV5 raw SHA-256"),
+        "semantic_sha256": digest(source_manifest.get("manifest_sha256"), "SourceV5 semantic SHA-256"),
+        "source_tree_sha256": digest(source_manifest.get("source", {}).get("source_tree_sha256"), "SourceV5 source-tree SHA-256"),
+        "build_sha256": digest_object(source_manifest.get("build")),
+    }
+    require(receipt["source_manifest"] == expected_source,
+            "origin-host probe receipt changed the SourceV5 raw/semantic/tree roles")
+    context_bundle = {name: dict(context["capacity_bundle"][name])
+                      for name in context["capacity_bundle"]}
+    require(receipt["capacity_bundle"] == context_bundle and
+            receipt["capacity_tsv"] == context_bundle["artifact"] and
+            receipt["probe_pin"] == pin,
+            "origin-host probe receipt names a different capacity bundle or ProbeV2")
+    artifact = exact(source_manifest["artifacts"].get(identity["allocator"]), {"path", "sha256"},
+                     "offline SourceV5 APP artifact")
+    binary_pin = {
+        "path": str(source_root.joinpath(*PurePosixPath(artifact["path"]).parts)),
+        "raw_sha256": digest(artifact["sha256"], "SourceV5 APP artifact SHA-256"),
+    }
+    require(receipt["binary"] == binary_pin and binary == Path(binary_pin["path"]),
+            "origin-host probe receipt names a different SourceV5 ELF")
+    expected_probe_argv = [
+        str(binary), "--emit-feedback-policy-only", "--workload", identity["workload"],
+        "--profile", identity["profile"], "--capacity-calibration-file", str(capacity_path),
+        "--capacity-calibration-sha256", _read_capacity_artifact_v5(capacity_pin)[1],
+        "--host-id", identity["host_id"], "--source-sha256", identity["source_sha256"],
+    ]
+    if capacity_floor_policy_id is not None:
+        require(capacity_floor_policy_id == CAPACITY_FLOOR_POLICY_ID,
+                "offline ProbeV2 capacity floor policy ID is unknown")
+        expected_probe_argv.extend(["--capacity-floor-policy-id", capacity_floor_policy_id])
+    require(receipt["cwd"] == str(source_root) and
+            receipt["probe_argv"] == expected_probe_argv,
+            "origin-host probe argv/cwd differs from the original ProbeV2 invocation")
+    require(receipt["qualification_eligible"] is False and receipt["execution_ready"] is False and
+            receipt["controller_chronology_proven"] is False,
+            "origin-host probe receipt claims qualification or launch authority")
+    observed_pin = exact(receipt["observed_host"], {"path", "raw_sha256"},
+                         "origin-host observed-host pin")
+    _require_offline_paths(context, {observed_pin["path"]}, "origin-host observed-host evidence")
+    observed, observed_raw_sha = read_canonical(
+        Path(observed_pin["path"]), "origin-host observed-host context",
+        MAX_SOURCE_MANIFEST_BYTES, observed_pin["raw_sha256"],
+    )
+    observed = exact(observed, {
+        "schema", "host_id", "boot_id_sha256", "controls_sha256", "controls",
+        "kernel_release", "cpu_model", "cpu_affinity", "network_namespace_inode",
+    }, "origin-host observed-host context")
+    require(observed_raw_sha == observed_pin["raw_sha256"] and
+            observed["schema"] == "allocatbelt.application-capacity-host-context.v1" and
+            observed["host_id"] == identity["host_id"],
+            "origin-host observed-host context differs from the exact SourceV5 host")
+    origin_facts = exact(receipt["origin_facts"], {
+        "schema", "host_id", "boot_id_sha256", "kernel_release", "cpu_affinity",
+        "network_namespace_inode", "observed_host_raw_sha256", "origin_facts_sha256",
+    }, "captured ProbeV2 origin-host facts")
+    origin_body = {key: item for key, item in origin_facts.items() if key != "origin_facts_sha256"}
+    require(origin_facts["schema"] == "allocatbelt.application-feedback-probe-origin-facts.v1" and
+            origin_facts["host_id"] == observed["host_id"] and
+            origin_facts["boot_id_sha256"] == observed["boot_id_sha256"] and
+            origin_facts["kernel_release"] == observed["kernel_release"] and
+            origin_facts["cpu_affinity"] == observed["cpu_affinity"] and
+            origin_facts["network_namespace_inode"] == observed["network_namespace_inode"] and
+            origin_facts["observed_host_raw_sha256"] == observed_raw_sha and
+            origin_facts["origin_facts_sha256"] == digest_object(origin_body),
+            "captured ProbeV2 host facts differ from the original observed-host bytes")
+    initial_tmp_for_launch = exact(receipt["tmpdir_initial"], {
+        "path", "device", "inode", "mode", "mount", "available_bytes", "available_inodes",
+        "bytes_limit", "inode_limit",
+    }, "origin-host probe initial TMPDIR storage")
+    tmpdir_path_for_launch = absolute_path(
+        initial_tmp_for_launch["path"], "origin-host probe launch TMPDIR",
+    )
+    environment = exact(receipt["environment"], {"PATH", "LANG", "LC_ALL", "TMPDIR"},
+                         "captured ProbeV2 strict environment")
+    expected_environment = {
+        "PATH": "/usr/bin:/bin", "LANG": "C", "LC_ALL": "C",
+        "TMPDIR": str(tmpdir_path_for_launch),
+    }
+    receipt_affinity = receipt["affinity"]
+    observed_affinity = observed["cpu_affinity"]
+    observed_netns = observed["network_namespace_inode"]
+    require(type(receipt_affinity) is list and receipt_affinity and
+            all(type(cpu) is int and 0 <= cpu <= 65_535 for cpu in receipt_affinity) and
+            receipt_affinity == sorted(set(receipt_affinity)) and
+            type(receipt["netns"]) is int and receipt["netns"] > 0 and
+            type(observed_affinity) is list and observed_affinity and
+            all(type(cpu) is int and 0 <= cpu <= 65_535 for cpu in observed_affinity) and
+            observed_affinity == sorted(set(observed_affinity)) and
+            type(observed_netns) is int and observed_netns > 0 and
+            environment == expected_environment and
+            receipt_affinity == observed_affinity == origin_facts["cpu_affinity"] and
+            receipt["netns"] == observed_netns ==
+            origin_facts["network_namespace_inode"],
+            "captured ProbeV2 environment/affinity/netns differs from strict origin-host facts")
+    start_role = exact(receipt["start"], APP_CAPTURE_START_ROLE_FIELDS,
+                       "captured calibrated-probe start role")
+    start_role_body = {key: item for key, item in start_role.items() if key != "start_sha256"}
+    owner_start = exact(start_role["owner_proof"], APP_CAPTURE_OWNER_START_FIELDS,
+                        "FixedR8 minimal probe start proof")
+    callback_start = exact(receipt["start_callback_proof"], APP_CAPTURE_OWNER_START_FIELDS,
+                           "FixedR8 on-start callback proof")
+    require(start_role["schema"] == "allocatbelt.application-feedback-probe-start-role.v1" and
+            start_role["role"] == "calibrated_construction_probe" and
+            start_role["start_sha256"] == digest_object(start_role_body) and
+            uint(receipt["start_callback_count"], "FixedR8 start callback count", positive=True) == 1 and
+            callback_start == owner_start and
+            uint(owner_start["pid"], "origin probe PID", positive=True, maximum=(1 << 31) - 1) > 0 and
+            uint(owner_start["start_ticks"], "origin probe start ticks", positive=True) > 0 and
+            owner_start["requested_argv"] == receipt["probe_argv"] and
+            owner_start["requested_argv_sha256"] == digest_object(receipt["probe_argv"]) and
+            owner_start["environment_sha256"] == digest_object(receipt["environment"]),
+            "FixedR8 minimal probe proof differs from its exact versioned role projection")
+    owner_result_pin = exact(receipt["owner_result_pin"], {
+        "path", "raw_sha256", "owner_result_sha256",
+    }, "captured FixedR8 owner-result pin")
+    _require_offline_files(context, {owner_result_pin["path"]},
+                           "captured FixedR8 owner result")
+    owner_result_path = absolute_path(owner_result_pin["path"],
+                                      "captured FixedR8 owner-result path")
+    owner_result, owner_result_raw_sha = read_canonical(
+        owner_result_path, "captured FixedR8 direct owner result",
+        MAX_PROBE_OWNER_RESULT_BYTES, digest(owner_result_pin["raw_sha256"],
+                                             "captured FixedR8 owner-result raw SHA-256"),
+    )
+    exact(owner_result, {
+        "schema", "direct", "start_callback_count", "start_callback_proofs",
+        "owner_result_sha256",
+    }, "captured FixedR8 owner-result record")
+    owner_result_body = {key: item for key, item in owner_result.items()
+                         if key != "owner_result_sha256"}
+    require(owner_result["schema"] == PROBE_OWNER_RESULT_SCHEMA and
+            digest(owner_result["owner_result_sha256"], "FixedR8 owner-result digest") ==
+            owner_result_pin["owner_result_sha256"] == digest_object(owner_result_body) and
+            owner_result_raw_sha == owner_result_pin["raw_sha256"] and
+            owner_result["start_callback_count"] == receipt["start_callback_count"] and
+            owner_result["start_callback_proofs"] ==
+            ([] if receipt["start_callback_proof"] is None else [receipt["start_callback_proof"]]),
+            "captured FixedR8 owner result differs from the receipt's original direct status/callback")
+    owner_result_info = owner_result_path.lstat()
+    require(stat.S_ISREG(owner_result_info.st_mode) and owner_result_info.st_uid == os.getuid() and
+            stat.S_IMODE(owner_result_info.st_mode) == 0o600,
+            "captured FixedR8 owner-result file is not an owned mode-0600 file")
+    inventory_pin = exact(receipt["tmpdir_inventory_pin"], {
+        "path", "raw_sha256", "inventory_sha256",
+    }, "captured ProbeV2 TMPDIR inventory pin")
+    _require_offline_files(context, {inventory_pin["path"]},
+                           "captured ProbeV2 TMPDIR inventory sidecar")
+    inventory_path = absolute_path(inventory_pin["path"],
+                                   "captured ProbeV2 TMPDIR inventory path")
+    inventory_value, inventory_raw_sha = read_canonical(
+        inventory_path, "captured ProbeV2 TMPDIR inventory sidecar",
+        MAX_PROBE_TMPDIR_INVENTORY_BYTES, digest(inventory_pin["raw_sha256"],
+                                                 "ProbeV2 TMPDIR inventory raw SHA-256"),
+    )
+    exact(inventory_value, {"schema", "entries", "inventory_sha256"},
+          "captured ProbeV2 TMPDIR inventory sidecar")
+    inventory_body = {key: item for key, item in inventory_value.items()
+                      if key != "inventory_sha256"}
+    require(inventory_value["schema"] == PROBE_TMPDIR_INVENTORY_SCHEMA and
+            inventory_raw_sha == inventory_pin["raw_sha256"] and
+            digest(inventory_value["inventory_sha256"], "ProbeV2 TMPDIR inventory digest") ==
+            inventory_pin["inventory_sha256"] == digest_object(inventory_body),
+            "captured ProbeV2 TMPDIR inventory differs from its exact raw/semantic pins")
+    inventory_info = inventory_path.lstat()
+    require(stat.S_ISREG(inventory_info.st_mode) and inventory_info.st_uid == os.getuid() and
+            stat.S_IMODE(inventory_info.st_mode) == 0o600,
+            "captured ProbeV2 TMPDIR inventory is not an owned mode-0600 file")
+    inventory = inventory_value["entries"]
+    direct = exact(owner_result["direct"], DIRECT_CAPTURE_FIELDS,
+                   "owned calibrated probe process capture")
+    require(direct["start"] == owner_start,
+            "captured owner-result start proof differs from the exact versioned role projection")
+    supervision = exact(direct["supervision"], {
+        "leader_info", "child_return_code", "timed_out", "artifact_budget_exceeded", "received_signal",
+        "term_grace_seconds", "kill_reap_seconds", "signals", "leader_unreaped_during_group_signals",
+        "group_signal_after_leader_reap_count", "leader_reaped", "remaining_session_members",
+        "cleanup_errors", "cleanup_status",
+    }, "owned calibrated probe cleanup")
+    leader_info = exact(supervision["leader_info"], {"si_code", "si_status", "si_pid"},
+                        "owned calibrated probe unreaped leader status")
+    timing = exact(direct["timing"], {
+        "schema", "time_source", "pid", "started_monotonic_ns", "ended_monotonic_ns",
+        "elapsed_ns", "exit_code", "child_return_code", "timed_out",
+        "artifact_budget_exceeded", "cleanup_status",
+    }, "owned calibrated probe timing")
+    binary_info = binary.stat(follow_symlinks=False)
+    capture_timeout_ns = uint(receipt["capture_timeout_ns"],
+                              "captured ProbeV2 timeout nanoseconds", positive=True,
+                              maximum=30_000_000_000)
+    require(direct["status"] == receipt["exit_status"] == 0 and
+            direct["child_return_code"] == supervision["child_return_code"] == 0 and
+            direct["start"] == owner_start and direct["requested_argv"] == receipt["probe_argv"] and
+            direct["requested_argv_sha256"] == digest_object(receipt["probe_argv"]) and
+            direct["environment"] == receipt["environment"] and direct["cwd"] == receipt["cwd"] and
+            direct["environment_sha256"] == digest_object(receipt["environment"]) and
+            direct["binary_path"] == binary_pin["path"] and
+            direct["binary_sha256"] == binary_pin["raw_sha256"] and
+            direct["binary_size"] == binary_info.st_size and
+            direct["cpu_affinity"] == receipt["affinity"] and
+            direct["network_namespace_inode"] == receipt["netns"] and
+            timing["schema"] == "allocatbelt.application-fixed-pair-direct-launch-time.v1" and
+            timing["time_source"] == "monotonic_direct_supervisor" and
+            timing["pid"] == owner_start["pid"] and timing["exit_code"] == direct["status"] and
+            timing["child_return_code"] == direct["child_return_code"] and
+            timing["timed_out"] is False and timing["artifact_budget_exceeded"] is False and
+            timing["cleanup_status"] == supervision["cleanup_status"] and
+            timing["ended_monotonic_ns"] > timing["started_monotonic_ns"] and
+            timing["elapsed_ns"] == timing["ended_monotonic_ns"] - timing["started_monotonic_ns"] and
+            timing["elapsed_ns"] <= capture_timeout_ns and
+            direct["started_monotonic_ns"] == timing["started_monotonic_ns"] and
+            direct["ended_monotonic_ns"] == timing["ended_monotonic_ns"] and
+            direct["received_signal"] is None and supervision["timed_out"] is False and
+            supervision["artifact_budget_exceeded"] is False and
+            supervision["received_signal"] is None and supervision["signals"] == [] and
+            leader_info["si_pid"] == owner_start["pid"] and leader_info["si_status"] == 0 and
+            type(leader_info["si_code"]) is int and leader_info["si_code"] > 0 and
+            supervision["leader_reaped"] is True and supervision["remaining_session_members"] == [] and
+            supervision["cleanup_errors"] == [] and supervision["cleanup_status"] == "verified" and
+            supervision["group_signal_after_leader_reap_count"] == 0 and
+            supervision["leader_unreaped_during_group_signals"] is True,
+            "origin-host direct process/cleanup evidence is not a successful owned capture")
+    stdout_pin = exact(receipt["stdout"], {"path", "raw_sha256"}, "captured probe stdout pin")
+    stderr_pin = exact(receipt["stderr"], {"path", "raw_sha256"}, "captured probe stderr pin")
+    _require_offline_paths(context, {stdout_pin["path"], stderr_pin["path"]},
+                           "owned calibrated probe output")
+    for label, output_pin in (("stdout", stdout_pin), ("stderr", stderr_pin)):
+        output_info = Path(output_pin["path"]).lstat()
+        require(stat.S_ISREG(output_info.st_mode) and output_info.st_uid == os.getuid() and
+                stat.S_IMODE(output_info.st_mode) == 0o600,
+                f"captured ProbeV2 {label} is not an owned mode-0600 file")
+    storage_budget = exact(receipt["storage_budget"], {
+        "tmpdir_bytes", "tmpdir_inodes", "stdout_bytes", "stderr_bytes",
+        "owner_result_bytes", "inventory_bytes", "failure_bytes", "receipt_bytes", "output_inodes",
+    }, "origin-host probe storage budget")
+    for key in storage_budget:
+        uint(storage_budget[key], f"origin-host probe {key} budget", positive=True)
+    require(storage_budget["tmpdir_bytes"] <= 1024 * 1024 * 1024 and
+            storage_budget["tmpdir_inodes"] <= 4096 and
+            storage_budget["stdout_bytes"] <= MAX_PROBE_OUTPUT_BYTES and
+            storage_budget["stderr_bytes"] <= 64 * 1024 and
+            storage_budget["owner_result_bytes"] == MAX_PROBE_OWNER_RESULT_BYTES and
+            storage_budget["inventory_bytes"] == MAX_PROBE_TMPDIR_INVENTORY_BYTES and
+            storage_budget["failure_bytes"] == MAX_PROBE_CAPTURE_FAILURE_BYTES and
+            0 < storage_budget["receipt_bytes"] <= MAX_PROBE_CAPTURE_RECEIPT_BYTES and
+            7 <= storage_budget["output_inodes"] <= 4096 and
+            receipt_info.st_size <= storage_budget["receipt_bytes"],
+            "origin-host probe storage budget exceeds the finite owner limits")
+    receipt_budget_bound = _probe_capture_receipt_budget_bound(receipt)
+    require(storage_budget["receipt_bytes"] >= receipt_budget_bound,
+            "origin-host probe receipt budget is below its recomputed prospective canonical bound")
+    stdout, stdout_sha = read_stable(Path(stdout_pin["path"]), "captured ProbeV2 stdout", MAX_PROBE_OUTPUT_BYTES)
+    stderr, stderr_sha = read_stable(Path(stderr_pin["path"]), "captured ProbeV2 stderr", MAX_PROBE_OUTPUT_BYTES)
+    require(stdout_sha == stdout_pin["raw_sha256"] and stderr_sha == stderr_pin["raw_sha256"] and
+            receipt["output_matches_probe"] is True and receipt["stderr_empty"] is True and
+            len(stdout) <= storage_budget["stdout_bytes"] and
+            len(stderr) <= storage_budget["stderr_bytes"] and
+            stdout == canonical_bytes(probe) and stdout_sha == probe_sha and not stderr,
+            "captured origin-host ProbeV2 stdout/stderr differs from the unchanged original bytes")
+    output_mount = exact(receipt["output_mount"], {
+        "mount_id", "major_minor", "mount_root", "mount_point", "filesystem_type",
+        "mount_source", "device", "available_bytes", "available_inodes",
+    }, "origin-host probe output mount")
+    require(type(output_mount["mount_id"]) is int and output_mount["mount_id"] > 0 and
+            type(output_mount["device"]) is int and output_mount["device"] >= 0 and
+            type(output_mount["available_bytes"]) is int and output_mount["available_bytes"] >= 0 and
+            type(output_mount["available_inodes"]) is int and output_mount["available_inodes"] >= 0 and
+            output_mount["available_bytes"] >= storage_budget["tmpdir_bytes"] +
+            storage_budget["stdout_bytes"] +
+            storage_budget["stderr_bytes"] + storage_budget["owner_result_bytes"] +
+            storage_budget["inventory_bytes"] + storage_budget["failure_bytes"] +
+            storage_budget["receipt_bytes"] and
+            output_mount["available_inodes"] >= storage_budget["tmpdir_inodes"] +
+            storage_budget["output_inodes"] and
+            type(output_mount["filesystem_type"]) is str and
+            output_mount["filesystem_type"] not in ("tmpfs", "ramfs", "devtmpfs"),
+            "origin-host probe output mount facts are malformed or memory-backed")
+    output_mount_static = {key: output_mount[key] for key in (
+        "mount_id", "major_minor", "mount_root", "mount_point", "filesystem_type",
+        "mount_source", "device",
+    )}
+    output_directory = Path(stdout_pin["path"]).parent
+    require(Path(stderr_pin["path"]).parent == output_directory and
+            owner_result_path.parent == output_directory and inventory_path.parent == output_directory and
+            Path(receipt_pin["path"]).parent == output_directory and
+            Path(receipt["tmpdir_initial"]["path"]).parent == output_directory and
+            Path(output_mount["mount_point"]).is_absolute(),
+            "origin-host probe storage paths are outside their captured private output root")
+    try:
+        output_members = {item.name for item in output_directory.iterdir()}
+    except OSError as error:
+        raise ValidationError(f"cannot enumerate origin-host probe output root: {error}") from error
+    require(output_members == {
+        "tmp", "stdout.bin", "stderr.bin", "owner-result.json", "tmpdir-inventory.json",
+        "capture-receipt.json",
+    },
+            "origin-host probe output root has missing or unpinned members")
+    initial_tmp = exact(receipt["tmpdir_initial"], {
+        "path", "device", "inode", "mode", "mount", "available_bytes", "available_inodes",
+        "bytes_limit", "inode_limit",
+    }, "origin-host probe initial TMPDIR storage")
+    final_tmp = exact(receipt["tmpdir_final"], {
+        "path", "device", "inode", "mode", "mount", "bytes_used", "file_count",
+        "directory_count", "bytes_limit", "inode_limit", "available_bytes", "available_inodes",
+    }, "origin-host probe final TMPDIR storage")
+    tmp_path = absolute_path(initial_tmp["path"], "origin-host probe TMPDIR")
+    require(initial_tmp["path"] == final_tmp["path"] == str(tmp_path) and
+            initial_tmp["mode"] == final_tmp["mode"] == 0o700 and
+            initial_tmp["device"] == final_tmp["device"] and
+            initial_tmp["inode"] == final_tmp["inode"] and
+            initial_tmp["mount"] == final_tmp["mount"] and
+            type(initial_tmp["bytes_limit"]) is int and initial_tmp["bytes_limit"] > 0 and
+            initial_tmp["bytes_limit"] == final_tmp["bytes_limit"] == storage_budget["tmpdir_bytes"] and
+            type(initial_tmp["inode_limit"]) is int and initial_tmp["inode_limit"] > 0 and
+            initial_tmp["inode_limit"] == final_tmp["inode_limit"] == storage_budget["tmpdir_inodes"] and
+            type(initial_tmp["available_bytes"]) is int and
+            initial_tmp["available_bytes"] >= initial_tmp["bytes_limit"] and
+            type(initial_tmp["available_inodes"]) is int and
+            initial_tmp["available_inodes"] >= initial_tmp["inode_limit"] and
+            initial_tmp["mount"] == final_tmp["mount"] == output_mount_static,
+            "origin-host probe TMPDIR storage does not match its original bounded output mount")
+    modules = exact(receipt["owner_modules"], {"fixed_pair", "launch_identity_helper"},
+                    "origin-host process owner module pins")
+    for name, relative in (
+        ("fixed_pair", "scripts/application-fixed-pair.py"),
+        ("launch_identity_helper", "scripts/application-soak-readback.py"),
+    ):
+        module_pin = exact(modules[name], {"path", "raw_sha256"}, f"origin {name} pin")
+        require(module_pin["path"] == relative, f"origin {name} path differs from the captured SourceV5 owner")
+        record = _source_v5_regular_record(source_manifest["source"], relative, name)
+        require(module_pin["raw_sha256"] == record["sha256"], f"origin {name} bytes differ from SourceV5 inventory")
+    fixed_module, _fixed_sha = _captured_source5_module(
+        source_manifest, "scripts/application-fixed-pair.py", "FixedR8 direct process owner",
+        MAX_SOURCE_MANIFEST_BYTES,
+    )
+    _helper_module, _helper_sha = _captured_source5_module(
+        source_manifest, "scripts/application-soak-readback.py", "FixedR8 launch identity helper",
+        MAX_SOURCE_MANIFEST_BYTES,
+    )
+    verify_tmpdir = getattr(fixed_module, "_verify_tmpdir_storage_offline", None)
+    require(callable(verify_tmpdir),
+            "SourceV5-pinned FixedR8 offline TMPDIR storage verifier is unavailable")
+    verify_tmpdir(
+        initial_tmp, final_tmp, str(tmp_path), initial_tmp["bytes_limit"],
+        initial_tmp["inode_limit"], output_mount_static, "origin-host probe",
+    )
+    inventory = inventory_value["entries"]
+    require(final_tmp["bytes_used"] == sum(
+                item["size"] for item in inventory if item["kind"] == "file"
+            ) and
+            final_tmp["file_count"] == sum(1 for item in inventory if item["kind"] == "file") and
+            final_tmp["directory_count"] == sum(1 for item in inventory if item["kind"] == "directory"),
+            "origin-host ProbeV2 TMPDIR inventory totals differ from strict storage receipt")
+    require(final_tmp["bytes_used"] <= final_tmp["bytes_limit"] and
+            final_tmp["file_count"] + final_tmp["directory_count"] <= final_tmp["inode_limit"],
+            "origin-host probe TMPDIR exceeded its captured finite storage limits")
     return probe_sha
 
 
@@ -1610,10 +2867,21 @@ def validate_construction_probe(
             digest(record["sha256"], f"SourceV5 source entry SHA-256 {name}")
             uint(record["size"], f"SourceV5 source entry size {name}")
         policy_artifact = exact(source_manifest_value["feedback_policy"], {"schema", "policy", "policy_sha256"}, "SourceV5 feedback policy artifact")
-        require(policy_artifact["schema"] == "allocatbelt.application-feedback-policy-artifact.v1", "SourceV5 feedback policy artifact schema is unsupported")
-        policy_body = exact(policy_artifact["policy"], {"schema", "version", "reader_contract", "algorithm", "contexts", "source_pins"}, "SourceV5 feedback policy body")
+        require(policy_artifact["schema"] in (
+            "allocatbelt.application-feedback-policy-artifact.v1",
+            "allocatbelt.application-feedback-policy-artifact.v2",
+        ), "SourceV5 feedback policy artifact schema is unsupported")
+        policy_body_keys = {
+            "schema", "version", "reader_contract", "algorithm", "contexts", "source_pins",
+        }
+        if policy_artifact["schema"] == "allocatbelt.application-feedback-policy-artifact.v2":
+            policy_body_keys.add("capacity_floor_policy")
+        policy_body = exact(policy_artifact["policy"], policy_body_keys,
+                            "SourceV5 feedback policy body")
         require(digest(policy_artifact["policy_sha256"], "SourceV5 feedback policy digest") == digest_object(policy_body), "SourceV5 feedback policy digest is invalid")
-        require(policy_body["schema"] == "allocatbelt.application-feedback-policy-artifact.v1", "SourceV5 feedback policy body schema differs")
+        require(policy_body["schema"] == policy_artifact["schema"], "SourceV5 feedback policy body schema differs")
+        if "capacity_floor_policy" in policy_body:
+            _validate_capacity_floor_policy_descriptor(policy_body["capacity_floor_policy"])
         require(policy_body["version"] == policy["version"], "SourceV5 feedback policy version differs from expectation")
         reader_contract = exact(policy_body["reader_contract"], {
             "sample_interval_ns", "max_dense_gap_ns", "telemetry_freshness_ns",
@@ -1686,10 +2954,10 @@ def _verify_source_manifest_v5(value: dict[str, Any], recipe: dict[str, Any]) ->
         require(recipe.get("mode") == "pressure_soak_validation", "SourceV5 expectation v3 requires pressure-soak validation mode")
     elif recipe.get("schema") == EXPECTATION_SCHEMA_V4:
         require(recipe.get("mode") == "capacity_calibration", "SourceV5 expectation v4 requires capacity calibration mode")
-    elif recipe.get("schema") == EXPECTATION_SCHEMA_V5:
-        require(recipe.get("mode") == "pressure_validation", "SourceV5 expectation v5 requires pressure validation mode")
+    elif recipe.get("schema") in (EXPECTATION_SCHEMA_V5, EXPECTATION_SCHEMA_V6):
+        require(recipe.get("mode") == "pressure_validation", "SourceV5 expectation v5/v6 requires pressure validation mode")
     else:
-        require(False, "SourceV5 verification requires feedback expectation v3, v4, or v5")
+        require(False, "SourceV5 verification requires feedback expectation v3, v4, v5, or v6")
     source = value.get("source")
     controller_record = _source_v5_regular_record(source, SOURCE_V5_CONTROLLER_PATH, "campaign controller")
     # The captured controller's V5 verifier validates this regular entry and
@@ -1794,17 +3062,25 @@ def _verify_source_manifest(recipe: dict[str, Any]) -> dict[str, Any]:
     return {"raw_sha256": raw_sha, "value": value}
 
 
-def _verify_pressure_proof(recipe: dict[str, Any], production: tuple[int, int], drain: tuple[int, int]) -> tuple[bool, str]:
+def _verify_pressure_proof(
+    recipe: dict[str, Any], production: tuple[int, int], drain: tuple[int, int], *,
+    offline_replayed_proof: dict[str, Any] | None = None,
+    allow_pressure_v2: bool = False,
+) -> tuple[bool, str]:
     pin = recipe["external_pressure_proof"]
     proof, raw_sha = read_canonical(Path(pin["path"]), "external pressure readback", MAX_PRESSURE_PROOF_BYTES, pin["raw_sha256"])
-    exact(proof, {
+    pressure_fields = {
         "schema", "status", "recipe_sha256", "recipe_raw_sha256", "validator_sha256", "condition_sha256", "identity",
         "run_sha256", "events_sha256",
         "launch_record_sha256", "process_binding_sha256", "readiness_marker_sha256", "sample_count",
         "application_overlap_nanoseconds", "application_process", "application_window", "continuous_ready_window",
         "readiness_windows_passed", "cleanup_rechecked", "physical_nic_claimed", "readback_sha256",
-    }, "external pressure validation receipt")
-    require(proof["schema"] == PRESSURE_READBACK_SCHEMA and proof["status"] == "valid", "external pressure readback is not valid")
+    }
+    if allow_pressure_v2 and type(proof) is dict and proof.get("schema") == PRESSURE_READBACK_SCHEMA_V2:
+        pressure_fields.add("calibration_scope_v2")
+    exact(proof, pressure_fields, "external pressure validation receipt")
+    allowed_schema = (PRESSURE_READBACK_SCHEMA, PRESSURE_READBACK_SCHEMA_V2) if allow_pressure_v2 else (PRESSURE_READBACK_SCHEMA,)
+    require(proof["schema"] in allowed_schema and proof["status"] == "valid", "external pressure readback is not valid")
     body = {key: item for key, item in proof.items() if key != "readback_sha256"}
     require(digest(proof["readback_sha256"], "pressure readback self digest") == digest_object(body), "external pressure readback self digest is invalid")
     for key in ("recipe_sha256", "recipe_raw_sha256", "validator_sha256", "condition_sha256", "run_sha256", "events_sha256", "launch_record_sha256", "process_binding_sha256", "readiness_marker_sha256"):
@@ -1822,6 +3098,9 @@ def _verify_pressure_proof(recipe: dict[str, Any], production: tuple[int, int], 
     require(uint(pressure_process["pid"], "pressure-bound application PID", positive=True, maximum=(1 << 31) - 1) == identity["process_id"], "pressure proof is bound to a different application PID")
     uint(pressure_process["start_ticks"], "pressure-bound application start ticks", positive=True)
     require(pressure_process["nonce"] == identity["report_nonce"] and digest(pressure_process["executable_sha256"], "pressure-bound application binary SHA-256") == identity["binary_sha256"], "pressure proof application nonce or binary differs from feedback identity")
+    if offline_replayed_proof is not None:
+        require(proof == offline_replayed_proof,
+                "external pressure proof bytes differ from the independent offline raw-artifact replay")
     require(proof["readiness_windows_passed"] is True and proof["cleanup_rechecked"] is True and proof["physical_nic_claimed"] is False, "external pressure readiness or cleanup proof is incomplete")
     uint(proof["sample_count"], "pressure proof sample count", positive=True, maximum=120_000)
     overlap = uint(proof["application_overlap_nanoseconds"], "pressure proof application overlap", positive=True)
@@ -3176,6 +4455,20 @@ def verify_feedback(
     trace_directory: Path,
     expected_artifact_sha256: dict[str, str],
 ) -> dict[str, Any]:
+    return _verify_feedback_replay(
+        expectation_path, expected_expectation_sha256, trace_directory,
+        expected_artifact_sha256,
+    )
+
+
+def _verify_feedback_replay(
+    expectation_path: Path,
+    expected_expectation_sha256: str,
+    trace_directory: Path,
+    expected_artifact_sha256: dict[str, str],
+    *, offline_replay_context: object | None = None,
+    offline_replayed_proof: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     expectation, expectation_raw_sha = read_canonical(
         expectation_path, "feedback expectation", MAX_EXPECTATION_BYTES,
         digest(expected_expectation_sha256, "expected expectation raw SHA-256"),
@@ -3183,11 +4476,23 @@ def verify_feedback(
     recipe = _validate_expectation_body({key: value for key, value in expectation.items() if key != "recipe_sha256"})
     require(digest(expectation.get("recipe_sha256"), "expectation self digest") == digest_object(recipe), "feedback expectation self digest is invalid")
     source_manifest = _verify_source_manifest(recipe)
-    if recipe["schema"] == EXPECTATION_SCHEMA_V5:
-        validate_calibrated_construction_probe_v2(
-            recipe["construction_probe"], source_manifest["value"],
-            recipe["app_capacity_artifact"], recipe["identity"], recipe["policy"],
-        )
+    if recipe["schema"] in (EXPECTATION_SCHEMA_V5, EXPECTATION_SCHEMA_V6):
+        capacity_floor_policy_id = recipe["policy"].get("capacity_floor_policy_id")
+        if offline_replay_context is None:
+            validate_calibrated_construction_probe_v2(
+                recipe["construction_probe"], source_manifest["value"],
+                recipe["app_capacity_artifact"], recipe["identity"], recipe["policy"],
+                capacity_floor_policy_id,
+            )
+        else:
+            source_pin = exact(recipe["host_binding"], {"path", "raw_sha256"},
+                               "offline feedback SourceV5 manifest pin")
+            validate_calibrated_construction_probe_v2_offline(
+                recipe["construction_probe"], source_pin, recipe["app_capacity_artifact"],
+                recipe["identity"], replay_context=offline_replay_context,
+                expected_policy=recipe["policy"],
+                capacity_floor_policy_id=capacity_floor_policy_id,
+            )
     elif recipe["schema"] in (EXPECTATION_SCHEMA_V2, EXPECTATION_SCHEMA_V3, EXPECTATION_SCHEMA_V4):
         validate_construction_probe(recipe, source_manifest["value"])
     artifact_pins = {
@@ -3235,6 +4540,8 @@ def verify_feedback(
             require(recipe["external_pressure_proof"]["validator_sha256"] == pressure_validator["sha256"], "pressure proof validator differs from SourceV5 harness pin")
         pressure_ok, _ = _verify_pressure_proof(
             recipe, tuple(production["start_monotonic_ns"]), drain,
+            offline_replayed_proof=offline_replayed_proof,
+            allow_pressure_v2=offline_replay_context is not None,
         )
         if recipe["schema"] == EXPECTATION_SCHEMA_V3:
             soak_binding = _verify_soak_final_binding_v3(recipe, source_manifest, manifest)
@@ -3247,7 +4554,7 @@ def verify_feedback(
         else:
             runtime_ok, runtime_sha, release_complete = _verify_runtime_binding(recipe, event_info["final_state"], model.sample_count)
     source_value = source_manifest["value"]
-    if recipe["schema"] in (EXPECTATION_SCHEMA_V3, EXPECTATION_SCHEMA_V4, EXPECTATION_SCHEMA_V5):
+    if recipe["schema"] in (EXPECTATION_SCHEMA_V3, EXPECTATION_SCHEMA_V4, EXPECTATION_SCHEMA_V5, EXPECTATION_SCHEMA_V6):
         feedback_record = _source_v5_regular_record(
             source_value.get("source"),
             "scripts/application-feedback-readback.py",
@@ -3298,6 +4605,258 @@ def verify_feedback(
         "final_runtime_binding",
     }, "feedback validation receipt has an unstable key set")
     return result
+
+
+
+
+def _preflight_feedback_nested_json_paths(
+    documents: list[dict[str, Any]], context: dict[str, Any],
+) -> None:
+    """Close nested original JSON path references before captured code runs."""
+    pending = list(documents)
+    seen: set[str] = set()
+    while pending:
+        document = pending.pop()
+        paths = _absolute_json_paths(document)
+        _require_offline_paths(context, paths, "nested feedback/pressure evidence")
+        for raw_path in paths:
+            if not raw_path.endswith(".json") or raw_path in seen:
+                continue
+            seen.add(raw_path)
+            _require_offline_files(context, {raw_path}, "nested JSON evidence")
+            nested, _raw_sha = read_canonical(
+                Path(raw_path), "preflighted nested feedback/pressure JSON",
+                MAX_OFFLINE_NESTED_JSON_BYTES,
+            )
+            pending.append(nested)
+            require(len(seen) <= MAX_OFFLINE_PATH_MAP_ENTRIES,
+                    "nested feedback/pressure JSON path closure exceeds its finite bound")
+
+
+def _verify_pressure_pair_replay_request(
+    value: object, expectation_source_pin: dict[str, Any], source_manifest: dict[str, Any],
+    context: dict[str, Any],
+) -> dict[str, Any]:
+    request = exact(value, {
+        "schema", "source_manifest", "source_root", "pair", "module_pins",
+    }, "offline feedback pressure-pair replay request")
+    require(request["schema"] == PRESSURE_PAIR_REPLAY_REQUEST_SCHEMA,
+            "unsupported offline feedback pressure-pair request schema")
+    source_pin = exact(request["source_manifest"], {
+        "path", "raw_sha256", "semantic_sha256", "source_tree_sha256",
+    }, "offline feedback pressure request SourceV5 pin")
+    require(source_pin["path"] == expectation_source_pin["path"] and
+            source_pin["raw_sha256"] == expectation_source_pin["raw_sha256"] and
+            source_pin["semantic_sha256"] == source_manifest["manifest_sha256"] and
+            source_pin["source_tree_sha256"] == source_manifest["source"]["source_tree_sha256"],
+            "offline feedback pressure request changed the original SourceV5 raw/semantic/tree roles")
+    for key in ("raw_sha256", "semantic_sha256", "source_tree_sha256"):
+        digest(source_pin[key], f"offline feedback pressure SourceV5 {key}")
+    source_root = absolute_path(request["source_root"], "offline feedback pressure SourceV5 root")
+    require(str(source_root) == str(Path(__file__).resolve().parent.parent),
+            "offline feedback pressure replay requires the original identity-mapped SourceV5 root")
+    _require_offline_directories(context, {str(source_root)}, "SourceV5 pressure replay root")
+    pair = exact(request["pair"], {
+        "recipe", "output_root", "readback", "host_verification",
+    }, "offline feedback pressure-pair artifact set")
+    recipe_pin = exact(pair["recipe"], {"path", "raw_sha256"},
+                       "offline feedback pressure-pair recipe pin")
+    readback_pin = exact(pair["readback"], {"path", "raw_sha256"},
+                         "offline feedback pressure-pair readback pin")
+    host_pin = exact(pair["host_verification"], {
+        "path", "raw_sha256", "receipt_sha256",
+    }, "offline feedback pressure-pair host receipt pin")
+    for label, pin in (("recipe", recipe_pin), ("readback", readback_pin),
+                       ("host receipt", host_pin)):
+        absolute_path(pin["path"], f"offline feedback pressure-pair {label} path")
+        digest(pin["raw_sha256"], f"offline feedback pressure-pair {label} raw SHA-256")
+    digest(host_pin["receipt_sha256"], "offline feedback pressure-pair host receipt semantic SHA-256")
+    output_root = absolute_path(pair["output_root"], "offline feedback pressure-pair output root")
+    module_pins = exact(request["module_pins"], {
+        "pressure_pair", "pressure_readback", "campaign_chronology",
+    }, "offline feedback pressure replay module pins")
+    module_paths = {
+        "pressure_pair": "scripts/application-pressure-pair.py",
+        "pressure_readback": "scripts/application-pressure-readback.py",
+        "campaign_chronology": "scripts/application-campaign-chronology.py",
+    }
+    for name, relative in module_paths.items():
+        pin = exact(module_pins[name], {"path", "raw_sha256"},
+                    f"offline feedback {name} SourceV5 pin")
+        require(pin["path"] == relative,
+                f"offline feedback {name} path differs from the captured SourceV5 contract")
+        digest(pin["raw_sha256"], f"offline feedback {name} raw SHA-256")
+        record = _source_v5_regular_record(source_manifest["source"], relative, name)
+        require(pin["raw_sha256"] == record["sha256"],
+                f"offline feedback {name} bytes differ from the SourceV5 typed inventory")
+        module_path = str(source_root.joinpath(*PurePosixPath(relative).parts))
+        _require_offline_files(context, {module_path}, f"captured {name} module")
+    _require_offline_files(context, {
+        recipe_pin["path"], readback_pin["path"], host_pin["path"],
+    }, "pressure-pair top-level artifact")
+    _require_offline_directories(context, {str(output_root)}, "pressure-pair output root")
+    require(readback_pin["path"] == str(output_root / "pressure-pair-readback.json"),
+            "offline feedback pressure-pair readback differs from its original output layout")
+    recipe, _recipe_raw_sha = read_canonical(
+        Path(recipe_pin["path"]), "offline feedback pressure-pair recipe", 16 * 1024 * 1024,
+        recipe_pin["raw_sha256"],
+    )
+    sidecar, _sidecar_raw_sha = read_canonical(
+        Path(readback_pin["path"]), "offline feedback pressure-pair readback", 16 * 1024 * 1024,
+        readback_pin["raw_sha256"],
+    )
+    host_receipt, _host_raw_sha = read_canonical(
+        Path(host_pin["path"]), "offline feedback pressure-pair host receipt", 16 * 1024 * 1024,
+        host_pin["raw_sha256"],
+    )
+    _preflight_feedback_nested_json_paths(
+        [recipe, sidecar, host_receipt], context,
+    )
+    source_records = source_manifest["source"]["files"]
+    for index, record_value in enumerate(source_records):
+        record = exact(record_value, {"path", "kind", "mode", "sha256", "size"},
+                       f"offline pressure SourceV5 inventory[{index}]")
+        relative = PurePosixPath(text(record["path"], "offline pressure source member path", 4096))
+        require(not relative.is_absolute() and ".." not in relative.parts and
+                relative.as_posix() == record["path"] and record["kind"] == "file" and
+                record["mode"] in ("100644", "100755"),
+                "offline pressure SourceV5 typed inventory entry is malformed")
+        exact_path = str(source_root.joinpath(*relative.parts))
+        _require_offline_files(context, {exact_path}, "SourceV5 typed source member")
+    for artifact in source_manifest["artifacts"].values():
+        artifact_value = exact(artifact, {"path", "sha256"}, "offline pressure SourceV5 artifact")
+        relative = PurePosixPath(text(artifact_value["path"], "offline pressure APP artifact path", 4096))
+        require(not relative.is_absolute() and ".." not in relative.parts and
+                relative.as_posix() == artifact_value["path"],
+                "offline pressure SourceV5 APP artifact path is malformed")
+        _require_offline_files(context, {
+            str(source_root.joinpath(*relative.parts)),
+        }, "SourceV5 APP artifact")
+    return {
+        "source_manifest": source_pin,
+        "source_root": str(source_root),
+        "pair": {
+            "recipe": recipe_pin, "output_root": str(output_root),
+            "readback": readback_pin, "host_verification": host_pin,
+        },
+        "module_pins": module_pins,
+        "recipe_value": recipe,
+        "sidecar_value": sidecar,
+        "host_receipt_value": host_receipt,
+    }
+
+
+def verify_feedback_offline(
+    expectation_path: Path,
+    expected_expectation_sha256: str,
+    trace_directory: Path,
+    expected_artifact_sha256: dict[str, str],
+    *, replay_context: object,
+    pressure_replay_request: object | None = None,
+) -> dict[str, Any]:
+    """Replay peer feedback and its Source5 pressure pair without launching workloads.
+
+    A full result is returned only after the exact SourceV5-captured pressure
+    pair reader has independently replayed the original pair and its chronology
+    dependency. Missing that adapter remains a hard error, never a partial pass.
+    """
+    context = _validate_feedback_offline_context(replay_context)
+    expected_path = absolute_path(str(expectation_path), "offline feedback expectation path")
+    trace_root = absolute_path(str(trace_directory), "offline feedback trace directory")
+    trace_paths = {str(trace_root / name) for name in TRACE_FILES}
+    _require_offline_paths(context, {
+        str(expected_path), str(trace_root), *trace_paths,
+        context["probe_capture_pin"]["path"],
+        *(context["capacity_bundle"][name]["path"] for name in context["capacity_bundle"]),
+    }, "offline feedback top-level evidence")
+    _require_offline_files(context, {str(expected_path)}, "offline feedback expectation")
+    _require_offline_directories(context, {str(trace_root)}, "offline feedback trace directory")
+    _require_offline_files(context, trace_paths, "offline feedback trace artifact")
+    expectation, expectation_sha = read_canonical(
+        expected_path, "offline feedback expectation", MAX_EXPECTATION_BYTES,
+        digest(expected_expectation_sha256, "offline expected expectation raw SHA-256"),
+    )
+    recipe = _validate_expectation_body({key: value for key, value in expectation.items() if key != "recipe_sha256"})
+    require(expectation.get("recipe_sha256") == digest_object(recipe),
+            "offline feedback expectation self digest is invalid")
+    require(recipe["schema"] in (EXPECTATION_SCHEMA_V5, EXPECTATION_SCHEMA_V6),
+            "offline feedback reader is scoped to SourceV5 calibrated ProbeV2 evidence")
+    source_pin = exact(recipe["host_binding"], {"path", "raw_sha256"},
+                       "offline feedback SourceV5 manifest pin")
+    validate_calibrated_construction_probe_v2_offline(
+        recipe["construction_probe"], source_pin, recipe["app_capacity_artifact"],
+        recipe["identity"], replay_context=replay_context,
+        expected_policy=recipe["policy"],
+        capacity_floor_policy_id=recipe["policy"].get("capacity_floor_policy_id"),
+    )
+    require(type(expected_artifact_sha256) is dict and
+            set(expected_artifact_sha256) == {"manifest", "events", "samples"},
+            "offline feedback raw artifact pins have an unexpected key set")
+    for key, value in expected_artifact_sha256.items():
+        digest(value, f"offline feedback {key} raw SHA-256")
+    proof_pin = exact(recipe["external_pressure_proof"], {
+        "path", "raw_sha256", "validator_sha256", "recipe_raw_sha256",
+    }, "offline external pressure receipt pin")
+    _require_offline_paths(context, {proof_pin["path"]}, "offline external pressure receipt")
+    _require_offline_files(context, {proof_pin["path"]}, "offline external pressure receipt")
+    if pressure_replay_request is None:
+        raise ValidationError(
+            "offline feedback replay is blocked: a closed independent pressure-pair request is required; "
+            "the captured ProbeV2 and trace pins cannot stand in for pressure replay"
+        )
+    source_manifest, _source_raw_sha = read_canonical(
+        Path(source_pin["path"]), "offline feedback SourceV5 manifest", MAX_SOURCE_MANIFEST_BYTES,
+        source_pin["raw_sha256"],
+    )
+    pressure_request = _verify_pressure_pair_replay_request(
+        pressure_replay_request, source_pin, source_manifest, context,
+    )
+    pressure_pair_pin = pressure_request["module_pins"]["pressure_pair"]
+    pressure_pair, pressure_pair_sha = _captured_source5_module(
+        source_manifest, pressure_pair_pin["path"], "offline pressure-pair reader",
+        MAX_SOURCE_MANIFEST_BYTES,
+    )
+    require(pressure_pair_sha == pressure_pair_pin["raw_sha256"],
+            "captured pressure-pair reader differs from its closed module pin")
+    pair = pressure_request["pair"]
+    pressure_path_map = {
+        "schema": context["evidence_path_map"]["schema"],
+        "entries": [dict(entry) for entry in context["evidence_path_map"]["entries"]],
+    }
+    pair_result = pressure_pair.validate_pressure_pair_artifacts_offline(
+        pair["recipe"], pair["output_root"], pair["readback"],
+        pair["host_verification"], pressure_path_map,
+    )
+    require(type(pair_result) is dict and pair_result.get("validated") is True and
+            pair_result.get("qualification_eligible") is False and
+            pair_result.get("execution_ready") is False,
+            "offline pressure-pair replay returned an incomplete or readiness-bearing result")
+    member_results = pair_result.get("member_results")
+    require(type(member_results) is list and len(member_results) == 2,
+            "offline pressure-pair result does not retain both original member readbacks")
+    matches = []
+    for index, member in enumerate(member_results):
+        exact(member, {"ordinal", "identity", "pressure_recipe", "proof_pin", "readback"},
+              f"offline pressure-pair member result[{index}]")
+        require(member["ordinal"] == index, "offline pressure-pair member result order changed")
+        if member["proof_pin"]["path"] == proof_pin["path"]:
+            matches.append(member)
+    require(len(matches) == 1 and matches[0]["proof_pin"]["raw_sha256"] == proof_pin["raw_sha256"],
+            "offline SourceV5 pressure pair does not contain the exact feedback pressure-proof bytes")
+    pressure_identity = matches[0]["readback"].get("identity")
+    require(type(pressure_identity) is dict and
+            pressure_identity["host_id"] == recipe["identity"]["host_id"] and
+            pressure_identity["run_id"] == recipe["identity"]["run_id"] and
+            pressure_identity["allocator"] == recipe["identity"]["allocator"] and
+            pressure_identity["executor"] == recipe["identity"]["executor"] and
+            pressure_identity["nonce"] == recipe["identity"]["report_nonce"] and
+            matches[0]["readback"]["application_process"]["pid"] == recipe["identity"]["process_id"],
+            "offline pressure replay is bound to another SourceV5 feedback process")
+    return _verify_feedback_replay(
+        expected_path, expectation_sha, trace_root, expected_artifact_sha256,
+        offline_replay_context=replay_context,
+        offline_replayed_proof=matches[0]["readback"],
+    )
 
 
 def _write_exclusive(path: Path, raw: bytes) -> None:

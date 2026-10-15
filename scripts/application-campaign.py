@@ -38,6 +38,7 @@ SPEC_SCHEMA = "allocatbelt.application-campaign-spec.v2"
 SPEC_SCHEMA_V3 = "allocatbelt.application-campaign-spec.v3"
 SOURCE_SCHEMA = "allocatbelt.application-source-manifest.v4"
 SOURCE_SCHEMA_V5 = "allocatbelt.application-source-manifest.v5"
+CAPACITY_FLOOR_POLICY_ID = "application_capacity_relative_tenth_v1"
 CAMPAIGN_INPUTS_MODULE_PATH = "scripts/application-campaign-inputs.py"
 SOURCE_INVENTORY_SCHEMA = "allocatbelt.application-source-inventory.v1"
 SOURCE_INVENTORY_MODULE_SHA256 = "09557087a64e83bc81e4116f8e8f6b59e42a59beb500108e57d66942bd05f950"
@@ -601,6 +602,8 @@ def source_inventory(root: Path, timeout_seconds: float = 120.0) -> tuple[str, l
 
 def source_manifest(args: argparse.Namespace) -> dict[str, Any]:
     root = Path(args.source_root).resolve(strict=True)
+    require(not (getattr(args, "legacy_v4", False) and getattr(args, "capacity_floor_policy_id", None) is not None),
+            "the opt-in capacity-floor policy requires a new SourceV5 manifest epoch")
     require(args.target_triple == "x86_64-unknown-linux-gnu", "campaign target must be x86_64-unknown-linux-gnu")
     require(args.target_cpu == "x86-64-v3", "campaign build must pin x86-64-v3")
     commit = run_checked(["git", "rev-parse", "HEAD"], root).decode().strip()
@@ -698,7 +701,10 @@ def source_manifest(args: argparse.Namespace) -> dict[str, Any]:
             )
             qualification_harness[name] = {"path": relative_path, "sha256": record["sha256"]}
         try:
-            feedback_policy = inputs.build_feedback_policy_artifact(root, source_files, qualification_harness)
+            feedback_policy = inputs.build_feedback_policy_artifact(
+                root, source_files, qualification_harness,
+                capacity_floor_policy_id=getattr(args, "capacity_floor_policy_id", None),
+            )
             inputs.validate_feedback_policy_artifact(feedback_policy, source_files, qualification_harness)
         except inputs.InputError as error:
             raise CampaignError(f"cannot freeze numeric feedback policy artifact: {error}") from error
@@ -802,7 +808,13 @@ def verify_source_manifest(
             raise CampaignError(f"invalid SourceV5 qualification inputs: {error}") from error
         if source_root is not None:
             try:
-                regenerated = inputs_module.build_feedback_policy_artifact(source_root.resolve(strict=True), source["files"], harness)
+                feedback_body = manifest["feedback_policy"]["policy"]
+                floor_policy = feedback_body.get("capacity_floor_policy") if type(feedback_body) is dict else None
+                floor_policy_id = None if floor_policy is None else floor_policy.get("policy_id")
+                regenerated = inputs_module.build_feedback_policy_artifact(
+                    source_root.resolve(strict=True), source["files"], harness,
+                    capacity_floor_policy_id=floor_policy_id,
+                )
             except inputs_module.InputError as error:
                 raise CampaignError(f"cannot independently rebuild SourceV5 feedback policy: {error}") from error
             require(canonical_bytes(regenerated) == canonical_bytes(manifest["feedback_policy"]), "SourceV5 feedback policy artifact differs from the pinned reader/runtime numeric contract")
@@ -933,7 +945,11 @@ def validate_spec(
     schema = spec.get("schema")
     spec_v3 = schema == SPEC_SCHEMA_V3
     if spec_v3:
-        exact_keys(spec, expected | {"qualification_inputs"}, "campaign spec v3")
+        optional_floor_key = {"capacity_floor_policy_id"} if "capacity_floor_policy_id" in spec else set()
+        exact_keys(spec, expected | {"qualification_inputs"} | optional_floor_key, "campaign spec v3")
+        floor_policy_id = spec.get("capacity_floor_policy_id")
+        require(floor_policy_id is None or floor_policy_id == CAPACITY_FLOOR_POLICY_ID,
+                "campaign spec capacity floor policy ID is unknown")
     else:
         exact_keys(spec, expected, "campaign spec v2")
         require(schema == SPEC_SCHEMA, "unsupported campaign-spec schema")
@@ -1000,6 +1016,13 @@ def validate_spec(
         feedback_policies = {source["feedback_policy"]["policy_sha256"] for source in sources.values()}
         require(len(feedback_policies) == 1, "SourceV5 host manifests do not share one numeric feedback policy artifact")
         require(binding["feedback_policy_sha256"] == next(iter(feedback_policies)), "runtime binding feedback policy hash does not identify the numeric reader/runtime policy artifact")
+        floor_policy_id = spec.get("capacity_floor_policy_id")
+        if floor_policy_id is not None:
+            for source in sources.values():
+                feedback_body = source["feedback_policy"]["policy"]
+                descriptor = feedback_body.get("capacity_floor_policy") if type(feedback_body) is dict else None
+                require(type(descriptor) is dict and descriptor.get("policy_id") == floor_policy_id,
+                        "campaign spec capacity floor policy ID is not source-published on every host")
     require(
         all(source["runtime_readback_validator"]["path"] == RUNTIME_VALIDATOR_RELATIVE_PATH for source in sources.values()),
         "host manifests do not pin the canonical runtime readback validator path",
@@ -2138,7 +2161,7 @@ def validate_aa_records(records: list[dict[str, Any]], expected_jobs: list[dict[
     return {"schema": "allocatbelt.application-aa-analysis.v1", "host_id": host_id, "controls": results, "passed": True}
 
 
-def analyze_confirmation_host_gated(
+def analyze_confirmation_host_numeric(
     spec: dict[str, Any], host_id: str, records: list[dict[str, Any]], ledger_root: Path,
     analysis_binary: Path | None = None, analysis_binary_sha256: str | None = None,
     phase: str = "confirmation",
@@ -2386,8 +2409,6 @@ def analyze_confirmation_host_gated(
                         item["p99_ratios_by_family"] = {family: bounded["latency_p99_by_family_ns"][family] / tokio["latency_p99_by_family_ns"][family] for family in metric_families}
                     secondary.append(item)
     qualification_eligible = RUNTIME_QUALIFICATION_READBACK_SUPPORTED and (phase != "pressure" or EXTERNAL_PRESSURE_DRIVER_SUPPORTED)
-    if not qualification_eligible:
-        passed = False
     return {
         "schema": "allocatbelt.application-host-analysis.v1",
         "host_id": host_id,
@@ -2401,8 +2422,24 @@ def analyze_confirmation_host_gated(
         "secondary_executor_sanity": secondary,
         "qualification_eligible": qualification_eligible,
         "qualification_blocker": None if qualification_eligible else "production binary runtime-domain/policy/ceiling readback is not verified",
+        "numeric_gates_passed": passed,
         "passed": passed,
     }
+
+
+def analyze_confirmation_host_gated(
+    spec: dict[str, Any], host_id: str, records: list[dict[str, Any]], ledger_root: Path,
+    analysis_binary: Path | None = None, analysis_binary_sha256: str | None = None,
+    phase: str = "confirmation",
+) -> dict[str, Any]:
+    """Keep the legacy hard-disabled qualification result unchanged."""
+    result = analyze_confirmation_host_numeric(
+        spec, host_id, records, ledger_root, analysis_binary,
+        analysis_binary_sha256, phase,
+    )
+    numeric_gates_passed = result.pop("numeric_gates_passed")
+    result["passed"] = numeric_gates_passed and result["qualification_eligible"]
+    return result
 
 
 def validate_soak_receipt(
@@ -4131,6 +4168,8 @@ def build_parser() -> argparse.ArgumentParser:
     source.add_argument("--analysis-binary", required=True, metavar="RELATIVE_PATH")
     source.add_argument("--resource-domain-calibration-binary", required=True, metavar="RELATIVE_PATH")
     source.add_argument("--resource-domain-calibration-output", required=True, metavar="RELATIVE_PATH")
+    source.add_argument("--capacity-floor-policy-id", choices=(CAPACITY_FLOOR_POLICY_ID,),
+                        help="publish the opt-in calibrated capacity-relative floor rule in SourceV5")
     source.add_argument("--legacy-v4", action="store_true", help="emit the archived SourceV4 contract for its existing functional test fixture")
     source.add_argument("--output", required=True)
     for name in ("plan", "validate"):

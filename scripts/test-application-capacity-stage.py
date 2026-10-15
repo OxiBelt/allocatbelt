@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import io
 import importlib.machinery
 import importlib.util
 import json
@@ -13,12 +14,15 @@ import shutil
 import signal
 import stat
 import subprocess
+import sys
 import tempfile
 import textwrap
 import time
+import types
 import unittest
 from pathlib import Path
 from typing import Any
+from unittest.mock import patch
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -44,6 +48,87 @@ feedback_fixtures = load_script(
     SCRIPT_DIR / "test-application-feedback-readback.py",
     "application_capacity_stage_feedback_fixtures",
 )
+capacity_producer = load_script(
+    SCRIPT_DIR / "application-byte-capacity.py",
+    "application_capacity_stage_capacity_producer",
+)
+fixed_pair_owner = load_script(
+    SCRIPT_DIR / "application-fixed-pair.py",
+    "application_capacity_stage_fixed_pair_owner",
+)
+process_identity_helper = load_script(
+    SCRIPT_DIR / "application-soak-readback.py",
+    "application_capacity_stage_process_identity_helper",
+)
+
+
+class SourceInventorySymlinkTests(unittest.TestCase):
+    def test_typed_source_symlink_is_literal_bounded_and_direct(self) -> None:
+        target_raw = b"license text\n"
+        records = {
+            "LICENSE": {
+                "path": "LICENSE", "kind": "file", "mode": "100644",
+                "sha256": sha(target_raw), "size": len(target_raw),
+            },
+            "crates/allocatbelt/LICENSE": {
+                "path": "crates/allocatbelt/LICENSE", "kind": "symlink",
+                "mode": "120000", "target": "../../LICENSE",
+                "sha256": sha(b"../../LICENSE"), "size": len(b"../../LICENSE"),
+            },
+        }
+        link_record = records["crates/allocatbelt/LICENSE"]
+        self.assertEqual(stage._source_inventory_symlink_target(
+            link_record, records, "fixture SourceInventory link",
+        ), ("LICENSE", b"../../LICENSE"))
+
+        with tempfile.TemporaryDirectory(prefix="source-inventory-symlink-") as root_text:
+            root = Path(root_text)
+            nested = root / "crates" / "allocatbelt"
+            nested.mkdir(parents=True)
+            (root / "LICENSE").write_bytes(target_raw)
+            (nested / "LICENSE").symlink_to("../../LICENSE")
+            fingerprint = stage._offline_local_fingerprint(
+                nested / "LICENSE", "fixture SourceInventory link",
+            )
+            self.assertEqual(fingerprint["kind"], "symlink")
+            self.assertEqual(fingerprint["target"], "../../LICENSE")
+            self.assertEqual(fingerprint["size"], len(b"../../LICENSE"))
+
+        invalid_records = []
+        escaping = dict(link_record, target="../../../LICENSE")
+        escaping["size"] = len(escaping["target"].encode("utf-8"))
+        escaping["sha256"] = sha(escaping["target"].encode("utf-8"))
+        invalid_records.append((escaping, records, "escapes SourceRoot"))
+
+        chained = dict(link_record, target="LICENSE")
+        chained["size"] = len(b"LICENSE")
+        chained["sha256"] = sha(b"LICENSE")
+        invalid_records.append((chained, records, "direct regular Source.files member"))
+
+        missing = dict(link_record, target="../../NOT_PRESENT")
+        missing["size"] = len(missing["target"].encode("utf-8"))
+        missing["sha256"] = sha(missing["target"].encode("utf-8"))
+        invalid_records.append((missing, records, "direct regular Source.files member"))
+
+        wrong_hash = dict(link_record, sha256=sha(b"not the link target"))
+        self.assertNotEqual(wrong_hash["sha256"], link_record["sha256"])
+        invalid_records.append((wrong_hash, records, "literal target hash"))
+
+        wrong_mode = dict(link_record, mode="100644")
+        invalid_records.append((wrong_mode, records, "typed terminal symlink"))
+
+        too_long = dict(link_record, target="x" * (stage.MAX_SOURCE_SYMLINK_BYTES + 1))
+        too_long["size"] = len(too_long["target"].encode("utf-8"))
+        too_long["sha256"] = sha(too_long["target"].encode("utf-8"))
+        invalid_records.append((too_long, records, "bounded text"))
+
+        for candidate, candidate_records, expected in invalid_records:
+            with self.subTest(target=candidate["target"], expected=expected):
+                with self.assertRaisesRegex(stage.CapacityStageError, expected):
+                    stage._source_inventory_symlink_target(
+                        candidate, candidate_records,
+                        "fixture SourceInventory link",
+                    )
 
 
 FAKE_CHILD_C = r"""
@@ -102,6 +187,60 @@ int main(int count, char **values) {
   if (count > 1 && strcmp(values[1], "--test-wait") == 0) {
     for (;;) pause();
   }
+  if (count > 1 && strcmp(values[1], "--test-escaped-descendant") == 0) {
+    pid_t child = fork();
+    if (child < 0) return 102;
+    if (child == 0) {
+      if (setpgid(0, 0) != 0) _exit(103);
+      const char *tmpdir = getenv("TMPDIR");
+      if (tmpdir == NULL) _exit(104);
+      char path[8192];
+      int size = snprintf(path, sizeof(path), "%s/owner-descendant.pid", tmpdir);
+      if (size <= 0 || (size_t)size >= sizeof(path)) _exit(105);
+      int fd = open(path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+      if (fd < 0) _exit(106);
+      char pid_text[64];
+      int pid_size = snprintf(pid_text, sizeof(pid_text), "%ld\n", (long)getpid());
+      if (pid_size <= 0 || write(fd, pid_text, (size_t)pid_size) != pid_size) _exit(107);
+      close(fd);
+      for (;;) pause();
+    }
+    const char *tmpdir = getenv("TMPDIR");
+    if (tmpdir == NULL) return 108;
+    char path[8192];
+    int size = snprintf(path, sizeof(path), "%s/owner-descendant.pid", tmpdir);
+    if (size <= 0 || (size_t)size >= sizeof(path)) return 109;
+    for (int attempt = 0; attempt < 1000 && access(path, F_OK) != 0; ++attempt) usleep(1000);
+    return access(path, F_OK) == 0 ? 0 : 110;
+  }
+  if (count > 1 && strcmp(values[1], "--test-churn") == 0) {
+    const char *tmpdir = getenv("TMPDIR");
+    if (tmpdir == NULL) return 111;
+    char path[8192];
+    char payload[4096];
+    memset(payload, 'c', sizeof(payload));
+    for (int index = 0; index < 12; ++index) {
+      int size = snprintf(path, sizeof(path), "%s/churn-%d", tmpdir, index);
+      if (size <= 0 || (size_t)size >= sizeof(path)) return 112;
+      int fd = open(path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+      if (fd < 0) return 113;
+      ssize_t written = write(fd, payload, sizeof(payload));
+      close(fd);
+      if (written != (ssize_t)sizeof(payload)) return 114;
+      usleep(150000);
+      if (unlink(path) != 0) return 115;
+    }
+    return 0;
+  }
+  if (count > 1 && strcmp(values[1], "--test-stdout-overage") == 0) {
+    char payload[4096];
+    memset(payload, 'o', sizeof(payload));
+    for (int index = 0; index < 8192; ++index) {
+      ssize_t written = write(STDOUT_FILENO, payload, sizeof(payload));
+      if (written <= 0) return 116;
+    }
+    return 0;
+  }
   if (count > 1 && strcmp(values[1], "--emit-feedback-policy-only") == 0) {
     const char *workload = argument_value(count, values, "--workload");
     const char *profile = argument_value(count, values, "--profile");
@@ -126,6 +265,33 @@ int main(int count, char **values) {
     return 98;
   }
   close(marker_fd);
+
+  const char *workload = getenv("ALLOCATBELT_APP_WORKLOAD");
+  const char *profile = getenv("ALLOCATBELT_APP_PROFILE");
+  if (workload != NULL && profile != NULL && strcmp(workload, "cpu") == 0 &&
+      strcmp(profile, "steady") == 0) {
+    char churn_path[8192];
+    int churn_size = snprintf(churn_path, sizeof(churn_path), "%s/capacity-churn-live.tmp", tmpdir);
+    if (churn_size <= 0 || (size_t)churn_size >= sizeof(churn_path)) return 117;
+    int churn_fd = open(churn_path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+    if (churn_fd < 0) return 118;
+    char churn_payload[8192];
+    memset(churn_payload, 't', sizeof(churn_payload));
+    ssize_t churn_written = write(churn_fd, churn_payload, sizeof(churn_payload));
+    close(churn_fd);
+    if (churn_written != (ssize_t)sizeof(churn_payload)) return 119;
+    usleep(250000);
+    if (unlink(churn_path) != 0) return 120;
+    char opaque_path[8192];
+    int opaque_size = snprintf(opaque_path, sizeof(opaque_path), "%s/opaque-payload.json", tmpdir);
+    if (opaque_size <= 0 || (size_t)opaque_size >= sizeof(opaque_path)) return 121;
+    int opaque_fd = open(opaque_path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+    if (opaque_fd < 0) return 122;
+    static const char opaque_payload[] = "[\n  {\"path\":\"/not-an-evidence-member\"}\n]\n";
+    ssize_t opaque_written = write(opaque_fd, opaque_payload, sizeof(opaque_payload) - 1);
+    close(opaque_fd);
+    if (opaque_written != (ssize_t)(sizeof(opaque_payload) - 1)) return 123;
+  }
 
   if (access(FAIL_FLAG, F_OK) == 0) { usleep(200000); return 41; }
   if (access(HANG_FLAG, F_OK) == 0) for (;;) pause();
@@ -542,6 +708,1188 @@ class CapacityStageCliTests(unittest.TestCase):
             except ValueError:
                 shutil.rmtree(candidate, ignore_errors=True)
 
+    def _source5_process_context(self) -> dict[str, Any]:
+        return {
+            "current_host": {
+                "cpu_affinity": sorted(os.sched_getaffinity(0)),
+                "network_namespace_inode": os.stat("/proc/self/ns/net").st_ino,
+            },
+            "stack": {
+                "fixed_pair": fixed_pair_owner,
+                "fixed_pair_sha256": sha((SCRIPT_DIR / "application-fixed-pair.py").read_bytes()),
+                "process_identity_helper": process_identity_helper,
+                "process_identity_helper_sha256": sha((SCRIPT_DIR / "application-soak-readback.py").read_bytes()),
+            },
+        }
+
+    def _run_source5_owned_child(
+        self, root: Path, arguments: list[str], *, timeout_seconds: int = 2,
+        on_bound=None, resource_monitor=None, capture_owner_return: bool = False,
+    ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], Path, list[str], dict[str, str]]:
+        job = {"run_id": "owned-test"}
+        job_dir = root / "jobs" / job["run_id"]
+        job_dir.mkdir(mode=0o700, parents=True)
+        (job_dir / "trace").mkdir(mode=0o700)
+        is_probe = bool(arguments and arguments[0] == "--emit-feedback-policy-only")
+        label = "policy-probe" if is_probe else "application"
+        tmpdir = job_dir / "tmp"
+        tmpdir.mkdir(mode=0o700)
+        environment = {"PATH": "/usr/bin:/bin", "LC_ALL": "C", "TMPDIR": str(tmpdir)}
+        context = self._source5_process_context()
+        argv = [str(self.binary_path), *arguments]
+        result = stage._spawn_with_source5_owner(
+            context, argv, job_dir, environment,
+            job_dir / ("policy-probe.json" if is_probe else "application.stdout"),
+            job_dir / ("policy-probe.stderr" if is_probe else "application.stderr"),
+            timeout_seconds, self.binary_path, self.binary_sha256,
+            job_dir / f"{label}.process-capture.json",
+            job_dir / f"{label}.process-start.json",
+            on_bound=on_bound, resource_monitor=resource_monitor,
+            owner_return_path=(job_dir / f"{label}.owner-return.json"
+                               if capture_owner_return else None),
+        )
+        return result, context, job, job_dir, argv, environment
+
+    def _bounded_churn_monitor(
+        self, root: Path, *, maximum_tmpdir_bytes: int,
+    ) -> tuple[Any, dict[str, Any], Path, Path]:
+        generation = root / "generation"
+        jobs_root = generation / "jobs"
+        job_dir = jobs_root / "owned-test"
+        trace_dir = job_dir / "trace"
+        tmpdir = job_dir / "tmp"
+        generation.mkdir(mode=0o700, parents=True)
+        jobs_root.mkdir(mode=0o700)
+        job_dir.mkdir(mode=0o700)
+        trace_dir.mkdir(mode=0o700)
+        tmpdir.mkdir(mode=0o700)
+        context = self._source5_process_context()
+        fixed = context["stack"]["fixed_pair"]
+        ceilings = {
+            "maximum_job_output_bytes": 128 * 1024 * 1024,
+            "maximum_job_output_inodes": 256,
+            "maximum_generation_bytes": 256 * 1024 * 1024,
+            "maximum_generation_inodes": 4096,
+            "maximum_tmpdir_bytes": maximum_tmpdir_bytes,
+            "maximum_tmpdir_inodes": 64,
+            "maximum_trace_file_bytes": 1024 * 1024,
+            "durable_receipt_reserve_bytes": 192 * 1024 * 1024,
+            "durable_receipt_reserve_inodes": 32,
+            "minimum_free_bytes": 0,
+            "minimum_free_inodes": 0,
+            "monitor_sample_interval_milliseconds": 50,
+            "process_deadline_seconds": 6,
+        }
+        progress = {
+            "expected_monitor_report_count": 2,
+            "monitor_report_count": 0,
+            "job_monitor_report_counts": {},
+            "high_water": {key: 0 for key in (
+                "job_output_bytes", "job_output_inodes", "generation_bytes",
+                "generation_inodes", "tmpdir_bytes", "tmpdir_inodes",
+            )},
+        }
+        stage_root = stage._bounded_root_identity(fixed, generation, "churn test generation")
+        job_root = stage._bounded_root_identity(fixed, job_dir, "churn test job")
+        trace_root = stage._bounded_root_identity(fixed, trace_dir, "churn test trace")
+        tmp_root = stage._bounded_root_identity(fixed, tmpdir, "churn test TMPDIR")
+        progress.update({
+            "stage_root": stage_root,
+            "job_roots": {"owned-test": job_root},
+            "trace_roots": {"owned-test": trace_root},
+            "tmpdir_roots": [tmp_root],
+        })
+        budget = {
+            "pin": {"path": str(root / "resource-budget.json"),
+                    "raw_sha256": "a" * 64, "semantic_sha256": "b" * 64},
+            "ceilings": ceilings,
+            "monitor_report_max_bytes": stage.MAX_METADATA_BYTES,
+            "monitor_report_max_samples": 203,
+            "monitor_report_count": 2,
+        }
+        monitor = stage.PreparationResourceMonitor(
+            context, budget, generation, job_dir, trace_dir,
+            progress["tmpdir_roots"], progress, stage_root, job_root, trace_root,
+        )
+        monitor.begin("application")
+        return monitor, progress, job_dir, tmpdir
+
+    def _replace_owned_tree_at_same_path(self, root: Path) -> tuple[int, int]:
+        original_inode = root.stat(follow_symlinks=False).st_ino
+        copied = root.with_name(f".{root.name}-identity-copy-{os.getpid()}")
+        self.assertFalse(copied.exists())
+        shutil.copytree(root, copied, symlinks=True, copy_function=shutil.copy2)
+        shutil.rmtree(root)
+        os.replace(copied, root)
+        copied_inode = root.stat(follow_symlinks=False).st_ino
+        self.assertNotEqual(original_inode, copied_inode,
+                            f"identity copy did not change the physical inode: {root}")
+        return original_inode, copied_inode
+
+    def _copy_bounded_offline_evidence(
+        self, completion: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Replace owned trees with byte copies at the exact original paths."""
+        source_root = SOURCE_ROOT
+        output_root = self.input_root / f"bounded-output-{self._testMethodName}"
+        stage_dir = Path(completion["stage_directory"])
+        self.assertTrue(output_root.is_dir() and stage_dir.is_relative_to(output_root))
+        inodes_before: dict[Path, int] = {self.input_root: self.input_root.stat().st_ino,
+                                         output_root: output_root.stat().st_ino}
+        tmp_roots = sorted({
+            Path(item["path"])
+            for item in completion["resource_monitor"]["final_usage"]["tmpdir_roots"]
+        })
+        for root in tmp_roots:
+            inodes_before[root] = root.stat(follow_symlinks=False).st_ino
+
+        # The input tree includes the output generation and every TMPDIR the
+        # bounded runner placed beneath that declared output root.
+        self._replace_owned_tree_at_same_path(self.input_root)
+        for root in tmp_roots:
+            if not root.is_relative_to(self.input_root):
+                self._replace_owned_tree_at_same_path(root)
+
+        origins: set[Path] = {source_root}
+
+        def add_source_member(path: Path, *, expected: dict[str, Any] | None = None) -> None:
+            info = path.lstat()
+            if stat.S_ISLNK(info.st_mode):
+                self.assertIsNotNone(expected)
+                self.assertEqual(expected.get("kind"), "symlink")
+                self.assertEqual(os.readlink(path), expected.get("target"))
+            else:
+                self.assertTrue(stat.S_ISDIR(info.st_mode) or stat.S_ISREG(info.st_mode),
+                                f"SourceV5 map member is a special file: {path}")
+                if expected is not None:
+                    self.assertEqual(expected.get("kind"), "file")
+            origins.add(path)
+            parent = path.parent
+            while parent != source_root:
+                self.assertTrue(parent.is_relative_to(source_root))
+                self.assertTrue(parent.is_dir() and not parent.is_symlink())
+                origins.add(parent)
+                parent = parent.parent
+
+        for source in self.sources.values():
+            for record in source["source"]["files"]:
+                add_source_member(source_root / record["path"], expected=record)
+            artifacts = [*source["artifacts"].values(),
+                         *source.get("soak_artifacts", {}).values(),
+                         source["analysis_artifact"],
+                         source["resource_domain_calibration"]["binary"],
+                         source["resource_domain_calibration"]["output"]]
+            for artifact in artifacts:
+                add_source_member(source_root / artifact["path"])
+
+        def add_tree(root: Path) -> None:
+            origins.add(root)
+            for member in sorted(root.rglob("*")):
+                info = member.lstat()
+                self.assertTrue(stat.S_ISDIR(info.st_mode) or stat.S_ISREG(info.st_mode),
+                                f"offline fixture tree has a special member: {member}")
+                origins.add(member)
+
+        add_tree(self.input_root)
+        for root in tmp_roots:
+            if not root.is_relative_to(self.input_root):
+                add_tree(root)
+        entries = [{"origin": str(path), "local": str(path)}
+                   for path in sorted(origins, key=str)]
+        path_map = {"schema": stage.EVIDENCE_PATH_MAP_SCHEMA, "entries": entries}
+        self.assertTrue(all(row["origin"] == row["local"] for row in entries))
+        inodes_after = {path: path.stat(follow_symlinks=False).st_ino
+                        for path in inodes_before}
+        self.assertTrue(all(inodes_before[path] != inodes_after[path]
+                            for path in inodes_before))
+        return {
+            "source_root": source_root, "input_root": self.input_root,
+            "output_root": output_root, "stage_dir": stage_dir,
+            "tmp_root_pairs": [(root, root) for root in tmp_roots],
+            "inodes_before": inodes_before, "inodes_after": inodes_after,
+            "evidence_path_map": path_map,
+        }
+
+    def _build_bounded_preparation_inputs(self) -> tuple[dict[str, str], dict[str, str], dict[str, str]]:
+        inputs = input_fixtures.inputs
+        prep_fixtures = load_script(
+            SCRIPT_DIR / "test-application-source5-input-preparation.py",
+            f"capacity_stage_bounded_preparation_fixtures_{self.host_id}",
+        )
+        fixture, _fixture_spec = prep_fixtures.preparation_fixture()
+        source_refs = {item["host_id"]: item for item in self.spec["source_manifests"]}
+        source_pins: dict[str, dict[str, Any]] = {}
+        observed_hosts: dict[str, dict[str, str]] = {}
+        observed_values: dict[str, dict[str, Any]] = {}
+        for index, host in enumerate(self.spec["hosts"]):
+            host_id = host["host_id"]
+            if host_id == self.host_id:
+                observed_path = self.observed_host_path
+                observed_value = json.loads(observed_path.read_bytes())
+            else:
+                controls = host["controls"]
+                observed_value = {
+                    "schema": stage.HOST_CONTEXT_SCHEMA,
+                    "host_id": host_id,
+                    "boot_id_sha256": str(index + 2) * 64,
+                    "controls_sha256": host["host_fingerprint_sha256"],
+                    "controls": controls,
+                    "kernel_release": controls["kernel_release"],
+                    "cpu_model": controls["cpu_model"],
+                    "cpu_affinity": stage._parse_cpu_set(controls["cpu_set"]),
+                    "network_namespace_inode": 10_000 + index,
+                }
+                observed_path = self.input_root / "bounded-observed-hosts" / f"{host_id}.json"
+                write_file(observed_path, canonical(observed_value))
+            observed_raw = observed_path.read_bytes()
+            observed_values[host_id] = observed_value
+            observed_hosts[host_id] = {
+                "relative_path": observed_path.relative_to(self.input_root).as_posix(),
+                "raw_sha256": sha(observed_raw),
+            }
+            source = self.sources[host_id]
+            inventory = {item["path"]: item for item in source["source"]["files"]}
+            manifest_path = self.input_root / source_refs[host_id]["relative_path"]
+            source_pins[host_id] = {
+                "manifest": {
+                    "relative_path": source_refs[host_id]["relative_path"],
+                    "raw_sha256": sha(manifest_path.read_bytes()),
+                    "semantic_sha256": source["manifest_sha256"],
+                    "source_tree_sha256": source["source"]["source_tree_sha256"],
+                },
+                "modules": {
+                    role: {"path": path, "sha256": inventory[path]["sha256"]}
+                    for role, path in inputs.PREPARATION_MODULE_PATHS.items()
+                },
+                "artifacts": copy.deepcopy(source["artifacts"]),
+            }
+
+        actual_templates = {
+            (item["host_id"], item["workload"], item["profile"]): item
+            for item in self.spec["qualification_inputs"]["capacity_templates"]
+        }
+        templates = []
+        for template in fixture["capacity_templates"]:
+            key = (template["host_id"], template["workload"], template["profile"])
+            actual = actual_templates[key]
+            templates.append({
+                "host_id": template["host_id"],
+                "workload": template["workload"],
+                "profile": template["profile"],
+                "calibration_id": template["calibration_id"],
+                "calibrator": template["calibrator"],
+                "request_template": actual["request_template"],
+                "context_template": actual["context_template"],
+            })
+        conditions = copy.deepcopy(fixture["condition_intensities"])
+        for item in conditions:
+            host_facts = observed_values[item["host_id"]]
+            item["schedule"]["application_cpu_affinity"] = host_facts["cpu_affinity"]
+            item["schedule"]["pressure_cpu_affinity"] = [host_facts["cpu_affinity"][0]]
+            condition_relative = Path(item["condition"]["relative_path"])
+            item["condition"]["relative_path"] = (
+                Path("bounded-preparation-conditions") / self._testMethodName /
+                condition_relative
+            ).as_posix()
+            raw_condition = canonical({
+                "schema": inputs.SOURCE5_PRESSURE_CONDITION_SCHEMA,
+                "host_id": item["host_id"],
+                "condition_id": item["condition_id"],
+                "capacity_key": item["capacity_key"],
+                "pressure_calibration_id": item["pressure_calibration_id"],
+                "readiness_threshold_rule": item["readiness_threshold_rule"],
+                "readiness_thresholds": item["readiness_thresholds"],
+                "pressure_thresholds": item["pressure_thresholds"],
+                "schedule": item["schedule"],
+            })
+            condition_path = self.input_root / item["condition"]["relative_path"]
+            write_file(condition_path, raw_condition)
+            item["condition"]["raw_sha256"] = sha(raw_condition)
+
+        core = {
+            key: self.spec[key]
+            for key in (
+                "campaign_id", "runner_sha256", "hosts", "cells", "protocol",
+                "runtime_binding", "phase_adapters", "aa_controls", "soak", "deadlines",
+            )
+        }
+        preparation_path = self.input_root / (
+            f"bounded-preparation-intent-{self._testMethodName}.json"
+        )
+        inputs.build_preparation_intent(
+            core, source_pins, observed_hosts, templates, conditions, preparation_path,
+            source_manifest_values=self.sources, input_root=self.input_root,
+        )
+        preparation_raw = preparation_path.read_bytes()
+        preparation = json.loads(preparation_raw)
+        preparation_pin = {
+            "path": str(preparation_path), "raw_sha256": sha(preparation_raw),
+            "semantic_sha256": preparation["preparation_sha256"],
+        }
+        ceilings = {
+            "maximum_job_output_bytes": 64 * 1024 * 1024,
+            "maximum_job_output_inodes": 256,
+            "maximum_generation_bytes": 2 * 1024 * 1024 * 1024,
+            "maximum_generation_inodes": 4096,
+            "maximum_tmpdir_bytes": 128 * 1024 * 1024,
+            "maximum_tmpdir_inodes": 512,
+            "maximum_trace_file_bytes": 64 * 1024 * 1024,
+            "durable_receipt_reserve_bytes": 1024 * 1024 * 1024,
+            "durable_receipt_reserve_inodes": 32,
+            "minimum_free_bytes": 32 * 1024 * 1024,
+            "minimum_free_inodes": 1000,
+            "monitor_sample_interval_milliseconds": 100,
+            "process_deadline_seconds": 60,
+        }
+        budget = inputs.build_preparation_resource_budget(
+            preparation, preparation_pin, self.host_id, ceilings,
+        )
+        budget_path = self.input_root / "bounded-resource-budget.json"
+        budget_raw = inputs._canonical(budget)
+        write_file(budget_path, budget_raw)
+        budget_pin = {"path": str(budget_path), "sha256": sha(budget_raw)}
+        observed_value = self.observed_host_path
+        observed_pin = {
+            "path": str(observed_value), "sha256": sha(observed_value.read_bytes()),
+        }
+        return preparation_pin, budget_pin, observed_pin
+
+    def test_source5_direct_owner_records_actual_probe_and_reaps_clean_leader(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="capacity-stage-owned-positive-") as temporary:
+            root = Path(temporary)
+            callbacks: list[dict[str, Any]] = []
+            waitable: list[dict[str, int]] = []
+
+            def hold_parent_until_probe_exit(proof: dict[str, Any]) -> None:
+                callbacks.append(proof)
+                self.assertEqual(set(proof), {
+                    "pid", "start_ticks", "requested_argv", "requested_argv_sha256",
+                    "environment_sha256",
+                })
+                deadline = time.monotonic() + 2.0
+                while time.monotonic() < deadline:
+                    result = os.waitid(os.P_PID, proof["pid"],
+                                       os.WEXITED | os.WNOHANG | os.WNOWAIT)
+                    if result is not None and result.si_pid == proof["pid"]:
+                        waitable.append({"si_pid": result.si_pid, "si_code": result.si_code,
+                                         "si_status": result.si_status})
+                        return
+                    time.sleep(0.005)
+                self.fail("fast policy emitter did not become waitable before the test bound")
+
+            result, context, job, job_dir, argv, environment = self._run_source5_owned_child(
+                root,
+                ["--emit-feedback-policy-only", "--workload", "cpu", "--profile", "steady"],
+                on_bound=hold_parent_until_probe_exit,
+            )
+            self.assertEqual(result["status"], "completed")
+            self.assertEqual(result["return_code"], 0)
+            self.assertEqual(len(callbacks), 1)
+            self.assertEqual(waitable, [{"si_pid": result["pid"],
+                                         "si_code": getattr(os, "CLD_EXITED", 1),
+                                         "si_status": 0}])
+            self.assertEqual(result["direct_process"]["start"]["path"],
+                             str(job_dir / "policy-probe.process-start.json"))
+            self.assertEqual(callbacks[0]["pid"], result["pid"])
+            start_path = job_dir / "policy-probe.process-start.json"
+            start_sidecar = json.loads(start_path.read_bytes())
+            self.assertEqual(start_sidecar["schema"], stage.OWNED_POLICY_PROBE_START_SCHEMA)
+            self.assertEqual(start_sidecar["role"], "source5_policy_probe")
+            self.assertEqual(set(start_sidecar["start"]), {
+                "pid", "start_ticks", "requested_argv", "requested_argv_sha256",
+                "environment_sha256",
+            })
+            self.assertNotIn("executed_argv", start_sidecar["start"])
+            self.assertNotIn("environment", start_sidecar["start"])
+            capture_path = job_dir / "policy-probe.process-capture.json"
+            capture = json.loads(capture_path.read_bytes())
+            self.assertEqual(capture["schema"], stage.OWNED_POLICY_PROBE_CAPTURE_SCHEMA)
+            self.assertEqual(capture["role"], "source5_policy_probe")
+            self.assertEqual(capture["dispatch"]["argv"], argv)
+            self.assertEqual(capture["dispatch"]["environment_sha256"], sha(canonical(environment)))
+            supervision = capture["runner_capture"]["supervision"]
+            self.assertEqual(supervision["cleanup_status"], "verified")
+            self.assertIs(supervision["leader_reaped"], True)
+            self.assertEqual(supervision["remaining_session_members"], [])
+            self.assertEqual(supervision["group_signal_after_leader_reap_count"], 0)
+            self.assertEqual(supervision["signals"], [])
+            start_raw = start_path.read_bytes()
+            start_path.write_bytes(start_raw[:-1] + (b" " if start_raw[-1:] != b" " else b"\n"))
+            with self.assertRaises(stage.CapacityStageError):
+                stage._verify_owned_process_start(
+                    context, job, root, result["direct_process"]["start"], argv,
+                    environment, self.binary_path, self.binary_sha256, result["pid"],
+                )
+            start_path.write_bytes(start_raw)
+            start = stage._verify_owned_process_start(
+                context, job, root, result["direct_process"]["start"], argv,
+                environment, self.binary_path, self.binary_sha256, result["pid"],
+            )
+            output_details = {
+                "stdout_path": result["stdout_path"], "stdout_sha256": result["stdout_sha256"],
+                "stdout_size": result["stdout_size"], "stderr_path": result["stderr_path"],
+                "stderr_sha256": result["stderr_sha256"], "stderr_size": result["stderr_size"],
+            }
+            capture_raw = capture_path.read_bytes()
+            capture_path.write_bytes(b"{}")
+            with self.assertRaises(stage.CapacityStageError):
+                stage._verify_owned_process_capture(
+                    context, job, root, result["direct_process"]["capture"], start,
+                    argv, environment, self.binary_path, self.binary_sha256,
+                    2, result["elapsed_ns"], output_details,
+                )
+            capture_path.write_bytes(capture_raw)
+            stage._verify_owned_process_capture(
+                context, job, root, result["direct_process"]["capture"], start,
+                argv, environment, self.binary_path, self.binary_sha256,
+                2, result["elapsed_ns"], output_details,
+            )
+
+    def test_bounded_monitor_observes_real_temporary_directory_churn(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="capacity-stage-budget-churn-") as temporary:
+            root = Path(temporary)
+            monitor, progress, job_dir, tmpdir = self._bounded_churn_monitor(
+                root, maximum_tmpdir_bytes=32 * 1024,
+            )
+            context = monitor.context
+            environment = {"PATH": "/usr/bin:/bin", "LC_ALL": "C", "TMPDIR": str(tmpdir)}
+            argv = [str(self.binary_path), "--test-churn"]
+            monitor.preflight()
+            try:
+                child = stage._spawn_with_source5_owner(
+                    context, argv, job_dir, environment,
+                    job_dir / "application.stdout", job_dir / "application.stderr",
+                    6, self.binary_path, self.binary_sha256,
+                    job_dir / "application.process-capture.json",
+                    job_dir / "application.process-start.json",
+                    resource_monitor=monitor,
+                )
+                report, report_pin = stage._seal_preparation_resource_monitor(
+                    monitor, job_dir, "application",
+                )
+            finally:
+                monitor.close()
+            self.assertEqual(child["status"], "completed")
+            self.assertEqual(child["return_code"], 0)
+            self.assertIsNone(report["stop_reason"])
+            self.assertGreater(progress["monitor_report_count"], 0)
+            self.assertEqual(report_pin["path"], str(job_dir / "application.resource-monitor.json"))
+            self.assertTrue(any(sample["tmpdir_bytes"] >= 4096 for sample in report["samples"]))
+            self.assertEqual(list(tmpdir.iterdir()), [])
+            capture = json.loads((job_dir / "application.process-capture.json").read_bytes())
+            self.assertEqual(capture["runner_capture"]["supervision"]["cleanup_status"], "verified")
+            self.assertEqual(capture["runner_capture"]["supervision"]["group_signal_after_leader_reap_count"], 0)
+
+    def test_bounded_monitor_terminates_and_retains_owner_receipt_on_live_tmpdir_overage(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="capacity-stage-budget-stop-") as temporary:
+            root = Path(temporary)
+            monitor, _progress, job_dir, tmpdir = self._bounded_churn_monitor(
+                root, maximum_tmpdir_bytes=1024,
+            )
+            context = monitor.context
+            environment = {"PATH": "/usr/bin:/bin", "LC_ALL": "C", "TMPDIR": str(tmpdir)}
+            argv = [str(self.binary_path), "--test-churn"]
+            monitor.preflight()
+            try:
+                child = stage._spawn_with_source5_owner(
+                    context, argv, job_dir, environment,
+                    job_dir / "application.stdout", job_dir / "application.stderr",
+                    6, self.binary_path, self.binary_sha256,
+                    job_dir / "application.process-capture.json",
+                    job_dir / "application.process-start.json",
+                    resource_monitor=monitor,
+                )
+                report, report_pin = stage._seal_preparation_resource_monitor(
+                    monitor, job_dir, "application",
+                )
+            finally:
+                monitor.close()
+            self.assertNotEqual(child["status"], "completed")
+            self.assertIn("tmpdir_bytes", report["stop_reason"] or "")
+            self.assertTrue(Path(report_pin["path"]).is_file())
+            capture = json.loads((job_dir / "application.process-capture.json").read_bytes())
+            self.assertEqual(capture["runner_capture"]["supervision"]["cleanup_status"], "verified")
+            self.assertIsNotNone(child["direct_process"]["capture"])
+            self.assertEqual(capture["runner_capture"]["supervision"]["group_signal_after_leader_reap_count"], 0)
+
+    def test_bounded_owner_output_overage_keeps_exact_return_and_cleanup_sidecars(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="capacity-stage-owner-output-limit-") as temporary:
+            root = Path(temporary)
+            with self.assertRaises(stage.DirectOwnerPostReturnError) as caught:
+                self._run_source5_owned_child(
+                    root, ["--test-stdout-overage"], timeout_seconds=8,
+                    capture_owner_return=True,
+                )
+            job_dir = root / "jobs" / "owned-test"
+            owner_path = job_dir / "application.owner-return.json"
+            owner_raw = owner_path.read_bytes()
+            owner = json.loads(owner_raw)
+            failure_pin = caught.exception.failure_pin
+            self.assertEqual(caught.exception.owner_return_pin, {
+                "path": str(owner_path), "sha256": sha(owner_raw),
+            })
+            self.assertIsNotNone(failure_pin)
+            failure_path = Path(failure_pin["path"])
+            failure = json.loads(failure_path.read_bytes())
+            self.assertEqual(failure["schema"], stage.DIRECT_OWNER_RETURN_FAILURE_SCHEMA)
+            self.assertEqual(failure["owner_return"], caught.exception.owner_return_pin)
+            self.assertIs(failure["complete"], False)
+            self.assertIs(failure["qualification_eligible"], False)
+            supervision = owner["supervision"]
+            self.assertIs(supervision["artifact_budget_exceeded"], True)
+            self.assertEqual(owner["status"], 125)
+            self.assertEqual(supervision["cleanup_status"], "verified")
+            self.assertIs(supervision["leader_reaped"], True)
+            self.assertEqual(supervision["group_signal_after_leader_reap_count"], 0)
+
+    def test_bounded_stage_failure_ledger_binds_raw_policy_probe_owner_return(self) -> None:
+        preparation_pin, budget_pin, observed_pin = self._build_bounded_preparation_inputs()
+        output_root = self.input_root / f"bounded-output-{self._testMethodName}"
+        output_root.mkdir(mode=0o700)
+        probes = sorted(self.probe_root.glob("*.json"))
+        originals = {path: path.read_bytes() for path in probes}
+        overage = b"p" * (stage.MAX_PROBE_BYTES + 64 * 1024)
+        try:
+            for path in probes:
+                write_file(path, overage)
+            with self.assertRaises(stage.DirectOwnerPostReturnError):
+                stage.run_capacity_preparation_bounded(
+                    preparation_pin, budget_pin, SOURCE_ROOT, self.input_root,
+                    self.host_id, observed_pin, output_root,
+                )
+        finally:
+            for path, raw in originals.items():
+                write_file(path, raw)
+        stage_dir = output_root / self.campaign_id / "capacity-preparation" / self.host_id
+        records = [json.loads(line)["record"] for line in
+                   (stage_dir / "capacity-preparation-bounded-ledger.jsonl").read_bytes().splitlines()]
+        failed = records[-1]
+        self.assertEqual(failed["event"], "stage_failed")
+        owner_failure = failed["details"]["direct_owner_return_failure"]
+        owner_pin = owner_failure["owner_return"]
+        owner_path = Path(owner_pin["path"])
+        owner_raw = owner_path.read_bytes()
+        owner = json.loads(owner_raw)
+        self.assertEqual(sha(owner_raw), owner_pin["sha256"])
+        self.assertIs(owner["supervision"]["artifact_budget_exceeded"], True)
+        self.assertEqual(owner["status"], 125)
+        self.assertEqual(owner["supervision"]["cleanup_status"], "verified")
+        failure_pin = owner_failure["failure"]
+        failure_path = Path(failure_pin["path"])
+        failure_raw = failure_path.read_bytes()
+        failure = json.loads(failure_raw)
+        self.assertEqual(sha(failure_raw), failure_pin["sha256"])
+        self.assertEqual(failure["owner_return"], owner_pin)
+        self.assertIs(failure["complete"], False)
+
+    def test_bounded_preparation_runs_fifteen_original_templates_and_replays_offline(self) -> None:
+        self.sources = copy.deepcopy(type(self).sources)
+        self.spec = copy.deepcopy(type(self).spec)
+        opaque_input_json = b'[\n  {"path":"/not-an-evidence-member"}\n]\n'
+        opaque_input_path = self.input_root / (
+            f"opaque-input-{self._testMethodName}.json"
+        )
+        write_file(opaque_input_path, opaque_input_json)
+        self.addCleanup(opaque_input_path.unlink, missing_ok=True)
+
+        input_storage_root = self.input_root / f"bounded-explicit-storage-{self._testMethodName}"
+        input_storage_root.mkdir(mode=0o700)
+        self.addCleanup(shutil.rmtree, input_storage_root, True)
+        input_storage_template = next(
+            item for item in self.spec["qualification_inputs"]["capacity_templates"]
+            if item["host_id"] == self.host_id and item["workload"] == "disk"
+        )
+        input_context_path = self.input_root / input_storage_template[
+            "context_template"]["relative_path"]
+        input_context_original = input_context_path.read_bytes()
+        input_context_mode = stat.S_IMODE(input_context_path.lstat().st_mode)
+        self.addCleanup(write_file, input_context_path, input_context_original,
+                        input_context_mode)
+        input_context = json.loads(input_context_original)
+        self.assertIsInstance(input_context.get("storage"), dict)
+        input_context["storage"]["root_path"] = str(input_storage_root)
+        input_context_raw = canonical(input_context)
+        write_file(input_context_path, input_context_raw, input_context_mode)
+        input_storage_template["context_template"]["raw_sha256"] = sha(input_context_raw)
+
+        preparation_pin, budget_pin, observed_pin = self._build_bounded_preparation_inputs()
+        output_root = self.input_root / f"bounded-output-{self._testMethodName}"
+        output_root.mkdir(mode=0o700)
+        result = stage.run_capacity_preparation_bounded(
+            preparation_pin, budget_pin, SOURCE_ROOT, self.input_root,
+            self.host_id, observed_pin, output_root,
+        )
+        self.assertEqual(opaque_input_path.read_bytes(), opaque_input_json)
+        self.assertIsInstance(json.loads(opaque_input_json), list)
+        self.assertNotEqual(opaque_input_json, canonical(json.loads(opaque_input_json)))
+        completion_pin = result["completion"]
+        completion_path = Path(completion_pin["path"])
+        completion = json.loads(completion_path.read_bytes())
+        for root_pin in completion["resource_monitor"]["final_usage"]["tmpdir_roots"]:
+            tmpdir_path = Path(root_pin["path"])
+            self.addCleanup(shutil.rmtree, tmpdir_path, True)
+        budget_value = json.loads(Path(budget_pin["path"]).read_bytes())
+        self.assertTrue(result["complete"])
+        self.assertEqual(result["entry_count"], 15)
+        self.assertEqual(completion["schema"], stage.PREPARATION_BOUNDED_COMPLETION_SCHEMA)
+        self.assertEqual(len(completion["entries"]), 15)
+        self.assertEqual(completion["resource_monitor"]["report_count"], 30)
+        self.assertEqual(len(completion["resource_monitor"]["final_usage"]["jobs"]), 15)
+        self.assertGreater(
+            completion["resource_monitor"]["high_water"]["tmpdir_bytes"],
+            completion["resource_monitor"]["final_usage"]["tmpdir_bytes"],
+            "the real deleted TMPDIR churn must survive as a sampled peak above final usage",
+        )
+        self.assertTrue(all(len(entry["resource_monitors"]) == 2
+                            for entry in completion["entries"]))
+        self.assertEqual(completion["resource_budget"], {
+            "path": budget_pin["path"], "raw_sha256": budget_pin["sha256"],
+            "semantic_sha256": budget_value["resource_budget_sha256"],
+        })
+        ledger_envelopes = [json.loads(line) for line in
+                            Path(completion["ledger"]["path"]).read_bytes().splitlines()]
+        self.assertTrue(all(
+            set(envelope) == {"previous_sha256", "record", "record_sha256"} and
+            type(envelope["record"]) is dict and "event" not in envelope
+            for envelope in ledger_envelopes
+        ), "the real preparation ledger must retain its closed hash-chain envelope")
+        ledger_records = [item["record"] for item in ledger_envelopes]
+        self.assertEqual(len(ledger_records), 15 * len(stage.JOB_EVENTS) + 1)
+        self.assertEqual([item["event"] for item in ledger_records],
+                         [event for _entry in completion["entries"]
+                          for event in stage.JOB_EVENTS] + ["preparation_complete"])
+        self.assertEqual([item["run_id"] for item in ledger_records[:-1]],
+                         [entry["run_id"] for entry in completion["entries"]
+                          for _event in stage.JOB_EVENTS])
+        self.assertTrue(all(item["schema"] == stage.PREPARATION_BOUNDED_EVENT_SCHEMA and
+                            item["resource_budget"] == completion["resource_budget"]
+                            for item in ledger_records))
+        application_dispatches = [item for item in ledger_records
+                                  if item["event"] == "application_dispatch"]
+        no_storage_dispatches = [item for item in application_dispatches
+                                 if item["details"]["storage_context"] is None]
+        explicit_storage_dispatches = [item for item in application_dispatches
+                                       if item["details"]["storage_context"] is not None]
+        self.assertTrue(no_storage_dispatches and explicit_storage_dispatches,
+                        "the original matrix must exercise both bounded TMPDIR construction paths")
+        explicit_storage_roots = {
+            Path(item["details"]["storage_context"]["root_path"])
+            for item in explicit_storage_dispatches
+        }
+        self.assertIn(input_storage_root, explicit_storage_roots,
+                      "the original 15-context schedule must exercise input-root explicit storage")
+        self.assertTrue(any(not root.is_relative_to(self.input_root)
+                            for root in explicit_storage_roots),
+                        "the original schedule must retain external explicit-storage coverage")
+        for item in no_storage_dispatches:
+            details = item["details"]
+            self.assertEqual(
+                details["tmpdir_path"],
+                str(output_root / f"capacity-preparation-tmp-{item['run_id']}"),
+            )
+        for item in explicit_storage_dispatches:
+            details = item["details"]
+            storage = details["storage_context"]
+            self.assertEqual(Path(details["tmpdir_path"]).parent,
+                             Path(storage["root_path"]))
+
+        insufficient_budget = copy.deepcopy(budget_value)
+        insufficient_budget["ceilings"]["durable_receipt_reserve_bytes"] = 1
+        insufficient_body = {key: value for key, value in insufficient_budget.items()
+                             if key != "resource_budget_sha256"}
+        insufficient_budget["resource_budget_sha256"] = input_fixtures.inputs._sha256(
+            input_fixtures.inputs._canonical(insufficient_body),
+        )
+        insufficient_path = self.input_root / "bounded-budget-insufficient-receipts.json"
+        insufficient_raw = input_fixtures.inputs._canonical(insufficient_budget)
+        write_file(insufficient_path, insufficient_raw)
+        insufficient_pin = {"path": str(insufficient_path), "sha256": sha(insufficient_raw)}
+        untouched_output = self.input_root / "bounded-output-insufficient-receipts"
+        untouched_output.mkdir(mode=0o700)
+        with self.assertRaisesRegex(stage.CapacityStageError, "cannot reserve durable receipts"):
+            stage.run_capacity_preparation_bounded(
+                preparation_pin, insufficient_pin, SOURCE_ROOT, self.input_root,
+                self.host_id, observed_pin, untouched_output,
+            )
+        self.assertFalse((untouched_output / self.campaign_id).exists())
+
+        strict = stage.verify_capacity_preparation_bounded(
+            preparation_pin, budget_pin, SOURCE_ROOT, self.input_root,
+            self.host_id, observed_pin, output_root, completion_pin,
+        )
+        stage_dir = Path(completion["stage_directory"])
+        receipt_path = stage_dir / "bounded-host-verification.json"
+        receipt_raw = canonical(strict)
+        write_file(receipt_path, receipt_raw)
+        receipt_pin = {
+            "path": str(receipt_path), "raw_sha256": sha(receipt_raw),
+            "receipt_sha256": strict["receipt_sha256"],
+        }
+        copied = self._copy_bounded_offline_evidence(completion)
+        self.assertEqual(copied["source_root"], SOURCE_ROOT)
+        self.assertEqual(copied["input_root"], self.input_root)
+        self.assertEqual(copied["output_root"], output_root)
+        for pinned_path, pinned_sha in (
+            (preparation_pin["path"], preparation_pin["raw_sha256"]),
+            (budget_pin["path"], budget_pin["sha256"]),
+            (observed_pin["path"], observed_pin["sha256"]),
+            (completion_pin["path"], completion_pin["sha256"]),
+            (receipt_pin["path"], receipt_pin["raw_sha256"]),
+        ):
+            self.assertEqual(sha(Path(pinned_path).read_bytes()), pinned_sha)
+        self.assertNotEqual(copied["inodes_before"][self.input_root],
+                            copied["inodes_after"][self.input_root])
+        self.assertNotEqual(copied["inodes_before"][output_root],
+                            copied["inodes_after"][output_root])
+        self.assertTrue(all(origin == local
+                            for origin, local in copied["tmp_root_pairs"]))
+        opaque_tmp_paths = [root / "opaque-payload.json"
+                            for root, _local in copied["tmp_root_pairs"]
+                            if (root / "opaque-payload.json").is_file()]
+        self.assertEqual(len(opaque_tmp_paths), 1)
+        self.assertEqual(opaque_tmp_paths[0].read_bytes(),
+                         b'[\n  {"path":"/not-an-evidence-member"}\n]\n')
+
+        def offline_replay(path_map: dict[str, Any]) -> dict[str, Any]:
+            return stage.verify_capacity_preparation_bounded_offline(
+                preparation_pin, budget_pin, SOURCE_ROOT, self.input_root,
+                self.host_id, observed_pin, output_root, completion_pin,
+                path_map, receipt_pin,
+            )
+
+        original_path_open = Path.open
+        original_os_stat = os.stat
+
+        def reject_proc_open(path: Path, *args: Any, **kwargs: Any):
+            if str(path).startswith("/proc/"):
+                raise AssertionError("offline replay opened current procfs")
+            return original_path_open(path, *args, **kwargs)
+
+        def reject_proc_stat(path: Any, *args: Any, **kwargs: Any):
+            try:
+                rendered = os.fspath(path)
+            except TypeError:
+                rendered = ""
+            if type(rendered) is str and rendered.startswith("/proc/"):
+                raise AssertionError("offline replay statted current procfs")
+            return original_os_stat(path, *args, **kwargs)
+
+        with patch.object(stage, "_verify_observed_host",
+                          side_effect=AssertionError("offline replay probed current host identity")), \
+             patch.object(stage, "_boot_id_sha256",
+                          side_effect=AssertionError("offline replay read current boot identity")), \
+             patch.object(stage, "_bounded_statvfs",
+                          side_effect=AssertionError("offline replay sampled current filesystem capacity")), \
+             patch.object(stage, "_storage_snapshot",
+                          side_effect=AssertionError("offline replay sampled current storage")), \
+             patch.object(stage, "_network_snapshot",
+                          side_effect=AssertionError("offline replay sampled current network namespace")), \
+             patch.object(Path, "open", new=reject_proc_open), \
+             patch.object(os, "stat", new=reject_proc_stat), \
+             patch.object(os, "statvfs",
+                          side_effect=AssertionError("offline replay called statvfs")), \
+             patch.object(stage.subprocess, "Popen",
+                          side_effect=AssertionError("offline replay launched a process")):
+            offline = offline_replay(copied["evidence_path_map"])
+        self.assertEqual(offline, strict,
+                         "identity-map replay must preserve the exact original receipt bytes")
+
+        offline_map_raw = canonical(copied["evidence_path_map"])
+        offline_map_path = self.root_temp / f"offline-evidence-path-map-{self._testMethodName}.json"
+        write_file(offline_map_path, offline_map_raw)
+        cli_output = io.BytesIO()
+        cli_argv = [
+            "verify-preparation-bounded-offline",
+            "--preparation", str(preparation_pin["path"]),
+            "--preparation-sha256", preparation_pin["raw_sha256"],
+            "--resource-budget", str(budget_pin["path"]),
+            "--resource-budget-sha256", budget_pin["sha256"],
+            "--source-root", str(SOURCE_ROOT),
+            "--input-root", str(self.input_root),
+            "--host-id", self.host_id,
+            "--observed-host", str(observed_pin["path"]),
+            "--observed-host-sha256", observed_pin["sha256"],
+            "--output-root", str(output_root),
+            "--completion", str(completion_pin["path"]),
+            "--completion-sha256", completion_pin["sha256"],
+            "--evidence-path-map", str(offline_map_path),
+            "--evidence-path-map-sha256", sha(offline_map_raw),
+            "--host-verification-receipt", str(receipt_pin["path"]),
+            "--host-verification-raw-sha256", receipt_pin["raw_sha256"],
+            "--host-verification-receipt-sha256", receipt_pin["receipt_sha256"],
+        ]
+        with patch.object(stage, "_verify_observed_host",
+                          side_effect=AssertionError("offline CLI probed current host identity")), \
+             patch.object(stage, "_boot_id_sha256",
+                          side_effect=AssertionError("offline CLI read current boot identity")), \
+             patch.object(stage, "_bounded_statvfs",
+                          side_effect=AssertionError("offline CLI sampled current filesystem capacity")), \
+             patch.object(stage, "_storage_snapshot",
+                          side_effect=AssertionError("offline CLI sampled current storage")), \
+             patch.object(stage, "_network_snapshot",
+                          side_effect=AssertionError("offline CLI sampled current network namespace")), \
+             patch.object(Path, "open", new=reject_proc_open), \
+             patch.object(os, "stat", new=reject_proc_stat), \
+             patch.object(os, "statvfs",
+                          side_effect=AssertionError("offline CLI called statvfs")), \
+             patch.object(stage.subprocess, "Popen",
+                          side_effect=AssertionError("offline CLI launched a process")), \
+             patch.object(stage.sys, "stdout",
+                          types.SimpleNamespace(buffer=cli_output)):
+            cli_status = stage.main(cli_argv)
+        self.assertEqual(cli_status, 0)
+        self.assertEqual(json.loads(cli_output.getvalue()), offline)
+
+        relocated_map = copy.deepcopy(copied["evidence_path_map"])
+        input_root_entry = next(
+            entry for entry in relocated_map["entries"]
+            if entry["origin"] == str(self.input_root)
+        )
+        input_root_entry["local"] = str(self.input_root.with_name("relocated-input-copy"))
+        with self.assertRaisesRegex(stage.CapacityStageError,
+                                    "preserve every original absolute path"):
+            offline_replay(relocated_map)
+
+        nested_capture_path = Path(next(
+            record["details"]["direct_process_capture"]["path"]
+            for record in ledger_records if record["event"] == "application_exited"
+        ))
+        incomplete_map = copy.deepcopy(copied["evidence_path_map"])
+        incomplete_map["entries"] = [
+            entry for entry in incomplete_map["entries"]
+            if entry["origin"] != str(nested_capture_path)
+        ]
+        with patch.object(stage, "_prepare_capacity_preparation_pins",
+                          side_effect=AssertionError("nested preparation ran before map closure")), \
+             patch.object(stage, "_capture_source_stack",
+                          side_effect=AssertionError("SourceV5 module loaded before map closure")):
+            with self.assertRaisesRegex(stage.CapacityStageError,
+                                        "complete recursive input/output/TMPDIR membership"):
+                offline_replay(incomplete_map)
+
+        budget_path = Path(budget_pin["path"])
+        budget_raw = budget_path.read_bytes()
+        write_file(budget_path, budget_raw + b" ")
+        with self.assertRaisesRegex(stage.CapacityStageError, "original raw host pin"):
+            offline_replay(copied["evidence_path_map"])
+        write_file(budget_path, budget_raw)
+
+        monitor_path = Path(
+            completion["entries"][0]["resource_monitors"]["policy_probe"]["path"],
+        )
+        local_monitor_path = monitor_path
+        monitor_raw = local_monitor_path.read_bytes()
+        write_file(local_monitor_path, monitor_raw + b" ")
+        with self.assertRaises(stage.CapacityStageError):
+            stage.verify_capacity_preparation_bounded_offline(
+                preparation_pin, budget_pin, SOURCE_ROOT, self.input_root,
+                self.host_id, observed_pin, output_root, completion_pin,
+                copied["evidence_path_map"], receipt_pin,
+            )
+        write_file(local_monitor_path, monitor_raw)
+
+        artifact_path = Path(completion["entries"][0]["artifact"]["path"])
+        local_artifact_path = artifact_path
+        artifact_raw = local_artifact_path.read_bytes()
+        local_artifact_path.unlink()
+        with self.assertRaises(stage.CapacityStageError):
+            stage.verify_capacity_preparation_bounded_offline(
+                preparation_pin, budget_pin, SOURCE_ROOT, self.input_root,
+                self.host_id, observed_pin, output_root, completion_pin,
+                copied["evidence_path_map"], receipt_pin,
+            )
+        write_file(local_artifact_path, artifact_raw)
+
+    def test_bounded_preparation_free_space_floor_fails_before_popen(self) -> None:
+        preparation_pin, budget_pin, observed_pin = self._build_bounded_preparation_inputs()
+        mismatched_semantic_pin = {
+            **preparation_pin, "semantic_sha256": "f" * 64,
+        }
+        wrong_semantic_output = self.input_root / (
+            f"bounded-output-wrong-semantic-{self._testMethodName}"
+        )
+        wrong_semantic_output.mkdir(mode=0o700)
+        with patch.object(subprocess, "Popen",
+                          side_effect=AssertionError("semantic mismatch crossed child launch")) as popen:
+            with self.assertRaisesRegex(
+                    stage.CapacityStageError,
+                    "bounded caller-pinned semantic digest",
+            ):
+                stage.run_capacity_preparation_bounded(
+                    mismatched_semantic_pin, budget_pin, SOURCE_ROOT, self.input_root,
+                    self.host_id, observed_pin, wrong_semantic_output,
+                )
+        popen.assert_not_called()
+
+        inputs = input_fixtures.inputs
+        budget_path = Path(budget_pin["path"])
+        budget = json.loads(budget_path.read_bytes())
+        budget["ceilings"]["minimum_free_bytes"] = 1 << 50
+        budget_body = {key: value for key, value in budget.items()
+                       if key != "resource_budget_sha256"}
+        budget["resource_budget_sha256"] = inputs._sha256(inputs._canonical(budget_body))
+        budget_raw = inputs._canonical(budget)
+        write_file(budget_path, budget_raw)
+        strict_budget_pin = {"path": str(budget_path), "sha256": sha(budget_raw)}
+        output_root = self.input_root / f"bounded-output-{self._testMethodName}"
+        output_root.mkdir(mode=0o700)
+        # Strict source verification may run read-only Git commands. This gate
+        # protects the scheduled policy-probe and APP owner entry point.
+        with patch.object(
+                stage, "_spawn_with_source5_owner",
+                side_effect=AssertionError("scheduled owner launch crossed the free-space gate"),
+        ) as owner_launch:
+            with self.assertRaisesRegex(stage.CapacityStageError,
+                                        "resource budget failed before child launch"):
+                stage.run_capacity_preparation_bounded(
+                    preparation_pin, strict_budget_pin, SOURCE_ROOT, self.input_root,
+                    self.host_id, observed_pin, output_root,
+                )
+        owner_launch.assert_not_called()
+        stage_dir = output_root / self.campaign_id / "capacity-preparation" / self.host_id
+        self.assertFalse((stage_dir / "capacity-preparation-bounded-completion.json").exists())
+        failed_records = [json.loads(line)["record"] for line in
+                          (stage_dir / "capacity-preparation-bounded-ledger.jsonl").read_bytes().splitlines()]
+        self.assertEqual([record["event"] for record in failed_records],
+                         ["probe_dispatch", "stage_failed"])
+        failure_pin = failed_records[-1]["details"].get("resource_monitor_failure")
+        self.assertIsNotNone(failure_pin)
+        failure_report = json.loads(Path(failure_pin["path"]).read_bytes())
+        self.assertEqual(failure_report["role"], "policy_probe")
+        self.assertIsNone(failure_report["monitor_error"])
+        self.assertIn("minimum_free_bytes_or_receipt_reserve", failure_report["stop_reason"])
+        self.assertTrue(any(
+            filesystem["available_bytes"] < filesystem["required_bytes"]
+            for sample in failure_report["samples"]
+            for filesystem in sample["filesystems"]
+        ))
+        for root_pin in failure_report["roots"]["tmpdirs"]:
+            self.addCleanup(shutil.rmtree, Path(root_pin["path"]), True)
+        self.assertFalse(any(output_root.rglob("fake-app.pid")))
+
+    def test_source5_direct_owner_reaps_timeout_and_records_signal_boundary(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="capacity-stage-owned-timeout-") as temporary:
+            root = Path(temporary)
+            result, _context, _job, job_dir, _argv, _environment = self._run_source5_owned_child(
+                root, ["--test-wait"], timeout_seconds=1,
+            )
+            self.assertEqual(result["status"], "timeout")
+            capture = json.loads((job_dir / "application.process-capture.json").read_bytes())
+            supervision = capture["runner_capture"]["supervision"]
+            self.assertIs(supervision["timed_out"], True)
+            self.assertIs(supervision["leader_reaped"], True)
+            self.assertEqual(supervision["remaining_session_members"], [])
+            self.assertEqual(supervision["group_signal_after_leader_reap_count"], 0)
+            self.assertTrue(all(item["group_signal"]["leader_unreaped"] is True
+                                for item in supervision["signals"]))
+
+    def test_source5_direct_owner_records_int_term_and_hup_without_raw_pid_forwarding(self) -> None:
+        for signum in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+            with self.subTest(signal=signum), tempfile.TemporaryDirectory(
+                prefix="capacity-stage-owned-signal-",
+            ) as temporary:
+                root = Path(temporary)
+                result, _context, _job, job_dir, _argv, _environment = self._run_source5_owned_child(
+                    root, ["--test-wait"], timeout_seconds=10,
+                    on_bound=lambda _proof, value=signum: os.kill(os.getpid(), value),
+                )
+                self.assertEqual(result["status"], "interrupted")
+                self.assertEqual(result["signal"], signum)
+                capture = json.loads((job_dir / "application.process-capture.json").read_bytes())
+                supervision = capture["runner_capture"]["supervision"]
+                self.assertEqual(supervision["received_signal"], signum)
+                self.assertIs(supervision["leader_reaped"], True)
+                self.assertEqual(supervision["remaining_session_members"], [])
+                self.assertEqual(supervision["group_signal_after_leader_reap_count"], 0)
+                self.assertTrue(all(item["group_signal"]["leader_unreaped"] is True
+                                    for item in supervision["signals"]))
+
+    def test_source5_direct_owner_retains_nonzero_application_capture(self) -> None:
+        self.failure_flag.touch(mode=0o600)
+        try:
+            with tempfile.TemporaryDirectory(prefix="capacity-stage-owned-failed-exit-") as temporary:
+                root = Path(temporary)
+                result, _context, _job, job_dir, _argv, _environment = self._run_source5_owned_child(
+                    root, [], timeout_seconds=2,
+                )
+                self.assertEqual(result["status"], "completed")
+                self.assertEqual(result["return_code"], 41)
+                capture = json.loads((job_dir / "application.process-capture.json").read_bytes())
+                direct = capture["runner_capture"]
+                self.assertEqual(direct["status"], 41)
+                self.assertEqual(direct["child_return_code"], 41)
+                self.assertEqual(direct["supervision"]["cleanup_status"], "verified")
+                self.assertIs(direct["supervision"]["leader_reaped"], True)
+                self.assertEqual(direct["supervision"]["group_signal_after_leader_reap_count"], 0)
+        finally:
+            self.failure_flag.unlink(missing_ok=True)
+
+    def test_source5_direct_owner_cleans_escaped_process_group_member_by_owned_pidfd(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="capacity-stage-owned-descendant-") as temporary:
+            root = Path(temporary)
+            result, context, job, job_dir, argv, environment = self._run_source5_owned_child(
+                root, ["--test-escaped-descendant"],
+            )
+            self.assertEqual(result["status"], "completed")
+            self.assertEqual(result["return_code"], 0)
+            descendant_pid = int((job_dir / "tmp" / "owner-descendant.pid").read_text().strip())
+            capture = json.loads((job_dir / "application.process-capture.json").read_bytes())
+            supervision = capture["runner_capture"]["supervision"]
+            self.assertIs(supervision["leader_reaped"], True)
+            self.assertEqual(supervision["remaining_session_members"], [])
+            self.assertEqual(supervision["group_signal_after_leader_reap_count"], 0)
+            self.assertTrue(all(item["group_signal"]["leader_unreaped"] is True
+                                for item in supervision["signals"]))
+            pidfd_signals = [
+                member
+                for signal_record in supervision["signals"]
+                for member in signal_record["pidfd_signals"]
+            ]
+            self.assertTrue(any(item["pid"] == descendant_pid and item["sent"] is True
+                                for item in pidfd_signals))
+
+            start = stage._verify_owned_process_start(
+                context, job, root, result["direct_process"]["start"], argv,
+                environment, self.binary_path, self.binary_sha256, result["pid"],
+            )
+            stage._verify_owned_process_capture(
+                context, job, root, result["direct_process"]["capture"], start,
+                argv, environment, self.binary_path, self.binary_sha256, 2,
+                result["elapsed_ns"], result,
+            )
+            capture_path = job_dir / "application.process-capture.json"
+            original_capture_raw = capture_path.read_bytes()
+            original_capture = json.loads(original_capture_raw)
+            original_supervision = original_capture["runner_capture"]["supervision"]
+            original_escape_signal = next(
+                item for item in original_supervision["signals"] if item["pidfd_signals"]
+            )
+            escaped_member = next(
+                item for item in original_escape_signal["members"] if item["pid"] == descendant_pid
+            )
+            escaped_pidfd = next(
+                item for item in original_escape_signal["pidfd_signals"]
+                if item["pid"] == descendant_pid
+            )
+
+            def reject_repinned_capture(label: str, mutate) -> None:
+                with self.subTest(resealed_capture=label):
+                    candidate = json.loads(original_capture_raw)
+                    mutate(candidate)
+                    candidate_raw = stage.canonical_bytes(candidate)
+                    try:
+                        capture_path.write_bytes(candidate_raw)
+                        repinned = {"path": str(capture_path), "sha256": sha(candidate_raw)}
+                        with self.assertRaises(stage.CapacityStageError):
+                            stage._verify_owned_process_capture(
+                                context, job, root, repinned, start, argv, environment,
+                                self.binary_path, self.binary_sha256, 2,
+                                result["elapsed_ns"], result,
+                            )
+                    finally:
+                        capture_path.write_bytes(original_capture_raw)
+
+            def invalid_term_grace(value: dict[str, Any]) -> None:
+                value["runner_capture"]["supervision"]["term_grace_seconds"] = "3.0"
+
+            def invalid_kill_reap(value: dict[str, Any]) -> None:
+                value["runner_capture"]["supervision"]["kill_reap_seconds"] = 2.0
+
+            def invalid_wait_kind(value: dict[str, Any]) -> None:
+                value["runner_capture"]["supervision"]["leader_info"]["si_code"] = 0
+
+            def invalid_group_signal(value: dict[str, Any]) -> None:
+                value["runner_capture"]["supervision"]["signals"][
+                    original_supervision["signals"].index(original_escape_signal)
+                ]["group_signal"]["signal"] = int(signal.SIGINT)
+
+            def mismatched_group_leader_start(value: dict[str, Any]) -> None:
+                value["runner_capture"]["supervision"]["signals"][
+                    original_supervision["signals"].index(original_escape_signal)
+                ]["group_signal"]["leader_start_ticks"] += 1
+
+            def malformed_group_error(value: dict[str, Any]) -> None:
+                value["runner_capture"]["supervision"]["signals"][
+                    original_supervision["signals"].index(original_escape_signal)
+                ]["group_error"] = {"arbitrary": "payload"}
+
+            def malformed_scan_error(value: dict[str, Any]) -> None:
+                value["runner_capture"]["supervision"]["signals"][
+                    original_supervision["signals"].index(original_escape_signal)
+                ]["scan_error"] = "opaque"
+
+            def invalid_pidfd_row(value: dict[str, Any]) -> None:
+                signal_index = original_supervision["signals"].index(original_escape_signal)
+                value["runner_capture"]["supervision"]["signals"][signal_index]["pidfd_signals"][0] = {
+                    "arbitrary": "payload",
+                }
+
+            def invalid_pidfd_sent_type(value: dict[str, Any]) -> None:
+                signal_index = original_supervision["signals"].index(original_escape_signal)
+                row = value["runner_capture"]["supervision"]["signals"][signal_index]["pidfd_signals"][0]
+                row["sent"] = "true"
+
+            def mismatched_pidfd_start(value: dict[str, Any]) -> None:
+                signal_index = original_supervision["signals"].index(original_escape_signal)
+                row = value["runner_capture"]["supervision"]["signals"][signal_index]["pidfd_signals"][0]
+                row["start_ticks"] += 1
+
+            def mismatched_pidfd_signal(value: dict[str, Any]) -> None:
+                signal_index = original_supervision["signals"].index(original_escape_signal)
+                row = value["runner_capture"]["supervision"]["signals"][signal_index]["pidfd_signals"][0]
+                row["signal"] = int(signal.SIGINT)
+
+            def mismatched_member_session(value: dict[str, Any]) -> None:
+                signal_index = original_supervision["signals"].index(original_escape_signal)
+                row = next(
+                    item for item in value["runner_capture"]["supervision"]["signals"][signal_index]["members"]
+                    if item["pid"] == descendant_pid
+                )
+                row["session_id"] = 0
+
+            def mismatched_member_pid(value: dict[str, Any]) -> None:
+                signal_index = original_supervision["signals"].index(original_escape_signal)
+                row = next(
+                    item for item in value["runner_capture"]["supervision"]["signals"][signal_index]["members"]
+                    if item["pid"] == descendant_pid
+                )
+                row["pid"] += 1000
+
+            self.assertEqual(escaped_member["start_ticks"], escaped_pidfd["start_ticks"])
+            for label, mutation in (
+                ("term_grace_type", invalid_term_grace),
+                ("kill_reap_constant", invalid_kill_reap),
+                ("waitid_kind", invalid_wait_kind),
+                ("group_signal", invalid_group_signal),
+                ("group_leader_start_ticks", mismatched_group_leader_start),
+                ("group_error_schema", malformed_group_error),
+                ("scan_error_schema", malformed_scan_error),
+                ("pidfd_payload_schema", invalid_pidfd_row),
+                ("pidfd_sent_type", invalid_pidfd_sent_type),
+                ("pidfd_start_ticks", mismatched_pidfd_start),
+                ("pidfd_signal", mismatched_pidfd_signal),
+                ("member_session", mismatched_member_session),
+                ("member_pid", mismatched_member_pid),
+            ):
+                reject_repinned_capture(label, mutation)
+
+    def test_source5_owned_child_fails_closed_before_output_creation_without_captured_owner(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="capacity-stage-owned-missing-") as temporary:
+            root = Path(temporary)
+            tmpdir = root / "tmp"
+            tmpdir.mkdir(mode=0o700)
+            context = {"current_host": {}, "stack": {}}
+            stdout = root / "stdout"
+            with self.assertRaises(stage.CapacityStageError):
+                stage._spawn_with_source5_owner(
+                    context, [str(self.binary_path)], root,
+                    {"PATH": "/usr/bin:/bin", "LC_ALL": "C", "TMPDIR": str(tmpdir)},
+                    stdout, root / "stderr", 1, self.binary_path, self.binary_sha256,
+                    root / "capture.json", root / "start.json",
+                )
+            self.assertFalse(stdout.exists())
+            self.assertFalse((root / "stderr").exists())
+
     def _cli_args(self, command: str, output_root: Path | None = None) -> list[str]:
         target = output_root or self.output_root
         args = [
@@ -625,6 +1973,96 @@ class CapacityStageCliTests(unittest.TestCase):
             self.ledger_path.write_bytes(original_ledger)
             self.ledger_path.chmod(0o400)
             completion_path.write_bytes(original_completion)
+
+    def test_pre_spec_environment_binds_feedback_mode_and_real_readers_keep_no_actuation(self) -> None:
+        job = {"run_id": "prep-cap-disk-steady"}
+        job_dir = stage._prepare_job_dir(self.stage_dir, job)
+        trace_dir = job_dir / "trace"
+        tmpdir = self.output_root / "preparation-tmp"
+        tmpdir.mkdir(mode=0o700)
+        probe_source = self.probe_root / "disk-steady.json"
+        probe_path = job_dir / "policy-probe.json"
+        probe_raw = probe_source.read_bytes()
+        write_file(probe_path, probe_raw)
+        probe = json.loads(probe_raw)
+        source = self.sources[self.host_id]
+        source_raw = self.source_manifest_path.read_bytes()
+        source_sha = sha(source_raw)
+        identity = {
+            "host_id": self.host_id, "run_id": job["run_id"],
+            "report_nonce": "d" * 32, "allocator": "allocatbelt",
+            "executor": "allocatbelt", "workload": "disk", "profile": "steady",
+            "mode": "capacity", "source_sha256": source["source"]["source_tree_sha256"],
+            "binary_sha256": self.binary_sha256, "pressure_qualification": False,
+        }
+        environment = stage._application_environment(
+            identity, trace_dir, tmpdir, source5_preparation=True,
+        )
+        self.assertEqual(environment["ALLOCATBELT_APP_COMPARISON_FAMILY"], "external_pressure")
+        self.assertEqual(environment["ALLOCATBELT_APP_PRESSURE_QUALIFICATION"], "false")
+        self.assertNotIn("ALLOCATBELT_APP_CAPACITY_CALIBRATION_FILE", environment)
+        self.assertNotIn("ALLOCATBELT_APP_CAPACITY_CALIBRATION_SHA256", environment)
+        self.assertNotIn("ALLOCATBELT_APP_COMPARISON_FAMILY",
+                         stage._application_environment(identity, trace_dir, tmpdir))
+
+        process_context = self._source5_process_context()
+        bound_proofs: list[dict[str, Any]] = []
+        child = stage._spawn_with_source5_owner(
+            process_context, [str(self.binary_path)], job_dir, environment,
+            job_dir / "application.stdout", job_dir / "application.stderr", 30,
+            self.binary_path, self.binary_sha256,
+            job_dir / "application.process-capture.json",
+            job_dir / "application.process-start.json", on_bound=bound_proofs.append,
+        )
+        self.assertEqual(child["status"], "completed")
+        self.assertEqual(child["return_code"], 0)
+        self.assertEqual(child["process_identity"]["environment"], environment)
+        self.assertEqual(len(bound_proofs), 1)
+        self.assertEqual(bound_proofs[0]["pid"], child["pid"])
+        app_start = stage._verify_owned_process_start(
+            process_context, job, self.stage_dir, child["direct_process"]["start"],
+            [str(self.binary_path)], environment, self.binary_path,
+            self.binary_sha256, child["pid"],
+        )
+        stage._verify_owned_process_capture(
+            process_context, job, self.stage_dir, child["direct_process"]["capture"],
+            app_start, [str(self.binary_path)], environment, self.binary_path,
+            self.binary_sha256, 30, child["elapsed_ns"], child,
+        )
+        trace_hashes = {
+            role: sha((trace_dir / name).read_bytes())
+            for role, name in (
+                ("manifest", "feedback-trace-manifest.tsv"),
+                ("events", "feedback-events.jsonl"),
+                ("samples", "resource-samples.tsv"),
+            )
+        }
+        policy = stage._make_policy(identity, source, probe, feedback_fixtures.reader)
+        self.assertEqual(policy["capacity_sources"], {"disk": False, "download": False})
+        seed = stage._expectation_seed(
+            identity, policy,
+            {"path": str(self.source_manifest_path), "sha256": source_sha},
+            {"path": str(probe_path), "sha256": sha(probe_raw)},
+            "allocatbelt", self.binary_sha256, 10,
+        )
+        expectation_raw, expectation_sha, expectation = stage._finish_expectation(
+            seed, child["pid"], feedback_fixtures.reader,
+        )
+        expectation_path = job_dir / "feedback-expectation.json"
+        write_file(expectation_path, expectation_raw)
+        validation = feedback_fixtures.reader.verify_feedback(
+            expectation_path, expectation_sha, trace_dir, trace_hashes,
+        )
+        self.assertIs(validation["validated"], True)
+        self.assertEqual(validation["mode"], "capacity_calibration")
+        self.assertIs(validation["qualification_eligible"], False)
+        self.assertIsNone(expectation["app_capacity_artifact_sha256"])
+        self.assertGreater(
+            capacity_producer.verify_no_actuation(
+                trace_dir / "feedback-events.jsonl", trace_hashes["events"],
+            ),
+            0,
+        )
 
     @staticmethod
     def _job_event(records: list[dict[str, Any]], run_id: str, event: str) -> dict[str, Any]:
@@ -956,12 +2394,6 @@ class CapacityStageCliTests(unittest.TestCase):
                 except subprocess.TimeoutExpired:
                     process.kill()
                     process.wait(timeout=10)
-            if marker is not None:
-                try:
-                    process_group = int(marker.read_text().strip())
-                    os.killpg(process_group, signal.SIGKILL)
-                except (OSError, ValueError):
-                    pass
             self.hang_flag.unlink(missing_ok=True)
 
     def test_bounded_supervisor_records_timeout_and_reaps_the_fake_child(self) -> None:

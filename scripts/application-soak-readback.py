@@ -62,6 +62,7 @@ SOURCE_V5_PRESSURE_MAX_DURATION_SECONDS = 12_000
 SOURCE_V5_PRESSURE_MAX_SAMPLES = 120_000
 SOURCE_V5_PRESSURE_MAX_TOTAL_SECONDS = 14_400
 SOURCE_V5_PRESSURE_OWNERSHIP_PROTOCOL = "allocatbelt.pressure-worker-ownership.v1"
+SOURCE5_SOAK_OFFLINE_CONTEXT_SCHEMA = "allocatbelt.application-source5-soak-offline-replay-context.v1"
 
 ALLOCATORS = ("allocatbelt", "mimalloc-secure", "mimalloc-standard", "system")
 DOMAINS = ("cpu", "memory", "disk", "network", "tasks", "control")
@@ -936,21 +937,82 @@ def _run_checked(
             raise SoakReadbackError(f"{active_exception}; {final_cleanup_failure}") from active_exception
 
 
-def verify_source_tree(root: Path, source: dict[str, Any]) -> str:
+def verify_source_tree(
+    root: Path, source: dict[str, Any], *, offline_context: dict[str, Any] | None = None,
+) -> str:
     require(root.is_dir() and not root.is_symlink(), "source root must be a real directory")
     commit = text(source["git_commit"], "source git commit", maximum=64)
-    live_commit = _run_checked(["git", "rev-parse", "HEAD"], root, "source git identity").decode("ascii").strip()
-    require(live_commit == commit, "live source Git commit differs from its frozen manifest")
+    if offline_context is None:
+        live_commit = _run_checked(["git", "rev-parse", "HEAD"], root, "source git identity").decode("ascii").strip()
+        require(live_commit == commit, "live source Git commit differs from its frozen manifest")
+    else:
+        exact_object(offline_context, {
+            "schema", "evidence_path_map", "construction_probe_capture",
+            "host_verification_pin", "application_environment",
+            "pressure_origin",
+        }, "Source5 Soak offline replay context")
+        require(offline_context["schema"] == SOURCE5_SOAK_OFFLINE_CONTEXT_SCHEMA,
+                "Source5 Soak offline replay context schema differs")
+        # Offline replay pins the recorded commit as part of the raw source
+        # manifest and verifies every typed source-tree entry below. It never
+        # asks the coordinator's Git worktree what commit it happens to be on.
+        require(type(commit) is str and bool(commit),
+                "Source5 offline source manifest has no recorded commit")
     inventory_module = source_inventory_module()
     expected_records = inventory_module.validate_records({
         "schema": inventory_module.SCHEMA,
         "entries": source["files"],
     })
     require(expected_records == source["files"], "source inventory records are not canonical")
-    try:
-        inventory_module.verify_source_tree(root, source["source_tree_sha256"], expected_records)
-    except inventory_module.InventoryError as error:
-        raise SoakReadbackError(f"live source inventory differs from its manifest: {error}") from error
+    require(inventory_module.digest_records(expected_records) ==
+            source["source_tree_sha256"],
+            "typed source inventory does not produce its frozen tree digest")
+    if offline_context is None:
+        try:
+            inventory_module.verify_source_tree(root, source["source_tree_sha256"], expected_records)
+        except inventory_module.InventoryError as error:
+            raise SoakReadbackError(f"live source inventory differs from its manifest: {error}") from error
+    else:
+        # `inventory_module.verify_source_tree` discovers files by invoking
+        # Git. Offline replay instead checks the exact closed typed records
+        # and their literal source bytes, so no coordinator Git/worktree probe
+        # can affect the result.
+        for index, entry in enumerate(expected_records):
+            relative = PurePosixPath(entry["path"])
+            candidate = root.joinpath(*relative.parts)
+            parent = candidate.parent
+            require(parent.resolve(strict=True) == parent,
+                    f"offline source entry[{index}] has an aliased parent")
+            if entry["kind"] == "file":
+                before = candidate.lstat()
+                raw, actual_sha = read_stable_bytes(
+                    candidate, f"offline SourceV5 source file {entry['path']}",
+                    MAX_SOURCE_FILE_BYTES,
+                )
+                info = candidate.lstat()
+                mode = f"{stat.S_IFMT(info.st_mode) | stat.S_IMODE(info.st_mode):06o}"
+                require(stat.S_ISREG(before.st_mode) and stat.S_ISREG(info.st_mode) and
+                        (before.st_dev, before.st_ino, before.st_size,
+                         before.st_mtime_ns, before.st_ctime_ns) ==
+                        (info.st_dev, info.st_ino, info.st_size,
+                         info.st_mtime_ns, info.st_ctime_ns) and
+                        actual_sha == entry["sha256"] and len(raw) == entry["size"] and
+                        mode == entry["mode"],
+                        f"offline SourceV5 source file differs from its typed record: {entry['path']}")
+            else:
+                try:
+                    info = candidate.lstat()
+                    target = os.readlink(candidate)
+                except OSError as error:
+                    raise SoakReadbackError(
+                        f"offline SourceV5 symlink is unavailable: {entry['path']}: {error}",
+                    ) from error
+                target_raw = target.encode("utf-8")
+                require(stat.S_ISLNK(info.st_mode) and
+                        hashlib.sha256(target_raw).hexdigest() == entry["sha256"] and
+                        len(target_raw) == entry["size"] and
+                        target == entry["target"],
+                        f"offline SourceV5 symlink differs from its typed record: {entry['path']}")
     cargo_lock = safe_child(root, "Cargo.lock", "Cargo.lock")
     lock_hash = sha256_file(cargo_lock, "Cargo.lock", MAX_SOURCE_FILE_BYTES)
     require(lock_hash == source["cargo_lock_sha256"], "live Cargo.lock differs from its source manifest")
@@ -1064,9 +1126,13 @@ def _validate_calibration_record(value: object) -> tuple[int, dict[str, Any]]:
     return baseline, record
 
 
-def _audit_manifest_and_binaries(recipe: dict[str, Any]) -> dict[str, Any]:
+def _audit_manifest_and_binaries(
+    recipe: dict[str, Any], *, offline_context: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     if recipe["schema"] == RECIPE_SCHEMA_V2:
-        return _audit_manifest_and_binaries_v5(recipe)
+        return _audit_manifest_and_binaries_v5(recipe, offline_context=offline_context)
+    require(offline_context is None,
+            "receipt-backed offline Soak replay supports only the original SourceV5 recipe")
     identity = recipe["identity"]
     source_config = recipe["source"]
     source_root = safe_absolute_path(source_config["root"], "source root")
@@ -1236,7 +1302,9 @@ def _audit_manifest_and_binaries(recipe: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _audit_manifest_and_binaries_v5(recipe: dict[str, Any]) -> dict[str, Any]:
+def _audit_manifest_and_binaries_v5(
+    recipe: dict[str, Any], *, offline_context: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     """Verify SourceV5 through the exact controller bytes in its inventory."""
     identity = recipe["identity"]
     source_binding = recipe["source"]
@@ -1271,7 +1339,7 @@ def _audit_manifest_and_binaries_v5(recipe: dict[str, Any]) -> dict[str, Any]:
     require(validated_files == files and inventory_module.digest_records(files) == source["source_tree_sha256"], "SourceV5 inventory does not produce its declared tree digest")
     inventory_entry = next((entry for entry in files if entry["path"] == SOURCE_INVENTORY_RELATIVE_PATH), None)
     require(type(inventory_entry) is dict and inventory_entry.get("kind") == "file" and inventory_entry.get("sha256") == SOURCE_INVENTORY_MODULE_SHA256, "SourceV5 inventory module pin differs from the reader")
-    live_tree = verify_source_tree(source_root, source)
+    live_tree = verify_source_tree(source_root, source, offline_context=offline_context)
     require(live_tree == identity["source_sha256"], "live SourceV5 tree differs from the parent identity")
 
     harness = exact_object(manifest["qualification_harness"], {
@@ -1330,18 +1398,103 @@ def _audit_manifest_and_binaries_v5(recipe: dict[str, Any]) -> dict[str, Any]:
     require(probe_raw == canonical_bytes(probe_value) and probe_raw_sha == probe["raw_sha256"], "SourceV5 construction probe raw bytes differ from their frozen pin")
     require(probe_value.get("schema") == "allocatbelt.application-feedback-policy-probe.v1", "unsupported SourceV5 construction probe schema")
     require(probe_value.get("context", {}).get("workload") == "mixed" and probe_value.get("context", {}).get("profile") == identity["profile"], "SourceV5 construction probe context differs from the soak profile")
-    probe_process = subprocess.run(
-        [str(normal_path), "--emit-feedback-policy-only", "--workload", "mixed", "--profile", identity["profile"]],
-        cwd=source_root,
-        env={"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "LANG": "C", "LC_ALL": "C"},
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        timeout=30,
-        check=False,
-    )
-    require(len(probe_process.stdout) <= 512 * 1024 and len(probe_process.stderr) <= 64 * 1024, "SourceV5 construction probe process exceeded its finite output bound")
-    require(probe_process.returncode == 0 and probe_process.stdout == probe_raw, "pinned SourceV5 application binary no longer emits the caller-frozen construction probe")
+    if offline_context is None:
+        probe_process = subprocess.run(
+            [str(normal_path), "--emit-feedback-policy-only", "--workload", "mixed", "--profile", identity["profile"]],
+            cwd=source_root,
+            env={"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "LANG": "C", "LC_ALL": "C"},
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=30,
+            check=False,
+        )
+        require(len(probe_process.stdout) <= 512 * 1024 and len(probe_process.stderr) <= 64 * 1024, "SourceV5 construction probe process exceeded its finite output bound")
+        require(probe_process.returncode == 0 and probe_process.stdout == probe_raw, "pinned SourceV5 application binary no longer emits the caller-frozen construction probe")
+    else:
+        capture = exact_object(offline_context["construction_probe_capture"], {
+            "schema", "source_manifest_raw_sha256", "source_tree_sha256",
+            "normal_binary_sha256", "probe_raw_sha256", "owner_source_sha256",
+            "owner_result", "stdout", "stderr", "argv", "environment",
+            "cwd", "cpu_affinity", "network_namespace_inode",
+            "tmpdir_path", "tmpdir_receipt_sha256",
+        }, "Source5 origin construction-probe capture")
+        expected_probe_argv = [
+            str(normal_path), "--emit-feedback-policy-only", "--workload",
+            "mixed", "--profile", identity["profile"],
+        ]
+        expected_environment = {
+            "PATH": "/usr/bin:/bin", "LANG": "C", "LC_ALL": "C",
+            "TMPDIR": capture["tmpdir_path"],
+        }
+        owner_result = exact_object(capture["owner_result"], {
+            "status", "child_return_code", "start", "binary_path",
+            "binary_sha256", "requested_argv", "requested_argv_sha256",
+            "environment", "environment_sha256", "cwd", "cpu_affinity",
+            "network_namespace_inode", "received_signal", "supervision",
+            "timing", "started_monotonic_ns", "ended_monotonic_ns",
+        }, "Source5 captured construction-probe owner result")
+        start = exact_object(owner_result["start"], {
+            "pid", "start_ticks", "requested_argv", "requested_argv_sha256",
+            "environment_sha256",
+        }, "Source5 captured construction-probe start identity")
+        supervision = owner_result["supervision"]
+        owner_source_record = records.get("scripts/application-fixed-pair.py")
+        require(type(supervision) is dict and
+                type(owner_source_record) is dict and
+                owner_source_record.get("kind") == "file" and
+                owner_source_record.get("sha256") == capture["owner_source_sha256"] and
+                supervision.get("cleanup_status") == "verified" and
+                supervision.get("leader_reaped") is True and
+                supervision.get("group_signal_after_leader_reap_count") == 0 and
+                supervision.get("timed_out") is False and
+                supervision.get("artifact_budget_exceeded") is False and
+                owner_result["status"] == owner_result["child_return_code"] == 0 and
+                owner_result["received_signal"] is None and
+                type(start["pid"]) is int and start["pid"] > 0 and
+                type(start["start_ticks"]) is int and start["start_ticks"] > 0 and
+                owner_result["binary_path"] == str(normal_path) and
+                owner_result["binary_sha256"] == normal_sha and
+                owner_result["requested_argv"] == start["requested_argv"] == expected_probe_argv and
+                owner_result["requested_argv_sha256"] == hashlib.sha256(canonical_bytes(expected_probe_argv)).hexdigest() and
+                owner_result["environment"] == expected_environment and
+                owner_result["environment_sha256"] == hashlib.sha256(canonical_bytes(expected_environment)).hexdigest() and
+                owner_result["cwd"] == str(source_root) and
+                owner_result["cpu_affinity"] == capture["cpu_affinity"] and
+                owner_result["network_namespace_inode"] == capture["network_namespace_inode"] and
+                capture["schema"] == "allocatbelt.application-source5-soak-probe-capture.v1" and
+                capture["source_manifest_raw_sha256"] == manifest_raw_sha and
+                capture["source_tree_sha256"] == source["source_tree_sha256"] and
+                capture["normal_binary_sha256"] == normal_sha and
+                capture["probe_raw_sha256"] == probe_raw_sha and
+                capture["argv"] == expected_probe_argv and
+                capture["environment"] == expected_environment and
+                capture["cwd"] == str(source_root) and
+                type(capture["cpu_affinity"]) is list and
+                capture["cpu_affinity"] == sorted(set(capture["cpu_affinity"])) and
+                type(capture["network_namespace_inode"]) is int and
+                capture["network_namespace_inode"] > 0 and
+                type(capture["tmpdir_path"]) is str and
+                Path(capture["tmpdir_path"]).is_absolute() and
+                re.fullmatch(r"[0-9a-f]{64}", str(capture["owner_source_sha256"])) is not None and
+                re.fullmatch(r"[0-9a-f]{64}", str(capture["tmpdir_receipt_sha256"])) is not None,
+                "Source5 captured ProbeV1 owner/source/environment differs from the parent recipe")
+        stdout = exact_object(capture["stdout"], {"path", "raw_sha256"},
+                              "Source5 captured construction-probe stdout pin")
+        stderr = exact_object(capture["stderr"], {"path", "raw_sha256"},
+                              "Source5 captured construction-probe stderr pin")
+        stdout_raw, stdout_sha = read_stable_bytes(
+            Path(stdout["path"]), "Source5 captured construction-probe stdout",
+            512 * 1024,
+        )
+        stderr_raw, stderr_sha = read_stable_bytes(
+            Path(stderr["path"]), "Source5 captured construction-probe stderr",
+            64 * 1024,
+        )
+        require(stdout_sha == stdout["raw_sha256"] == probe_raw_sha and
+                stdout_raw == probe_raw and stderr_sha == stderr["raw_sha256"] and
+                stderr_raw == b"",
+                "Source5 origin ProbeV1 stdout/stderr differ from the source-pinned construction probe")
     feedback_validator_pin = manifest["qualification_harness"]["feedback_validator"]
     feedback_validator_path = safe_child(source_root, feedback_validator_pin["path"], "SourceV5 feedback validator")
     feedback_validator_raw, feedback_validator_sha = read_stable_bytes(feedback_validator_path, "SourceV5 feedback validator", MAX_SOURCE_FILE_BYTES)
@@ -1783,6 +1936,7 @@ def _audit_inputs(
     runner_path: Path | None = None,
     *,
     require_executing_reader_path: bool = False,
+    offline_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     recipe, recipe_sha, raw = read_json(recipe_path, "parent soak recipe", MAX_RECIPE_BYTES)
     require(raw == canonical_bytes(recipe), "parent soak recipe is not canonical JSON")
@@ -1794,7 +1948,9 @@ def _audit_inputs(
         require(recipe["runtime"]["mode"] == selected_mode, "runner mode differs from the frozen parent recipe")
     if selected_duration is not None:
         require(recipe["runtime"]["duration_seconds"] == selected_duration, "runner duration differs from the frozen parent recipe")
-    source_audit = _audit_manifest_and_binaries(recipe)
+    source_audit = _audit_manifest_and_binaries(
+        recipe, offline_context=offline_context,
+    )
     source_root = Path(source_audit["source_root"])
     expected_reader = safe_child(source_root, recipe["validator"]["path"], "recipe validator source")
     executing_reader = Path(__file__).resolve(strict=True)
@@ -1857,6 +2013,62 @@ def _audit_inputs(
         "comparison_family": identity["comparison_family"],
         "launch_enabled": recipe["qualification"]["launch_enabled"] if recipe["schema"] == RECIPE_SCHEMA_V2 else True,
     }
+
+
+def _current_audit_offline(
+    args: argparse.Namespace, offline_context: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Rebuild the SourceV5 Soak audit without Git, APP, or procfs probes."""
+    exact_object(offline_context, {
+        "schema", "evidence_path_map", "construction_probe_capture",
+            "host_verification_pin", "application_environment",
+            "pressure_origin",
+    }, "Source5 Soak offline replay context")
+    require(offline_context["schema"] == SOURCE5_SOAK_OFFLINE_CONTEXT_SCHEMA,
+            "Source5 Soak offline replay context schema differs")
+    require(type(offline_context["application_environment"]) is dict and
+            type(offline_context["application_environment"].get("PATH")) is str and
+            bool(offline_context["application_environment"]["PATH"]),
+            "Source5 offline replay lacks the exact origin launch environment")
+    recipe_expected_sha = digest(args.recipe_sha256,
+                                 "expected Source5 recipe SHA-256")
+    recipe, _raw_sha, raw = read_json(
+        args.recipe, "Source5 parent soak recipe", MAX_RECIPE_BYTES,
+    )
+    require(raw == canonical_bytes(recipe) and
+            hashlib.sha256(raw).hexdigest() == recipe_expected_sha,
+            "Source5 parent recipe raw bytes differ from the offline pin")
+    normalized, identity = _validate_recipe(recipe, recipe_expected_sha)
+    require(normalized == recipe and recipe["schema"] == RECIPE_SCHEMA_V2,
+            "receipt-backed offline replay requires the original SourceV5 recipe")
+    cli_identity = {name: identity[name] for name in (
+        "campaign_id", "host_id", "run_id", "allocator", "executor",
+        "profile", "source_sha256", "binary_sha256",
+        "resource_ceiling_sha256",
+    )}
+    audit = _audit_inputs(
+        args.recipe, recipe_expected_sha, cli_identity, args.binary, None,
+        None, args.runner_path, require_executing_reader_path=True,
+        offline_context=offline_context,
+    )
+    require(audit["recipe"] == recipe and audit["launch_enabled"] is
+            recipe["qualification"]["launch_enabled"],
+            "Source5 offline audit changed the original recipe or readiness")
+    output_dir = _check_private_output_directory(args.output_dir)
+    audit["launch_descriptor"] = _make_launch_descriptor(
+        audit, output_dir, args.cpu_set,
+    )
+    # The original baseline preflight belongs to the immutable false legacy
+    # audit, whose v2 descriptor intentionally has no environment. The actual
+    # Soak environment is compared only after Source5 reconstructs its
+    # separately authorized enabled overlay.
+    require(audit["launch_enabled"] is False and
+            audit["launch_descriptor"].get("launch_enabled") is False and
+            audit["launch_descriptor"].get("environment") == {},
+            "Source5 offline baseline audit no longer preserves false legacy readiness")
+    preflight = _verify_preflight(output_dir / "soak-preflight.json", audit)
+    audit["preflight"] = preflight
+    return audit, preflight
 
 
 def _read_json_raw(raw: bytes, label: str) -> dict[str, Any]:
@@ -2158,11 +2370,15 @@ def _make_launch_descriptor(
     cpu_set: str,
     terminal_path: Path | None = None,
     samples_path: Path | None = None,
+    *, path_value: str | None = None,
 ) -> dict[str, Any]:
     _parse_cpu_set(cpu_set)
     output_dir = _check_private_output_directory(output_dir)
     if audit["recipe"]["schema"] == RECIPE_SCHEMA_V2:
-        return _make_launch_descriptor_v2(audit, output_dir, cpu_set, terminal_path, samples_path)
+        return _make_launch_descriptor_v2(
+            audit, output_dir, cpu_set, terminal_path, samples_path,
+            path_value=path_value,
+        )
     terminal = terminal_path or output_dir / "terminal-records.tsv"
     samples = samples_path or output_dir / "resource-samples.tsv"
     require(terminal.resolve(strict=False).parent == output_dir, "launch terminal path escaped its private output directory")
@@ -2232,7 +2448,8 @@ def _make_launch_descriptor(
 
 def _make_launch_descriptor_v2(
     audit: dict[str, Any], output_dir: Path, cpu_set: str,
-    terminal_path: Path | None, samples_path: Path | None,
+    terminal_path: Path | None, samples_path: Path | None, *,
+    path_value: str | None = None,
 ) -> dict[str, Any]:
     pressure_info = audit["source"].get("pressure_recipe")
     terminal = terminal_path or output_dir / "terminal-records.tsv"
@@ -2295,7 +2512,7 @@ def _make_launch_descriptor_v2(
         "--output-dir", str(output_dir),
     ]
     env = {
-        "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+        "PATH": os.environ.get("PATH", "/usr/bin:/bin") if path_value is None else path_value,
         "LANG": "C",
         "LC_ALL": "C",
         "ALLOCATBELT_APP_COMPARISON_FAMILY": "external_pressure",
@@ -3204,6 +3421,186 @@ def _validate_artifacts_v2(artifact_dir: Path, audit: dict[str, Any]) -> dict[st
         "passed": True,
         # This is eligibility of the independently audited soak component.
         # Campaign qualification also needs independent pressure and feedback receipts.
+        "qualification_eligible": phases["qualification_eligible"],
+        "mode": audit["mode"],
+        "identity": audit["identity"],
+        "source_manifest_sha256": audit["source"]["source_manifest_sha256"],
+        "source_tree_sha256": audit["source"]["source_tree_sha256"],
+        "build_sha256": audit["source"]["build_sha256"],
+        "candidate_binary_sha256": audit["source"]["candidate_binary_sha256"],
+        "resource_ceiling_sha256": audit["identity"]["resource_ceiling_sha256"],
+        "fixed_global_control_baseline": audit["source"]["fixed_global_control_baseline"],
+        "receipt_sha256": receipt_sha,
+        "validator_sha256": audit["execution"]["reader_sha256"],
+        "monotonic_endpoints": phases["monotonic_endpoints"],
+    }
+
+
+def _validate_pressure_proof_offline(
+    artifact_dir: Path, audit: dict[str, Any], offline_context: dict[str, Any],
+) -> dict[str, Any]:
+    """Replay the original one-APP pressure run through its captured reader."""
+    pressure_info = audit["source"].get("pressure_recipe")
+    require(type(pressure_info) is dict,
+            "SourceV5 offline Soak is missing its frozen pressure recipe")
+    parent_pin = exact_object(audit["recipe"]["pressure"]["recipe"], {
+        "path", "raw_sha256", "semantic_sha256",
+    }, "SourceV5 parent pressure recipe pin")
+    recipe_pin = {
+        **parent_pin,
+        "condition_sha256": audit["recipe"]["pressure"]["condition_sha256"],
+    }
+    require(pressure_info.get("raw_sha256") == parent_pin["raw_sha256"] and
+            pressure_info.get("recipe_sha256") == parent_pin["semantic_sha256"] and
+            pressure_info.get("condition_sha256") == recipe_pin["condition_sha256"],
+            "SourceV5 offline pressure recipe raw/semantic/condition roles differ")
+    reader = pressure_info.get("reader")
+    verifier = getattr(reader, "verify_source5_soak_pressure_offline", None)
+    require(callable(verifier),
+            "source5_soak_pressure_offline_dependency_unavailable: captured pressure reader lacks its single-APP offline API")
+    condition = audit["recipe"]["qualification"]["pressure_condition"]
+    origin = exact_object(offline_context["pressure_origin"], {
+        "schema", "recipe_pin", "recipe_dependency_paths",
+        "application_tmpdir_path", "storage_before", "storage_after",
+    }, "Source5 Soak origin pressure/storage receipt")
+    storage_before = exact_object(origin["storage_before"], {
+        "application_storage", "pressure_scratch", "recipe_storage",
+    }, "Source5 Soak frozen pressure storage facts")
+    storage_after = exact_object(origin["storage_after"], {
+        "application_process", "pressure_artifacts", "pressure_readback_sha256",
+        "pressure_cleanup", "pressure_driver_source_sha256",
+        "application_storage", "pressure_scratch",
+    }, "Source5 Soak post-run pressure storage facts")
+    pressure_value = pressure_info["value"]
+    require(origin["schema"] ==
+            "allocatbelt.application-source5-soak-pressure-origin.v2" and
+            origin["recipe_pin"] == recipe_pin and
+            origin["application_tmpdir_path"] ==
+                pressure_value["process"]["application_tmpdir_path"] and
+            storage_before["application_storage"] ==
+                pressure_value["host"]["application_storage"] and
+            storage_before["pressure_scratch"] ==
+                pressure_value["host"]["pressure_scratch"] and
+            storage_before["recipe_storage"] == pressure_value["storage"] and
+            storage_after["pressure_cleanup"] == "verified" and
+            storage_after["pressure_driver_source_sha256"] ==
+                audit["recipe"]["pressure"]["driver"]["sha256"],
+            "Source5 Soak origin storage facts changed their raw pressure recipe")
+    app_after = exact_object(storage_after["application_process"], {
+        "pid", "start_ticks", "tmpdir_path", "cpu_affinity",
+        "network_namespace_inode",
+    }, "Source5 Soak original application storage identity")
+    require(app_after["tmpdir_path"] == origin["application_tmpdir_path"] ==
+            audit["launch_descriptor"]["environment"].get("TMPDIR") and
+            type(app_after["pid"]) is int and app_after["pid"] > 0 and
+            type(app_after["start_ticks"]) is int and app_after["start_ticks"] > 0,
+            "Source5 Soak original TMPDIR/PID-start storage binding differs")
+    pressure_artifacts = exact_object(storage_after["pressure_artifacts"], {
+        "directory", "pins", "proof", "ready_sha256", "driver",
+        "worker_sessions", "driver_logs",
+    }, "Source5 Soak closed pressure artifact descriptor")
+    pressure_dir = artifact_dir / "pressure"
+    require(pressure_artifacts["directory"] == str(pressure_dir) and
+            pressure_artifacts["proof"]["path"] ==
+                str(artifact_dir / "pressure-readback.json") and
+            type(storage_after["pressure_readback_sha256"]) is str and
+            re.fullmatch(r"[0-9a-f]{64}",
+                         storage_after["pressure_readback_sha256"]) is not None and
+            pressure_artifacts["driver_logs"]["stdout"]["path"] ==
+                str(artifact_dir / "pressure-driver.stdout.log") and
+            pressure_artifacts["driver_logs"]["stderr"]["path"] ==
+                str(artifact_dir / "pressure-driver.stderr.log"),
+            "Source5 Soak pressure output paths differ from the strict origin receipt")
+    result = verifier(
+        recipe_pin, pressure_artifacts,
+        offline_context["host_verification_pin"],
+        evidence_path_map=offline_context["evidence_path_map"],
+        source_root=Path(audit["source_root"]),
+    )
+    require(type(result) is dict and
+            result.get("readback_sha256") ==
+                storage_after["pressure_readback_sha256"],
+            "captured pressure reader returned no matching single-APP replay")
+    minimum_samples = uint(
+        condition["readiness_thresholds"]["minimum_ready_samples"],
+        "SourceV5 offline pressure minimum ready samples", positive=True,
+    )
+    minimum_overlap = uint(
+        condition["readiness_thresholds"]["minimum_overlap_seconds"],
+        "SourceV5 offline pressure minimum overlap seconds", positive=True,
+    )
+    require(uint(result.get("sample_count"),
+                 "SourceV5 offline pressure sample count") >= minimum_samples and
+            uint(result.get("application_overlap_nanoseconds"),
+                 "SourceV5 offline pressure overlap") >=
+            minimum_overlap * 1_000_000_000,
+            "SourceV5 offline pressure replay is below frozen readiness thresholds")
+    proof_raw, proof_sha = read_stable_bytes(
+        artifact_dir / "pressure-readback.json",
+        "SourceV5 saved pressure readback proof", MAX_RECEIPT_BYTES,
+    )
+    proof = _read_json_raw(proof_raw, "SourceV5 saved pressure readback proof")
+    require(pressure_artifacts["proof"]["raw_sha256"] == proof_sha and
+            proof == result and proof_raw == canonical_bytes(result),
+            "SourceV5 saved pressure proof differs from full offline pressure replay")
+    return result
+
+
+def _validate_artifacts_offline(
+    artifact_dir: Path, audit: dict[str, Any], offline_context: dict[str, Any],
+) -> dict[str, Any]:
+    """Replay all Soak streams offline; never launch, inspect peers, or accept summaries."""
+    exact_object(offline_context, {
+        "schema", "evidence_path_map", "construction_probe_capture",
+        "host_verification_pin", "application_environment",
+        "pressure_origin",
+    }, "Source5 Soak offline replay context")
+    require(offline_context["schema"] == SOURCE5_SOAK_OFFLINE_CONTEXT_SCHEMA and
+            audit["recipe"]["schema"] == RECIPE_SCHEMA_V2 and
+            audit["mode"] == "qualified" and audit["duration_seconds"] == QUALIFIED_SECONDS,
+            "Source5 offline replay is not the original qualified three-hour Soak")
+    launch_receipt, _launch_sha = _verify_launch_receipt(
+        artifact_dir, audit, audit["preflight"], require_success=True,
+    )
+    audit["launch_receipt"] = launch_receipt
+    receipt_path = _artifact_from_receipt(
+        artifact_dir, "soak-receipt.json", "runtime-soak.v2 receipt",
+        MAX_RECEIPT_BYTES,
+    )
+    receipt, receipt_sha, _raw = _validate_receipt_json(
+        receipt_path, artifact_dir, audit,
+    )
+    terminal_path = _artifact_from_receipt(
+        artifact_dir, receipt["terminal_stream_relative_path"],
+        "terminal stream", audit["recipe"]["runtime"]["terminal_budget_bytes"],
+    )
+    sample_path = _artifact_from_receipt(
+        artifact_dir, receipt["resource_samples_relative_path"],
+        "resource sample stream", audit["recipe"]["runtime"]["sample_budget_bytes"],
+    )
+    terminal_sha, terminal_count = _parse_terminal_stream(
+        terminal_path, receipt, audit["ring"],
+        audit["recipe"]["runtime"]["terminal_budget_bytes"],
+    )
+    samples = _parse_samples(
+        sample_path, receipt, audit,
+        audit["recipe"]["runtime"]["sample_budget_bytes"],
+    )
+    phases = _validate_phase_and_receipt_v2(
+        receipt, audit, terminal_count, samples,
+    )
+    require(receipt["mode"] == "soak" and
+            receipt["comparison_family"] == "external_pressure" and
+            samples["count"] == QUALIFIED_SECONDS * 1000 // SAMPLE_INTERVAL_MS + 1 and
+            samples["exact_rss_windows"] and samples["rss_growth_passed"],
+            "SourceV5 offline Soak lost its exact original horizon or RSS gates")
+    require(audit["launch_enabled"] is True,
+            "SourceV5 Soak offline replay requires the separately authorized Soak overlay")
+    _validate_pressure_proof_offline(artifact_dir, audit, offline_context)
+    return {
+        "schema": RESULT_SCHEMA_V2,
+        "validated": True,
+        "passed": True,
         "qualification_eligible": phases["qualification_eligible"],
         "mode": audit["mode"],
         "identity": audit["identity"],

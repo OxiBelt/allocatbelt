@@ -44,3 +44,15 @@ per-sample registration counts.
 All emitted contexts remain functional calibration preparation. This command
 does not assert chronology, validate calibration artifacts, or make a campaign
 qualification eligible.
+
+The calibrated SourceV5 construction form keeps the ProbeV2 schema and accepts
+the exact optional selector `application_capacity_relative_tenth_v1` only
+with a hash-pinned capacity artifact. The selector is echoed at the ProbeV2
+capacity-calibration and resolution boundaries. With no selector, the original
+ProbeV2 shape and 64 MiB/s disk/download floor remain unchanged. Unknown
+selectors, a missing
+artifact, or runtime use without explicit pressure qualification fail closed.
+The selected source-derived rule resolves each relevant disk/download floor as
+`max(1, min(64 MiB/s, raw_capacity / 10))`, using integer division, while
+initial and ceiling remain `min(raw_capacity, 16 GiB/s)`. It does not change
+the hard roof, bursts, reservations, CPU policy, or qualification thresholds.

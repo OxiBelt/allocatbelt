@@ -37,6 +37,7 @@ def _load(name: str, path: Path) -> Any:
 
 
 reader = _load("application_feedback_readback_test_target", READER_PATH)
+FEEDBACK_OFFLINE_FIXTURE_SCHEMA = "allocatbelt.application-feedback-offline-fixture.v1"
 campaign = _load("application_campaign_feedback_fixture", CAMPAIGN_PATH)
 
 
@@ -1350,6 +1351,46 @@ class FeedbackReadbackTests(unittest.TestCase):
         probe_sha = reader.validate_construction_probe(recipe, source_manifest)
         self.assertEqual(probe_sha, recipe["construction_probe"]["raw_sha256"])
 
+        selected_source = json.loads(json.dumps(source_manifest))
+        selected_artifact = selected_source["feedback_policy"]
+        selected_artifact["schema"] = "allocatbelt.application-feedback-policy-artifact.v2"
+        selected_policy = selected_artifact["policy"]
+        selected_policy["schema"] = selected_artifact["schema"]
+        selected_policy["capacity_floor_policy"] = {
+            "capacity_divisor": reader.CAPACITY_FLOOR_DIVISOR,
+            "minimum_floor_bytes_per_second": reader.CAPACITY_FLOOR_MINIMUM_BYTES_PER_SECOND,
+            "policy_id": reader.CAPACITY_FLOOR_POLICY_ID,
+            "probe_activation": reader.CAPACITY_FLOOR_PROBE_ACTIVATION,
+            "rule": reader.CAPACITY_FLOOR_RULE,
+            "rule_version": reader.CAPACITY_RESOLUTION_VERSION,
+            "runtime_activation": reader.CAPACITY_FLOOR_RUNTIME_ACTIVATION,
+            "static_floor_bytes_per_second": reader.CAPACITY_RATE_FLOOR,
+            "static_rate_roof_bytes_per_second": reader.CAPACITY_RATE_ROOF,
+        }
+        selected_artifact["policy_sha256"] = reader.digest_object(selected_policy)
+        self.assertEqual(reader.validate_construction_probe(recipe, selected_source), probe_sha)
+
+        selected_policy["capacity_floor_policy"]["capacity_divisor"] = 9
+        selected_artifact["policy_sha256"] = reader.digest_object(selected_policy)
+        with self.assertRaisesRegex(reader.ValidationError, "capacity_divisor differs"):
+            reader.validate_construction_probe(recipe, selected_source)
+
+        original_probe = fixture.construction_probe_path.read_bytes()
+        for forbidden_field, value in (
+            ("capacity_calibration", {}),
+            ("capacity_floor_policy_id", reader.CAPACITY_FLOOR_POLICY_ID),
+        ):
+            with self.subTest(forbidden_field=forbidden_field):
+                injected_probe = json.loads(original_probe)
+                injected_probe[forbidden_field] = value
+                injected_raw = reader.canonical_bytes(injected_probe)
+                fixture.construction_probe_path.write_bytes(injected_raw)
+                injected_recipe = json.loads(json.dumps(recipe))
+                injected_recipe["construction_probe"]["raw_sha256"] = _sha(injected_raw)
+                with self.assertRaises(reader.ValidationError):
+                    reader.validate_construction_probe(injected_recipe, source_manifest)
+        fixture.construction_probe_path.write_bytes(original_probe)
+
         missing = json.loads(json.dumps(source_manifest))
         missing["source"]["files"] = [record for record in missing["source"]["files"] if record["path"] != "crates/allocatbelt/src/runtime/resource_domain.rs"]
         with self.assertRaisesRegex(reader.ValidationError, "not a regular SourceV5 inventory entry: resource_domain"):
@@ -2091,6 +2132,43 @@ class FeedbackReadbackTests(unittest.TestCase):
         return {**body, "readback_sha256": reader.digest_object(body)}
 
 
+def run_feedback_offline_fixture(request_path: Path, expected_request_raw_sha256: str) -> dict[str, Any]:
+    """Public replay harness for genuine captured ProbeV2 and pressure bytes."""
+    request, request_raw_sha = reader.read_canonical(
+        request_path, "feedback offline fixture request", 4 * 1024 * 1024,
+        expected_request_raw_sha256,
+    )
+    reader.exact(request, {
+        "schema", "expectation", "trace_directory", "artifact_sha256",
+        "replay_context", "pressure_replay_request", "expected_readback",
+    }, "feedback offline fixture request")
+    if request["schema"] != FEEDBACK_OFFLINE_FIXTURE_SCHEMA:
+        raise reader.ValidationError("unsupported feedback offline fixture request schema")
+    expectation_pin = reader.exact(request["expectation"], {"path", "raw_sha256"},
+                                   "feedback offline fixture expectation pin")
+    expected_readback_pin = reader.exact(request["expected_readback"], {"path", "raw_sha256"},
+                                         "feedback offline fixture readback pin")
+    checked_context = reader._validate_feedback_offline_context(request["replay_context"])
+    reader._require_offline_files(checked_context, {expected_readback_pin["path"]},
+                                  "origin-host feedback readback")
+    actual = reader.verify_feedback_offline(
+        Path(expectation_pin["path"]), expectation_pin["raw_sha256"],
+        Path(request["trace_directory"]), request["artifact_sha256"],
+        replay_context=request["replay_context"],
+        pressure_replay_request=request["pressure_replay_request"],
+    )
+    expected, expected_raw_sha = reader.read_canonical(
+        Path(expected_readback_pin["path"]), "origin-host feedback readback",
+        reader.MAX_EXPECTATION_BYTES, expected_readback_pin["raw_sha256"],
+    )
+    if expected_raw_sha != expected_readback_pin["raw_sha256"] or actual != expected:
+        raise reader.ValidationError("offline feedback result differs from the exact origin-host readback bytes")
+    if actual.get("validated") is not True or actual.get("qualification_eligible") is not False:
+        raise reader.ValidationError("offline feedback fixture returned an invalid or eligible result")
+    return {"request_raw_sha256": request_raw_sha, "readback": actual}
+
+
+
 class HelperTests(unittest.TestCase):
     def test_canonical_parser_rejects_duplicate_keys_nonfinite_values_and_boolean_integer(self) -> None:
         with self.assertRaises(reader.ValidationError):
@@ -2099,6 +2177,80 @@ class HelperTests(unittest.TestCase):
             reader.parse_json(b'{"value":NaN}', "nonfinite", 128)
         with self.assertRaises(reader.ValidationError):
             reader.uint(True, "bool-as-integer")
+
+
+class OfflineProbeReplayContextTests(unittest.TestCase):
+    def test_offline_context_uses_closed_sorted_identity_mapping(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="feedback-offline-map-", dir="/var/tmp") as directory:
+            root = Path(directory).resolve(strict=True)
+            context = {
+                "schema": reader.FEEDBACK_OFFLINE_CONTEXT_SCHEMA,
+                "evidence_path_map": {
+                    "schema": reader.EVIDENCE_PATH_MAP_SCHEMA,
+                    "entries": [{"origin": str(root), "local": str(root)}],
+                },
+                "probe_capture_pin": {
+                    "path": str(root / "capture.json"), "raw_sha256": "a" * 64,
+                    "receipt_sha256": "b" * 64,
+                },
+                "capacity_bundle": {
+                    "request": {"path": str(root / "request.json"), "raw_sha256": "c" * 64},
+                    "artifact": {"path": str(root / "capacity.tsv"), "raw_sha256": "d" * 64},
+                    "receipt": {"path": str(root / "receipt.json"), "raw_sha256": "e" * 64},
+                },
+            }
+            checked = reader._validate_feedback_offline_context(context)
+            self.assertEqual(checked["mapped_directories"], frozenset({str(root)}))
+            self.assertEqual(checked["capacity_bundle"], context["capacity_bundle"])
+
+            aliased = json.loads(json.dumps(context))
+            aliased["evidence_path_map"]["entries"][0]["local"] = str(root / "local-copy")
+            with self.assertRaisesRegex(reader.ValidationError, "identity paths"):
+                reader._validate_feedback_offline_context(aliased)
+
+            unknown = {**context, "validated": True}
+            with self.assertRaisesRegex(reader.ValidationError, "unexpected key set"):
+                reader._validate_feedback_offline_context(unknown)
+
+
+    def test_pressure_pair_request_rejects_caller_supplied_success_flags_before_io(self) -> None:
+        request = {
+            "schema": reader.PRESSURE_PAIR_REPLAY_REQUEST_SCHEMA,
+            "source_manifest": {}, "source_root": "/no/read",
+            "pair": {}, "module_pins": {}, "validated": True,
+        }
+        with self.assertRaisesRegex(reader.ValidationError, "unexpected key set"):
+            reader._verify_pressure_pair_replay_request(
+                request, {}, {}, {"mapped_paths": frozenset(),
+                                  "mapped_directories": frozenset(),
+                                  "mapped_files": frozenset()},
+            )
+
+
+    def test_omitted_nested_json_path_fails_before_nested_read(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="feedback-offline-closure-") as directory:
+            root = Path(directory).resolve(strict=True)
+            parent = root / "request.json"
+            child = root / "nested.json"
+            document = {"capacity": {"path": str(child)}}
+            context = {
+                "mapped_paths": frozenset({str(root), str(parent)}),
+                "mapped_files": frozenset({str(parent)}),
+                "mapped_directories": frozenset({str(root)}),
+            }
+            reads: list[str] = []
+            original = reader.read_canonical
+
+            def guarded(path: Path, *args: Any, **kwargs: Any):
+                reads.append(str(path))
+                if str(path) not in context["mapped_files"]:
+                    raise AssertionError(f"unmapped file read: {path}")
+                return original(path, *args, **kwargs)
+
+            with patch.object(reader, "read_canonical", side_effect=guarded):
+                with self.assertRaisesRegex(reader.ValidationError, "omits exact"):
+                    reader._preflight_feedback_nested_json_paths([document], context)
+            self.assertEqual(reads, [])
 
 
 if __name__ == "__main__":

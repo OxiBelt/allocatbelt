@@ -818,6 +818,173 @@ class Fixture:
 
 
 class SoakReadbackTests(unittest.TestCase):
+    def test_false_legacy_descriptor_and_enabled_overlay_use_separate_environments(self):
+        """Keep the disabled baseline empty while rebuilding the launched overlay."""
+        with tempfile.TemporaryDirectory(prefix="allocatbelt-soak-overlay-env-") as temporary:
+            root = Path(temporary).resolve()
+            source_root = root / "source"
+            output = root / "output"
+            source_root.mkdir(mode=0o700)
+            output.mkdir(mode=0o700)
+            binary = source_root / "application"
+            driver = source_root / "application-pressure-driver.py"
+            write_private(binary, b"pinned normal APP fixture\n", 0o700)
+            write_private(driver, b"pinned pressure driver fixture\n")
+            audit, _enabled_descriptor, _pressure_recipe = source_v5_pressure_fixture(
+                source_root, output, binary, driver, "0", 5,
+                "campaign-host-v2-soak-allocatbelt-01",
+            )
+
+            base_audit = dict(audit, launch_enabled=False)
+            base_descriptor = module._make_launch_descriptor_v2(
+                base_audit, output, "0", None, None,
+                path_value="/origin/bin:/usr/bin:/bin",
+            )
+            self.assertFalse(base_descriptor["launch_enabled"])
+            self.assertEqual(base_descriptor["environment"], {})
+
+            overlay_audit = dict(base_audit, launch_enabled=True)
+            with mock.patch.dict(os.environ, {"PATH": "/coordinator-only"}):
+                overlay_descriptor = module._make_launch_descriptor_v2(
+                    overlay_audit, output, "0", None, None,
+                    path_value="/origin/bin:/usr/bin:/bin",
+                )
+            self.assertTrue(overlay_descriptor["launch_enabled"])
+            self.assertEqual(
+                overlay_descriptor["environment"]["PATH"],
+                "/origin/bin:/usr/bin:/bin",
+            )
+            self.assertFalse(base_audit["launch_enabled"])
+            self.assertEqual(base_descriptor["environment"], {})
+
+    def test_full_v2_pressure_recipe_uses_real_validator_without_losing_input(self):
+        """Exercise the actual pressure validator with a complete V2 recipe shape.
+
+        This is a structural reader regression, not a host or qualification witness.
+        """
+        with tempfile.TemporaryDirectory(prefix="allocatbelt-full-v2-pressure-recipe-") as temporary:
+            root = Path(temporary).resolve()
+            source_root = root / "source"
+            output = root / "output"
+            source_root.mkdir(mode=0o700)
+            output.mkdir(mode=0o700)
+            binary = source_root / "application"
+            driver = source_root / "application-pressure-driver.py"
+            write_private(binary, b"pinned normal APP fixture\n", 0o700)
+            write_private(driver, b"pinned pressure driver fixture\n")
+            _audit, _descriptor, original_recipe = source_v5_pressure_fixture(
+                source_root, output, binary, driver, "0", 5,
+                "campaign-host-v2-validator-allocatbelt-01",
+            )
+
+            def raw_pin(path: Path) -> dict[str, str]:
+                return {"path": str(path), "raw_sha256": hash_file(path)}
+
+            policy_bundle_path = source_root / "per-job-context-policy.json"
+            members = []
+            for index in range(2):
+                member_request = source_root / f"member-{index}-request.json"
+                resolved_policy = source_root / f"member-{index}-resolved.json"
+                composition_receipt = source_root / f"member-{index}-composition.json"
+                write_private(member_request, canon({"fixture_member": index, "kind": "request"}))
+                write_private(resolved_policy, canon({"fixture_member": index, "kind": "resolved"}))
+                write_private(composition_receipt, canon({"fixture_member": index, "kind": "receipt"}))
+                members.append({
+                    "descriptor": {
+                        "pair": f"fixture-pair-{index}", "executor": "bounded",
+                        "allocator": "allocatbelt",
+                    },
+                    "request": raw_pin(member_request),
+                    "construction_probe": {
+                        **raw_pin(binary), "allocator": "allocatbelt",
+                        "binary_sha256": hash_file(binary),
+                    },
+                    "resolved_policy": raw_pin(resolved_policy),
+                    "composition_receipt": raw_pin(composition_receipt),
+                })
+            write_private(policy_bundle_path, canon({
+                "schema": pressure_reader.CONTEXT_POLICY_BUNDLE_SCHEMA_V2,
+                "artifact": original_recipe["files"]["policy"],
+                "members": members,
+            }))
+
+            condition_path = source_root / "prospective-pressure-condition.json"
+            observed_host_path = source_root / "observed-host.json"
+            scope_receipt_path = source_root / "calibration-scope-receipt.json"
+            write_private(condition_path, canon({"fixture": "condition"}))
+            write_private(observed_host_path, canon({"fixture": "observed host"}))
+            write_private(scope_receipt_path, canon({"fixture": "scope receipt"}))
+            capacity_request_path = source_root / "capacity-request.json"
+            capacity_receipt_path = source_root / "capacity-receipt.json"
+            write_private(capacity_request_path, canon({"fixture": "capacity request"}))
+            write_private(capacity_receipt_path, canon({"fixture": "capacity receipt"}))
+
+            recipe_body = {
+                key: value for key, value in original_recipe.items()
+                if key != "recipe_sha256"
+            }
+            recipe_body["schema"] = pressure_reader.RECIPE_SCHEMA_V2
+            recipe_body["calibration_scope_v2"] = {
+                "schema": pressure_reader.CALIBRATION_BINDING_SCHEMA_V2,
+                "scope_receipt": {
+                    **raw_pin(scope_receipt_path), "scope_sha256": "a" * 64,
+                },
+                "validator_sha256": recipe_body["script_hashes"]["reader_sha256"],
+                "condition": raw_pin(condition_path),
+                "context_policy": raw_pin(policy_bundle_path),
+                "capacity_bundle_pins": {
+                    "schema": pressure_reader.CAPACITY_BUNDLE_PIN_SCHEMA_V2,
+                    "capacity_key": {
+                        "host_id": "host-v2-fixture", "workload": "mixed",
+                        "profile": "mixed", "calibration_id": "capacity-fixture",
+                    },
+                    "source_manifest": recipe_body["files"]["source_manifest"],
+                    "request": raw_pin(capacity_request_path),
+                    "artifact": recipe_body["files"]["application_capacity_calibration"],
+                    "receipt": raw_pin(capacity_receipt_path),
+                },
+                "observed_host": raw_pin(observed_host_path),
+                "context_policy_sha256": "b" * 64,
+            }
+            semantic_sha = pressure_reader.digest_object(recipe_body)
+            full_recipe = {**recipe_body, "recipe_sha256": semantic_sha}
+            summary = pressure_reader._validate_recipe(full_recipe, semantic_sha)
+
+            self.assertEqual(full_recipe["schema"], pressure_reader.RECIPE_SCHEMA_V2)
+            self.assertIn("host", full_recipe)
+            self.assertIn("process", full_recipe)
+            self.assertEqual(summary["identity"], full_recipe["identity"])
+            self.assertEqual(summary["condition_sha256"], full_recipe["condition_sha256"])
+            self.assertNotIn("schema", summary)
+            self.assertNotIn("host", summary)
+            self.assertNotIn("process", summary)
+
+    def test_source5_offline_audit_requires_origin_environment_before_reads(self):
+        context = {
+            "schema": module.SOURCE5_SOAK_OFFLINE_CONTEXT_SCHEMA,
+            "evidence_path_map": {
+                "schema": "allocatbelt.application-pressure-evidence-path-map.v1",
+                "entries": [{"origin": "/origin", "local": "/origin"}],
+            },
+            "construction_probe_capture": {},
+            "host_verification_pin": {},
+        }
+        args = SimpleNamespace(recipe=Path("/origin/recipe.json"),
+                               recipe_sha256="a" * 64)
+        with mock.patch.object(
+            module, "read_json",
+            side_effect=AssertionError("offline audit read before its closed context"),
+        ) as read_json, mock.patch.object(
+            module.subprocess, "Popen",
+            side_effect=AssertionError("offline audit attempted a process launch"),
+        ) as popen:
+            with self.assertRaisesRegex(
+                module.SoakReadbackError, "keys differ from the frozen contract",
+            ):
+                module._current_audit_offline(args, context)
+            read_json.assert_not_called()
+            popen.assert_not_called()
+
     def test_owned_worker_adoption_transition_survives_worker_exit_between_polls(self):
         pid, start_ticks, driver_pid = 501, 9001, 600
         sessions = {("cpu", 2): {
@@ -2575,9 +2742,31 @@ class SoakReadbackTests(unittest.TestCase):
             with self.assertRaisesRegex(module.SoakReadbackError, "pinned external ring"):
                 module._parse_terminal_stream(terminal_path, receipt, audit["ring"], fixture.recipe["runtime"]["terminal_budget_bytes"])
 
+    def test_resource_limits_and_credit_conservation_are_checked(self):
+        with tempfile.TemporaryDirectory(prefix="allocatbelt-soak-sample-") as temp:
+            fixture = Fixture(Path(temp))
+            audit = fixture.audit()
+            receipt, _, sample_bytes = fixture.write_receipt_and_streams()
+            rows = sample_bytes.decode("ascii").splitlines()
+            fields = rows[1].split("\t")
+            header = rows[0].split("\t")
+            available = header.index("disk_rate_available_bytes")
+            fields[available] = str(module.RATE_BURST_BYTES)
+            reserved = header.index("disk_rate_reserved_bytes")
+            fields[reserved] = "1"
+            rows[1] = "\t".join(fields)
+            bad_samples = ("\n".join(rows) + "\n").encode("ascii")
+            sample_path = fixture.output / "resource-samples.tsv"
+            sample_path.unlink()
+            write_private(sample_path, bad_samples)
+            receipt["resource_samples_sha256"] = digest_bytes(bad_samples)
+            with self.assertRaisesRegex(module.SoakReadbackError, "retained credits exceed owner bounds"):
+                module._parse_samples(sample_path, receipt, audit, fixture.recipe["runtime"]["sample_budget_bytes"])
+
     def test_soak_samples_accept_refill_while_two_original_owners_remain(self):
         for version in (module.RECIPE_SCHEMA, module.RECIPE_SCHEMA_V2):
-            with tempfile.TemporaryDirectory(prefix="soak-refilled-owners-") as temp:
+            with self.subTest(version=version), tempfile.TemporaryDirectory(
+                    prefix="soak-refilled-owners-") as temp:
                 fixture = Fixture(Path(temp), profile="mixed", mode="functional", duration=2)
                 audit = fixture.audit()
                 receipt, _, raw = fixture.write_receipt_and_streams()
@@ -2601,7 +2790,10 @@ class SoakReadbackTests(unittest.TestCase):
                 path.unlink()
                 write_private(path, changed)
                 receipt["resource_samples_sha256"] = digest_bytes(changed)
-                module._parse_samples(path, receipt, audit, fixture.recipe["runtime"]["sample_budget_bytes"])
+                module._parse_samples(
+                    path, receipt, audit,
+                    fixture.recipe["runtime"]["sample_budget_bytes"],
+                )
 
     def test_soak_samples_reject_owner_and_token_overcommit_in_both_versions(self):
         with tempfile.TemporaryDirectory(prefix="soak-invalid-balances-") as temp:
@@ -2618,32 +2810,17 @@ class SoakReadbackTests(unittest.TestCase):
                     "download": {"floor": 64 * 1024**2, "ceiling": module.RATE_BYTES_PER_SECOND},
                 }}
                 burst = audit["source"]["byte_buckets"]["disk"]["ceiling_burst_bytes"]
-                for available, reserved, owners in ((burst + 1, 0, 0), (0, burst + 1, 1), (0, 1, 0), (0, 1, 2), (0, 65, 65)):
+                for available, reserved, owners in (
+                    (burst + 1, 0, 0), (0, burst + 1, 1),
+                    (0, 1, 0), (0, 1, 2), (0, 65, 65),
+                ):
                     bad = dict(row, disk_rate_available_bytes=available,
-                               disk_rate_reserved_bytes=reserved, disk_rate_reservations=owners)
-                    with self.subTest(version=version, balance=(available, reserved, owners)), self.assertRaises(module.SoakReadbackError):
+                               disk_rate_reserved_bytes=reserved,
+                               disk_rate_reservations=owners)
+                    with self.subTest(version=version,
+                                      balances=(available, reserved, owners)), \
+                            self.assertRaises(module.SoakReadbackError):
                         module._check_numeric_sample(bad, audit, 0)
-
-    def test_resource_limits_and_credit_conservation_are_checked(self):
-        with tempfile.TemporaryDirectory(prefix="allocatbelt-soak-sample-") as temp:
-            fixture = Fixture(Path(temp))
-            audit = fixture.audit()
-            receipt, _, sample_bytes = fixture.write_receipt_and_streams()
-            rows = sample_bytes.decode("ascii").splitlines()
-            fields = rows[1].split("\t")
-            header = rows[0].split("\t")
-            available = header.index("disk_rate_available_bytes")
-            fields[available] = str(module.RATE_BURST_BYTES)
-            reserved = header.index("disk_rate_reserved_bytes")
-            fields[reserved] = "1"
-            rows[1] = "\t".join(fields)
-            bad_samples = ("\n".join(rows) + "\n").encode("ascii")
-            sample_path = fixture.output / "resource-samples.tsv"
-            sample_path.unlink()
-            write_private(sample_path, bad_samples)
-            receipt["resource_samples_sha256"] = digest_bytes(bad_samples)
-            with self.assertRaisesRegex(module.SoakReadbackError, "retained credits exceed owner bounds"):
-                module._parse_samples(sample_path, receipt, audit, fixture.recipe["runtime"]["sample_budget_bytes"])
 
     def test_qualified_recipe_cannot_use_a_short_horizon_and_rss_windows_are_exact(self):
         with tempfile.TemporaryDirectory(prefix="allocatbelt-soak-qualified-") as temp:

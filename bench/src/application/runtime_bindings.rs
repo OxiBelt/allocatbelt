@@ -52,6 +52,21 @@ pub(crate) const RUNTIME_BINDING_RECEIPT_SCHEMA_V2: &str =
   "allocatbelt.application-runtime-binding.v2";
 #[cfg(feature = "resource-feedback")]
 pub(crate) const FEEDBACK_MINIMUM_DENSE_OBSERVATIONS: u32 = 1;
+#[cfg(feature = "resource-feedback")]
+pub(super) const CAPACITY_FLOOR_POLICY_ID: &str = "application_capacity_relative_tenth_v1";
+#[cfg(feature = "resource-feedback")]
+pub(super) const CAPACITY_FLOOR_RULE_VERSION: &str = "application-feedback-capacity-resolution-v2";
+#[cfg(feature = "resource-feedback")]
+pub(super) const CAPACITY_FLOOR_RULE: &str = "max_one_min_static_floor_capacity_div_ten";
+#[cfg(feature = "resource-feedback")]
+pub(super) const CAPACITY_FLOOR_PROBE_ACTIVATION: &str = "explicit_policy_id_and_capacity_artifact";
+#[cfg(feature = "resource-feedback")]
+pub(super) const CAPACITY_FLOOR_RUNTIME_ACTIVATION: &str =
+  "explicit_pressure_qualification_and_policy_id_and_capacity_artifact";
+#[cfg(feature = "resource-feedback")]
+pub(super) const CAPACITY_FLOOR_DIVISOR: u64 = 10;
+#[cfg(feature = "resource-feedback")]
+pub(super) const CAPACITY_FLOOR_MINIMUM_BYTES_PER_SECOND: u64 = 1;
 pub(crate) const CPU_WAITER_CEILING: usize = APPLICATION_TASK_CEILING;
 // CPU-gate waiter leases consume 64 fixed slots. The remaining 192 slots
 // cover the owning async pool, filesystem pool, and bounded service roles.
@@ -62,7 +77,7 @@ const RATE_BURST_BYTES: usize = 64 * 1024;
 const RATE_RESERVATIONS: usize = 64;
 const RATE_TIMER_REGISTRATIONS: usize = 256;
 #[cfg(feature = "resource-feedback")]
-const FEEDBACK_RATE_FLOOR: u64 = 64 * 1024 * 1024;
+pub(super) const FEEDBACK_RATE_FLOOR: u64 = 64 * 1024 * 1024;
 #[cfg(feature = "resource-feedback")]
 const FEEDBACK_LOW_UTILIZATION_BPS: u16 = 3_000;
 #[cfg(feature = "resource-feedback")]
@@ -192,12 +207,39 @@ impl CapacityCalibrationArtifact {
 }
 
 #[cfg(feature = "resource-feedback")]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(super) enum CapacityFloorPolicy {
+  #[default]
+  StaticDefault,
+  CapacityRelativeTenth,
+}
+
+#[cfg(feature = "resource-feedback")]
+impl CapacityFloorPolicy {
+  pub(super) fn from_id(value: Option<&str>) -> Result<Self, String> {
+    match value {
+      None => Ok(Self::StaticDefault),
+      Some(CAPACITY_FLOOR_POLICY_ID) => Ok(Self::CapacityRelativeTenth),
+      Some(_) => Err("capacity floor policy ID is unknown".into()),
+    }
+  }
+
+  const fn id(self) -> Option<&'static str> {
+    match self {
+      Self::StaticDefault => None,
+      Self::CapacityRelativeTenth => Some(CAPACITY_FLOOR_POLICY_ID),
+    }
+  }
+}
+
+#[cfg(feature = "resource-feedback")]
 #[derive(Clone, Copy)]
 pub(super) struct CapacityCalibrationProbeInput<'a> {
   pub(super) path: &'a std::path::Path,
   pub(super) sha256: &'a str,
   pub(super) host_id: &'a str,
   pub(super) source_sha256: &'a str,
+  pub(super) capacity_floor_policy_id: Option<&'a str>,
 }
 
 #[cfg(feature = "resource-feedback")]
@@ -205,6 +247,7 @@ pub(super) struct CapacityCalibrationProbeInput<'a> {
 pub(super) struct FeedbackCalibrations {
   pub(super) artifact: Option<Arc<CapacityCalibrationArtifact>>,
   pub(super) pressure_qualification: bool,
+  pub(super) capacity_floor_policy: CapacityFloorPolicy,
 }
 
 #[cfg(feature = "resource-feedback")]
@@ -222,7 +265,10 @@ impl FeedbackCalibrations {
       source_sha256: input.source_sha256,
       pressure_qualification: false,
     };
-    Self::from_file(tenant, input.path, input.sha256, &identity)
+    let floor_policy = CapacityFloorPolicy::from_id(input.capacity_floor_policy_id)?;
+    let mut calibrations = Self::from_file(tenant, input.path, input.sha256, &identity)?;
+    calibrations.capacity_floor_policy = floor_policy;
+    Ok(calibrations)
   }
 
   fn from_environment(
@@ -231,6 +277,15 @@ impl FeedbackCalibrations {
     selected_profile: &str,
   ) -> Result<Self, String> {
     let pressure_qualification = pressure_qualification_requested()?;
+    let floor_policy_value = match std::env::var("ALLOCATBELT_APP_CAPACITY_FLOOR_POLICY_ID") {
+      Ok(value) => Some(value),
+      Err(std::env::VarError::NotPresent) => None,
+      Err(std::env::VarError::NotUnicode(_)) => {
+        return Err("capacity floor policy ID is not valid Unicode".into());
+      }
+    };
+    let floor_policy = CapacityFloorPolicy::from_id(floor_policy_value.as_deref())?;
+    validate_capacity_floor_activation(floor_policy, pressure_qualification, None)?;
     if pressure_qualification && std::env::var_os("ALLOCATBELT_APP_FEEDBACK_TRACE_DIR").is_none() {
       return Err("pressure qualification requires ALLOCATBELT_APP_FEEDBACK_TRACE_DIR".into());
     }
@@ -243,6 +298,7 @@ impl FeedbackCalibrations {
     let supplied_sha256 = std::env::var("ALLOCATBELT_APP_CAPACITY_CALIBRATION_SHA256");
     let (path, supplied_sha256) = match (path, supplied_sha256) {
       (None, Err(std::env::VarError::NotPresent)) if !pressure_qualification => {
+        validate_capacity_floor_activation(floor_policy, pressure_qualification, Some(false))?;
         return Ok(Self::default());
       }
       (None, Err(std::env::VarError::NotPresent)) => {
@@ -272,7 +328,11 @@ impl FeedbackCalibrations {
       source_sha256: &source_sha256,
       pressure_qualification,
     };
-    Self::from_file(tenant, &PathBuf::from(path), &supplied_sha256, &identity)
+    validate_capacity_floor_activation(floor_policy, pressure_qualification, Some(true))?;
+    let mut calibrations =
+      Self::from_file(tenant, &PathBuf::from(path), &supplied_sha256, &identity)?;
+    calibrations.capacity_floor_policy = floor_policy;
+    Ok(calibrations)
   }
 
   fn from_file(
@@ -353,6 +413,7 @@ impl FeedbackCalibrations {
     Ok(Self {
       artifact: Some(Arc::new(artifact)),
       pressure_qualification: identity.pressure_qualification,
+      capacity_floor_policy: CapacityFloorPolicy::StaticDefault,
     })
   }
 
@@ -648,6 +709,7 @@ impl ApplicationRateConfigs {
 pub(crate) struct ResolvedApplicationFeedback {
   pub(crate) policy: ResourceFeedbackPolicyConfig,
   pub(crate) rates: ApplicationRateConfigs,
+  pub(crate) capacity_floor_policy_id: Option<&'static str>,
 }
 
 #[cfg(feature = "resource-feedback")]
@@ -659,7 +721,14 @@ fn resolve_application_feedback(
   let mut policy = feedback_policy(workers);
   let mut rates = ApplicationRateConfigs::fixed();
   let Some(artifact) = calibrations.artifact.as_deref() else {
-    return Ok(ResolvedApplicationFeedback { policy, rates });
+    if calibrations.capacity_floor_policy != CapacityFloorPolicy::StaticDefault {
+      return Err("capacity floor policy requires a validated capacity artifact".into());
+    }
+    return Ok(ResolvedApplicationFeedback {
+      policy,
+      rates,
+      capacity_floor_policy_id: None,
+    });
   };
 
   let needs_disk = matches!(workload, Workload::Disk | Workload::Mixed);
@@ -668,6 +737,7 @@ fn resolve_application_feedback(
     resolve_calibrated_rate(
       "disk",
       artifact.disk.bytes_per_second,
+      calibrations.capacity_floor_policy,
       &mut policy.disk_rate,
       &mut rates.disk,
     )?;
@@ -676,31 +746,75 @@ fn resolve_application_feedback(
     resolve_calibrated_rate(
       "download",
       artifact.download.bytes_per_second,
+      calibrations.capacity_floor_policy,
       &mut policy.network_rate,
       &mut rates.download,
     )?;
   }
-  Ok(ResolvedApplicationFeedback { policy, rates })
+  Ok(ResolvedApplicationFeedback {
+    policy,
+    rates,
+    capacity_floor_policy_id: calibrations.capacity_floor_policy.id(),
+  })
+}
+
+#[cfg(feature = "resource-feedback")]
+fn validate_capacity_floor_activation(
+  floor_policy: CapacityFloorPolicy,
+  pressure_qualification: bool,
+  capacity_artifact_present: Option<bool>,
+) -> Result<(), String> {
+  if floor_policy == CapacityFloorPolicy::StaticDefault {
+    return Ok(());
+  }
+  if !pressure_qualification {
+    return Err("capacity-relative floor policy requires pressure qualification".into());
+  }
+  if capacity_artifact_present == Some(false) {
+    return Err("capacity floor policy requires a validated capacity artifact".into());
+  }
+  Ok(())
+}
+
+#[cfg(feature = "resource-feedback")]
+fn capacity_relative_floor(default_floor: u64, measured_capacity: u64) -> Result<u64, String> {
+  let relative = measured_capacity
+    .checked_div(CAPACITY_FLOOR_DIVISOR)
+    .ok_or_else(|| "capacity-relative floor divisor is zero".to_owned())?;
+  let floor = relative
+    .min(default_floor)
+    .max(CAPACITY_FLOOR_MINIMUM_BYTES_PER_SECOND);
+  if floor > measured_capacity {
+    return Err("capacity-relative floor exceeds measured application-byte capacity".into());
+  }
+  Ok(floor)
 }
 
 #[cfg(feature = "resource-feedback")]
 fn resolve_calibrated_rate(
   direction: &str,
   measured_capacity: Option<NonZeroU64>,
+  floor_policy: CapacityFloorPolicy,
   control: &mut FeedbackControlConfig,
   bucket: &mut ByteRateConfig,
 ) -> Result<(), String> {
   let measured_capacity = measured_capacity.ok_or_else(|| {
     format!("capacity calibration is missing the relevant {direction} application-byte source")
   })?;
-  let resolved = measured_capacity
-    .get()
-    .min(APPLICATION_RATE_CEILING_BYTES_PER_SECOND);
-  if resolved < control.floor {
+  let raw_capacity = measured_capacity.get();
+  let resolved = raw_capacity.min(APPLICATION_RATE_CEILING_BYTES_PER_SECOND);
+  let floor = match floor_policy {
+    CapacityFloorPolicy::StaticDefault => control.floor,
+    CapacityFloorPolicy::CapacityRelativeTenth => {
+      capacity_relative_floor(control.floor, raw_capacity)?
+    }
+  };
+  if resolved < floor {
     return Err(format!(
-      "{direction} application-byte capacity is below the feedback floor"
+      "{direction} application-byte capacity is below the selected feedback floor"
     ));
   }
+  control.floor = floor;
   control.initial = resolved;
   control.ceiling = resolved;
   bucket.bytes_per_second = resolved;

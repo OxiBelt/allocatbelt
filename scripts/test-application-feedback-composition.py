@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
-"""Native tests for SourceV5 calibrated feedback composition.
+"""Component tests for SourceV5 calibrated feedback composition.
 
-These tests use synthetic trace/capacity fixtures and one no-workload Rust
-policy-probe invocation. They never start an application pressure workload.
-Run only on the designated SSH-MCP native host.
+Ordinary fixture coverage uses synthetic trace/capacity evidence and is not a
+qualification witness. The required native capture gate uses the explicit
+ALLOCATBELT_FEEDBACK_V5_NATIVE_CAPTURE_REQUIRED mode with source/host inputs.
+Neither path starts an application pressure workload. Run native mode only on
+the designated SSH-MCP host.
 """
 from __future__ import annotations
 
@@ -20,6 +22,7 @@ import time
 import unittest
 from pathlib import Path
 from typing import Any
+from unittest import mock
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -188,6 +191,18 @@ class CompositionContractTests(unittest.TestCase):
             },
         }
         composition._validate_resolve_request(request)
+        selected = json.loads(json.dumps(request))
+        selected["schema"] = composition.REQUEST_SCHEMA_V2
+        selected["capacity_floor_policy_id"] = reader.CAPACITY_FLOOR_POLICY_ID
+        composition._validate_resolve_request(selected)
+        unknown_floor = json.loads(json.dumps(selected))
+        unknown_floor["capacity_floor_policy_id"] = "unknown_floor_policy"
+        with self.assertRaisesRegex(composition.CompositionError, "unknown"):
+            composition._validate_resolve_request(unknown_floor)
+        missing_floor = json.loads(json.dumps(selected))
+        missing_floor.pop("capacity_floor_policy_id")
+        with self.assertRaisesRegex(composition.CompositionError, "missing keys"):
+            composition._validate_resolve_request(missing_floor)
         hash_only = json.loads(json.dumps(request))
         hash_only["capacity_bundle"].pop("request")
         with self.assertRaisesRegex(composition.CompositionError, "unexpected key set"):
@@ -252,12 +267,32 @@ class CompositionContractTests(unittest.TestCase):
             reader.build_pressure_expectation_recipe(zero_pid)
 
     def test_source5_app_cli_full_v4_bundle_replay_resolves_v5_policy_ineligible(self) -> None:
+        capture_mode = os.environ.get("ALLOCATBELT_FEEDBACK_V5_NATIVE_CAPTURE_REQUIRED", "0")
+        if capture_mode not in ("0", "1"):
+            self.fail("ALLOCATBELT_FEEDBACK_V5_NATIVE_CAPTURE_REQUIRED must be 0 or 1")
         manifest_env = os.environ.get("ALLOCATBELT_FEEDBACK_V5_SOURCE_MANIFEST")
-        if not manifest_env or not Path(manifest_env).is_file():
-            self.skipTest("SourceV5 component manifest and actual APP artifacts were not supplied to this native test run")
+        observed_host_env = os.environ.get("ALLOCATBELT_FEEDBACK_V5_OBSERVED_HOST")
+        if capture_mode == "1" and (
+            not manifest_env or not observed_host_env or
+            not Path(manifest_env).is_file() or not Path(observed_host_env).is_file()
+        ):
+            self.fail("required native ProbeV2 gate needs both raw-pinned SourceV5 and observed-host inputs")
+        if bool(manifest_env) != bool(observed_host_env):
+            self.fail("partial SourceV5 native inputs cannot silently bypass the ProbeV2 capture")
+        if not manifest_env and capture_mode == "0":
+            self.skipTest("ordinary fixture mode only; no native ProbeV2 acceptance is claimed")
+        if not Path(manifest_env).is_file() or not Path(observed_host_env).is_file():
+            self.fail("native SourceV5 manifest and observed-host paths must name existing files")
         source_manifest_path = Path(manifest_env).resolve(strict=True)
         _feedback, bundle, capacity_receipt = _capacity_bundle(self.root, source_manifest_path)
         source_manifest = _feedback.source
+        floor_policy_descriptor = source_manifest["feedback_policy"]["policy"].get("capacity_floor_policy")
+        if capture_mode == "1":
+            self.assertEqual(
+                floor_policy_descriptor.get("policy_id") if type(floor_policy_descriptor) is dict else None,
+                reader.CAPACITY_FLOOR_POLICY_ID,
+                "required native ProbeV2 gate must pin the selected capacity-floor rule in every SourceV5 manifest",
+            )
         source_manifest_raw_before = reader.canonical_bytes(source_manifest)
         source_manifest_sha_before = reader.sha256_bytes(source_manifest_raw_before)
         values = dict(line.split("\t") for line in Path(bundle["artifact"]["path"]).read_text(encoding="ascii").splitlines())
@@ -265,6 +300,7 @@ class CompositionContractTests(unittest.TestCase):
         self.assertGreater(int(values["download.bytes_per_second"]), reader.CAPACITY_RATE_ROOF)
         self.assertFalse(capacity_receipt["qualification_eligible"])
         for allocator in reader.APPLICATION_ALLOCATOR_LABELS:
+            offline_replay_context: dict[str, Any] | None = None
             binary = _artifact_binary(source_manifest, allocator)
             binary_sha = _sha(binary.read_bytes())
             probe_path = self.root / f"calibrated-probe-v2-{allocator}.json"
@@ -335,6 +371,76 @@ class CompositionContractTests(unittest.TestCase):
             self.assertEqual(reader.digest_object(source_manifest), source_manifest_sha_before)
             self.assertEqual(_feedback.source_path.read_bytes(), source_manifest_raw_before)
 
+            if allocator == reader.APPLICATION_ALLOCATOR_LABELS[0] and floor_policy_descriptor is not None:
+                # This fresh synthetic artifact keeps the captured source/run
+                # identity and changes only the two independent byte rates.
+                # It exercises the actual ProbeV2 CLI and reader, not a lowered
+                # expected receipt or a re-labeled original capacity artifact.
+                fields = dict(
+                    line.split("\t")
+                    for line in Path(bundle["artifact"]["path"]).read_text(encoding="ascii").splitlines()
+                )
+                fields["disk.bytes_per_second"] = "4617956"
+                fields["download.bytes_per_second"] = "4617956"
+                low_capacity_raw = ("".join(f"{name}\t{fields[name]}\n" for name in sorted(fields))).encode("ascii")
+                low_capacity_path = self.root / "capacity-low-relative-floor.tsv"
+                _write(low_capacity_path, low_capacity_raw)
+                low_capacity_pin = {"path": str(low_capacity_path), "raw_sha256": _sha(low_capacity_raw)}
+                selected_command = [
+                    str(binary), "--emit-feedback-policy-only", "--workload", "mixed", "--profile", "mixed",
+                    "--capacity-calibration-file", low_capacity_pin["path"],
+                    "--capacity-calibration-sha256", low_capacity_pin["raw_sha256"],
+                    "--host-id", _feedback.identity["host_id"], "--source-sha256",
+                    _feedback.source["source"]["source_tree_sha256"],
+                    "--capacity-floor-policy-id", reader.CAPACITY_FLOOR_POLICY_ID,
+                ]
+                selected_process = subprocess.run(
+                    selected_command, cwd=SOURCE_ROOT, stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30, check=False,
+                )
+                self.assertEqual(selected_process.returncode, 0, selected_process.stderr.decode("utf-8", "replace"))
+                selected_probe = reader.parse_json(
+                    selected_process.stdout, "actual low-capacity ProbeV2", reader.MAX_CONSTRUCTION_PROBE_BYTES,
+                )
+                self.assertEqual(selected_probe["schema"], "allocatbelt.application-feedback-policy-probe.v2")
+                selected_probe_path = self.root / "calibrated-probe-relative-floor.json"
+                _write(selected_probe_path, selected_process.stdout)
+                selected_probe_pin = {
+                    "path": str(selected_probe_path), "raw_sha256": _sha(selected_process.stdout),
+                    "allocator": allocator, "binary_sha256": binary_sha,
+                }
+                resolved = reader.resolve_calibrated_feedback_policy_v5(
+                    source_manifest, selected_probe, low_capacity_pin, identity,
+                    capacity_floor_policy_id=reader.CAPACITY_FLOOR_POLICY_ID,
+                )
+                self.assertEqual(resolved["controls"]["disk"]["floor"], 461795)
+                self.assertEqual(resolved["controls"]["download"]["floor"], 461795)
+                self.assertEqual(resolved["controls"]["download"]["initial"], 4617956)
+                self.assertEqual(resolved["rate_buckets"]["download"]["initial_bytes_per_second"], 4617956)
+                self.assertEqual(
+                    reader.validate_calibrated_construction_probe_v2(
+                        selected_probe_pin, source_manifest, low_capacity_pin, identity,
+                        capacity_floor_policy_id=reader.CAPACITY_FLOOR_POLICY_ID,
+                    ),
+                    selected_probe_pin["raw_sha256"],
+                )
+                with self.assertRaisesRegex(reader.ValidationError, "unknown"):
+                    reader.resolve_calibrated_feedback_policy_v5(
+                        source_manifest, selected_probe, low_capacity_pin, identity,
+                        capacity_floor_policy_id="unknown_floor_policy",
+                    )
+                with self.assertRaises(reader.ValidationError):
+                    reader.resolve_calibrated_feedback_policy_v5(
+                        source_manifest, selected_probe, low_capacity_pin, identity,
+                    )
+                mismatched_selector = json.loads(json.dumps(selected_probe))
+                mismatched_selector["capacity_floor_policy_id"] = "unknown_floor_policy"
+                with self.assertRaises(reader.ValidationError):
+                    reader.resolve_calibrated_feedback_policy_v5(
+                        source_manifest, mismatched_selector, low_capacity_pin, identity,
+                        capacity_floor_policy_id=reader.CAPACITY_FLOOR_POLICY_ID,
+                    )
+
             request = {
                 "schema": composition.REQUEST_SCHEMA,
                 "source_root": str(SOURCE_ROOT),
@@ -347,7 +453,8 @@ class CompositionContractTests(unittest.TestCase):
                 "capacity_bundle": bundle,
             }
             request_path = self.root / f"composition-request-{allocator}.json"
-            _write(request_path, composition.canonical(request))
+            request_raw = composition.canonical(request)
+            _write(request_path, request_raw)
             policy_path = self.root / f"resolved-policy-{allocator}.json"
             composition_receipt_path = self.root / f"composition-receipt-{allocator}.json"
             status = composition.main([
@@ -368,6 +475,412 @@ class CompositionContractTests(unittest.TestCase):
             self.assertFalse(receipt["execution_ready"])
             self.assertFalse(receipt["qualification_eligible"])
             self.assertFalse(receipt["controller_chronology_proven"])
+            if allocator == reader.APPLICATION_ALLOCATOR_LABELS[0] and floor_policy_descriptor is not None:
+                selected_command = [
+                    str(binary), "--emit-feedback-policy-only", "--workload", "mixed", "--profile", "mixed",
+                    "--capacity-calibration-file", bundle["artifact"]["path"],
+                    "--capacity-calibration-sha256", bundle["artifact"]["raw_sha256"],
+                    "--host-id", _feedback.identity["host_id"], "--source-sha256",
+                    _feedback.source["source"]["source_tree_sha256"],
+                    "--capacity-floor-policy-id", reader.CAPACITY_FLOOR_POLICY_ID,
+                ]
+                selected_process = subprocess.run(
+                    selected_command, cwd=SOURCE_ROOT, stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30, check=False,
+                )
+                self.assertEqual(selected_process.returncode, 0, selected_process.stderr.decode("utf-8", "replace"))
+                selected_probe_path = self.root / "calibrated-probe-selected-policy.json"
+                _write(selected_probe_path, selected_process.stdout)
+                selected_request = json.loads(json.dumps(request))
+                selected_request["schema"] = composition.REQUEST_SCHEMA_V2
+                selected_request["capacity_floor_policy_id"] = reader.CAPACITY_FLOOR_POLICY_ID
+                selected_request["construction_probe"] = {
+                    "path": str(selected_probe_path), "raw_sha256": _sha(selected_process.stdout),
+                    "allocator": allocator, "binary_sha256": binary_sha,
+                }
+                selected_request_path = self.root / "composition-request-selected-policy.json"
+                _write(selected_request_path, composition.canonical(selected_request))
+                selected_policy_path = self.root / "resolved-policy-selected-policy.json"
+                selected_receipt_path = self.root / "composition-receipt-selected-policy.json"
+                selected_status = composition.main([
+                    "resolve", "--request", str(selected_request_path),
+                    "--policy-output", str(selected_policy_path),
+                    "--receipt-output", str(selected_receipt_path),
+                ])
+                self.assertEqual(selected_status, 0)
+                selected_policy, _, _ = composition._read_canonical(
+                    selected_policy_path, "selected resolved policy", _sha(selected_policy_path.read_bytes()),
+                )
+                selected_receipt, _, _ = composition._read_canonical(
+                    selected_receipt_path, "selected composition receipt", _sha(selected_receipt_path.read_bytes()),
+                )
+                self.assertEqual(selected_policy["schema"], composition.POLICY_SCHEMA_V2)
+                self.assertEqual(selected_policy["capacity_floor_policy_id"], reader.CAPACITY_FLOOR_POLICY_ID)
+                self.assertEqual(selected_policy["policy"]["capacity_floor_policy_id"], reader.CAPACITY_FLOOR_POLICY_ID)
+                self.assertEqual(selected_receipt["schema"], composition.RECEIPT_SCHEMA_V2)
+                self.assertEqual(selected_receipt["capacity_floor_policy_id"], reader.CAPACITY_FLOOR_POLICY_ID)
+                self.assertFalse(selected_receipt["execution_ready"])
+                with self.assertRaisesRegex(composition.CompositionError, "unknown"):
+                    composition._validate_resolve_request({
+                        **selected_request, "capacity_floor_policy_id": "unknown_floor_policy",
+                    })
+            if allocator == reader.APPLICATION_ALLOCATOR_LABELS[0]:
+                observed_host_path = Path(observed_host_env).resolve(strict=True)
+                def probe_storage_budget(receipt_bytes: int = reader.MAX_PROBE_CAPTURE_RECEIPT_BYTES) -> dict[str, int]:
+                    return {
+                        "tmpdir_bytes": 4 * 1024 * 1024, "tmpdir_inodes": 256,
+                        "stdout_bytes": reader.MAX_PROBE_OUTPUT_BYTES,
+                        "stderr_bytes": composition.MAX_PROBE_STDERR_BYTES,
+                        "owner_result_bytes": composition.MAX_PROBE_OWNER_RESULT_BYTES,
+                        "inventory_bytes": composition.MAX_PROBE_TMPDIR_INVENTORY_BYTES,
+                        "failure_bytes": composition.MAX_PROBE_CAPTURE_FAILURE_BYTES,
+                        "receipt_bytes": receipt_bytes, "output_inodes": 7,
+                    }
+
+                undersized_capture_id = hashlib.sha256(
+                    (str(self.root) + allocator + probe_pin["raw_sha256"] + "budget").encode("utf-8"),
+                ).hexdigest()[:32]
+                with mock.patch.object(
+                    subprocess, "Popen", side_effect=AssertionError("undersized budget reached Popen"),
+                ):
+                    with self.assertRaisesRegex(composition.CompositionError, "computed bound"):
+                        composition.capture_calibrated_probe_v2(
+                            request, _sha(request_raw),
+                            {"path": str(observed_host_path),
+                             "raw_sha256": _sha(observed_host_path.read_bytes())},
+                            output_root=self.root, capture_id=undersized_capture_id,
+                            capture_timeout_ns=30_000_000_000,
+                            storage_budget=probe_storage_budget(receipt_bytes=1),
+                        )
+                self.assertFalse((self.root / undersized_capture_id / "owner-result.json").exists())
+                capture_id = hashlib.sha256(
+                    (str(self.root) + allocator + probe_pin["raw_sha256"]).encode("utf-8"),
+                ).hexdigest()[:32]
+                capture_pin = composition.capture_calibrated_probe_v2(
+                    request, _sha(request_raw),
+                    {"path": str(observed_host_path), "raw_sha256": _sha(observed_host_path.read_bytes())},
+                    output_root=self.root, capture_id=capture_id,
+                    capture_timeout_ns=30_000_000_000,
+                    storage_budget=probe_storage_budget(),
+                )
+                failed_capture_id = hashlib.sha256(
+                    (str(self.root) + allocator + probe_pin["raw_sha256"] + "deadline").encode("utf-8"),
+                ).hexdigest()[:32]
+                with self.assertRaisesRegex(composition.CompositionError, "capture failed"):
+                    composition.capture_calibrated_probe_v2(
+                        request, _sha(request_raw),
+                        {"path": str(observed_host_path), "raw_sha256": _sha(observed_host_path.read_bytes())},
+                        output_root=self.root, capture_id=failed_capture_id, capture_timeout_ns=1,
+                        storage_budget=probe_storage_budget(),
+                    )
+                failed_capture_path = self.root / failed_capture_id / "capture-receipt.json"
+                failed_capture_value, _failed_capture_raw, _failed_capture_sha = composition._read_canonical(
+                    failed_capture_path, "failed owned ProbeV2 capture", _sha(failed_capture_path.read_bytes()),
+                )
+                failed_owner_path = Path(failed_capture_value["owner_result_pin"]["path"])
+                failed_owner_value, _failed_owner_raw, _failed_owner_sha = composition._read_canonical(
+                    failed_owner_path, "failed capture's retained FixedR8 owner result",
+                    failed_capture_value["owner_result_pin"]["raw_sha256"],
+                    composition.MAX_PROBE_OWNER_RESULT_BYTES,
+                )
+                self.assertTrue(
+                    failed_capture_value["exit_status"] != 0 or
+                    failed_owner_value["direct"]["timing"]["elapsed_ns"] > 1 or
+                    failed_capture_value["output_matches_probe"] is False,
+                )
+                self.assertFalse(failed_capture_value["qualification_eligible"])
+                self.assertFalse(failed_capture_value["execution_ready"])
+                self.assertFalse(failed_capture_value["controller_chronology_proven"])
+                self.assertTrue(Path(failed_capture_value["stdout"]["path"]).is_file())
+                self.assertTrue(Path(failed_capture_value["stderr"]["path"]).is_file())
+
+                post_storage_capture_id = hashlib.sha256(
+                    (str(self.root) + allocator + probe_pin["raw_sha256"] + "post-storage").encode("utf-8"),
+                ).hexdigest()[:32]
+                real_source_loader = composition._captured_source_module
+
+                def fail_only_after_real_owner_load(
+                    source_reader: Any, source_value: dict[str, Any], relative: str, label: str,
+                ) -> tuple[Any, str]:
+                    module, module_sha = real_source_loader(source_reader, source_value, relative, label)
+                    if relative == composition.FIXED_PAIR_OWNER:
+                        def reject_post_capture_storage(*_args: Any, **_kwargs: Any) -> None:
+                            raise composition.CompositionError("injected post-return storage verification failure")
+                        module._verify_tmpdir_storage = reject_post_capture_storage
+                    return module, module_sha
+
+                with mock.patch.object(
+                    composition, "_captured_source_module", side_effect=fail_only_after_real_owner_load,
+                ):
+                    with self.assertRaisesRegex(
+                        composition.CompositionError, "post-return storage verification failure",
+                    ):
+                        composition.capture_calibrated_probe_v2(
+                            request, _sha(request_raw),
+                            {"path": str(observed_host_path),
+                             "raw_sha256": _sha(observed_host_path.read_bytes())},
+                            output_root=self.root, capture_id=post_storage_capture_id,
+                            capture_timeout_ns=30_000_000_000,
+                            storage_budget=probe_storage_budget(),
+                        )
+                post_storage_directory = self.root / post_storage_capture_id
+                post_storage_owner_path = post_storage_directory / "owner-result.json"
+                post_storage_failure_path = post_storage_directory / "capture-failure.json"
+                post_owner, _post_owner_raw, post_owner_raw_sha = composition._read_canonical(
+                    post_storage_owner_path, "retained original FixedR8 owner result",
+                    _sha(post_storage_owner_path.read_bytes()), composition.MAX_PROBE_OWNER_RESULT_BYTES,
+                )
+                post_failure, _post_failure_raw, _post_failure_sha = composition._read_canonical(
+                    post_storage_failure_path, "bounded post-capture failure record",
+                    _sha(post_storage_failure_path.read_bytes()), composition.MAX_PROBE_CAPTURE_FAILURE_BYTES,
+                )
+                self.assertEqual(post_failure["schema"], composition.PROBE_CAPTURE_FAILURE_SCHEMA)
+                self.assertEqual(set(post_failure), {
+                    "schema", "capture_id", "stage", "error_type", "error_message",
+                    "owner_result_pin", "owner_result_overflow", "tmpdir_inventory_pin",
+                    "stdout", "stderr", "qualification_eligible", "execution_ready",
+                    "controller_chronology_proven", "failure_sha256",
+                })
+                self.assertEqual(
+                    post_failure["failure_sha256"],
+                    _sha(composition.canonical({
+                        key: value for key, value in post_failure.items() if key != "failure_sha256"
+                    })),
+                )
+                self.assertEqual(post_failure["stage"], "post_capture_validation")
+                self.assertEqual(post_failure["owner_result_pin"]["path"], str(post_storage_owner_path))
+                self.assertEqual(post_failure["owner_result_pin"]["raw_sha256"], post_owner_raw_sha)
+                self.assertEqual(post_owner["direct"]["status"], 0)
+                self.assertEqual(
+                    post_owner["owner_result_sha256"],
+                    _sha(composition.canonical({
+                        key: value for key, value in post_owner.items() if key != "owner_result_sha256"
+                    })),
+                )
+                self.assertEqual(post_owner["direct"]["supervision"]["cleanup_status"], "verified")
+                self.assertEqual(post_owner["start_callback_count"], 1)
+                self.assertFalse(post_failure["qualification_eligible"])
+                self.assertFalse(post_failure["execution_ready"])
+                self.assertFalse(post_failure["controller_chronology_proven"])
+                capture_directory = Path(capture_pin["path"]).parent
+                capacity_request_value, _capacity_request_raw, _capacity_request_sha = \
+                    composition._read_canonical(
+                        Path(bundle["request"]["path"]), "test capacity request",
+                        bundle["request"]["raw_sha256"],
+                    )
+                capacity_expectation_pin = capacity_request_value["expectation"]
+                capacity_expectation_value, _capacity_expectation_raw, _capacity_expectation_sha = \
+                    composition._read_canonical(
+                        Path(capacity_expectation_pin["path"]), "test capacity expectation",
+                        capacity_expectation_pin["sha256"],
+                    )
+                capture_receipt_value, _capture_raw, _capture_sha = composition._read_canonical(
+                    Path(capture_pin["path"]), "test ProbeV2 capture receipt", capture_pin["raw_sha256"],
+                )
+                captured_receipt_body = {
+                    key: value for key, value in capture_receipt_value.items()
+                    if key != "receipt_sha256"
+                }
+                produced_envelope, produced_envelope_raw = composition._seal_probe_capture_receipt(
+                    captured_receipt_body,
+                )
+                self.assertEqual(produced_envelope, capture_receipt_value)
+                self.assertEqual(produced_envelope_raw, _capture_raw)
+                self.assertNotEqual(capture_pin["raw_sha256"], capture_pin["receipt_sha256"])
+                self.assertEqual(
+                    reader.validate_probe_capture_receipt_envelope(
+                        _capture_raw, capture_pin["raw_sha256"], capture_pin["receipt_sha256"],
+                    ),
+                    capture_receipt_value,
+                )
+                with self.assertRaisesRegex(reader.ValidationError, "raw SHA-256 differs"):
+                    reader.validate_probe_capture_receipt_envelope(
+                        _capture_raw, capture_pin["receipt_sha256"], capture_pin["receipt_sha256"],
+                    )
+                with self.assertRaisesRegex(reader.ValidationError, "semantic digest"):
+                    reader.validate_probe_capture_receipt_envelope(
+                        _capture_raw, capture_pin["raw_sha256"], capture_pin["raw_sha256"],
+                    )
+                inventory_sidecar_pin = capture_receipt_value["tmpdir_inventory_pin"]
+                capture_inventory_value, _inventory_raw, _inventory_sha = composition._read_canonical(
+                    Path(inventory_sidecar_pin["path"]), "test ProbeV2 TMPDIR inventory",
+                    inventory_sidecar_pin["raw_sha256"], composition.MAX_PROBE_TMPDIR_INVENTORY_BYTES,
+                )
+                mapped_files: set[Path] = set()
+                mapped_directories: set[Path] = set()
+
+                def add_mapped_path(path_value: str | Path) -> None:
+                    path = Path(path_value).resolve(strict=True)
+                    if path.is_dir():
+                        mapped_directories.add(path)
+                    else:
+                        self.assertTrue(path.is_file(), f"unexpected offline input type: {path}")
+                        mapped_files.add(path)
+
+                mapped_directories.update({SOURCE_ROOT.resolve(strict=True), self.root.resolve(strict=True),
+                                           observed_host_path.parent, capture_directory.resolve(strict=True),
+                                           (self.root / failed_capture_id).resolve(strict=True),
+                                           post_storage_directory.resolve(strict=True),
+                                           Path(capacity_request_value["trace_directory"]).resolve(strict=True)})
+                add_mapped_path(source_manifest_path)
+                add_mapped_path(observed_host_path)
+                add_mapped_path(probe_path)
+                add_mapped_path(policy_path)
+                add_mapped_path(composition_receipt_path)
+                for record in source_manifest["source"]["files"]:
+                    add_mapped_path(SOURCE_ROOT.joinpath(*Path(record["path"]).parts))
+                for artifact in source_manifest["artifacts"].values():
+                    add_mapped_path(SOURCE_ROOT.joinpath(*Path(artifact["path"]).parts))
+                for pin_value in bundle.values():
+                    add_mapped_path(pin_value["path"])
+                add_mapped_path(capacity_expectation_pin["path"])
+                add_mapped_path(capture_pin["path"])
+                for inventory_item in capture_inventory_value["entries"]:
+                    add_mapped_path(inventory_item["path"])
+                add_mapped_path(failed_capture_path)
+                add_mapped_path(post_storage_failure_path)
+                for raw_path in (
+                    composition._absolute_paths(request)
+                    | composition._absolute_paths(source_manifest)
+                    | composition._absolute_paths(capacity_request_value)
+                    | composition._absolute_paths(capacity_expectation_value)
+                    | composition._absolute_paths(capture_receipt_value)
+                    | composition._absolute_paths(failed_capture_value)
+                ):
+                    add_mapped_path(raw_path)
+                trace_directory = Path(capacity_request_value["trace_directory"]).resolve(strict=True)
+                for name in composition.CAPACITY_TRACE_FILES:
+                    add_mapped_path(trace_directory / name)
+                map_paths = mapped_files | mapped_directories
+                offline_replay_context = {
+                    "schema": reader.FEEDBACK_OFFLINE_CONTEXT_SCHEMA,
+                    "evidence_path_map": {
+                        "schema": reader.EVIDENCE_PATH_MAP_SCHEMA,
+                        "entries": [
+                            {"origin": str(path), "local": str(path)}
+                            for path in sorted(map_paths, key=lambda item: str(item))
+                        ],
+                    },
+                    "probe_capture_pin": capture_pin,
+                    "capacity_bundle": bundle,
+                }
+                failed_context = json.loads(json.dumps(offline_replay_context))
+                failed_context["probe_capture_pin"] = {
+                    "path": str(failed_capture_path),
+                    "raw_sha256": _sha(failed_capture_path.read_bytes()),
+                    "receipt_sha256": failed_capture_value["receipt_sha256"],
+                }
+                with mock.patch.object(subprocess, "Popen", side_effect=AssertionError("offline failure replay attempted Popen")):
+                    with self.assertRaises((reader.ValidationError, composition.CompositionError)):
+                        reader.validate_calibrated_construction_probe_v2_offline(
+                            probe_pin, request["source_manifest"], bundle["artifact"], identity,
+                            replay_context=failed_context,
+                        )
+                missing_source_map = json.loads(json.dumps(offline_replay_context))
+                missing_source_map["evidence_path_map"]["entries"] = [
+                    item for item in missing_source_map["evidence_path_map"]["entries"]
+                    if item["origin"] != str(SOURCE_ROOT)
+                ]
+                with mock.patch.object(
+                    composition, "_read_canonical",
+                    side_effect=AssertionError("offline map preflight read nested evidence"),
+                ):
+                    with self.assertRaisesRegex(composition.CompositionError, "path map omits"):
+                        composition.compose_calibrated_policy_v5_offline(
+                            request, _sha(request_raw), replay_context=missing_source_map,
+                        )
+                trace_directory = Path(capacity_request_value["trace_directory"]).resolve(strict=True)
+                omitted_map_inputs = [
+                    trace_directory,
+                    *(trace_directory / name for name in composition.CAPACITY_TRACE_FILES),
+                    Path(capacity_request_value["validation"]["path"]).resolve(strict=True),
+                    Path(capacity_expectation_pin["path"]).resolve(strict=True),
+                    *(Path(bundle[name]["path"]).resolve(strict=True) for name in bundle),
+                    SOURCE_ROOT / "scripts/application-feedback-readback.py",
+                ]
+                real_read_canonical = composition._read_canonical
+                trace_file_paths = {trace_directory / name for name in composition.CAPACITY_TRACE_FILES}
+
+                def reject_trace_open(path: Path, label: str, *args: Any, **kwargs: Any) -> Any:
+                    self.assertNotIn(Path(path), trace_file_paths, f"preflight opened unallowlisted {label}")
+                    return real_read_canonical(path, label, *args, **kwargs)
+
+                for omitted_path in omitted_map_inputs:
+                    incomplete_context = json.loads(json.dumps(offline_replay_context))
+                    incomplete_context["evidence_path_map"]["entries"] = [
+                        entry for entry in incomplete_context["evidence_path_map"]["entries"]
+                        if entry["origin"] != str(omitted_path)
+                    ]
+                    with mock.patch.object(composition, "_read_canonical", side_effect=reject_trace_open), \
+                         mock.patch.object(composition, "_load_verified_inputs",
+                                           side_effect=AssertionError("offline dependency executed before map closure")), \
+                         mock.patch.object(composition, "_captured_source_module",
+                                           side_effect=AssertionError("captured module executed before map closure")):
+                        with self.assertRaisesRegex(composition.CompositionError, "path map"):
+                            composition.compose_calibrated_policy_v5_offline(
+                                request, _sha(request_raw), replay_context=incomplete_context,
+                            )
+                    real_reader_read = reader.read_stable
+
+                    def reject_reader_trace_read(path: Path, label: str, maximum: int) -> Any:
+                        self.assertNotIn(Path(path), trace_file_paths,
+                                         f"reader preflight opened unallowlisted {label}")
+                        return real_reader_read(path, label, maximum)
+
+                    with mock.patch.object(reader, "read_stable", side_effect=reject_reader_trace_read), \
+                         mock.patch.object(reader, "_verify_source_manifest_v5",
+                                           side_effect=AssertionError("SourceV5 verifier executed before map closure")), \
+                         mock.patch.object(reader, "_captured_source5_module",
+                                           side_effect=AssertionError("reader dependency executed before map closure")), \
+                         mock.patch.object(subprocess, "Popen",
+                                           side_effect=AssertionError("reader offline path attempted Popen")):
+                        with self.assertRaisesRegex(reader.ValidationError, "path map"):
+                            reader.validate_calibrated_construction_probe_v2_offline(
+                                probe_pin, request["source_manifest"], bundle["artifact"], identity,
+                                replay_context=incomplete_context,
+                            )
+                with mock.patch.object(subprocess, "Popen", side_effect=AssertionError("offline replay attempted Popen")), \
+                     mock.patch.object(reader.os, "statvfs",
+                                       side_effect=AssertionError("offline replay queried current storage")), \
+                     mock.patch.object(reader.os, "sched_getaffinity",
+                                       side_effect=AssertionError("offline replay queried current affinity")), \
+                     mock.patch.object(reader.platform, "release",
+                                       side_effect=AssertionError("offline replay queried current host")):
+                    self.assertEqual(
+                        reader.validate_calibrated_construction_probe_v2_offline(
+                            probe_pin, request["source_manifest"], bundle["artifact"], identity,
+                            replay_context=offline_replay_context,
+                        ),
+                        probe_pin["raw_sha256"],
+                    )
+                    offline_policy, offline_receipt = composition.compose_calibrated_policy_v5_offline(
+                        request, _sha(request_raw), replay_context=offline_replay_context,
+                    )
+                self.assertEqual(offline_policy, policy)
+                self.assertEqual(offline_receipt, receipt)
+                failed_schema_context = json.loads(json.dumps(offline_replay_context))
+                failed_schema_context["probe_capture_pin"] = {
+                    "path": str(post_storage_failure_path),
+                    "raw_sha256": _sha(post_storage_failure_path.read_bytes()),
+                    "receipt_sha256": post_failure["failure_sha256"],
+                }
+                with mock.patch.object(subprocess, "Popen",
+                                       side_effect=AssertionError("offline failure replay attempted Popen")), \
+                     mock.patch.object(composition, "_captured_source_module",
+                                       side_effect=AssertionError("failure schema reached dependency execution")):
+                    with self.assertRaisesRegex(composition.CompositionError, "unexpected key set"):
+                        composition.compose_calibrated_policy_v5_offline(
+                            request, _sha(request_raw), replay_context=failed_schema_context,
+                        )
+                with mock.patch.object(subprocess, "Popen",
+                                       side_effect=AssertionError("offline failure replay attempted Popen")), \
+                     mock.patch.object(reader, "_captured_source5_module",
+                                       side_effect=AssertionError("failure schema reached dependency execution")):
+                    with self.assertRaisesRegex(reader.ValidationError, "unexpected key set"):
+                        reader.validate_calibrated_construction_probe_v2_offline(
+                            probe_pin, request["source_manifest"], bundle["artifact"], identity,
+                            replay_context=failed_schema_context,
+                        )
             finalize_request = {
                 "schema": composition.FINALIZE_SCHEMA,
                 "source_root": str(SOURCE_ROOT),
@@ -395,7 +908,15 @@ class CompositionContractTests(unittest.TestCase):
             finalize_request_path = self.root / f"finalize-request-{allocator}.json"
             finalize_expectation_path = self.root / f"finalized-expectation-{allocator}.json"
             finalize_receipt_path = self.root / f"finalization-receipt-{allocator}.json"
-            _write(finalize_request_path, composition.canonical(finalize_request))
+            finalize_request_raw = composition.canonical(finalize_request)
+            _write(finalize_request_path, finalize_request_raw)
+            offline_finalized: dict[str, Any] | None = None
+            if offline_replay_context is not None:
+                with mock.patch.object(subprocess, "Popen", side_effect=AssertionError("offline finalization attempted Popen")):
+                    offline_finalized = composition.finalize_calibrated_feedback_expectation_v5_offline(
+                        finalize_request, _sha(finalize_request_raw),
+                        replay_context=offline_replay_context,
+                    )
             finalize_status = composition.main([
                 "finalize", "--request", str(finalize_request_path),
                 "--expectation-output", str(finalize_expectation_path),
@@ -414,11 +935,369 @@ class CompositionContractTests(unittest.TestCase):
             self.assertFalse(finalization_receipt["execution_ready"])
             self.assertFalse(finalization_receipt["qualification_eligible"])
             self.assertFalse(finalization_receipt["controller_chronology_proven"])
+            if offline_finalized is not None:
+                self.assertEqual(offline_finalized, finalized)
+                # These empty files and zero-event trace rows are path-map
+                # shape fixtures only. The API must stop before reading them
+                # as pressure evidence because no full pressure replay request
+                # is present in this phase's context.
+                blocked_trace_directory = self.root / "blocked-feedback-trace"
+                blocked_trace_directory.mkdir(mode=0o700)
+                blocked_trace_files = [blocked_trace_directory / name for name in reader.TRACE_FILES]
+                for path in blocked_trace_files:
+                    _write(path, b"fixture-only\n")
+                pressure_pin_path = self.root / "pressure-readback.json"
+                runtime_pin_path = self.root / "runtime-binding.tsv"
+                _write(pressure_pin_path, b"fixture-only\n")
+                _write(runtime_pin_path, b"fixture-only\n")
+                blocked_context = json.loads(json.dumps(offline_replay_context))
+                blocked_entries = blocked_context["evidence_path_map"]["entries"]
+                blocked_entries.extend(
+                    {"origin": str(path), "local": str(path)}
+                    for path in [blocked_trace_directory, *blocked_trace_files,
+                                 pressure_pin_path, runtime_pin_path, finalize_expectation_path]
+                )
+                blocked_context["evidence_path_map"]["entries"] = sorted(
+                    blocked_entries, key=lambda entry: entry["origin"],
+                )
+                blocked_trace_set = {Path(path) for path in blocked_trace_files}
+                real_read_stable = reader.read_stable
+
+                def reject_unrequested_trace_read(path: Path, label: str, maximum: int) -> Any:
+                    self.assertNotIn(Path(path), blocked_trace_set,
+                                     f"blocked feedback replay opened fixture trace {label}")
+                    self.assertNotIn(Path(path), {pressure_pin_path, runtime_pin_path},
+                                     f"blocked feedback replay opened fixture proof {label}")
+                    return real_read_stable(path, label, maximum)
+
+                with mock.patch.object(subprocess, "Popen", side_effect=AssertionError("offline feedback attempted Popen")):
+                    with mock.patch.object(reader, "read_stable", side_effect=reject_unrequested_trace_read):
+                        with self.assertRaisesRegex(
+                            reader.ValidationError, "full independent pressure artifact request",
+                        ):
+                            reader.verify_feedback_offline(
+                                finalize_expectation_path, _sha(finalize_expectation_path.read_bytes()),
+                                blocked_trace_directory,
+                                {"manifest": "1" * 64, "events": "2" * 64, "samples": "3" * 64},
+                                replay_context=blocked_context,
+                            )
             self.assertEqual(reader.canonical_bytes(source_manifest), source_manifest_raw_before)
             self.assertEqual(reader.digest_object(source_manifest), source_manifest_sha_before)
             self.assertEqual(_feedback.source_path.read_bytes(), source_manifest_raw_before)
 
             if allocator == reader.APPLICATION_ALLOCATOR_LABELS[0]:
+                if offline_replay_context is not None:
+                    capture_receipt_path = Path(offline_replay_context["probe_capture_pin"]["path"])
+                    capture_owner_path = capture_receipt_path.parent / "owner-result.json"
+                    capture_inventory_path = capture_receipt_path.parent / "tmpdir-inventory.json"
+                    original_capture_receipt = capture_receipt_path.read_bytes()
+                    original_owner_result = capture_owner_path.read_bytes()
+                    original_inventory_raw = capture_inventory_path.read_bytes()
+
+                    def reseal_capture(
+                        mutate: Any, *, mutate_owner: bool,
+                    ) -> dict[str, Any]:
+                        capture_value = json.loads(original_capture_receipt)
+                        capture_body = {key: value for key, value in capture_value.items()
+                                        if key != "receipt_sha256"}
+                        owner_value = json.loads(original_owner_result)
+                        if mutate_owner:
+                            mutate(capture_body, owner_value)
+                            owner_body = {key: value for key, value in owner_value.items()
+                                          if key != "owner_result_sha256"}
+                            owner_value["owner_result_sha256"] = _sha(composition.canonical(owner_body))
+                            owner_raw = composition.canonical(owner_value)
+                            _write(capture_owner_path, owner_raw)
+                            capture_body["owner_result_pin"]["raw_sha256"] = _sha(owner_raw)
+                            capture_body["owner_result_pin"]["owner_result_sha256"] = owner_value["owner_result_sha256"]
+                        else:
+                            mutate(capture_body, owner_value)
+                        capture_raw = composition.canonical({
+                            **capture_body,
+                            "receipt_sha256": _sha(composition.canonical(capture_body)),
+                        })
+                        _write(capture_receipt_path, capture_raw)
+                        altered_context = json.loads(json.dumps(offline_replay_context))
+                        capture_value = json.loads(capture_raw)
+                        altered_context["probe_capture_pin"] = {
+                            "path": str(capture_receipt_path), "raw_sha256": _sha(capture_raw),
+                            "receipt_sha256": capture_value["receipt_sha256"],
+                        }
+                        return altered_context
+
+                    try:
+                        semantic_context = reseal_capture(
+                            lambda capture_body, _owner: capture_body["source_manifest"].__setitem__(
+                                "semantic_sha256", "0" * 64,
+                            ),
+                            mutate_owner=False,
+                        )
+                        with mock.patch.object(subprocess, "Popen",
+                                               side_effect=AssertionError("offline replay attempted Popen")):
+                            with self.assertRaisesRegex(
+                                (reader.ValidationError, composition.CompositionError),
+                                "SourceV5 raw/semantic/tree roles",
+                            ):
+                                composition.compose_calibrated_policy_v5_offline(
+                                    request, _sha(request_raw), replay_context=semantic_context,
+                                )
+
+                        def alter_environment(capture_body: dict[str, Any], owner_value: dict[str, Any]) -> None:
+                            environment = dict(capture_body["environment"])
+                            environment["LANG"] = "C.UTF-8"
+                            capture_body["environment"] = environment
+                            direct = owner_value["direct"]
+                            direct["environment"] = environment
+                            environment_sha = _sha(composition.canonical(environment))
+                            direct["environment_sha256"] = environment_sha
+                            direct["start"]["environment_sha256"] = environment_sha
+                            capture_body["start_callback_proof"]["environment_sha256"] = environment_sha
+                            capture_body["start"]["owner_proof"]["environment_sha256"] = environment_sha
+                            role = {key: value for key, value in capture_body["start"].items()
+                                    if key != "start_sha256"}
+                            capture_body["start"]["start_sha256"] = _sha(composition.canonical(role))
+                            owner_value["start_callback_proofs"] = [capture_body["start_callback_proof"]]
+
+                        environment_context = reseal_capture(alter_environment, mutate_owner=True)
+                        with mock.patch.object(subprocess, "Popen",
+                                               side_effect=AssertionError("offline environment replay attempted Popen")):
+                            with self.assertRaisesRegex(
+                                reader.ValidationError, "environment/affinity/netns differs",
+                            ):
+                                reader.validate_calibrated_construction_probe_v2_offline(
+                                    probe_pin, request["source_manifest"], bundle["artifact"], identity,
+                                    replay_context=environment_context,
+                                )
+
+                        def add_environment_entry(capture_body: dict[str, Any], owner_value: dict[str, Any]) -> None:
+                            environment = dict(capture_body["environment"])
+                            environment["UNDECLARED"] = "unexpected"
+                            capture_body["environment"] = environment
+                            direct = owner_value["direct"]
+                            direct["environment"] = environment
+                            environment_sha = _sha(composition.canonical(environment))
+                            direct["environment_sha256"] = environment_sha
+                            direct["start"]["environment_sha256"] = environment_sha
+                            capture_body["start_callback_proof"]["environment_sha256"] = environment_sha
+                            capture_body["start"]["owner_proof"]["environment_sha256"] = environment_sha
+                            role = {key: value for key, value in capture_body["start"].items()
+                                    if key != "start_sha256"}
+                            capture_body["start"]["start_sha256"] = _sha(composition.canonical(role))
+                            owner_value["start_callback_proofs"] = [capture_body["start_callback_proof"]]
+
+                        extra_environment_context = reseal_capture(add_environment_entry, mutate_owner=True)
+                        with mock.patch.object(subprocess, "Popen",
+                                               side_effect=AssertionError("offline extra-environment replay attempted Popen")):
+                            with self.assertRaisesRegex(reader.ValidationError,
+                                                        "strict environment has an unexpected key set"):
+                                reader.validate_calibrated_construction_probe_v2_offline(
+                                    probe_pin, request["source_manifest"], bundle["artifact"], identity,
+                                    replay_context=extra_environment_context,
+                                )
+
+                        def alter_affinity(capture_body: dict[str, Any], owner_value: dict[str, Any]) -> None:
+                            altered = [65_000]
+                            capture_body["affinity"] = altered
+                            owner_value["direct"]["cpu_affinity"] = altered
+
+                        affinity_context = reseal_capture(alter_affinity, mutate_owner=True)
+                        with mock.patch.object(subprocess, "Popen",
+                                               side_effect=AssertionError("offline affinity replay attempted Popen")):
+                            with self.assertRaisesRegex(
+                                (reader.ValidationError, composition.CompositionError),
+                                "environment/affinity/netns differs",
+                            ):
+                                composition.compose_calibrated_policy_v5_offline(
+                                    request, _sha(request_raw), replay_context=affinity_context,
+                                )
+
+                        def alter_netns(capture_body: dict[str, Any], owner_value: dict[str, Any]) -> None:
+                            capture_body["netns"] += 1
+                            owner_value["direct"]["network_namespace_inode"] = capture_body["netns"]
+
+                        netns_context = reseal_capture(alter_netns, mutate_owner=True)
+                        with mock.patch.object(subprocess, "Popen",
+                                               side_effect=AssertionError("offline finalizer replay attempted Popen")):
+                            with self.assertRaisesRegex(
+                                (reader.ValidationError, composition.CompositionError),
+                                "environment/affinity/netns differs",
+                            ):
+                                composition.finalize_calibrated_feedback_expectation_v5_offline(
+                                    finalize_request, _sha(finalize_request_raw),
+                                    replay_context=netns_context,
+                                )
+                    finally:
+                        _write(capture_receipt_path, original_capture_receipt)
+                        _write(capture_owner_path, original_owner_result)
+
+                    tmp_path = capture_receipt_path.parent / "tmp"
+                    original_tmp_mode = stat.S_IMODE(tmp_path.lstat().st_mode)
+                    os.chmod(tmp_path, 0o777)
+                    try:
+                        with mock.patch.object(subprocess, "Popen",
+                                               side_effect=AssertionError("offline TMPDIR check attempted Popen")):
+                            with self.assertRaisesRegex(
+                                (reader.ValidationError, composition.CompositionError),
+                                "private directory",
+                            ):
+                                composition.compose_calibrated_policy_v5_offline(
+                                    request, _sha(request_raw), replay_context=offline_replay_context,
+                                )
+                    finally:
+                        os.chmod(tmp_path, original_tmp_mode)
+
+                    if hasattr(os, "geteuid") and os.geteuid() == 0:
+                        captured_tmp_uid = tmp_path.lstat().st_uid
+                        os.chown(tmp_path, captured_tmp_uid + 1, -1)
+                        try:
+                            with mock.patch.object(subprocess, "Popen",
+                                                   side_effect=AssertionError("offline TMPDIR owner check attempted Popen")):
+                                with self.assertRaisesRegex(
+                                    composition.CompositionError,
+                                    "output/TMPDIR roots are not owned private directories",
+                                ):
+                                    composition.compose_calibrated_policy_v5_offline(
+                                        request, _sha(request_raw), replay_context=offline_replay_context,
+                                    )
+                        finally:
+                            os.chown(tmp_path, captured_tmp_uid, -1)
+
+                    output_directory_path = capture_receipt_path.parent
+                    original_output_mode = stat.S_IMODE(output_directory_path.lstat().st_mode)
+                    os.chmod(output_directory_path, 0o777)
+                    try:
+                        with mock.patch.object(subprocess, "Popen",
+                                               side_effect=AssertionError("offline output-root check attempted Popen")):
+                            with self.assertRaisesRegex(
+                                composition.CompositionError, "output root is not an owned private directory",
+                            ):
+                                composition.compose_calibrated_policy_v5_offline(
+                                    request, _sha(request_raw), replay_context=offline_replay_context,
+                                )
+                    finally:
+                        os.chmod(output_directory_path, original_output_mode)
+
+                    def context_with_unmapped_inventory_entry(
+                        kind: str, child_path: Path,
+                    ) -> dict[str, Any]:
+                        capture_value = json.loads(original_capture_receipt)
+                        capture_body = {key: value for key, value in capture_value.items()
+                                        if key != "receipt_sha256"}
+                        inventory_value = json.loads(original_inventory_raw)
+                        inventory_body = {key: value for key, value in inventory_value.items()
+                                          if key != "inventory_sha256"}
+                        if kind == "file":
+                            raw = child_path.read_bytes()
+                            item = {
+                                "path": str(child_path), "kind": "file", "uid": os.getuid(),
+                                "mode": stat.S_IMODE(child_path.lstat().st_mode),
+                                "size": len(raw), "raw_sha256": _sha(raw),
+                            }
+                        else:
+                            item = {
+                                "path": str(child_path), "kind": "directory", "uid": os.getuid(),
+                                "mode": stat.S_IMODE(child_path.lstat().st_mode),
+                                "size": None, "raw_sha256": None,
+                            }
+                        inventory_body["entries"].append(item)
+                        inventory_body["entries"].sort(key=lambda value: value["path"])
+                        inventory_value = {
+                            **inventory_body,
+                            "inventory_sha256": _sha(composition.canonical(inventory_body)),
+                        }
+                        inventory_raw = composition.canonical(inventory_value)
+                        _write(capture_inventory_path, inventory_raw)
+                        capture_body["tmpdir_inventory_pin"]["raw_sha256"] = _sha(inventory_raw)
+                        capture_body["tmpdir_inventory_pin"]["inventory_sha256"] = inventory_value["inventory_sha256"]
+                        capture_raw = composition.canonical({
+                            **capture_body,
+                            "receipt_sha256": _sha(composition.canonical(capture_body)),
+                        })
+                        _write(capture_receipt_path, capture_raw)
+                        value = json.loads(capture_raw)
+                        result = json.loads(json.dumps(offline_replay_context))
+                        result["probe_capture_pin"] = {
+                            "path": str(capture_receipt_path), "raw_sha256": _sha(capture_raw),
+                            "receipt_sha256": value["receipt_sha256"],
+                        }
+                        return result
+
+                    unmapped_inventory_file = tmp_path / "declared-but-unmapped.bin"
+                    _write(unmapped_inventory_file, b"mapped inventory payload\n")
+                    try:
+                        file_map_context = context_with_unmapped_inventory_entry(
+                            "file", unmapped_inventory_file,
+                        )
+                        with mock.patch.object(subprocess, "Popen",
+                                               side_effect=AssertionError("offline omitted-file replay attempted Popen")), \
+                             mock.patch.object(composition, "_captured_source_module",
+                                               side_effect=AssertionError("omitted file reached module execution")), \
+                             mock.patch.object(reader, "_captured_source5_module",
+                                               side_effect=AssertionError("omitted file reached reader module execution")):
+                            with self.assertRaisesRegex(
+                                (reader.ValidationError, composition.CompositionError), "path map omits exact",
+                            ):
+                                composition.compose_calibrated_policy_v5_offline(
+                                    request, _sha(request_raw), replay_context=file_map_context,
+                                )
+                    finally:
+                        _write(capture_receipt_path, original_capture_receipt)
+                        _write(capture_inventory_path, original_inventory_raw)
+                        unmapped_inventory_file.unlink()
+
+                    unmapped_inventory_directory = tmp_path / "declared-but-unmapped-directory"
+                    unmapped_inventory_directory.mkdir(mode=0o700)
+                    try:
+                        directory_map_context = context_with_unmapped_inventory_entry(
+                            "directory", unmapped_inventory_directory,
+                        )
+                        with mock.patch.object(subprocess, "Popen",
+                                               side_effect=AssertionError("offline omitted-directory replay attempted Popen")), \
+                             mock.patch.object(composition, "_captured_source_module",
+                                               side_effect=AssertionError("omitted directory reached module execution")), \
+                             mock.patch.object(reader, "_captured_source5_module",
+                                               side_effect=AssertionError("omitted directory reached reader module execution")):
+                            with self.assertRaisesRegex(
+                                (reader.ValidationError, composition.CompositionError), "path map omits exact",
+                            ):
+                                reader.validate_calibrated_construction_probe_v2_offline(
+                                    probe_pin, request["source_manifest"], bundle["artifact"], identity,
+                                    replay_context=directory_map_context,
+                                )
+                    finally:
+                        _write(capture_receipt_path, original_capture_receipt)
+                        _write(capture_inventory_path, original_inventory_raw)
+                        unmapped_inventory_directory.rmdir()
+
+                    unexpected_tmp_child = tmp_path / "unmapped-child.bin"
+                    _write(unexpected_tmp_child, b"unmapped child payload\n")
+                    try:
+                        with mock.patch.object(subprocess, "Popen",
+                                               side_effect=AssertionError("offline unmapped TMPDIR attempted Popen")), \
+                             mock.patch.object(composition, "_captured_source_module",
+                                               side_effect=AssertionError("unmapped TMPDIR reached module execution")), \
+                             mock.patch.object(reader, "_captured_source5_module",
+                                               side_effect=AssertionError("unmapped TMPDIR reached reader module execution")):
+                            with self.assertRaisesRegex(
+                                composition.CompositionError, "path map omits exact ProbeV2 TMPDIR descendant",
+                            ):
+                                composition.compose_calibrated_policy_v5_offline(
+                                    request, _sha(request_raw), replay_context=offline_replay_context,
+                                )
+                    finally:
+                        unexpected_tmp_child.unlink()
+                    stdout_capture_path = capture_receipt_path.parent / "stdout.bin"
+                    captured_stdout = stdout_capture_path.read_bytes()
+                    stdout_capture_path.unlink()
+                    try:
+                        with mock.patch.object(subprocess, "Popen", side_effect=AssertionError("offline replay attempted Popen")):
+                            with self.assertRaises((reader.ValidationError, composition.CompositionError)):
+                                composition.compose_calibrated_policy_v5_offline(
+                                    request, _sha(request_raw), replay_context=offline_replay_context,
+                                )
+                    finally:
+                        _write(stdout_capture_path, captured_stdout)
+                    self.assertEqual(capture_receipt_path.read_bytes(), original_capture_receipt)
                 original_request_raw = Path(bundle["request"]["path"]).read_bytes()
                 original_receipt_raw = Path(bundle["receipt"]["path"]).read_bytes()
                 original_artifact_raw = Path(bundle["artifact"]["path"]).read_bytes()

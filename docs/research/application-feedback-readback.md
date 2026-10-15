@@ -168,8 +168,13 @@ reconciliation and a fresh post-reconciliation sample.
 Resource rows are checked against the independent ceilings and reservation
 caps. Each meter bracket must be inside its containing resource snapshot; its
 fixed-width monotonic bracket must strictly advance by no more than 200 ms.
-Rates use the actual difference between measured lower bounds. Counter values
-cannot decrease within a generation, and a reset requires a greater generation.
+Rates use the actual difference between measured lower bounds. Available
+admission credits are bounded by the current burst. Live owners retain their
+admitted bytes while credits refill; the reader bounds retained bytes by the
+reservation count times the construction-time burst ceiling, not by adding
+retained bytes to the current burst after a lower-burst reconfiguration.
+Counter values cannot decrease within a generation, and a reset requires a
+greater generation.
 Every meter attachment count must fit its caller-frozen v2 source bound;
 legacy v1 rows must equal their archived pinned count. A live endpoint owns an
 RAII registration that retains its tenant-charged shared meter, so a terminal
@@ -194,6 +199,19 @@ is rejected. The feedback receipt's
 `qualification_eligible` flag reports only this component's gates and does not
 qualify application performance or satisfy the broader campaign gates.
 
+For a newly frozen SourceV5 pressure epoch, calibrated ProbeV2 may carry the
+optional selector `application_capacity_relative_tenth_v1`. The reader
+requires the identical selector in the caller policy, ProbeV2 capacity
+resolution, SourceV5 feedback-policy descriptor, and captured probe argv. It
+recomputes the positive disk/download floor as
+`max(1, min(64 MiB/s, raw_capacity / 10))` using integer division and checks
+the resolved initial and ceiling against the unchanged 16 GiB/s roof. Runtime
+activation also requires explicit pressure qualification and the exact pinned
+capacity artifact. Unknown, absent, mismatched, or unpinned selectors fail
+closed. Without the selector, the historical ProbeV2 field sets and 64 MiB/s
+minimum remain unchanged. The selected epoch may use expectation V6; earlier
+expectations and receipts are not migrated or relabeled.
+
 The validation receipt has exactly ten top-level keys:
 `schema`, `mode`, `validated`, `qualification_eligible`,
 `expectation_raw_sha256`, `validator_sha256`, `identity`,
@@ -214,3 +232,130 @@ python3 -B scripts/test-application-pressure-driver.py
 
 The fixtures are synthetic contract tests. They do not launch a production
 application, run a qualification campaign, or make performance claims.
+
+## Captured ProbeV2 offline boundary
+
+For SourceV5 ProbeV2, `validate_calibrated_construction_probe_v2_offline(...)`
+rechecks the original source manifest, APP ELF, capacity TSV and complete
+capacity producer bundle, then compares the pinned probe bytes with the raw
+stdout and process/cleanup receipt produced by the FixedR8 direct owner on the
+origin host. The `allocatbelt.application-feedback-probe-capture.v2` receipt
+binds distinct SourceV5 raw-manifest, semantic-manifest, source-tree and build
+digests, the original producer bundle, exact APP argv/environment/cwd/affinity/
+network namespace, PID/start proof, output bytes, owner modules, and storage
+facts. Its versioned start role records the accepted FixedR8 minimal
+`capture_identity=False` PID/start/argv/environment-hash proof; it does not
+claim the full live `/proc/PID/exe` attestation for timed application members.
+It never edits the original ProbeV2 or producer artifacts. Offline replay
+reconstructs the exact four-entry allowlisted environment and compares the
+captured affinity and network-namespace inode with the raw-pinned observed-host
+context and origin facts; mutually updated capture hashes cannot replace those
+source facts. The receipt contains raw and semantic pins to separate
+`owner-result.json` and `tmpdir-inventory.json` sidecars. Replay validates each
+sidecar against its exact map entry, then checks the inventory's complete
+recursive path set and file hashes before reading nested producer inputs.
+`receipt_sha256` hashes the canonical body with that field omitted; the separate
+raw SHA-256 covers the final canonical envelope bytes.
+
+Offline callers supply a closed
+`allocatbelt.application-feedback-offline-replay-context.v1` object with the
+receipt pin, exact producer bundle, and a sorted identity-only
+`allocatbelt.application-pressure-evidence-path-map.v1`. Each invocation checks
+an exact map entry for every SourceV5 inventory member, every nested producer
+pin, the capacity V4 trace directory and its three exact members, the capture
+receipt, owner/inventory sidecars and outputs, every captured TMPDIR descendant, and required evidence
+directories before reading nested dependencies or compiling pinned code. The
+current copied output root and TMPDIR must remain owned, nonsymlink, mode-0700
+directories. The closed TMPDIR inventory binds each file's bytes, mode and
+owner and each directory's mode and owner; unexpected descendants are rejected
+by name before the verifier inspects their metadata or contents. Offline replay
+then invokes the SourceV5-pinned FixedR8 offline storage verifier. An ancestor
+path does not satisfy a missing file entry.
+The replay has no APP launch, `/proc` host
+check, or trusted success flag; it reads and recomputes the original bytes
+again rather than accepting a prior in-memory result.
+
+This reader verifies and replays an already captured ProbeV2 receipt; it does
+not create that receipt. The current capacity-stage `direct_process_capture`
+is a different capacity-calibration execution and cannot stand in for the
+actual SourceV5 `--emit-feedback-policy-only` ProbeV2 owner result. The
+Source5 pressure-input builder must materialize the approved two-member v2
+helper payload from real captures before authorizing the pressure helper. Until
+that producer path exists, the strict receipt API rejects the legacy payload
+and no host receipt or offline feedback result is emitted.
+
+`verify_feedback_offline(...)` is deliberately blocked after this ProbeV2
+replay until its context carries the full independently replayable pressure
+artifact request. The current phase therefore cannot return a partial feedback
+receipt or infer pressure validity from the stored readback status. Strict
+`verify_feedback(...)` and all historical expectation schemas retain their
+existing behavior.
+
+## Pressure-bound offline replay
+
+The Phase1R4 `verify_feedback_offline(...)` boundary has an optional additive
+`pressure_replay_request` input with schema
+`allocatbelt.application-feedback-pressure-pair-replay-request.v1`. It binds
+the unchanged SourceV5 manifest raw, semantic and source-tree roles; original
+pair recipe/readback pins; the separate strict origin-host receipt pin; the
+original SourceV5 root; and raw pins for the pair, pressure-readback and
+chronology modules. Each module is captured from the SourceV5 typed inventory,
+then compiled from the exact verified bytes. The request and nested pressure
+JSON references must be present in the sorted identity path map before any
+captured module executes.
+
+When supplied, the reader independently invokes the captured pressure-pair
+offline API on every call. It does not trust a `validated` flag, stored summary,
+receipt self-digest alone, or a prior replay result. It then compares the
+replayed original pressure-proof bytes to the expectation's proof pin and runs
+the existing V5 trace, collector, policy and runtime-binding checks using the
+captured ProbeV2 receipt instead of launching a peer APP probe. Omitting the
+pressure request remains blocked. If chronology, the original fixed
+predecessor, or normal-APP replay adapters are unavailable, the pair reader
+raises a closed blocker and feedback does not return a partial validation
+result. Source5 cohort eligibility and Soak remain separate later gates.
+
+The existing strict `verify_feedback(...)` path is unchanged and still runs its
+origin-host ProbeV2 behavior. Offline replay accepts only identity-mapped
+original absolute paths; no canonical request or receipt bytes are rewritten.
+No offline API grants execution authority or sets qualification eligibility.
+
+## Source5 policy composition
+
+For a newly selected SourceV5 epoch, the feedback-policy artifact v2 derives
+its descriptor from the pinned Rust source. Composer request v2 carries the
+same policy ID, and the feedback composer plus pressure reader each verify it
+against that source descriptor and the pinned capacity artifact. Only
+external-pressure templates carry the selector; fixed-policy templates and
+requests retain their previous shapes. The additive selected receipts remain
+subject to the separate campaign gates and do not qualify a run on their own.
+
+The pressure request shape is closed:
+
+```json
+{
+  "schema": "allocatbelt.application-feedback-pressure-pair-replay-request.v1",
+  "source_manifest": {
+    "path": "/original/source-manifest.json",
+    "raw_sha256": "<raw digest>",
+    "semantic_sha256": "<manifest_sha256>",
+    "source_tree_sha256": "<typed inventory digest>"
+  },
+  "source_root": "/original/source-root",
+  "pair": {
+    "recipe": {"path": "/original/pair-recipe.json", "raw_sha256": "<raw digest>"},
+    "output_root": "/original/pair-output",
+    "readback": {"path": "/original/pair-output/pressure-pair-readback.json", "raw_sha256": "<raw digest>"},
+    "host_verification": {"path": "/original/host-receipt.json", "raw_sha256": "<raw digest>", "receipt_sha256": "<semantic digest>"}
+  },
+  "module_pins": {
+    "pressure_pair": {"path": "scripts/application-pressure-pair.py", "raw_sha256": "<SourceV5 inventory digest>"},
+    "pressure_readback": {"path": "scripts/application-pressure-readback.py", "raw_sha256": "<SourceV5 inventory digest>"},
+    "campaign_chronology": {"path": "scripts/application-campaign-chronology.py", "raw_sha256": "<SourceV5 inventory digest>"}
+  }
+}
+```
+
+The placeholders above describe digest roles only; they are not accepted
+values or a prepared evidence package. The request's original absolute path
+strings must remain byte-for-byte unchanged in the supplied JSON documents.

@@ -13,6 +13,7 @@ import platform
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -39,7 +40,7 @@ def source_inventory_records() -> list[dict]:
     return records
 
 
-def source_v5_for(host_id: str) -> dict:
+def source_v5_for(host_id: str, capacity_floor_policy_id: str | None = None) -> dict:
     source = fixtures.source_for(host_id)
     records = copy.deepcopy(source_inventory_records())
     by_path = {entry["path"]: entry for entry in records}
@@ -55,15 +56,22 @@ def source_v5_for(host_id: str) -> dict:
         for name, path in inputs.HARNESS_PATHS.items()
     }
     source["qualification_harness"] = harness
-    source["feedback_policy"] = inputs.build_feedback_policy_artifact(SOURCE_ROOT, records, harness)
+    source["feedback_policy"] = inputs.build_feedback_policy_artifact(
+        SOURCE_ROOT, records, harness, capacity_floor_policy_id=capacity_floor_policy_id,
+    )
     source["manifest_sha256"] = campaign.digest_object(source)
     return source
 
 
-def spec_v3_fixture() -> tuple[dict, dict[str, dict]]:
+def spec_v3_fixture(capacity_floor_policy_id: str | None = None) -> tuple[dict, dict[str, dict]]:
     spec, legacy_sources = fixtures.spec_fixture()
-    sources = {host_id: source_v5_for(host_id) for host_id in legacy_sources}
+    sources = {
+        host_id: source_v5_for(host_id, capacity_floor_policy_id)
+        for host_id in legacy_sources
+    }
     spec["schema"] = campaign.SPEC_SCHEMA_V3
+    if capacity_floor_policy_id is not None:
+        spec["capacity_floor_policy_id"] = capacity_floor_policy_id
     for ref in spec["source_manifests"]:
         ref["sha256"] = sources[ref["host_id"]]["manifest_sha256"]
     spec["runtime_binding"]["feedback_policy_sha256"] = sources["host-1"]["feedback_policy"]["policy_sha256"]
@@ -161,6 +169,10 @@ class ApplicationCampaignInputTests(unittest.TestCase):
         ]
         self.assertFalse(campaign.build_parser().parse_args(args).legacy_v4)
         self.assertTrue(campaign.build_parser().parse_args([*args[:-2], "--legacy-v4", *args[-2:]]).legacy_v4)
+        selected = campaign.build_parser().parse_args([
+            *args[:-2], "--capacity-floor-policy-id", inputs.CAPACITY_FLOOR_POLICY_ID, *args[-2:],
+        ])
+        self.assertEqual(selected.capacity_floor_policy_id, inputs.CAPACITY_FLOOR_POLICY_ID)
 
     def test_source_v5_binds_exact_harness_inventory_and_numeric_feedback_policy(self) -> None:
         source = source_v5_for("host-1")
@@ -200,6 +212,67 @@ class ApplicationCampaignInputTests(unittest.TestCase):
         damaged["manifest_sha256"] = campaign.digest_object(damaged)
         with self.assertRaisesRegex(campaign.CampaignError, "bounds or thresholds|numeric context"):
             campaign.verify_source_manifest(damaged, verify_artifacts=False)
+
+    def test_capacity_floor_policy_is_explicit_additive_and_source_derived(self) -> None:
+        static = source_v5_for("host-1")
+        self.assertEqual(static["feedback_policy"]["schema"], inputs.FEEDBACK_POLICY_SCHEMA)
+        self.assertNotIn("capacity_floor_policy", static["feedback_policy"]["policy"])
+        selected = source_v5_for("host-1", inputs.CAPACITY_FLOOR_POLICY_ID)
+        campaign.verify_source_manifest(selected, verify_artifacts=False)
+        descriptor = selected["feedback_policy"]["policy"]["capacity_floor_policy"]
+        self.assertEqual(descriptor["policy_id"], inputs.CAPACITY_FLOOR_POLICY_ID)
+        self.assertEqual(descriptor["rule"], "max_one_min_static_floor_capacity_div_ten")
+        self.assertEqual(descriptor["capacity_divisor"], 10)
+        self.assertEqual(descriptor["minimum_floor_bytes_per_second"], 1)
+        self.assertEqual(descriptor["static_floor_bytes_per_second"], 64 * 1024 * 1024)
+        with self.assertRaisesRegex(inputs.InputError, "unknown"):
+            inputs.build_feedback_policy_artifact(
+                SOURCE_ROOT, selected["source"]["files"], selected["qualification_harness"],
+                capacity_floor_policy_id="unknown_floor_policy",
+            )
+
+        spec, sources = spec_v3_fixture(inputs.CAPACITY_FLOOR_POLICY_ID)
+        core = inputs.preparation_core_from_spec(spec)
+        self.assertEqual(core["schema"], inputs.SOURCE5_PREPARATION_CORE_SCHEMA_V2)
+        self.assertEqual(core["capacity_floor_policy_id"], inputs.CAPACITY_FLOOR_POLICY_ID)
+        self.assertEqual(inputs._validate_preparation_core(core)["capacity_floor_policy_id"], inputs.CAPACITY_FLOOR_POLICY_ID)
+        unknown_core = copy.deepcopy(core)
+        unknown_core["capacity_floor_policy_id"] = "unknown_floor_policy"
+        with self.assertRaisesRegex(inputs.InputError, "unknown"):
+            inputs._validate_preparation_core(unknown_core)
+        raw_core = {key: value for key, value in core.items() if key != "schema"}
+        captured_preparation: dict[str, object] = {}
+        source_pins = {host_id: {} for host_id in sources}
+        observed_hosts = {host_id: {} for host_id in sources}
+        with tempfile.TemporaryDirectory(prefix="capacity-floor-preparation-core-") as directory, \
+             patch.object(inputs, "validate_preparation_intent",
+                          side_effect=lambda value, *_args: captured_preparation.update(value=value) or {}):
+            inputs.build_preparation_intent(
+                raw_core, source_pins, observed_hosts, [], [],
+                Path(directory) / "intent.json",
+            )
+        self.assertEqual(captured_preparation["value"]["core"], core)
+        plan = campaign.freeze_plan(spec, sources)
+        selected_templates = [
+            item for item in plan["feedback_process_templates"]
+            if item["identity"]["host_id"] == "host-1"
+            and item["identity"]["workload"] == "mixed"
+            and item["identity"]["profile"] == "mixed"
+        ]
+        self.assertEqual(len(selected_templates), 16)
+        for item in selected_templates:
+            if item["identity"]["comparison_family"] == "external_pressure":
+                self.assertEqual(item["policy"]["capacity_floor_policy_id"], inputs.CAPACITY_FLOOR_POLICY_ID)
+                self.assertEqual(item["policy"]["capacity_floor_policy"], descriptor)
+            else:
+                self.assertNotIn("capacity_floor_policy_id", item["policy"])
+                self.assertNotIn("capacity_floor_policy", item["policy"])
+        self.assertTrue(campaign.validate_spec(spec, sources)["feedback_runtime_composition_ready"] is False)
+
+        bad_spec = copy.deepcopy(spec)
+        bad_spec["capacity_floor_policy_id"] = "unknown_floor_policy"
+        with self.assertRaisesRegex(campaign.CampaignError, "unknown"):
+            campaign.validate_spec(bad_spec, sources)
 
     def test_spec_v3_null_capacity_evidence_blocks_confirmation_and_plan_contains_only_prospective_bindings(self) -> None:
         spec, sources = spec_v3_fixture()

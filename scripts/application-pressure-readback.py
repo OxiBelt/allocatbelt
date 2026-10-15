@@ -41,6 +41,8 @@ CALIBRATION_SCOPE_SCHEMA_V2 = "allocatbelt.application-pressure-calibration-scop
 CALIBRATION_SCOPE_RECEIPT_SCHEMA_V2 = "allocatbelt.application-pressure-calibration-scope-readback.v2"
 CALIBRATION_HOST_VERIFICATION_SCHEMA_V2 = "allocatbelt.application-pressure-calibration-host-verification.v1"
 EVIDENCE_PATH_MAP_SCHEMA_V1 = "allocatbelt.application-pressure-evidence-path-map.v1"
+PRESSURE_PAIR_HOST_VERIFICATION_SCHEMA = "allocatbelt.application-pressure-pair-host-verification.v1"
+PRESSURE_PAIR_ORIGIN_FACTS_SCHEMA = "allocatbelt.application-pressure-pair-origin-facts.v1"
 CAPACITY_BUNDLE_PIN_SCHEMA_V2 = "allocatbelt.application-pressure-capacity-bundle-pin.v2"
 CONTEXT_POLICY_BUNDLE_SCHEMA_V2 = "allocatbelt.application-pressure-context-policy-bundle.v2"
 CALIBRATION_BINDING_SCHEMA_V2 = "allocatbelt.application-pressure-calibration-binding.v2"
@@ -73,17 +75,24 @@ MAX_SAMPLE_COUNT = 120000
 MAX_EVENT_COUNT = 120006
 MAX_WORKER_STDERR_RAW_BYTES = 8192
 MAX_BINARY_BYTES = 1024 * 1024 * 1024
+MAX_OFFLINE_JSON_BYTES = 256 * 1024 * 1024
 MAX_SOURCE_BYTES = 64 * 1024 * 1024
 MAX_POLICY_BYTES = 8 * 1024 * 1024
 MAX_SOURCE_MODULE_BYTES = 16 * 1024 * 1024
 MAX_CONTEXT_POLICY_BUNDLE_BYTES = 8 * 1024 * 1024
 MAX_SCOPE_RECEIPT_BYTES = 8 * 1024 * 1024
+MAX_PRESSURE_PROOF_BYTES = 256 * 1024
 MAX_CAPACITY_CONTEXT_BYTES = 1 * 1024 * 1024
+MAX_SOURCE5_SOAK_HOST_RECEIPT_BYTES = 32 * 1024 * 1024
+MAX_SOURCE5_SOAK_INVENTORY_ENTRIES = 250_000
 U64_MAX = (1 << 64) - 1
 BLOCK_BYTES = 4096
 DRIVER_PATH = Path(__file__).with_name("application-pressure-driver.py")
 _EVIDENCE_PATH_MAP_CONTEXT: contextvars.ContextVar[tuple[dict[str, str], set[str]] | None] = contextvars.ContextVar(
     "allocatbelt_pressure_evidence_path_map", default=None,
+)
+_PRESSURE_OFFLINE_REPLAY_CONTEXT: contextvars.ContextVar[dict[str, Any] | None] = contextvars.ContextVar(
+    "allocatbelt_pressure_offline_replay_context", default=None,
 )
 
 
@@ -155,6 +164,13 @@ def text(value: object, label: str, maximum: int = 4096) -> str:
 def sha256(value: object, label: str) -> str:
     result = text(value, label, 64)
     require(re.fullmatch(r"[0-9a-f]{64}", result) is not None, f"{label} is not lowercase SHA-256")
+    return result
+
+
+def token(value: object, label: str, maximum: int = 128) -> str:
+    result = text(value, label, maximum)
+    require(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", result) is not None,
+            f"{label} is not a canonical token")
     return result
 
 
@@ -757,9 +773,9 @@ def _device_chain(value: object, device: str) -> list[dict[str, Any]]:
     return result
 
 
-def _validate_calibration(recipe: dict[str, Any]) -> dict[str, str] | None:
+def _validate_calibration(recipe: dict[str, Any], *, offline_context: dict[str, Any] | None = None) -> dict[str, str] | None:
     if recipe["schema"] == RECIPE_SCHEMA_V2:
-        return _validate_calibration_v2_recipe(recipe)
+        return _validate_calibration_v2_recipe(recipe, offline_context=offline_context)
     binding = recipe["pressure_calibration"]
     path = Path(binding["path"])
     value, _, raw_sha = read_canonical(path, "pressure contention calibration", 64 * 1024 * 1024)
@@ -1219,7 +1235,42 @@ def _load_source_module(source_root: Path, source: dict[str, Any], relative: str
     return module, actual
 
 
-def _source5_stack(source_pin_value: object, source_root_value: object) -> dict[str, Any]:
+
+def _capture_offline_typed_inventory(
+    source_root: Path, records: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Hash declared SourceV5 members without Git, /proc, or child processes."""
+    actual: list[dict[str, Any]] = []
+    for index, entry_value in enumerate(records):
+        entry = exact(entry_value, {"path", "kind", "mode", "sha256", "size"},
+                      f"offline SourceV5 inventory[{index}]")
+        relative = PurePosixPath(text(entry["path"], "offline SourceV5 inventory path", 4096))
+        require(not relative.is_absolute() and ".." not in relative.parts and
+                relative.as_posix() == entry["path"] and entry["kind"] == "file" and
+                entry["mode"] in ("100644", "100755"),
+                "offline SourceV5 inventory contains an unsafe or non-regular path")
+        path = source_root.joinpath(*relative.parts)
+        try:
+            require(path.resolve(strict=True) == path,
+                    "offline SourceV5 inventory member traverses an alias")
+            info = path.lstat()
+            actual_mode = stat.S_IFMT(info.st_mode) | stat.S_IMODE(info.st_mode)
+            require(stat.S_ISREG(info.st_mode) and not stat.S_ISLNK(info.st_mode) and
+                    actual_mode == int(entry["mode"], 8),
+                    "offline SourceV5 inventory member mode/type differs")
+        except OSError as error:
+            raise ReadbackError(f"offline SourceV5 inventory member is unavailable: {error}") from error
+        raw, actual_sha = read_stable(path, "offline SourceV5 inventory member",
+                                      MAX_SOURCE_MODULE_BYTES)
+        require(len(raw) == entry["size"] and actual_sha == entry["sha256"],
+                "offline SourceV5 inventory member bytes differ from the original typed pin")
+        actual.append(dict(entry))
+    return actual
+
+
+def _source5_stack(
+    source_pin_value: object, source_root_value: object, *, verify_git_commit: bool = True,
+) -> dict[str, Any]:
     source_pin, source, source_raw, source_raw_sha = _read_raw_pin(
         source_pin_value, "SourceV5 manifest", MAX_SOURCE_BYTES,
     )
@@ -1244,21 +1295,27 @@ def _source5_stack(source_pin_value: object, source_root_value: object) -> dict[
     try:
         records = inventory_module.validate_records({"schema": SOURCE5_INVENTORY_SCHEMA, "entries": source_identity["files"]})
         require(records == source_identity["files"] and inventory_module.digest_records(records) == source_tree, "SourceV5 typed source inventory digest is invalid")
-        actual_inventory = inventory_module.inventory(source_root_access, timeout_seconds=120.0)
-        require(actual_inventory.get("entries") == records and inventory_module.digest_inventory(actual_inventory) == source_tree, "live SourceV5 source tree differs from its complete typed inventory")
+        if verify_git_commit:
+            actual_inventory = inventory_module.inventory(source_root_access, timeout_seconds=120.0)
+            require(actual_inventory.get("entries") == records and inventory_module.digest_inventory(actual_inventory) == source_tree, "live SourceV5 source tree differs from its complete typed inventory")
+        else:
+            actual_records = _capture_offline_typed_inventory(source_root_access, records)
+            require(actual_records == records and inventory_module.digest_records(actual_records) == source_tree,
+                    "offline SourceV5 raw source members differ from the complete typed inventory")
     except Exception as error:
         if isinstance(error, ReadbackError):
             raise
         raise ReadbackError(f"SourceV5 source inventory replay failed: {type(error).__name__}: {error}") from error
-    try:
-        result = subprocess.run(
-            ["git", "-C", str(source_root_access), "rev-parse", "HEAD"], stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10, check=False,
-            env={"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "GIT_CONFIG_NOSYSTEM": "1", "GIT_TERMINAL_PROMPT": "0"},
-        )
-    except (OSError, subprocess.TimeoutExpired) as error:
-        raise ReadbackError(f"cannot verify SourceV5 Git commit: {error}") from error
-    require(result.returncode == 0 and result.stdout.decode("ascii", errors="strict").strip() == commit, "live SourceV5 Git commit differs from its manifest")
+    if verify_git_commit:
+        try:
+            result = subprocess.run(
+                ["git", "-C", str(source_root_access), "rev-parse", "HEAD"], stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10, check=False,
+                env={"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "GIT_CONFIG_NOSYSTEM": "1", "GIT_TERMINAL_PROMPT": "0"},
+            )
+        except (OSError, subprocess.TimeoutExpired) as error:
+            raise ReadbackError(f"cannot verify SourceV5 Git commit: {error}") from error
+        require(result.returncode == 0 and result.stdout.decode("ascii", errors="strict").strip() == commit, "live SourceV5 Git commit differs from its manifest")
     harness = exact(source.get("qualification_harness"), {
         "campaign_controller", "feedback_validator", "byte_capacity_producer", "pressure_driver",
         "pressure_validator", "soak_recipe_builder", "soak_validator", "soak_runner",
@@ -1399,6 +1456,33 @@ def _context_policy_numeric_projection_digest_v2(value: object) -> str:
     })
 
 
+def _source5_capacity_floor_policy_id(source_stack: dict[str, Any]) -> str | None:
+    artifact = exact(source_stack["source"]["feedback_policy"], {
+        "schema", "policy", "policy_sha256",
+    }, "SourceV5 feedback policy artifact for pressure replay")
+    body_keys = {
+        "schema", "version", "reader_contract", "algorithm", "contexts", "source_pins",
+    }
+    if artifact["schema"] == "allocatbelt.application-feedback-policy-artifact.v2":
+        body_keys.add("capacity_floor_policy")
+    body = exact(artifact["policy"], body_keys,
+                 "SourceV5 feedback policy body for pressure replay")
+    require(body["schema"] == artifact["schema"] and
+            sha256(artifact["policy_sha256"], "SourceV5 feedback policy digest") ==
+            digest_object(body),
+            "SourceV5 feedback policy schema/hash differs in pressure replay")
+    if artifact["schema"] == "allocatbelt.application-feedback-policy-artifact.v1":
+        return None
+    require(artifact["schema"] == "allocatbelt.application-feedback-policy-artifact.v2",
+            "unsupported SourceV5 pressure feedback policy artifact")
+    descriptor = source_stack["feedback_reader"]._validate_capacity_floor_policy_descriptor(
+        body["capacity_floor_policy"],
+    )
+    require(descriptor["policy_id"] == source_stack["feedback_reader"].CAPACITY_FLOOR_POLICY_ID,
+            "SourceV5 pressure feedback policy ID differs from the independent reader")
+    return descriptor["policy_id"]
+
+
 def _verify_context_policy_bundle_v2(
     source_stack: dict[str, Any], context_policy_pin_value: object,
     capacity: dict[str, Any], expected_source_pin: dict[str, Any],
@@ -1423,8 +1507,17 @@ def _verify_context_policy_bundle_v2(
     require(sha256(policy["policy_sha256"], "shared policy digest") == digest_object(policy_body), "shared numeric policy self digest is invalid")
     source_pin = _raw_pin(policy["source_manifest"], "shared policy SourceV5 manifest")
     require(source_pin == expected_source_pin == source_stack["source_pin"], "shared policy refers to a different SourceV5 raw manifest")
-    context = exact(policy["context"], {"host_id", "workload", "profile", "calibration_id"}, "shared policy context")
-    require(context == capacity["capacity_key"], "shared policy context differs from the capacity key")
+    selected_floor_policy_id = _source5_capacity_floor_policy_id(source_stack)
+    shared_context_keys = {"host_id", "workload", "profile", "calibration_id"}
+    if selected_floor_policy_id is not None:
+        shared_context_keys.add("capacity_floor_policy_id")
+    context = exact(policy["context"], shared_context_keys, "shared policy context")
+    require({key: context[key] for key in capacity["capacity_key"]} ==
+            capacity["capacity_key"],
+            "shared policy context differs from the capacity key")
+    if selected_floor_policy_id is not None:
+        require(context["capacity_floor_policy_id"] == selected_floor_policy_id,
+                "shared policy context lost the SourceV5 capacity-floor selector")
     policy_capacity = exact(policy["capacity_bundle"], {"request", "artifact", "receipt"}, "shared policy capacity bundle")
     expected_capacity = {name: capacity["pins"][name] for name in ("request", "artifact", "receipt")}
     require(policy_capacity == expected_capacity, "shared policy does not pin the exact prepared capacity producer bundle")
@@ -1461,7 +1554,19 @@ def _verify_context_policy_bundle_v2(
         composition_pin = _raw_pin(member["composition_receipt"], f"context-policy member[{index}] composition receipt")
         composition_receipt, composition_raw, composition_sha = read_canonical(Path(composition_pin["path"]), f"context-policy member[{index}] composition receipt", MAX_CONTEXT_POLICY_BUNDLE_BYTES)
         require(composition_sha == composition_pin["raw_sha256"], f"context-policy member[{index}] composition receipt raw digest differs")
-        require(type(request) is dict and request.get("schema") == "allocatbelt.application-feedback-composition-request.v1", f"context-policy member[{index}] has an unsupported composer request")
+        expected_request_schema = (
+            source_stack["composer"].REQUEST_SCHEMA_V2
+            if selected_floor_policy_id is not None else
+            source_stack["composer"].REQUEST_SCHEMA
+        )
+        require(type(request) is dict and request.get("schema") == expected_request_schema,
+                f"context-policy member[{index}] has an unsupported composer request")
+        if selected_floor_policy_id is None:
+            require("capacity_floor_policy_id" not in request,
+                    f"context-policy member[{index}] static request contains a floor selector")
+        else:
+            require(request.get("capacity_floor_policy_id") == selected_floor_policy_id,
+                    f"context-policy member[{index}] request differs from the SourceV5 floor selector")
         require(request.get("source_root") == str(source_stack["source_root"]), f"context-policy member[{index}] composer source root differs")
         request_source = _raw_pin(request.get("source_manifest"), f"context-policy member[{index}] composer SourceV5 manifest")
         require(request_source == expected_source_pin, f"context-policy member[{index}] composer request uses different SourceV5 bytes")
@@ -1482,8 +1587,17 @@ def _verify_context_policy_bundle_v2(
         except Exception as error:
             raise ReadbackError(f"pinned SourceV5 composer replay failed for member[{index}]: {type(error).__name__}: {error}") from error
         require(canonical_bytes(resolved_replayed) == resolved_raw and canonical_bytes(receipt_replayed) == composition_raw, f"context-policy member[{index}] resolved policy/receipt differs from full SourceV5 composer replay")
-        resolved_context = exact(resolved_policy.get("context"), {"host_id", "workload", "profile", "calibration_id", "allocator"}, f"context-policy member[{index}] resolved context")
+        resolved_context_keys = {
+            "host_id", "workload", "profile", "calibration_id", "allocator",
+        }
+        if selected_floor_policy_id is not None:
+            resolved_context_keys.add("capacity_floor_policy_id")
+        resolved_context = exact(resolved_policy.get("context"), resolved_context_keys,
+                                 f"context-policy member[{index}] resolved context")
         require({key: resolved_context[key] for key in capacity["capacity_key"]} == capacity["capacity_key"] and resolved_context["allocator"] == allocator, f"context-policy member[{index}] resolved policy identity differs")
+        if selected_floor_policy_id is not None:
+            require(resolved_context["capacity_floor_policy_id"] == selected_floor_policy_id,
+                    f"context-policy member[{index}] resolved policy lost the SourceV5 floor selector")
         replayed_members.append({
             "pair": pair, "executor": executor, "allocator": allocator,
             "binary_sha256": probe_pin["binary_sha256"],
@@ -1515,10 +1629,16 @@ def _verify_context_policy_bundle_v2(
         )
     } for row in replayed_members] == resolutions, "shared policy member-resolution references differ from composer-replayed inputs")
     numeric = first["policy"]
+    expected_shared_context = {
+        key: first_context[key]
+        for key in ("host_id", "workload", "profile", "calibration_id")
+    }
+    if selected_floor_policy_id is not None:
+        expected_shared_context["capacity_floor_policy_id"] = selected_floor_policy_id
     expected_shared = {
         "schema": SOURCE5_PRESSURE_POLICY_SCHEMA,
         "source_manifest": expected_source_pin,
-        "context": {key: first_context[key] for key in ("host_id", "workload", "profile", "calibration_id")},
+        "context": expected_shared_context,
         "capacity_bundle": expected_capacity,
         "base_policy_artifact_sha256": first["base_policy_artifact_sha256"],
         "base_policy_sha256": first["base_policy_sha256"],
@@ -2019,7 +2139,10 @@ def _replay_calibration_scope_v2(
     }, "context calibration capacity bundle input")
     require(capacity_pins == scope["capacity_bundle_pins"], "context calibration capacity bundle differs from its independently supplied pin")
     _preflight_scope_replay_paths_v2(scope, context_policy_pin, capacity_pins, observed_host_pin)
-    source_stack = _source5_stack(scope["source_manifest"], scope["source_root"])
+    source_stack = _source5_stack(
+        scope["source_manifest"], scope["source_root"],
+        verify_git_commit=require_local_host,
+    )
     require(
         source_stack["source_raw_sha256"] == scope["source_manifest"]["raw_sha256"]
         and source_stack["source_semantic_sha256"] == scope["source_manifest_semantic_sha256"]
@@ -2230,7 +2353,7 @@ def _scope_receipts_match_replay_v2(stored: dict[str, Any], replayed: dict[str, 
     )
 
 
-def _validate_calibration_v2_recipe(recipe: dict[str, Any]) -> dict[str, Any]:
+def _validate_calibration_v2_recipe(recipe: dict[str, Any], *, offline_context: dict[str, Any] | None = None) -> dict[str, Any]:
     binding = recipe["calibration_scope_v2"]
     calibration_pin = {"path": recipe["pressure_calibration"]["path"], "raw_sha256": recipe["pressure_calibration"]["raw_sha256"]}
     calibration_value, _, calibration_raw_sha = read_canonical(Path(calibration_pin["path"]), "frozen context calibration v2", 64 * 1024 * 1024)
@@ -2295,9 +2418,17 @@ def _validate_calibration_v2_recipe(recipe: dict[str, Any]) -> dict[str, Any]:
         and receipt["readiness_thresholds"] == condition["readiness_thresholds"],
         "stored independent scope receipt differs from the frozen calibration/context pins",
     )
-    replay = verify_calibration_scope_v2(
-        calibration_pin, binding["context_policy"], binding["capacity_bundle_pins"], binding["observed_host"],
-    )
+    if offline_context is None:
+        replay = verify_calibration_scope_v2(
+            calibration_pin, binding["context_policy"], binding["capacity_bundle_pins"], binding["observed_host"],
+        )
+    else:
+        replay = verify_calibration_scope_v2_offline(
+            calibration_pin, binding["context_policy"], binding["capacity_bundle_pins"],
+            binding["observed_host"], source_root=offline_context["source_root"],
+            evidence_path_map=offline_context["evidence_path_map"],
+            host_verification_pin=binding["scope_receipt"],
+        )
     require(
         _scope_receipts_match_replay_v2(receipt, replay),
         "current per-job SourceV5 context no longer matches the independently verified calibration receipt",
@@ -2532,6 +2663,9 @@ def _validate_run(value: object, expected: dict[str, str]) -> dict[str, Any]:
 
 
 def _pid_same(pid: int, start_ticks: int) -> bool:
+    offline_context = _PRESSURE_OFFLINE_REPLAY_CONTEXT.get()
+    if offline_context is not None:
+        return (pid, start_ticks) not in offline_context["origin_absent_identities"]
     try:
         raw = Path(f"/proc/{pid}/stat").read_bytes()
         text_value = raw.decode("ascii").strip()
@@ -2640,7 +2774,7 @@ def verify_pressure(
     recipe = recipe_value
     _verify_script_hashes(recipe_info)
     _verify_raw_inputs(recipe_info)
-    calibration_scope_readback = _validate_calibration(recipe)
+    calibration_scope_readback = _validate_calibration(recipe, offline_context=_PRESSURE_OFFLINE_REPLAY_CONTEXT.get())
     try:
         dir_info = artifacts.lstat()
         require(stat.S_ISDIR(dir_info.st_mode) and artifacts.resolve(strict=True) == artifacts, "artifact directory is a symlink or alias")
@@ -2944,6 +3078,1327 @@ def _validate_event_timeline(
             "end_monotonic_ns": continuous_ready_end_ns,
         },
     }
+
+
+def _pressure_absolute_json_paths(value: object) -> set[str]:
+    path_keys = {
+        "path", "source_root", "output_root", "binary_path", "executable_path",
+        "cwd", "tmpdir", "trace_directory", "directory", "pressure_scratch_path",
+        "application_tmpdir_path", "mount_point",
+    }
+    result: set[str] = set()
+
+    def visit(item: object, argv_context: bool = False) -> None:
+        if type(item) is dict:
+            for key, child in item.items():
+                if key in path_keys and type(child) is str and child.startswith("/"):
+                    result.add(child)
+                if key in {"argv", "requested_argv", "executed_argv", "probe_argv"}:
+                    visit(child, True)
+                elif key == "environment" and type(child) is dict:
+                    temp = child.get("TMPDIR")
+                    if type(temp) is str and temp.startswith("/"):
+                        result.add(temp)
+                    visit(child)
+                else:
+                    visit(child, argv_context)
+        elif type(item) is list:
+            for child in item:
+                visit(child, argv_context)
+        elif argv_context and type(item) is str and item.startswith("/"):
+            result.add(item)
+
+    visit(value)
+    return result
+
+
+
+def _preflight_pressure_json_path_closure(
+    documents: list[dict[str, Any]], mapped_paths: frozenset[str],
+    mapped_directories: set[str],
+) -> None:
+    """Walk every mapped JSON dependency before any validator module is executed."""
+    pending: list[dict[str, Any]] = list(documents)
+    queued: set[str] = set()
+    json_suffixes = (".json",)
+    while pending:
+        document = pending.pop()
+        referenced = _pressure_absolute_json_paths(document)
+        for raw_path in referenced:
+            require(raw_path in mapped_paths,
+                    f"offline pressure evidence map omits exact nested dependency: {raw_path}")
+        for raw_path in referenced:
+            if not raw_path.endswith(json_suffixes) or raw_path in queued:
+                continue
+            queued.add(raw_path)
+            require(raw_path in mapped_paths and raw_path not in mapped_directories,
+                    f"offline pressure JSON dependency is not an explicitly mapped file: {raw_path}")
+            child, _raw, _raw_sha = read_canonical(
+                Path(raw_path), "offline pressure nested JSON dependency", MAX_OFFLINE_JSON_BYTES,
+            )
+            pending.append(child)
+            require(len(queued) <= 4096,
+                    "offline pressure nested JSON dependency set exceeds its finite limit")
+
+
+def _validate_pressure_pair_host_receipt(
+    pin_value: object,
+) -> tuple[dict[str, Any], str, dict[str, Any]]:
+    pin = exact(pin_value, {"path", "raw_sha256", "receipt_sha256"},
+                "pressure-pair host-verification receipt pin")
+    path = absolute_path(pin["path"], "pressure-pair host-verification receipt path")
+    raw_sha = sha256(pin["raw_sha256"], "pressure-pair host receipt raw SHA-256")
+    receipt_sha = sha256(pin["receipt_sha256"], "pressure-pair host receipt semantic SHA-256")
+    receipt, raw, actual_raw = read_canonical(path, "pressure-pair host-verification receipt", 16 * 1024 * 1024)
+    info = path.lstat()
+    require(actual_raw == raw_sha and stat.S_ISREG(info.st_mode) and info.st_uid == os.getuid() and
+            stat.S_IMODE(info.st_mode) == 0o600,
+            "pressure-pair host receipt is not the exact owned mode-0600 pinned file")
+    exact(receipt, {
+        "schema", "campaign_id", "host_id", "job", "recipe", "readback",
+        "source_manifest", "spec", "plan", "execution_manifest", "authorization_id",
+        "journal_head", "registration_head", "observed_host", "origin_facts",
+        "dependency_pins", "member_facts", "strict_result_sha256",
+        "qualification_eligible", "execution_ready", "receipt_sha256",
+    }, "pressure-pair host-verification receipt")
+    body = {key: value for key, value in receipt.items() if key != "receipt_sha256"}
+    require(receipt["schema"] == PRESSURE_PAIR_HOST_VERIFICATION_SCHEMA and
+            raw == canonical_bytes(receipt),
+            "pressure-pair host receipt schema or canonical bytes differ")
+    require(receipt_sha == receipt["receipt_sha256"] == digest_object(body),
+            "pressure-pair host receipt raw/semantic digest roles differ")
+    require(receipt["qualification_eligible"] is False and receipt["execution_ready"] is False,
+            "pressure-pair host receipt false eligibility fields differ")
+    token(receipt["campaign_id"], "pressure-pair receipt campaign ID")
+    token(receipt["host_id"], "pressure-pair receipt host ID")
+    job = exact(receipt["job"], {"run_id", "ordinal", "job_index", "semantic_sha256"},
+                "pressure-pair host receipt original job")
+    token(job["run_id"], "pressure-pair receipt original run ID")
+    uint(job["ordinal"], "pressure-pair receipt ordinal", positive=True)
+    uint(job["job_index"], "pressure-pair receipt original job index")
+    sha256(job["semantic_sha256"], "pressure-pair receipt job semantic digest")
+    for label, expected_keys in (
+        ("recipe", {"path", "raw_sha256", "semantic_sha256"}),
+        ("readback", {"path", "raw_sha256", "semantic_sha256"}),
+        ("spec", {"path", "raw_sha256", "semantic_sha256"}),
+        ("plan", {"path", "raw_sha256", "semantic_sha256"}),
+    ):
+        item = exact(receipt[label], expected_keys, f"pressure-pair receipt {label} pin")
+        absolute_path(item["path"], f"pressure-pair receipt {label} path")
+        sha256(item["raw_sha256"], f"pressure-pair receipt {label} raw SHA-256")
+        sha256(item["semantic_sha256"], f"pressure-pair receipt {label} semantic SHA-256")
+    source = exact(receipt["source_manifest"], {
+        "path", "raw_sha256", "semantic_sha256", "source_tree_sha256",
+    }, "pressure-pair receipt SourceV5 manifest")
+    absolute_path(source["path"], "pressure-pair receipt SourceV5 path")
+    for name in ("raw_sha256", "semantic_sha256", "source_tree_sha256"):
+        sha256(source[name], f"pressure-pair receipt SourceV5 {name}")
+    execution = exact(receipt["execution_manifest"], {
+        "path", "raw_sha256", "semantic_sha256",
+    }, "pressure-pair receipt execution manifest")
+    absolute_path(execution["path"], "pressure-pair receipt execution manifest path")
+    for name in ("raw_sha256", "semantic_sha256"):
+        sha256(execution[name], f"pressure-pair receipt execution manifest {name}")
+    token(receipt["authorization_id"], "pressure-pair receipt authorization ID")
+    sha256(receipt["journal_head"], "pressure-pair receipt journal head")
+    sha256(receipt["registration_head"], "pressure-pair receipt registration head")
+    observed = exact(receipt["observed_host"], {"path", "raw_sha256"},
+                     "pressure-pair receipt observed-host pin")
+    absolute_path(observed["path"], "pressure-pair receipt observed-host path")
+    sha256(observed["raw_sha256"], "pressure-pair receipt observed-host raw SHA-256")
+    origin = exact(receipt["origin_facts"], {
+        "schema", "host_id", "observed_host_raw_sha256", "before", "after",
+        "storage_sha256", "origin_facts_sha256",
+    }, "pressure-pair receipt origin facts")
+    origin_body = {key: value for key, value in origin.items() if key != "origin_facts_sha256"}
+    require(origin["schema"] == PRESSURE_PAIR_ORIGIN_FACTS_SCHEMA and
+            origin["host_id"] == receipt["host_id"] and
+            origin["observed_host_raw_sha256"] == observed["raw_sha256"] and
+            origin["origin_facts_sha256"] == digest_object(origin_body),
+            "pressure-pair origin facts schema, host, or self digest differs")
+    sha256(origin["storage_sha256"], "pressure-pair origin storage digest")
+    host_fact_keys = {"boot_id_sha256", "kernel_release", "cpu_affinity", "network_namespace_inode"}
+    for phase in ("before", "after"):
+        facts = exact(origin[phase], host_fact_keys, f"pressure-pair {phase} host facts")
+        sha256(facts["boot_id_sha256"], f"pressure-pair {phase} boot ID digest")
+        text(facts["kernel_release"], f"pressure-pair {phase} kernel release", 256)
+        affinity = facts["cpu_affinity"]
+        require(type(affinity) is list and affinity and
+                affinity == sorted(set(uint(cpu, f"pressure-pair {phase} CPU", maximum=65535) for cpu in affinity)),
+                f"pressure-pair {phase} CPU affinity is malformed")
+        uint(facts["network_namespace_inode"], f"pressure-pair {phase} network namespace", positive=True)
+    require(origin["before"] == origin["after"],
+            "pressure-pair host identity changed during strict verification")
+    deps = receipt["dependency_pins"]
+    require(type(deps) is dict and set(deps) == {
+        "campaign_controller", "campaign_chronology", "feedback_composition",
+        "feedback_validator", "pressure_validator", "soak_supervisor",
+        "capacity_producer", "pressure_pair", "pressure_driver",
+        "source_inventory", "fixed_pair", "source5_helper_input", "source5_helper_module",
+    }, "pressure-pair host receipt dependency pin set differs")
+    for name, value in deps.items():
+        dep = exact(value, {"path", "raw_sha256"}, f"pressure-pair dependency {name}")
+        text(dep["path"], f"pressure-pair dependency {name} path", 4096)
+        sha256(dep["raw_sha256"], f"pressure-pair dependency {name} raw SHA-256")
+    sha256(receipt["strict_result_sha256"], "pressure-pair strict result digest")
+    require(type(receipt["member_facts"]) is list and len(receipt["member_facts"]) == 2,
+            "pressure-pair host receipt must retain exactly two original members")
+    seen_identities: set[tuple[int, int]] = set()
+    for index, value in enumerate(receipt["member_facts"]):
+        row = exact(value, {
+            "ordinal", "descriptor", "identity", "pressure_recipe", "pressure_artifacts",
+            "application_identity", "worker_identities", "pid_absence", "probe_capture",
+            "application_launch_attestation", "application_cleanup", "supervision_receipt",
+            "storage_proof",
+        }, f"pressure-pair host member[{index}]")
+        require(row["ordinal"] == index, "pressure-pair host receipt member order differs from the original pair")
+        exact(row["descriptor"], {"pair", "executor", "allocator"}, "pressure-pair host member descriptor")
+        identity = row["identity"]
+        require(type(identity) is dict and identity.get("host_id") == receipt["host_id"],
+                "pressure-pair host member identity differs from its host")
+        pressure_recipe = exact(row["pressure_recipe"], {
+            "path", "raw_sha256", "semantic_sha256", "condition_sha256",
+        }, "pressure-pair host member pressure recipe")
+        absolute_path(pressure_recipe["path"], "pressure-pair host member recipe path")
+        for key in ("raw_sha256", "semantic_sha256", "condition_sha256"):
+            sha256(pressure_recipe[key], f"pressure-pair host member recipe {key}")
+        pressure = exact(row["pressure_artifacts"], {
+            "directory", "pins", "proof", "ready_sha256", "driver", "worker_sessions", "driver_logs",
+        }, "pressure-pair host member pressure artifacts")
+        absolute_path(pressure["directory"], "pressure-pair host member pressure directory")
+        exact(pressure["pins"], {"events", "launch", "process_binding", "ready", "run"},
+              "pressure-pair host member pressure artifact pins")
+        for key, value in pressure["pins"].items():
+            sha256(value, f"pressure-pair host member pressure {key} raw SHA-256")
+        proof = exact(pressure["proof"], {"path", "raw_sha256"}, "pressure-pair host member proof pin")
+        absolute_path(proof["path"], "pressure-pair host member proof path")
+        sha256(proof["raw_sha256"], "pressure-pair host member proof raw SHA-256")
+        app_identity = exact(row["application_identity"], {"pid", "start_ticks"},
+                             "pressure-pair member APP identity")
+        app_key = (uint(app_identity["pid"], "pressure-pair member APP PID", positive=True,
+                         maximum=(1 << 31) - 1),
+                   uint(app_identity["start_ticks"], "pressure-pair member APP start ticks", positive=True))
+        require(app_key not in seen_identities, "pressure-pair host receipt repeats a process identity")
+        seen_identities.add(app_key)
+        workers = row["worker_identities"]
+        require(type(workers) is list and 1 <= len(workers) <= MAX_SAMPLE_COUNT,
+                "pressure-pair host member worker identity list is malformed")
+        for worker_value in workers:
+            worker = exact(worker_value, {"role", "cpu", "pid", "start_ticks", "pgid", "session_id"},
+                           "pressure-pair host member worker identity")
+            key = (uint(worker["pid"], "pressure-pair worker PID", positive=True,
+                        maximum=(1 << 31) - 1),
+                   uint(worker["start_ticks"], "pressure-pair worker start ticks", positive=True))
+            uint(worker["pgid"], "pressure-pair worker process group", positive=True,
+                 maximum=(1 << 31) - 1)
+            uint(worker["session_id"], "pressure-pair worker session", positive=True,
+                 maximum=(1 << 31) - 1)
+            require(key not in seen_identities, "pressure-pair host receipt repeats a worker identity")
+            seen_identities.add(key)
+        absence = row["pid_absence"]
+        require(type(absence) is list and len(absence) == 1 + len(workers),
+                "pressure-pair member origin-host absence receipt is sparse")
+        absent_seen: set[tuple[int, int]] = set()
+        for absence_value in absence:
+            item = exact(absence_value, {"pid", "start_ticks", "absent", "observed_monotonic_ns"},
+                         "pressure-pair origin PID absence observation")
+            key = (uint(item["pid"], "pressure-pair absent PID", positive=True,
+                        maximum=(1 << 31) - 1),
+                   uint(item["start_ticks"], "pressure-pair absent start ticks", positive=True))
+            require(item["absent"] is True and key not in absent_seen,
+                    "pressure-pair host receipt lacks a unique positive PID absence observation")
+            uint(item["observed_monotonic_ns"], "pressure-pair PID absence observation time", positive=True)
+            absent_seen.add(key)
+        require(absent_seen == {app_key} | {
+            (item["pid"], item["start_ticks"]) for item in workers
+        }, "pressure-pair absence identities differ from its original APP/worker set")
+        capture = exact(row["probe_capture"], {
+            "construction_probe", "capture_receipt", "capacity_bundle",
+        }, "pressure-pair member ProbeV2 capture binding")
+        probe_pin = exact(capture["construction_probe"], {
+            "path", "raw_sha256", "allocator", "binary_sha256",
+        }, "pressure-pair member original construction probe")
+        absolute_path(probe_pin["path"], "pressure-pair member construction probe path")
+        sha256(probe_pin["raw_sha256"], "pressure-pair member construction probe raw SHA-256")
+        sha256(probe_pin["binary_sha256"], "pressure-pair member construction probe binary SHA-256")
+        text(probe_pin["allocator"], "pressure-pair member construction probe allocator", 64)
+        capture_pin = exact(capture["capture_receipt"], {
+            "path", "raw_sha256", "receipt_sha256",
+        }, "pressure-pair member ProbeV2 capture receipt pin")
+        absolute_path(capture_pin["path"], "pressure-pair member ProbeV2 capture receipt path")
+        sha256(capture_pin["raw_sha256"], "pressure-pair member ProbeV2 receipt raw SHA-256")
+        sha256(capture_pin["receipt_sha256"], "pressure-pair member ProbeV2 receipt semantic SHA-256")
+        capacity_bundle = exact(capture["capacity_bundle"], {"request", "artifact", "receipt"},
+                                "pressure-pair member ProbeV2 capacity bundle")
+        for name, capacity_pin_value in capacity_bundle.items():
+            capacity_pin = exact(capacity_pin_value, {"path", "raw_sha256"},
+                                 f"pressure-pair member ProbeV2 capacity {name}")
+            absolute_path(capacity_pin["path"], f"pressure-pair member ProbeV2 capacity {name} path")
+            sha256(capacity_pin["raw_sha256"], f"pressure-pair member ProbeV2 capacity {name} raw SHA-256")
+        for name in ("application_launch_attestation", "application_cleanup", "supervision_receipt"):
+            artifact = exact(row[name], {"path", "raw_sha256"}, f"pressure-pair member {name} pin")
+            absolute_path(artifact["path"], f"pressure-pair member {name} path")
+            sha256(artifact["raw_sha256"], f"pressure-pair member {name} raw SHA-256")
+        storage = exact(row["storage_proof"], {
+            "application_tmpdir_path", "pressure_scratch_path", "application_mount_id",
+            "storage_sha256",
+        }, "pressure-pair member storage proof")
+        absolute_path(storage["application_tmpdir_path"], "pressure-pair member TMPDIR")
+        absolute_path(storage["pressure_scratch_path"], "pressure-pair member scratch path")
+        uint(storage["application_mount_id"], "pressure-pair member application mount", positive=True)
+        sha256(storage["storage_sha256"], "pressure-pair member storage digest")
+    require(len(seen_identities) == sum(1 + len(row["worker_identities"]) for row in receipt["member_facts"]),
+            "pressure-pair host receipt repeats a process identity across members")
+    require(origin["storage_sha256"] == digest_object([
+        row["storage_proof"]["storage_sha256"] for row in receipt["member_facts"]
+    ]), "pressure-pair origin storage digest differs from the two member proofs")
+    return receipt, actual_raw, pin
+
+
+def verify_pressure_offline(
+    pressure_recipe_pin: object,
+    pressure_artifacts: object,
+    host_verification_pin: object,
+    *, evidence_path_map: object,
+    source_root: object,
+) -> dict[str, Any]:
+    """Replay one pressure run off-host using its exact member of a strict pair receipt.
+
+    The reader recomputes recipe, calibration, launch, event, sample, readiness,
+    and cleanup structure from original bytes. PID absence is accepted only for
+    exact identities in the strict origin-host receipt; this API never probes
+    the coordinator's process table or launches the peer APP/worker.
+    """
+    recipe_pin = exact(pressure_recipe_pin, {
+        "path", "raw_sha256", "semantic_sha256", "condition_sha256",
+    }, "offline pressure recipe pin")
+    recipe_path = absolute_path(recipe_pin["path"], "offline pressure recipe path")
+    for name in ("raw_sha256", "semantic_sha256", "condition_sha256"):
+        sha256(recipe_pin[name], f"offline pressure recipe {name}")
+    artifact_value = exact(pressure_artifacts, {
+        "directory", "pins", "proof", "ready_sha256", "driver", "worker_sessions", "driver_logs",
+    }, "offline pressure artifacts")
+    artifact_root = absolute_path(artifact_value["directory"], "offline pressure artifact directory")
+    pins = exact(artifact_value["pins"], {"events", "launch", "process_binding", "ready", "run"},
+                 "offline pressure raw artifact pins")
+    pins = {name: sha256(value, f"offline pressure {name} raw SHA-256") for name, value in pins.items()}
+    require(artifact_value["ready_sha256"] == pins["ready"],
+            "offline pressure ready digest differs from the frozen ready artifact pin")
+    driver_logs = exact(artifact_value["driver_logs"], {"stdout", "stderr"},
+                        "offline pressure driver log pins")
+    for label, log_value in driver_logs.items():
+        log_pin = exact(log_value, {"path", "raw_sha256"},
+                        f"offline pressure driver {label} log pin")
+        absolute_path(log_pin["path"], f"offline pressure driver {label} log path")
+        sha256(log_pin["raw_sha256"], f"offline pressure driver {label} log raw SHA-256")
+    proof_pin = exact(artifact_value["proof"], {"path", "raw_sha256"}, "offline pressure proof pin")
+    proof_path = absolute_path(proof_pin["path"], "offline pressure proof path")
+    sha256(proof_pin["raw_sha256"], "offline pressure proof raw SHA-256")
+    source_root_path = absolute_path(source_root, "offline pressure SourceV5 root")
+    mapping, directories = _normalize_evidence_path_map(evidence_path_map, source_root_path)
+    mapped_paths = frozenset(mapping)
+    mapped_files = frozenset(path for path in mapping if path not in directories)
+    raw_host_pin = exact(host_verification_pin, {
+        "path", "raw_sha256", "receipt_sha256",
+    }, "offline pressure-pair host receipt pin")
+    absolute_path(raw_host_pin["path"], "offline pressure-pair host receipt path")
+    sha256(raw_host_pin["raw_sha256"], "offline pressure-pair host receipt raw SHA-256")
+    sha256(raw_host_pin["receipt_sha256"], "offline pressure-pair host receipt semantic SHA-256")
+    require(raw_host_pin["path"] in mapped_files,
+            "offline pressure evidence map omits the strict origin-host receipt")
+    require(str(recipe_path) in mapped_files and str(artifact_root) in directories and
+            str(proof_path) in mapped_files,
+            "offline pressure evidence map omits a top-level pinned input")
+    for log_value in driver_logs.values():
+        log_pin = exact(log_value, {"path", "raw_sha256"}, "offline pressure driver log pin")
+        require(log_pin["path"] in mapped_files,
+                "offline pressure evidence map omits an exact driver log")
+    for path in (artifact_root / "events.jsonl", artifact_root / "process-binding.json",
+                 artifact_root / "launch-record.json", artifact_root / "run.json",
+                 artifact_root / "pressure-ready.json"):
+        require(str(path) in mapped_files,
+                f"offline pressure evidence map omits exact artifact member: {path}")
+    for log_value in driver_logs.values():
+        log_pin = exact(log_value, {"path", "raw_sha256"}, "offline pressure driver log pin")
+        require(log_pin["path"] in mapped_files,
+                "offline pressure evidence map omits an exact driver log")
+    raw_recipe, recipe_raw_sha = read_stable(recipe_path, "offline frozen pressure recipe", MAX_RECIPE_BYTES)
+    require(recipe_raw_sha == recipe_pin["raw_sha256"],
+            "offline pressure recipe raw SHA-256 differs from its strict member pin")
+    recipe_value = parse_object(raw_recipe, "offline frozen pressure recipe", MAX_RECIPE_BYTES)
+    require(raw_recipe == canonical_bytes(recipe_value), "offline pressure recipe is not canonical JSON")
+    require(recipe_pin["semantic_sha256"] == digest_object({
+        key: value for key, value in recipe_value.items() if key != "recipe_sha256"
+    }), "offline pressure recipe semantic digest differs from original bytes")
+    required_paths = _pressure_absolute_json_paths(recipe_value)
+    for path in required_paths:
+        require(path in mapped_paths,
+                f"offline pressure path map omits an exact nested recipe dependency: {path}")
+    source_pin = exact(recipe_value.get("files", {}).get("source_manifest"),
+                       {"path", "raw_sha256"}, "offline pressure SourceV5 manifest pin")
+    require(source_pin["path"] in mapped_files,
+            "offline pressure path map omits the typed SourceV5 manifest")
+    source_manifest, _source_raw, source_raw_sha = read_canonical(
+        Path(source_pin["path"]), "offline pressure SourceV5 manifest", MAX_SOURCE_BYTES,
+    )
+    require(source_raw_sha == source_pin["raw_sha256"],
+            "offline pressure SourceV5 manifest raw digest differs")
+    source = exact(source_manifest.get("source"), {
+        "git_commit", "source_tree_sha256", "cargo_lock_sha256", "files",
+    }, "offline pressure typed SourceV5 inventory")
+    require(type(source["files"]) is list and len(source["files"]) <= 1_000_000,
+            "offline pressure SourceV5 source inventory is malformed")
+    inventory_paths: set[str] = set()
+    for index, entry_value in enumerate(source["files"]):
+        entry = exact(entry_value, {"path", "kind", "mode", "sha256", "size"},
+                      f"offline pressure SourceV5 inventory[{index}]")
+        relative = PurePosixPath(text(entry["path"], "offline pressure inventory path", 4096))
+        require(not relative.is_absolute() and ".." not in relative.parts and
+                relative.as_posix() == entry["path"] and entry["kind"] == "file" and
+                entry["mode"] in ("100644", "100755"),
+                "offline pressure SourceV5 inventory entry is not a typed regular file")
+        inventory_path = str(source_root_path.joinpath(*relative.parts))
+        inventory_paths.add(inventory_path)
+    artifact_paths: set[str] = set()
+    artifacts = source_manifest.get("artifacts")
+    require(type(artifacts) is dict, "offline pressure SourceV5 artifact inventory is malformed")
+    for artifact_value in artifacts.values():
+        artifact = exact(artifact_value, {"path", "sha256"}, "offline pressure SourceV5 artifact")
+        relative = PurePosixPath(text(artifact["path"], "offline pressure artifact path", 4096))
+        require(not relative.is_absolute() and ".." not in relative.parts and
+                relative.as_posix() == artifact["path"],
+                "offline pressure SourceV5 artifact path is not portable")
+        artifact_paths.add(str(source_root_path.joinpath(*relative.parts)))
+    require(inventory_paths | artifact_paths <= mapped_files,
+            "offline pressure evidence map omits a typed SourceV5 source or artifact member")
+    host_receipt, host_receipt_raw_sha, host_pin = _validate_pressure_pair_host_receipt(
+        raw_host_pin,
+    )
+    _preflight_pressure_json_path_closure(
+        [recipe_value, host_receipt], mapped_paths, directories,
+    )
+    pressure_semantic = recipe_pin["semantic_sha256"]
+    candidates = [row for row in host_receipt["member_facts"]
+                  if row["pressure_recipe"]["path"] == str(recipe_path)]
+    require(len(candidates) == 1, "strict host receipt does not contain exactly one matching pressure member")
+    member = candidates[0]
+    require(member["pressure_recipe"] == recipe_pin and
+            member["pressure_artifacts"] == artifact_value,
+            "strict host receipt member differs from the exact recipe/artifact input pins")
+    for label, log_value in driver_logs.items():
+        log_pin = exact(log_value, {"path", "raw_sha256"},
+                        f"strict host pressure driver {label} log pin")
+        log_raw, log_sha = read_stable(
+            Path(log_pin["path"]), f"offline pressure driver {label} log", MAX_EVENTS_BYTES,
+        )
+        require(log_sha == log_pin["raw_sha256"] and len(log_raw) <= MAX_EVENTS_BYTES,
+                f"offline pressure driver {label} log bytes differ from the strict member receipt")
+    recipe = _validate_recipe(recipe_value, pressure_semantic)
+    require(recipe["schema"] == RECIPE_SCHEMA_V2 and "calibration_scope_v2" in recipe,
+            "offline pressure replay requires the original Source5 context-scoped calibration v2")
+    require(recipe["identity"]["host_id"] == host_receipt["host_id"] and
+            recipe_pin["condition_sha256"] == recipe["condition_sha256"],
+            "offline pressure recipe host/condition differs from its strict pair receipt")
+    member_identity = member["identity"]
+    require(member_identity["host_id"] == recipe["identity"]["host_id"] and
+            member_identity["run_id"] == recipe["identity"]["run_id"] and
+            member_identity["allocator"] == recipe["identity"]["allocator"] and
+            member_identity["executor"] == recipe["identity"]["executor"] and
+            member_identity["pressure_nonce"] == recipe["identity"]["nonce"] and
+            member["descriptor"]["allocator"] == recipe["identity"]["allocator"],
+            "offline pressure recipe differs from its original normal-APP pair descriptor")
+    storage_proof = member["storage_proof"]
+    require(storage_proof == {
+        "application_tmpdir_path": recipe["process"]["application_tmpdir_path"],
+        "pressure_scratch_path": recipe["storage"]["pressure_scratch_path"],
+        "application_mount_id": recipe["storage"]["application_mount_id"],
+        "storage_sha256": digest_object({
+            "application_storage": recipe["host"]["application_storage"],
+            "pressure_scratch": recipe["host"]["pressure_scratch"],
+            "storage": recipe["storage"],
+        }),
+    }, "strict pair storage/TMPDIR proof differs from the pressure recipe")
+    expected = {"recipe": pressure_semantic, **pins}
+    launch, _launch_raw, _launch_sha = read_canonical(
+        artifact_root / "launch-record.json", "offline pressure launch record", MAX_LAUNCH_BYTES,
+        pins["launch"],
+    )
+    process = _validate_launch(launch, recipe, pins["launch"])
+    run_value, _run_raw, _run_sha = read_canonical(
+        artifact_root / "run.json", "offline pressure run receipt", MAX_MANIFEST_BYTES,
+        pins["run"],
+    )
+    run = _validate_run(run_value, expected)
+    require(member["application_identity"] == {
+        "pid": process["pid"], "start_ticks": process["start_ticks"],
+    }, "strict pair receipt APP identity differs from the pressure launch record")
+    run_workers = {
+        (item["role"], item["cpu"], item["pid"], item["start_ticks"], item["pgid"], item["session_id"])
+        for item in run["worker_cleanup"]
+    }
+    host_workers = {
+        (item["role"], item["cpu"], item["pid"], item["start_ticks"], item["pgid"], item["session_id"])
+        for item in member["worker_identities"]
+    }
+    require(host_workers == run_workers,
+            "strict pair receipt pressure worker identities differ from the raw run cleanup rows")
+    identity_keys = {(process["pid"], process["start_ticks"])}
+    for record in run["worker_cleanup"]:
+        identity_keys.add((record["pid"], record["start_ticks"]))
+    absences = member["pid_absence"]
+    absence_by_identity = {(item["pid"], item["start_ticks"]): item for item in absences}
+    require(set(absence_by_identity) == identity_keys and len(absence_by_identity) == len(absences),
+            "strict host receipt does not bind every exact pressure APP/worker PID-start identity")
+    for pid, start_ticks in identity_keys:
+        require(absence_by_identity[(pid, start_ticks)]["observed_monotonic_ns"] >= run["finish_monotonic_ns"],
+                "strict host PID absence observation predates pressure cleanup completion")
+    receipt_origin = host_receipt["origin_facts"]
+    require(receipt_origin["host_id"] == recipe["identity"]["host_id"] and
+            receipt_origin["observed_host_raw_sha256"] == recipe["calibration_scope_v2"]["observed_host"]["raw_sha256"],
+            "strict host identity receipt differs from the exact pressure calibration observation")
+    offline_context = types.MappingProxyType({
+        "source_root": str(source_root_path),
+        "evidence_path_map": evidence_path_map,
+        "origin_absent_identities": frozenset(identity_keys),
+        "host_receipt_pin": types.MappingProxyType(dict(host_pin)),
+        "host_receipt_raw_sha256": host_receipt_raw_sha,
+    })
+    token_value = _EVIDENCE_PATH_MAP_CONTEXT.set((mapping, directories))
+    replay_token = _PRESSURE_OFFLINE_REPLAY_CONTEXT.set(dict(offline_context))
+    try:
+        result = verify_pressure(recipe_path, pressure_semantic, artifact_root, expected)
+        proof_value, proof_raw, proof_raw_sha = read_canonical(
+            proof_path, "offline pressure proof output", MAX_PRESSURE_PROOF_BYTES,
+            proof_pin["raw_sha256"],
+        )
+        require(proof_raw_sha == proof_pin["raw_sha256"] and proof_raw == canonical_bytes(result) and
+                proof_value == result,
+                "offline pressure replay differs from its exact original proof bytes")
+        require(result["identity"]["host_id"] == host_receipt["host_id"] and
+                result["recipe_raw_sha256"] == recipe_pin["raw_sha256"],
+                "offline pressure readback differs from the host receipt's original generation")
+        calibration = exact(result.get("calibration_scope_v2"), {
+            "schema", "replay_success", "validated", "execution_ready", "qualification_eligible",
+            "controller_chronology_proven", "calibration_raw_sha256", "calibration_sha256",
+            "scope_sha256", "condition_id", "pressure_calibration_id", "capacity_key",
+            "condition_sha256", "source_manifest_sha256", "source_manifest_semantic_sha256",
+            "source_tree_sha256", "context_policy_bundle_raw_sha256",
+            "context_policy_artifact_raw_sha256", "context_policy_sha256",
+            "capacity_bundle_pins_sha256", "capacity_tsv_raw_sha256", "observed_host_raw_sha256",
+            "host_verification", "driver_sha256", "reader_sha256", "capacity_producer_sha256",
+            "feedback_composer_sha256", "feedback_reader_sha256", "sample_count",
+            "samples_sha256", "summary", "pressure_thresholds", "readiness_thresholds",
+            "suggested_readiness_thresholds", "worker_cleanup_sha256", "worker_session_count",
+            "scratch_file_removed", "receipt_sha256",
+        }, "offline pressure calibration scope receipt")
+        origin = host_receipt["origin_facts"]
+        host_verification = calibration["host_verification"]
+        require(host_verification["host_id"] == origin["host_id"] and
+                host_verification["boot_id_sha256"] == origin["before"]["boot_id_sha256"] ==
+                origin["after"]["boot_id_sha256"] and
+                host_verification["kernel_release"] == origin["before"]["kernel_release"] ==
+                origin["after"]["kernel_release"] and
+                host_verification["allowed_cpu_affinity"] == origin["before"]["cpu_affinity"] ==
+                origin["after"]["cpu_affinity"] and
+                host_verification["network_namespace_inode"] ==
+                origin["before"]["network_namespace_inode"] == origin["after"]["network_namespace_inode"] and
+                host_verification["observed_host_raw_sha256"] == origin["observed_host_raw_sha256"],
+                "strict pair host facts differ from the independent calibration host receipt")
+        return result
+    finally:
+        _PRESSURE_OFFLINE_REPLAY_CONTEXT.reset(replay_token)
+        _EVIDENCE_PATH_MAP_CONTEXT.reset(token_value)
+
+
+def _validate_source5_soak_host_receipt_v2(
+    pin_value: object,
+) -> tuple[dict[str, Any], str, dict[str, str]]:
+    """Validate the separate single-APP Soak host receipt without pair coercion."""
+    pin = exact(pin_value, {"path", "raw_sha256", "receipt_sha256"},
+                "Source5 Soak host-verification receipt pin")
+    path = absolute_path(pin["path"], "Source5 Soak host receipt path")
+    raw_sha = sha256(pin["raw_sha256"], "Source5 Soak host receipt raw SHA-256")
+    receipt_sha = sha256(pin["receipt_sha256"], "Source5 Soak host receipt semantic SHA-256")
+    receipt, raw, actual_raw = read_canonical(
+        path, "Source5 Soak host-verification receipt",
+        MAX_SOURCE5_SOAK_HOST_RECEIPT_BYTES,
+    )
+    info = path.lstat()
+    require(actual_raw == raw_sha and stat.S_ISREG(info.st_mode) and
+            info.st_uid == os.getuid() and stat.S_IMODE(info.st_mode) == 0o600,
+            "Source5 Soak host receipt is not the exact owned mode-0600 pinned file")
+    fields = {
+        "schema", "campaign_id", "host_id", "run_id", "component_sha256",
+        "component_pins", "generation", "prepared_host_context_pin",
+        "fixed_spec_host_pin", "observed_host_pin",
+        "prepared_host_binding_sha256", "helper_input_pin",
+        "construction_probe", "pressure_origin", "origin_host",
+        "process_absence", "tree_roots", "evidence_inventory",
+        "evidence_bases", "readback_sha256", "bounded_execution_ready",
+        "bounded_blockers", "qualification_eligible", "execution_ready",
+        "receipt_sha256",
+    }
+    exact(receipt, fields, "Source5 Soak host-verification receipt")
+    body = {key: value for key, value in receipt.items()
+            if key != "receipt_sha256"}
+    require(receipt["schema"] ==
+            "allocatbelt.application-source5-soak-host-verification.v2" and
+            receipt["receipt_sha256"] == receipt_sha == digest_object(body) and
+            receipt["bounded_execution_ready"] is False and
+            receipt["bounded_blockers"] == [
+                "prospective_bounded_soak_resource_budget_not_pinned",
+            ] and receipt["qualification_eligible"] is False and
+            receipt["execution_ready"] is False,
+            "Source5 Soak host receipt schema/digest/status differs")
+    token(receipt["campaign_id"], "Source5 Soak host receipt campaign")
+    token(receipt["host_id"], "Source5 Soak host receipt host")
+    token(receipt["run_id"], "Source5 Soak host receipt run")
+    for name in ("component_sha256", "prepared_host_binding_sha256",
+                 "readback_sha256"):
+        sha256(receipt[name], f"Source5 Soak host receipt {name}")
+    component_pins = exact(receipt["component_pins"], {
+        "materials_index", "parent_recipe", "build_receipt", "preflight",
+        "launch_authorization", "supervisor", "launch", "postflight",
+        "readback",
+    }, "Source5 Soak component raw pins")
+    for name, value in component_pins.items():
+        _raw_pin(value, f"Source5 Soak component {name}")
+    generation = receipt["generation"]
+    require(type(generation) is dict and
+            generation.get("campaign_id") == receipt["campaign_id"] and
+            generation.get("host_id") == receipt["host_id"] and
+            type(generation.get("job")) is dict and
+            generation["job"].get("run_id") == receipt["run_id"] and
+            generation["job"].get("phase") == "soak",
+            "Source5 Soak host receipt changed its original generation/job")
+    source_generation = exact(generation.get("source_manifest"), {
+        "path", "raw_sha256", "semantic_sha256", "source_tree_sha256",
+    }, "Source5 Soak selected SourceV5 generation")
+    absolute_path(source_generation["path"], "Source5 Soak selected source manifest path")
+    for name in ("raw_sha256", "semantic_sha256", "source_tree_sha256"):
+        sha256(source_generation[name], f"Source5 Soak source generation {name}")
+    origin = exact(receipt["origin_host"], {
+        "schema", "host_id", "observed_host_raw_sha256", "boot_id_sha256",
+        "kernel_release", "allowed_cpu_affinity", "network_namespace_inode",
+        "controls_sha256", "host_identity_sha256",
+    }, "Source5 Soak origin host facts")
+    origin_body = {key: value for key, value in origin.items()
+                   if key != "host_identity_sha256"}
+    require(origin["schema"] ==
+            "allocatbelt.application-source5-soak-origin-host.v1" and
+            origin["host_id"] == receipt["host_id"] and
+            origin["host_identity_sha256"] == digest_object(origin_body),
+            "Source5 Soak origin host fact digest or identity differs")
+    for name in ("observed_host_raw_sha256", "boot_id_sha256", "controls_sha256"):
+        sha256(origin[name], f"Source5 Soak origin host {name}")
+    affinity = origin["allowed_cpu_affinity"]
+    normalized_affinity = [
+        uint(cpu, "Source5 Soak origin CPU", maximum=65535)
+        for cpu in affinity
+    ] if type(affinity) is list else []
+    require(type(affinity) is list and 1 <= len(affinity) <= 4096 and
+            affinity == sorted(set(normalized_affinity)),
+            "Source5 Soak origin CPU affinity is malformed")
+    uint(origin["network_namespace_inode"],
+         "Source5 Soak origin network namespace", positive=True)
+    text(origin["kernel_release"], "Source5 Soak origin kernel release", 256)
+    observed_pin = _raw_pin(receipt["observed_host_pin"],
+                            "Source5 Soak observed-host pin")
+    require(observed_pin == _raw_pin(receipt["prepared_host_context_pin"],
+                                     "Source5 Soak prepared host-context pin") and
+            observed_pin["raw_sha256"] == origin["observed_host_raw_sha256"],
+            "Source5 Soak origin host facts changed their observed-host pin")
+    pressure_origin = exact(receipt["pressure_origin"], {
+        "schema", "recipe_pin", "recipe_dependency_paths",
+        "application_tmpdir_path", "storage_before", "storage_after",
+    }, "Source5 Soak pressure origin facts")
+    require(pressure_origin["schema"] ==
+            "allocatbelt.application-source5-soak-pressure-origin.v2",
+            "Source5 Soak pressure origin schema differs")
+    dependency_paths = pressure_origin["recipe_dependency_paths"]
+    require(type(dependency_paths) is list and dependency_paths and
+            all(type(path_value) is str and
+                absolute_path(path_value, "Source5 pressure dependency path")
+                    == Path(path_value)
+                for path_value in dependency_paths) and
+            dependency_paths == sorted(set(dependency_paths)),
+            "Source5 Soak pressure dependency path closure is malformed")
+    return receipt, actual_raw, {"path": str(path), "raw_sha256": raw_sha,
+                                 "receipt_sha256": receipt_sha}
+
+
+def verify_source5_soak_pressure_offline(
+    pressure_recipe_pin: object, pressure_artifacts: object,
+    soak_host_verification_pin: object, *, evidence_path_map: object,
+    source_root: object,
+) -> dict[str, Any]:
+    """Replay the one original Soak APP pressure run from its own strict facts.
+
+    This API is separate from `verify_pressure_offline`, which requires exactly
+    two original pressure-pair members. The Soak host receipt remains in its
+    own closed schema; no pair-member rows are synthesized or inferred.
+    """
+    recipe_pin = exact(pressure_recipe_pin, {
+        "path", "raw_sha256", "semantic_sha256", "condition_sha256",
+    }, "Source5 Soak pressure recipe pin")
+    recipe_path = absolute_path(recipe_pin["path"], "Source5 Soak pressure recipe path")
+    for name in ("raw_sha256", "semantic_sha256", "condition_sha256"):
+        sha256(recipe_pin[name], f"Source5 Soak pressure recipe {name}")
+    artifacts = exact(pressure_artifacts, {
+        "directory", "pins", "proof", "ready_sha256", "driver",
+        "worker_sessions", "driver_logs",
+    }, "Source5 Soak pressure artifacts")
+    artifact_root = absolute_path(artifacts["directory"],
+                                  "Source5 Soak pressure artifact directory")
+    pins = exact(artifacts["pins"], {
+        "events", "launch", "process_binding", "ready", "run",
+    }, "Source5 Soak pressure artifact pins")
+    pins = {name: sha256(value, f"Source5 Soak pressure {name} raw SHA-256")
+            for name, value in pins.items()}
+    require(artifacts["ready_sha256"] == pins["ready"],
+            "Source5 Soak pressure ready pin differs")
+    proof_pin = exact(artifacts["proof"], {"path", "raw_sha256"},
+                      "Source5 Soak pressure proof pin")
+    proof_path = absolute_path(proof_pin["path"], "Source5 Soak pressure proof path")
+    sha256(proof_pin["raw_sha256"], "Source5 Soak pressure proof raw SHA-256")
+    driver_logs = exact(artifacts["driver_logs"], {"stdout", "stderr"},
+                        "Source5 Soak pressure driver log pins")
+    for label, pin_value in driver_logs.items():
+        log_pin = exact(pin_value, {"path", "raw_sha256"},
+                        f"Source5 Soak pressure {label} log pin")
+        absolute_path(log_pin["path"],
+                      f"Source5 Soak pressure {label} log path")
+        sha256(log_pin["raw_sha256"],
+               f"Source5 Soak pressure {label} log raw SHA-256")
+    source_root_path = absolute_path(source_root, "Source5 Soak pressure SourceV5 root")
+    mapping, directories = _normalize_evidence_path_map(
+        evidence_path_map, source_root_path,
+    )
+    mapped_paths = frozenset(mapping)
+    mapped_files = frozenset(path for path in mapping if path not in directories)
+    host_pin = exact(soak_host_verification_pin, {
+        "path", "raw_sha256", "receipt_sha256",
+    }, "Source5 Soak host receipt pin")
+    absolute_path(host_pin["path"], "Source5 Soak host receipt path")
+    sha256(host_pin["raw_sha256"], "Source5 Soak host receipt raw SHA-256")
+    sha256(host_pin["receipt_sha256"], "Source5 Soak host receipt semantic SHA-256")
+    direct_files = {
+        str(recipe_path), str(proof_path), host_pin["path"],
+        str(artifact_root / "events.jsonl"),
+        str(artifact_root / "launch-record.json"),
+        str(artifact_root / "process-binding.json"),
+        str(artifact_root / "pressure-ready.json"),
+        str(artifact_root / "run.json"),
+    }
+    direct_files.update(pin["path"] for pin in driver_logs.values())
+    require(direct_files <= mapped_files and str(artifact_root) in directories and
+            str(source_root_path) in directories,
+            "Source5 Soak pressure path map omits a direct pinned input")
+
+    token_value = _EVIDENCE_PATH_MAP_CONTEXT.set((mapping, directories))
+    replay_token: contextvars.Token[dict[str, Any] | None] | None = None
+    try:
+        raw_host_receipt, host_receipt_raw_sha, _host_pin = \
+            _validate_source5_soak_host_receipt_v2(host_pin)
+        origin = raw_host_receipt["pressure_origin"]
+        recorded_recipe_pin = origin["recipe_pin"]
+        require(recorded_recipe_pin == recipe_pin and
+                type(origin["application_tmpdir_path"]) is str,
+                "Source5 Soak pressure receipt changed its original recipe/output scope")
+        recorded_artifacts = origin["storage_after"].get("pressure_artifacts")
+        require(recorded_artifacts == artifacts,
+                "Source5 Soak pressure artifacts differ from its strict host receipt")
+        recipe_value, recipe_raw, recipe_raw_sha = read_canonical(
+            recipe_path, "Source5 Soak frozen pressure recipe", MAX_RECIPE_BYTES,
+        )
+        require(recipe_raw_sha == recipe_pin["raw_sha256"] and
+                recipe_raw == canonical_bytes(recipe_value) and
+                recipe_pin["semantic_sha256"] == digest_object({
+                    key: value for key, value in recipe_value.items()
+                    if key != "recipe_sha256"
+                }) and
+                recipe_value.get("condition_sha256") ==
+                    recipe_pin["condition_sha256"],
+                "Source5 Soak pressure recipe raw/semantic/condition roles differ")
+        expected_dependencies = set(_pressure_absolute_json_paths(recipe_value))
+        expected_dependencies.add(str(recipe_path))
+        expected_dependencies = {
+            str(absolute_path(value, "Source5 Soak nested recipe dependency"))
+            for value in expected_dependencies
+        }
+        require(origin["recipe_dependency_paths"] ==
+                sorted(expected_dependencies) and
+                expected_dependencies <= mapped_paths,
+                "Source5 Soak evidence map omits or changes the complete pressure recipe path closure")
+        inventory = raw_host_receipt["evidence_inventory"]
+        require(type(inventory) is list and
+                len(inventory) <= MAX_SOURCE5_SOAK_INVENTORY_ENTRIES and
+                expected_dependencies <= {
+                    entry.get("path") for entry in inventory
+                    if type(entry) is dict
+                },
+                "Source5 Soak host receipt does not bind every pressure recipe dependency")
+
+        supervisor_pin = _raw_pin(
+            raw_host_receipt["component_pins"]["supervisor"],
+            "Source5 Soak pressure supervisor pin",
+        )
+        require(supervisor_pin["path"] in mapped_files,
+                "Source5 Soak pressure map omits its pinned supervisor")
+        supervisor, _supervisor_raw, supervisor_sha = read_canonical(
+            Path(supervisor_pin["path"]), "Source5 Soak pressure supervisor",
+            MAX_MANIFEST_BYTES,
+        )
+        require(supervisor_sha == supervisor_pin["raw_sha256"],
+                "Source5 Soak pressure supervisor bytes differ from their raw pin")
+        exact(supervisor, {
+            "schema", "execution_kind", "status", "interrupted", "received_signal",
+            "application_cleanup", "application_binding", "application_binding_sha256",
+            "application_attestation", "pressure_ready_sha256", "pressure_proof",
+            "pressure_cleanup", "pressure_driver", "pressure_worker_sessions", "details",
+        }, "Source5 Soak pressure supervisor")
+        require(supervisor["schema"] == "allocatbelt.application-pressure-supervision.v1" and
+                supervisor["execution_kind"] == "timed_soak" and
+                supervisor["status"] == 0 and supervisor["interrupted"] is False and
+                supervisor["received_signal"] is None and
+                supervisor["pressure_cleanup"] == "verified",
+                "Source5 Soak pressure supervisor did not complete its original lifecycle")
+        parent_recipe_pin = _raw_pin(
+            raw_host_receipt["component_pins"]["parent_recipe"],
+            "Source5 Soak parent recipe pin",
+        )
+        require(parent_recipe_pin["path"] in mapped_files,
+                "Source5 Soak pressure map omits its parent recipe")
+        parent_recipe, _parent_raw, parent_raw_sha = read_canonical(
+            Path(parent_recipe_pin["path"]), "Source5 Soak parent recipe",
+            MAX_RECIPE_BYTES,
+        )
+        require(parent_raw_sha == parent_recipe_pin["raw_sha256"] and
+                parent_recipe.get("schema") ==
+                    "allocatbelt.application-soak-parent-recipe.v2",
+                "Source5 Soak parent recipe raw bytes/schema differ")
+        parent_identity = exact(parent_recipe.get("identity"), {
+            "campaign_id", "host_id", "run_id", "nonce", "allocator",
+            "executor", "workload", "profile", "comparison_family",
+            "source_sha256", "build_sha256", "binary_sha256",
+            "resource_ceiling_sha256",
+        }, "Source5 Soak parent recipe identity")
+        parent_source = exact(parent_recipe.get("source"), {
+            "root", "manifest_path", "manifest_sha256",
+        }, "Source5 Soak parent SourceV5 binding")
+        parent_qualification = parent_recipe.get("qualification")
+        require(type(parent_qualification) is dict,
+                "Source5 Soak parent recipe omits its frozen qualification inputs")
+        parent_condition = exact(parent_qualification.get("pressure_condition"), {
+            "condition_id", "condition_sha256", "condition",
+            "pressure_calibration", "readiness_thresholds", "schedule",
+        }, "Source5 Soak parent pressure condition")
+        parent_condition_pin = exact(parent_condition["condition"], {
+            "relative_path", "raw_sha256",
+        }, "Source5 Soak parent raw pressure-condition pin")
+        sha256(parent_condition_pin["raw_sha256"],
+               "Source5 Soak parent pressure-condition raw SHA-256")
+        require(parent_condition["condition_sha256"] ==
+                parent_condition_pin["raw_sha256"],
+                "Source5 Soak parent condition raw-digest roles differ")
+        parent_pressure = exact(parent_recipe.get("pressure"), {
+            "request_template", "recipe", "condition_sha256", "driver",
+            "validator",
+        }, "Source5 Soak parent pressure binding")
+        parent_pressure_pin = exact(parent_pressure["recipe"], {
+            "path", "raw_sha256", "semantic_sha256",
+        }, "Source5 Soak parent pressure recipe pin")
+        require(parent_identity["campaign_id"] == raw_host_receipt["campaign_id"] and
+                parent_identity["host_id"] == raw_host_receipt["host_id"] and
+                parent_identity["run_id"] == raw_host_receipt["run_id"] and
+                parent_identity["allocator"] == "allocatbelt" and
+                parent_identity["executor"] == "bounded" and
+                parent_identity["workload"] == "mixed" and
+                parent_identity["comparison_family"] == "external_pressure" and
+                parent_source["root"] == str(source_root_path) and
+                parent_source["manifest_path"] ==
+                    raw_host_receipt["generation"]["source_manifest"]["path"] and
+                parent_source["manifest_sha256"] ==
+                    raw_host_receipt["generation"]["source_manifest"]["raw_sha256"] and
+                parent_pressure["condition_sha256"] ==
+                    recipe_pin["condition_sha256"] and
+                parent_pressure_pin == {
+                    key: recipe_pin[key] for key in (
+                        "path", "raw_sha256", "semantic_sha256",
+                    )
+                } and
+                parent_pressure["condition_sha256"] == recipe_pin["condition_sha256"],
+                "Source5 Soak parent pressure/job identity differs from this single-APP run")
+        app_cleanup = exact(supervisor["application_cleanup"], {
+            "schema", "status", "pid", "return_code", "received_signal",
+            "cleanup_error",
+        }, "Source5 Soak direct APP cleanup")
+        require(app_cleanup["schema"] ==
+                "allocatbelt.application-soak-process-cleanup.v1" and
+                app_cleanup["status"] == "verified" and
+                app_cleanup["return_code"] == 0 and
+                app_cleanup["received_signal"] is None and
+                app_cleanup["cleanup_error"] is None,
+                "Source5 Soak APP cleanup receipt is incomplete")
+        details = exact(supervisor["details"], {
+            "status", "child_return_code", "timed_out", "artifact_budget_exceeded",
+            "received_signal", "started_monotonic_ns", "ended_monotonic_ns",
+            "binary_path", "binary_sha256", "binary_device", "binary_inode",
+            "binary_size", "requested_argv", "requested_argv_sha256",
+            "executed_argv", "executed_file_descriptor", "environment",
+            "environment_sha256", "cwd", "cpu_set",
+        }, "Source5 Soak supervisor final APP facts")
+        require(details["status"] == 0 and details["child_return_code"] == 0 and
+                details["timed_out"] is False and
+                details["artifact_budget_exceeded"] is False and
+                details["received_signal"] is None and
+                type(details["started_monotonic_ns"]) is int and
+                type(details["ended_monotonic_ns"]) is int and
+                details["ended_monotonic_ns"] >= details["started_monotonic_ns"],
+                "Source5 Soak supervisor final APP status differs")
+        app_attestation = exact(supervisor["application_attestation"], {
+            "schema", "execution_kind", "process", "attestation_sha256",
+        }, "Source5 Soak direct APP attestation")
+        app_attestation_body = {
+            key: value for key, value in app_attestation.items()
+            if key != "attestation_sha256"
+        }
+        require(app_attestation["schema"] ==
+                "allocatbelt.application-pressure-app-launch-attestation.v1" and
+                app_attestation["execution_kind"] == "timed_soak" and
+                app_attestation["attestation_sha256"] ==
+                    digest_object(app_attestation_body),
+                "Source5 Soak direct APP attestation digest or role differs")
+        app_process = exact(app_attestation["process"], {
+            "pid", "start_ticks", "executable_path", "executable_sha256",
+            "executable_device", "executable_inode", "executable_size",
+            "executable_fd_reference", "cwd", "argv", "argv_sha256",
+            "cmdline_raw_sha256", "environment_sha256", "environment_raw_sha256",
+        }, "Source5 Soak pressure APP attestation")
+        app_binding = exact(supervisor["application_binding"]["process"], {
+            "pid", "start_ticks", "executable_path", "executable_sha256", "cwd",
+            "tmpdir_path", "cpu_affinity", "network_namespace_inode",
+        }, "Source5 Soak pressure APP binding")
+        driver = artifacts["driver"]
+        require(driver == supervisor["pressure_driver"] and
+                type(driver) is dict and type(driver.get("pid")) is int and
+                driver["pid"] > 0 and type(driver.get("start_ticks")) is int and
+                driver["start_ticks"] > 0 and driver.get("return_code") == 0 and
+                artifacts["worker_sessions"] == supervisor["pressure_worker_sessions"] and
+                app_binding["pid"] == app_process["pid"] and
+                app_binding["start_ticks"] == app_process["start_ticks"],
+                "Source5 Soak pressure identities differ from the supervisor capture")
+        require(app_cleanup["pid"] == app_process["pid"] and
+                details["binary_sha256"] == app_process["executable_sha256"] and
+                details["requested_argv"] == app_process["argv"] and
+                details["executed_argv"] == app_process["argv"] and
+                details["environment_sha256"] == app_process["environment_sha256"] and
+                supervisor["pressure_ready_sha256"] == artifacts["ready_sha256"],
+                "Source5 Soak APP environment/cleanup or pressure readiness differs from its raw identities")
+        supervisor_pressure_proof = exact(supervisor["pressure_proof"], {
+            "proof", "raw_sha256",
+        }, "Source5 Soak supervisor pressure proof")
+        require(type(supervisor_pressure_proof["proof"]) is dict and
+                supervisor_pressure_proof["raw_sha256"] ==
+                    artifacts["proof"]["raw_sha256"],
+                "Source5 Soak supervisor proof pin differs from the pressure artifact descriptor")
+        worker_sessions = artifacts["worker_sessions"]
+        require(type(worker_sessions) is list and worker_sessions,
+                "Source5 Soak pressure worker set is empty")
+        identities = [(app_process["pid"], app_process["start_ticks"]),
+                      (driver["pid"], driver["start_ticks"])]
+        expected_absence = [{
+            "role": "application", "pid": app_process["pid"],
+            "start_ticks": app_process["start_ticks"],
+        }, {
+            "role": "pressure_driver", "pid": driver["pid"],
+            "start_ticks": driver["start_ticks"],
+        }]
+        for index, worker_value in enumerate(worker_sessions):
+            require(type(worker_value) is dict and {
+                "role", "cpu", "pid", "start_ticks", "pgid", "session_id",
+                "reaped",
+            } <= set(worker_value),
+                f"Source5 Soak pressure worker[{index}] is malformed")
+            worker = worker_value
+            require(worker["reaped"] is True and type(worker["role"]) is str and
+                    (worker["cpu"] is None or type(worker["cpu"]) is int),
+                    "Source5 Soak pressure worker is not marked reaped")
+            key = (uint(worker["pid"], "Source5 Soak pressure worker PID", positive=True,
+                        maximum=(1 << 31) - 1),
+                   uint(worker["start_ticks"], "Source5 Soak pressure worker start", positive=True))
+            uint(worker["pgid"], "Source5 Soak pressure worker process group", positive=True,
+                 maximum=(1 << 31) - 1)
+            uint(worker["session_id"], "Source5 Soak pressure worker session", positive=True,
+                 maximum=(1 << 31) - 1)
+            identities.append(key)
+            expected_absence.append({
+                "role": f"pressure_worker:{worker['role']}:{'-' if worker['cpu'] is None else worker['cpu']}",
+                "pid": key[0], "start_ticks": key[1],
+            })
+        require(len(identities) == len(set(identities)),
+                "Source5 Soak pressure supervisor repeats a process identity")
+        expected_absence.sort(key=lambda item: item["role"])
+        absences = raw_host_receipt["process_absence"]
+        require(type(absences) is list and len(absences) == len(expected_absence),
+                "Source5 Soak pressure origin absence set is sparse")
+        absence_observations: dict[tuple[int, int], int] = {}
+        for index, (absence_value, identity) in enumerate(zip(
+                absences, expected_absence, strict=True)):
+            absence = exact(absence_value, {
+                "role", "pid", "start_ticks", "original_identity_absent",
+                "observed_start_ticks", "observed_monotonic_ns",
+            }, f"Source5 Soak pressure absence[{index}]")
+            require({key: absence[key] for key in identity} == identity and
+                    absence["original_identity_absent"] is True and
+                    type(absence["observed_monotonic_ns"]) is int and
+                    absence["observed_monotonic_ns"] > 0 and
+                    (absence["observed_start_ticks"] is None or
+                     type(absence["observed_start_ticks"]) is int and
+                     absence["observed_start_ticks"] != identity["start_ticks"]),
+                    "Source5 Soak pressure origin absence does not bind the original PID/start")
+            absence_observations[(identity["pid"], identity["start_ticks"])] = \
+                absence["observed_monotonic_ns"]
+
+        origin_host = raw_host_receipt["origin_host"]
+        observed_pin = _raw_pin(raw_host_receipt["observed_host_pin"],
+                                "Source5 Soak pressure observed-host pin")
+        observed, _observed_raw, observed_sha = read_canonical(
+            Path(observed_pin["path"]), "Source5 Soak pressure observed host",
+            MAX_SOURCE_BYTES,
+        )
+        exact(observed, {
+            "schema", "host_id", "boot_id_sha256", "controls_sha256", "controls",
+            "kernel_release", "cpu_model", "cpu_affinity",
+            "network_namespace_inode",
+        }, "Source5 Soak pressure observed host")
+        require(observed_sha == observed_pin["raw_sha256"] and
+                observed_sha == origin_host["observed_host_raw_sha256"] and
+                observed["schema"] == "allocatbelt.application-capacity-host-context.v1" and
+                observed["host_id"] == raw_host_receipt["host_id"] and
+                observed["boot_id_sha256"] == origin_host["boot_id_sha256"] and
+                observed["kernel_release"] == origin_host["kernel_release"] and
+                observed["cpu_affinity"] == origin_host["allowed_cpu_affinity"] and
+                observed["network_namespace_inode"] ==
+                    origin_host["network_namespace_inode"] and
+                observed["controls_sha256"] == origin_host["controls_sha256"],
+                "Source5 Soak pressure origin host facts differ from observed bytes")
+
+        storage_before = exact(origin["storage_before"], {
+            "application_storage", "pressure_scratch", "recipe_storage",
+        }, "Source5 Soak pressure storage-before facts")
+        storage_after = exact(origin["storage_after"], {
+            "application_process", "pressure_artifacts", "pressure_readback_sha256",
+            "pressure_cleanup", "pressure_driver_source_sha256",
+            "application_storage", "pressure_scratch",
+        }, "Source5 Soak pressure storage-after facts")
+        pressure_readback_sha = sha256(
+            storage_after["pressure_readback_sha256"],
+            "Source5 Soak strict pressure readback semantic SHA-256",
+        )
+        recipe_summary = _validate_recipe(
+            recipe_value, recipe_pin["semantic_sha256"],
+        )
+        require(recipe_summary["condition_sha256"] ==
+                recipe_pin["condition_sha256"],
+                "Source5 Soak pressure recipe summary changed its condition digest")
+        recipe = recipe_value
+        condition_path = PurePosixPath(text(
+            parent_condition_pin["relative_path"],
+            "Source5 Soak parent pressure-condition relative path", 4096,
+        ))
+        spec_pin = exact(parent_qualification["spec"], {
+            "path", "raw_sha256", "semantic_sha256",
+        }, "Source5 Soak parent SpecV3 pin")
+        expected_condition_path = Path(spec_pin["path"]).parent.joinpath(
+            *condition_path.parts,
+        )
+        pressure_condition_pin = exact(
+            recipe["calibration_scope_v2"]["condition"],
+            {"path", "raw_sha256"},
+            "Source5 pressure recipe condition raw pin",
+        )
+        require(not condition_path.is_absolute() and
+                ".." not in condition_path.parts and
+                pressure_condition_pin == {
+                    "path": str(expected_condition_path),
+                    "raw_sha256": parent_condition_pin["raw_sha256"],
+                },
+                "Source5 Soak pressure recipe changed the raw original condition path/bytes")
+        binding_receipt = exact(supervisor["application_binding"], {
+            "schema", "recipe_sha256", "nonce", "process",
+            "launch_binding_sha256",
+        }, "Source5 Soak direct APP pressure binding")
+        binding_body = {key: value for key, value in binding_receipt.items()
+                        if key != "launch_binding_sha256"}
+        require(recipe["schema"] == RECIPE_SCHEMA_V2 and
+                recipe["identity"]["host_id"] == raw_host_receipt["host_id"] and
+                recipe["identity"]["run_id"] == raw_host_receipt["run_id"] and
+                recipe["identity"]["condition_id"] ==
+                    parent_condition["condition_id"] and
+                recipe["identity"]["allocator"] == parent_identity["allocator"] ==
+                    "allocatbelt" and
+                recipe["identity"]["executor"] == "allocatbelt" and
+                recipe["identity"]["phase"] == "external_pressure" and
+                recipe["identity"]["nonce"] == parent_identity["nonce"] and
+                recipe["condition_sha256"] == recipe_pin["condition_sha256"] and
+                recipe["files"]["source_manifest"]["raw_sha256"] ==
+                    raw_host_receipt["generation"]["source_manifest"]["raw_sha256"] and
+                recipe["files"]["source_manifest"]["path"] ==
+                    raw_host_receipt["generation"]["source_manifest"]["path"] and
+                binding_receipt["recipe_sha256"] == recipe_pin["semantic_sha256"] and
+                binding_receipt["nonce"] == recipe["identity"]["nonce"] and
+                binding_receipt["launch_binding_sha256"] ==
+                    digest_object(binding_body) and
+                supervisor["application_binding_sha256"] ==
+                    binding_receipt["launch_binding_sha256"],
+                "Source5 Soak pressure recipe differs from its original host/generation")
+        require(storage_before["application_storage"] == recipe["host"]["application_storage"] and
+                storage_before["pressure_scratch"] == recipe["host"]["pressure_scratch"] and
+                storage_before["recipe_storage"] == recipe["storage"] and
+                origin["application_tmpdir_path"] ==
+                    recipe["process"]["application_tmpdir_path"] and
+                storage_after["pressure_cleanup"] == "verified" and
+                storage_after["pressure_driver_source_sha256"] ==
+                    recipe["script_hashes"]["driver_sha256"],
+                "Source5 Soak pressure storage facts differ from the raw recipe")
+        app_after = exact(storage_after["application_process"], {
+            "pid", "start_ticks", "tmpdir_path", "cpu_affinity",
+            "network_namespace_inode",
+        }, "Source5 Soak pressure APP/storage identity")
+        require(app_after["pid"] == app_process["pid"] and
+                app_after["start_ticks"] == app_process["start_ticks"] and
+                app_after["tmpdir_path"] == recipe["process"]["application_tmpdir_path"] ==
+                    recipe["storage"]["application_io_paths"][
+                        recipe["storage"]["application_io_paths"].index(
+                            recipe["process"]["application_tmpdir_path"])
+                    ] and
+                app_after["cpu_affinity"] == recipe["schedule"]["application_cpu_affinity"] and
+                app_after["network_namespace_inode"] ==
+                    recipe["network"]["network_namespace_inode"] and
+                app_binding["tmpdir_path"] == app_after["tmpdir_path"] and
+                app_binding["cpu_affinity"] == app_after["cpu_affinity"] and
+                app_binding["network_namespace_inode"] ==
+                    app_after["network_namespace_inode"],
+                "Source5 Soak pressure APP identity differs from its raw recipe")
+        minimum_free = recipe["storage"]["output_minimum_free_bytes"]
+        before_rows = {row["path"]: row
+                       for row in storage_before["application_storage"]}
+        after_rows = storage_after["application_storage"]
+        require(type(after_rows) is list and set(before_rows) == {
+            row.get("path") for row in after_rows if type(row) is dict
+        }, "Source5 Soak post-pressure storage path set differs")
+        for index, row_value in enumerate(after_rows):
+            row = exact(row_value, {
+                "path", "record", "available_bytes", "available_inodes",
+            }, f"Source5 Soak post-pressure application storage[{index}]")
+            require(row["record"] == before_rows[row["path"]] and
+                    type(row["available_bytes"]) is int and
+                    row["available_bytes"] >= minimum_free and
+                    type(row["available_inodes"]) is int and
+                    row["available_inodes"] >= 0,
+                    "Source5 Soak post-pressure application storage facts differ")
+        scratch_before = storage_before["pressure_scratch"]
+        scratch_after = exact(storage_after["pressure_scratch"], {
+            "path", "record", "available_bytes", "available_inodes",
+        }, "Source5 Soak post-pressure scratch storage")
+        require(scratch_after["path"] == scratch_before["path"] and
+                scratch_after["record"] == scratch_before and
+                type(scratch_after["available_bytes"]) is int and
+                scratch_after["available_bytes"] >= minimum_free and
+                type(scratch_after["available_inodes"]) is int and
+                scratch_after["available_inodes"] >= 0,
+                "Source5 Soak post-pressure scratch storage facts differ")
+
+        require(set(artifacts["pins"]) == set(pins) and
+                str(artifact_root) == str(Path(origin["storage_after"]["pressure_artifacts"]["directory"])) and
+                storage_after["pressure_artifacts"] == artifacts and
+                proof_path == Path(artifacts["proof"]["path"]) and
+                proof_path == Path(raw_host_receipt["component_pins"]["supervisor"]["path"]).parent / "pressure-readback.json" and
+                supervisor_pressure_proof["raw_sha256"] == proof_pin["raw_sha256"],
+                "Source5 Soak pressure output descriptor differs from its host receipt")
+        expected_paths = {str(recipe_path), str(proof_path),
+                          str(artifact_root / "events.jsonl"),
+                          str(artifact_root / "launch-record.json"),
+                          str(artifact_root / "process-binding.json"),
+                          str(artifact_root / "pressure-ready.json"),
+                          str(artifact_root / "run.json"),
+                          *(value["path"] for value in driver_logs.values())}
+        require(expected_paths <= mapped_files,
+                "Source5 Soak pressure map omits exact artifacts/logs")
+        _preflight_pressure_json_path_closure(
+            [recipe_value], mapped_paths, directories,
+        )
+        source_pin = exact(recipe["files"]["source_manifest"], {
+            "path", "raw_sha256",
+        }, "Source5 Soak pressure source-manifest pin")
+        source_manifest, _source_raw, source_raw_sha = read_canonical(
+            Path(source_pin["path"]), "Source5 Soak pressure SourceV5 manifest",
+            MAX_SOURCE_BYTES,
+        )
+        source = exact(source_manifest.get("source"), {
+            "git_commit", "source_tree_sha256", "cargo_lock_sha256", "files",
+        }, "Source5 Soak pressure SourceV5 identity")
+        source_body = {key: value for key, value in source_manifest.items()
+                       if key != "manifest_sha256"}
+        source_generation = raw_host_receipt["generation"]["source_manifest"]
+        require(source_raw_sha == source_pin["raw_sha256"] and
+                source_manifest.get("schema") == SOURCE5_MANIFEST_SCHEMA and
+                source_manifest.get("manifest_sha256") ==
+                    source_generation["semantic_sha256"] ==
+                    digest_object(source_body) and
+                source["source_tree_sha256"] ==
+                    source_generation["source_tree_sha256"],
+                "Source5 Soak pressure SourceV5 manifest raw bytes differ")
+        source_files = source["files"]
+        require(type(source_files) is list and len(source_files) <= 1_000_000,
+                "Source5 Soak pressure typed SourceV5 inventory is malformed")
+        typed_paths: set[str] = {source_pin["path"]}
+        for index, entry_value in enumerate(source_files):
+            entry = exact(entry_value, {
+                "path", "kind", "mode", "sha256", "size",
+            }, f"Source5 Soak pressure SourceV5 inventory[{index}]")
+            relative = PurePosixPath(text(
+                entry["path"], "Source5 Soak pressure SourceV5 relative path", 4096,
+            ))
+            require(not relative.is_absolute() and ".." not in relative.parts and
+                    relative.as_posix() == entry["path"] and
+                    entry["kind"] == "file" and entry["mode"] in ("100644", "100755"),
+                    "Source5 Soak pressure source inventory entry is not a regular typed file")
+            typed_paths.add(str(source_root_path.joinpath(*relative.parts)))
+        artifacts_block = source_manifest.get("artifacts")
+        require(type(artifacts_block) is dict,
+                "Source5 Soak pressure SourceV5 artifact inventory is malformed")
+        for artifact_value in artifacts_block.values():
+            artifact = exact(artifact_value, {"path", "sha256"},
+                             "Source5 Soak pressure SourceV5 artifact")
+            relative = PurePosixPath(text(
+                artifact["path"], "Source5 Soak pressure artifact path", 4096,
+            ))
+            require(not relative.is_absolute() and ".." not in relative.parts and
+                    relative.as_posix() == artifact["path"],
+                    "Source5 Soak pressure artifact path is not portable")
+            typed_paths.add(str(source_root_path.joinpath(*relative.parts)))
+        require(typed_paths <= mapped_files,
+                "Source5 Soak pressure map omits typed SourceV5 source/artifact members")
+        # The receipt was parsed above; compare its origin facts with the
+        # original pressure recipe and its one direct APP identity before
+        # enabling the existing full raw event/calibration verifier.
+        pressure_value = recipe_value
+        for label, pin_value in driver_logs.items():
+            log_pin = exact(pin_value, {"path", "raw_sha256"},
+                            f"Source5 Soak pressure {label} log pin")
+            _log_raw, log_sha = read_stable(
+                Path(log_pin["path"]), f"Source5 Soak pressure {label} log",
+                MAX_EVENTS_BYTES,
+            )
+            require(log_sha == log_pin["raw_sha256"],
+                    f"Source5 Soak pressure {label} log bytes differ")
+
+        proof_pin_raw = proof_pin["raw_sha256"]
+        expected = {"recipe": recipe_pin["semantic_sha256"], **pins}
+        absent_ids = frozenset(identities)
+        replay_context = {
+            "source_root": str(source_root_path),
+            "evidence_path_map": evidence_path_map,
+            "origin_absent_identities": absent_ids,
+            "host_receipt_pin": dict(host_pin),
+            "host_receipt_raw_sha256": host_receipt_raw_sha,
+        }
+        replay_token = _PRESSURE_OFFLINE_REPLAY_CONTEXT.set(replay_context)
+        recipe_validated = _validate_recipe(
+            pressure_value, recipe_pin["semantic_sha256"],
+        )
+        require(pressure_value.get("schema") == RECIPE_SCHEMA_V2 and
+                recipe_validated["condition_sha256"] == recipe_pin["condition_sha256"],
+                "Source5 Soak pressure recipe no longer satisfies the original V2 gate")
+        run_value, _run_raw, run_sha = read_canonical(
+            artifact_root / "run.json", "Source5 Soak pressure run receipt",
+            MAX_MANIFEST_BYTES,
+        )
+        require(run_sha == pins["run"],
+                "Source5 Soak pressure run receipt bytes differ from their raw pin")
+        run = _validate_run(run_value, expected)
+        host_worker_identities = {
+            (worker["role"], worker["cpu"], worker["pid"],
+             worker["start_ticks"], worker["pgid"], worker["session_id"])
+            for worker in worker_sessions
+        }
+        run_worker_identities = {
+            (worker["role"], worker["cpu"], worker["pid"],
+             worker["start_ticks"], worker["pgid"], worker["session_id"])
+            for worker in run["worker_cleanup"]
+        }
+        require(host_worker_identities == run_worker_identities,
+                "Source5 Soak supervisor workers differ from raw pressure cleanup rows")
+        require(all(observed_ns >= run["finish_monotonic_ns"]
+                    for observed_ns in absence_observations.values()),
+                "Source5 Soak PID absence observation predates pressure cleanup completion")
+        result = verify_pressure(
+            recipe_path, recipe_pin["semantic_sha256"], artifact_root, expected,
+        )
+        proof_value, proof_raw, proof_raw_sha = read_canonical(
+            proof_path, "Source5 Soak pressure proof", MAX_PRESSURE_PROOF_BYTES,
+        )
+        require(result["readback_sha256"] == pressure_readback_sha ==
+                proof_value.get("readback_sha256") and
+                result == proof_value and proof_raw == canonical_bytes(result) and
+                proof_raw_sha == proof_pin_raw and
+                supervisor_pressure_proof["proof"] == proof_value and
+                result["identity"]["host_id"] == raw_host_receipt["host_id"] and
+                result["identity"]["run_id"] == raw_host_receipt["run_id"] and
+                result["recipe_raw_sha256"] == recipe_pin["raw_sha256"] and
+                result["application_process"]["pid"] == app_process["pid"] and
+                result["application_process"]["start_ticks"] == app_process["start_ticks"] and
+                result["application_process"]["executable_sha256"] ==
+                    app_process["executable_sha256"],
+                "Source5 Soak pressure proof differs from full single-APP raw replay")
+        calibration = exact(result.get("calibration_scope_v2"), {
+            "schema", "replay_success", "validated", "execution_ready",
+            "qualification_eligible", "controller_chronology_proven",
+            "calibration_raw_sha256", "calibration_sha256", "scope_sha256",
+            "condition_id", "pressure_calibration_id", "capacity_key",
+            "condition_sha256", "source_manifest_sha256",
+            "source_manifest_semantic_sha256", "source_tree_sha256",
+            "context_policy_bundle_raw_sha256", "context_policy_artifact_raw_sha256",
+            "context_policy_sha256", "capacity_bundle_pins_sha256",
+            "capacity_tsv_raw_sha256", "observed_host_raw_sha256",
+            "host_verification", "driver_sha256", "reader_sha256",
+            "capacity_producer_sha256", "feedback_composer_sha256",
+            "feedback_reader_sha256", "sample_count", "samples_sha256",
+            "summary", "pressure_thresholds", "readiness_thresholds",
+            "suggested_readiness_thresholds", "worker_cleanup_sha256",
+            "worker_session_count", "scratch_file_removed", "receipt_sha256",
+        }, "Source5 Soak offline pressure calibration replay")
+        calibration_host = calibration["host_verification"]
+        require(calibration_host["host_id"] == raw_host_receipt["host_id"] and
+                calibration_host["boot_id_sha256"] == origin_host["boot_id_sha256"] and
+                calibration_host["kernel_release"] == origin_host["kernel_release"] and
+                calibration_host["allowed_cpu_affinity"] == origin_host["allowed_cpu_affinity"] and
+                calibration_host["network_namespace_inode"] ==
+                    origin_host["network_namespace_inode"] and
+                calibration_host["observed_host_raw_sha256"] == observed_sha,
+                "Source5 Soak pressure calibration host facts differ from the strict Soak host receipt")
+        require(calibration["source_manifest_sha256"] == source_raw_sha and
+                calibration["source_manifest_semantic_sha256"] ==
+                    source_generation["semantic_sha256"] and
+                calibration["source_tree_sha256"] ==
+                    source_generation["source_tree_sha256"] and
+                calibration["condition_id"] == parent_condition["condition_id"],
+                "Source5 Soak pressure calibration changed its selected SourceV5 generation")
+        capacity_key = _capacity_key_v2(
+            calibration["capacity_key"],
+            "Source5 Soak pressure calibration capacity key",
+        )
+        require(capacity_key["host_id"] == raw_host_receipt["host_id"] and
+                capacity_key["workload"] == parent_identity["workload"] and
+                capacity_key["profile"] == parent_identity["profile"],
+                "Source5 Soak pressure capacity key differs from its original APP job")
+        return result
+    finally:
+        if replay_token is not None:
+            _PRESSURE_OFFLINE_REPLAY_CONTEXT.reset(replay_token)
+        _EVIDENCE_PATH_MAP_CONTEXT.reset(token_value)
 
 
 def _parser() -> argparse.ArgumentParser:

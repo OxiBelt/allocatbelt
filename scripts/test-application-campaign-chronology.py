@@ -17,6 +17,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 from typing import Any
 
@@ -885,6 +886,38 @@ class CampaignChronologyCliTests(unittest.TestCase):
         self.assertEqual(stage_detail["entry_count"], 15)
         self.assertEqual(stage_detail["capacity_schedule_sha256"],
                          self.plan["capacity_process_templates_sha256"])
+        original_context = self.chronology_module._prepare_inputs(
+            {"path": str(self.plan_path), "sha256": self.plan_sha256},
+            {"path": str(self.spec_path), "sha256": self.spec_sha256},
+            self.source_root, self.input_root, self.host_id,
+            {"path": str(self.observed_host_path),
+             "sha256": self.observed_host_sha256},
+            self.output_root,
+        )
+        original_journal = self.journal_path.read_bytes()
+        replayed = self.chronology_module.replay_journal_bytes(
+            original_journal, original_context["original_pins"],
+            self.campaign_id, self.host_id, original_context["boot_id_sha256"],
+        )
+        self.assertEqual(replayed["record_count"], 1)
+        self.assertEqual(replayed["terminal_head"],
+                         json.loads(original_journal.splitlines()[0])["record_sha256"])
+        self.assertIs(replayed["component_dispatch_pending"], True)
+        self.assertIs(replayed["qualification_eligible"], False)
+        broken_chain = original_journal.replace(
+            b'"previous_sha256":"' + b"0" * 64 + b'"',
+            b'"previous_sha256":"' + b"1" * 64 + b'"', 1,
+        )
+        self.assertNotEqual(broken_chain, original_journal)
+        with self.assertRaisesRegex(
+            self.chronology_module.ChronologyError,
+            "chain breaks|record digest is invalid",
+        ):
+            self.chronology_module.replay_journal_bytes(
+                broken_chain, original_context["original_pins"],
+                self.campaign_id, self.host_id,
+                original_context["boot_id_sha256"],
+            )
         audit = [json.loads(line) for line in self.audit_path.read_text().splitlines()]
         capacity_launches = [item for item in audit
                              if item.get("kind") == "popen" and item.get("role") == "capacity"]
@@ -1589,6 +1622,824 @@ class CampaignChronologyCliTests(unittest.TestCase):
             json.loads(line) for line in self.audit_path.read_text().splitlines()
         ]
         self.assertFalse(any(item.get("kind") == "popen" for item in audit))
+
+
+class Source5FixedPhaseScopeTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.chronology = load_script(
+            SCRIPT_DIR / "application-campaign-chronology.py",
+            "source5_fixed_phase_scope_test_target",
+        )
+
+    @staticmethod
+    def _record(path: Path, phase: str) -> dict[str, str]:
+        metrics = [{"ordinal": 0}, {"ordinal": 1}]
+        metric_sha = sha(canonical(metrics))
+        chronology = {
+            "authorization_id": "authorization-fixture",
+            "authorization_head": "a" * 64,
+            "app_started_heads": ["b" * 64, "c" * 64],
+            "app_terminal_heads": ["d" * 64, "e" * 64],
+            "job_terminal_head": "f" * 64,
+            "component_sha256": "1" * 64,
+            "process_metrics_sha256": metric_sha,
+            "app_start_events": [{}, {}],
+            "app_terminal_events": [{}, {}],
+            "member_processes": [],
+        }
+        body = {
+            "schema": "allocatbelt.application-source5-job-record.v1",
+            "state": "valid_pair",
+            "job": {"host_id": "host-1", "phase": phase, "run_id": "run-1"},
+            "pair_directory": str(path.parent),
+            "process_metrics": metrics,
+            "evidence": {}, "chronology": chronology,
+            "qualification_eligible": False,
+        }
+        value = {**body, "record_sha256": sha(canonical(body))}
+        raw = canonical(value)
+        path.write_bytes(raw)
+        return {"path": str(path), "raw_sha256": sha(raw)}
+
+    def _run_scope(self, path: Path, phase: str, *, fixed_api: bool) -> None:
+        chronology = self.chronology
+        record_pin = self._record(path, phase)
+        prepared = {"host_id": "host-1"}
+        state = {"source5_finished": {}}
+        with patch.object(chronology, "_lock_token_is_live", return_value=True), \
+                patch.object(chronology, "_prepare_source5_context",
+                             return_value=({}, prepared, state, {})):
+            with self.assertRaisesRegex(
+                chronology.ChronologyError,
+                "outside its original job/predecessor scope" if
+                (fixed_api and phase == "pressure") or
+                (not fixed_api and phase in {"exploration", "aa"}) else
+                "exact completed APP lifecycle chain",
+            ):
+                if fixed_api:
+                    chronology.verify_source5_completed_fixed_phase_locked(
+                        object(), {"path": "/manifest", "sha256": "a" * 64}, record_pin,
+                    )
+                else:
+                    chronology.verify_source5_completed_job_locked(
+                        object(), {"path": "/manifest", "sha256": "a" * 64},
+                        None, record_pin,
+                    )
+
+    def test_fixed_phase_scope_is_separate_and_pressure_predecessor_scope_remains_closed(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="source5-fixed-phase-scope-") as temporary:
+            root = Path(temporary)
+            self._run_scope(root / "old-exploration.json", "exploration", fixed_api=False)
+            self._run_scope(root / "old-aa.json", "aa", fixed_api=False)
+            self._run_scope(root / "new-pressure.json", "pressure", fixed_api=True)
+            self._run_scope(root / "new-exploration.json", "exploration", fixed_api=True)
+            self._run_scope(root / "new-aa.json", "aa", fixed_api=True)
+            self._run_scope(root / "new-confirmation.json", "confirmation", fixed_api=True)
+            self._run_scope(root / "old-pressure.json", "pressure", fixed_api=False)
+        source = (SCRIPT_DIR / "application-campaign-chronology.py").read_text()
+        self.assertLess(source.index("common_evidence_keys = {"),
+                        source.index("if phase in fixed_phase_allowlist:"))
+
+
+class Source5ProbeCaptureBundleTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.chronology = load_script(
+            SCRIPT_DIR / "application-campaign-chronology.py",
+            "source5_probe_capture_bundle_test_target",
+        )
+
+    def test_v2_bundle_binds_two_raw_receipts_to_recipe_and_budget(self) -> None:
+        chronology = self.chronology
+        with tempfile.TemporaryDirectory(prefix="source5-probe-bundle-") as temporary:
+            root = Path(temporary)
+            output_root = root / "job"
+            output_root.mkdir(mode=0o700)
+            budget = {
+                "capture_timeout_ns": 5_000_000_000,
+                "storage_budget": {
+                    "tmpdir_bytes": 64 * 1024 * 1024,
+                    "tmpdir_inodes": 512,
+                    "stdout_bytes": 512 * 1024,
+                    "stderr_bytes": 64 * 1024,
+                    "owner_result_bytes": 16 * 1024 * 1024,
+                    "inventory_bytes": 16 * 1024 * 1024,
+                    "failure_bytes": 64 * 1024,
+                    "receipt_bytes": 16 * 1024 * 1024,
+                    "output_inodes": 32,
+                },
+            }
+            capacity = {
+                name: {"path": str(root / f"capacity-{name}"),
+                       "raw_sha256": chr(ord("a") + index) * 64}
+                for index, name in enumerate(("request", "artifact", "receipt"))
+            }
+            probes = [
+                {"path": str(root / f"probe-{index}.json"),
+                 "raw_sha256": str(index + 1) * 64,
+                 "allocator": "allocatbelt",
+                 "binary_sha256": "f" * 64}
+                for index in range(2)
+            ]
+            recipe = {
+                "schema": "allocatbelt.application-pressure-pair-recipe.v2",
+                "probe_capture": budget,
+                "capacity_bundle": capacity,
+                "members": [{"construction_probe": probe} for probe in probes],
+            }
+            rows = []
+            for index, probe in enumerate(probes):
+                receipt_path = output_root / f"receipt-{index}.json"
+                body = {
+                    "schema": "allocatbelt.application-feedback-probe-capture.v2",
+                    "probe_pin": probe, "capacity_bundle": capacity,
+                    "capture_timeout_ns": budget["capture_timeout_ns"],
+                    "storage_budget": budget["storage_budget"],
+                    "qualification_eligible": False,
+                    "execution_ready": False,
+                    "controller_chronology_proven": False,
+                }
+                receipt = {**body, "receipt_sha256": sha(canonical(body))}
+                raw = canonical(receipt)
+                write_file(receipt_path, raw)
+                rows.append({
+                    "ordinal": index, "construction_probe": probe,
+                    "capture_receipt": {
+                        "path": str(receipt_path), "raw_sha256": sha(raw),
+                        "receipt_sha256": receipt["receipt_sha256"],
+                    },
+                    "capacity_bundle": capacity,
+                })
+            bundle = {
+                "schema": "allocatbelt.application-source5-probe-capture-bundle.v1",
+                "members": rows,
+            }
+            self.assertEqual(
+                chronology._verify_source5_probe_capture_bundle_v2(
+                    bundle, recipe, str(output_root), str(root),
+                ), bundle,
+            )
+            with self.assertRaises(chronology.ChronologyError):
+                chronology._verify_source5_probe_capture_bundle_v2(
+                    {**bundle, "members": rows[:1]}, recipe,
+                    str(output_root), str(root),
+                )
+            wrong_budget = {**recipe, "probe_capture": {
+                **budget, "capture_timeout_ns": budget["capture_timeout_ns"] + 1,
+            }}
+            with self.assertRaises(chronology.ChronologyError):
+                chronology._verify_source5_probe_capture_bundle_v2(
+                    bundle, wrong_budget, str(output_root), str(root),
+                )
+            wrong_probe_rows = [dict(item) for item in rows]
+            wrong_probe_rows[1] = {**wrong_probe_rows[1], "ordinal": 0}
+            with self.assertRaises(chronology.ChronologyError):
+                chronology._verify_source5_probe_capture_bundle_v2(
+                    {**bundle, "members": wrong_probe_rows}, recipe,
+                    str(output_root), str(root),
+                )
+            altered_pin_rows = [dict(item) for item in rows]
+            altered_pin = dict(altered_pin_rows[0]["capture_receipt"])
+            altered_pin["receipt_sha256"] = "0" * 64
+            altered_pin_rows[0] = {**altered_pin_rows[0],
+                                   "capture_receipt": altered_pin}
+            with self.assertRaises(chronology.ChronologyError):
+                chronology._verify_source5_probe_capture_bundle_v2(
+                    {**bundle, "members": altered_pin_rows}, recipe,
+                    str(output_root), str(root),
+                )
+
+
+class Source5JournalInputValidationTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.chronology = load_script(
+            SCRIPT_DIR / "application-campaign-chronology.py",
+            "source5_journal_input_validation_target",
+        )
+
+    def _source_manifest_capture(
+        self, files: list[dict[str, Any]],
+    ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+        chronology = self.chronology
+        source = {
+            "git_commit": "a" * 40,
+            "source_tree_sha256": chronology.sha256_bytes(
+                canonical({"schema": "allocatbelt.application-source-inventory.v1",
+                           "entries": files}),
+            ),
+            "cargo_lock_sha256": "b" * 64,
+            "files": files,
+        }
+        body = {
+            "schema": "allocatbelt.application-source-manifest.v5",
+            "source": source,
+            "build": {},
+            "artifacts": {},
+            "soak_artifacts": {},
+            "analysis_artifact": {},
+            "fixed_runtime_policy": {},
+            "runtime_readback_validator": {},
+            "resource_domain_calibration": {},
+            "qualification_harness": {},
+            "feedback_policy": {},
+        }
+        semantic = chronology.sha256_bytes(canonical(body))
+        value = {**body, "manifest_sha256": semantic}
+        raw = canonical(value)
+        path = "/private/source-manifests/host-a.json"
+        raw_sha = chronology.sha256_bytes(raw)
+        index_row = {
+            "role": "source_manifest", "host_id": "host-a",
+            "origin_path": path, "local_path": path,
+            "raw_sha256": raw_sha, "semantic_sha256": semantic,
+            "byte_count": len(raw),
+        }
+        store = {path: {**index_row, "raw_bytes": raw}}
+        return value, index_row, store
+
+    @staticmethod
+    def _inventory_files() -> list[dict[str, Any]]:
+        license_bytes = b"license payload\n"
+        target = "../../LICENSE"
+        target_bytes = target.encode("utf-8")
+        return [
+            {"path": "LICENSE", "kind": "file", "mode": "100644",
+             "sha256": sha(license_bytes), "size": len(license_bytes)},
+            {"path": "vendor/deep/LICENSE", "kind": "symlink",
+             "mode": "120000", "target": target,
+             "sha256": sha(target_bytes), "size": len(target_bytes)},
+        ]
+
+    def test_source_manifest_replays_literal_license_symlink_inventory(self) -> None:
+        chronology = self.chronology
+        _value, row, store = self._source_manifest_capture(self._inventory_files())
+        parsed = chronology._source5_source_manifest_document(store, row)
+        self.assertEqual(parsed["source"]["files"], self._inventory_files())
+        self.assertNotEqual(row["raw_sha256"], row["semantic_sha256"])
+        path = row["origin_path"]
+        wrong_raw_store = dict(store)
+        wrong_raw_store[path] = {
+            **store[path], "raw_sha256": "0" * 64,
+        }
+        with self.assertRaisesRegex(chronology.ChronologyError,
+                                    "bytes differ"):
+            chronology._source5_source_manifest_document(
+                wrong_raw_store, row,
+            )
+        wrong_semantic_row = {**row, "semantic_sha256": "0" * 64}
+        with self.assertRaisesRegex(chronology.ChronologyError,
+                                    "raw/semantic roles differ"):
+            chronology._source5_source_manifest_document(
+                store, wrong_semantic_row,
+            )
+
+        wrong_mode = self._inventory_files()
+        wrong_mode[1] = {**wrong_mode[1], "mode": "100644"}
+        _bad_value, bad_row, bad_store = self._source_manifest_capture(wrong_mode)
+        with self.assertRaisesRegex(chronology.ChronologyError,
+                                    "kind or mode"):
+            chronology._source5_source_manifest_document(bad_store, bad_row)
+
+        escaping = self._inventory_files()
+        bad_target = "../../../outside"
+        bad_target_bytes = bad_target.encode("utf-8")
+        escaping[1] = {
+            **escaping[1], "target": bad_target,
+            "sha256": sha(bad_target_bytes), "size": len(bad_target_bytes),
+        }
+        _escape_value, escape_row, escape_store = self._source_manifest_capture(
+            escaping,
+        )
+        with self.assertRaisesRegex(chronology.ChronologyError,
+                                    "escapes the source tree"):
+            chronology._source5_source_manifest_document(
+                escape_store, escape_row,
+            )
+
+    def _full_source_index_fixture(self):
+        root = "/private/source"
+        host_ids = ["host-a", "host-b", "host-c"]
+        validator = b"# pinned validator source\n"
+        files = self._inventory_files() + [{
+            "path": "scripts/runtime-readback.py", "kind": "file",
+            "mode": "100644", "sha256": sha(validator),
+            "size": len(validator),
+        }]
+        files.sort(key=lambda item: item["path"].encode("utf-8"))
+        file_bytes = {
+            "LICENSE": b"license payload\n",
+            "vendor/deep/LICENSE": b"../../LICENSE",
+            "scripts/runtime-readback.py": validator,
+        }
+        artifacts = {
+            "allocatbelt": ("target/app/allocatbelt", b"allocatbelt elf"),
+            "mimalloc-secure": ("target/app/mimalloc-secure", b"secure elf"),
+            "mimalloc-standard": ("target/app/mimalloc-standard", b"standard elf"),
+            "system": ("target/app/system", b"system elf"),
+        }
+        soak = {"allocatbelt": ("target/soak/allocatbelt", b"soak elf")}
+        analysis = ("target/analyzer", b"analyzer elf")
+        calibration_binary = ("target/domain-calibrator", b"calibrator elf")
+        calibration_output = ("target/domain-calibration.json", b"{}\n")
+        source = {
+            "git_commit": "a" * 40,
+            "source_tree_sha256": sha(canonical({
+                "schema": "allocatbelt.application-source-inventory.v1",
+                "entries": files,
+            })),
+            "cargo_lock_sha256": "b" * 64,
+            "files": files,
+        }
+        documents: dict[str, dict[str, Any]] = {}
+        artifact_bytes: dict[str, tuple[str, bytes]] = {}
+        for name, (path, raw) in artifacts.items():
+            artifact_bytes[path] = ("normal_app_output", raw)
+        for path, raw in soak.values():
+            artifact_bytes[path] = ("source5_soak_artifact", raw)
+        artifact_bytes[analysis[0]] = ("analysis_artifact", analysis[1])
+        artifact_bytes[calibration_binary[0]] = (
+            "capacity_artifact", calibration_binary[1],
+        )
+        artifact_bytes[calibration_output[0]] = (
+            "capacity_artifact", calibration_output[1],
+        )
+        for host_id in host_ids:
+            documents[host_id] = {
+                "source": source,
+                "artifacts": {
+                    name: {"path": path, "sha256": sha(raw)}
+                    for name, (path, raw) in artifacts.items()
+                },
+                "soak_artifacts": {
+                    name: {"path": path, "sha256": sha(raw)}
+                    for name, (path, raw) in soak.items()
+                },
+                "analysis_artifact": {
+                    "path": analysis[0], "sha256": sha(analysis[1]),
+                },
+                "resource_domain_calibration": {
+                    "binary": {"path": calibration_binary[0],
+                               "sha256": sha(calibration_binary[1])},
+                    "output": {"path": calibration_output[0],
+                               "sha256": sha(calibration_output[1])},
+                    "record": {}, "source": {}, "build": {},
+                    "build_sha256": "c" * 64,
+                },
+                "runtime_readback_validator": {
+                    "path": "scripts/runtime-readback.py",
+                    "sha256": sha(validator),
+                },
+            }
+
+        raw_entries = dict(file_bytes)
+        for path, (_role, raw) in artifact_bytes.items():
+            raw_entries[path] = raw
+        rows = []
+        captured = []
+        for relative, raw in raw_entries.items():
+            if relative in file_bytes:
+                file_record = next(item for item in files
+                                   if item["path"] == relative)
+                role = ("typed_source_file" if file_record["kind"] == "file"
+                        else "typed_source_symlink")
+            else:
+                role = artifact_bytes[relative][0]
+            path = str(Path(root) / relative)
+            common = {
+                "role": role, "host_id": "host-a",
+                "origin_path": path, "local_path": path,
+                "raw_sha256": sha(raw), "semantic_sha256": None,
+                "byte_count": len(raw),
+            }
+            rows.append(common)
+            captured.append({**common, "raw_bytes": raw})
+        rows.sort(key=lambda item: item["origin_path"])
+        captured.sort(key=lambda item: item["origin_path"])
+        request = {"source_root": root, "host_id": "host-a"}
+        manifest = {
+            "execution_sources": {
+                host_id: {"source_root": root} for host_id in host_ids
+            },
+        }
+        store = {item["origin_path"]: item for item in captured}
+        return request, manifest, documents, host_ids, {"entries": rows}, store
+
+    def test_full_typed_source_and_artifact_index_closure_is_exact(self) -> None:
+        chronology = self.chronology
+        request, manifest, sources, hosts, index, store = \
+            self._full_source_index_fixture()
+        chronology._source5_validate_full_source_index_closure(
+            request, manifest, sources, hosts, index, store,
+        )
+        missing_symlink = dict(store)
+        missing_symlink.pop("/private/source/vendor/deep/LICENSE")
+        index_without_symlink = {
+            "entries": [item for item in index["entries"]
+                        if item["origin_path"] !=
+                        "/private/source/vendor/deep/LICENSE"],
+        }
+        with self.assertRaisesRegex(chronology.ChronologyError,
+                                    "lacks one exact typed_source_symlink"):
+            chronology._source5_validate_full_source_index_closure(
+                request, manifest, sources, hosts,
+                index_without_symlink, missing_symlink,
+            )
+        missing_artifact = dict(store)
+        missing_artifact.pop("/private/source/target/soak/allocatbelt")
+        index_without_artifact = {
+            "entries": [item for item in index["entries"]
+                        if item["origin_path"] !=
+                        "/private/source/target/soak/allocatbelt"],
+        }
+        with self.assertRaisesRegex(chronology.ChronologyError,
+                                    "lacks one exact source5_soak_artifact"):
+            chronology._source5_validate_full_source_index_closure(
+                request, manifest, sources, hosts,
+                index_without_artifact, missing_artifact,
+            )
+
+    def test_selected_floor_source_rule_and_plan_generation_are_transitively_bound(self) -> None:
+        chronology = self.chronology
+        policy_id = "application_capacity_relative_tenth_v1"
+        runtime_path = "bench/src/application/runtime_bindings.rs"
+        runtime_raw = (SOURCE_ROOT / runtime_path).read_bytes()
+        runtime_sha = sha(runtime_raw)
+        evidence_path = f"/private/source/{runtime_path}"
+        runtime_record = {
+            "path": runtime_path, "kind": "file", "mode": "100644",
+            "sha256": runtime_sha, "size": len(runtime_raw),
+        }
+        runtime_entry = {
+            "role": "typed_source_file", "host_id": "host-a",
+            "origin_path": evidence_path, "local_path": evidence_path,
+            "raw_sha256": runtime_sha, "semantic_sha256": None,
+            "byte_count": len(runtime_raw), "raw_bytes": runtime_raw,
+        }
+        source = {"source": {"files": [runtime_record]}}
+        request = {"source_root": "/private/source", "host_id": "host-a"}
+        descriptor = chronology._source5_capacity_floor_descriptor(
+            source, {evidence_path: runtime_entry}, request,
+        )
+        self.assertEqual(descriptor["policy_id"], policy_id)
+        bad_entry = {
+            **runtime_entry,
+            "raw_bytes": runtime_raw[:-1] + b" " if runtime_raw else b" ",
+        }
+        with self.assertRaisesRegex(chronology.ChronologyError,
+                                    "bytes differ"):
+            chronology._source5_capacity_floor_descriptor(
+                source, {evidence_path: bad_entry}, request,
+            )
+
+        core_keys = {
+            "campaign_id", "runner_sha256", "hosts", "cells", "protocol",
+            "runtime_binding", "phase_adapters", "aa_controls", "soak",
+            "deadlines",
+        }
+        spec = {key: key for key in core_keys}
+        static_core = chronology._source5_preparation_core_projection(spec, None)
+        self.assertEqual(static_core["schema"],
+                         chronology.SOURCE5_PREPARATION_CORE_SCHEMA_V1)
+        self.assertNotIn("capacity_floor_policy_id", static_core)
+        selected_core = chronology._source5_preparation_core_projection(
+            spec, policy_id,
+        )
+        self.assertEqual(selected_core["schema"],
+                         chronology.SOURCE5_PREPARATION_CORE_SCHEMA_V2)
+        self.assertEqual(selected_core["capacity_floor_policy_id"], policy_id)
+        with self.assertRaisesRegex(chronology.ChronologyError, "unknown"):
+            chronology._source5_preparation_core_projection(spec, "unknown_floor")
+
+        expected_source_pins = {
+            "feedback_validator": ("scripts/application-feedback-readback.py", "1" * 64),
+            "runtime_bindings": (runtime_path, runtime_sha),
+            "runtime_policy": (
+                "crates/allocatbelt/src/runtime/resource_feedback_policy.rs",
+                "2" * 64,
+            ),
+            "runtime_sensor": (
+                "crates/allocatbelt/src/runtime/resource_feedback_sensor.rs",
+                "3" * 64,
+            ),
+        }
+        records = [
+            {"path": path, "kind": "file", "sha256": digest}
+            for path, digest in expected_source_pins.values()
+        ]
+        pins = {
+            name: {"path": path, "sha256": digest}
+            for name, (path, digest) in expected_source_pins.items()
+        }
+        selected_policy_body = {
+            "schema": "allocatbelt.application-feedback-policy-artifact.v2",
+            "version": "runtime-feedback-policy-v1",
+            "reader_contract": {}, "algorithm": {}, "contexts": {},
+            "source_pins": pins,
+            "capacity_floor_policy": descriptor,
+        }
+        selected_artifact = {
+            "schema": selected_policy_body["schema"],
+            "policy": selected_policy_body,
+            "policy_sha256": sha(canonical(selected_policy_body)),
+        }
+        policy_source = {
+            "source": {"files": records},
+            "qualification_harness": {
+                "feedback_validator": pins["feedback_validator"],
+            },
+            "feedback_policy": selected_artifact,
+        }
+        self.assertEqual(
+            chronology._source5_feedback_policy_artifact(
+                policy_source, policy_id, descriptor, "host-a",
+            )[0], selected_artifact,
+        )
+        static_policy_body = {
+            key: value for key, value in selected_policy_body.items()
+            if key not in ("schema", "capacity_floor_policy")
+        }
+        static_policy_body["schema"] = \
+            "allocatbelt.application-feedback-policy-artifact.v1"
+        static_artifact = {
+            "schema": static_policy_body["schema"],
+            "policy": static_policy_body,
+            "policy_sha256": sha(canonical(static_policy_body)),
+        }
+        static_source = {**policy_source, "feedback_policy": static_artifact}
+        self.assertEqual(
+            chronology._source5_feedback_policy_artifact(
+                static_source, None, None, "host-a",
+            )[0], static_artifact,
+        )
+        malformed_policy = copy.deepcopy(policy_source)
+        malformed_policy["feedback_policy"]["policy"]["capacity_floor_policy"] = {
+            **descriptor, "policy_id": "unknown_floor",
+        }
+        malformed_policy["feedback_policy"]["policy_sha256"] = sha(
+            canonical(malformed_policy["feedback_policy"]["policy"]),
+        )
+        with self.assertRaisesRegex(chronology.ChronologyError, "descriptor"):
+            chronology._source5_feedback_policy_artifact(
+                malformed_policy, policy_id, descriptor, "host-a",
+            )
+
+        host_ids = ["host-a", "host-b", "host-c"]
+        contexts = [
+            (workload, profile)
+            for workload, profiles in (
+                ("cpu", ("steady", "burst", "oversubscribed")),
+                ("memory", ("steady", "burst", "oversubscribed")),
+                ("http", ("steady", "burst", "oversubscribed")),
+                ("disk", ("steady", "burst", "oversubscribed")),
+                ("mixed", ("mixed", "burst", "oversubscribed")),
+            )
+            for profile in profiles
+        ]
+        allocators = ("allocatbelt", "mimalloc-secure", "mimalloc-standard", "system")
+        executors = ("allocatbelt", "tokio-1.53.1")
+        source_documents: dict[str, dict[str, Any]] = {}
+        capacity_templates: list[dict[str, Any]] = []
+        for host_index, host_id in enumerate(host_ids):
+            source_sha = chr(ord("a") + host_index) * 64
+            feedback_sha = chr(ord("d") + host_index) * 64
+            fixed_sha = chr(ord("g") + host_index) * 64
+            context_values = {
+                f"{workload}/{profile}": {
+                    "workers": 2 if profile == "oversubscribed" else 4,
+                    "minimum_dense_observations": 1,
+                    "controls": {},
+                }
+                for workload, profile in contexts
+            }
+            feedback_body = {
+                "version": "runtime-feedback-policy-v1",
+                "reader_contract": {}, "algorithm": {},
+                "contexts": context_values, "source_pins": pins,
+                "capacity_floor_policy": descriptor,
+            }
+            source_documents[host_id] = {
+                "source": {"source_tree_sha256": source_sha},
+                "feedback_policy": {
+                    "schema": "allocatbelt.application-feedback-policy-artifact.v2",
+                    "policy": feedback_body, "policy_sha256": feedback_sha,
+                },
+                "fixed_runtime_policy": {"policy_sha256": fixed_sha},
+                "artifacts": {
+                    allocator: {"sha256": chr(ord("j") + index) * 64}
+                    for index, allocator in enumerate(allocators)
+                },
+            }
+            for workload, profile in contexts:
+                capacity_templates.append({
+                    "capacity_key": {
+                        "host_id": host_id, "workload": workload,
+                        "profile": profile,
+                        "calibration_id": f"cal-{host_id}-{workload}-{profile}",
+                    },
+                    "pressure_condition_id": f"condition-{host_id}-{workload}-{profile}",
+                })
+
+        feedback_templates: list[dict[str, Any]] = []
+        for host_id in host_ids:
+            source_document = source_documents[host_id]
+            source_body = source_document["feedback_policy"]["policy"]
+            for workload, profile in contexts:
+                capacity = next(
+                    item["capacity_key"] for item in capacity_templates
+                    if item["capacity_key"]["host_id"] == host_id and
+                    item["capacity_key"]["workload"] == workload and
+                    item["capacity_key"]["profile"] == profile
+                )
+                condition_id = next(
+                    item["pressure_condition_id"] for item in capacity_templates
+                    if item["capacity_key"]["host_id"] == host_id and
+                    item["capacity_key"]["workload"] == workload and
+                    item["capacity_key"]["profile"] == profile
+                )
+                for family in ("fixed_policy", "external_pressure"):
+                    for allocator in allocators:
+                        for executor in executors:
+                            policy = {
+                                "version": source_body["version"],
+                                "reader_contract": source_body["reader_contract"],
+                                "algorithm": source_body["algorithm"],
+                                "context": source_body["contexts"][f"{workload}/{profile}"],
+                                "source_pins": source_body["source_pins"],
+                            }
+                            condition = condition_id if family == "external_pressure" else None
+                            if family == "external_pressure":
+                                policy["capacity_floor_policy"] = descriptor
+                                policy["capacity_floor_policy_id"] = policy_id
+                            identity = {
+                                "campaign_id": "campaign",
+                                "host_id": host_id, "workload": workload,
+                                "profile": profile,
+                                "comparison_family": family,
+                                "capacity_calibration_id": capacity["calibration_id"],
+                                "pressure_condition_id": condition,
+                                "allocator": allocator, "executor": executor,
+                                "source_sha256": source_document["source"]["source_tree_sha256"],
+                                "binary_sha256": source_document["artifacts"][allocator]["sha256"],
+                                "fixed_policy_sha256": source_document["fixed_runtime_policy"]["policy_sha256"],
+                                "feedback_policy_sha256": source_document["feedback_policy"]["policy_sha256"],
+                                "context_policy_sha256": sha(canonical(policy)),
+                                "prospective_nonce": f"{len(feedback_templates):032x}",
+                            }
+                            body = {
+                                "identity": identity,
+                                "nonce_scope": "reusable_template",
+                                "nonce_instantiation_schema": "allocatbelt.application-process-nonce-instantiation.v1",
+                                "nonce_instantiation_rule": "sha256(template_nonce,campaign_id,job_run_id,pair_member,ordinal)",
+                                "policy": policy, "required_proofs": [],
+                            }
+                            feedback_templates.append({
+                                **body, "template_sha256": sha(canonical(body)),
+                            })
+        plan = {
+            "campaign_id": "campaign", "host_ids": host_ids,
+            "capacity_process_templates": capacity_templates,
+            "feedback_process_templates": feedback_templates,
+            "feedback_process_templates_sha256": sha(canonical(feedback_templates)),
+        }
+        chronology._source5_validate_selected_plan_templates(
+            plan, source_documents, policy_id, descriptor,
+        )
+
+        bad_templates = copy.deepcopy(feedback_templates)
+        selected_row = next(
+            row for row in bad_templates
+            if row["identity"]["comparison_family"] == "external_pressure"
+        )
+        selected_row["policy"]["capacity_floor_policy_id"] = "unknown_floor"
+        selected_body = {key: value for key, value in selected_row.items()
+                         if key != "template_sha256"}
+        selected_row["template_sha256"] = sha(canonical(selected_body))
+        bad_plan = {**plan, "feedback_process_templates": bad_templates,
+                    "feedback_process_templates_sha256": sha(canonical(bad_templates))}
+        with self.assertRaisesRegex(chronology.ChronologyError,
+                                    "projection differs"):
+            chronology._source5_validate_selected_plan_templates(
+                bad_plan, source_documents, policy_id, descriptor,
+            )
+
+        foreign_templates = copy.deepcopy(feedback_templates)
+        fixed_row = next(
+            row for row in foreign_templates
+            if row["identity"]["comparison_family"] == "fixed_policy"
+        )
+        fixed_row["policy"]["capacity_floor_policy_id"] = policy_id
+        fixed_row["policy"]["capacity_floor_policy"] = descriptor
+        fixed_body = {key: value for key, value in fixed_row.items()
+                      if key != "template_sha256"}
+        fixed_row["template_sha256"] = sha(canonical(fixed_body))
+        foreign_plan = {
+            **plan, "feedback_process_templates": foreign_templates,
+            "feedback_process_templates_sha256": sha(canonical(foreign_templates)),
+        }
+        with self.assertRaisesRegex(chronology.ChronologyError,
+                                    "unexpected field set"):
+            chronology._source5_validate_selected_plan_templates(
+                foreign_plan, source_documents, policy_id, descriptor,
+            )
+
+    def test_every_evidence_role_has_a_finite_bound(self) -> None:
+        chronology = self.chronology
+        self.assertEqual(set(chronology.SOURCE5_JOURNAL_ROLE_LIMITS),
+                         chronology.SOURCE5_JOURNAL_EVIDENCE_ROLES)
+        self.assertEqual(chronology._source5_journal_role_limit(
+            "prepared_completion"), chronology.MAX_COMPLETION_BYTES)
+        self.assertEqual(chronology._source5_journal_role_limit(
+            "typed_source_symlink"), 4 * 1024)
+
+    def test_final_plan_horizon_is_derived_from_all_original_host_job_lists(self) -> None:
+        chronology = self.chronology
+        request = {"scope": "final_prepared_bounded", "host_id": "host-a"}
+        plan = {"jobs": {
+            "exploration": [{"host_id": "host-a"} for _ in range(3)],
+            "aa": [{"host_id": "host-a"} for _ in range(2)],
+            "confirmation": [{"host_id": "host-a"} for _ in range(6)],
+            "pressure": [{"host_id": "host-a"} for _ in range(6)],
+            "soak": [{"host_id": "host-a"}],
+        }}
+        manifest = {"schema": chronology.SOURCE5_EXECUTION_SCHEMA_V3}
+        ceiling = chronology._source5_plan_event_projection(
+            plan, request, manifest,
+        )
+        self.assertEqual(ceiling["job_counts"], {
+            "exploration": 3, "aa": 2, "confirmation": 6,
+            "pressure": 6, "soak": 1,
+        })
+        self.assertEqual(ceiling["maximum_callback_events"], 113)
+        self.assertEqual(ceiling["maximum_journal_bytes"],
+                         113 * chronology.MAX_EVENT_BYTES)
+        self.assertIs(ceiling["component_gate_claim"], False)
+
+    def test_final_request_uses_versioned_envelope_then_legacy_keeps_100k(self) -> None:
+        chronology = self.chronology
+        output = "/private/output"
+        campaign_id = "campaign-1"
+        host_id = "host-a"
+        chronology_dir = Path(output) / campaign_id / "chronology" / host_id
+        request = {
+            "schema": chronology.SOURCE5_HOST_JOURNAL_REQUEST_SCHEMA_V1,
+            "scope": "final_prepared",
+            "campaign_id": campaign_id,
+            "host_id": host_id,
+            "source_root": "/private/source",
+            "input_root": "/private/input",
+            "output_root": output,
+            "execution_manifest": {
+                "path": "/private/input/execution.json",
+                "raw_sha256": "1" * 64, "semantic_sha256": "2" * 64,
+            },
+            "provenance": {
+                "schema": chronology.SOURCE5_JOURNAL_PROVENANCE_SCHEMA_V1,
+                "preparation_pin": {
+                    "path": "/private/input/preparation.json",
+                    "raw_sha256": "3" * 64,
+                },
+                "final_spec_pin": {
+                    "path": "/private/input/spec.json",
+                    "raw_sha256": "4" * 64,
+                },
+                "final_plan_pin": {
+                    "path": "/private/input/plan.json",
+                    "raw_sha256": "5" * 64,
+                },
+            },
+            "journal": {
+                "path": str(chronology_dir / "dispatch-journal.jsonl"),
+                "raw_sha256": "6" * 64, "byte_count": 1,
+                "record_count": chronology.MAX_JOURNAL_EVENTS + 1,
+                "terminal_head": "7" * 64,
+            },
+            "origin_receipt": {
+                "path": str(chronology_dir /
+                            "source5-origin-journal-receipt.json"),
+                "raw_sha256": "8" * 64, "semantic_sha256": "9" * 64,
+            },
+            "evidence_index": {
+                "path": str(chronology_dir / "evidence-index.json"),
+                "raw_sha256": "a" * 64, "semantic_sha256": "b" * 64,
+            },
+        }
+        parsed = chronology._source5_journal_request(request)
+        self.assertEqual(parsed["journal"]["record_count"], 100_001)
+        too_many = copy.deepcopy(request)
+        too_many["journal"]["record_count"] = \
+            chronology.MAX_SOURCE5_JOURNAL_EVENTS + 1
+        with self.assertRaisesRegex(chronology.ChronologyError,
+                                    "record count"):
+            chronology._source5_journal_request(too_many)
+
+        legacy = copy.deepcopy(request)
+        legacy["scope"] = "prospective_exploration"
+        legacy["provenance"]["preparation_pin"] = None
+        with self.assertRaisesRegex(chronology.ChronologyError,
+                                    "record count"):
+            chronology._source5_journal_request(legacy)
 
 
 if __name__ == "__main__":

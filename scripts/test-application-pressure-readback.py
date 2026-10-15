@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import argparse
+import ast
+import inspect
 import importlib.util
 import builtins
 import json
@@ -18,6 +20,7 @@ from unittest.mock import patch
 SCRIPT_DIR = Path(__file__).resolve().parent
 READER_PATH = SCRIPT_DIR / "application-pressure-readback.py"
 DRIVER_PATH = SCRIPT_DIR / "application-pressure-driver.py"
+FEEDBACK_READER_PATH = SCRIPT_DIR / "application-feedback-readback.py"
 
 
 def _load_module(name: str, path: Path) -> Any:
@@ -32,7 +35,10 @@ def _load_module(name: str, path: Path) -> Any:
 
 readback = _load_module("pressure_readback_v2_test_target", READER_PATH)
 driver = _load_module("pressure_driver_v2_test_target", DRIVER_PATH)
+feedback_reader = _load_module("pressure_feedback_readback_floor_test_target", FEEDBACK_READER_PATH)
 SCOPE_FIXTURE_SCHEMA = "allocatbelt.application-pressure-calibration-v2-native-fixture.v1"
+PRESSURE_OFFLINE_FIXTURE_SCHEMA = "allocatbelt.application-pressure-offline-fixture.v1"
+SOAK_PRESSURE_OFFLINE_FIXTURE_SCHEMA = "allocatbelt.application-source5-soak-pressure-offline-fixture.v1"
 SCOPE_FIXTURE_EXPECTED_KEYS = {
     "host_id", "condition_id", "pressure_calibration_id", "capacity_key",
     "calibration_raw_sha256", "calibration_sha256", "scope_sha256",
@@ -471,6 +477,76 @@ def run_genuine_scope_fixture(path: Path) -> dict[str, Any]:
 
 
 class PressureReadbackV2Tests(unittest.TestCase):
+    def test_selected_floor_policy_is_bound_through_exact_shared_and_member_contexts(self) -> None:
+        tree = ast.parse(READER_PATH.read_bytes(), filename=str(READER_PATH))
+        matches = [node for node in tree.body
+                   if isinstance(node, ast.FunctionDef) and
+                   node.name == "_verify_context_policy_bundle_v2"]
+        self.assertEqual(len(matches), 1)
+        source = ast.unparse(matches[0])
+        self.assertIn("_source5_capacity_floor_policy_id(source_stack)", source)
+        self.assertIn("shared_context_keys.add", source)
+        self.assertIn("expected_request_schema", source)
+        self.assertIn("request.get('capacity_floor_policy_id')", source)
+        self.assertIn("resolved_context_keys.add", source)
+        self.assertIn("expected_shared_context['capacity_floor_policy_id']", source)
+
+    def test_pressure_policy_floor_selector_is_derived_from_exact_source_artifact(self) -> None:
+        descriptor = {
+            "capacity_divisor": feedback_reader.CAPACITY_FLOOR_DIVISOR,
+            "minimum_floor_bytes_per_second": feedback_reader.CAPACITY_FLOOR_MINIMUM_BYTES_PER_SECOND,
+            "policy_id": feedback_reader.CAPACITY_FLOOR_POLICY_ID,
+            "probe_activation": feedback_reader.CAPACITY_FLOOR_PROBE_ACTIVATION,
+            "rule": feedback_reader.CAPACITY_FLOOR_RULE,
+            "rule_version": feedback_reader.CAPACITY_RESOLUTION_VERSION,
+            "runtime_activation": feedback_reader.CAPACITY_FLOOR_RUNTIME_ACTIVATION,
+            "static_floor_bytes_per_second": feedback_reader.CAPACITY_RATE_FLOOR,
+            "static_rate_roof_bytes_per_second": feedback_reader.CAPACITY_RATE_ROOF,
+        }
+        policy_body = {
+            "schema": "allocatbelt.application-feedback-policy-artifact.v2",
+            "version": "runtime-feedback-policy-v1",
+            "reader_contract": {}, "algorithm": {}, "contexts": {},
+            "source_pins": {}, "capacity_floor_policy": descriptor,
+        }
+        artifact = {
+            "schema": "allocatbelt.application-feedback-policy-artifact.v2",
+            "policy": policy_body,
+            "policy_sha256": readback.digest_object(policy_body),
+        }
+        source_stack = {
+            "source": {"feedback_policy": artifact},
+            "feedback_reader": feedback_reader,
+        }
+        self.assertEqual(
+            readback._source5_capacity_floor_policy_id(source_stack),
+            feedback_reader.CAPACITY_FLOOR_POLICY_ID,
+        )
+
+        static_body = {key: value for key, value in policy_body.items()
+                       if key != "capacity_floor_policy"}
+        static_body["schema"] = "allocatbelt.application-feedback-policy-artifact.v1"
+        static_artifact = {
+            "schema": "allocatbelt.application-feedback-policy-artifact.v1",
+            "policy": static_body,
+            "policy_sha256": readback.digest_object(static_body),
+        }
+        self.assertIsNone(readback._source5_capacity_floor_policy_id({
+            "source": {"feedback_policy": static_artifact},
+            "feedback_reader": feedback_reader,
+        }))
+
+        bad_descriptor = {**descriptor, "policy_id": "unknown_floor_policy"}
+        bad_body = {**policy_body, "capacity_floor_policy": bad_descriptor}
+        bad_artifact = {**artifact, "policy": bad_body,
+                        "policy_sha256": readback.digest_object(bad_body)}
+        with self.assertRaisesRegex(feedback_reader.ValidationError,
+                                    "independent reader contract"):
+            readback._source5_capacity_floor_policy_id({
+                "source": {"feedback_policy": bad_artifact},
+                "feedback_reader": feedback_reader,
+            })
+
     def test_driver_context_preflight_passes_canonical_source_root_text_to_reader(self) -> None:
         with tempfile.TemporaryDirectory(prefix="pressure-v2-source-boundary-") as temporary:
             root = Path(temporary)
@@ -815,13 +891,521 @@ class PressureReadbackV2Tests(unittest.TestCase):
             self.assertEqual(path.read_bytes(), replacement)
 
 
+class PressurePairHostReceiptSchemaTests(unittest.TestCase):
+    """Synthetic schema fixture only; this is not a host-cleanup witness."""
+
+    def _receipt(self) -> dict[str, Any]:
+        deps = {
+            name: {"path": f"scripts/{name}.py", "raw_sha256": f"{index:064x}"}
+            for index, name in enumerate((
+                "application-campaign", "application-campaign-chronology",
+                "application-feedback-composition", "application-feedback-readback",
+                "application-pressure-readback", "application-soak-readback",
+                "application-byte-capacity", "application-pressure-pair",
+                "application-pressure-driver", "application-source-inventory",
+                "application-fixed-pair",
+            ), 1)
+        }
+        roles = dict(zip(("application-campaign", "application-campaign-chronology",
+                          "application-feedback-composition", "application-feedback-readback",
+                          "application-pressure-readback", "application-soak-readback",
+                          "application-byte-capacity", "application-pressure-pair",
+                          "application-pressure-driver", "application-source-inventory",
+                          "application-fixed-pair"),
+                         ("campaign_controller", "campaign_chronology", "feedback_composition",
+                          "feedback_validator", "pressure_validator", "soak_supervisor",
+                          "capacity_producer", "pressure_pair", "pressure_driver",
+                          "source_inventory", "fixed_pair"), strict=True))
+        deps = {roles[name]: pin for name, pin in deps.items()}
+        deps["source5_helper_input"] = {
+            "path": "/evidence/helper-input.json", "raw_sha256": "2" * 64,
+        }
+        deps["source5_helper_module"] = deps["pressure_pair"]
+        facts = {
+            "boot_id_sha256": "a" * 64, "kernel_release": "fixture-kernel",
+            "cpu_affinity": [0, 1], "network_namespace_inode": 7,
+        }
+        origin = {
+            "schema": readback.PRESSURE_PAIR_ORIGIN_FACTS_SCHEMA,
+            "host_id": "host-a", "observed_host_raw_sha256": "f" * 64,
+            "before": facts, "after": facts, "storage_sha256": "c" * 64,
+        }
+        origin["origin_facts_sha256"] = readback.digest_object(origin)
+        rows = []
+        for index, pair_name in enumerate(("bounded", "tokio")):
+            app = {"pid": 100 + index * 10, "start_ticks": 1000 + index * 10}
+            worker = {
+                "role": "loopback", "cpu": None, "pid": app["pid"] + 1,
+                "start_ticks": app["start_ticks"] + 1,
+                "pgid": app["pid"] + 1, "session_id": app["pid"] + 1,
+            }
+            artifacts = {
+                "directory": f"/evidence/member-{index}/pressure",
+                "pins": {name: f"{index + 1:064x}" for name in (
+                    "events", "launch", "process_binding", "ready", "run",
+                )},
+                "proof": {"path": f"/evidence/member-{index}/pressure-readback.json",
+                          "raw_sha256": f"{index + 11:064x}"},
+                "ready_sha256": f"{index + 21:064x}", "driver": {},
+                "worker_sessions": [worker], "driver_logs": {},
+            }
+            rows.append({
+                "ordinal": index,
+                "descriptor": {"pair": pair_name,
+                               "executor": "bounded" if index == 0 else "tokio",
+                               "allocator": "allocatbelt"},
+                "identity": {"host_id": "host-a", "run_id": "run-a",
+                             "allocator": "allocatbelt"},
+                "pressure_recipe": {
+                    "path": f"/evidence/member-{index}/recipe.json",
+                    "raw_sha256": f"{index + 31:064x}",
+                    "semantic_sha256": f"{index + 41:064x}",
+                    "condition_sha256": f"{index + 51:064x}",
+                },
+                "pressure_artifacts": artifacts,
+                "application_identity": app,
+                "worker_identities": [worker],
+                "pid_absence": [
+                    {"pid": app["pid"], "start_ticks": app["start_ticks"],
+                     "absent": True, "observed_monotonic_ns": 5000},
+                    {"pid": worker["pid"], "start_ticks": worker["start_ticks"],
+                     "absent": True, "observed_monotonic_ns": 5001},
+                ],
+                "probe_capture": {
+                    "construction_probe": {
+                        "path": f"/evidence/member-{index}/probe.json",
+                        "raw_sha256": f"{index + 91:064x}", "allocator": "allocatbelt",
+                        "binary_sha256": f"{index + 101:064x}",
+                    },
+                    "capture_receipt": {
+                        "path": f"/evidence/member-{index}/capture.json",
+                        "raw_sha256": f"{index + 111:064x}",
+                        "receipt_sha256": f"{index + 121:064x}",
+                    },
+                    "capacity_bundle": {
+                        name: {"path": f"/evidence/member-{index}/capacity-{name}.json",
+                               "raw_sha256": f"{index + 131 + offset:064x}"}
+                        for offset, name in enumerate(("request", "artifact", "receipt"))
+                    },
+                },
+                "application_launch_attestation": {
+                    "path": f"/evidence/member-{index}/attestation.json",
+                    "raw_sha256": f"{index + 61:064x}"},
+                "application_cleanup": {
+                    "path": f"/evidence/member-{index}/cleanup.json",
+                    "raw_sha256": f"{index + 71:064x}"},
+                "supervision_receipt": {
+                    "path": f"/evidence/member-{index}/supervision.json",
+                    "raw_sha256": f"{index + 81:064x}"},
+                "storage_proof": {
+                    "application_tmpdir_path": f"/evidence/member-{index}/tmp",
+                    "pressure_scratch_path": f"/storage/member-{index}/scratch.bin",
+                    "application_mount_id": 3, "storage_sha256": "d" * 64,
+                },
+            })
+        origin["storage_sha256"] = readback.digest_object([
+            row["storage_proof"]["storage_sha256"] for row in rows
+        ])
+        origin_body = {key: value for key, value in origin.items()
+                       if key != "origin_facts_sha256"}
+        origin["origin_facts_sha256"] = readback.digest_object(origin_body)
+        body = {
+            "schema": readback.PRESSURE_PAIR_HOST_VERIFICATION_SCHEMA,
+            "campaign_id": "campaign-a", "host_id": "host-a",
+            "job": {"run_id": "run-a", "ordinal": 9, "job_index": 4,
+                    "semantic_sha256": "e" * 64},
+            "recipe": {"path": "/evidence/recipe.json", "raw_sha256": "f" * 64,
+                       "semantic_sha256": "1" * 64},
+            "readback": {"path": "/evidence/pressure-pair-readback.json",
+                         "raw_sha256": "2" * 64, "semantic_sha256": "3" * 64},
+            "source_manifest": {"path": "/evidence/source-manifest.json",
+                                 "raw_sha256": "4" * 64, "semantic_sha256": "5" * 64,
+                                 "source_tree_sha256": "6" * 64},
+            "spec": {"path": "/evidence/spec.json", "raw_sha256": "7" * 64,
+                     "semantic_sha256": "8" * 64},
+            "plan": {"path": "/evidence/plan.json", "raw_sha256": "9" * 64,
+                     "semantic_sha256": "a" * 64},
+            "execution_manifest": {"path": "/evidence/overlay.json",
+                                   "raw_sha256": "b" * 64,
+                                   "semantic_sha256": "c" * 64},
+            "authorization_id": "auth-a", "journal_head": "d" * 64,
+            "registration_head": "e" * 64,
+            "observed_host": {"path": "/evidence/observed-host.json",
+                               "raw_sha256": "f" * 64},
+            "origin_facts": origin, "dependency_pins": deps,
+            "member_facts": rows, "strict_result_sha256": "1" * 64,
+            "qualification_eligible": False, "execution_ready": False,
+        }
+        return {**body, "receipt_sha256": readback.digest_object(body)}
+
+    def test_receipt_validator_checks_separate_raw_and_semantic_pins(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="pressure-host-receipt-") as directory:
+            root = Path(directory)
+            root.chmod(0o700)
+            path = root / "host-receipt.json"
+            receipt = self._receipt()
+            raw = readback.canonical_bytes(receipt)
+            path.write_bytes(raw)
+            path.chmod(0o600)
+            pin = {"path": str(path), "raw_sha256": readback.sha256_bytes(raw),
+                   "receipt_sha256": receipt["receipt_sha256"]}
+            checked, actual_raw, checked_pin = readback._validate_pressure_pair_host_receipt(pin)
+            self.assertEqual(checked, receipt)
+            self.assertEqual(actual_raw, pin["raw_sha256"])
+            self.assertEqual(checked_pin["receipt_sha256"], receipt["receipt_sha256"])
+
+            wrong_role = dict(pin, receipt_sha256=pin["raw_sha256"])
+            with self.assertRaisesRegex(readback.ReadbackError, "raw/semantic digest roles"):
+                readback._validate_pressure_pair_host_receipt(wrong_role)
+
+            mutated = dict(receipt, execution_ready=True)
+            mutated_body = {key: value for key, value in mutated.items() if key != "receipt_sha256"}
+            mutated["receipt_sha256"] = readback.digest_object(mutated_body)
+            path.write_bytes(readback.canonical_bytes(mutated))
+            with self.assertRaisesRegex(readback.ReadbackError, "false eligibility fields"):
+                readback._validate_pressure_pair_host_receipt({
+                    "path": str(path), "raw_sha256": readback.sha256_bytes(path.read_bytes()),
+                    "receipt_sha256": mutated["receipt_sha256"],
+                })
+
+    def test_soak_single_app_api_has_its_own_three_pin_boundary(self) -> None:
+        signature = inspect.signature(readback.verify_source5_soak_pressure_offline)
+        positional = [
+            parameter.name for parameter in signature.parameters.values()
+            if parameter.kind is inspect.Parameter.POSITIONAL_OR_KEYWORD
+        ]
+        keyword_only = {
+            parameter.name for parameter in signature.parameters.values()
+            if parameter.kind is inspect.Parameter.KEYWORD_ONLY
+        }
+        self.assertEqual(positional, [
+            "pressure_recipe_pin", "pressure_artifacts",
+            "soak_host_verification_pin",
+        ])
+        self.assertEqual(keyword_only, {"evidence_path_map", "source_root"})
+
+    def test_soak_pressure_calls_match_the_actual_reader_api_signatures(self) -> None:
+        """Bind new direct calls to parsed definitions and loaded functions."""
+        def assert_call_shapes(owner: ast.AST,
+                               definitions: dict[str, ast.AST],
+                               functions: dict[str, Any]) -> None:
+            seen = {name: 0 for name in functions}
+            for call in ast.walk(owner):
+                if not isinstance(call, ast.Call):
+                    continue
+                if isinstance(call.func, ast.Name):
+                    target_name = call.func.id
+                elif isinstance(call.func, ast.Attribute):
+                    target_name = call.func.attr
+                else:
+                    continue
+                runtime_target = functions.get(target_name)
+                if runtime_target is None:
+                    continue
+                definition = definitions[target_name]
+                args = definition.args
+                positional_ast = args.posonlyargs + args.args
+                positional_names = [argument.arg for argument in positional_ast]
+                positional_defaults = [None] * (
+                    len(positional_names) - len(args.defaults)
+                ) + list(args.defaults)
+                keyword_only_names = [argument.arg for argument in args.kwonlyargs]
+                keyword_only_required = {
+                    name for name, default in zip(
+                        keyword_only_names, args.kw_defaults, strict=True,
+                    ) if default is None
+                }
+                signature = inspect.signature(runtime_target)
+                runtime_positional = [
+                    parameter.name for parameter in signature.parameters.values()
+                    if parameter.kind in (
+                        inspect.Parameter.POSITIONAL_ONLY,
+                        inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                    )
+                ]
+                runtime_keyword_only = [
+                    parameter.name for parameter in signature.parameters.values()
+                    if parameter.kind is inspect.Parameter.KEYWORD_ONLY
+                ]
+                self.assertEqual(
+                    runtime_positional, positional_names,
+                    f"{target_name} loaded positional signature differs from its parsed definition",
+                )
+                self.assertEqual(
+                    runtime_keyword_only, keyword_only_names,
+                    f"{target_name} loaded keyword-only signature differs from its parsed definition",
+                )
+                self.assertIsNone(args.vararg,
+                                  f"{target_name} must not hide call arity in *args")
+                self.assertIsNone(args.kwarg,
+                                  f"{target_name} must not hide call names in **kwargs")
+                seen[target_name] += 1
+                self.assertLessEqual(
+                    len(call.args), len(positional_names),
+                    f"{target_name} call passes too many positional arguments",
+                )
+                supplied = set(positional_names[:len(call.args)])
+                self.assertFalse(
+                    any(keyword.arg is None for keyword in call.keywords),
+                    f"{target_name} call uses **kwargs without an accepting parameter",
+                )
+                keyword_names = {keyword.arg for keyword in call.keywords
+                                 if keyword.arg is not None}
+                keywordable = {
+                    argument.arg for argument in args.args
+                } | set(keyword_only_names)
+                self.assertTrue(
+                    keyword_names <= keywordable,
+                    f"{target_name} call uses an unknown keyword argument",
+                )
+                self.assertFalse(
+                    supplied & keyword_names,
+                    f"{target_name} call supplies an argument twice",
+                )
+                required_positional = {
+                    name for name, default in zip(
+                        positional_names, positional_defaults, strict=True,
+                    ) if default is None
+                }
+                self.assertTrue(
+                    required_positional | keyword_only_required <=
+                    supplied | keyword_names,
+                    f"{target_name} call omits a required argument",
+                )
+            for name, count in seen.items():
+                self.assertGreater(count, 0, f"expected a direct {name} call")
+
+        reader_tree = ast.parse(READER_PATH.read_text(encoding="utf-8"))
+        reader_functions = {
+            node.name: node for node in reader_tree.body
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        }
+        offline = reader_functions["verify_source5_soak_pressure_offline"]
+        assert_call_shapes(offline, reader_functions, {
+            "read_canonical": readback.read_canonical,
+            "_validate_recipe": readback._validate_recipe,
+            "verify_pressure": readback.verify_pressure,
+        })
+
+        test_tree = ast.parse(Path(__file__).read_text(encoding="utf-8"))
+        test_functions = {
+            node.name: node for node in test_tree.body
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        }
+        fixture_functions = [
+            test_functions["run_pressure_offline_fixture"],
+            test_functions["run_source5_soak_pressure_offline_fixture"],
+        ]
+        for fixture_function in fixture_functions:
+            assert_call_shapes(fixture_function, reader_functions, {
+                "read_canonical": readback.read_canonical,
+            })
+
+    def test_soak_single_app_receipt_validator_rejects_pair_receipt_schema(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="pressure-soak-receipt-schema-") as temporary:
+            root = Path(temporary)
+            root.chmod(0o700)
+            path = root / "pair-host-receipt.json"
+            receipt = self._receipt()
+            raw = readback.canonical_bytes(receipt)
+            path.write_bytes(raw)
+            path.chmod(0o600)
+            with self.assertRaisesRegex(readback.ReadbackError, "unexpected shape"):
+                readback._validate_source5_soak_host_receipt_v2({
+                    "path": str(path), "raw_sha256": readback.sha256_bytes(raw),
+                    "receipt_sha256": receipt["receipt_sha256"],
+                })
+
+    def test_soak_single_app_pressure_rejects_missing_host_receipt_map_before_reads(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="pressure-soak-map-preflight-") as temporary:
+            root = Path(temporary).resolve()
+            source_root = root / "source"
+            artifact_root = root / "pressure"
+            source_root.mkdir(mode=0o700)
+            artifact_root.mkdir(mode=0o700)
+            recipe = source_root / "pressure-recipe.json"
+            proof = root / "pressure-readback.json"
+            logs = [root / "pressure-driver.stdout.log",
+                    root / "pressure-driver.stderr.log"]
+            artifact_files = [
+                artifact_root / "events.jsonl",
+                artifact_root / "launch-record.json",
+                artifact_root / "process-binding.json",
+                artifact_root / "pressure-ready.json",
+                artifact_root / "run.json",
+            ]
+            for path in [recipe, proof, *logs, *artifact_files]:
+                path.write_bytes(b"placeholder\n")
+                path.chmod(0o600)
+            pins = {
+                name: "a" * 64 for name in (
+                    "events", "launch", "process_binding", "ready", "run",
+                )
+            }
+            artifacts = {
+                "directory": str(artifact_root), "pins": pins,
+                "proof": {"path": str(proof), "raw_sha256": "b" * 64},
+                "ready_sha256": pins["ready"], "driver": {},
+                "worker_sessions": [],
+                "driver_logs": {
+                    "stdout": {"path": str(logs[0]), "raw_sha256": "c" * 64},
+                    "stderr": {"path": str(logs[1]), "raw_sha256": "d" * 64},
+                },
+            }
+            mapped = [source_root, artifact_root, recipe, proof, *logs,
+                      *artifact_files]
+            entries = [
+                {"origin": str(path), "local": str(path)}
+                for path in sorted(mapped, key=str)
+            ]
+            with patch.object(
+                readback, "read_canonical",
+                side_effect=AssertionError("read before top-level map closure"),
+            ) as read_canonical:
+                with self.assertRaisesRegex(
+                    readback.ReadbackError,
+                    "path map omits a direct pinned input",
+                ):
+                    readback.verify_source5_soak_pressure_offline(
+                        {
+                            "path": str(recipe), "raw_sha256": "e" * 64,
+                            "semantic_sha256": "f" * 64,
+                            "condition_sha256": "1" * 64,
+                        }, artifacts,
+                        {"path": str(root / "unmapped-host.json"),
+                         "raw_sha256": "2" * 64,
+                         "receipt_sha256": "3" * 64},
+                        evidence_path_map={
+                            "schema": readback.EVIDENCE_PATH_MAP_SCHEMA_V1,
+                            "entries": entries,
+                        },
+                        source_root=str(source_root),
+                    )
+                read_canonical.assert_not_called()
+
+
+
+
+def run_pressure_offline_fixture(request_path: Path, expected_request_raw_sha256: str) -> dict[str, Any]:
+    """Public replay entrypoint for genuine copied pressure evidence."""
+    request, _request_raw, request_sha = readback.read_canonical(
+        request_path, "pressure offline fixture request", 2 * 1024 * 1024,
+    )
+    if request_sha != expected_request_raw_sha256:
+        raise readback.ReadbackError("pressure offline fixture request raw pin differs")
+    readback.exact(request, {
+        "schema", "pressure_recipe", "pressure_artifacts", "host_verification",
+        "evidence_path_map", "source_root",
+    }, "pressure offline fixture request")
+    if request["schema"] != PRESSURE_OFFLINE_FIXTURE_SCHEMA:
+        raise readback.ReadbackError("unsupported pressure offline fixture request schema")
+    result = readback.verify_pressure_offline(
+        request["pressure_recipe"], request["pressure_artifacts"],
+        request["host_verification"], evidence_path_map=request["evidence_path_map"],
+        source_root=request["source_root"],
+    )
+    if result.get("status") != "valid" or "qualification_eligible" in result:
+        raise readback.ReadbackError("offline pressure fixture returned an invalid or readiness-bearing result")
+    return {"request_raw_sha256": request_sha, "readback": result}
+
+
+def run_source5_soak_pressure_offline_fixture(
+    request_path: Path, expected_request_raw_sha256: str,
+) -> dict[str, Any]:
+    """Replay a genuine one-APP Soak pressure receipt and its raw event set."""
+    request, _request_raw, request_sha = readback.read_canonical(
+        request_path, "Source5 Soak pressure offline fixture request",
+        2 * 1024 * 1024,
+    )
+    if request_sha != expected_request_raw_sha256:
+        raise readback.ReadbackError(
+            "Source5 Soak pressure offline fixture request raw pin differs",
+        )
+    readback.exact(request, {
+        "schema", "pressure_recipe", "pressure_artifacts",
+        "soak_host_verification", "evidence_path_map", "source_root",
+        "expected",
+    }, "Source5 Soak pressure offline fixture request")
+    if request["schema"] != SOAK_PRESSURE_OFFLINE_FIXTURE_SCHEMA:
+        raise readback.ReadbackError(
+            "unsupported Source5 Soak pressure offline fixture schema",
+        )
+    result = readback.verify_source5_soak_pressure_offline(
+        request["pressure_recipe"], request["pressure_artifacts"],
+        request["soak_host_verification"],
+        evidence_path_map=request["evidence_path_map"],
+        source_root=request["source_root"],
+    )
+    expected = readback.exact(request["expected"], {
+        "host_id", "run_id", "recipe_raw_sha256", "condition_sha256",
+        "readback_sha256", "sample_count", "application_overlap_nanoseconds",
+    }, "Source5 Soak pressure offline fixture expected replay pins")
+    projection = {
+        "host_id": result["identity"]["host_id"],
+        "run_id": result["identity"]["run_id"],
+        "recipe_raw_sha256": result["recipe_raw_sha256"],
+        "condition_sha256": result["condition_sha256"],
+        "readback_sha256": result["readback_sha256"],
+        "sample_count": result["sample_count"],
+        "application_overlap_nanoseconds":
+            result["application_overlap_nanoseconds"],
+    }
+    if projection != expected:
+        raise readback.ReadbackError(
+            "Source5 Soak pressure offline replay differs from the pinned fixture result",
+        )
+    if "qualification_eligible" in result or "execution_ready" in result:
+        raise readback.ReadbackError(
+            "Source5 Soak pressure replay returned a qualification-bearing result",
+        )
+    return {"request_raw_sha256": request_sha, "readback": result}
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--scope-fixture", type=Path,
         help="run full replay and mutation checks against a raw-pinned genuine SourceV5 fixture",
     )
+    parser.add_argument("--pressure-offline-fixture", type=Path,
+                        help="replay pressure output using a genuine strict host receipt")
+    parser.add_argument("--expected-pressure-fixture-sha256")
+    parser.add_argument("--source5-soak-pressure-offline-fixture", type=Path,
+                        help="replay pressure output using a genuine strict single-APP Soak receipt")
+    parser.add_argument("--expected-source5-soak-pressure-fixture-sha256")
     args = parser.parse_args(argv)
+    if args.source5_soak_pressure_offline_fixture is not None:
+        if args.expected_source5_soak_pressure_fixture_sha256 is None:
+            parser.error(
+                "--source5-soak-pressure-offline-fixture requires "
+                "--expected-source5-soak-pressure-fixture-sha256",
+            )
+        result = run_source5_soak_pressure_offline_fixture(
+            args.source5_soak_pressure_offline_fixture,
+            args.expected_source5_soak_pressure_fixture_sha256,
+        )
+        sys.stdout.buffer.write(readback.canonical_bytes({
+            "schema": SOAK_PRESSURE_OFFLINE_FIXTURE_SCHEMA,
+            "status": "single_app_pressure_offline_replay_passed",
+            "request_raw_sha256": result["request_raw_sha256"],
+            "readback_sha256": result["readback"]["readback_sha256"],
+            "qualification_eligible": False,
+        }))
+        return 0
+    if args.pressure_offline_fixture is not None:
+        if args.expected_pressure_fixture_sha256 is None:
+            parser.error("--pressure-offline-fixture requires --expected-pressure-fixture-sha256")
+        result = run_pressure_offline_fixture(
+            args.pressure_offline_fixture, args.expected_pressure_fixture_sha256,
+        )
+        sys.stdout.buffer.write(readback.canonical_bytes({
+            "schema": PRESSURE_OFFLINE_FIXTURE_SCHEMA,
+            "status": "full_pressure_offline_replay_passed",
+            "request_raw_sha256": result["request_raw_sha256"],
+            "readback_sha256": result["readback"]["readback_sha256"],
+            "qualification_eligible": False,
+        }))
+        return 0
     if args.scope_fixture is not None:
         result = run_genuine_scope_fixture(args.scope_fixture)
         sys.stdout.buffer.write(readback.canonical_bytes({

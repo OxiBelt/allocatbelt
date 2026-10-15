@@ -22,16 +22,19 @@ use allocatbelt::runtime::resource_feedback_policy::{
 
 use super::runtime_bindings::{
   APPLICATION_BYTE_CALIBRATION_UNITS, APPLICATION_RATE_CEILING_BYTES_PER_SECOND, ApplicationDomain,
-  ApplicationRateConfigs, CapacityCalibrationArtifact, CapacityCalibrationProbeInput,
-  FEEDBACK_MINIMUM_DENSE_OBSERVATIONS, ResolvedApplicationFeedback,
-  after_release_global_snapshot_rows, application_domain_limits,
-  construction_global_control_baseline, feedback_policy_control_config, fixed_rate_config,
+  ApplicationRateConfigs, CAPACITY_FLOOR_DIVISOR, CAPACITY_FLOOR_MINIMUM_BYTES_PER_SECOND,
+  CAPACITY_FLOOR_POLICY_ID, CAPACITY_FLOOR_PROBE_ACTIVATION, CAPACITY_FLOOR_RULE,
+  CAPACITY_FLOOR_RULE_VERSION, CAPACITY_FLOOR_RUNTIME_ACTIVATION, CapacityCalibrationArtifact,
+  CapacityCalibrationProbeInput, CapacityFloorPolicy, FEEDBACK_MINIMUM_DENSE_OBSERVATIONS,
+  FEEDBACK_RATE_FLOOR, ResolvedApplicationFeedback, after_release_global_snapshot_rows,
+  application_domain_limits, construction_global_control_baseline, feedback_policy_control_config,
+  fixed_rate_config,
 };
 use super::{Profile, Workload, resource_limits};
 
 const SCHEMA: &str = "allocatbelt.application-feedback-policy-probe.v1";
 const CALIBRATED_SCHEMA: &str = "allocatbelt.application-feedback-policy-probe.v2";
-const CAPACITY_RESOLUTION_RULE_VERSION: &str = "application-feedback-capacity-resolution-v1";
+const CAPACITY_RESOLUTION_RULE_VERSION: &str = CAPACITY_FLOOR_RULE_VERSION;
 const CPU_REDUCTION_RULE: &str = "floor_current_limit_over_10_zero_is_quantized";
 const CPU_RECOVERY_INCREMENT: u64 = 1;
 const NETWORK_SENSOR_SOURCE: &str = "download_application_bytes_only";
@@ -55,6 +58,18 @@ fn object<const N: usize>(pairs: [(&str, JsonValue); N]) -> JsonValue {
       .map(|(key, value)| (key.to_owned(), value))
       .collect(),
   )
+}
+
+fn insert_object_field(value: &mut JsonValue, key: &str, field: JsonValue) -> Result<(), String> {
+  match value {
+    JsonValue::Object(fields) => {
+      if fields.insert(key.to_owned(), field).is_some() {
+        return Err(format!("feedback policy probe repeats object key {key}"));
+      }
+      Ok(())
+    }
+    _ => Err("internal feedback policy probe object construction failed".into()),
+  }
 }
 
 fn string(value: impl Into<String>) -> JsonValue {
@@ -594,19 +609,57 @@ fn calibration_direction_value(
   ])
 }
 
+fn capacity_floor_policy_descriptor() -> JsonValue {
+  object([
+    ("capacity_divisor", number_u64(CAPACITY_FLOOR_DIVISOR)),
+    (
+      "minimum_floor_bytes_per_second",
+      number_u64(CAPACITY_FLOOR_MINIMUM_BYTES_PER_SECOND),
+    ),
+    ("policy_id", string(CAPACITY_FLOOR_POLICY_ID)),
+    ("probe_activation", string(CAPACITY_FLOOR_PROBE_ACTIVATION)),
+    ("rule", string(CAPACITY_FLOOR_RULE)),
+    ("rule_version", string(CAPACITY_FLOOR_RULE_VERSION)),
+    (
+      "runtime_activation",
+      string(CAPACITY_FLOOR_RUNTIME_ACTIVATION),
+    ),
+    (
+      "static_floor_bytes_per_second",
+      number_u64(FEEDBACK_RATE_FLOOR),
+    ),
+    (
+      "static_rate_roof_bytes_per_second",
+      number_u64(APPLICATION_RATE_CEILING_BYTES_PER_SECOND),
+    ),
+  ])
+}
+
 fn capacity_calibration_value(
   artifact: &CapacityCalibrationArtifact,
   resolved: ResolvedApplicationFeedback,
 ) -> Result<JsonValue, String> {
   let artifact_sha256 = std::str::from_utf8(&artifact.artifact_sha256)
     .map_err(|_| "loaded capacity calibration digest is not ASCII hexadecimal".to_owned())?;
-  let resolution = object([
+  let relative_floor = resolved.capacity_floor_policy_id.is_some();
+  let mut resolution = object([
     ("rate_buckets", resolved_rate_buckets(resolved.rates)?),
     (
       "rule",
-      string("clip_relevant_initial_and_ceiling_to_raw_capacity"),
+      string(if relative_floor {
+        "clip_relevant_initial_and_ceiling_to_raw_capacity_and_explicit_floor"
+      } else {
+        "clip_relevant_initial_and_ceiling_to_raw_capacity"
+      }),
     ),
-    ("rule_version", string(CAPACITY_RESOLUTION_RULE_VERSION)),
+    (
+      "rule_version",
+      string(if relative_floor {
+        CAPACITY_RESOLUTION_RULE_VERSION
+      } else {
+        "application-feedback-capacity-resolution-v1"
+      }),
+    ),
     (
       "static_rate_roof_bytes_per_second",
       number_u64(APPLICATION_RATE_CEILING_BYTES_PER_SECOND),
@@ -614,7 +667,19 @@ fn capacity_calibration_value(
     ("controls", resolved_controls(resolved)),
     ("upload_controlled", JsonValue::Bool(false)),
   ]);
-  Ok(object([
+  if let Some(policy_id) = resolved.capacity_floor_policy_id {
+    insert_object_field(
+      &mut resolution,
+      "capacity_floor_policy",
+      capacity_floor_policy_descriptor(),
+    )?;
+    insert_object_field(
+      &mut resolution,
+      "capacity_floor_policy_id",
+      string(policy_id),
+    )?;
+  }
+  let mut value = object([
     ("artifact_sha256", string(artifact_sha256)),
     (
       "calibration_id",
@@ -669,7 +734,11 @@ fn capacity_calibration_value(
       ),
     ),
     ("workload", string(artifact.value(&artifact.workload))),
-  ]))
+  ]);
+  if let Some(policy_id) = resolved.capacity_floor_policy_id {
+    insert_object_field(&mut value, "capacity_floor_policy_id", string(policy_id))?;
+  }
+  Ok(value)
 }
 
 fn actual_rate_bucket(rate: &ByteRateLimit) -> Result<JsonValue, String> {
@@ -754,10 +823,12 @@ fn build_calibrated_probe_value(
       sha256: &calibration.sha256,
       host_id: &calibration.host_id,
       source_sha256: &calibration.source_sha256,
+      capacity_floor_policy_id: calibration.capacity_floor_policy_id.as_deref(),
     },
   )?;
   let domain_limits = application_domain_limits(scope_limits, workers)?;
   let resolved = domain.resolved_feedback();
+  let top_level_capacity_floor_policy_id = resolved.capacity_floor_policy_id;
   let artifact = domain
     .feedback_calibrations()
     .artifact
@@ -854,7 +925,7 @@ fn build_calibrated_probe_value(
   drop(domain);
   let after_release =
     actual_after_release(&readback_domain.snapshot(), fixed_global_control_baseline)?;
-  Ok(object([
+  let mut value = object([
     ("after_release", after_release),
     ("baseline", baseline),
     ("capacity_calibration", capacity_calibration),
@@ -867,7 +938,11 @@ fn build_calibrated_probe_value(
     ("rust_control_context", rust_control_context),
     ("schema", string(CALIBRATED_SCHEMA)),
     ("source_references", source_references()),
-  ]))
+  ]);
+  if let Some(policy_id) = top_level_capacity_floor_policy_id {
+    insert_object_field(&mut value, "capacity_floor_policy_id", string(policy_id))?;
+  }
+  Ok(value)
 }
 
 fn build_probe_value(workload: Workload, profile: Profile) -> Result<JsonValue, String> {
@@ -914,6 +989,7 @@ struct CapacityCalibrationArguments {
   sha256: String,
   host_id: String,
   source_sha256: String,
+  capacity_floor_policy_id: Option<String>,
 }
 
 fn context_args(
@@ -929,6 +1005,7 @@ fn context_args(
   let mut capacity_sha256 = None;
   let mut host_id = None;
   let mut source_sha256 = None;
+  let mut capacity_floor_policy_id: Option<String> = None;
   while let Some(key) = args.next() {
     let value = args
       .next()
@@ -944,13 +1021,18 @@ fn context_args(
       }
       "--host-id" if host_id.is_none() => host_id = Some(value),
       "--source-sha256" if source_sha256.is_none() => source_sha256 = Some(value),
+      "--capacity-floor-policy-id" if capacity_floor_policy_id.is_none() => {
+        CapacityFloorPolicy::from_id(Some(&value))?;
+        capacity_floor_policy_id = Some(value);
+      }
       "--workload" | "--profile" => {
         return Err(format!("duplicate feedback policy probe argument {key}"));
       }
       "--capacity-calibration-file"
       | "--capacity-calibration-sha256"
       | "--host-id"
-      | "--source-sha256" => {
+      | "--source-sha256"
+      | "--capacity-floor-policy-id" => {
         return Err(format!("duplicate feedback policy probe argument {key}"));
       }
       _ => return Err(format!("unknown feedback policy probe argument {key}")),
@@ -970,13 +1052,19 @@ fn context_args(
     .filter(|supplied| **supplied)
     .count();
   let calibration = match (capacity_file, capacity_sha256, host_id, source_sha256) {
-    (None, None, None, None) => None,
+    (None, None, None, None) => {
+      if capacity_floor_policy_id.is_some() {
+        return Err("capacity floor policy ID requires capacity calibration arguments".into());
+      }
+      None
+    }
     (Some(file), Some(sha256), Some(host_id), Some(source_sha256)) => {
       Some(CapacityCalibrationArguments {
         file,
         sha256,
         host_id,
         source_sha256,
+        capacity_floor_policy_id,
       })
     }
     _ => {
@@ -1013,6 +1101,13 @@ mod tests {
     match value {
       JsonValue::Object(fields) => fields.get(key).unwrap_or_else(|| panic!("missing {key}")),
       _ => panic!("expected an object while reading {key}"),
+    }
+  }
+
+  fn has_field(value: &JsonValue, key: &str) -> bool {
+    match value {
+      JsonValue::Object(fields) => fields.contains_key(key),
+      _ => false,
     }
   }
 
@@ -1449,6 +1544,107 @@ mod tests {
     assert_eq!(calibration.sha256, hash);
     assert_eq!(calibration.host_id, "agent-9700x");
     assert_eq!(calibration.source_sha256, "a".repeat(64));
+    assert_eq!(calibration.capacity_floor_policy_id, None);
+  }
+
+  #[test]
+  fn calibrated_floor_policy_id_is_exact_opt_in_and_requires_capacity_arguments() {
+    let policy_only = context_args(
+      [
+        "--emit-feedback-policy-only".to_owned(),
+        "--workload".to_owned(),
+        "mixed".to_owned(),
+        "--profile".to_owned(),
+        "mixed".to_owned(),
+        "--capacity-floor-policy-id".to_owned(),
+        CAPACITY_FLOOR_POLICY_ID.to_owned(),
+      ]
+      .into_iter(),
+    )
+    .expect_err("policy ID alone cannot enable calibrated resolution");
+    assert!(policy_only.contains("requires capacity calibration arguments"));
+
+    let unknown = context_args(
+      [
+        "--emit-feedback-policy-only".to_owned(),
+        "--workload".to_owned(),
+        "mixed".to_owned(),
+        "--profile".to_owned(),
+        "mixed".to_owned(),
+        "--capacity-calibration-file".to_owned(),
+        "artifact.tsv".to_owned(),
+        "--capacity-calibration-sha256".to_owned(),
+        "a".repeat(64),
+        "--host-id".to_owned(),
+        "agent-9700x".to_owned(),
+        "--source-sha256".to_owned(),
+        "a".repeat(64),
+        "--capacity-floor-policy-id".to_owned(),
+        "unknown_policy".to_owned(),
+      ]
+      .into_iter(),
+    )
+    .expect_err("unknown relative-floor policy is rejected");
+    assert!(unknown.contains("policy ID is unknown"));
+
+    let duplicate = context_args(
+      [
+        "--emit-feedback-policy-only".to_owned(),
+        "--workload".to_owned(),
+        "mixed".to_owned(),
+        "--profile".to_owned(),
+        "mixed".to_owned(),
+        "--capacity-calibration-file".to_owned(),
+        "artifact.tsv".to_owned(),
+        "--capacity-calibration-sha256".to_owned(),
+        "a".repeat(64),
+        "--host-id".to_owned(),
+        "agent-9700x".to_owned(),
+        "--source-sha256".to_owned(),
+        "a".repeat(64),
+        "--capacity-floor-policy-id".to_owned(),
+        CAPACITY_FLOOR_POLICY_ID.to_owned(),
+        "--capacity-floor-policy-id".to_owned(),
+        CAPACITY_FLOOR_POLICY_ID.to_owned(),
+      ]
+      .into_iter(),
+    )
+    .expect_err("duplicate floor policy ID is rejected");
+    assert!(
+      duplicate.contains("duplicate feedback policy probe argument --capacity-floor-policy-id")
+    );
+
+    let hash = "a".repeat(64);
+    let (workload, profile, selected) = context_args(
+      [
+        "--emit-feedback-policy-only".to_owned(),
+        "--workload".to_owned(),
+        "mixed".to_owned(),
+        "--profile".to_owned(),
+        "mixed".to_owned(),
+        "--capacity-calibration-file".to_owned(),
+        "artifact.tsv".to_owned(),
+        "--capacity-calibration-sha256".to_owned(),
+        hash.clone(),
+        "--host-id".to_owned(),
+        "agent-9700x".to_owned(),
+        "--source-sha256".to_owned(),
+        hash,
+        "--capacity-floor-policy-id".to_owned(),
+        CAPACITY_FLOOR_POLICY_ID.to_owned(),
+      ]
+      .into_iter(),
+    )
+    .expect("the exact source-published policy ID is accepted");
+    assert_eq!(workload, Workload::Mixed);
+    assert_eq!(profile, Profile::Mixed);
+    assert_eq!(
+      selected
+        .expect("complete capacity group")
+        .capacity_floor_policy_id
+        .as_deref(),
+      Some(CAPACITY_FLOOR_POLICY_ID),
+    );
   }
 
   #[test]
@@ -1459,10 +1655,21 @@ mod tests {
       sha256: sha256.clone(),
       host_id: "agent-9700x".to_owned(),
       source_sha256: source_sha256.clone(),
+      capacity_floor_policy_id: None,
     };
     let value = build_calibrated_probe_value(Workload::Mixed, Profile::Mixed, &arguments)
       .expect("calibrated construction probe");
     assert_eq!(text(field(&value, "schema")), CALIBRATED_SCHEMA);
+    assert!(!has_field(&value, "capacity_floor_policy_id"));
+    let calibration = field(&value, "capacity_calibration");
+    assert!(!has_field(calibration, "capacity_floor_policy_id"));
+    let resolution = field(calibration, "resolution");
+    assert!(!has_field(resolution, "capacity_floor_policy"));
+    assert!(!has_field(resolution, "capacity_floor_policy_id"));
+    assert_eq!(
+      text(field(resolution, "rule_version")),
+      "application-feedback-capacity-resolution-v1"
+    );
     assert_eq!(
       text(field(
         field(&value, "capacity_calibration"),
@@ -1555,6 +1762,59 @@ mod tests {
   }
 
   #[test]
+  fn calibrated_probe_reports_the_explicit_capacity_relative_floor_for_low_capacity() {
+    let (file, _original_sha, source_sha256) = test_capacity_artifact();
+    let original = std::fs::read(&file).expect("read high-capacity fixture");
+    let low = String::from_utf8(original)
+      .expect("capacity fixture is UTF-8")
+      .replace("750000000", "4617956")
+      .replace("1250000000", "4617956")
+      .into_bytes();
+    std::fs::write(&file, &low).expect("write low-capacity fixture");
+    let sha256 = super::super::runtime_bindings::capacity_artifact_hash::sha256_hex(&low);
+    let arguments = CapacityCalibrationArguments {
+      file: file.clone(),
+      sha256,
+      host_id: "agent-9700x".to_owned(),
+      source_sha256,
+      capacity_floor_policy_id: Some(CAPACITY_FLOOR_POLICY_ID.to_owned()),
+    };
+    let value = build_calibrated_probe_value(Workload::Mixed, Profile::Mixed, &arguments)
+      .expect("explicit policy resolves low but genuine application capacity");
+    assert_eq!(text(field(&value, "schema")), CALIBRATED_SCHEMA);
+    let rust_context = field(&value, "rust_control_context");
+    let controls = field(rust_context, "controls");
+    assert_eq!(uint(field(field(controls, "disk"), "floor")), 461_795);
+    assert_eq!(uint(field(field(controls, "download"), "floor")), 461_795);
+    assert_eq!(uint(field(field(controls, "disk"), "initial")), 4_617_956);
+    assert_eq!(
+      uint(field(field(controls, "download"), "ceiling")),
+      4_617_956
+    );
+    let calibration = field(&value, "capacity_calibration");
+    assert_eq!(
+      text(field(&value, "capacity_floor_policy_id")),
+      CAPACITY_FLOOR_POLICY_ID
+    );
+    assert_eq!(
+      text(field(calibration, "capacity_floor_policy_id")),
+      CAPACITY_FLOOR_POLICY_ID
+    );
+    let resolution = field(calibration, "resolution");
+    assert_eq!(
+      text(field(resolution, "rule_version")),
+      CAPACITY_FLOOR_RULE_VERSION
+    );
+    let descriptor = field(resolution, "capacity_floor_policy");
+    assert_eq!(
+      text(field(descriptor, "policy_id")),
+      CAPACITY_FLOOR_POLICY_ID
+    );
+    assert_eq!(uint(field(descriptor, "capacity_divisor")), 10);
+    std::fs::remove_file(file).expect("remove low-capacity fixture");
+  }
+
+  #[test]
   fn calibrated_probe_rejects_hash_and_identity_mismatches_without_output() {
     let (file, sha256, source_sha256) = test_capacity_artifact();
     let wrong_hash = CapacityCalibrationArguments {
@@ -1562,6 +1822,7 @@ mod tests {
       sha256: "bad".to_owned(),
       host_id: "agent-9700x".to_owned(),
       source_sha256: source_sha256.clone(),
+      capacity_floor_policy_id: None,
     };
     assert!(build_calibrated_probe_value(Workload::Mixed, Profile::Mixed, &wrong_hash).is_err());
     let mismatched_hash = CapacityCalibrationArguments {
@@ -1569,6 +1830,7 @@ mod tests {
       sha256: "0".repeat(64),
       host_id: "agent-9700x".to_owned(),
       source_sha256: source_sha256.clone(),
+      capacity_floor_policy_id: None,
     };
     assert!(
       build_calibrated_probe_value(Workload::Mixed, Profile::Mixed, &mismatched_hash).is_err()
@@ -1578,6 +1840,7 @@ mod tests {
       sha256: sha256.clone(),
       host_id: "another-host".to_owned(),
       source_sha256: source_sha256.clone(),
+      capacity_floor_policy_id: None,
     };
     assert!(build_calibrated_probe_value(Workload::Mixed, Profile::Mixed, &wrong_host).is_err());
     let wrong_source = CapacityCalibrationArguments {
@@ -1585,6 +1848,7 @@ mod tests {
       sha256,
       host_id: "agent-9700x".to_owned(),
       source_sha256: "b".repeat(64),
+      capacity_floor_policy_id: None,
     };
     assert!(build_calibrated_probe_value(Workload::Mixed, Profile::Mixed, &wrong_source).is_err());
     std::fs::remove_file(file).expect("remove probe calibration fixture");

@@ -1002,13 +1002,42 @@ def build_external_pressure_recipe(
     require(is_sha256(soak_sha), "SourceV5 soak binary SHA-256 is malformed")
     require(app_binary != soak_binary and app_sha != soak_sha, "SourceV5 app emitter and timed soak artifacts must be distinct")
 
+    capacity_floor_policy_id = spec.get("capacity_floor_policy_id")
+    require(capacity_floor_policy_id is None or capacity_floor_policy_id == getattr(controller, "CAPACITY_FLOOR_POLICY_ID", None),
+            "SourceV5 soak floor policy ID is unknown to the pinned source controller")
+    capacity_evidence = capacity.get("evidence")
+    calibrated_probe = capacity_floor_policy_id is not None
+    require(not calibrated_probe or type(capacity_evidence) is dict,
+            "selected capacity-floor policy requires a validated SourceV5 capacity artifact")
+    probe_command = [str(app_binary), "--emit-feedback-policy-only", "--workload", "mixed", "--profile", soak["profile"]]
+    capacity_artifact_pin: dict[str, str] | None = None
+    if calibrated_probe:
+        capacity_path = safe_child(input_root, capacity_evidence["artifact"]["relative_path"], "SourceV5 calibrated capacity artifact")
+        _capacity_raw, capacity_raw_sha = read_stable(capacity_path, "SourceV5 calibrated capacity artifact", MAX_MANIFEST_BYTES)
+        require(capacity_raw_sha == capacity_evidence["artifact"]["raw_sha256"],
+                "SourceV5 calibrated capacity artifact differs from its frozen evidence pin")
+        capacity_artifact_pin = {"path": str(capacity_path.resolve(strict=True)), "raw_sha256": capacity_raw_sha}
+        probe_command.extend([
+            "--capacity-calibration-file", capacity_artifact_pin["path"],
+            "--capacity-calibration-sha256", capacity_raw_sha,
+            "--host-id", host_id,
+            "--source-sha256", selected_manifest["source"]["source_tree_sha256"],
+        ])
+        if capacity_floor_policy_id is not None:
+            probe_command.extend(["--capacity-floor-policy-id", capacity_floor_policy_id])
     construction_probe_raw, construction_probe_raw_sha = read_stable(construction_probe_path, "caller-pinned app construction probe", 512 * 1024)
     require(construction_probe_raw_sha == construction_probe_sha256, "caller-pinned construction probe raw SHA differs")
     probe = parse_json(construction_probe_raw, "caller-pinned app construction probe")
     require(construction_probe_raw == canonical_bytes(probe), "caller-pinned construction probe is not canonical JSON")
     require(probe.get("context") == {"workload": "mixed", "profile": soak["profile"], "workers": 2 if soak["profile"] == "oversubscribed" else 4}, "app construction probe workload/profile differs")
+    if calibrated_probe:
+        require(probe.get("schema") == "allocatbelt.application-feedback-policy-probe.v2",
+                "SourceV5 capacity evidence requires the calibrated ProbeV2 schema")
+    else:
+        require(probe.get("schema") == "allocatbelt.application-feedback-policy-probe.v1",
+                "launch-disabled SourceV5 without capacity evidence requires the legacy ProbeV1 schema")
     probe_run = subprocess.run(
-        [str(app_binary), "--emit-feedback-policy-only", "--workload", "mixed", "--profile", soak["profile"]],
+        probe_command,
         cwd=source_base,
         env={"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "LANG": "C", "LC_ALL": "C"},
         stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30, check=False,
@@ -1017,17 +1046,41 @@ def build_external_pressure_recipe(
     require(probe_run.returncode == 0 and probe_run.stdout == construction_probe_raw, "caller-pinned construction probe is not the exact output of the SourceV5 application binary")
     feedback_validator_pin = harness["feedback_validator"]
     feedback_module = _source_v5_module(source_base, selected_manifest["source"]["files"], feedback_validator_pin["path"], feedback_validator_pin["sha256"], "source_v5_feedback_validator")
-    feedback_policy = _source_v5_feedback_policy(selected_manifest, probe)
-    probe_context = {
-        "schema": feedback_module.EXPECTATION_SCHEMA_V3,
-        "identity": {"allocator": "allocatbelt", "binary_sha256": soak_sha, "workload": "mixed", "profile": soak["profile"]},
-        "construction_probe": {"path": str(construction_probe_path.resolve(strict=True)), "raw_sha256": construction_probe_raw_sha, "allocator": "allocatbelt", "binary_sha256": app_sha},
-        "policy": feedback_policy,
+    construction_probe_pin = {
+        "path": str(construction_probe_path.resolve(strict=True)), "raw_sha256": construction_probe_raw_sha,
+        "allocator": "allocatbelt", "binary_sha256": app_sha,
     }
-    try:
-        feedback_module.validate_construction_probe(probe_context, selected_manifest)
-    except (OSError, TypeError, ValueError, getattr(feedback_module, "ValidationError", ValueError)) as error:
-        raise RecipeBuildError(f"captured SourceV5 feedback reader rejected the actual construction probe: {error}") from error
+    if not calibrated_probe:
+        feedback_policy = _source_v5_feedback_policy(selected_manifest, probe)
+        probe_context = {
+            "schema": feedback_module.EXPECTATION_SCHEMA_V3,
+            "identity": {"allocator": "allocatbelt", "binary_sha256": soak_sha, "workload": "mixed", "profile": soak["profile"]},
+            "construction_probe": construction_probe_pin,
+            "policy": feedback_policy,
+        }
+        try:
+            feedback_module.validate_construction_probe(probe_context, selected_manifest)
+        except (OSError, TypeError, ValueError, getattr(feedback_module, "ValidationError", ValueError)) as error:
+            raise RecipeBuildError(f"captured SourceV5 feedback reader rejected the actual construction probe: {error}") from error
+    else:
+        require(capacity_artifact_pin is not None and probe.get("schema") == feedback_module.CALIBRATED_PROBE_SCHEMA_V2,
+                "SourceV5 capacity evidence requires the exact calibrated ProbeV2 schema")
+        identity = {
+            "host_id": host_id, "workload": "mixed", "profile": soak["profile"],
+            "allocator": "allocatbelt", "source_sha256": selected_manifest["source"]["source_tree_sha256"],
+            "binary_sha256": app_sha,
+        }
+        feedback_policy = feedback_module.resolve_calibrated_feedback_policy_v5(
+            selected_manifest, probe, capacity_artifact_pin, identity,
+            capacity_floor_policy_id=capacity_floor_policy_id,
+        )
+        try:
+            feedback_module._check_calibrated_construction_probe_v2_inputs(
+                construction_probe_pin, selected_manifest, capacity_artifact_pin,
+                identity, feedback_policy, capacity_floor_policy_id,
+            )
+        except (OSError, TypeError, ValueError, getattr(feedback_module, "ValidationError", ValueError)) as error:
+            raise RecipeBuildError(f"captured SourceV5 reader rejected the calibrated construction probe: {error}") from error
     probe_baseline = probe["baseline"]["expected_global_control_baseline"]
     require(probe_baseline == selected_manifest["resource_domain_calibration"]["record"]["fixed_global_control_baseline"], "compiled construction probe Control baseline differs from SourceV5 calibration")
 
@@ -1045,6 +1098,11 @@ def build_external_pressure_recipe(
     feedback_template = feedback_templates[0]
     template_identity = feedback_template["identity"]
     require(template_identity["binary_sha256"] == app_sha and feedback_template["policy"]["context"] == selected_manifest["feedback_policy"]["policy"]["contexts"][f"mixed/{soak['profile']}"] , "SourceV5 feedback template differs from source application/policy pins")
+    require(feedback_template["policy"].get("capacity_floor_policy_id") == capacity_floor_policy_id,
+            "SourceV5 external-pressure template selector differs from the frozen campaign epoch")
+    if capacity_floor_policy_id is not None:
+        require(feedback_template["policy"].get("capacity_floor_policy") == selected_manifest["feedback_policy"]["policy"].get("capacity_floor_policy"),
+                "SourceV5 external-pressure template floor descriptor differs from its source manifest")
     ordinal = uint(job.get("ordinal"), "SourceV5 soak ordinal", positive=True)
     nonce = process_nonce(template_identity["prospective_nonce"], spec["campaign_id"], job["run_id"], "soak", ordinal)
     nonce_material = {
@@ -1197,7 +1255,7 @@ def build_external_pressure_recipe(
             "terminal_budget_bytes": terminal_budget, "sample_budget_bytes": sample_budget,
         },
         "qualification": qualification,
-        "construction_probe": {"path": str(construction_probe_path.resolve(strict=True)), "raw_sha256": construction_probe_raw_sha, "allocator": "allocatbelt", "binary_sha256": app_sha},
+        "construction_probe": construction_probe_pin,
         "pressure": pressure_binding,
         "feedback_expectation": feedback_expectation,
         "validator": harness["soak_validator"],
