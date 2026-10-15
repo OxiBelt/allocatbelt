@@ -19,7 +19,7 @@ import stat
 import sys
 import types
 from pathlib import Path, PurePosixPath
-from typing import Any
+from typing import Any, Callable
 
 
 REQUEST_SCHEMA = "allocatbelt.application-feedback-composition-request.v1"
@@ -1270,9 +1270,11 @@ def _live_probe_origin_facts(host: dict[str, Any]) -> dict[str, Any]:
 def capture_calibrated_probe_v2(
     request: object, request_raw_sha256: object, observed_host_pin: object, *,
     output_root: Path | str, capture_id: str, capture_timeout_ns: int,
-    storage_budget: object,
+    storage_budget: object, resource_monitor: Callable[[], bool] | None = None,
 ) -> dict[str, str]:
-    """Capture the original ProbeV2 with the SourceV5-pinned FixedR8 process owner."""
+    """Capture ProbeV2 with the pinned FixedR8 owner and optional outer monitor."""
+    require(resource_monitor is None or callable(resource_monitor),
+            "probe capture resource monitor must be a callable or None")
     value = _validate_resolve_request(request)
     raw_sha = digest(request_raw_sha256, "probe capture composition request raw SHA-256")
     require(raw_sha == sha256(canonical(value)),
@@ -1482,7 +1484,40 @@ def capture_calibrated_probe_v2(
     require(budget["receipt_bytes"] >= receipt_budget_required,
             f"prospective ProbeV2 receipt budget {budget['receipt_bytes']} is below its computed bound "
             f"{receipt_budget_required}")
+    if resource_monitor is not None:
+        try:
+            prelaunch_stop = bool(resource_monitor())
+        except BaseException as error:
+            failure = CompositionError(
+                f"aggregate Source5 resource monitor failed before ProbeV2 Popen: "
+                f"{type(error).__name__}: {error}",
+            )
+            _capture_failure_record(
+                capture_dir, capture_id, "resource_monitor_prelaunch", failure,
+                None, stdout_path, stderr_path, budget,
+            )
+            raise failure from error
+        if prelaunch_stop:
+            failure = CompositionError(
+                "aggregate Source5 resource monitor refused before ProbeV2 Popen",
+            )
+            failure_path = _capture_failure_record(
+                capture_dir, capture_id, "resource_monitor_prelaunch", failure,
+                None, stdout_path, stderr_path, budget,
+            )
+            raise CompositionError(
+                f"{failure}; bounded failure evidence retained at {failure_path}",
+            )
     started: list[dict[str, Any]] = []
+    tmpdir_monitor = fixed._bounded_tmpdir_monitor(
+        tmpdir, budget["tmpdir_bytes"], budget["tmpdir_inodes"],
+    )
+
+    def combined_resource_monitor() -> bool:
+        tmpdir_exceeded = bool(tmpdir_monitor())
+        outer_exceeded = bool(resource_monitor()) if resource_monitor is not None else False
+        return tmpdir_exceeded or outer_exceeded
+
     try:
         direct = fixed._run_direct_process(
             argv, binary, value["construction_probe"]["binary_sha256"], source_root, environment,
@@ -1491,9 +1526,7 @@ def capture_calibrated_probe_v2(
             expected_network_inode=host["network_namespace_inode"],
             on_started=lambda proof: started.append(proof),
             capture_identity=False,
-            resource_monitor=fixed._bounded_tmpdir_monitor(
-                tmpdir, budget["tmpdir_bytes"], budget["tmpdir_inodes"],
-            ),
+            resource_monitor=combined_resource_monitor,
         )
     except BaseException as error:
         try:

@@ -64,6 +64,440 @@ class Source5SoakPublicApiTests(unittest.TestCase):
             "executor": "bounded",
         })
 
+    def test_prospective_resource_budget_is_additive_to_exact_material_v1(self) -> None:
+        job = {
+            "phase": "soak", "run_id": "campaign-host-mixed-soak-allocatbelt-01",
+            "campaign_id": "campaign", "host_id": "host",
+            "allocator": "allocatbelt", "executor": "bounded",
+        }
+        pin = lambda path: {
+            "path": path, "raw_sha256": "1" * 64,
+        }
+        module = lambda path: {
+            "path": path, "raw_sha256": "2" * 64,
+            "mode": "100644", "size": 1024,
+        }
+        body = {
+            "schema": self.soak.SOAK_RESOURCE_BUDGET_SCHEMA,
+            "binding": {
+                "campaign_id": "campaign", "host_id": "host",
+                "job_sha256": self.soak.sha256(self.soak.canonical_bytes(job)),
+                "source_manifest": {
+                    **pin("/origin/source/source-manifest.json"),
+                    "semantic_sha256": "3" * 64,
+                },
+                "source_tree_sha256": "4" * 64,
+                "parent_recipe": pin("/origin/input/recipe.json"),
+                "build_receipt": pin("/origin/input/build-receipt.json"),
+                "prepared_host_binding_sha256": "5" * 64,
+                "observed_host": pin("/origin/input/host-context.json"),
+                "monitor_owner": module("scripts/application-fixed-pair.py"),
+                "soak_adapter": module("scripts/application-source5-soak.py"),
+                "soak_reader": module("scripts/application-soak-readback.py"),
+            },
+            "layout": {
+                "output_root": "/origin/output/run",
+                "application_tmpdir": "/origin/tmp/application",
+                "pressure_scratch": "/origin/tmp/pressure",
+                "probe_capture_root": "/origin/probe/0123456789abcdef0123456789abcdef",
+                "probe_tmpdir": "/origin/probe/0123456789abcdef0123456789abcdef/tmp",
+                "host_receipt_path": "/origin/receipt/host.json",
+            },
+            "schedule": {
+                "production_seconds": 10_800,
+                "application_sample_interval_ms": 100,
+                "application_sample_tolerance_ns": 10_000_000,
+                "application_sample_count": 108_001,
+                "application_wall_timeout_seconds": 11_050,
+                "pressure_total_deadline_seconds": 12_000,
+                "authorization_effective_timeout_seconds": 13_000,
+                "probe_timeout_seconds": 30,
+                "resource_monitor_interval_ms": 100,
+                "resource_monitor_tolerance_ns": 100_000_000,
+            },
+            "ceilings": {
+                "maximum_output_bytes": 8 * 1024 * 1024 * 1024,
+                "maximum_output_inodes": 100_000,
+                "maximum_application_tmpdir_bytes": 512 * 1024 * 1024,
+                "maximum_application_tmpdir_inodes": 4096,
+                "maximum_pressure_scratch_bytes": 512 * 1024 * 1024,
+                "maximum_pressure_scratch_inodes": 4096,
+                "maximum_probe_output_bytes": 64 * 1024 * 1024,
+                "maximum_probe_output_inodes": 16,
+                "maximum_probe_tmpdir_bytes": 64 * 1024 * 1024,
+                "maximum_probe_tmpdir_inodes": 256,
+                "minimum_free_bytes": 1024 * 1024 * 1024,
+                "minimum_free_inodes": 1024,
+                "durable_receipt_reserve_bytes": 8 * 1024 * 1024,
+                "durable_receipt_reserve_inodes": 16,
+                "maximum_monitor_stream_bytes": 1024 * 1024 * 1024,
+                "maximum_monitor_rows": 1_000_000,
+                "maximum_monitor_row_bytes": 2 * 1024 * 1024,
+            },
+            "artifact_limits": {
+                name: 8 * 1024 * 1024
+                for name in self.soak.RESOURCE_BUDGET_ARTIFACT_LIMIT_FIELDS
+            },
+        }
+        body["artifact_limits"].update({
+            "terminal_stream_bytes": 32 * 1024 * 1024 * 1024,
+            "resource_samples_bytes": 96 * 1024 * 1024,
+            "pressure_events_bytes": 512 * 1024 * 1024,
+            "probe_stdout_bytes": 512 * 1024,
+            "probe_stderr_bytes": 64 * 1024,
+            "probe_owner_receipt_bytes": 16 * 1024 * 1024,
+            "probe_inventory_bytes": 16 * 1024 * 1024,
+            "probe_failure_bytes": 64 * 1024,
+            "probe_capture_receipt_bytes": 16 * 1024 * 1024,
+            "resource_monitor_stream_bytes": 512 * 1024 * 1024,
+            "owner_return_receipt_bytes": 2 * 1024 * 1024,
+        })
+        budget = self.soak.make_resource_budget_document(body)
+        with tempfile.TemporaryDirectory(prefix="allocatbelt-soak-budget-pin-") as temporary:
+            budget_path = Path(temporary) / "resource-budget.json"
+            budget_raw = self.soak.canonical_bytes(budget)
+            budget_path.write_bytes(budget_raw)
+            budget_path.chmod(0o600)
+            budget_pin = {
+                "path": str(budget_path),
+                "raw_sha256": self.soak.sha256(budget_raw),
+                "semantic_sha256": budget["resource_budget_sha256"],
+            }
+            common = {
+                "campaign_id": "campaign", "host_id": "host", "job": job,
+                "parent_recipe_pin": pin("/origin/input/recipe.json"),
+                "build_receipt_pin": pin("/origin/input/build-receipt.json"),
+                "prepared_host_binding_sha256": "5" * 64,
+            }
+            legacy = self.soak.make_material_index(**common)
+            bounded = self.soak.make_material_index(
+                **common, resource_budget_pin=budget_pin,
+            )
+            self.assertEqual(legacy["schema"], self.soak.MATERIALS_INDEX_SCHEMA)
+            self.assertEqual(set(legacy), {
+                "schema", "campaign_id", "host_id", "job", "job_sha256",
+                "parent_recipe", "build_receipt",
+                "prepared_host_binding_sha256", "materials_sha256",
+            })
+            self.assertEqual(bounded["schema"], self.soak.MATERIALS_INDEX_SCHEMA_V2)
+            self.assertEqual(bounded["resource_budget"], budget_pin)
+            self.assertEqual(
+                self.soak.validate_material_index(
+                    legacy, "campaign", "host", job, "5" * 64,
+                ), legacy,
+            )
+            self.assertEqual(
+                self.soak.validate_material_index(
+                    bounded, "campaign", "host", job, "5" * 64,
+                ), bounded,
+            )
+            with self.assertRaises(self.soak.Source5SoakError):
+                self.soak.validate_material_index(
+                    {**bounded, "resource_budget": {
+                        **budget_pin, "semantic_sha256": "f" * 64,
+                    }}, "campaign", "host", job, "5" * 64,
+                )
+        bad_schedule = dict(body["schedule"], application_sample_count=108_000)
+        with self.assertRaises(self.soak.Source5SoakError):
+            self.soak.make_resource_budget_document({**body, "schedule": bad_schedule})
+
+    def test_probe_capture_phase_advances_from_preflight_before_owner(self) -> None:
+        class OrderedMonitor:
+            def __init__(self) -> None:
+                self.order = self_test.soak.RESOURCE_MONITOR_PHASES
+                self.phases: list[str] = []
+                self.failure = None
+
+            def sample(self, phase: str, *, force: bool = False) -> bool:
+                if self.phases:
+                    self_test.assertGreaterEqual(
+                        self.order.index(phase),
+                        self.order.index(self.phases[-1]),
+                    )
+                self.phases.append(phase)
+                return False
+
+        self_test = self
+        monitor = OrderedMonitor()
+        budget = {
+            "schedule": {"resource_monitor_interval_ms": 60_000},
+            "layout": {"probe_capture_root": "/tmp/probe/capture"},
+        }
+
+        def fake_probe_capture(*args, **kwargs):
+            owner_monitor = kwargs["resource_monitor"]
+            self.assertFalse(owner_monitor())
+            self.assertFalse(owner_monitor())
+            return ({"capture": True}, {"path": "/tmp/probe/capture/receipt.json",
+                                        "raw_sha256": "a" * 64}, {})
+
+        with mock.patch.object(
+            self.soak, "_capture_source5_soak_probe", side_effect=fake_probe_capture,
+        ):
+            self.soak._capture_source5_soak_probe_monitored(
+                {}, {}, {}, {}, object(), budget, monitor,
+            )
+        monitor.sample("preflight_audit", force=True)
+        self.assertEqual(monitor.phases, [
+            "preflight", "probe_capture", "probe_capture", "probe_capture",
+            "preflight_audit",
+        ])
+
+    def test_prepare_source5_soak_reaches_sentinel_preflight_without_unbound_local(self) -> None:
+        class SentinelBoundaryReached(Exception):
+            pass
+
+        with tempfile.TemporaryDirectory(prefix="source5-prepare-sentinel-") as temp:
+            output = Path(temp) / "output"
+            output.mkdir(mode=0o700)
+            job = {
+                "phase": "soak", "run_id": "sentinel-run",
+                "campaign_id": "campaign", "host_id": "host",
+                "allocator": "allocatbelt", "executor": "bounded",
+            }
+            binding = {"binding_sha256": "b" * 64}
+            recipe_pin = {
+                "path": str(Path(temp) / "recipe.json"),
+                "raw_sha256": "c" * 64,
+            }
+            build_pin = {
+                "path": str(Path(temp) / "build-receipt.json"),
+                "raw_sha256": "d" * 64,
+            }
+            material_index = {
+                "schema": self.soak.MATERIALS_INDEX_SCHEMA,
+                "job": job, "parent_recipe": recipe_pin,
+                "build_receipt": build_pin,
+            }
+            identities = {
+                "prepared_host_binding_sha256": binding["binding_sha256"],
+                "recipe_sha256": recipe_pin["raw_sha256"],
+            }
+            recipe = {"runtime": {"mode": "functional", "duration_seconds": 1}}
+            audit = {
+                "recipe": {"schema": self.soak.RECIPE_SCHEMA},
+                "identity": {"run_id": job["run_id"]},
+                "launch_enabled": False,
+                "mode": "functional", "duration_seconds": 1,
+            }
+            sentinel_preflight = {"sentinel": "captured-reader-preflight"}
+            report = {"schema": "sentinel-preflight-report"}
+
+            class ReadbackBoundary:
+                def __init__(self) -> None:
+                    self.command_preflight = mock.Mock()
+                    self._current_audit = mock.Mock(
+                        return_value=(audit, sentinel_preflight),
+                    )
+                    self._preflight_report = mock.Mock(return_value=report)
+
+            readback = ReadbackBoundary()
+
+            def write_sentinel_preflight(_args) -> int:
+                (output / "soak-preflight.json").write_bytes(
+                    self.soak.canonical_bytes(report),
+                )
+                return 0
+
+            readback.command_preflight.side_effect = write_sentinel_preflight
+            helper_input = {
+                "payload": {
+                    "materials_index": {
+                        "path": str(Path(temp) / "materials-index.json"),
+                        "raw_sha256": "a" * 64,
+                    },
+                    "output_root": str(output),
+                    "prepared_host_binding_sha256": binding["binding_sha256"],
+                },
+            }
+            prepared = {
+                "source5_prepared_input_completion": {"sentinel": True},
+                "host_id": "host",
+            }
+            details = {
+                "job": job,
+                "members": [self.soak.soak_descriptor(job)],
+                "output_root": str(output),
+            }
+            args = types.SimpleNamespace(recipe_sha256=recipe_pin["raw_sha256"])
+            with mock.patch.object(
+                self.soak, "read_json",
+                return_value=(material_index, b"{}", "a" * 64),
+            ), mock.patch.object(
+                self.soak, "_selected_prepared_host_binding",
+                return_value=binding,
+            ), mock.patch.object(
+                self.soak, "_verify_build_receipt",
+                return_value=(material_index, recipe, identities),
+            ), mock.patch.object(
+                self.soak, "_readback_args", return_value=args,
+            ), mock.patch.object(
+                self.soak, "build_source5_launch_overlay",
+                side_effect=SentinelBoundaryReached("sentinel overlay stop"),
+            ) as overlay_boundary:
+                with self.assertRaisesRegex(
+                    SentinelBoundaryReached, "sentinel overlay stop",
+                ):
+                    self.soak.prepare_source5_soak(
+                        helper_input, prepared, details, readback,
+                    )
+
+            self.assertTrue((output / "soak-preflight.json").is_file())
+            readback.command_preflight.assert_called_once()
+            readback._current_audit.assert_called_once()
+            overlay_boundary.assert_called_once()
+            self.assertIs(overlay_boundary.call_args.args[9], sentinel_preflight)
+            self.assertFalse((output / "source5-soak-launch-authorization.json").exists())
+
+    def test_bounded_run_retains_and_finalizes_preflight_monitor(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="allocatbelt-soak-run-monitor-") as temp:
+            output = Path(temp) / "output"
+            output.mkdir(mode=0o700)
+            budget_pin = {
+                "path": str(Path(temp) / "budget.json"),
+                "raw_sha256": "a" * 64, "semantic_sha256": "b" * 64,
+            }
+            stream_pin = {
+                "path": str(output / "source5-soak-resource-monitor.jsonl"),
+                "raw_sha256": "c" * 64,
+            }
+
+            class HeldMonitor:
+                def __init__(self) -> None:
+                    self.fd = 41
+                    self.budget_pin = budget_pin
+                    self.last_usage = {"domains": {}, "devices": {}}
+                    self.final_summary = None
+                    self.phases: list[str] = []
+                    self.finish_calls = 0
+
+                def sample(self, phase: str, *, force: bool = False) -> bool:
+                    self.phases.append(phase)
+                    return False
+
+                def finish(self, usage):
+                    self.finish_calls += 1
+                    self.fd = None
+                    self.final_summary = {
+                        "schema": "allocatbelt.application-source5-soak-resource-monitor-summary.v1",
+                        "budget": budget_pin, "stream": stream_pin,
+                        "row_count": 4, "high_water": {}, "final_usage": {},
+                        "failure": None, "prefix_sha256": "d" * 64,
+                    }
+                    return self.final_summary
+
+            monitor = HeldMonitor()
+            job = {
+                "phase": "soak", "run_id": "run", "campaign_id": "campaign",
+                "host_id": "host", "allocator": "allocatbelt",
+                "executor": "bounded",
+            }
+            argv = ["/pinned/app"]
+            environment_sha = "e" * 64
+            binary_sha = "f" * 64
+            process = {
+                "pid": 321, "start_ticks": 654,
+                "executable_path": "/pinned/app",
+                "executable_sha256": binary_sha,
+                "executable_device": 1, "executable_inode": 2,
+                "executable_size": 3, "executable_fd_reference": 4,
+                "cwd": "/pinned", "argv": argv,
+                "argv_sha256": "1" * 64, "cmdline_raw_sha256": "2" * 64,
+                "environment_sha256": environment_sha,
+                "environment_raw_sha256": "3" * 64,
+            }
+            attestation_body = {
+                "schema": "allocatbelt.application-pressure-app-launch-attestation.v1",
+                "process": process,
+            }
+            attestation = {
+                **attestation_body,
+                "attestation_sha256": self.soak.sha256(
+                    self.soak.canonical_bytes(attestation_body),
+                ),
+            }
+            cleanup = {
+                "schema": "allocatbelt.application-soak-process-cleanup.v1",
+                "status": "verified", "pid": process["pid"],
+                "return_code": 1, "received_signal": None,
+                "cleanup_error": None,
+            }
+            details = {
+                "status": 1, "timed_out": False,
+                "artifact_budget_exceeded": False,
+            }
+            launch_calls = []
+
+            class FakeReadback:
+                def launch_soak_v2_application(
+                    _self, _args, _audit, _preflight, _output,
+                    on_started, on_cleanup, **kwargs,
+                ):
+                    launch_calls.append(kwargs)
+                    on_started(attestation)
+                    on_cleanup(cleanup)
+                    return {
+                        "schema": "allocatbelt.application-pressure-supervision.v1",
+                        "execution_kind": "timed_soak", "status": 1,
+                        "interrupted": False, "received_signal": None,
+                        "application_cleanup": cleanup,
+                        "application_binding": {},
+                        "application_binding_sha256": "4" * 64,
+                        "application_attestation": attestation,
+                        "pressure_ready_sha256": "5" * 64,
+                        "pressure_proof": {}, "pressure_cleanup": "verified",
+                        "pressure_driver": {}, "pressure_worker_sessions": [],
+                        "details": details,
+                    }
+
+            descriptor = {
+                "argv": argv, "environment_sha256": environment_sha,
+            }
+            preflight = {
+                "schema": "allocatbelt.application-source5-soak-preflight.v2",
+                "materials_index": {"job": job},
+                "materials_index_pin": {"path": "/input/index", "raw_sha256": "6" * 64},
+                "helper_input": {},
+                "parent_recipe": {
+                    "identity": {
+                        "campaign_id": "campaign", "host_id": "host",
+                        "run_id": "run", "binary_sha256": binary_sha,
+                    },
+                },
+                "parent_recipe_pin": {"path": "/input/recipe", "raw_sha256": "7" * 64},
+                "build_receipt_pin": {"path": "/input/build", "raw_sha256": "8" * 64},
+                "identities": {"prepared_host_binding_sha256": "9" * 64},
+                "audit": {"launch_descriptor": descriptor},
+                "preflight": {},
+                "preflight_pin": {"path": "/output/preflight", "raw_sha256": "a" * 64},
+                "launch_overlay": {},
+                "launch_overlay_pin": {"path": "/output/overlay", "raw_sha256": "b" * 64},
+                "base_audit": {}, "base_audit_sha256": "c" * 64,
+                "args": object(), "output_dir": output,
+                "readback_module": FakeReadback(), "prepared": {}, "details": {},
+                "resource_budget": {
+                    "artifact_limits": {"source5_supervisor_bytes": 1024 * 1024},
+                },
+                "resource_budget_pin": budget_pin,
+                "probe_capture": {},
+                "probe_capture_pin": {"path": "/probe/receipt", "raw_sha256": "d" * 64},
+                "probe_capture_context": {}, "initial_resource_usage": {},
+                "resource_monitor": monitor,
+            }
+            events = []
+            component = self.soak.run_source5_soak(
+                preflight, events.append, events.append,
+            )
+            self.assertEqual(len(launch_calls), 1)
+            self.assertIs(launch_calls[0]["resource_monitor_context"], monitor)
+            self.assertEqual(monitor.finish_calls, 1)
+            self.assertIsNone(monitor.fd)
+            self.assertEqual(component["schema"], self.soak.COMPONENT_SCHEMA_V2)
+            self.assertIs(component["resource_monitor"], monitor.final_summary)
+            self.assertEqual(component["pins"]["resource_monitor"], stream_pin)
+            self.assertFalse(component["validated"])
+            self.assertFalse(component["passed"])
+
     def test_offline_path_map_is_closed_sorted_and_identity_only(self) -> None:
         valid = {
             "schema": self.soak.EVIDENCE_PATH_MAP_SCHEMA,
@@ -802,6 +1236,43 @@ class Source5SoakPublicApiTests(unittest.TestCase):
                 base_audit_sha,
             )
             self.assertFalse(base_audit["launch_enabled"])
+
+            prepare_output = temp_root / "budgetless-prepare-entrypoint"
+            prepare_output.mkdir(mode=0o700)
+            prepare_helper_input = {
+                **helper_input,
+                "payload": {
+                    **helper_input["payload"],
+                    "output_root": str(prepare_output),
+                },
+            }
+            prepare_details = {
+                **details, "output_root": str(prepare_output),
+            }
+            prepare_context = {
+                **receipt_context,
+                "source5_prepared_input_completion": completion,
+                "source_manifest_raw_refs": source_refs,
+            }
+            with self.assertRaisesRegex(
+                self.soak.Source5SoakError,
+                "qualified Soak recipe has no original pressure recipe",
+            ), mock.patch.object(
+                self.soak, "_capture_source5_soak_probe_monitored",
+                side_effect=AssertionError("preflight reached a probe owner"),
+            ):
+                self.soak.prepare_source5_soak(
+                    prepare_helper_input, prepare_context, prepare_details,
+                    readback,
+                )
+            self.assertFalse((prepare_output / "soak-preflight.json").exists())
+            for owner_artifact in (
+                "soak-launch.json", "source5-soak-supervisor.json",
+                "source5-soak-component.json",
+                "source5-soak-application-owner-return.json",
+                "source5-soak-pressure-owner-return.json",
+            ):
+                self.assertFalse((prepare_output / owner_artifact).exists())
 
 
 if __name__ == "__main__":

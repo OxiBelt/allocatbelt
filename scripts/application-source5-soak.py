@@ -9,6 +9,7 @@ import json
 import os
 import re
 import stat
+import threading
 import time
 import types
 from pathlib import Path, PurePosixPath
@@ -17,24 +18,122 @@ from typing import Any
 
 MATERIALS_SCHEMA = "allocatbelt.application-source5-soak-materials.v1"
 MATERIALS_INDEX_SCHEMA = "allocatbelt.application-source5-soak-materials-index.v1"
+MATERIALS_INDEX_SCHEMA_V2 = "allocatbelt.application-source5-soak-materials-index.v2"
 COMPONENT_SCHEMA = "allocatbelt.application-source5-soak-component.v1"
+COMPONENT_SCHEMA_V2 = "allocatbelt.application-source5-soak-component.v2"
 LAUNCH_AUTHORIZATION_SCHEMA = "allocatbelt.application-source5-soak-launch-authorization.v1"
 LAUNCH_AUTHORIZATION_SCHEMA_V2 = "allocatbelt.application-source5-soak-launch-authorization.v2"
+LAUNCH_AUTHORIZATION_SCHEMA_V3 = "allocatbelt.application-source5-soak-launch-authorization.v3"
+LAUNCH_SCHEMA_V3 = "allocatbelt.application-soak-launch.v3"
 POSTFLIGHT_SCHEMA = "allocatbelt.application-source5-soak-postflight.v1"
+POSTFLIGHT_SCHEMA_V2 = "allocatbelt.application-source5-soak-postflight.v2"
 AUDIT_PROJECTION_SCHEMA = "allocatbelt.application-source5-soak-audit-projection.v1"
 MODULE_CLOSURE_SCHEMA = "allocatbelt.application-source5-captured-module-closure.v1"
 READBACK_SCHEMA = "allocatbelt.application-soak-readback.v2"
 RECIPE_SCHEMA = "allocatbelt.application-soak-parent-recipe.v2"
 BUILD_RECEIPT_SCHEMA = "allocatbelt.application-soak-recipe-build-receipt.v2"
 HOST_VERIFICATION_SCHEMA = "allocatbelt.application-source5-soak-host-verification.v2"
+HOST_VERIFICATION_SCHEMA_V3 = "allocatbelt.application-source5-soak-host-verification.v3"
 PROBE_CAPTURE_SCHEMA = "allocatbelt.application-source5-soak-probe-capture.v1"
+PROBE_CAPTURE_SCHEMA_V2 = "allocatbelt.application-feedback-probe-capture.v2"
 SOAK_OFFLINE_CONTEXT_SCHEMA = "allocatbelt.application-source5-soak-offline-replay-context.v1"
+SOAK_OFFLINE_CONTEXT_SCHEMA_V2 = "allocatbelt.application-source5-soak-offline-replay-context.v2"
+SOAK_RESOURCE_BUDGET_SCHEMA = "allocatbelt.application-source5-soak-resource-budget.v2"
+SOAK_RESOURCE_MONITOR_SCHEMA = "allocatbelt.application-source5-soak-resource-monitor-stream.v1"
+SOAK_RESOURCE_MONITOR_ROW_SCHEMA = "allocatbelt.application-source5-soak-resource-monitor-row.v1"
+SOAK_RESOURCE_MONITOR_FOOTER_SCHEMA = "allocatbelt.application-source5-soak-resource-monitor-footer.v1"
+SOAK_RESOURCE_OWNER_RETURN_SCHEMA = "allocatbelt.application-source5-soak-owner-return.v1"
+SOAK_BOUNDED_OFFLINE_RESULT_SCHEMA = "allocatbelt.application-source5-soak-bounded-offline-result.v1"
 EVIDENCE_PATH_MAP_SCHEMA = "allocatbelt.application-pressure-evidence-path-map.v1"
 MAX_ARTIFACT_BYTES = 256 * 1024 * 1024
 MAX_SCRIPT_BYTES = 8 * 1024 * 1024
 MAX_RECIPE_BYTES = 16 * 1024 * 1024
 MAX_RECEIPT_BYTES = 32 * 1024 * 1024
 MAX_EVIDENCE_ENTRIES = 250_000
+MAX_RESOURCE_BUDGET_BYTES = 64 * 1024
+MAX_RESOURCE_MONITOR_STREAM_BYTES = 1024 * 1024 * 1024
+MAX_RESOURCE_MONITOR_ROW_BYTES = 2 * 1024 * 1024
+MAX_RESOURCE_MONITOR_ROWS = 1_000_000
+MAX_RESOURCE_OWNER_POLL_NS = 100_000_000
+# Reserve forced samples at every preflight, ProbeV2, owner, cleanup, and
+# postflight handoff in addition to the interval-derived full authorization bound.
+RESOURCE_MONITOR_ENDPOINT_RESERVE_ROWS = 64
+RESOURCE_MONITOR_PHASES = (
+    "preflight", "probe_capture", "preflight_audit", "pressure_startup",
+    "application", "pressure_cleanup", "postflight",
+)
+RESOURCE_BUDGET_FIELDS = {
+    "schema", "binding", "layout", "schedule", "ceilings",
+    "artifact_limits", "resource_budget_sha256",
+}
+RESOURCE_BUDGET_BINDING_FIELDS = {
+    "campaign_id", "host_id", "job_sha256", "source_manifest",
+    "source_tree_sha256", "parent_recipe", "build_receipt",
+    "prepared_host_binding_sha256", "observed_host", "monitor_owner",
+    "soak_adapter", "soak_reader",
+}
+RESOURCE_BUDGET_LAYOUT_FIELDS = {
+    "output_root", "application_tmpdir", "pressure_scratch",
+    "probe_capture_root", "probe_tmpdir", "host_receipt_path",
+}
+RESOURCE_BUDGET_SCHEDULE_FIELDS = {
+    "production_seconds", "application_sample_interval_ms",
+    "application_sample_tolerance_ns", "application_sample_count",
+    "application_wall_timeout_seconds", "pressure_total_deadline_seconds",
+    "authorization_effective_timeout_seconds", "probe_timeout_seconds",
+    "resource_monitor_interval_ms", "resource_monitor_tolerance_ns",
+}
+RESOURCE_BUDGET_CEILING_FIELDS = {
+    "maximum_output_bytes", "maximum_output_inodes",
+    "maximum_application_tmpdir_bytes", "maximum_application_tmpdir_inodes",
+    "maximum_pressure_scratch_bytes", "maximum_pressure_scratch_inodes",
+    "maximum_probe_output_bytes", "maximum_probe_output_inodes",
+    "maximum_probe_tmpdir_bytes", "maximum_probe_tmpdir_inodes",
+    "minimum_free_bytes", "minimum_free_inodes",
+    "durable_receipt_reserve_bytes", "durable_receipt_reserve_inodes",
+    "maximum_monitor_stream_bytes", "maximum_monitor_rows",
+    "maximum_monitor_row_bytes",
+}
+RESOURCE_BUDGET_ARTIFACT_LIMIT_FIELDS = {
+    "terminal_stream_bytes", "resource_samples_bytes",
+    "application_stdout_bytes", "application_stderr_bytes",
+    "application_timing_bytes", "soak_receipt_bytes",
+    "launch_receipt_bytes", "launch_authorization_bytes",
+    "preflight_receipt_bytes",
+    "postflight_receipt_bytes", "readback_receipt_bytes",
+    "source5_supervisor_bytes", "pressure_events_bytes",
+    "pressure_readback_bytes", "pressure_run_receipt_bytes", "pressure_launch_bytes",
+    "pressure_binding_bytes", "pressure_ready_bytes",
+    "pressure_driver_stdout_bytes", "pressure_driver_stderr_bytes",
+    "pressure_worker_stderr_bytes", "probe_stdout_bytes",
+    "probe_stderr_bytes", "probe_owner_receipt_bytes",
+    "probe_inventory_bytes", "probe_failure_bytes",
+    "probe_capture_receipt_bytes", "resource_monitor_stream_bytes",
+    "owner_return_receipt_bytes", "host_receipt_bytes",
+    "failure_receipt_bytes", "component_receipt_bytes",
+}
+SOAK_PRESSURE_OUTPUT_FILES = (
+    "run.json", "events.jsonl", "launch-record.json",
+    "process-binding.json", "pressure-ready.json",
+)
+SOAK_BOUNDED_OUTPUT_FILES = (
+    "soak-preflight.json", "soak-postflight.json", "soak-launch.json",
+    "soak-readback.json", "source5-soak-launch-authorization.json",
+    "source5-soak-postflight.json", "source5-soak-supervisor.json",
+    "soak-receipt.json", "pressure-readback.json", "stdout.log",
+    "stderr.log", "time.txt", "terminal-records.tsv",
+    "resource-samples.tsv", "pressure-driver.stdout.log",
+    "pressure-driver.stderr.log", "source5-soak-resource-monitor.jsonl",
+    "source5-soak-application-owner-return.json",
+    "source5-soak-pressure-owner-return.json",
+    "source5-soak-component.json",
+)
+SOAK_BOUNDED_FAILURE_OUTPUT_FILES = ("source5-soak-failure.json",)
+SOAK_BOUNDED_OUTPUT_MIN_INODES = (
+    len(SOAK_BOUNDED_OUTPUT_FILES) +
+    len(SOAK_BOUNDED_FAILURE_OUTPUT_FILES) +
+    len(SOAK_PRESSURE_OUTPUT_FILES) + 1
+)
 
 
 class Source5SoakError(ValueError):
@@ -127,6 +226,567 @@ def raw_pin(value: object, label: str) -> dict[str, str]:
     return {"path": pin["path"], "raw_sha256": pin["raw_sha256"]}
 
 
+def resource_budget_pin(value: object, label: str = "Source5 Soak resource budget") -> dict[str, str]:
+    pin = exact(value, {"path", "raw_sha256", "semantic_sha256"}, label)
+    require(type(pin["path"]) is str and Path(pin["path"]).is_absolute() and
+            str(Path(pin["path"])) == pin["path"] and ".." not in Path(pin["path"]).parts,
+            f"{label} path is not a normalized original absolute path")
+    digest(pin["raw_sha256"], f"{label} raw SHA-256")
+    digest(pin["semantic_sha256"], f"{label} semantic SHA-256")
+    return dict(pin)
+
+
+def _resource_budget_shape(value: object) -> dict[str, Any]:
+    budget = exact(value, RESOURCE_BUDGET_FIELDS, "Source5 Soak resource budget")
+    require(budget["schema"] == SOAK_RESOURCE_BUDGET_SCHEMA,
+            "unsupported Source5 Soak resource budget schema")
+    body = {key: item for key, item in budget.items()
+            if key != "resource_budget_sha256"}
+    require(budget["resource_budget_sha256"] == sha256(canonical_bytes(body)),
+            "Source5 Soak resource budget semantic digest differs")
+    binding = exact(budget["binding"], RESOURCE_BUDGET_BINDING_FIELDS,
+                    "Source5 Soak resource budget binding")
+    for label in ("campaign_id", "host_id"):
+        require(type(binding[label]) is str and binding[label],
+                f"Source5 Soak resource budget {label} is malformed")
+    for label in ("job_sha256", "source_tree_sha256",
+                  "prepared_host_binding_sha256"):
+        digest(binding[label], f"Source5 Soak budget {label}")
+    source_pin = exact(binding["source_manifest"],
+                       {"path", "raw_sha256", "semantic_sha256"},
+                       "Source5 Soak budget SourceV5 manifest pin")
+    parent_pin = raw_pin(binding["parent_recipe"],
+                         "Source5 Soak budget parent recipe")
+    build_pin = raw_pin(binding["build_receipt"],
+                        "Source5 Soak budget build receipt")
+    observed_pin = raw_pin(binding["observed_host"],
+                           "Source5 Soak budget observed host")
+    for name, pin in (("source manifest", source_pin),
+                      ("parent recipe", parent_pin),
+                      ("build receipt", build_pin),
+                      ("observed host", observed_pin)):
+        require(type(pin["path"]) is str and Path(pin["path"]).is_absolute() and
+                str(Path(pin["path"])) == pin["path"] and
+                ".." not in Path(pin["path"]).parts,
+                f"Source5 Soak budget {name} path is malformed")
+        digest(pin["raw_sha256"], f"Source5 Soak budget {name} raw SHA-256")
+        if "semantic_sha256" in pin:
+            digest(pin["semantic_sha256"],
+                   f"Source5 Soak budget {name} semantic SHA-256")
+    for name in ("monitor_owner", "soak_adapter", "soak_reader"):
+        module = exact(binding[name], {"path", "raw_sha256", "mode", "size"},
+                       f"Source5 Soak budget {name} SourceV5 module pin")
+        require(type(module["path"]) is str and module["path"].startswith("scripts/") and
+                ".." not in Path(module["path"]).parts and
+                module["mode"] in {"100644", "100755"} and
+                type(module["size"]) is int and 0 < module["size"] <= MAX_SCRIPT_BYTES,
+                f"Source5 Soak budget {name} module path/mode/size is malformed")
+        digest(module["raw_sha256"], f"Source5 Soak budget {name} module SHA-256")
+    layout = exact(budget["layout"], RESOURCE_BUDGET_LAYOUT_FIELDS,
+                   "Source5 Soak resource budget layout")
+    for name, raw_path in layout.items():
+        require(type(raw_path) is str and Path(raw_path).is_absolute() and
+                str(Path(raw_path)) == raw_path and ".." not in Path(raw_path).parts,
+                f"Source5 Soak resource budget {name} is not a normalized original path")
+    require(layout["probe_tmpdir"] == str(Path(layout["probe_capture_root"]) / "tmp"),
+            "Source5 Soak ProbeV2 TMPDIR differs from its frozen capture root")
+    schedule = exact(budget["schedule"], RESOURCE_BUDGET_SCHEDULE_FIELDS,
+                     "Source5 Soak resource budget schedule")
+    for name, amount in schedule.items():
+        require(type(amount) is int and 0 < amount <= (1 << 64) - 1,
+                f"Source5 Soak resource budget {name} must be a positive u64")
+    require(schedule["production_seconds"] == 10_800 and
+            schedule["application_sample_interval_ms"] == 100 and
+            schedule["application_sample_tolerance_ns"] == 10_000_000 and
+            schedule["application_sample_count"] == 108_001 and
+            1 <= schedule["resource_monitor_interval_ms"] <= 100 and
+            schedule["resource_monitor_tolerance_ns"] <= 100_000_000,
+            "Source5 Soak resource budget changed the APP horizon or exceeds owner polling bounds")
+    require((schedule["resource_monitor_interval_ms"] * 1_000_000 +
+             schedule["resource_monitor_tolerance_ns"]) <= 200_000_000,
+            "Source5 Soak resource monitor gap exceeds finite cleanup/readiness polling bounds")
+    ceilings = exact(budget["ceilings"], RESOURCE_BUDGET_CEILING_FIELDS,
+                     "Source5 Soak resource budget ceilings")
+    for name, amount in ceilings.items():
+        require(type(amount) is int and 0 < amount <= (1 << 64) - 1,
+                f"Source5 Soak resource budget ceiling {name} must be a positive u64")
+    require(ceilings["maximum_monitor_stream_bytes"] <= MAX_RESOURCE_MONITOR_STREAM_BYTES and
+            ceilings["maximum_monitor_rows"] <= MAX_RESOURCE_MONITOR_ROWS and
+            ceilings["maximum_monitor_row_bytes"] <= MAX_RESOURCE_MONITOR_ROW_BYTES and
+            ceilings["maximum_monitor_stream_bytes"] >= 4096 and
+            ceilings["maximum_monitor_rows"] >= len(RESOURCE_MONITOR_PHASES) + 4 and
+            ceilings["maximum_monitor_row_bytes"] >= 1024,
+            "Source5 Soak resource monitor limits exceed the finite stream bound")
+    artifact_limits = exact(budget["artifact_limits"],
+                            RESOURCE_BUDGET_ARTIFACT_LIMIT_FIELDS,
+                            "Source5 Soak artifact limits")
+    for name, amount in artifact_limits.items():
+        require(type(amount) is int and 0 < amount <= (1 << 64) - 1,
+                f"Source5 Soak artifact limit {name} must be a positive u64")
+    require(artifact_limits["terminal_stream_bytes"] <= 32 * 1024 * 1024 * 1024 and
+            artifact_limits["resource_samples_bytes"] <= 96 * 1024 * 1024 and
+            artifact_limits["pressure_events_bytes"] <= 512 * 1024 * 1024 and
+            artifact_limits["probe_stdout_bytes"] <= 512 * 1024 and
+            artifact_limits["probe_stderr_bytes"] <= 64 * 1024 and
+            artifact_limits["probe_owner_receipt_bytes"] == 16 * 1024 * 1024 and
+            artifact_limits["probe_inventory_bytes"] == 16 * 1024 * 1024 and
+            artifact_limits["probe_failure_bytes"] == 64 * 1024 and
+            artifact_limits["resource_monitor_stream_bytes"] <=
+                ceilings["maximum_monitor_stream_bytes"] and
+            artifact_limits["owner_return_receipt_bytes"] <=
+                ceilings["durable_receipt_reserve_bytes"],
+            "Source5 Soak artifact limits exceed their original finite owner bounds")
+    return budget
+
+
+def make_resource_budget_document(body_value: object) -> dict[str, Any]:
+    """Seal caller-frozen prospective bounds without choosing defaults."""
+    body = exact(body_value, RESOURCE_BUDGET_FIELDS - {"resource_budget_sha256"},
+                 "Source5 Soak resource budget body")
+    require(body["schema"] == SOAK_RESOURCE_BUDGET_SCHEMA,
+            "unsupported Source5 Soak resource budget body schema")
+    result = {**body, "resource_budget_sha256": sha256(canonical_bytes(body))}
+    return _resource_budget_shape(result)
+
+
+def _read_resource_budget_pin(value: object) -> tuple[dict[str, Any], dict[str, str]]:
+    pin = resource_budget_pin(value)
+    path = Path(pin["path"])
+    try:
+        require(path.resolve(strict=True) == path,
+                "Source5 Soak resource-budget path traverses an alias")
+        info = path.lstat()
+    except OSError as error:
+        raise Source5SoakError(
+            f"Source5 Soak resource budget is unavailable: {error}",
+        ) from error
+    require(stat.S_ISREG(info.st_mode) and not stat.S_ISLNK(info.st_mode) and
+            info.st_uid == os.getuid() and stat.S_IMODE(info.st_mode) == 0o600,
+            "Source5 Soak resource budget must be an owned mode-0600 regular file")
+    budget, _raw, actual = read_json(
+        path, pin["raw_sha256"],
+        "Source5 prospective Soak resource budget", MAX_RESOURCE_BUDGET_BYTES,
+    )
+    _resource_budget_shape(budget)
+    require(actual == pin["raw_sha256"] and
+            budget["resource_budget_sha256"] == pin["semantic_sha256"],
+            "Source5 Soak resource-budget raw/semantic pin differs")
+    return budget, pin
+
+
+def _resource_budget_module_pin(
+    prepared: dict[str, Any], relative: str, label: str,
+) -> dict[str, Any]:
+    files = prepared["source"].get("source", {}).get("files")
+    require(type(files) is list,
+            "Source5 resource budget has no typed source-file inventory")
+    rows = [row for row in files if type(row) is dict and
+            row.get("path") == relative]
+    require(len(rows) == 1,
+            f"Source5 resource budget source inventory omits {label}")
+    row = exact(rows[0], {"path", "kind", "mode", "sha256", "size"},
+                f"Source5 resource budget {label} inventory row")
+    require(row["kind"] == "file" and row["mode"] in {"100644", "100755"} and
+            type(row["size"]) is int and 0 < row["size"] <= MAX_SCRIPT_BYTES,
+            f"Source5 resource budget {label} inventory row is malformed")
+    path = Path(prepared["source_root"]) / relative
+    raw, actual, info = read_stable(path, f"Source5 resource budget {label}",
+                                    MAX_SCRIPT_BYTES)
+    mode = f"{stat.S_IFMT(info.st_mode) | stat.S_IMODE(info.st_mode):06o}"
+    require(actual == row["sha256"] and len(raw) == row["size"] and
+            mode == row["mode"],
+            f"Source5 resource budget {label} differs from captured SourceV5 bytes")
+    return {"path": relative, "raw_sha256": actual,
+            "mode": mode, "size": len(raw)}
+
+
+def _resource_monitor_worst_line_bounds(
+    budget: dict[str, Any], budget_pin: dict[str, str],
+) -> tuple[int, int, int]:
+    layout = budget["layout"]
+    maximum = (1 << 64) - 1
+    names = (
+        "output", "application_tmpdir", "pressure_scratch",
+        "probe_capture", "probe_tmpdir",
+    )
+    domains = {
+        name: {
+            "path": layout[path_field], "device": maximum, "inode": maximum,
+            "bytes_used": maximum, "inode_count": maximum,
+            "available_bytes": maximum, "available_inodes": maximum,
+            "bytes_limit": maximum, "inode_limit": maximum,
+        }
+        for name, path_field in (
+            ("output", "output_root"),
+            ("application_tmpdir", "application_tmpdir"),
+            ("pressure_scratch", "pressure_scratch"),
+            ("probe_capture", "probe_capture_root"),
+            ("probe_tmpdir", "probe_tmpdir"),
+        )
+    }
+    devices = {
+        str(maximum - index): {
+            "available_bytes": maximum, "available_inodes": maximum,
+            "remaining_bytes": maximum, "remaining_inodes": maximum,
+            "required_bytes": maximum, "required_inodes": maximum,
+        }
+        for index, _name in enumerate(names)
+    }
+    row_body = {
+        "schema": SOAK_RESOURCE_MONITOR_ROW_SCHEMA,
+        "sequence": maximum, "phase": "pressure_cleanup",
+        "monotonic_ns": maximum, "previous_sha256": "f" * 64,
+        "domains": domains, "devices": devices,
+        "failure": "x" * 4096,
+    }
+    row_size = len(canonical_bytes({
+        **row_body, "row_sha256": "f" * 64,
+    }))
+    header_body = {
+        "schema": SOAK_RESOURCE_MONITOR_SCHEMA,
+        "budget": budget_pin,
+        "monitor_owner": budget["binding"]["monitor_owner"],
+        "layout": layout, "schedule": budget["schedule"],
+        "ceilings": budget["ceilings"],
+        "started_monotonic_ns": maximum,
+    }
+    header_size = len(canonical_bytes({
+        **header_body, "header_sha256": "f" * 64,
+    }))
+    footer_body = {
+        "schema": SOAK_RESOURCE_MONITOR_FOOTER_SCHEMA,
+        "budget": budget_pin,
+        "row_count": maximum, "previous_sha256": "f" * 64,
+        "prefix_sha256": "f" * 64,
+        "high_water": {name: {"bytes": maximum, "inodes": maximum}
+                       for name in names},
+        "final_usage": {
+            "domains": domains, "devices": devices,
+        },
+        "failure": "x" * 4096, "ended_monotonic_ns": maximum,
+    }
+    footer_size = len(canonical_bytes({
+        **footer_body, "footer_sha256": "f" * 64,
+    }))
+    return max(row_size, header_size, footer_size), header_size, footer_size
+
+
+def _resource_budget_metadata_bounds(
+    budget: dict[str, Any], prepared: dict[str, Any], job: dict[str, Any],
+    binding: dict[str, Any], recipe: dict[str, Any],
+    material_index: dict[str, Any], details: dict[str, Any],
+    pressure_recipe: dict[str, Any], readback: types.ModuleType,
+) -> dict[str, int]:
+    """Derive receipt bounds from pinned inputs, maximum paths, and inode ceilings."""
+    require(type(details) is dict,
+            "Source5 resource budget metadata sizing requires the original authorization")
+    ceilings = budget["ceilings"]
+    limits = budget["artifact_limits"]
+    source_files = prepared["source"].get("source", {}).get("files")
+    require(type(source_files) is list,
+            "Source5 resource budget metadata sizing lacks the typed source-file inventory")
+    pinned_inputs = _raw_pins_in((
+        prepared["source"], prepared["source5_execution_manifest"],
+        prepared["source5_prepared_input_completion"], job, binding,
+        recipe, material_index, details,
+    ))
+    workers = readback._expected_pressure_worker_keys(
+        pressure_recipe["schedule"],
+    )
+    worker_count = len(workers)
+    max_path = "\x01" * 4096
+    max_path_bytes = len(canonical_bytes(max_path))
+    max_inventory_file = len(canonical_bytes({
+        "path": max_path, "kind": "file", "mode": "0777",
+        "size": (1 << 64) - 1, "raw_sha256": "f" * 64,
+    }))
+    max_inventory_directory = len(canonical_bytes({
+        "path": max_path, "kind": "directory", "mode": "0777",
+    }))
+    max_inventory_entry = max(max_inventory_file, max_inventory_directory)
+    dynamic_inode_bound = sum(ceilings[name] for name in (
+        "maximum_output_inodes", "maximum_application_tmpdir_inodes",
+        "maximum_pressure_scratch_inodes", "maximum_probe_output_inodes",
+        "maximum_probe_tmpdir_inodes",
+    ))
+    inventory_entries = (
+        dynamic_inode_bound + len(source_files) +
+        2 * len(pinned_inputs) + 32
+    )
+    evidence_bases = len(source_files) + len(pinned_inputs) + 32
+    require(inventory_entries <= MAX_EVIDENCE_ENTRIES and
+            evidence_bases <= MAX_EVIDENCE_ENTRIES,
+            "Source5 resource ceilings cannot be represented by the finite recursive inventory")
+
+    source_bytes = len(canonical_bytes(prepared["source"]))
+    manifest_bytes = len(canonical_bytes(
+        prepared["source5_execution_manifest"],
+    ))
+    completion_bytes = len(canonical_bytes(
+        prepared["source5_prepared_input_completion"],
+    ))
+    job_bytes = len(canonical_bytes(job))
+    binding_bytes = len(canonical_bytes(binding))
+    recipe_bytes = len(canonical_bytes(recipe))
+    material_bytes = len(canonical_bytes(material_index))
+    authorization_bytes = len(canonical_bytes(details))
+    path_field_reserve = 20 * max_path_bytes
+    owner_bytes = (recipe_bytes + job_bytes + authorization_bytes +
+                   path_field_reserve + 16 * 1024)
+    supervisor_bytes = (owner_bytes + (worker_count + 2) *
+                        (max_path_bytes + 2048) + 64 * 1024)
+    preflight_bytes = (source_bytes + recipe_bytes + material_bytes +
+                       authorization_bytes + 64 * 1024)
+    launch_authorization_bytes = (preflight_bytes + manifest_bytes +
+                                  completion_bytes + 64 * 1024)
+    readback_bytes = (source_bytes + recipe_bytes + job_bytes + 64 * 1024)
+    component_bytes = (readback_bytes + binding_bytes +
+                       path_field_reserve + 64 * 1024)
+    pressure_receipt_bytes = (recipe_bytes + (worker_count + 2) *
+                              (max_path_bytes + 2048) + 64 * 1024)
+    postflight_bytes = (4 * max_path_bytes + 32 * 1024)
+    failure_bytes = (authorization_bytes + 8 * max_path_bytes +
+                     (worker_count + 2) * 1024 + 32 * 1024)
+    fixed_host_bytes = (
+        source_bytes + manifest_bytes + completion_bytes + job_bytes +
+        binding_bytes + recipe_bytes + material_bytes + authorization_bytes +
+        len(canonical_bytes(budget)) + path_field_reserve +
+        limits["readback_receipt_bytes"] +
+        limits["probe_capture_receipt_bytes"] +
+        (worker_count + 2) * (max_path_bytes + 4096) + 128 * 1024
+    )
+    host_bytes = (
+        fixed_host_bytes + inventory_entries * (max_inventory_entry + 1) +
+        evidence_bases * (max_path_bytes + 1)
+    )
+    return {
+        "owner_return_receipt_bytes": owner_bytes,
+        "source5_supervisor_bytes": supervisor_bytes,
+        "preflight_receipt_bytes": preflight_bytes,
+        "launch_authorization_bytes": launch_authorization_bytes,
+        "launch_receipt_bytes": owner_bytes + 32 * 1024,
+        "soak_receipt_bytes": recipe_bytes + job_bytes + 64 * 1024,
+        "readback_receipt_bytes": readback_bytes,
+        "component_receipt_bytes": component_bytes,
+        "pressure_readback_bytes": pressure_receipt_bytes,
+        "pressure_run_receipt_bytes": pressure_receipt_bytes,
+        "pressure_launch_bytes": pressure_receipt_bytes,
+        "pressure_binding_bytes": pressure_receipt_bytes,
+        "pressure_ready_bytes": pressure_receipt_bytes,
+        "postflight_receipt_bytes": postflight_bytes,
+        "failure_receipt_bytes": failure_bytes,
+        "host_receipt_bytes": host_bytes,
+    }
+
+
+def _validate_resource_budget_bindings(
+    budget: dict[str, Any], prepared: dict[str, Any], job: dict[str, Any],
+    binding: dict[str, Any], recipe: dict[str, Any],
+    material_index: dict[str, Any], *, output_root: Path | None = None,
+    details: dict[str, Any] | None = None, audit: dict[str, Any] | None = None,
+    readback: types.ModuleType | None = None,
+) -> dict[str, Any]:
+    """Rebind caller-frozen limits to the original selected SourceV5 job."""
+    checked = _resource_budget_shape(budget)
+    budget_file = Path(material_index["resource_budget"]["path"])
+    source_root_for_budget = Path(prepared["source_root"]).resolve(strict=True)
+    require(budget_file != source_root_for_budget and
+            source_root_for_budget not in budget_file.parents and
+            budget_file != output_root and
+            (output_root is None or output_root not in budget_file.parents),
+            "Source5 Soak resource budget must remain outside immutable SourceRoot and job output")
+    scope = checked["binding"]
+    source_ref = exact(prepared["source_manifest_raw_refs"][prepared["host_id"]], {
+        "host_id", "path", "raw_sha256", "semantic_sha256",
+        "source_tree_sha256",
+    }, "Source5 selected SourceV5 manifest pin")
+    expected_source = {key: source_ref[key] for key in
+                       ("path", "raw_sha256", "semantic_sha256")}
+    expected_parent = raw_pin(material_index["parent_recipe"],
+                              "Source5 resource budget parent recipe")
+    expected_build = raw_pin(material_index["build_receipt"],
+                             "Source5 resource budget build receipt")
+    expected_observed = raw_pin(binding["prepared_host_context_pin"],
+                                "Source5 resource budget observed-host context")
+    expected_modules = {
+        "monitor_owner": _resource_budget_module_pin(
+            prepared, "scripts/application-fixed-pair.py", "FixedR8 monitor owner",
+        ),
+        "soak_adapter": _resource_budget_module_pin(
+            prepared, "scripts/application-source5-soak.py", "Source5 Soak adapter",
+        ),
+        "soak_reader": _resource_budget_module_pin(
+            prepared, "scripts/application-soak-readback.py", "Source5 Soak reader",
+        ),
+    }
+    require(scope["campaign_id"] == prepared["campaign_id"] ==
+                job.get("campaign_id", prepared["campaign_id"]) and
+            scope["host_id"] == prepared["host_id"] == job.get("host_id", prepared["host_id"]) and
+            scope["job_sha256"] == sha256(canonical_bytes(job)) and
+            scope["source_manifest"] == expected_source and
+            scope["source_tree_sha256"] == source_ref["source_tree_sha256"] and
+            scope["parent_recipe"] == expected_parent and
+            scope["build_receipt"] == expected_build and
+            scope["prepared_host_binding_sha256"] == binding["binding_sha256"] and
+            scope["observed_host"] == expected_observed and
+            all(scope[name] == pin for name, pin in expected_modules.items()),
+            "Source5 Soak resource budget is not bound to the original job, source, host, recipe, or owner modules")
+
+    layout = checked["layout"]
+    pressure_pin = recipe["pressure"].get("recipe")
+    require(type(pressure_pin) is dict,
+            "bounded Source5 Soak requires its original pressure recipe")
+    pressure_value, _pressure_raw, _pressure_sha = read_json(
+        Path(pressure_pin["path"]), pressure_pin["raw_sha256"],
+        "Source5 resource budget pressure recipe", MAX_RECIPE_BYTES,
+    )
+    original_tmpdir = pressure_value["process"]["application_tmpdir_path"]
+    original_scratch = pressure_value["storage"]["pressure_scratch_path"]
+    capture_parent = Path(layout["probe_capture_root"]).parent
+    try:
+        capture_parent_info = capture_parent.lstat()
+    except OSError as error:
+        raise Source5SoakError(
+            f"Source5 Soak ProbeV2 capture parent is unavailable: {error}",
+        ) from error
+    require(layout["application_tmpdir"] == original_tmpdir and
+            layout["pressure_scratch"] == original_scratch and
+            stat.S_ISDIR(capture_parent_info.st_mode) and
+            not stat.S_ISLNK(capture_parent_info.st_mode) and
+            capture_parent_info.st_uid == os.getuid() and
+            stat.S_IMODE(capture_parent_info.st_mode) == 0o700,
+            "Source5 Soak budget changes original TMPDIR/scratch or probe-root parent")
+    if output_root is not None:
+        require(layout["output_root"] == str(output_root),
+                "Source5 Soak budget output root differs from its authorized job")
+
+    ceilings = checked["ceilings"]
+    limits = checked["artifact_limits"]
+    schedule = checked["schedule"]
+    if readback is None:
+        readback = _load_readback_module(prepared)
+    pressure_request_pin = raw_pin(
+        recipe["pressure"]["request_template"],
+        "Source5 resource budget pressure request template",
+    )
+    pressure_request, _request_raw, _request_sha = read_json(
+        Path(pressure_request_pin["path"]), pressure_request_pin["raw_sha256"],
+        "Source5 resource budget pressure request template", MAX_ARTIFACT_BYTES,
+    )
+    derived = readback._derive_v5_pressure_schedule(
+        recipe["runtime"]["duration_seconds"], pressure_request,
+        recipe["qualification"]["pressure_condition"]["schedule"],
+    )
+    require(recipe["runtime"]["mode"] in {"qualified", "functional"} and
+            recipe["runtime"]["duration_seconds"] ==
+                schedule["production_seconds"] and
+            job.get("duration_seconds") == schedule["production_seconds"] and
+            recipe["runtime"]["sample_interval_ms"] ==
+                schedule["application_sample_interval_ms"] and
+            schedule["pressure_total_deadline_seconds"] ==
+                derived["pressure_schedule"]["total_deadline_seconds"] ==
+                    pressure_value["schedule"]["total_deadline_seconds"] and
+            schedule["application_wall_timeout_seconds"] ==
+                derived["application_wall_timeout_seconds"] and
+            schedule["probe_timeout_seconds"] <= 30,
+            "Source5 Soak resource budget schedule differs from the derived original owner deadlines")
+    row_bound, header_bound, footer_bound = \
+        _resource_monitor_worst_line_bounds(
+            checked, resource_budget_pin(material_index["resource_budget"]),
+        )
+    interval_ns = schedule["resource_monitor_interval_ms"] * 1_000_000
+    monitored_seconds = (
+        schedule["authorization_effective_timeout_seconds"] +
+        schedule["probe_timeout_seconds"]
+    )
+    derived_rows = (monitored_seconds * 1_000_000_000 + interval_ns - 1) // interval_ns
+    derived_rows += RESOURCE_MONITOR_ENDPOINT_RESERVE_ROWS
+    require(ceilings["maximum_monitor_row_bytes"] >= row_bound and
+            ceilings["maximum_monitor_rows"] >= derived_rows and
+            ceilings["maximum_monitor_stream_bytes"] >=
+                header_bound + footer_bound +
+                derived_rows * row_bound and
+            checked["artifact_limits"]["resource_monitor_stream_bytes"] >=
+                header_bound + footer_bound +
+                derived_rows * row_bound,
+            "Source5 Soak resource monitor stream cannot encode its full prospective horizon")
+    if audit is not None:
+        supervision = audit["source"]["application_supervision"]
+        pressure_audit = audit["source"]["pressure_recipe"]
+        require(schedule["application_wall_timeout_seconds"] ==
+                    supervision["application_wall_timeout_seconds"] and
+                schedule["pressure_total_deadline_seconds"] ==
+                    pressure_audit["pressure_schedule"]["total_deadline_seconds"],
+                "Source5 Soak budget differs from the captured reader's complete derived schedule")
+    if details is not None:
+        require(schedule["authorization_effective_timeout_seconds"] ==
+                    details["effective_timeout_seconds"],
+                "Source5 Soak resource budget differs from the authorized outer deadline")
+
+    mandatory_output = sum(limits[name] for name in (
+        "terminal_stream_bytes", "resource_samples_bytes",
+        "application_stdout_bytes", "application_stderr_bytes",
+        "application_timing_bytes", "soak_receipt_bytes", "launch_receipt_bytes",
+        "launch_authorization_bytes",
+        "preflight_receipt_bytes", "postflight_receipt_bytes",
+        "readback_receipt_bytes", "source5_supervisor_bytes",
+        "pressure_readback_bytes", "pressure_events_bytes",
+        "pressure_run_receipt_bytes",
+        "pressure_launch_bytes", "pressure_binding_bytes", "pressure_ready_bytes",
+        "pressure_driver_stdout_bytes", "pressure_driver_stderr_bytes",
+        "resource_monitor_stream_bytes", "failure_receipt_bytes",
+        "component_receipt_bytes",
+    )) + limits["postflight_receipt_bytes"] + \
+        2 * limits["owner_return_receipt_bytes"]
+    mandatory_probe = sum(limits[name] for name in (
+        "probe_stdout_bytes", "probe_stderr_bytes", "probe_owner_receipt_bytes",
+        "probe_inventory_bytes", "probe_capture_receipt_bytes",
+        "probe_failure_bytes",
+    ))
+    metadata_bounds = _resource_budget_metadata_bounds(
+        checked, prepared, job, binding, recipe, material_index,
+        details, pressure_value, readback,
+    )
+    reader_receipt_cap = getattr(readback, "MAX_RECEIPT_BYTES", None)
+    require(type(reader_receipt_cap) is int and reader_receipt_cap > 0 and
+            limits["terminal_stream_bytes"] ==
+                recipe["runtime"]["terminal_budget_bytes"] and
+            limits["resource_samples_bytes"] ==
+                recipe["runtime"]["sample_budget_bytes"] and
+            all(limits[name] <= reader_receipt_cap for name in (
+                "soak_receipt_bytes", "launch_receipt_bytes",
+                "preflight_receipt_bytes", "readback_receipt_bytes",
+                "pressure_run_receipt_bytes", "pressure_launch_bytes",
+                "pressure_binding_bytes", "pressure_ready_bytes",
+            )) and
+            limits["source5_supervisor_bytes"] <= MAX_RECEIPT_BYTES and
+            limits["postflight_receipt_bytes"] <= MAX_RECEIPT_BYTES and
+            limits["launch_authorization_bytes"] <= MAX_RECEIPT_BYTES and
+            limits["owner_return_receipt_bytes"] <= MAX_RECEIPT_BYTES and
+            limits["host_receipt_bytes"] <= MAX_RECEIPT_BYTES and
+            limits["failure_receipt_bytes"] <= MAX_RECEIPT_BYTES and
+            limits["component_receipt_bytes"] <= MAX_RECEIPT_BYTES and
+            ceilings["maximum_output_bytes"] >= mandatory_output and
+            ceilings["maximum_probe_output_bytes"] >= mandatory_probe and
+            ceilings["maximum_application_tmpdir_bytes"] <= 1024 * 1024 * 1024 and
+            ceilings["maximum_application_tmpdir_inodes"] <= 4096 and
+            ceilings["maximum_probe_tmpdir_bytes"] <= 1024 * 1024 * 1024 and
+            ceilings["maximum_probe_tmpdir_inodes"] <= 4096 and
+            ceilings["maximum_output_inodes"] >=
+                SOAK_BOUNDED_OUTPUT_MIN_INODES and
+            ceilings["maximum_probe_output_inodes"] >= 7 and
+            ceilings["durable_receipt_reserve_bytes"] >=
+                limits["host_receipt_bytes"] and
+            ceilings["durable_receipt_reserve_inodes"] >= 1,
+            "Source5 Soak budget does not reserve complete bounded outputs and durable metadata")
+    require(all(limits[name] >= minimum
+                for name, minimum in metadata_bounds.items()) and
+            limits["failure_receipt_bytes"] >=
+                metadata_bounds["failure_receipt_bytes"],
+            "Source5 Soak receipt limits cannot encode their maximum-width pinned metadata")
+    return checked
+
+
 def soak_descriptor(job: dict[str, Any]) -> dict[str, str]:
     """Return the single original Soak APP role, without pair semantics."""
     require(job.get("phase") == "soak" and
@@ -178,13 +838,15 @@ def make_material_index(
     campaign_id: str, host_id: str, job: dict[str, Any],
     parent_recipe_pin: object, build_receipt_pin: object,
     prepared_host_binding_sha256: str,
+    *, resource_budget_pin: object | None = None,
 ) -> dict[str, Any]:
-    """Make the closed index from the exact externally built original recipe."""
+    """Make the v1 index unchanged or add a prospectively pinned bounded v2."""
     recipe_pin = raw_pin(parent_recipe_pin, "Source5 parent Soak recipe")
     receipt_pin = raw_pin(build_receipt_pin, "Source5 Soak recipe-build receipt")
     digest(prepared_host_binding_sha256, "prepared fixed-pair host-binding SHA-256")
     body = {
-        "schema": MATERIALS_INDEX_SCHEMA,
+        "schema": (MATERIALS_INDEX_SCHEMA if resource_budget_pin is None
+                   else MATERIALS_INDEX_SCHEMA_V2),
         "campaign_id": campaign_id,
         "host_id": host_id,
         "job": job,
@@ -193,6 +855,9 @@ def make_material_index(
         "build_receipt": receipt_pin,
         "prepared_host_binding_sha256": prepared_host_binding_sha256,
     }
+    if resource_budget_pin is not None:
+        _budget, budget_pin = _read_resource_budget_pin(resource_budget_pin)
+        body["resource_budget"] = budget_pin
     return {**body, "materials_sha256": sha256(canonical_bytes(body))}
 
 
@@ -201,16 +866,23 @@ def validate_material_index(
     prepared_host_binding_sha256: str,
 ) -> dict[str, Any]:
     """Validate the complete closed ordinal/material binding before preflight."""
-    index = exact(value, {
+    require(type(value) is dict,
+            "Source5 Soak materials index must be an object")
+    schema = value.get("schema")
+    expected_fields = {
         "schema", "campaign_id", "host_id", "job", "job_sha256",
         "parent_recipe", "build_receipt", "prepared_host_binding_sha256",
         "materials_sha256",
-    }, "Source5 Soak materials index")
+    }
+    if schema == MATERIALS_INDEX_SCHEMA_V2:
+        expected_fields.add("resource_budget")
+    index = exact(value, expected_fields, "Source5 Soak materials index")
     body = {key: item for key, item in index.items()
             if key != "materials_sha256"}
     digest(prepared_host_binding_sha256,
            "prepared fixed-pair host-binding SHA-256")
-    require(index["schema"] == MATERIALS_INDEX_SCHEMA and
+    require(index["schema"] in {MATERIALS_INDEX_SCHEMA,
+                                MATERIALS_INDEX_SCHEMA_V2} and
             index["campaign_id"] == campaign_id and
             index["host_id"] == host_id and index["job"] == job and
             index["job_sha256"] == sha256(canonical_bytes(job)) and
@@ -219,6 +891,8 @@ def validate_material_index(
             "Source5 Soak materials index does not bind its exact original host/job/preparation")
     raw_pin(index["parent_recipe"], "Source5 parent Soak recipe")
     raw_pin(index["build_receipt"], "Source5 Soak recipe-build receipt")
+    if schema == MATERIALS_INDEX_SCHEMA_V2:
+        _read_resource_budget_pin(index["resource_budget"])
     return index
 
 
@@ -988,6 +1662,7 @@ def build_source5_launch_overlay(
     binding: dict[str, Any], recipe: dict[str, Any], identities: dict[str, str],
     args: Any, audit: dict[str, Any], preflight: dict[str, Any],
     readback: types.ModuleType, *, path_value: str | None = None,
+    source5_probe_capture: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
     """Derive a narrow Soak-only launch descriptor from locked Source5 proofs.
 
@@ -1036,6 +1711,17 @@ def build_source5_launch_overlay(
                 job, binding["binding_sha256"],
             ) == material_index,
             "Source5 Soak overlay material index differs from the authorized raw pin")
+    resource_budget = None
+    resource_budget_pin_value = None
+    if material_index["schema"] == MATERIALS_INDEX_SCHEMA_V2:
+        resource_budget, resource_budget_pin_value = _read_resource_budget_pin(
+            material_index["resource_budget"],
+        )
+        _validate_resource_budget_bindings(
+            resource_budget, prepared, job, binding, recipe, material_index,
+            output_root=Path(details["output_root"]), details=details, audit=audit,
+            readback=readback,
+        )
     # Validate and pin the actual captured ModuleType handles before any
     # readiness decision. A real V2 audit contains these live objects, so the
     # closed projection must be exercised before the missing-gate refusal.
@@ -1059,15 +1745,18 @@ def build_source5_launch_overlay(
             recipe["pressure"]["recipe"] is not None and
             type(audit["source"].get("pressure_recipe")) is dict,
             "Source5 overlay lacks genuine capacity, composition, or pressure prerequisites")
+    run_mode = recipe["runtime"]["mode"]
+    run_duration = recipe["runtime"]["duration_seconds"]
     require(recipe["schema"] == RECIPE_SCHEMA and
-            recipe["runtime"]["mode"] == "qualified" and
-            recipe["runtime"]["duration_seconds"] == 10_800 and
-            job["duration_seconds"] == 10_800 and
+            run_mode in {"qualified", "functional"} and
+            ((run_mode == "qualified" and run_duration == 10_800) or
+             (run_mode == "functional" and 0 < run_duration < 10_800)) and
+            job["duration_seconds"] == run_duration and
             job["phase"] == "soak" and job["host_id"] == prepared["host_id"] and
             job["run_id"] == recipe["identity"]["run_id"] and
             details["phase"] == "soak" and
             details["members"] == [soak_descriptor(job)],
-            "Source5 launch overlay is outside the exact original qualified Soak job")
+            "Source5 launch overlay is outside the exact original qualified or functional Soak job")
     allowed_legacy_gaps = {
         "production binary runtime-domain/policy/ceiling readback is not implemented and independently validated",
         "external-pressure pair driver/readbacks are not implemented; fixed-policy predecessor receipts cannot qualify pressure",
@@ -1182,8 +1871,15 @@ def build_source5_launch_overlay(
         overlay_audit, Path(args.output_dir), args.cpu_set, None, None,
         path_value=path_value,
     )
+    if resource_budget_pin_value is not None:
+        launch_descriptor["resource_budget_pin"] = resource_budget_pin_value
+        launch_descriptor["resource_monitor_path"] = str(
+            Path(args.output_dir) / "source5-soak-resource-monitor.jsonl",
+        )
     require(launch_descriptor.get("launch_enabled") is True and
-            launch_descriptor.get("execution_scope") == "qualification" and
+            launch_descriptor.get("execution_scope") ==
+                ("qualification" if run_mode == "qualified" else
+                 "functional_only") and
             bool(launch_descriptor.get("argv")) and
             launch_descriptor.get("pressure_recipe_path") ==
                 recipe["pressure"]["recipe"]["path"],
@@ -1199,7 +1895,9 @@ def build_source5_launch_overlay(
     require(preflight_raw == canonical_bytes(preflight),
             "Source5 captured-reader baseline preflight differs from its frozen report")
     body = {
-        "schema": (LAUNCH_AUTHORIZATION_SCHEMA_V2
+        "schema": (LAUNCH_AUTHORIZATION_SCHEMA_V3
+                   if resource_budget is not None else
+                   LAUNCH_AUTHORIZATION_SCHEMA_V2
                    if capacity_resource_proof is not None
                    else LAUNCH_AUTHORIZATION_SCHEMA),
         "campaign_id": prepared["campaign_id"],
@@ -1211,6 +1909,8 @@ def build_source5_launch_overlay(
         "helper_input": details["helper_input"],
         "helper_module": details["helper_module"],
         "materials_index": materials_pin,
+        **({"resource_budget": resource_budget_pin_value}
+           if resource_budget_pin_value is not None else {}),
         "parent_recipe": raw_pin(material_index["parent_recipe"],
                                   "Source5 overlay parent recipe"),
         "build_receipt": raw_pin(material_index["build_receipt"],
@@ -1260,6 +1960,9 @@ def build_source5_launch_overlay(
             capacity_resource_proof["resource_monitor"]["report_count"]
         body["source5_gate_evidence"]["resource_budget_semantic_sha256"] = \
             capacity_resource_proof["resource_budget"]["semantic_sha256"]
+    if resource_budget_pin_value is not None:
+        body["source5_gate_evidence"]["soak_resource_budget_semantic_sha256"] = \
+            resource_budget_pin_value["semantic_sha256"]
     overlay = {**body, "authorization_sha256": sha256(canonical_bytes(body))}
     return overlay, overlay_audit, overlay_preflight
 
@@ -1306,18 +2009,89 @@ def prepare_source5_soak(
     args = _readback_args(recipe, recipe_pin, output_dir)
     require(args.recipe_sha256 == identities["recipe_sha256"],
             "Source5 parent recipe raw pin changed before preflight")
+    budget_document = None
+    budget_pin = None
+    probe_capture = None
+    probe_capture_pin = None
+    probe_capture_context = None
+    initial_resource_usage = None
+    resource_monitor = None
+    resource_monitor_summary = None
+    if material_index["schema"] == MATERIALS_INDEX_SCHEMA_V2:
+        budget_document, budget_pin = _read_resource_budget_pin(
+            material_index["resource_budget"],
+        )
+        fixed_owner, _owner_sha, _owner_path = \
+            _load_fixed_pair_process_owner(prepared)
+        initial_resource_usage = _preflight_source5_resource_budget(
+            budget_document, output_dir, fixed_owner,
+        )
+        require(callable(getattr(readback, "_SoakResourceMonitor", None)),
+                "captured Soak reader lacks its bounded resource monitor")
+        resource_monitor = readback._SoakResourceMonitor(
+            budget_document, budget_pin, fixed_owner, output_dir,
+        )
+        if resource_monitor.sample("preflight", force=True):
+            resource_monitor.finish(resource_monitor.last_usage)
+            raise Source5SoakError(
+                "Source5 Soak monitor preflight refused before ProbeV2 owner",
+            )
+        _run_source5_preflight_monitored(
+            lambda: _validate_resource_budget_bindings(
+                budget_document, prepared, job, binding, recipe,
+                material_index, output_root=output_dir, details=details,
+                readback=readback,
+            ),
+            budget_document, resource_monitor, phase="preflight",
+        )
+        try:
+            probe_capture, probe_capture_pin, probe_capture_context = \
+                _capture_source5_soak_probe_monitored(
+                    prepared, job, binding, recipe, readback,
+                    budget_document, resource_monitor,
+                )
+        except BaseException as error:
+            resource_monitor.failure = resource_monitor.failure or (
+                f"probe_capture_owner:{type(error).__name__}:{error}"
+            )[:4096]
+            resource_monitor.finish(resource_monitor.last_usage)
+            raise
+        if resource_monitor.sample("preflight_audit", force=True):
+            resource_monitor.finish(resource_monitor.last_usage)
+            raise Source5SoakError(
+                "Source5 Soak resource monitor refused after bounded probe capture",
+            )
     # The captured reader independently rebuilds Spec/Plan/source/ring/probe/
     # pressure context and persists its preflight. This path does not launch.
-    with contextlib.redirect_stdout(io.StringIO()):
-        status = readback.command_preflight(args)
-    require(status == 0, "captured Soak V2 preflight refused the original inputs")
-    audit, preflight = readback._current_audit(args)
+    def run_captured_reader_preflight() -> tuple[dict[str, Any], dict[str, Any]]:
+        with contextlib.redirect_stdout(io.StringIO()):
+            status = (readback.command_preflight(args)
+                      if probe_capture_context is None else
+                      readback.command_preflight(
+                          args, source5_probe_capture=probe_capture_context,
+                      ))
+        require(status == 0,
+                "captured Soak V2 preflight refused the original inputs")
+        return (readback._current_audit(args)
+                if probe_capture_context is None else
+                readback._current_audit(
+                    args, source5_probe_capture=probe_capture_context,
+                ))
+
+    audit, preflight = (
+        _run_source5_preflight_monitored(
+            run_captured_reader_preflight, budget_document, resource_monitor,
+        ) if resource_monitor is not None else
+        run_captured_reader_preflight()
+    )
     require(audit["recipe"]["schema"] == RECIPE_SCHEMA and
             audit["identity"]["run_id"] == job["run_id"] and
             audit["launch_enabled"] is False and
-            audit["mode"] == "qualified" and
-            audit["duration_seconds"] == 10_800,
-            "captured Soak V2 legacy audit is not false for the exact original 10,800-second job")
+            audit["mode"] == recipe["runtime"]["mode"] and
+            audit["duration_seconds"] == recipe["runtime"]["duration_seconds"] and
+            (audit["mode"] != "qualified" or
+             audit["duration_seconds"] == 10_800),
+            "captured Soak V2 audit differs from the exact original qualified or functional job")
     preflight_path = output_dir / "soak-preflight.json"
     preflight_pin_raw, preflight_sha, _preflight_info = read_stable(
         preflight_path, "Source5 Soak preflight receipt", MAX_RECEIPT_BYTES,
@@ -1325,23 +2099,55 @@ def prepare_source5_soak(
     require(json.loads(preflight_pin_raw) == readback._preflight_report(audit) and
             preflight_pin_raw == canonical_bytes(json.loads(preflight_pin_raw)),
             "captured Soak V2 preflight file differs from its recomputed report")
-    launch_overlay, overlay_audit, overlay_preflight = \
-        build_source5_launch_overlay(
+    if material_index["schema"] == MATERIALS_INDEX_SCHEMA_V2:
+        _check_budget_file(
+            preflight_path,
+            budget_document["artifact_limits"]["preflight_receipt_bytes"],
+            "Source5 Soak preflight receipt",
+        )
+        _run_source5_preflight_monitored(
+            lambda: _validate_resource_budget_bindings(
+                budget_document, prepared, job, binding, recipe, material_index,
+                output_root=output_dir, details=details, audit=audit,
+                readback=readback,
+            ),
+            budget_document, resource_monitor,
+        )
+    def build_overlay_value() -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+        return build_source5_launch_overlay(
             helper_input, prepared, details, material_index, binding, recipe,
             identities, args, audit, preflight, readback,
+            source5_probe_capture=probe_capture_context,
         )
+    launch_overlay, overlay_audit, overlay_preflight = (
+        _run_source5_preflight_monitored(
+            build_overlay_value, budget_document, resource_monitor,
+        ) if resource_monitor is not None else build_overlay_value()
+    )
     overlay_path = output_dir / "source5-soak-launch-authorization.json"
+    if budget_document is not None:
+        require(len(canonical_bytes(launch_overlay)) <=
+                budget_document["artifact_limits"]["launch_authorization_bytes"],
+                "Source5 Soak launch authorization exceeds its frozen metadata bound")
     launch_overlay_pin = _write_exclusive_json(
         overlay_path, launch_overlay,
         "Source5 Soak-only launch authorization overlay",
     )
+    if resource_monitor is not None:
+        if resource_monitor.sample("preflight_audit", force=True):
+            resource_monitor.finish(resource_monitor.last_usage)
+            raise Source5SoakError(
+                "Source5 Soak monitor refused after source/authorization preflight",
+            )
     launch_args = types.SimpleNamespace(**vars(args))
     launch_args.command = ["--", *overlay_audit["launch_descriptor"]["argv"]]
     launch_args.timeout_seconds = overlay_audit["source"]["application_supervision"][
         "application_wall_timeout_seconds"]
     launch_args.term_grace_seconds = 1.5
-    return {
-        "schema": "allocatbelt.application-source5-soak-preflight.v1",
+    preflight_result = {
+        "schema": ("allocatbelt.application-source5-soak-preflight.v1"
+                   if budget_document is None else
+                   "allocatbelt.application-source5-soak-preflight.v2"),
         "materials_index": material_index,
         "materials_index_pin": index_pin,
         "helper_input": helper_input,
@@ -1364,6 +2170,17 @@ def prepare_source5_soak(
         "prepared": prepared,
         "details": details,
     }
+    if budget_document is not None:
+        preflight_result.update({
+            "resource_budget": budget_document,
+            "resource_budget_pin": budget_pin,
+            "probe_capture": probe_capture,
+            "probe_capture_pin": probe_capture_pin,
+            "probe_capture_context": probe_capture_context,
+            "initial_resource_usage": initial_resource_usage,
+            "resource_monitor": resource_monitor,
+        })
+    return preflight_result
 
 
 def _write_exclusive_json(path: Path, value: dict[str, Any], label: str) -> dict[str, str]:
@@ -1385,6 +2202,14 @@ def _write_exclusive_json(path: Path, value: dict[str, Any], label: str) -> dict
     finally:
         os.close(parent_fd)
     return {"path": str(path), "raw_sha256": sha256(raw)}
+
+
+def _check_budget_file(path: Path, maximum: int, label: str) -> None:
+    info = path.lstat()
+    require(stat.S_ISREG(info.st_mode) and info.st_nlink == 1 and
+            info.st_uid == os.getuid() and stat.S_IMODE(info.st_mode) == 0o600 and
+            0 <= info.st_size <= maximum,
+            f"{label} exceeds its frozen prospective artifact limit")
 
 
 def _stable_file_inventory(path: Path, label: str, maximum: int) -> dict[str, Any]:
@@ -1600,10 +2425,129 @@ def _load_fixed_pair_process_owner(prepared: dict[str, Any]) -> tuple[types.Modu
         raise Source5SoakError(f"SourceV5 fixed process owner cannot be compiled: {error}") from error
     for name in ("_run_direct_process", "_prepare_member_tmpdir", "_tmpdir_usage",
                  "_verify_tmpdir_storage", "_artifact_budgets",
-                 "_bounded_tmpdir_monitor", "_mount_identity", "_mount_static"):
+                 "_bounded_tmpdir_monitor", "_mount_identity", "_mount_static",
+                 "_tmpdir_usage_snapshot", "_open_tmpdir_absolute_directory"):
         require(callable(getattr(module, name, None)),
                 f"SourceV5 fixed process owner omits {name}")
     return module, actual, path
+
+
+def _preflight_source5_resource_budget(
+    budget: dict[str, Any], output_root: Path,
+    fixed_owner: types.ModuleType,
+) -> dict[str, Any]:
+    """Check every original writable root and filesystem reserve before owner launch."""
+    layout = budget["layout"]
+    ceilings = budget["ceilings"]
+    domains = [
+        ("output", Path(layout["output_root"]),
+         ceilings["maximum_output_bytes"], ceilings["maximum_output_inodes"]),
+        ("application_tmpdir", Path(layout["application_tmpdir"]),
+         ceilings["maximum_application_tmpdir_bytes"],
+         ceilings["maximum_application_tmpdir_inodes"]),
+        ("pressure_scratch", Path(layout["pressure_scratch"]),
+         ceilings["maximum_pressure_scratch_bytes"],
+         ceilings["maximum_pressure_scratch_inodes"]),
+        ("probe_capture", Path(layout["probe_capture_root"]),
+         ceilings["maximum_probe_output_bytes"],
+         ceilings["maximum_probe_output_inodes"]),
+    ]
+    require(output_root == Path(layout["output_root"]),
+            "Source5 resource budget output root differs from the authorized job")
+    usage_by_domain: dict[str, dict[str, Any]] = {}
+    device_rows: dict[int, dict[str, Any]] = {}
+    for role, path, byte_limit, inode_limit in domains:
+        absent_probe = role == "probe_capture" and not path.exists() and not path.is_symlink()
+        stat_path = path.parent if absent_probe else path
+        fd = fixed_owner._open_tmpdir_absolute_directory(stat_path)
+        try:
+            root_info = os.fstat(fd)
+            mount = fixed_owner._mount_identity(stat_path)
+            filesystem = os.fstatvfs(fd)
+            mount["available_bytes"] = filesystem.f_bavail * filesystem.f_frsize
+            mount["available_inodes"] = filesystem.f_favail
+            require(stat.S_ISDIR(root_info.st_mode) and root_info.st_uid == os.getuid() and
+                    stat.S_IMODE(root_info.st_mode) == 0o700 and
+                    mount.get("device") == root_info.st_dev,
+                    f"Source5 resource budget {role} root is not a private held directory")
+            if absent_probe:
+                usage = {"bytes_used": 0, "inode_count": 0}
+                root_identity = {"device": root_info.st_dev, "inode": None}
+            else:
+                usage = fixed_owner._tmpdir_usage_snapshot(
+                    path, byte_limit, inode_limit,
+                    (root_info.st_dev, root_info.st_ino),
+                    allow_descendant_enoent=True,
+                )
+                root_identity = {"device": root_info.st_dev,
+                                 "inode": root_info.st_ino}
+            require(usage["bytes_used"] <= byte_limit and
+                    usage["inode_count"] <= inode_limit,
+                    f"Source5 resource budget {role} initial usage exceeds its prospective ceiling")
+            item = {
+                "path": str(path), "device": root_info.st_dev,
+                "inode": root_identity["inode"],
+                "bytes_used": usage["bytes_used"],
+                "inode_count": usage["inode_count"],
+                "available_bytes": mount["available_bytes"],
+                "available_inodes": mount["available_inodes"],
+                "bytes_limit": byte_limit, "inode_limit": inode_limit,
+            }
+            usage_by_domain[role] = item
+            device = device_rows.setdefault(root_info.st_dev, {
+                "available_bytes": mount["available_bytes"],
+                "available_inodes": mount["available_inodes"],
+                "domains": [],
+            })
+            device["available_bytes"] = min(
+                device["available_bytes"], mount["available_bytes"],
+            )
+            device["available_inodes"] = min(
+                device["available_inodes"], mount["available_inodes"],
+            )
+            device["domains"].append(role)
+        finally:
+            os.close(fd)
+
+    host_receipt_parent = Path(layout["host_receipt_path"]).parent
+    host_parent_fd = fixed_owner._open_tmpdir_absolute_directory(
+        host_receipt_parent,
+    )
+    try:
+        host_parent_info = os.fstat(host_parent_fd)
+        require(host_parent_info.st_uid == os.getuid() and
+                stat.S_IMODE(host_parent_info.st_mode) == 0o700 and
+                host_parent_info.st_dev in device_rows,
+                "Source5 host-receipt reserve is outside the monitored origin devices")
+    finally:
+        os.close(host_parent_fd)
+
+    for device, row in device_rows.items():
+        roots = [item for item in domains
+                 if usage_by_domain[item[0]]["device"] == device]
+        roots.sort(key=lambda item: (len(item[1].parts), str(item[1])))
+        top_level: list[Path] = []
+        allowances_bytes = 0
+        allowances_inodes = 0
+        for role, path, byte_limit, inode_limit in roots:
+            if any(path == parent or parent in path.parents
+                   for parent in top_level):
+                continue
+            top_level.append(path)
+            current = usage_by_domain[role]
+            allowances_bytes += max(0, byte_limit - current["bytes_used"])
+            allowances_inodes += max(0, inode_limit - current["inode_count"])
+        required_bytes = (ceilings["minimum_free_bytes"] +
+                          allowances_bytes +
+                          ceilings["durable_receipt_reserve_bytes"])
+        required_inodes = (ceilings["minimum_free_inodes"] +
+                           allowances_inodes +
+                           ceilings["durable_receipt_reserve_inodes"])
+        require(row["available_bytes"] >= required_bytes and
+                row["available_inodes"] >= required_inodes,
+                f"Source5 resource budget device {device} cannot satisfy its full output/TMPDIR/free-space reserve")
+    return {"domains": usage_by_domain,
+            "devices": {str(device): row for device, row in device_rows.items()}}
 
 
 def _load_source5_preparation_verifier(
@@ -1725,24 +2669,556 @@ def _load_pressure_readback_module(
             f"Source5 captured pressure readback cannot be compiled: {error}",
         ) from error
     require(callable(getattr(module, "verify_source5_soak_pressure_offline", None)) and
+            callable(getattr(module, "verify_source5_soak_pressure_offline_v3", None)) and
             callable(getattr(module, "_pressure_absolute_json_paths", None)) and
             type(getattr(module, "MAX_EVENTS_BYTES", None)) is int,
             "Source5 pressure reader lacks its typed Soak replay APIs")
     return module, actual, path
 
 
+def _load_feedback_composition_module(
+    prepared: dict[str, Any],
+) -> tuple[types.ModuleType, dict[str, Any]]:
+    """Compile the Composer only from the selected SourceV5 typed inventory."""
+    pin = _resource_budget_module_pin(
+        prepared, "scripts/application-feedback-composition.py",
+        "ProbeV2 composition owner",
+    )
+    path = Path(prepared["source_root"]) / pin["path"]
+    raw, actual, info = read_stable(
+        path, "captured ProbeV2 composition owner", MAX_SCRIPT_BYTES,
+    )
+    mode = f"{stat.S_IFMT(info.st_mode) | stat.S_IMODE(info.st_mode):06o}"
+    require(actual == pin["raw_sha256"] and len(raw) == pin["size"] and
+            mode == pin["mode"],
+            "ProbeV2 Composer differs from its SourceV5 typed inventory before execution")
+    module = types.ModuleType(f"source5_soak_probe_composer_{actual}")
+    module.__file__ = str(path)
+    module.__package__ = ""
+    try:
+        exec(compile(raw, str(path), "exec", dont_inherit=True), module.__dict__)
+    except (SyntaxError, TypeError, ValueError) as error:
+        raise Source5SoakError(
+            f"captured ProbeV2 composition owner cannot be compiled: {error}",
+        ) from error
+    require(callable(getattr(module, "capture_calibrated_probe_v2", None)) and
+            callable(getattr(module, "_validate_resolve_request", None)),
+            "captured SourceV5 Composer lacks its strict ProbeV2 owner API")
+    return module, pin
+
+
+def _source5_soak_capacity_bundle(
+    prepared: dict[str, Any], recipe: dict[str, Any],
+) -> dict[str, dict[str, str]]:
+    completion = prepared["source5_prepared_input_completion"]
+    rows = [row for row in completion.get("capacity_preparations", [])
+            if type(row) is dict and row.get("host_id") == prepared["host_id"]]
+    require(len(rows) == 1,
+            "Source5 ProbeV2 has no unique selected-host capacity completion")
+    capacity_template = exact(
+        recipe["qualification"]["capacity_template"],
+        {"template_sha256", "calibration_id", "request_template",
+         "context_template", "evidence"},
+        "Source5 original capacity template",
+    )
+    matches = [entry for entry in rows[0].get("entries", [])
+               if type(entry) is dict and
+               entry.get("capacity_key") == {
+                   "host_id": prepared["host_id"], "workload": "mixed",
+                   "profile": recipe["identity"]["profile"],
+                   "calibration_id": capacity_template["calibration_id"],
+               }]
+    require(len(matches) == 1,
+            "Source5 ProbeV2 capacity bundle differs from the exact mixed Soak context")
+    entry = matches[0]
+    result: dict[str, dict[str, str]] = {}
+    for role in ("request", "artifact", "receipt"):
+        pin = exact(entry.get(role), {"path", "sha256"},
+                    f"Source5 ProbeV2 capacity {role} pin")
+        require(type(pin["path"]) is str and Path(pin["path"]).is_absolute(),
+                f"Source5 ProbeV2 capacity {role} path is not absolute")
+        result[role] = {"path": pin["path"],
+                        "raw_sha256": digest(pin["sha256"],
+                                             f"Source5 ProbeV2 capacity {role} SHA-256")}
+    require(len({pin["path"] for pin in result.values()}) == 3,
+            "Source5 ProbeV2 capacity request/artifact/receipt paths alias")
+    evidence = capacity_template["evidence"]
+    require(type(evidence) is dict and
+            evidence.get("artifact", {}).get("raw_sha256") ==
+                result["artifact"]["raw_sha256"] and
+            evidence.get("receipt", {}).get("raw_sha256") ==
+                result["receipt"]["raw_sha256"],
+            "Source5 ProbeV2 capacity bundle differs from the original recipe evidence")
+    return result
+
+
+def _capture_source5_soak_probe_v2(
+    prepared: dict[str, Any], binding: dict[str, Any], recipe: dict[str, Any],
+    resource_budget: dict[str, Any], capture_root_value: object,
+    *, resource_monitor: Any = None,
+) -> tuple[dict[str, Any], dict[str, str], dict[str, Any]]:
+    """Capture the selected-floor ProbeV2 with the accepted FixedR8 owner."""
+    capture_root = Path(str(capture_root_value))
+    require(capture_root.is_absolute() and ".." not in capture_root.parts and
+            re.fullmatch(r"[a-f0-9]{32}", capture_root.name) is not None and
+            not capture_root.exists() and not capture_root.is_symlink(),
+            "Source5 ProbeV2 capture root must be its fresh budget-pinned capture ID")
+    parent = capture_root.parent
+    parent_info = parent.lstat()
+    require(stat.S_ISDIR(parent_info.st_mode) and
+            not stat.S_ISLNK(parent_info.st_mode) and
+            parent_info.st_uid == os.getuid() and
+            stat.S_IMODE(parent_info.st_mode) == 0o700,
+            "Source5 ProbeV2 capture parent must be an owned private directory")
+    probe_pin = exact(recipe["construction_probe"], {
+        "path", "raw_sha256", "allocator", "binary_sha256",
+    }, "Source5 selected ProbeV2 pin")
+    expected_probe, probe_raw, probe_sha = read_json(
+        Path(probe_pin["path"]), probe_pin["raw_sha256"],
+        "Source5 selected ProbeV2", 512 * 1024,
+    )
+    normal_sha = digest(
+        prepared["source"]["artifacts"]["allocatbelt"]["sha256"],
+        "Source5 normal APP artifact SHA-256",
+    )
+    require(probe_pin["allocator"] == "allocatbelt" and
+            probe_pin["binary_sha256"] == normal_sha,
+            "Source5 selected ProbeV2 allocator differs from the original normal APP")
+    floor_policy = recipe["feedback_expectation"]["policy"].get(
+        "capacity_floor_policy_id",
+    )
+    require(type(floor_policy) is str and
+            expected_probe.get("schema") ==
+                "allocatbelt.application-feedback-policy-probe.v2" and
+            expected_probe.get("context", {}).get("workload") == "mixed" and
+            expected_probe.get("context", {}).get("profile") == recipe["identity"]["profile"],
+            "Source5 bounded ProbeV2 does not match its selected capacity-floor context")
+    source_ref = exact(prepared["source_manifest_raw_refs"][prepared["host_id"]], {
+        "host_id", "path", "raw_sha256", "semantic_sha256",
+        "source_tree_sha256",
+    }, "Source5 ProbeV2 selected SourceV5 manifest pin")
+    source_manifest_pin = {"path": source_ref["path"],
+                           "raw_sha256": source_ref["raw_sha256"]}
+    capacity_bundle = _source5_soak_capacity_bundle(prepared, recipe)
+    composition, _composition_pin = _load_feedback_composition_module(prepared)
+    request_schema = getattr(composition, "REQUEST_SCHEMA_V2", None)
+    require(type(request_schema) is str and request_schema,
+            "captured SourceV5 Composer lacks the selected-floor request schema")
+    request = {
+        "schema": request_schema,
+        "source_root": str(Path(prepared["source_root"]).resolve(strict=True)),
+        "source_manifest": source_manifest_pin,
+        "context": {
+            "host_id": prepared["host_id"], "workload": "mixed",
+            "profile": recipe["identity"]["profile"],
+            "calibration_id": recipe["qualification"]["capacity_template"][
+                "calibration_id"],
+        },
+        "construction_probe": probe_pin,
+        "capacity_bundle": capacity_bundle,
+        "capacity_floor_policy_id": floor_policy,
+    }
+    validate_request = composition._validate_resolve_request(request)
+    require(validate_request == request,
+            "Source5 selected ProbeV2 request changed during Composer normalization")
+    ceilings = resource_budget["ceilings"]
+    limits = resource_budget["artifact_limits"]
+    storage_budget = {
+        "tmpdir_bytes": ceilings["maximum_probe_tmpdir_bytes"],
+        "tmpdir_inodes": ceilings["maximum_probe_tmpdir_inodes"],
+        "stdout_bytes": limits["probe_stdout_bytes"],
+        "stderr_bytes": limits["probe_stderr_bytes"],
+        "owner_result_bytes": limits["probe_owner_receipt_bytes"],
+        "inventory_bytes": limits["probe_inventory_bytes"],
+        "failure_bytes": limits["probe_failure_bytes"],
+        "receipt_bytes": limits["probe_capture_receipt_bytes"],
+        "output_inodes": ceilings["maximum_probe_output_inodes"],
+    }
+    observed_host_pin = raw_pin(binding["prepared_host_context_pin"],
+                                "Source5 ProbeV2 observed-host context")
+    timeout_ns = resource_budget["schedule"]["probe_timeout_seconds"] * 1_000_000_000
+    receipt_pin = composition.capture_calibrated_probe_v2(
+        request, sha256(canonical_bytes(request)), observed_host_pin,
+        output_root=parent, capture_id=capture_root.name,
+        capture_timeout_ns=timeout_ns, storage_budget=storage_budget,
+        resource_monitor=resource_monitor,
+    )
+    receipt_pin = exact(receipt_pin, {"path", "raw_sha256", "receipt_sha256"},
+                        "Source5 ProbeV2 strict capture receipt pin")
+    capture, _raw, capture_sha = read_json(
+        Path(receipt_pin["path"]), receipt_pin["raw_sha256"],
+        "Source5 ProbeV2 strict capture receipt",
+        limits["probe_capture_receipt_bytes"],
+    )
+    require(capture_sha == receipt_pin["raw_sha256"] and
+            capture.get("schema") ==
+                "allocatbelt.application-feedback-probe-capture.v2" and
+            capture.get("receipt_sha256") == receipt_pin["receipt_sha256"] and
+            capture.get("probe_pin") == probe_pin and
+            capture.get("probe_raw_sha256") == probe_sha and
+            capture.get("source_manifest", {}).get("raw_sha256") ==
+                source_ref["raw_sha256"] and
+            capture.get("source_manifest", {}).get("semantic_sha256") ==
+                source_ref["semantic_sha256"] and
+            capture.get("capacity_bundle") == capacity_bundle and
+            capture.get("capture_timeout_ns") == timeout_ns,
+            "Source5 ProbeV2 capture does not bind the pinned source, capacity bundle, and owner deadline")
+    probe_context = {
+        "schema": "allocatbelt.application-source5-soak-probe-audit-context.v2",
+        "capture_pin": receipt_pin,
+        "capture": capture,
+        "probe": expected_probe,
+        "probe_raw": probe_raw,
+        "probe_raw_sha256": probe_sha,
+        "capacity_bundle": capacity_bundle,
+        "capacity_floor_policy_id": floor_policy,
+        "normal_binary_sha256": probe_pin["binary_sha256"],
+        "request": request,
+    }
+    return capture, receipt_pin, probe_context
+
+
+def _source5_probe_v2_audit_context(
+    prepared: dict[str, Any], recipe: dict[str, Any],
+    capture_pin_value: object,
+    *, evidence_path_map: object | None = None,
+) -> tuple[dict[str, Any], dict[str, str]]:
+    """Reconstruct the bounded ProbeV2 audit context from its pinned receipt."""
+    capture_pin = exact(capture_pin_value, {
+        "path", "raw_sha256", "receipt_sha256",
+    }, "Source5 ProbeV2 captured receipt pin")
+    capture, _capture_raw, capture_sha = read_json(
+        Path(capture_pin["path"]), capture_pin["raw_sha256"],
+        "Source5 ProbeV2 captured receipt", MAX_RECEIPT_BYTES,
+    )
+    require(capture_sha == capture_pin["raw_sha256"] and
+            capture.get("schema") ==
+                "allocatbelt.application-feedback-probe-capture.v2" and
+            capture.get("receipt_sha256") == capture_pin["receipt_sha256"],
+            "Source5 ProbeV2 capture receipt differs from its strict host pin")
+    probe_pin = exact(recipe["construction_probe"], {
+        "path", "raw_sha256", "allocator", "binary_sha256",
+    }, "Source5 selected ProbeV2 source pin")
+    probe, probe_raw, probe_sha = read_json(
+        Path(probe_pin["path"]), probe_pin["raw_sha256"],
+        "Source5 selected ProbeV2 source", 512 * 1024,
+    )
+    capacity_bundle = _source5_soak_capacity_bundle(prepared, recipe)
+    composition, _composition_pin = _load_feedback_composition_module(prepared)
+    floor_policy = recipe["feedback_expectation"]["policy"].get(
+        "capacity_floor_policy_id",
+    )
+    require(type(floor_policy) is str and
+            callable(getattr(composition, "_validate_resolve_request", None)),
+            "captured SourceV5 Composer lacks the strict ProbeV2 request API")
+    source_ref = prepared["source_manifest_raw_refs"][prepared["host_id"]]
+    request = {
+        "schema": composition.REQUEST_SCHEMA_V2,
+        "source_root": str(Path(prepared["source_root"]).resolve(strict=True)),
+        "source_manifest": {"path": source_ref["path"],
+                             "raw_sha256": source_ref["raw_sha256"]},
+        "context": {
+            "host_id": prepared["host_id"], "workload": "mixed",
+            "profile": recipe["identity"]["profile"],
+            "calibration_id": recipe["qualification"]["capacity_template"][
+                "calibration_id"],
+        },
+        "construction_probe": probe_pin,
+        "capacity_bundle": capacity_bundle,
+        "capacity_floor_policy_id": floor_policy,
+    }
+    normalized = composition._validate_resolve_request(request)
+    require(normalized == request,
+            "captured SourceV5 Composer normalized a different ProbeV2 request")
+    context = {
+        "schema": "allocatbelt.application-source5-soak-probe-audit-context.v2",
+        "capture_pin": capture_pin,
+        "capture": capture,
+        "probe": probe,
+        "probe_raw": probe_raw,
+        "probe_raw_sha256": probe_sha,
+        "capacity_bundle": capacity_bundle,
+        "capacity_floor_policy_id": floor_policy,
+        "normal_binary_sha256": probe_pin["binary_sha256"],
+        "request": request,
+    }
+    if evidence_path_map is not None:
+        require(callable(getattr(composition,
+                                 "compose_calibrated_policy_v5_offline", None)),
+                "captured SourceV5 Composer lacks offline ProbeV2 policy replay")
+        try:
+            policy_document, composition_receipt = \
+                composition.compose_calibrated_policy_v5_offline(
+                    request, sha256(canonical_bytes(request)),
+                    replay_context={
+                        "schema": "allocatbelt.application-feedback-offline-replay-context.v1",
+                        "evidence_path_map": evidence_path_map,
+                        "probe_capture_pin": capture_pin,
+                        "capacity_bundle": capacity_bundle,
+                    },
+                )
+        except Exception as error:
+            raise Source5SoakError(
+                f"Source5 offline Composer rejected the captured ProbeV2 evidence: {error}",
+            ) from error
+        require(type(policy_document) is dict and
+                type(composition_receipt) is dict and
+                policy_document.get("policy") ==
+                    recipe["feedback_expectation"]["policy"] and
+                policy_document.get("capacity_floor_policy_id") == floor_policy and
+                policy_document.get("source_manifest_raw_sha256") ==
+                    source_ref["raw_sha256"] and
+                composition_receipt.get("schema") == composition.RECEIPT_SCHEMA_V2 and
+                composition_receipt.get("validated") is True and
+                composition_receipt.get("execution_ready") is False and
+                composition_receipt.get("qualification_eligible") is False and
+                composition_receipt.get("controller_chronology_proven") is False,
+                "Source5 offline Composer policy/receipt differs from the original selected ProbeV2 recipe")
+    return context, capture_pin
+
+
+def _verify_source5_probe_resource_budget(
+    budget: dict[str, Any], prepared: dict[str, Any],
+    probe_context: dict[str, Any],
+) -> None:
+    """Re-derive the exact ProbeV1/V2 owner limits from the prospective budget."""
+    capture = probe_context.get("capture")
+    capture_pin = probe_context.get("capture_pin")
+    require(type(capture) is dict and type(capture_pin) is dict,
+            "Source5 bounded probe capture context is incomplete")
+    layout = budget["layout"]
+    ceilings = budget["ceilings"]
+    limits = budget["artifact_limits"]
+    schedule = budget["schedule"]
+    root = Path(layout["probe_capture_root"])
+    if capture.get("schema") == PROBE_CAPTURE_SCHEMA_V2:
+        storage = exact(capture.get("storage_budget"), {
+            "tmpdir_bytes", "tmpdir_inodes", "stdout_bytes", "stderr_bytes",
+            "owner_result_bytes", "inventory_bytes", "failure_bytes",
+            "receipt_bytes", "output_inodes",
+        }, "Source5 bounded ProbeV2 owner storage budget")
+        expected_storage = {
+            "tmpdir_bytes": ceilings["maximum_probe_tmpdir_bytes"],
+            "tmpdir_inodes": ceilings["maximum_probe_tmpdir_inodes"],
+            "stdout_bytes": limits["probe_stdout_bytes"],
+            "stderr_bytes": limits["probe_stderr_bytes"],
+            "owner_result_bytes": limits["probe_owner_receipt_bytes"],
+            "inventory_bytes": limits["probe_inventory_bytes"],
+            "failure_bytes": limits["probe_failure_bytes"],
+            "receipt_bytes": limits["probe_capture_receipt_bytes"],
+            "output_inodes": ceilings["maximum_probe_output_inodes"],
+        }
+        require(storage == expected_storage and
+                capture.get("capture_timeout_ns") ==
+                    schedule["probe_timeout_seconds"] * 1_000_000_000 and
+                Path(capture_pin["path"]) == root / "capture-receipt.json" and
+                capture.get("tmpdir_initial", {}).get("path") ==
+                    layout["probe_tmpdir"],
+                "Source5 ProbeV2 owner receipt differs from its exact prospective limits/layout")
+        return
+    require(capture.get("schema") == PROBE_CAPTURE_SCHEMA,
+            "Source5 bounded probe has an unknown original capture schema")
+    owner, _owner_sha, _owner_path = _load_fixed_pair_process_owner(prepared)
+    owner_limits = owner._artifact_budgets()
+    stdout_limit = min(owner.MAX_PROBE_STDOUT_BYTES,
+                       limits["probe_stdout_bytes"])
+    stderr_limit = min(owner.MAX_PROBE_STDERR_BYTES,
+                       limits["probe_stderr_bytes"])
+    tmpdir_bytes = min(owner_limits["tmpdir_bytes"],
+                       ceilings["maximum_probe_tmpdir_bytes"])
+    tmpdir_inodes = min(owner_limits["tmpdir_inodes"],
+                        ceilings["maximum_probe_tmpdir_inodes"])
+    owner_bytes = min(owner_limits["runtime_receipt_bytes"],
+                      limits["probe_owner_receipt_bytes"])
+    capture_bytes = min(owner_limits["runtime_receipt_bytes"],
+                        limits["probe_capture_receipt_bytes"])
+    expected = {
+        "stdout_bytes": stdout_limit,
+        "stderr_bytes": stderr_limit,
+        "tmpdir_bytes": tmpdir_bytes,
+        "tmpdir_inodes": tmpdir_inodes,
+        "output_bytes": stdout_limit + stderr_limit + 2 * owner_bytes,
+        "output_inodes": 4,
+        "deadline_seconds": min(
+            int(owner.PROBE_TIMEOUT_SECONDS),
+            schedule["probe_timeout_seconds"],
+        ),
+        "owner_receipt_bytes": owner_bytes,
+        "capture_receipt_bytes": capture_bytes,
+    }
+    require(capture.get("capture_budgets") == expected and
+            Path(capture_pin["path"]) == root / "probe-capture.json" and
+            capture.get("tmpdir_path") == layout["probe_tmpdir"] and
+            capture.get("tmpdir_receipt", {}).get("byte_limit") == tmpdir_bytes and
+            capture.get("tmpdir_receipt", {}).get("inode_limit") == tmpdir_inodes,
+            "Source5 ProbeV1 owner receipt differs from its exact prospective limits/layout")
+
+
+def _source5_probe_owner_interval(
+    prepared: dict[str, Any], probe_context: dict[str, Any],
+    budget: dict[str, Any],
+) -> tuple[int, int]:
+    capture = probe_context["capture"]
+    owner_pin_value = capture.get("owner_result_pin")
+    if capture.get("schema") == PROBE_CAPTURE_SCHEMA_V2:
+        owner_pin = exact(owner_pin_value, {
+            "path", "raw_sha256", "owner_result_sha256",
+        }, "Source5 ProbeV2 owner-result pin")
+        owner, _raw, _sha = read_json(
+            Path(owner_pin["path"]), owner_pin["raw_sha256"],
+            "Source5 ProbeV2 FixedR8 owner result",
+            budget["artifact_limits"]["probe_owner_receipt_bytes"],
+        )
+        exact(owner, {
+            "schema", "direct", "start_callback_count", "start_callback_proofs",
+            "owner_result_sha256",
+        }, "Source5 ProbeV2 owner-result receipt")
+        owner_body = {key: value for key, value in owner.items()
+                      if key != "owner_result_sha256"}
+        require(owner["schema"] ==
+                    "allocatbelt.application-feedback-probe-owner-result.v1" and
+                owner["owner_result_sha256"] ==
+                    owner_pin["owner_result_sha256"] ==
+                    sha256(canonical_bytes(owner_body)) and
+                owner["start_callback_count"] == 1 and
+                type(owner["start_callback_proofs"]) is list and
+                len(owner["start_callback_proofs"]) == 1,
+                "Source5 ProbeV2 owner receipt differs from its original callback proof")
+        direct = owner["direct"]
+    else:
+        owner_pin = raw_pin(owner_pin_value,
+                            "Source5 ProbeV1 owner-result pin")
+        direct, _raw, _sha = read_json(
+            Path(owner_pin["path"]), owner_pin["raw_sha256"],
+            "Source5 ProbeV1 direct owner result",
+            budget["artifact_limits"]["probe_owner_receipt_bytes"],
+        )
+    require(type(direct) is dict and direct.get("status") == 0 and
+            direct.get("child_return_code") == 0 and
+            type(direct.get("started_monotonic_ns")) is int and
+            type(direct.get("ended_monotonic_ns")) is int and
+            0 < direct["started_monotonic_ns"] <=
+                direct["ended_monotonic_ns"] and
+            type(direct.get("supervision")) is dict and
+            direct["supervision"].get("cleanup_status") == "verified" and
+            direct["supervision"].get("leader_reaped") is True and
+            direct["supervision"].get("group_signal_after_leader_reap_count") == 0,
+            "Source5 Probe owner return/cleanup interval is not a successful owned capture")
+    return direct["started_monotonic_ns"], direct["ended_monotonic_ns"]
+
+
+def _verify_source5_owner_phase_intervals(
+    monitor_replay: dict[str, Any], budget: dict[str, Any],
+    probe_interval: tuple[int, int], app_details: dict[str, Any],
+    pressure_owner: dict[str, Any], supervisor: dict[str, Any],
+) -> None:
+    phases = monitor_replay["phase_bounds"]
+    phase_counts = monitor_replay["phase_counts"]
+    schedule = budget["schedule"]
+    gap_ns = (schedule["resource_monitor_interval_ms"] * 1_000_000 +
+              schedule["resource_monitor_tolerance_ns"])
+
+    def bounds(name: str) -> tuple[int, int]:
+        value = phases.get(name)
+        require(type(value) is list and len(value) == 2 and
+                all(type(item) is int and item > 0 for item in value) and
+                value[0] <= value[1],
+                f"Source5 resource monitor omits the {name} owner interval")
+        return value[0], value[1]
+
+    def require_near(actual: int, expected: int, label: str) -> None:
+        require(abs(actual - expected) <= gap_ns,
+                f"Source5 resource monitor {label} is outside its held-owner interval")
+
+    require(phase_counts.get("preflight", 0) >= 1 and
+            phase_counts.get("preflight_audit", 0) >= 2 and
+            phase_counts.get("postflight", 0) >= 3,
+            "Source5 resource monitor omits preparation or finalization samples")
+
+    probe_started, probe_ended = probe_interval
+    app_started = app_details["started_monotonic_ns"]
+    app_ended = app_details["ended_monotonic_ns"]
+    pressure_started = pressure_owner["started_monotonic_ns"]
+    pressure_returned = pressure_owner["returned_monotonic_ns"]
+    require(type(app_started) is int and type(app_ended) is int and
+            0 < app_started <= app_ended and
+            type(pressure_started) is int and type(pressure_returned) is int and
+            0 < pressure_started <= pressure_returned and
+            probe_ended <= pressure_started < app_started <= app_ended <=
+                pressure_returned and
+            app_ended - app_started >=
+                schedule["production_seconds"] * 1_000_000_000 -
+                schedule["application_sample_tolerance_ns"],
+            "Source5 Probe/pressure/APP owner intervals do not cover the original run horizon")
+
+    probe_first, probe_last = bounds("probe_capture")
+    require(phase_counts.get("probe_capture", 0) >= 2,
+            "Source5 probe owner is not covered by monitor start/end samples")
+    require_near(probe_first, probe_started, "ProbeV2 owner start")
+    require_near(probe_last, probe_ended, "ProbeV2 owner return")
+    require(probe_first >= probe_started - gap_ns and
+            probe_last <= probe_ended + gap_ns,
+            "Source5 probe monitor rows do not bracket the captured FixedR8 owner")
+    startup_first, startup_last = bounds("pressure_startup")
+    require(phase_counts.get("pressure_startup", 0) >= 2,
+            "Source5 pressure startup lacks prelaunch and readiness samples")
+    require_near(startup_first, pressure_started, "pressure Popen")
+    require_near(startup_last, app_started, "pressure readiness")
+    require(startup_first <= pressure_started + gap_ns and
+            startup_last <= app_started + gap_ns,
+            "Source5 pressure-startup monitor rows do not bracket the owner handoff")
+    app_first, app_last = bounds("application")
+    require(phase_counts.get("application", 0) >= 2,
+            "Source5 APP/pressure lifetime lacks owner start/end samples")
+    require_near(app_first, app_started, "APP owner start")
+    require_near(app_last, pressure_returned, "post-APP pressure return")
+    require(app_first >= app_started - gap_ns and
+            app_last >= app_ended - gap_ns and
+            app_last <= pressure_returned + gap_ns,
+            "Source5 APP monitor rows omit its lifetime or post-APP pressure wait")
+    cleanup_first, cleanup_last = bounds("pressure_cleanup")
+    require(phase_counts.get("pressure_cleanup", 0) >= 2,
+            "Source5 pressure cleanup lacks owner-return and cleanup samples")
+    require_near(cleanup_first, pressure_returned, "pressure cleanup start")
+    require(cleanup_first >= pressure_returned - gap_ns and
+            cleanup_last >= cleanup_first and
+            supervisor["pressure_cleanup"] == "verified",
+            "Source5 pressure-cleanup monitor rows do not bind the returned owned session")
+    postflight_first, postflight_last = bounds("postflight")
+    require(postflight_first >= cleanup_last and
+            postflight_first - cleanup_last <= gap_ns,
+            "Source5 postflight monitor does not follow verified pressure cleanup")
+    footer_ended = monitor_replay["footer_ended_monotonic_ns"]
+    require(phase_counts.get("postflight", 0) >= 3 and
+            footer_ended >= postflight_last and
+            footer_ended - postflight_last <= gap_ns,
+            "Source5 postflight monitor rows do not cover final source/readback checks")
+
+
 def _capture_source5_soak_probe(
     prepared: dict[str, Any], job: dict[str, Any], binding: dict[str, Any],
     recipe: dict[str, Any], readback: types.ModuleType, capture_root_value: object,
-) -> tuple[dict[str, Any], dict[str, str]]:
+    *, resource_budget: dict[str, Any] | None = None,
+    resource_monitor: Any = None,
+) -> tuple[dict[str, Any], dict[str, str], dict[str, Any] | None]:
     """Capture the SourceV5 ProbeV1 on-origin with the accepted process owner."""
+    floor_policy = recipe["feedback_expectation"]["policy"].get(
+        "capacity_floor_policy_id",
+    )
+    if resource_budget is not None and floor_policy is not None:
+        return _capture_source5_soak_probe_v2(
+            prepared, binding, recipe, resource_budget, capture_root_value,
+            resource_monitor=resource_monitor,
+        )
     capture_root = Path(str(capture_root_value))
     require(capture_root.is_absolute() and ".." not in capture_root.parts and
             not capture_root.exists() and not capture_root.is_symlink(),
             "Source5 Soak probe capture root must be fresh and normalized")
     parent = capture_root.parent
-    parent_info = parent.stat()
-    require(stat.S_ISDIR(parent_info.st_mode) and parent_info.st_uid == os.getuid() and
+    parent_info = parent.lstat() if resource_budget is not None else parent.stat()
+    require(stat.S_ISDIR(parent_info.st_mode) and
+            (resource_budget is None or not stat.S_ISLNK(parent_info.st_mode)) and
+            parent_info.st_uid == os.getuid() and
             stat.S_IMODE(parent_info.st_mode) == 0o700,
             "Source5 Soak probe capture parent must be an owned private directory")
     capture_root.mkdir(mode=0o700)
@@ -1771,13 +3247,33 @@ def _capture_source5_soak_probe(
     stderr_path = capture_root / "probe.stderr"
     owner_path_out = capture_root / "process-owner.json"
     budgets = owner._artifact_budgets()
-    tmpdir_initial = owner._prepare_member_tmpdir(tmpdir, capture_root, budgets)
     byte_limit = budgets["tmpdir_bytes"]
     inode_limit = budgets["tmpdir_inodes"]
+    stdout_limit = owner.MAX_PROBE_STDOUT_BYTES
+    stderr_limit = owner.MAX_PROBE_STDERR_BYTES
+    probe_timeout = owner.PROBE_TIMEOUT_SECONDS
+    if resource_budget is not None:
+        ceilings = resource_budget["ceilings"]
+        limits = resource_budget["artifact_limits"]
+        byte_limit = min(byte_limit, ceilings["maximum_probe_tmpdir_bytes"])
+        inode_limit = min(inode_limit, ceilings["maximum_probe_tmpdir_inodes"])
+        stdout_limit = min(stdout_limit, limits["probe_stdout_bytes"])
+        stderr_limit = min(stderr_limit, limits["probe_stderr_bytes"])
+        probe_timeout = min(
+            probe_timeout, resource_budget["schedule"]["probe_timeout_seconds"],
+        )
+    tmpdir_budgets = dict(budgets)
+    tmpdir_budgets["tmpdir_bytes"] = byte_limit
+    tmpdir_budgets["tmpdir_inodes"] = inode_limit
+    tmpdir_initial = owner._prepare_member_tmpdir(
+        tmpdir, capture_root, tmpdir_budgets,
+    )
     output_byte_bound = (
-        budgets["construction_probe_stdout_bytes"] +
-        budgets["construction_probe_stderr_bytes"] +
-        2 * budgets["runtime_receipt_bytes"]
+        stdout_limit + stderr_limit +
+        2 * min(budgets["runtime_receipt_bytes"],
+                (resource_budget["artifact_limits"]["probe_owner_receipt_bytes"]
+                 if resource_budget is not None else
+                 budgets["runtime_receipt_bytes"]))
     )
     output_inode_bound = 4
     require(tmpdir_initial["available_bytes"] >= byte_limit + output_byte_bound and
@@ -1792,23 +3288,46 @@ def _capture_source5_soak_probe(
             "mixed", "--profile", recipe["identity"]["profile"]]
     affinity = list(binding["process_affinity"])
     network_inode = binding["network_namespace_inode"]
+    tmpdir_monitor = owner._bounded_tmpdir_monitor(
+        tmpdir, byte_limit, inode_limit, tmpdir_initial,
+    )
+
+    def combined_resource_monitor() -> bool:
+        tmpdir_exceeded = bool(tmpdir_monitor())
+        outer_exceeded = bool(resource_monitor()) if resource_monitor is not None else False
+        return tmpdir_exceeded or outer_exceeded
+
     direct = owner._run_direct_process(
         argv, normal_path, normal_sha, source_root, environment, affinity,
-        stdout_path, stderr_path, owner.MAX_PROBE_STDOUT_BYTES,
-        owner.MAX_PROBE_STDERR_BYTES, owner.PROBE_TIMEOUT_SECONDS, readback,
+        stdout_path, stderr_path, stdout_limit,
+        stderr_limit, probe_timeout, readback,
         expected_tmpdir=tmpdir, expected_network_inode=network_inode,
         capture_identity=False,
-        resource_monitor=owner._bounded_tmpdir_monitor(
-            tmpdir, byte_limit, inode_limit, tmpdir_initial,
-        ),
+        resource_monitor=(combined_resource_monitor if resource_monitor is not None
+                          else tmpdir_monitor),
     )
+    process_pin = None
+    process_receipt_limit = budgets["runtime_receipt_bytes"]
+    if resource_budget is not None:
+        process_receipt_limit = min(
+            process_receipt_limit,
+            resource_budget["artifact_limits"]["probe_owner_receipt_bytes"],
+        )
+        # Preserve the actual owner result before reading streams, rescanning
+        # TMPDIR, or checking post-return host state.
+        process_pin = _write_exclusive_json(
+            owner_path_out, direct,
+            "Source5 bounded ProbeV1 original process-owner result",
+        )
+        require(len(canonical_bytes(direct)) <= process_receipt_limit,
+                "Source5 bounded ProbeV1 original owner result exceeds its frozen receipt bound")
     stdout_raw, stdout_sha, _stdout_info = read_stable(
         stdout_path, "Source5 Soak captured ProbeV1 stdout",
-        owner.MAX_PROBE_STDOUT_BYTES,
+        stdout_limit,
     )
     stderr_raw, stderr_sha, _stderr_info = read_stable(
         stderr_path, "Source5 Soak captured ProbeV1 stderr",
-        owner.MAX_PROBE_STDERR_BYTES,
+        stderr_limit,
     )
     require(direct["status"] == direct["child_return_code"] == 0 and
             direct["supervision"]["cleanup_status"] == "verified" and
@@ -1833,8 +3352,9 @@ def _capture_source5_soak_probe(
             "Source5 ProbeV1 owner returned while its original PID/start remained live")
     require(len(canonical_bytes(direct)) <= budgets["runtime_receipt_bytes"],
             "Source5 ProbeV1 process-owner result exceeded its frozen receipt budget")
-    process_pin = _write_exclusive_json(owner_path_out, direct,
-                                        "Source5 ProbeV1 process-owner result")
+    if process_pin is None:
+        process_pin = _write_exclusive_json(owner_path_out, direct,
+                                            "Source5 ProbeV1 process-owner result")
     tmpdir_record = {
         "initial": tmpdir_initial, "final": tmpdir_final,
         "output_mount": owner._mount_identity(capture_root),
@@ -1862,8 +3382,13 @@ def _capture_source5_soak_probe(
             "output_bytes": output_byte_bound,
             "output_inodes": output_inode_bound,
             "deadline_seconds": int(owner.PROBE_TIMEOUT_SECONDS),
-            "owner_receipt_bytes": budgets["runtime_receipt_bytes"],
-            "capture_receipt_bytes": budgets["runtime_receipt_bytes"],
+            "owner_receipt_bytes": process_receipt_limit,
+            "capture_receipt_bytes": min(
+                budgets["runtime_receipt_bytes"],
+                (resource_budget["artifact_limits"]["probe_capture_receipt_bytes"]
+                 if resource_budget is not None else
+                 budgets["runtime_receipt_bytes"]),
+            ),
         },
         "process_absence": {
             "pid": direct["start"]["pid"],
@@ -1873,33 +3398,237 @@ def _capture_source5_soak_probe(
         },
     }
     capture["capture_sha256"] = sha256(canonical_bytes(capture))
-    require(len(canonical_bytes(capture)) <= budgets["runtime_receipt_bytes"],
+    capture_receipt_limit = min(
+        budgets["runtime_receipt_bytes"],
+        (resource_budget["artifact_limits"]["probe_capture_receipt_bytes"]
+         if resource_budget is not None else budgets["runtime_receipt_bytes"]),
+    )
+    require(len(canonical_bytes(capture)) <= capture_receipt_limit,
             "Source5 ProbeV1 capture receipt exceeded its frozen receipt budget")
     capture_pin = _write_exclusive_json(
         capture_root / "probe-capture.json", capture,
         "Source5 Soak ProbeV1 capture receipt",
     )
     capture_pin["capture_sha256"] = capture["capture_sha256"]
-    return capture, capture_pin
+    return capture, capture_pin, None
+
+
+def _capture_source5_soak_probe_monitored(
+    prepared: dict[str, Any], job: dict[str, Any], binding: dict[str, Any],
+    recipe: dict[str, Any], readback: types.ModuleType,
+    resource_budget: dict[str, Any],
+    resource_monitor: Any,
+) -> tuple[dict[str, Any], dict[str, str], dict[str, Any] | None]:
+    """Monitor SourceV5 probe setup, then the accepted owner's live interval."""
+    require(resource_monitor.sample("preflight", force=True) is False,
+            "Source5 resource monitor refused before the construction-probe owner")
+    capture: dict[str, Any] | None = None
+    capture_pin: dict[str, str] | None = None
+    probe_context: dict[str, Any] | None = None
+    owner_gate = [True]
+    owner_started = [False]
+    phase_lock = threading.Lock()
+    stop_sampler = threading.Event()
+    sampler_errors: list[BaseException] = []
+    interval_seconds = (
+        resource_budget["schedule"]["resource_monitor_interval_ms"] / 1000
+    )
+
+    def sample_probe_setup() -> None:
+        while not stop_sampler.wait(interval_seconds):
+            try:
+                with phase_lock:
+                    if owner_started[0]:
+                        return
+                    if resource_monitor.sample("preflight"):
+                        return
+            except BaseException as error:
+                sampler_errors.append(error)
+                return
+
+    sampler = threading.Thread(
+        target=sample_probe_setup,
+        name="source5-soak-probe-setup-monitor",
+        daemon=True,
+    )
+    sampler.start()
+
+    def monitor_probe_owner() -> bool:
+        with phase_lock:
+            if owner_gate[0]:
+                owner_gate[0] = False
+                owner_started[0] = True
+                return resource_monitor.sample("probe_capture", force=True)
+            return resource_monitor.sample("probe_capture")
+
+    operation_error: BaseException | None = None
+    try:
+        capture, capture_pin, probe_context = _capture_source5_soak_probe(
+            prepared, job, binding, recipe, readback,
+            resource_budget["layout"]["probe_capture_root"],
+            resource_budget=resource_budget,
+            resource_monitor=monitor_probe_owner,
+        )
+    except BaseException as error:
+        operation_error = error
+    finally:
+        stop_sampler.set()
+        sampler.join()
+        if sampler_errors:
+            resource_monitor.failure = resource_monitor.failure or (
+                f"probe_setup_monitor:{type(sampler_errors[0]).__name__}:"
+                f"{sampler_errors[0]}"
+            )[:4096]
+        final_phase = "probe_capture" if owner_started[0] else "preflight"
+        try:
+            resource_monitor.sample(final_phase, force=True)
+        except BaseException as error:
+            resource_monitor.failure = resource_monitor.failure or (
+                f"probe_capture_final_sample:{type(error).__name__}:{error}"
+            )[:4096]
+    if operation_error is not None:
+        raise operation_error
+    require(owner_started[0],
+            "Source5 probe capture returned without entering its monitored owner interval")
+    if resource_monitor.failure is not None:
+        raise Source5SoakError(
+            f"Source5 resource monitor stopped the owned ProbeV2 capture: "
+            f"{resource_monitor.failure}",
+        )
+    require(capture is not None and capture_pin is not None,
+            "Source5 ProbeV2 owner returned no capture receipt")
+    return capture, capture_pin, probe_context
+
+
+def _run_source5_preflight_monitored(
+    operation: Any, budget: dict[str, Any], resource_monitor: Any, *,
+    phase: str = "preflight_audit",
+) -> Any:
+    """Keep the held-root monitor sampling through one bounded owner phase."""
+    stop = threading.Event()
+    sampler_error: list[BaseException] = []
+    interval_seconds = budget["schedule"]["resource_monitor_interval_ms"] / 1000
+
+    def sample_until_operation_returns() -> None:
+        try:
+            while not stop.wait(interval_seconds):
+                if resource_monitor.sample(phase):
+                    return
+        except BaseException as error:
+            sampler_error.append(error)
+
+    thread = threading.Thread(
+        target=sample_until_operation_returns,
+        name=f"source5-soak-resource-monitor-{phase}",
+        daemon=True,
+    )
+    thread.start()
+    result: Any = None
+    operation_error: BaseException | None = None
+    try:
+        result = operation()
+    except BaseException as error:
+        operation_error = error
+    finally:
+        stop.set()
+        thread.join()
+        if sampler_error:
+            resource_monitor.failure = resource_monitor.failure or (
+                f"preflight_monitor_thread:{type(sampler_error[0]).__name__}:"
+                f"{sampler_error[0]}"
+            )[:4096]
+        try:
+            resource_monitor.sample(phase, force=True)
+        except BaseException as error:
+            resource_monitor.failure = resource_monitor.failure or (
+                f"{phase}_monitor_final_sample:{type(error).__name__}:{error}"
+            )[:4096]
+    if operation_error is not None:
+        resource_monitor.failure = resource_monitor.failure or (
+            f"{phase}:{type(operation_error).__name__}:{operation_error}"
+        )[:4096]
+    if resource_monitor.failure is not None:
+        if resource_monitor.fd is not None:
+            try:
+                resource_monitor.finish(resource_monitor.last_usage)
+            except BaseException:
+                pass
+        message = f"Source5 bounded {phase} monitor failed: {resource_monitor.failure}"
+        if operation_error is not None:
+            raise Source5SoakError(f"{message}; preflight also failed: {operation_error}") from operation_error
+        raise Source5SoakError(message)
+    if operation_error is not None:
+        raise operation_error
+    return result
+
+
+def finish_source5_soak_monitor_failure(
+    preflight_value: object, error: BaseException,
+) -> dict[str, Any] | None:
+    """Close and retain the live monitor when the locked caller catches failure."""
+    require(type(preflight_value) is dict and
+            preflight_value.get("schema") ==
+                "allocatbelt.application-source5-soak-preflight.v2",
+            "Source5 failure monitor finalization requires bounded preflight context")
+    monitor = preflight_value.get("resource_monitor")
+    require(monitor is not None and
+            callable(getattr(monitor, "sample", None)) and
+            callable(getattr(monitor, "finish", None)),
+            "Source5 failure monitor owner is unavailable")
+    if monitor.fd is None:
+        return monitor.final_summary
+    monitor.failure = monitor.failure or (
+        f"authorized_soak_failure:{type(error).__name__}:{error}"
+    )[:4096]
+    try:
+        monitor.sample("postflight", force=True)
+    except BaseException as sample_error:
+        monitor.failure = monitor.failure or (
+            f"failure_monitor_final_sample:{type(sample_error).__name__}:"
+            f"{sample_error}"
+        )[:4096]
+    try:
+        return monitor.finish(monitor.last_usage)
+    except BaseException:
+        return None
 
 
 def run_source5_soak(
     preflight_value: dict[str, Any], on_started, on_cleanup,
 ) -> dict[str, Any]:
     """Launch the one original APP through the captured V2 callback API."""
-    preflight = exact(preflight_value, {
+    require(type(preflight_value) is dict,
+            "Source5 Soak preflight context must be an object")
+    preflight_keys = {
         "schema", "materials_index", "materials_index_pin", "helper_input",
         "parent_recipe",
         "parent_recipe_pin", "build_receipt_pin", "identities", "audit",
         "preflight", "preflight_pin", "launch_overlay", "launch_overlay_pin",
         "base_audit", "base_audit_sha256", "args", "output_dir",
         "readback_module", "prepared", "details",
-    }, "Source5 Soak preflight context")
-    require(preflight["schema"] ==
-            "allocatbelt.application-source5-soak-preflight.v1" and
+    }
+    if preflight_value.get("schema") == \
+            "allocatbelt.application-source5-soak-preflight.v2":
+        preflight_keys |= {
+            "resource_budget", "resource_budget_pin", "probe_capture",
+            "probe_capture_pin", "probe_capture_context",
+            "initial_resource_usage", "resource_monitor",
+        }
+    preflight = exact(preflight_value, preflight_keys,
+                      "Source5 Soak preflight context")
+    require(preflight["schema"] in {
+                "allocatbelt.application-source5-soak-preflight.v1",
+                "allocatbelt.application-source5-soak-preflight.v2",
+            } and
             callable(on_started) and callable(on_cleanup),
             "Source5 Soak launch lacks its preflight or lifecycle callbacks")
     readback = preflight["readback_module"]
+    resource_monitor = (
+        preflight["resource_monitor"]
+        if preflight["schema"] ==
+        "allocatbelt.application-source5-soak-preflight.v2" else None
+    )
+    resource_monitor_summary = None
     output_dir = Path(preflight["output_dir"])
     args = preflight["args"]
     started: list[dict[str, Any]] = []
@@ -1977,10 +3706,19 @@ def run_source5_soak(
         terminal_events.append(event)
         on_cleanup(event)
 
-    receipt = readback.launch_soak_v2_application(
-        args, preflight["audit"], preflight["preflight"], output_dir,
-        started_callback, cleanup_callback,
-    )
+    if preflight["schema"] == \
+            "allocatbelt.application-source5-soak-preflight.v2":
+        receipt = readback.launch_soak_v2_application(
+            args, preflight["audit"], preflight["preflight"], output_dir,
+            started_callback, cleanup_callback,
+            resource_budget_pin=preflight["resource_budget_pin"],
+            resource_monitor_context=preflight["resource_monitor"],
+        )
+    else:
+        receipt = readback.launch_soak_v2_application(
+            args, preflight["audit"], preflight["preflight"], output_dir,
+            started_callback, cleanup_callback,
+        )
     receipt_keys = {
         "schema", "execution_kind", "status", "interrupted", "received_signal",
         "application_cleanup", "application_binding", "application_binding_sha256",
@@ -1997,6 +3735,12 @@ def run_source5_soak(
             terminal_events[0]["child_return_code"] ==
                 cleanups[0]["return_code"],
             "captured Soak supervisor receipt differs from its direct APP callbacks")
+    if preflight["schema"] == \
+            "allocatbelt.application-source5-soak-preflight.v2":
+        require(len(canonical_bytes(receipt)) <=
+                preflight["resource_budget"]["artifact_limits"][
+                    "source5_supervisor_bytes"],
+                "Source5 Soak supervisor receipt exceeds its frozen artifact limit")
     supervisor_pin = _write_exclusive_json(
         output_dir / "source5-soak-supervisor.json", receipt,
         "Source5 Soak supervisor receipt",
@@ -2024,60 +3768,175 @@ def run_source5_soak(
         "supervisor": supervisor_pin,
         "launch": None, "postflight": None, "readback": None,
     }
+    if preflight["schema"] == \
+            "allocatbelt.application-source5-soak-preflight.v2":
+        pins["resource_budget"] = preflight["resource_budget_pin"]
+        pins["probe_capture"] = preflight["probe_capture_pin"]
+        for role, filename in (
+            ("application_owner", "source5-soak-application-owner-return.json"),
+            ("pressure_owner", "source5-soak-pressure-owner-return.json"),
+        ):
+            owner_path = output_dir / filename
+            if owner_path.exists() and not owner_path.is_symlink():
+                _owner_raw, owner_sha, _owner_info = read_stable(
+                    owner_path, f"Source5 {role} return receipt", MAX_RECEIPT_BYTES,
+                )
+                pins[role] = {"path": str(owner_path),
+                              "raw_sha256": owner_sha}
+            else:
+                pins[role] = None
     launch_path = output_dir / "soak-launch.json"
     if launch_path.exists() and not launch_path.is_symlink():
         _raw, launch_sha, _info = read_stable(
             launch_path, "Source5 Soak launch receipt", MAX_RECEIPT_BYTES,
         )
         pins["launch"] = {"path": str(launch_path), "raw_sha256": launch_sha}
+        if preflight["schema"] == \
+                "allocatbelt.application-source5-soak-preflight.v2":
+            launch_value, _launch_raw, _launch_sha = read_json(
+                launch_path, launch_sha, "Source5 bounded Soak launch receipt",
+                MAX_RECEIPT_BYTES,
+            )
+            require(launch_value.get("schema") ==
+                        "allocatbelt.application-soak-launch.v3" and
+                    launch_value.get("resource_budget") ==
+                        preflight["resource_budget_pin"] and
+                    launch_value.get("resource_monitor_prefix", {}).get("budget") ==
+                        preflight["resource_budget_pin"],
+                    "Source5 bounded launch receipt does not bind its live monitor prefix")
 
     validated = False
     passed = False
     readback_value: dict[str, Any] | None = None
+
+    def finish_postflight_monitor() -> dict[str, Any] | None:
+        if resource_monitor is None:
+            return None
+        if resource_monitor.fd is not None:
+            resource_monitor.sample("postflight", force=True)
+            summary = resource_monitor.finish(resource_monitor.last_usage)
+        else:
+            summary = resource_monitor.final_summary
+        require(type(summary) is dict and summary.get("failure") is None,
+                "Source5 Soak resource monitor failed during owner or postflight checks")
+        return summary
+
     if receipt["status"] == 0 and receipt["interrupted"] is False and \
             receipt["application_cleanup"]["status"] == "verified" and \
             receipt["pressure_cleanup"] == "verified" and pins["launch"] is not None:
-        audit_after, preflight_after = readback._current_audit(args)
+        probe_context = preflight.get("probe_capture_context")
+        audit_after, preflight_after = (
+            _run_source5_preflight_monitored(
+                lambda: (readback._current_audit(args)
+                         if probe_context is None else
+                         readback._current_audit(
+                             args, source5_probe_capture=probe_context,
+                         )),
+                preflight["resource_budget"], resource_monitor,
+                phase="postflight",
+            ) if resource_monitor is not None else
+            (readback._current_audit(args) if probe_context is None else
+             readback._current_audit(
+                 args, source5_probe_capture=probe_context,
+             ))
+        )
         require(_base_readback_audit_sha256(audit_after) ==
                 preflight["base_audit_sha256"],
                 "captured legacy SourceV5 audit changed after the one-use Soak launch")
-        overlay_after, overlay_audit_after, overlay_preflight_after = \
-            build_source5_launch_overlay(
-                preflight["helper_input"], preflight["prepared"],
-                preflight["details"], preflight["materials_index"],
-                _selected_prepared_host_binding(
-                    preflight["prepared"]["source5_prepared_input_completion"],
-                    preflight["prepared"]["host_id"],
-                ),
-                preflight["parent_recipe"], preflight["identities"], args,
-                audit_after, preflight_after, readback,
-            )
+        overlay_operation = lambda: build_source5_launch_overlay(
+            preflight["helper_input"], preflight["prepared"],
+            preflight["details"], preflight["materials_index"],
+            _selected_prepared_host_binding(
+                preflight["prepared"]["source5_prepared_input_completion"],
+                preflight["prepared"]["host_id"],
+            ),
+            preflight["parent_recipe"], preflight["identities"], args,
+            audit_after, preflight_after, readback,
+            source5_probe_capture=probe_context,
+        )
+        overlay_after, overlay_audit_after, overlay_preflight_after = (
+            _run_source5_preflight_monitored(
+                overlay_operation, preflight["resource_budget"],
+                resource_monitor, phase="postflight",
+            ) if resource_monitor is not None else overlay_operation()
+        )
         require(overlay_after == preflight["launch_overlay"] and
                 _base_readback_audit_sha256(preflight["base_audit"]) ==
                     preflight["base_audit_sha256"],
                 "Source5 Soak launch authorization overlay changed after APP cleanup")
-        launch_receipt, launch_sha = readback._verify_launch_receipt(
-            readback._check_private_output_directory(output_dir),
-            overlay_audit_after, overlay_preflight_after,
-            require_success=True,
+        launch_receipt, launch_sha = (
+            _run_source5_preflight_monitored(
+                lambda: readback._verify_launch_receipt(
+                    readback._check_private_output_directory(output_dir),
+                    overlay_audit_after, overlay_preflight_after,
+                    require_success=True,
+                ),
+                preflight["resource_budget"], resource_monitor,
+                phase="postflight",
+            ) if resource_monitor is not None else
+            readback._verify_launch_receipt(
+                readback._check_private_output_directory(output_dir),
+                overlay_audit_after, overlay_preflight_after,
+                require_success=True,
+            )
         )
         overlay_audit_after["launch_receipt"] = launch_receipt
-        readback_value = readback._validate_artifacts(
-            readback._check_private_output_directory(output_dir),
-            overlay_audit_after,
+        legacy_postflight_writer = lambda: readback._write_verify_inputs_postflight(
+            overlay_audit_after, overlay_preflight_after,
+            readback._check_private_output_directory(output_dir), launch_sha,
+        )
+        _legacy_postflight_sha, _legacy_postflight_value = (
+            _run_source5_preflight_monitored(
+                legacy_postflight_writer, preflight["resource_budget"],
+                resource_monitor, phase="postflight",
+            ) if resource_monitor is not None else legacy_postflight_writer()
+        )
+        if resource_monitor is not None:
+            _check_budget_file(
+                output_dir / "soak-postflight.json",
+                preflight["resource_budget"]["artifact_limits"][
+                    "postflight_receipt_bytes"],
+                "Source5 legacy Soak input-stability receipt",
+            )
+        readback._verify_verify_inputs_postflight(
+            overlay_audit_after, overlay_preflight_after, output_dir,
+            launch_sha,
+        )
+        readback_value = (
+            _run_source5_preflight_monitored(
+                lambda: readback._validate_artifacts(
+                    readback._check_private_output_directory(output_dir),
+                    overlay_audit_after,
+                ),
+                preflight["resource_budget"], resource_monitor,
+                phase="postflight",
+            ) if resource_monitor is not None else
+            readback._validate_artifacts(
+                readback._check_private_output_directory(output_dir),
+                overlay_audit_after,
+            )
         )
         require(readback_value.get("schema") == READBACK_SCHEMA and
                 readback_value.get("validated") is True and
                 readback_value.get("passed") is True and
-                readback_value.get("qualification_eligible") is True,
+                readback_value.get("qualification_eligible") is
+                    (preflight["parent_recipe"]["runtime"]["mode"] == "qualified"),
                 "captured Soak V2 failed its original full-horizon numeric/RSS gates")
+        if preflight["schema"] == \
+                "allocatbelt.application-source5-soak-preflight.v2":
+            require(len(canonical_bytes(readback_value)) <=
+                    preflight["resource_budget"]["artifact_limits"][
+                        "readback_receipt_bytes"],
+                    "Source5 Soak readback result exceeds its frozen artifact limit")
         readback_path = output_dir / "soak-readback.json"
         readback_pin = _write_exclusive_json(
             readback_path, readback_value, "Source5 Soak V2 readback result",
         )
         pins["readback"] = readback_pin
+        resource_monitor_summary = finish_postflight_monitor()
         postflight_body = {
-            "schema": POSTFLIGHT_SCHEMA,
+            "schema": (POSTFLIGHT_SCHEMA if resource_monitor is None else
+                       POSTFLIGHT_SCHEMA_V2),
             "campaign_id": preflight["parent_recipe"]["identity"]["campaign_id"],
             "host_id": preflight["parent_recipe"]["identity"]["host_id"],
             "run_id": preflight["parent_recipe"]["identity"]["run_id"],
@@ -2091,7 +3950,15 @@ def run_source5_soak(
             "inputs_unchanged": True,
             "campaign_qualification_eligible": False,
         }
+        if resource_monitor is not None:
+            postflight_body["resource_budget"] = preflight["resource_budget_pin"]
+            postflight_body["resource_monitor"] = resource_monitor_summary
         postflight_body["postflight_sha256"] = sha256(canonical_bytes(postflight_body))
+        if resource_monitor is not None:
+            require(len(canonical_bytes(postflight_body)) <=
+                    preflight["resource_budget"]["artifact_limits"][
+                        "postflight_receipt_bytes"],
+                    "Source5 Soak postflight exceeds its frozen artifact limit")
         pins["postflight"] = _write_exclusive_json(
             output_dir / "source5-soak-postflight.json", postflight_body,
             "Source5 Soak-only postflight receipt",
@@ -2099,8 +3966,12 @@ def run_source5_soak(
         validated = True
         passed = readback_value["passed"]
 
+    if resource_monitor is not None and resource_monitor_summary is None:
+        resource_monitor_summary = finish_postflight_monitor()
+
     component = {
-        "schema": COMPONENT_SCHEMA,
+        "schema": (COMPONENT_SCHEMA if resource_monitor is None else
+                   COMPONENT_SCHEMA_V2),
         "campaign_id": preflight["parent_recipe"]["identity"]["campaign_id"],
         "host_id": preflight["parent_recipe"]["identity"]["host_id"],
         "run_id": preflight["parent_recipe"]["identity"]["run_id"],
@@ -2118,6 +3989,11 @@ def run_source5_soak(
         "readback": readback_value,
         "supervisor_sha256": supervisor_pin["raw_sha256"],
     }
+    if resource_monitor is not None:
+        component["resource_budget"] = preflight["resource_budget_pin"]
+        component["probe_capture"] = preflight["probe_capture_pin"]
+        component["resource_monitor"] = resource_monitor_summary
+        pins["resource_monitor"] = resource_monitor_summary["stream"]
     return component
 
 
@@ -2128,13 +4004,19 @@ def _verify_source5_soak_component_replay(
     offline_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Replay the raw false legacy audit, Soak-only authorization and full V2 gate."""
-    exact(component, {
+    require(type(component) is dict,
+            "Source5 Soak component must be an object")
+    bounded = component.get("schema") == COMPONENT_SCHEMA_V2
+    component_fields = {
         "schema", "campaign_id", "host_id", "run_id", "validated", "passed",
         "qualification_eligible", "launch_enabled", "prepared_host_binding_sha256",
         "pins", "application_attestation", "application_cleanup", "pressure_cleanup",
         "terminal_event", "readback", "supervisor_sha256",
-    }, "Source5 Soak component")
-    require(component["schema"] == COMPONENT_SCHEMA and
+    }
+    if bounded:
+        component_fields |= {"resource_budget", "probe_capture", "resource_monitor"}
+    exact(component, component_fields, "Source5 Soak component")
+    require(component["schema"] in {COMPONENT_SCHEMA, COMPONENT_SCHEMA_V2} and
             component["campaign_id"] == prepared["campaign_id"] and
             component["host_id"] == prepared["host_id"] and
             component["run_id"] == job["run_id"] and
@@ -2142,10 +4024,16 @@ def _verify_source5_soak_component_replay(
             component["qualification_eligible"] is False and
             component["launch_enabled"] is True,
             "Source5 Soak component identity/status/outer eligibility differs")
-    pins = exact(component["pins"], {
+    pin_fields = {
         "materials_index", "parent_recipe", "build_receipt", "preflight",
         "launch_authorization", "supervisor", "launch", "postflight", "readback",
-    }, "Source5 Soak component pins")
+    }
+    if bounded:
+        pin_fields |= {
+            "resource_budget", "probe_capture", "resource_monitor",
+            "application_owner", "pressure_owner",
+        }
+    pins = exact(component["pins"], pin_fields, "Source5 Soak component pins")
     materials_pin = raw_pin(pins["materials_index"], "Source5 Soak materials index")
     material_index, _index_raw, _index_sha = read_json(
         Path(materials_pin["path"]), materials_pin["raw_sha256"],
@@ -2154,6 +4042,73 @@ def _verify_source5_soak_component_replay(
     binding = _selected_prepared_host_binding(
         prepared["source5_prepared_input_completion"], prepared["host_id"],
     )
+    probe_capture_context = None
+    budget_document = None
+    monitor_replay = None
+    probe_owner_interval = None
+    if bounded:
+        budget_document, budget_pin = _read_resource_budget_pin(
+            component["resource_budget"],
+        )
+        require(material_index["schema"] == MATERIALS_INDEX_SCHEMA_V2 and
+                budget_pin == component["resource_budget"] ==
+                    pins["resource_budget"] and
+                component["probe_capture"] == pins["probe_capture"] and
+                resource_budget_pin(component["resource_monitor"]["budget"]) ==
+                    budget_pin and
+                pins["resource_monitor"] ==
+                    component["resource_monitor"]["stream"] and
+                type(pins["application_owner"]) is dict and
+                type(pins["pressure_owner"]) is dict,
+                "Source5 bounded component budget/probe/monitor pins differ")
+        launch_pin_preview = raw_pin(
+            pins["launch"], "Source5 bounded launch receipt prefix source",
+        )
+        launch_preview, _launch_preview_raw, _launch_preview_sha = read_json(
+            Path(launch_pin_preview["path"]), launch_pin_preview["raw_sha256"],
+            "Source5 bounded launch receipt prefix source",
+            budget_document["artifact_limits"]["launch_receipt_bytes"],
+        )
+        require(launch_preview.get("schema") == LAUNCH_SCHEMA_V3,
+                "Source5 bounded component launch receipt lacks the v3 live-prefix binding")
+        monitor_replay = _verify_source5_resource_monitor_stream(
+            budget_document, budget_pin, component["resource_monitor"],
+            launch_preview.get("resource_monitor_prefix"),
+        )
+        recipe_for_probe, _receipt_for_probe, _identities_for_probe = \
+            _verify_build_receipt(
+                material_index, prepared, job, binding, readback,
+            )
+        if recipe_for_probe["feedback_expectation"]["policy"].get(
+                "capacity_floor_policy_id") is not None:
+            if offline_context is None:
+                probe_capture_context, _probe_pin = _source5_probe_v2_audit_context(
+                    prepared, recipe_for_probe, component["probe_capture"],
+                )
+            else:
+                probe_capture_context = exact(
+                    offline_context.get("construction_probe_capture"), {
+                        "schema", "capture_pin", "capture", "probe", "probe_raw",
+                        "probe_raw_sha256", "capacity_bundle",
+                        "capacity_floor_policy_id", "normal_binary_sha256", "request",
+                    }, "Source5 offline selected ProbeV2 replay context",
+                )
+        else:
+            probe_pin = component["probe_capture"]
+            probe_capture, _probe_raw, _probe_sha = read_json(
+                Path(probe_pin["path"]), probe_pin["raw_sha256"],
+                "Source5 bounded original ProbeV1 receipt",
+                budget_document["artifact_limits"]["probe_capture_receipt_bytes"],
+            )
+            probe_capture_context = {
+                "capture": probe_capture, "capture_pin": probe_pin,
+            }
+        _verify_source5_probe_resource_budget(
+            budget_document, prepared, probe_capture_context,
+        )
+        probe_owner_interval = _source5_probe_owner_interval(
+            prepared, probe_capture_context, budget_document,
+        )
     _, recipe, identities = _verify_build_receipt(
         material_index, prepared, job, binding, readback,
     )
@@ -2165,7 +4120,13 @@ def _verify_source5_soak_component_replay(
     output_dir = Path(pins["supervisor"]["path"]).parent.resolve(strict=True)
     args = _readback_args(recipe, pins["parent_recipe"], output_dir)
     if offline_context is None:
-        base_audit, base_preflight = readback._current_audit(args)
+        base_audit, base_preflight = (
+            readback._current_audit(args)
+            if probe_capture_context is None else
+            readback._current_audit(
+                args, source5_probe_capture=probe_capture_context,
+            )
+        )
     else:
         base_audit, base_preflight = readback._current_audit_offline(
             args, offline_context,
@@ -2191,6 +4152,7 @@ def _verify_source5_soak_component_replay(
         recipe, identities, args, base_audit, base_preflight, readback,
         path_value=(None if offline_context is None else
                     offline_context["application_environment"]["PATH"]),
+        source5_probe_capture=probe_capture_context,
     )
     if offline_context is not None:
         actual_environment = offline_context["application_environment"]
@@ -2220,6 +4182,21 @@ def _verify_source5_soak_component_replay(
         readback._check_private_output_directory(output_dir),
         overlay_audit, overlay_preflight, require_success=True,
     )
+    if bounded:
+        require(launch_receipt["resource_budget"] == budget_pin and
+                launch_receipt.get("schema") == LAUNCH_SCHEMA_V3 and
+                launch_receipt["resource_monitor_prefix"]["budget"] ==
+                    budget_pin and
+                details["resource_budget_exceeded"] is
+                    launch_receipt["resource_budget_exceeded"] and
+                (details["resource_monitor_error"] is None or
+                 type(details["resource_monitor_error"]) is str) and
+                launch_receipt["resource_monitor_prefix"]["path"] ==
+                    pins["resource_monitor"]["path"],
+                "Source5 bounded launch receipt differs from the component monitor prefix")
+    readback._verify_verify_inputs_postflight(
+        overlay_audit, overlay_preflight, output_dir, launch_sha,
+    )
     require(pins["launch"] == {
         "path": str(output_dir / "soak-launch.json"), "raw_sha256": launch_sha,
     }, "Source5 Soak launch receipt differs from its raw pin")
@@ -2228,11 +4205,22 @@ def _verify_source5_soak_component_replay(
         Path(postflight_pin["path"]), postflight_pin["raw_sha256"],
         "Source5 Soak-only postflight", MAX_RECEIPT_BYTES,
     )
+    postflight_fields = {
+        "schema", "campaign_id", "host_id", "run_id",
+        "base_legacy_audit_sha256_before", "base_legacy_audit_sha256_after",
+        "launch_authorization", "baseline_preflight", "launch_receipt_sha256",
+        "readback", "inputs_unchanged", "campaign_qualification_eligible",
+        "postflight_sha256",
+    }
+    if bounded:
+        postflight_fields |= {"resource_budget", "resource_monitor"}
+    exact(postflight, postflight_fields, "Source5 Soak postflight receipt")
     postflight_body = {key: value for key, value in postflight.items()
                        if key != "postflight_sha256"}
     require(postflight_pin["path"] ==
                 str(output_dir / "source5-soak-postflight.json") and
-            postflight["schema"] == POSTFLIGHT_SCHEMA and
+            postflight["schema"] == (POSTFLIGHT_SCHEMA_V2 if bounded else
+                                     POSTFLIGHT_SCHEMA) and
             postflight_raw == canonical_bytes(postflight) and
             postflight["postflight_sha256"] == sha256(canonical_bytes(postflight_body)) and
             postflight["base_legacy_audit_sha256_before"] ==
@@ -2245,6 +4233,10 @@ def _verify_source5_soak_component_replay(
             postflight["inputs_unchanged"] is True and
             postflight["campaign_qualification_eligible"] is False,
             "Source5 Soak postflight does not bind unchanged inputs and the overlay launch")
+    if bounded:
+        require(postflight["resource_budget"] == budget_pin and
+                postflight["resource_monitor"] == component["resource_monitor"],
+                "Source5 bounded postflight changed its budget/monitor evidence")
     overlay_audit["launch_receipt"] = launch_receipt
     if offline_context is None:
         fresh = readback._validate_artifacts(
@@ -2266,7 +4258,8 @@ def _verify_source5_soak_component_replay(
             } and fresh == readback_value == component["readback"] and
             readback_value.get("validated") is True and
             readback_value.get("passed") is True and
-            readback_value.get("qualification_eligible") is True,
+            readback_value.get("qualification_eligible") is
+                (recipe["runtime"]["mode"] == "qualified"),
             "Source5 Soak raw component eligibility/readback differs from fresh V2 validation")
 
     supervisor, _supervisor_raw, supervisor_sha = read_json(
@@ -2282,14 +4275,67 @@ def _verify_source5_soak_component_replay(
         "application_attestation", "pressure_ready_sha256", "pressure_proof",
         "pressure_cleanup", "pressure_driver", "pressure_worker_sessions", "details",
     }, "Source5 Soak supervisor receipt")
-    details = exact(supervisor["details"], {
+    details_fields = {
         "status", "child_return_code", "timed_out", "artifact_budget_exceeded",
         "received_signal", "started_monotonic_ns", "ended_monotonic_ns",
         "binary_path", "binary_sha256", "binary_device", "binary_inode",
         "binary_size", "requested_argv", "requested_argv_sha256",
         "executed_argv", "executed_file_descriptor", "environment",
         "environment_sha256", "cwd", "cpu_set",
-    }, "Source5 Soak supervisor terminal details")
+    }
+    if bounded:
+        details_fields |= {"resource_budget_exceeded", "resource_monitor_error"}
+    details = exact(supervisor["details"], details_fields,
+                    "Source5 Soak supervisor terminal details")
+    if bounded:
+        app_owner_pin = raw_pin(pins["application_owner"],
+                                "Source5 bounded APP owner result")
+        pressure_owner_pin = raw_pin(pins["pressure_owner"],
+                                     "Source5 bounded pressure owner result")
+        require(app_owner_pin["path"] ==
+                    str(output_dir / "source5-soak-application-owner-return.json") and
+                pressure_owner_pin["path"] ==
+                    str(output_dir / "source5-soak-pressure-owner-return.json"),
+                "Source5 bounded owner-result paths differ from their declared output roles")
+        app_owner, _app_owner_raw, _app_owner_sha = read_json(
+            Path(app_owner_pin["path"]), app_owner_pin["raw_sha256"],
+            "Source5 bounded original APP owner result",
+            budget_document["artifact_limits"]["owner_return_receipt_bytes"],
+        )
+        pressure_owner, _pressure_owner_raw, _pressure_owner_sha = read_json(
+            Path(pressure_owner_pin["path"]), pressure_owner_pin["raw_sha256"],
+            "Source5 bounded original pressure owner result",
+            budget_document["artifact_limits"]["owner_return_receipt_bytes"],
+        )
+        expected_pressure_owner = exact(pressure_owner, {
+            "schema", "pid", "start_ticks", "return_code",
+            "started_monotonic_ns", "returned_monotonic_ns",
+        }, "Source5 bounded original pressure owner result")
+        expected_pressure_driver = exact(supervisor["pressure_driver"], {
+            "pid", "start_ticks", "return_code",
+        }, "Source5 bounded pressure supervisor result")
+        require(app_owner == details and
+                details["resource_budget_exceeded"] is False and
+                details["resource_monitor_error"] is None and
+                expected_pressure_owner["schema"] ==
+                    "allocatbelt.application-source5-soak-pressure-owner-return.v2" and
+                expected_pressure_owner["pid"] == expected_pressure_driver["pid"] and
+                expected_pressure_owner["start_ticks"] ==
+                    expected_pressure_driver["start_ticks"] and
+                expected_pressure_owner["return_code"] ==
+                    expected_pressure_driver["return_code"] and
+                supervisor["pressure_cleanup"] == "verified" and
+                type(expected_pressure_owner["started_monotonic_ns"]) is int and
+                type(expected_pressure_owner["returned_monotonic_ns"]) is int and
+                0 < expected_pressure_owner["started_monotonic_ns"] <=
+                    expected_pressure_owner["returned_monotonic_ns"],
+                "Source5 bounded owner sidecars differ from the actual APP/pressure supervisor results")
+        require(probe_owner_interval is not None and monitor_replay is not None,
+                "Source5 bounded resource replay lacks owner-interval evidence")
+        _verify_source5_owner_phase_intervals(
+            monitor_replay, budget_document, probe_owner_interval, details,
+            expected_pressure_owner, supervisor,
+        )
     binding_receipt = exact(supervisor["application_binding"], {
         "schema", "recipe_sha256", "nonce", "process", "launch_binding_sha256",
     }, "Source5 direct APP pressure binding")
@@ -2905,14 +4951,13 @@ def _declared_soak_output_inventory(
         "path": str(pressure_dir), "kind": "directory",
         "mode": f"{stat.S_IMODE(pressure_info.st_mode):04o}",
     }
-    expected_direct = {
-        "soak-preflight.json", "soak-postflight.json", "soak-launch.json",
-        "soak-readback.json", "source5-soak-launch-authorization.json",
-        "source5-soak-postflight.json", "source5-soak-supervisor.json",
-        "soak-receipt.json", "pressure-readback.json", "stdout.log",
-        "stderr.log", "time.txt",
-        "pressure-driver.stdout.log", "pressure-driver.stderr.log", "pressure",
-    }
+    expected_direct = set(SOAK_BOUNDED_OUTPUT_FILES) | {"pressure"}
+    if component.get("schema") != COMPONENT_SCHEMA_V2:
+        expected_direct.difference_update({
+            "source5-soak-resource-monitor.jsonl",
+            "source5-soak-application-owner-return.json",
+            "source5-soak-pressure-owner-return.json",
+        })
     try:
         direct_children = sorted(os.scandir(output_root), key=lambda item: item.name)
     except OSError as error:
@@ -2932,13 +4977,15 @@ def _declared_soak_output_inventory(
         runtime_receipt["resource_samples_relative_path"]:
             runtime_receipt["resource_samples_sha256"],
     }
+    require(set(stream_pins) == {"terminal-records.tsv", "resource-samples.tsv"},
+            "Source5 Soak runtime stream pins differ from the exact declared stream files")
     pressure_filenames = {
         "run.json": "run", "events.jsonl": "events",
         "launch-record.json": "launch",
         "process-binding.json": "process_binding",
         "pressure-ready.json": "ready",
     }
-    expected_pressure = set(pressure_filenames)
+    expected_pressure = set(SOAK_PRESSURE_OUTPUT_FILES)
     try:
         pressure_children = sorted(os.scandir(pressure_dir), key=lambda item: item.name)
     except OSError as error:
@@ -2949,6 +4996,21 @@ def _declared_soak_output_inventory(
     paths: dict[str, str | None] = {}
     for name in expected_direct - {"pressure"}:
         paths[str(output_root / name)] = None
+    component_bytes = canonical_bytes(component)
+    paths[str(output_root / "source5-soak-component.json")] = \
+        sha256(component_bytes)
+    if component.get("schema") == COMPONENT_SCHEMA_V2:
+        for role in ("application_owner", "pressure_owner", "resource_monitor"):
+            pin = component["pins"].get(role)
+            require(type(pin) is dict and pin.get("path") ==
+                    str(output_root / {
+                        "application_owner": "source5-soak-application-owner-return.json",
+                        "pressure_owner": "source5-soak-pressure-owner-return.json",
+                        "resource_monitor": "source5-soak-resource-monitor.jsonl",
+                    }[role]),
+                    f"Source5 bounded {role} output lacks its exact raw pin")
+            raw_pin_value = raw_pin(pin, f"Source5 bounded {role} output")
+            paths[raw_pin_value["path"]] = raw_pin_value["raw_sha256"]
     for relative, expected_sha in stream_pins.items():
         relative_path = Path(relative)
         require(not relative_path.is_absolute() and ".." not in relative_path.parts and
@@ -2965,7 +5027,8 @@ def _declared_soak_output_inventory(
             continue
         path = output_root / child.name
         info = child.stat(follow_symlinks=False)
-        require(stat.S_ISREG(info.st_mode) and not stat.S_ISLNK(info.st_mode),
+        require(stat.S_ISREG(info.st_mode) and not stat.S_ISLNK(info.st_mode) and
+                info.st_nlink == 1 and info.st_uid == os.getuid(),
                 f"Source5 Soak output is not a regular file: {path}")
         expected_sha = paths.get(str(path))
         record = _stable_file_inventory(
@@ -2980,6 +5043,10 @@ def _declared_soak_output_inventory(
     pressure_hashes = readback._pressure_output_hashes(pressure_dir)
     for name, key in sorted(pressure_filenames.items()):
         path = pressure_dir / name
+        info = path.lstat()
+        require(stat.S_ISREG(info.st_mode) and info.st_nlink == 1 and
+                info.st_uid == os.getuid(),
+                f"Source5 pressure artifact is linked or unowned: {name}")
         entries[str(path)] = _stable_file_inventory(
             path, f"Source5 pressure artifact {name}",
             32 * 1024 * 1024 * 1024,
@@ -2997,10 +5064,16 @@ def _declared_probe_capture_inventory(
     info = probe_root.lstat()
     require(stat.S_ISDIR(info.st_mode) and not stat.S_ISLNK(info.st_mode),
             "Source5 ProbeV1 output root is not a real directory")
-    expected_names = {
-        "probe.stdout", "probe.stderr", "process-owner.json",
-        "probe-capture.json", "tmp",
-    }
+    if probe_capture.get("schema") == PROBE_CAPTURE_SCHEMA_V2:
+        expected_names = {
+            "stdout.bin", "stderr.bin", "owner-result.json",
+            "tmpdir-inventory.json", "capture-receipt.json", "tmp",
+        }
+    else:
+        expected_names = {
+            "probe.stdout", "probe.stderr", "process-owner.json",
+            "probe-capture.json", "tmp",
+        }
     children = sorted(os.scandir(probe_root), key=lambda item: item.name)
     require({item.name for item in children} == expected_names,
             "Source5 ProbeV1 output root has missing or undeclared artifacts")
@@ -3013,21 +5086,384 @@ def _declared_probe_capture_inventory(
     tmpdir = probe_root / "tmp"
     for item in _tree_inventory(tmpdir, "Source5 ProbeV1 bounded TMPDIR"):
         entries[item["path"]] = item
-    expected_files = {
-        "probe.stdout": probe_capture["stdout"]["raw_sha256"],
-        "probe.stderr": probe_capture["stderr"]["raw_sha256"],
-        "process-owner.json": probe_capture["owner_result_pin"]["raw_sha256"],
-        "probe-capture.json": probe_capture_pin["raw_sha256"],
-    }
+    if probe_capture.get("schema") == PROBE_CAPTURE_SCHEMA_V2:
+        expected_files = {
+            "stdout.bin": probe_capture["stdout"]["raw_sha256"],
+            "stderr.bin": probe_capture["stderr"]["raw_sha256"],
+            "owner-result.json": probe_capture["owner_result_pin"]["raw_sha256"],
+            "tmpdir-inventory.json": probe_capture["tmpdir_inventory_pin"]["raw_sha256"],
+            "capture-receipt.json": probe_capture_pin["raw_sha256"],
+        }
+    else:
+        expected_files = {
+            "probe.stdout": probe_capture["stdout"]["raw_sha256"],
+            "probe.stderr": probe_capture["stderr"]["raw_sha256"],
+            "process-owner.json": probe_capture["owner_result_pin"]["raw_sha256"],
+            "probe-capture.json": probe_capture_pin["raw_sha256"],
+        }
     for name, expected_sha in expected_files.items():
         path = probe_root / name
+        file_info = path.lstat()
+        require(stat.S_ISREG(file_info.st_mode) and file_info.st_nlink == 1 and
+                file_info.st_uid == os.getuid(),
+                f"Source5 probe output is linked or unowned: {name}")
         record = _stable_file_inventory(
-            path, f"Source5 ProbeV1 output {name}", MAX_RECEIPT_BYTES,
+            path, f"Source5 ProbeV2 output {name}", MAX_RECEIPT_BYTES,
         )
         require(record["raw_sha256"] == expected_sha,
-                f"Source5 ProbeV1 output raw pin differs: {name}")
+                f"Source5 ProbeV2 output raw pin differs: {name}")
         entries[str(path)] = record
     return sorted(entries.values(), key=lambda item: item["path"])
+
+
+def _resource_monitor_expected_device_rows(
+    budget: dict[str, Any], domains: object,
+) -> dict[str, dict[str, int]]:
+    require(type(domains) is dict and set(domains) == {
+        "output", "application_tmpdir", "pressure_scratch",
+        "probe_capture", "probe_tmpdir",
+    }, "Source5 resource-monitor domain set differs")
+    ceilings = budget["ceilings"]
+    roots = (
+        ("output", "output_root", "maximum_output_bytes", "maximum_output_inodes"),
+        ("application_tmpdir", "application_tmpdir", "maximum_application_tmpdir_bytes", "maximum_application_tmpdir_inodes"),
+        ("pressure_scratch", "pressure_scratch", "maximum_pressure_scratch_bytes", "maximum_pressure_scratch_inodes"),
+        ("probe_capture", "probe_capture_root", "maximum_probe_output_bytes", "maximum_probe_output_inodes"),
+        ("probe_tmpdir", "probe_tmpdir", "maximum_probe_tmpdir_bytes", "maximum_probe_tmpdir_inodes"),
+    )
+    by_device: dict[int, dict[str, Any]] = {}
+    for role, path_field, byte_field, inode_field in roots:
+        item = exact(domains[role], {
+            "path", "device", "inode", "bytes_used", "inode_count",
+            "available_bytes", "available_inodes", "bytes_limit", "inode_limit",
+        }, f"Source5 resource-monitor {role} row")
+        require(item["path"] == budget["layout"][path_field] and
+                type(item["device"]) is int and item["device"] >= 0 and
+                (item["inode"] is None or
+                 type(item["inode"]) is int and item["inode"] > 0) and
+                type(item["bytes_used"]) is int and item["bytes_used"] >= 0 and
+                type(item["inode_count"]) is int and item["inode_count"] >= 0 and
+                type(item["available_bytes"]) is int and item["available_bytes"] >= 0 and
+                type(item["available_inodes"]) is int and item["available_inodes"] >= 0 and
+                item["bytes_limit"] == ceilings[byte_field] and
+                item["inode_limit"] == ceilings[inode_field] and
+                item["bytes_used"] <= item["bytes_limit"] and
+                item["inode_count"] <= item["inode_limit"],
+                f"Source5 resource-monitor {role} origin usage differs from its frozen root/budget")
+        device = by_device.setdefault(item["device"], {
+            "available_bytes": item["available_bytes"],
+            "available_inodes": item["available_inodes"],
+            "roles": [],
+        })
+        device["available_bytes"] = min(device["available_bytes"],
+                                        item["available_bytes"])
+        device["available_inodes"] = min(device["available_inodes"],
+                                         item["available_inodes"])
+        device["roles"].append(role)
+    expected: dict[str, dict[str, int]] = {}
+    for device, record in by_device.items():
+        selected = [next(root for root in roots if root[0] == role)
+                    for role in record["roles"]]
+        selected.sort(key=lambda root: (len(Path(budget["layout"][root[1]]).parts),
+                                        budget["layout"][root[1]]))
+        top: list[Path] = []
+        remaining_bytes = 0
+        remaining_inodes = 0
+        for role, path_field, byte_field, inode_field in selected:
+            path = Path(budget["layout"][path_field])
+            if any(path == parent or parent in path.parents for parent in top):
+                continue
+            top.append(path)
+            usage = domains[role]
+            remaining_bytes += max(0, ceilings[byte_field] - usage["bytes_used"])
+            remaining_inodes += max(0, ceilings[inode_field] - usage["inode_count"])
+        required_bytes = (ceilings["minimum_free_bytes"] + remaining_bytes +
+                          ceilings["durable_receipt_reserve_bytes"])
+        required_inodes = (ceilings["minimum_free_inodes"] + remaining_inodes +
+                           ceilings["durable_receipt_reserve_inodes"])
+        require(record["available_bytes"] >= required_bytes and
+                record["available_inodes"] >= required_inodes,
+                f"Source5 resource-monitor device {device} violated its recorded free-space/reserve inequality")
+        expected[str(device)] = {
+            "available_bytes": record["available_bytes"],
+            "available_inodes": record["available_inodes"],
+            "remaining_bytes": remaining_bytes,
+            "remaining_inodes": remaining_inodes,
+            "required_bytes": required_bytes,
+            "required_inodes": required_inodes,
+        }
+    return expected
+
+
+def _verify_source5_resource_monitor_stream(
+    budget: dict[str, Any], budget_pin: dict[str, str],
+    summary_value: object,
+    launch_prefix_value: object | None = None,
+) -> dict[str, Any]:
+    summary = exact(summary_value, {
+        "schema", "budget", "stream", "row_count", "high_water",
+        "final_usage", "failure", "prefix_sha256",
+    }, "Source5 Soak resource-monitor summary")
+    stream_pin = exact(summary["stream"], {"path", "raw_sha256"},
+                       "Source5 Soak resource-monitor stream pin")
+    path = Path(stream_pin["path"])
+    require(summary["schema"] ==
+                "allocatbelt.application-source5-soak-resource-monitor-summary.v1" and
+            summary["budget"] == budget_pin and
+            path == Path(budget["layout"]["output_root"]) /
+                "source5-soak-resource-monitor.jsonl" and
+            type(summary["row_count"]) is int and
+            1 <= summary["row_count"] <= budget["ceilings"]["maximum_monitor_rows"] and
+            summary["failure"] is None,
+            "Source5 Soak resource-monitor summary is incomplete or blocked")
+    digest(stream_pin["raw_sha256"],
+           "Source5 Soak resource-monitor stream raw SHA-256")
+    maximum = budget["ceilings"]["maximum_monitor_stream_bytes"]
+    try:
+        require(path.resolve(strict=True) == path,
+                "Source5 resource-monitor path traverses an alias")
+        before_path = path.lstat()
+        require(stat.S_ISREG(before_path.st_mode) and before_path.st_uid == os.getuid() and
+                stat.S_IMODE(before_path.st_mode) == 0o600 and
+                before_path.st_nlink == 1 and 0 <= before_path.st_size <= maximum,
+                "Source5 resource-monitor stream is not a bounded private regular file")
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) |
+                     getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
+    except OSError as error:
+        raise Source5SoakError(
+            f"Source5 resource-monitor stream is unavailable: {error}",
+        ) from error
+    digest_state = hashlib.sha256()
+    line = bytearray()
+    header: dict[str, Any] | None = None
+    footer: dict[str, Any] | None = None
+    previous_sha = "0" * 64
+    previous_ns: int | None = None
+    previous_phase = "preflight"
+    rows = 0
+    seen_phases: set[str] = set()
+    phase_bounds: dict[str, list[int]] = {}
+    phase_counts: dict[str, int] = {}
+    origin_root_identities: dict[str, tuple[int, int]] = {}
+    placeholder_devices: dict[str, int] = {}
+    high_water = {
+        role: {"bytes": 0, "inodes": 0}
+        for role in ("output", "application_tmpdir", "pressure_scratch",
+                     "probe_capture", "probe_tmpdir")
+    }
+    prefix_digest = hashlib.sha256()
+    row_limit = budget["ceilings"]["maximum_monitor_row_bytes"]
+    interval_ns = budget["schedule"]["resource_monitor_interval_ms"] * 1_000_000
+    gap_ns = interval_ns + budget["schedule"]["resource_monitor_tolerance_ns"]
+    launch_prefix = None
+    if launch_prefix_value is not None:
+        launch_prefix = exact(launch_prefix_value, {
+            "schema", "path", "budget", "row_count", "prefix_sha256",
+            "last_row_sha256", "high_water", "failure",
+        }, "Source5 launch monitor prefix")
+        require(launch_prefix["schema"] ==
+                    "allocatbelt.application-source5-soak-resource-monitor-prefix.v1" and
+                launch_prefix["path"] == str(path) and
+                launch_prefix["budget"] == budget_pin and
+                type(launch_prefix["row_count"]) is int and
+                launch_prefix["row_count"] > 0 and
+                type(launch_prefix["prefix_sha256"]) is str and
+                re.fullmatch(r"[0-9a-f]{64}", launch_prefix["prefix_sha256"]) is not None and
+                type(launch_prefix["last_row_sha256"]) is str and
+                re.fullmatch(r"[0-9a-f]{64}", launch_prefix["last_row_sha256"]) is not None and
+                launch_prefix["failure"] is None,
+                "Source5 launch monitor prefix is malformed or detached from its budget")
+    prefix_checked = False
+    prefix_high_water: dict[str, dict[str, int]] | None = None
+
+    def parse_line(raw_line: bytes) -> None:
+        nonlocal header, footer, previous_sha, previous_ns, previous_phase, rows
+        nonlocal prefix_checked, prefix_high_water
+        require(footer is None,
+                "Source5 resource-monitor stream contains data after its footer")
+        require(len(raw_line) <= row_limit,
+                "Source5 resource-monitor line exceeds its prospective bound")
+        try:
+            value = json.loads(raw_line)
+        except (UnicodeError, json.JSONDecodeError, RecursionError) as error:
+            raise Source5SoakError(
+                f"Source5 resource-monitor line is invalid: {error}",
+            ) from error
+        require(type(value) is dict and
+                raw_line == canonical_bytes(value),
+                "Source5 resource-monitor line is not canonical")
+        if header is None:
+            header = value
+            body = {key: item for key, item in header.items()
+                    if key != "header_sha256"}
+            require(set(header) == {
+                        "schema", "budget", "monitor_owner", "layout",
+                        "schedule", "ceilings", "started_monotonic_ns",
+                        "header_sha256",
+                    } and header["schema"] == SOAK_RESOURCE_MONITOR_SCHEMA and
+                    header["budget"] == budget_pin and
+                    header["monitor_owner"] == budget["binding"]["monitor_owner"] and
+                    header["layout"] == budget["layout"] and
+                    header["schedule"] == budget["schedule"] and
+                    header["ceilings"] == budget["ceilings"] and
+                    header["header_sha256"] == sha256(canonical_bytes(body)) and
+                    type(header["started_monotonic_ns"]) is int and
+                    header["started_monotonic_ns"] > 0,
+                    "Source5 resource-monitor header differs from its original budget")
+            prefix_digest.update(raw_line)
+            return
+        if value.get("schema") == SOAK_RESOURCE_MONITOR_FOOTER_SCHEMA:
+            footer = value
+            return
+        body = {key: item for key, item in value.items()
+                if key != "row_sha256"}
+        require(set(value) == {
+                    "schema", "sequence", "phase", "monotonic_ns",
+                    "previous_sha256", "domains", "devices", "failure",
+                    "row_sha256",
+                } and value["schema"] == SOAK_RESOURCE_MONITOR_ROW_SCHEMA and
+                value["sequence"] == rows and
+                value["previous_sha256"] == previous_sha and
+                value["row_sha256"] == sha256(canonical_bytes(body)) and
+                value["phase"] in RESOURCE_MONITOR_PHASES and
+                RESOURCE_MONITOR_PHASES.index(value["phase"]) >=
+                    RESOURCE_MONITOR_PHASES.index(previous_phase) and
+                value["failure"] is None,
+                f"Source5 resource-monitor row[{rows}] chain/order/failure differs")
+        monotonic_ns = value["monotonic_ns"]
+        require(type(monotonic_ns) is int and monotonic_ns > 0 and
+                (previous_ns is None or
+                 0 < monotonic_ns - previous_ns <= gap_ns),
+                f"Source5 resource-monitor row[{rows}] violates its prospective timing bound")
+        if rows == 0:
+            require(header is not None and
+                    header["started_monotonic_ns"] <= monotonic_ns and
+                    monotonic_ns - header["started_monotonic_ns"] <= gap_ns,
+                    "Source5 resource-monitor header is outside the first origin sample interval")
+        expected_devices = _resource_monitor_expected_device_rows(
+            budget, value["domains"],
+        )
+        require(all(item["inode"] is not None or
+                    (value["phase"] in {"preflight", "preflight_audit"} and
+                     role in {"probe_capture", "probe_tmpdir"})
+                    for role, item in value["domains"].items()),
+                "Source5 resource-monitor missing root appears outside initial preflight")
+        for role, item in value["domains"].items():
+            if item["inode"] is None:
+                require(role not in origin_root_identities,
+                        f"Source5 resource-monitor {role} root disappeared after origin binding")
+                previous_device = placeholder_devices.setdefault(role, item["device"])
+                require(item["device"] == previous_device,
+                        f"Source5 resource-monitor {role} absent-root device changed")
+            else:
+                identity = (item["device"], item["inode"])
+                previous_identity = origin_root_identities.get(role)
+                require(previous_identity is None or previous_identity == identity,
+                        f"Source5 resource-monitor {role} root device/inode changed across rows")
+                expected_device = placeholder_devices.get(role)
+                require(expected_device is None or expected_device == item["device"],
+                        f"Source5 resource-monitor {role} created root changed its held-parent device")
+                placeholder_devices.pop(role, None)
+                origin_root_identities[role] = identity
+        require(value["devices"] == expected_devices,
+                f"Source5 resource-monitor row[{rows}] device reserve arithmetic differs")
+        for role, usage in value["domains"].items():
+            high_water[role]["bytes"] = max(
+                high_water[role]["bytes"], usage["bytes_used"],
+            )
+            high_water[role]["inodes"] = max(
+                high_water[role]["inodes"], usage["inode_count"],
+            )
+        previous_sha = value["row_sha256"]
+        previous_ns = monotonic_ns
+        previous_phase = value["phase"]
+        seen_phases.add(value["phase"])
+        bounds = phase_bounds.setdefault(value["phase"], [monotonic_ns, monotonic_ns])
+        bounds[1] = monotonic_ns
+        phase_counts[value["phase"]] = phase_counts.get(value["phase"], 0) + 1
+        rows += 1
+        prefix_digest.update(raw_line)
+        if launch_prefix is not None and rows == launch_prefix["row_count"]:
+            require(prefix_digest.hexdigest() == launch_prefix["prefix_sha256"] and
+                    previous_sha == launch_prefix["last_row_sha256"],
+                    "Source5 launch monitor prefix is not the exact first stream prefix")
+            prefix_high_water = {
+                role: dict(value) for role, value in high_water.items()
+            }
+            require(launch_prefix["high_water"] == prefix_high_water,
+                    "Source5 launch monitor prefix high-water differs from its rows")
+            prefix_checked = True
+
+    try:
+        before = os.fstat(fd)
+        signature = lambda item: (
+            item.st_dev, item.st_ino, item.st_mode, item.st_size,
+            item.st_mtime_ns, item.st_ctime_ns,
+        )
+        require(stat.S_ISREG(before.st_mode) and before.st_nlink == 1 and
+                signature(before) == signature(before_path) and
+                0 <= before.st_size <= maximum,
+                "Source5 resource-monitor stream changed while opening")
+        consumed = 0
+        while consumed < before.st_size:
+            block = os.read(fd, min(64 * 1024, before.st_size - consumed))
+            require(bool(block), "Source5 resource-monitor stream was truncated")
+            consumed += len(block)
+            digest_state.update(block)
+            for byte in block:
+                line.append(byte)
+                if byte == 10:
+                    parse_line(bytes(line))
+                    line.clear()
+                else:
+                    require(len(line) <= row_limit,
+                            "Source5 resource-monitor line exceeds its prospective bound")
+        after = os.fstat(fd)
+        after_path = path.lstat()
+        require(not line and signature(before) == signature(after) ==
+                signature(after_path) and
+                digest_state.hexdigest() == stream_pin["raw_sha256"],
+                "Source5 resource-monitor stream changed during its replay")
+    finally:
+        os.close(fd)
+    require(header is not None and footer is not None and
+            rows == summary["row_count"] and
+            previous_phase == "postflight" and
+            set(RESOURCE_MONITOR_PHASES) <= seen_phases,
+            "Source5 resource-monitor stream omits its full bounded phase coverage")
+    require(launch_prefix is None or (prefix_checked and
+            launch_prefix["high_water"] == prefix_high_water),
+            "Source5 launch monitor prefix extends beyond the finalized stream")
+    require(set(origin_root_identities) == set(high_water) and
+            not placeholder_devices,
+            "Source5 resource-monitor stream never bound every writable root identity")
+    footer_body = {key: item for key, item in footer.items()
+                   if key != "footer_sha256"}
+    require(set(footer) == {
+                "schema", "budget", "row_count", "previous_sha256",
+                "prefix_sha256", "high_water", "final_usage", "failure",
+                "ended_monotonic_ns", "footer_sha256",
+            } and footer["schema"] == SOAK_RESOURCE_MONITOR_FOOTER_SCHEMA and
+            footer["budget"] == budget_pin and footer["row_count"] == rows and
+            footer["previous_sha256"] == previous_sha and
+            footer["prefix_sha256"] == prefix_digest.hexdigest() and
+            footer["high_water"] == high_water == summary["high_water"] and
+            footer["final_usage"] == summary["final_usage"] and
+            footer["failure"] is None and summary["failure"] is None and
+            footer["footer_sha256"] == sha256(canonical_bytes(footer_body)) and
+            type(footer["ended_monotonic_ns"]) is int and
+            previous_ns <= footer["ended_monotonic_ns"] and
+            footer["ended_monotonic_ns"] - previous_ns <= gap_ns,
+            "Source5 resource-monitor footer/high-water summary differs")
+    require(summary["prefix_sha256"] == footer["prefix_sha256"],
+            "Source5 resource-monitor launch/footer prefix digest differs")
+    return {
+        "summary": summary,
+        "phase_bounds": phase_bounds,
+        "phase_counts": phase_counts,
+        "origin_root_identities": origin_root_identities,
+        "footer_ended_monotonic_ns": footer["ended_monotonic_ns"],
+    }
 
 
 def _collect_evidence_inventory(
@@ -3179,6 +5615,40 @@ def _collect_evidence_inventory(
         add({"path": path_text, "kind": "directory",
              "mode": f"{stat.S_IMODE(info.st_mode):04o}"},
             "frozen pressure storage directory")
+    if component.get("schema") == COMPONENT_SCHEMA_V2:
+        budget_document, _budget_pin = _read_resource_budget_pin(
+            component["resource_budget"],
+        )
+        fixed_owner, _owner_sha, _owner_path = \
+            _load_fixed_pair_process_owner(prepared)
+        for role, path_field, byte_field, inode_field in (
+            ("application TMPDIR", "application_tmpdir",
+             "maximum_application_tmpdir_bytes",
+             "maximum_application_tmpdir_inodes"),
+            ("pressure scratch", "pressure_scratch",
+             "maximum_pressure_scratch_bytes",
+             "maximum_pressure_scratch_inodes"),
+        ):
+            root = Path(budget_document["layout"][path_field])
+            root_fd = fixed_owner._open_tmpdir_absolute_directory(root)
+            try:
+                root_info = os.fstat(root_fd)
+                fixed_owner._tmpdir_usage_snapshot(
+                    root, budget_document["ceilings"][byte_field],
+                    budget_document["ceilings"][inode_field],
+                    (root_info.st_dev, root_info.st_ino),
+                    allow_descendant_enoent=False,
+                )
+            finally:
+                os.close(root_fd)
+            for record in _tree_inventory(
+                    root, f"Source5 bounded {role}"):
+                if record["kind"] == "file":
+                    file_info = Path(record["path"]).lstat()
+                    require(file_info.st_nlink == 1 and
+                            file_info.st_uid == os.getuid(),
+                            f"Source5 bounded {role} contains a hardlink/unowned file")
+                add(record, f"bounded {role} recursive inventory")
     require(len(inventory) <= MAX_EVIDENCE_ENTRIES,
             "Source5 Soak evidence inventory exceeds its finite entry bound")
     required_directories = {
@@ -3224,6 +5694,61 @@ def _relative_raw_pins_in(value: object, input_root: Path) -> list[tuple[str, st
     return pins
 
 
+def _source5_resource_final_usage(
+    budget: dict[str, Any], inventory: list[dict[str, Any]],
+    monitor: dict[str, Any],
+) -> dict[str, Any]:
+    """Recompute quiescent usage from the complete captured writable inventory."""
+    ceilings = budget["ceilings"]
+    roots = {
+        "output": (Path(budget["layout"]["output_root"]),
+                   "maximum_output_bytes", "maximum_output_inodes"),
+        "application_tmpdir": (Path(budget["layout"]["application_tmpdir"]),
+                               "maximum_application_tmpdir_bytes",
+                               "maximum_application_tmpdir_inodes"),
+        "pressure_scratch": (Path(budget["layout"]["pressure_scratch"]),
+                             "maximum_pressure_scratch_bytes",
+                             "maximum_pressure_scratch_inodes"),
+        "probe_capture": (Path(budget["layout"]["probe_capture_root"]),
+                          "maximum_probe_output_bytes",
+                          "maximum_probe_output_inodes"),
+        "probe_tmpdir": (Path(budget["layout"]["probe_tmpdir"]),
+                         "maximum_probe_tmpdir_bytes",
+                         "maximum_probe_tmpdir_inodes"),
+    }
+    final: dict[str, dict[str, int]] = {}
+    sampled = exact(monitor.get("high_water"), set(roots),
+                    "Source5 Soak monitor sampled high-water map")
+    high_water: dict[str, dict[str, int]] = {}
+    by_path = {entry["path"]: entry for entry in inventory}
+    for role, (root, byte_cap, inode_cap) in roots.items():
+        require(type(by_path.get(str(root))) is dict and
+                by_path[str(root)]["kind"] == "directory",
+                f"Source5 bounded final inventory omits the {role} root")
+        descendants = [entry for entry in inventory
+                       if type(entry) is dict and type(entry.get("path")) is str and
+                       root in Path(entry["path"]).parents]
+        bytes_used = sum(entry["size"] for entry in descendants
+                         if entry.get("kind") == "file")
+        inode_count = len(descendants)
+        require(type(bytes_used) is int and type(inode_count) is int and
+                bytes_used <= ceilings[byte_cap] and
+                inode_count <= ceilings[inode_cap],
+                f"Source5 bounded final {role} inventory exceeds its frozen ceiling")
+        final[role] = {"bytes_used": bytes_used,
+                       "inode_count": inode_count}
+        high = exact(sampled[role], {"bytes", "inodes"},
+                     f"Source5 Soak sampled {role} high-water")
+        require(type(high["bytes"]) is int and high["bytes"] >= 0 and
+                type(high["inodes"]) is int and high["inodes"] >= 0,
+                f"Source5 Soak sampled {role} high-water is malformed")
+        high_water[role] = {
+            "bytes": max(high["bytes"], bytes_used),
+            "inodes": max(high["inodes"], inode_count),
+        }
+    return {"domains": final, "high_water": high_water}
+
+
 def _host_receipt_value(
     component: dict[str, Any], prepared: dict[str, Any], job: dict[str, Any],
     authorization_context: dict[str, Any], binding: dict[str, Any],
@@ -3233,12 +5758,80 @@ def _host_receipt_value(
     pressure_origin: dict[str, Any],
     evidence_inventory: list[dict[str, Any]], evidence_bases: list[str],
     source_root: Path, input_root: Path, output_root: Path,
-    probe_root: Path, result: dict[str, Any],
+    probe_root: Path, result: dict[str, Any], *,
+    resource_budget_pin_value: dict[str, str] | None = None,
+    resource_monitor_value: dict[str, Any] | None = None,
+    probe_capture_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     helper_pin = raw_pin(authorization_context["helper_input"],
                          "Source5 Soak original helper input")
+    bounded = resource_budget_pin_value is not None
+    require((resource_monitor_value is None) == (not bounded),
+            "Source5 bounded host receipt must bind its monitor summary")
+    if bounded:
+        require(probe_capture_context is not None,
+                "Source5 bounded host receipt requires its captured construction probe")
+        if probe_capture_context["capture"].get("schema") == PROBE_CAPTURE_SCHEMA_V2:
+            probe_projection = {
+                "schema": PROBE_CAPTURE_SCHEMA_V2,
+                "receipt_pin": dict(probe_capture_context["capture_pin"]),
+                "capture_sha256": probe_capture_context["capture"]["receipt_sha256"],
+                "probe_raw_sha256": probe_capture_context["probe_raw_sha256"],
+                "normal_binary_sha256": probe_capture_context["normal_binary_sha256"],
+                "owner_source_sha256": probe_capture_context["capture"][
+                    "owner_modules"]["fixed_pair"]["raw_sha256"],
+                "capacity_bundle": probe_capture_context["capacity_bundle"],
+                "request": probe_capture_context["request"],
+            }
+        else:
+            probe_projection = {
+                "schema": PROBE_CAPTURE_SCHEMA,
+                "receipt_pin": {
+                    "path": probe_capture_context["capture_pin"]["path"],
+                    "raw_sha256": probe_capture_context["capture_pin"]["raw_sha256"],
+                },
+                "capture_sha256": probe_capture_context["capture"]["capture_sha256"],
+                "probe_raw_sha256": probe_capture_context["capture"]["probe_raw_sha256"],
+                "normal_binary_sha256": probe_capture_context["capture"]["normal_binary_sha256"],
+                "owner_source_sha256": probe_capture_context["capture"]["owner_source_sha256"],
+            }
+        budget_document, checked_budget_pin = _read_resource_budget_pin(
+            resource_budget_pin_value,
+        )
+        require(checked_budget_pin == resource_budget_pin_value,
+                "Source5 bounded host receipt budget pin changed")
+        require(component.get("schema") == COMPONENT_SCHEMA_V2 and
+                component.get("validated") is True and
+                component.get("passed") is True and
+                result.get("validated") is True and
+                result.get("passed") is True and
+                result.get("qualification_eligible") is
+                    (component["readback"].get("mode") == "qualified") and
+                resource_monitor_value.get("failure") is None,
+                "Source5 bounded host receipt cannot seal an incomplete strict component replay")
+        _verify_source5_resource_monitor_stream(
+            budget_document, checked_budget_pin, resource_monitor_value,
+        )
+        final_usage = _source5_resource_final_usage(
+            budget_document, evidence_inventory, resource_monitor_value,
+        )
+        monitor_projection = dict(resource_monitor_value)
+        monitor_projection["high_water"] = final_usage["high_water"]
+        monitor_projection["final_usage"] = final_usage["domains"]
+    else:
+        probe_projection = {
+            "receipt_pin": {
+                "path": probe_capture_pin["path"],
+                "raw_sha256": probe_capture_pin["raw_sha256"],
+            },
+            "capture_sha256": probe_capture["capture_sha256"],
+            "probe_raw_sha256": probe_capture["probe_raw_sha256"],
+            "normal_binary_sha256": probe_capture["normal_binary_sha256"],
+            "owner_source_sha256": probe_capture["owner_source_sha256"],
+        }
     body = {
-        "schema": HOST_VERIFICATION_SCHEMA,
+        "schema": (HOST_VERIFICATION_SCHEMA_V3 if bounded else
+                   HOST_VERIFICATION_SCHEMA),
         "campaign_id": component["campaign_id"],
         "host_id": component["host_id"],
         "run_id": component["run_id"],
@@ -3255,16 +5848,7 @@ def _host_receipt_value(
         "observed_host_pin": observed_host_pin,
         "prepared_host_binding_sha256": binding["binding_sha256"],
         "helper_input_pin": helper_pin,
-        "construction_probe": {
-            "receipt_pin": {
-                "path": probe_capture_pin["path"],
-                "raw_sha256": probe_capture_pin["raw_sha256"],
-            },
-            "capture_sha256": probe_capture["capture_sha256"],
-            "probe_raw_sha256": probe_capture["probe_raw_sha256"],
-            "normal_binary_sha256": probe_capture["normal_binary_sha256"],
-            "owner_source_sha256": probe_capture["owner_source_sha256"],
-        },
+        "construction_probe": probe_projection,
         "pressure_origin": pressure_origin,
         "origin_host": host_identity,
         "process_absence": absence,
@@ -3275,13 +5859,16 @@ def _host_receipt_value(
         "evidence_inventory": evidence_inventory,
         "evidence_bases": evidence_bases,
         "readback_sha256": sha256(canonical_bytes(result)),
-        "bounded_execution_ready": False,
-        "bounded_blockers": [
-            "prospective_bounded_soak_resource_budget_not_pinned",
-        ],
+        "bounded_execution_ready": bounded,
+        "bounded_blockers": ([] if bounded else
+                              ["prospective_bounded_soak_resource_budget_not_pinned"]),
         "qualification_eligible": False,
         "execution_ready": False,
     }
+    if bounded:
+        body["resource_budget"] = resource_budget_pin_value
+        body["resource_monitor"] = monitor_projection
+        body["final_usage"] = final_usage
     body["receipt_sha256"] = sha256(canonical_bytes(body))
     return body
 
@@ -3290,7 +5877,7 @@ def verify_source5_soak_component_with_host_receipt(
     component: dict[str, Any], prepared: dict[str, Any],
     job: dict[str, Any], authorization_context: dict[str, Any],
     readback: types.ModuleType, host_receipt_path: str | Path, *,
-    probe_capture_root: str | Path,
+    probe_capture_root: str | Path, resource_monitor: Any = None,
 ) -> dict[str, str]:
     """Strictly replay on the origin host and seal its exact Soak evidence."""
     receipt_path = Path(host_receipt_path)
@@ -3316,9 +5903,58 @@ def verify_source5_soak_component_with_host_receipt(
     _, recipe, _identities = _verify_build_receipt(
         material_index, prepared, job, binding, readback,
     )
-    probe_capture, probe_capture_pin = _capture_source5_soak_probe(
-        prepared, job, binding, recipe, readback, capture_root,
-    )
+    bounded = component.get("schema") == COMPONENT_SCHEMA_V2
+    budget_document = None
+    budget_pin = None
+    probe_capture_context = None
+    if bounded:
+        budget_document, budget_pin = _read_resource_budget_pin(
+            component["resource_budget"],
+        )
+        _validate_resource_budget_bindings(
+            budget_document, prepared, job, binding, recipe, material_index,
+            output_root=Path(component["pins"]["supervisor"]["path"]).parent,
+            details=authorization_context.get("details"), readback=readback,
+        )
+        require(budget_pin == component["resource_budget"],
+                "Source5 Soak host receipt budget pin differs from component")
+        require(str(capture_root) == budget_document["layout"]["probe_capture_root"] and
+                str(receipt_path) == budget_document["layout"]["host_receipt_path"],
+                "Source5 Soak host receipt/capture paths differ from their prospective budget")
+        require(len(canonical_bytes(component)) <=
+                budget_document["artifact_limits"]["component_receipt_bytes"],
+                "Source5 bounded component exceeds its frozen output role limit")
+        require(resource_monitor is not None and
+                getattr(resource_monitor, "fd", None) is None and
+                getattr(resource_monitor, "budget_pin", None) == budget_pin and
+                getattr(resource_monitor, "final_summary", None) ==
+                    component.get("resource_monitor"),
+                "Source5 host verifier requires the finalized budget-pinned monitor owner")
+        probe_capture_pin = component["pins"]["probe_capture"]
+        if recipe["feedback_expectation"]["policy"].get(
+                "capacity_floor_policy_id") is not None:
+            probe_capture_context, probe_capture_pin = \
+                _source5_probe_v2_audit_context(
+                    prepared, recipe, probe_capture_pin,
+                )
+            probe_capture = probe_capture_context["capture"]
+        else:
+            probe_capture, _capture_raw, _capture_sha = read_json(
+                Path(probe_capture_pin["path"]),
+                probe_capture_pin["raw_sha256"],
+                "Source5 bounded ProbeV1 capture receipt", MAX_RECEIPT_BYTES,
+            )
+            probe_capture_context = {
+                "capture": probe_capture,
+                "capture_pin": probe_capture_pin,
+            }
+        require(Path(probe_capture_pin["path"]).parent == capture_root,
+                "Source5 Soak component probe receipt is outside the budgeted capture root")
+    else:
+        probe_capture, probe_capture_pin, _probe_context = \
+            _capture_source5_soak_probe(
+                prepared, job, binding, recipe, readback, capture_root,
+            )
     # Preserve the public strict/live path unchanged. It independently replays
     # its original APP probe, authorization overlay, cleanup and full readback.
     result = verify_source5_soak_component(
@@ -3373,9 +6009,17 @@ def verify_source5_soak_component_with_host_receipt(
         host_identity, observed_host_pin, absence, probe_capture,
         probe_capture_pin, pressure_origin, inventory, evidence_bases, source_root, input_root,
         output_root, capture_root, result,
+        resource_budget_pin_value=budget_pin,
+        resource_monitor_value=(None if not bounded else
+                                component["resource_monitor"]),
+        probe_capture_context=probe_capture_context,
     )
     require(len(canonical_bytes(receipt)) <= MAX_RECEIPT_BYTES,
             "Source5 Soak host-verification receipt exceeds its finite byte bound")
+    if bounded:
+        require(len(canonical_bytes(receipt)) <=
+                budget_document["artifact_limits"]["host_receipt_bytes"],
+                "Source5 Soak host-verification receipt exceeds its frozen artifact limit")
     written = _write_exclusive_json(
         receipt_path, receipt, "Source5 Soak strict host-verification receipt",
     )
@@ -3473,8 +6117,22 @@ def _verify_evidence_inventory(
         require(type(path) is str and Path(path).is_absolute() and
                 str(Path(path)) == path,
                 f"Source5 Soak {role} root is not normalized absolute")
-    for role in ("output", "probe_capture"):
-        root = Path(tree_roots[role])
+    recursive_roots = {
+        tree_roots["output"], tree_roots["probe_capture"],
+    }
+    if receipt.get("schema") == HOST_VERIFICATION_SCHEMA_V3:
+        budget, _budget_pin = _read_resource_budget_pin(
+            receipt["resource_budget"],
+        )
+        recursive_roots.update({
+            budget["layout"]["application_tmpdir"],
+            budget["layout"]["pressure_scratch"],
+            budget["layout"]["probe_tmpdir"],
+        })
+    for root_text in sorted(recursive_roots):
+        root = Path(root_text)
+        require(root_text in expected and expected[root_text]["kind"] == "directory",
+                f"offline Source5 Soak receipt omits recursive evidence root: {root_text}")
         actual = _current_tree_entries_without_hash(root, set(expected))
         declared = [entry for entry in entries
                     if entry["path"] == str(root) or
@@ -3492,7 +6150,7 @@ def _verify_evidence_inventory(
                     "mode": entry["mode"],
                 })
         require(actual == sorted(declared_projection, key=lambda item: item["path"]),
-                f"offline Source5 Soak {role} tree membership/modes differ from the origin receipt")
+                f"offline Source5 Soak recursive tree membership/modes differ: {root}")
     _require_evidence_paths(mapped, set(expected), "typed inventory")
     _require_evidence_paths(mapped, set(receipt["evidence_bases"]),
                             "evidence-base directory")
@@ -3614,6 +6272,7 @@ def _validate_process_absence_offline(
 def _offline_probe_context(
     receipt: dict[str, Any], prepared: dict[str, Any],
     readback: types.ModuleType,
+    *, resource_budget: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     probe = exact(receipt["construction_probe"], {
         "receipt_pin", "capture_sha256", "probe_raw_sha256",
@@ -3643,6 +6302,11 @@ def _offline_probe_context(
             capture["normal_binary_sha256"] == probe["normal_binary_sha256"] and
             capture["owner_source_sha256"] == probe["owner_source_sha256"],
             "Source5 Soak ProbeV1 capture receipt differs from the strict host pin")
+    if resource_budget is not None:
+        _verify_source5_probe_resource_budget(
+            resource_budget, prepared,
+            {"capture": capture, "capture_pin": capture_pin},
+        )
     owner_pin = raw_pin(capture["owner_result_pin"],
                         "Source5 ProbeV1 direct process owner result")
     owner_result, _owner_raw, _owner_sha = read_json(
@@ -3776,10 +6440,14 @@ def verify_source5_soak_component_offline(
         "bounded_execution_ready", "bounded_blockers",
         "qualification_eligible", "execution_ready", "receipt_sha256",
     }
+    bounded = component.get("schema") == COMPONENT_SCHEMA_V2
+    if bounded:
+        expected_fields |= {"resource_budget", "resource_monitor", "final_usage"}
     exact(receipt, expected_fields, "Source5 Soak host-verification receipt")
     receipt_body = {key: value for key, value in receipt.items()
                     if key != "receipt_sha256"}
-    require(receipt["schema"] == HOST_VERIFICATION_SCHEMA and
+    require(receipt["schema"] == (HOST_VERIFICATION_SCHEMA_V3 if bounded else
+                                   HOST_VERIFICATION_SCHEMA) and
             receipt["receipt_sha256"] == receipt_pin["receipt_sha256"] ==
                 sha256(canonical_bytes(receipt_body)) and
             receipt["campaign_id"] == component["campaign_id"] ==
@@ -3788,13 +6456,36 @@ def verify_source5_soak_component_offline(
             receipt["run_id"] == component["run_id"] == job["run_id"] and
             receipt["component_sha256"] == sha256(canonical_bytes(component)) and
             receipt["component_pins"] == component["pins"] and
-            receipt["bounded_execution_ready"] is False and
-            receipt["bounded_blockers"] == [
+            receipt["bounded_execution_ready"] is bounded and
+            receipt["bounded_blockers"] == ([] if bounded else [
                 "prospective_bounded_soak_resource_budget_not_pinned",
-            ] and
+            ]) and
             receipt["qualification_eligible"] is False and
             receipt["execution_ready"] is False,
             "Source5 Soak host receipt is not bound to the exact non-qualifying component")
+    budget_document = None
+    budget_pin = None
+    if bounded:
+        budget_document, budget_pin = _read_resource_budget_pin(
+            receipt["resource_budget"],
+        )
+        host_monitor = exact(receipt["resource_monitor"], {
+            "schema", "budget", "stream", "row_count", "high_water",
+            "final_usage", "failure", "prefix_sha256",
+        }, "Source5 bounded host monitor summary")
+        component_monitor = exact(component["resource_monitor"], {
+            "schema", "budget", "stream", "row_count", "high_water",
+            "final_usage", "failure", "prefix_sha256",
+        }, "Source5 bounded component monitor summary")
+        require(budget_pin == component["resource_budget"] and
+                host_monitor["schema"] ==
+                    "allocatbelt.application-source5-soak-resource-monitor-summary.v1" and
+                resource_budget_pin(host_monitor["budget"]) == budget_pin and
+                host_monitor["stream"] == component_monitor["stream"] and
+                host_monitor["row_count"] == component_monitor["row_count"] and
+                host_monitor["prefix_sha256"] == component_monitor["prefix_sha256"] and
+                host_monitor["failure"] is None,
+                "Source5 bounded host receipt changed the budget/monitor stream")
     binding = _selected_prepared_host_binding(
         prepared["source5_prepared_input_completion"], prepared["host_id"],
     )
@@ -3827,6 +6518,17 @@ def verify_source5_soak_component_offline(
                 str(Path(receipt["construction_probe"]["receipt_pin"]["path"]).parent.resolve(strict=True)),
             "Source5 Soak host receipt tree roots differ from the original evidence")
     _verify_evidence_inventory(receipt, mapped)
+    if bounded:
+        final_usage = _source5_resource_final_usage(
+            budget_document, receipt["evidence_inventory"],
+            component["resource_monitor"],
+        )
+        require(receipt["final_usage"] == final_usage and
+                host_monitor["high_water"] == final_usage["high_water"] and
+                host_monitor["final_usage"] ==
+                    final_usage["domains"] and
+                host_monitor["failure"] is None,
+                "Source5 bounded host receipt final inventory/high-water differs")
 
     generation = _generation_projection(prepared, job, binding)
     require(receipt["generation"] == generation,
@@ -3868,11 +6570,67 @@ def verify_source5_soak_component_offline(
     _validate_process_absence_offline(receipt, supervisor)
 
     readback = _load_readback_module(offline_prepared)
-    construction_probe_capture = _offline_probe_context(
-        receipt, offline_prepared, readback,
-    )
+    if bounded:
+        material_pin = raw_pin(component["pins"]["materials_index"],
+                               "Source5 bounded materials index")
+        material_index, _material_raw, _material_sha = read_json(
+            Path(material_pin["path"]), material_pin["raw_sha256"],
+            "Source5 bounded materials index", MAX_ARTIFACT_BYTES,
+        )
+        offline_binding = _selected_prepared_host_binding(
+            offline_prepared["source5_prepared_input_completion"],
+            offline_prepared["host_id"],
+        )
+        offline_recipe, _offline_receipt, _offline_identities = \
+            _verify_build_receipt(
+                material_index, offline_prepared, job, offline_binding,
+                readback,
+            )
+        if offline_recipe["feedback_expectation"]["policy"].get(
+                "capacity_floor_policy_id") is not None:
+            construction_probe_capture, _offline_probe_pin = \
+                _source5_probe_v2_audit_context(
+                    offline_prepared, offline_recipe,
+                    component["probe_capture"],
+                    evidence_path_map=context["evidence_path_map"],
+                )
+            _verify_source5_probe_resource_budget(
+                budget_document, offline_prepared,
+                construction_probe_capture,
+            )
+            probe_projection = exact(receipt["construction_probe"], {
+                "schema", "receipt_pin", "capture_sha256", "probe_raw_sha256",
+                "normal_binary_sha256", "owner_source_sha256",
+                "capacity_bundle", "request",
+            }, "Source5 bounded ProbeV2 host receipt binding")
+            require(probe_projection["schema"] == PROBE_CAPTURE_SCHEMA_V2 and
+                    probe_projection["receipt_pin"] == component["probe_capture"] and
+                    probe_projection["capture_sha256"] ==
+                        construction_probe_capture["capture"]["receipt_sha256"] and
+                    probe_projection["probe_raw_sha256"] ==
+                        construction_probe_capture["probe_raw_sha256"] and
+                    probe_projection["normal_binary_sha256"] ==
+                        construction_probe_capture["normal_binary_sha256"] and
+                    probe_projection["owner_source_sha256"] ==
+                        construction_probe_capture["capture"]["owner_modules"][
+                            "fixed_pair"]["raw_sha256"] and
+                    probe_projection["capacity_bundle"] ==
+                        construction_probe_capture["capacity_bundle"] and
+                    probe_projection["request"] ==
+                        construction_probe_capture["request"],
+                    "Source5 bounded host receipt ProbeV2 projection differs from its strict capture")
+        else:
+            construction_probe_capture = _offline_probe_context(
+                receipt, offline_prepared, readback,
+                resource_budget=budget_document,
+            )
+    else:
+        construction_probe_capture = _offline_probe_context(
+            receipt, offline_prepared, readback,
+        )
     offline_readback_context = {
-        "schema": "allocatbelt.application-source5-soak-offline-replay-context.v1",
+        "schema": (SOAK_OFFLINE_CONTEXT_SCHEMA_V2 if bounded else
+                   SOAK_OFFLINE_CONTEXT_SCHEMA),
         "evidence_path_map": context["evidence_path_map"],
         "construction_probe_capture": construction_probe_capture,
         "application_environment": supervisor["details"]["environment"],
@@ -3890,6 +6648,34 @@ def verify_source5_soak_component_offline(
     require(sha256(canonical_bytes(result)) == receipt["readback_sha256"] and
             result == component["readback"],
             "Source5 Soak offline result differs from the strict host readback")
+    if bounded:
+        require(receipt["bounded_execution_ready"] is True and
+                receipt["bounded_blockers"] == [] and
+                receipt["resource_monitor"]["failure"] is None and
+                receipt["final_usage"]["high_water"] ==
+                    receipt["resource_monitor"]["high_water"],
+                "Source5 bounded offline replay did not close every live resource blocker")
+        return {
+            "schema": SOAK_BOUNDED_OFFLINE_RESULT_SCHEMA,
+            "campaign_id": component["campaign_id"],
+            "host_id": component["host_id"],
+            "run_id": component["run_id"],
+            "component_sha256": sha256(canonical_bytes(component)),
+            "host_verification": {
+                "path": receipt_pin["path"],
+                "raw_sha256": receipt_pin["raw_sha256"],
+                "receipt_sha256": receipt_pin["receipt_sha256"],
+            },
+            "resource_budget": budget_pin,
+            "resource_monitor": receipt["resource_monitor"],
+            "final_usage": receipt["final_usage"],
+            "readback_sha256": receipt["readback_sha256"],
+            "validated": True,
+            "passed": True,
+            "bounded_execution_ready": True,
+            "qualification_eligible": False,
+            "execution_ready": False,
+        }
     raise Source5SoakError(
         "source5_soak_bounded_acceptance_blocked: complete Soak and pressure replay passed, but no prospective bounded-Soak resource-budget document is pinned",
     )

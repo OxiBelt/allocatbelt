@@ -42,6 +42,8 @@ CALIBRATION_SCOPE_RECEIPT_SCHEMA_V2 = "allocatbelt.application-pressure-calibrat
 CALIBRATION_HOST_VERIFICATION_SCHEMA_V2 = "allocatbelt.application-pressure-calibration-host-verification.v1"
 EVIDENCE_PATH_MAP_SCHEMA_V1 = "allocatbelt.application-pressure-evidence-path-map.v1"
 PRESSURE_PAIR_HOST_VERIFICATION_SCHEMA = "allocatbelt.application-pressure-pair-host-verification.v1"
+SOURCE5_SOAK_HOST_VERIFICATION_SCHEMA_V2 = "allocatbelt.application-source5-soak-host-verification.v2"
+SOURCE5_SOAK_HOST_VERIFICATION_SCHEMA_V3 = "allocatbelt.application-source5-soak-host-verification.v3"
 PRESSURE_PAIR_ORIGIN_FACTS_SCHEMA = "allocatbelt.application-pressure-pair-origin-facts.v1"
 CAPACITY_BUNDLE_PIN_SCHEMA_V2 = "allocatbelt.application-pressure-capacity-bundle-pin.v2"
 CONTEXT_POLICY_BUNDLE_SCHEMA_V2 = "allocatbelt.application-pressure-context-policy-bundle.v2"
@@ -3611,7 +3613,7 @@ def verify_pressure_offline(
 
 
 def _validate_source5_soak_host_receipt_v2(
-    pin_value: object,
+    pin_value: object, *, allow_v3: bool = False,
 ) -> tuple[dict[str, Any], str, dict[str, str]]:
     """Validate the separate single-APP Soak host receipt without pair coercion."""
     pin = exact(pin_value, {"path", "raw_sha256", "receipt_sha256"},
@@ -3627,6 +3629,9 @@ def _validate_source5_soak_host_receipt_v2(
     require(actual_raw == raw_sha and stat.S_ISREG(info.st_mode) and
             info.st_uid == os.getuid() and stat.S_IMODE(info.st_mode) == 0o600,
             "Source5 Soak host receipt is not the exact owned mode-0600 pinned file")
+    bounded_v3 = receipt.get("schema") == SOURCE5_SOAK_HOST_VERIFICATION_SCHEMA_V3
+    require(not bounded_v3 or allow_v3,
+            "Source5 host-v3 receipt requires the bounded single-APP pressure API")
     fields = {
         "schema", "campaign_id", "host_id", "run_id", "component_sha256",
         "component_pins", "generation", "prepared_host_context_pin",
@@ -3638,16 +3643,19 @@ def _validate_source5_soak_host_receipt_v2(
         "bounded_blockers", "qualification_eligible", "execution_ready",
         "receipt_sha256",
     }
+    if bounded_v3:
+        fields |= {"resource_budget", "resource_monitor", "final_usage"}
     exact(receipt, fields, "Source5 Soak host-verification receipt")
     body = {key: value for key, value in receipt.items()
             if key != "receipt_sha256"}
-    require(receipt["schema"] ==
-            "allocatbelt.application-source5-soak-host-verification.v2" and
+    require(receipt["schema"] == (SOURCE5_SOAK_HOST_VERIFICATION_SCHEMA_V3
+                                  if bounded_v3 else
+                                  SOURCE5_SOAK_HOST_VERIFICATION_SCHEMA_V2) and
             receipt["receipt_sha256"] == receipt_sha == digest_object(body) and
-            receipt["bounded_execution_ready"] is False and
-            receipt["bounded_blockers"] == [
+            receipt["bounded_execution_ready"] is bounded_v3 and
+            receipt["bounded_blockers"] == ([] if bounded_v3 else [
                 "prospective_bounded_soak_resource_budget_not_pinned",
-            ] and receipt["qualification_eligible"] is False and
+            ]) and receipt["qualification_eligible"] is False and
             receipt["execution_ready"] is False,
             "Source5 Soak host receipt schema/digest/status differs")
     token(receipt["campaign_id"], "Source5 Soak host receipt campaign")
@@ -3656,13 +3664,167 @@ def _validate_source5_soak_host_receipt_v2(
     for name in ("component_sha256", "prepared_host_binding_sha256",
                  "readback_sha256"):
         sha256(receipt[name], f"Source5 Soak host receipt {name}")
-    component_pins = exact(receipt["component_pins"], {
+    component_pin_fields = {
         "materials_index", "parent_recipe", "build_receipt", "preflight",
         "launch_authorization", "supervisor", "launch", "postflight",
         "readback",
-    }, "Source5 Soak component raw pins")
+    }
+    if bounded_v3:
+        component_pin_fields |= {
+            "resource_budget", "probe_capture", "resource_monitor",
+            "application_owner", "pressure_owner",
+        }
+    component_pins = exact(receipt["component_pins"], component_pin_fields,
+                           "Source5 Soak component raw pins")
     for name, value in component_pins.items():
-        _raw_pin(value, f"Source5 Soak component {name}")
+        if name == "resource_budget" and bounded_v3:
+            exact(value, {"path", "raw_sha256", "semantic_sha256"},
+                  "Source5 Soak component resource-budget pin")
+        else:
+            _raw_pin(value, f"Source5 Soak component {name}")
+    if bounded_v3:
+        budget_pin = exact(receipt["resource_budget"], {
+            "path", "raw_sha256", "semantic_sha256",
+        }, "Source5 Soak prospective resource-budget pin")
+        budget_path = absolute_path(budget_pin["path"],
+                                    "Source5 Soak resource-budget path")
+        _require_evidence_path_mapped(budget_path)
+        budget_raw_sha = sha256(budget_pin["raw_sha256"],
+                                "Source5 Soak resource-budget raw SHA-256")
+        budget_semantic_sha = sha256(
+            budget_pin["semantic_sha256"],
+            "Source5 Soak resource-budget semantic SHA-256",
+        )
+        budget, budget_raw, actual_budget_sha = read_canonical(
+            budget_path, "Source5 Soak prospective resource budget", 64 * 1024,
+        )
+        require(actual_budget_sha == budget_raw_sha and
+                budget_raw == canonical_bytes(budget) and
+                budget.get("schema") ==
+                    "allocatbelt.application-source5-soak-resource-budget.v2" and
+                budget.get("resource_budget_sha256") == budget_semantic_sha ==
+                    digest_object({key: value for key, value in budget.items()
+                                   if key != "resource_budget_sha256"}),
+                "Source5 Soak prospective budget raw/semantic/schema binding differs")
+        budget_binding = exact(budget.get("binding"), {
+            "campaign_id", "host_id", "job_sha256", "source_manifest",
+            "source_tree_sha256", "parent_recipe", "build_receipt",
+            "prepared_host_binding_sha256", "observed_host", "monitor_owner",
+            "soak_adapter", "soak_reader",
+        }, "Source5 Soak budget generation binding")
+        source_generation = exact(receipt["generation"]["source_manifest"], {
+            "path", "raw_sha256", "semantic_sha256", "source_tree_sha256",
+        }, "Source5 Soak receipt source generation")
+        budget_layout = exact(budget.get("layout"), {
+            "output_root", "application_tmpdir", "pressure_scratch",
+            "probe_capture_root", "probe_tmpdir", "host_receipt_path",
+        }, "Source5 Soak budget output layout")
+        budget_recipe = _raw_pin(
+            budget_binding["parent_recipe"],
+            "Source5 Soak budget parent recipe",
+        )
+        component_recipe = _raw_pin(
+            component_pins["parent_recipe"],
+            "Source5 Soak component parent recipe",
+        )
+        budget_build = _raw_pin(
+            budget_binding["build_receipt"],
+            "Source5 Soak budget build receipt",
+        )
+        component_build = _raw_pin(
+            component_pins["build_receipt"],
+            "Source5 Soak component build receipt",
+        )
+        prepared_host_pin = _raw_pin(
+            receipt["prepared_host_context_pin"],
+            "Source5 Soak prepared host context",
+        )
+        budget_observed_pin = _raw_pin(
+            budget_binding["observed_host"],
+            "Source5 Soak budget observed-host context",
+        )
+        receipt_observed_pin = _raw_pin(
+            receipt["observed_host_pin"],
+            "Source5 Soak receipt observed-host context",
+        )
+        probe_receipt_path = absolute_path(
+            receipt["construction_probe"]["receipt_pin"]["path"],
+            "Source5 Soak ProbeV2 capture receipt path",
+        )
+        require(budget_binding["campaign_id"] == receipt["campaign_id"] and
+                budget_binding["host_id"] == receipt["host_id"] and
+                budget_binding["job_sha256"] == digest_object(
+                    receipt["generation"]["job"],
+                ) and
+                budget_binding["source_manifest"] == {
+                    "path": source_generation["path"],
+                    "raw_sha256": source_generation["raw_sha256"],
+                    "semantic_sha256": source_generation["semantic_sha256"],
+                } and
+                budget_binding["source_tree_sha256"] ==
+                    source_generation["source_tree_sha256"] and
+                budget_binding["prepared_host_binding_sha256"] ==
+                    receipt["prepared_host_binding_sha256"] and
+                budget_recipe == component_recipe and
+                budget_build == component_build and
+                budget_observed_pin == receipt_observed_pin == prepared_host_pin and
+                budget_layout["output_root"] == str(Path(
+                    component_pins["supervisor"]["path"],
+                ).parent) and
+                budget_layout["application_tmpdir"] ==
+                    receipt["pressure_origin"]["application_tmpdir_path"] and
+                budget_layout["probe_capture_root"] ==
+                    str(probe_receipt_path.parent) and
+                budget_layout["probe_tmpdir"] == str(
+                    probe_receipt_path.parent / "tmp",
+                ) and
+                budget_layout["host_receipt_path"] == pin["path"],
+                "Source5 Soak v3 host receipt changed its original budget/job/source/layout binding")
+        monitor = exact(receipt["resource_monitor"], {
+            "schema", "budget", "stream", "row_count", "high_water",
+            "final_usage", "failure", "prefix_sha256",
+        }, "Source5 Soak resource-monitor summary")
+        monitor_stream = exact(monitor["stream"], {"path", "raw_sha256"},
+                               "Source5 Soak resource-monitor stream pin")
+        _raw_pin(component_pins["resource_monitor"],
+                 "Source5 Soak resource-monitor component pin")
+        _require_evidence_path_mapped(monitor_stream["path"])
+        require(monitor["schema"] ==
+                    "allocatbelt.application-source5-soak-resource-monitor-summary.v1" and
+                monitor["budget"] == budget_pin and
+                component_pins["resource_budget"] == budget_pin and
+                component_pins["resource_monitor"] == monitor_stream and
+                monitor_stream["path"] ==
+                    str(Path(budget["layout"]["output_root"]) /
+                        "source5-soak-resource-monitor.jsonl") and
+                type(monitor["row_count"]) is int and monitor["row_count"] > 0 and
+                monitor["failure"] is None and
+                monitor["final_usage"] == receipt["final_usage"]["domains"] and
+                monitor["high_water"] == receipt["final_usage"]["high_water"],
+                "Source5 Soak v3 host receipt budget/monitor/final usage differs")
+        sha256(monitor_stream["raw_sha256"],
+               "Source5 Soak resource-monitor stream raw SHA-256")
+        final_usage = exact(receipt["final_usage"], {"domains", "high_water"},
+                            "Source5 Soak final usage")
+        expected_domains = {
+            "output", "application_tmpdir", "pressure_scratch",
+            "probe_capture", "probe_tmpdir",
+        }
+        exact(final_usage["domains"], expected_domains,
+              "Source5 Soak final usage domains")
+        exact(final_usage["high_water"], expected_domains,
+              "Source5 Soak final high-water domains")
+        for role in expected_domains:
+            domain = exact(final_usage["domains"][role], {
+                "bytes_used", "inode_count",
+            }, f"Source5 Soak final {role} usage")
+            high = exact(final_usage["high_water"][role], {
+                "bytes", "inodes",
+            }, f"Source5 Soak {role} high-water")
+            for name, value in domain.items():
+                uint(value, f"Source5 Soak final {role} {name}")
+            for name, value in high.items():
+                uint(value, f"Source5 Soak {role} {name}")
     generation = receipt["generation"]
     require(type(generation) is dict and
             generation.get("campaign_id") == receipt["campaign_id"] and
@@ -3727,10 +3889,10 @@ def _validate_source5_soak_host_receipt_v2(
                                  "receipt_sha256": receipt_sha}
 
 
-def verify_source5_soak_pressure_offline(
+def _verify_source5_soak_pressure_offline_impl(
     pressure_recipe_pin: object, pressure_artifacts: object,
     soak_host_verification_pin: object, *, evidence_path_map: object,
-    source_root: object,
+    source_root: object, bounded_v3: bool,
 ) -> dict[str, Any]:
     """Replay the one original Soak APP pressure run from its own strict facts.
 
@@ -3799,7 +3961,9 @@ def verify_source5_soak_pressure_offline(
     replay_token: contextvars.Token[dict[str, Any] | None] | None = None
     try:
         raw_host_receipt, host_receipt_raw_sha, _host_pin = \
-            _validate_source5_soak_host_receipt_v2(host_pin)
+            _validate_source5_soak_host_receipt_v2(
+                host_pin, allow_v3=bounded_v3,
+            )
         origin = raw_host_receipt["pressure_origin"]
         recorded_recipe_pin = origin["recipe_pin"]
         require(recorded_recipe_pin == recipe_pin and
@@ -4399,6 +4563,32 @@ def verify_source5_soak_pressure_offline(
         if replay_token is not None:
             _PRESSURE_OFFLINE_REPLAY_CONTEXT.reset(replay_token)
         _EVIDENCE_PATH_MAP_CONTEXT.reset(token_value)
+
+
+def verify_source5_soak_pressure_offline(
+    pressure_recipe_pin: object, pressure_artifacts: object,
+    soak_host_verification_pin: object, *, evidence_path_map: object,
+    source_root: object,
+) -> dict[str, Any]:
+    """Replay the historical budgetless single-APP Soak host receipt."""
+    return _verify_source5_soak_pressure_offline_impl(
+        pressure_recipe_pin, pressure_artifacts, soak_host_verification_pin,
+        evidence_path_map=evidence_path_map, source_root=source_root,
+        bounded_v3=False,
+    )
+
+
+def verify_source5_soak_pressure_offline_v3(
+    pressure_recipe_pin: object, pressure_artifacts: object,
+    soak_host_verification_pin: object, *, evidence_path_map: object,
+    source_root: object,
+) -> dict[str, Any]:
+    """Replay one bounded Soak APP against its strict host-v3 receipt."""
+    return _verify_source5_soak_pressure_offline_impl(
+        pressure_recipe_pin, pressure_artifacts, soak_host_verification_pin,
+        evidence_path_map=evidence_path_map, source_root=source_root,
+        bounded_v3=True,
+    )
 
 
 def _parser() -> argparse.ArgumentParser:

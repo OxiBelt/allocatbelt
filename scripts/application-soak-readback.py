@@ -27,6 +27,7 @@ import secrets
 import stat
 import subprocess
 import sys
+import threading
 import time
 import types
 from pathlib import Path, PurePosixPath
@@ -38,6 +39,8 @@ RECIPE_SCHEMA_V2 = "allocatbelt.application-soak-parent-recipe.v2"
 PREFLIGHT_SCHEMA = "allocatbelt.application-soak-preflight.v2"
 POSTFLIGHT_SCHEMA = "allocatbelt.application-soak-postflight.v2"
 LAUNCH_SCHEMA = "allocatbelt.application-soak-launch.v1"
+LAUNCH_SCHEMA_V2 = "allocatbelt.application-soak-launch.v2"
+LAUNCH_SCHEMA_V3 = "allocatbelt.application-soak-launch.v3"
 RESULT_SCHEMA = "allocatbelt.application-soak-readback.v1"
 RESULT_SCHEMA_V2 = "allocatbelt.application-soak-readback.v2"
 SOURCE_SCHEMA = "allocatbelt.application-source-manifest.v4"
@@ -63,6 +66,52 @@ SOURCE_V5_PRESSURE_MAX_SAMPLES = 120_000
 SOURCE_V5_PRESSURE_MAX_TOTAL_SECONDS = 14_400
 SOURCE_V5_PRESSURE_OWNERSHIP_PROTOCOL = "allocatbelt.pressure-worker-ownership.v1"
 SOURCE5_SOAK_OFFLINE_CONTEXT_SCHEMA = "allocatbelt.application-source5-soak-offline-replay-context.v1"
+SOURCE5_SOAK_OFFLINE_CONTEXT_SCHEMA_V2 = "allocatbelt.application-source5-soak-offline-replay-context.v2"
+SOAK_RESOURCE_BUDGET_SCHEMA = "allocatbelt.application-source5-soak-resource-budget.v2"
+SOAK_RESOURCE_MONITOR_SCHEMA = "allocatbelt.application-source5-soak-resource-monitor-stream.v1"
+SOAK_RESOURCE_MONITOR_ROW_SCHEMA = "allocatbelt.application-source5-soak-resource-monitor-row.v1"
+SOAK_RESOURCE_MONITOR_FOOTER_SCHEMA = "allocatbelt.application-source5-soak-resource-monitor-footer.v1"
+SOAK_RESOURCE_BUDGET_CEILING_FIELDS = {
+    "maximum_output_bytes", "maximum_output_inodes",
+    "maximum_application_tmpdir_bytes", "maximum_application_tmpdir_inodes",
+    "maximum_pressure_scratch_bytes", "maximum_pressure_scratch_inodes",
+    "maximum_probe_output_bytes", "maximum_probe_output_inodes",
+    "maximum_probe_tmpdir_bytes", "maximum_probe_tmpdir_inodes",
+    "minimum_free_bytes", "minimum_free_inodes",
+    "durable_receipt_reserve_bytes", "durable_receipt_reserve_inodes",
+    "maximum_monitor_stream_bytes", "maximum_monitor_rows",
+    "maximum_monitor_row_bytes",
+}
+SOAK_RESOURCE_BUDGET_ARTIFACT_FIELDS = {
+    "terminal_stream_bytes", "resource_samples_bytes",
+    "application_stdout_bytes", "application_stderr_bytes",
+    "application_timing_bytes", "soak_receipt_bytes",
+    "launch_receipt_bytes", "launch_authorization_bytes",
+    "preflight_receipt_bytes",
+    "postflight_receipt_bytes", "readback_receipt_bytes",
+    "source5_supervisor_bytes", "pressure_events_bytes",
+    "pressure_readback_bytes", "pressure_run_receipt_bytes",
+    "pressure_launch_bytes",
+    "pressure_binding_bytes", "pressure_ready_bytes",
+    "pressure_driver_stdout_bytes", "pressure_driver_stderr_bytes",
+    "pressure_worker_stderr_bytes", "probe_stdout_bytes",
+    "probe_stderr_bytes", "probe_owner_receipt_bytes",
+    "probe_inventory_bytes", "probe_failure_bytes",
+    "probe_capture_receipt_bytes", "resource_monitor_stream_bytes",
+    "owner_return_receipt_bytes", "host_receipt_bytes",
+    "failure_receipt_bytes", "component_receipt_bytes",
+}
+SOAK_RESOURCE_BUDGET_LAYOUT_FIELDS = {
+    "output_root", "application_tmpdir", "pressure_scratch",
+    "probe_capture_root", "probe_tmpdir", "host_receipt_path",
+}
+SOAK_RESOURCE_BUDGET_SCHEDULE_FIELDS = {
+    "production_seconds", "application_sample_interval_ms",
+    "application_sample_tolerance_ns", "application_sample_count",
+    "application_wall_timeout_seconds", "pressure_total_deadline_seconds",
+    "authorization_effective_timeout_seconds", "probe_timeout_seconds",
+    "resource_monitor_interval_ms", "resource_monitor_tolerance_ns",
+}
 
 ALLOCATORS = ("allocatbelt", "mimalloc-secure", "mimalloc-standard", "system")
 DOMAINS = ("cpu", "memory", "disk", "network", "tasks", "control")
@@ -95,6 +144,10 @@ MAX_SOURCE_FILE_BYTES = 64 * 1024 * 1024
 # Keep this ceiling aligned with the existing bounded launch-environment reads.
 MAX_ENVIRONMENT_BYTES = 16 * 1024 * 1024
 MAX_LINE_BYTES = 8192
+MAX_SOAK_RESOURCE_MONITOR_STREAM_BYTES = 1024 * 1024 * 1024
+MAX_SOAK_RESOURCE_MONITOR_ROWS = 1_000_000
+MAX_SOAK_RESOURCE_MONITOR_ROW_BYTES = 2 * 1024 * 1024
+MAX_SOAK_RESOURCE_OWNER_POLL_NS = 100_000_000
 _SOURCE_INVENTORY_MODULE_CACHE: dict[str, Any] = {}
 _PRESSURE_SUBREAPER_ACTIVE = False
 OWNED_GROUP_SCAN_MAX_SECONDS = 0.05
@@ -951,7 +1004,10 @@ def verify_source_tree(
             "host_verification_pin", "application_environment",
             "pressure_origin",
         }, "Source5 Soak offline replay context")
-        require(offline_context["schema"] == SOURCE5_SOAK_OFFLINE_CONTEXT_SCHEMA,
+        require(offline_context["schema"] in {
+                    SOURCE5_SOAK_OFFLINE_CONTEXT_SCHEMA,
+                    SOURCE5_SOAK_OFFLINE_CONTEXT_SCHEMA_V2,
+                },
                 "Source5 Soak offline replay context schema differs")
         # Offline replay pins the recorded commit as part of the raw source
         # manifest and verifies every typed source-tree entry below. It never
@@ -1128,9 +1184,13 @@ def _validate_calibration_record(value: object) -> tuple[int, dict[str, Any]]:
 
 def _audit_manifest_and_binaries(
     recipe: dict[str, Any], *, offline_context: dict[str, Any] | None = None,
+    source5_probe_capture: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     if recipe["schema"] == RECIPE_SCHEMA_V2:
-        return _audit_manifest_and_binaries_v5(recipe, offline_context=offline_context)
+        return _audit_manifest_and_binaries_v5(
+            recipe, offline_context=offline_context,
+            source5_probe_capture=source5_probe_capture,
+        )
     require(offline_context is None,
             "receipt-backed offline Soak replay supports only the original SourceV5 recipe")
     identity = recipe["identity"]
@@ -1304,6 +1364,7 @@ def _audit_manifest_and_binaries(
 
 def _audit_manifest_and_binaries_v5(
     recipe: dict[str, Any], *, offline_context: dict[str, Any] | None = None,
+    source5_probe_capture: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Verify SourceV5 through the exact controller bytes in its inventory."""
     identity = recipe["identity"]
@@ -1396,9 +1457,18 @@ def _audit_manifest_and_binaries_v5(
     probe_path = safe_absolute_path(probe["path"], "SourceV5 construction policy probe")
     probe_value, probe_raw_sha, probe_raw = read_json(probe_path, "SourceV5 construction policy probe", 512 * 1024)
     require(probe_raw == canonical_bytes(probe_value) and probe_raw_sha == probe["raw_sha256"], "SourceV5 construction probe raw bytes differ from their frozen pin")
-    require(probe_value.get("schema") == "allocatbelt.application-feedback-policy-probe.v1", "unsupported SourceV5 construction probe schema")
+    floor_policy_id = recipe["feedback_expectation"]["policy"].get(
+        "capacity_floor_policy_id",
+    )
+    require((floor_policy_id is None and probe_value.get("schema") ==
+             "allocatbelt.application-feedback-policy-probe.v1") or
+            (type(floor_policy_id) is str and probe_value.get("schema") ==
+             "allocatbelt.application-feedback-policy-probe.v2"),
+            "SourceV5 construction probe schema does not match the selected policy")
     require(probe_value.get("context", {}).get("workload") == "mixed" and probe_value.get("context", {}).get("profile") == identity["profile"], "SourceV5 construction probe context differs from the soak profile")
-    if offline_context is None:
+    selected_probe_context = None
+    selected_capacity_artifact_pin = None
+    if offline_context is None and floor_policy_id is None:
         probe_process = subprocess.run(
             [str(normal_path), "--emit-feedback-policy-only", "--workload", "mixed", "--profile", identity["profile"]],
             cwd=source_root,
@@ -1411,7 +1481,7 @@ def _audit_manifest_and_binaries_v5(
         )
         require(len(probe_process.stdout) <= 512 * 1024 and len(probe_process.stderr) <= 64 * 1024, "SourceV5 construction probe process exceeded its finite output bound")
         require(probe_process.returncode == 0 and probe_process.stdout == probe_raw, "pinned SourceV5 application binary no longer emits the caller-frozen construction probe")
-    else:
+    elif floor_policy_id is None:
         capture = exact_object(offline_context["construction_probe_capture"], {
             "schema", "source_manifest_raw_sha256", "source_tree_sha256",
             "normal_binary_sha256", "probe_raw_sha256", "owner_source_sha256",
@@ -1495,6 +1565,129 @@ def _audit_manifest_and_binaries_v5(
                 stdout_raw == probe_raw and stderr_sha == stderr["raw_sha256"] and
                 stderr_raw == b"",
                 "Source5 origin ProbeV1 stdout/stderr differ from the source-pinned construction probe")
+    else:
+        selected_probe_context = source5_probe_capture
+        if selected_probe_context is None and offline_context is not None:
+            selected_probe_context = offline_context.get("construction_probe_capture")
+        selected_probe_context = exact_object(selected_probe_context, {
+            "schema", "capture_pin", "capture", "probe", "probe_raw",
+            "probe_raw_sha256", "capacity_bundle", "capacity_floor_policy_id",
+            "normal_binary_sha256", "request",
+        }, "Source5 selected ProbeV2 audit context")
+        require(selected_probe_context["schema"] ==
+                    "allocatbelt.application-source5-soak-probe-audit-context.v2" and
+                selected_probe_context["probe"] == probe_value and
+                selected_probe_context["probe_raw"] == probe_raw and
+                selected_probe_context["probe_raw_sha256"] == probe_raw_sha and
+                selected_probe_context["capacity_floor_policy_id"] == floor_policy_id and
+                selected_probe_context["normal_binary_sha256"] == normal_sha,
+                "Source5 selected ProbeV2 context differs from its original pinned inputs")
+        capture_pin = exact_object(selected_probe_context["capture_pin"], {
+            "path", "raw_sha256", "receipt_sha256",
+        }, "Source5 ProbeV2 capture receipt pin")
+        capture, capture_raw, capture_raw_sha = read_json(
+            Path(capture_pin["path"]), capture_pin["raw_sha256"],
+            "Source5 selected ProbeV2 capture receipt", 16 * 1024 * 1024,
+        )
+        require(capture == selected_probe_context["capture"] and
+                capture_raw_sha == capture_pin["raw_sha256"] and
+                capture.get("schema") ==
+                    "allocatbelt.application-feedback-probe-capture.v2" and
+                capture.get("receipt_sha256") == capture_pin["receipt_sha256"] and
+                capture.get("probe_pin") == probe and
+                capture.get("probe_raw_sha256") == probe_raw_sha and
+                capture.get("normal_binary_sha256") == normal_sha and
+                capture.get("source_manifest", {}).get("raw_sha256") == manifest_raw_sha and
+                capture.get("source_manifest", {}).get("source_tree_sha256") ==
+                    source["source_tree_sha256"] and
+                capture.get("capacity_bundle") ==
+                    selected_probe_context["capacity_bundle"] and
+                capture.get("exit_status") == 0 and
+                capture.get("output_matches_probe") is True and
+                capture.get("stderr_empty") is True,
+                "Source5 selected ProbeV2 capture receipt differs from its owner/source context")
+        bundle = exact_object(selected_probe_context["capacity_bundle"], {
+            "request", "artifact", "receipt",
+        }, "Source5 selected ProbeV2 capacity bundle")
+        probe_request = exact_object(selected_probe_context["request"], {
+            "schema", "source_root", "source_manifest", "context",
+            "construction_probe", "capacity_bundle",
+            "capacity_floor_policy_id",
+        }, "Source5 selected ProbeV2 composition request")
+        probe_request_source = exact_object(
+            probe_request["source_manifest"], {"path", "raw_sha256"},
+            "Source5 ProbeV2 request SourceV5 pin",
+        )
+        probe_request_context = exact_object(probe_request["context"], {
+            "host_id", "workload", "profile", "calibration_id",
+        }, "Source5 ProbeV2 request context")
+        require(probe_request["schema"] ==
+                    "allocatbelt.application-feedback-composition-request.v2" and
+                probe_request["source_root"] == str(source_root) and
+                probe_request_source == {
+                    "path": recipe["source"]["manifest_path"],
+                    "raw_sha256": manifest_raw_sha,
+                } and
+                probe_request_context == {
+                    "host_id": identity["host_id"], "workload": "mixed",
+                    "profile": identity["profile"],
+                    "calibration_id": recipe["qualification"]["capacity_template"][
+                        "calibration_id"],
+                } and
+                probe_request["construction_probe"] == probe and
+                probe_request["capacity_bundle"] == bundle and
+                probe_request["capacity_floor_policy_id"] == floor_policy_id,
+                "Source5 selected ProbeV2 request differs from its captured receipt")
+        for label, pin_value in bundle.items():
+            capacity_pin = exact_object(pin_value, {"path", "raw_sha256"},
+                                         f"Source5 selected ProbeV2 capacity {label}")
+            safe_absolute_path(capacity_pin["path"],
+                               f"Source5 selected ProbeV2 capacity {label} path")
+            digest(capacity_pin["raw_sha256"],
+                   f"Source5 selected ProbeV2 capacity {label} SHA-256")
+        capacity_evidence = recipe["qualification"]["capacity_template"]["evidence"]
+        input_root = Path(recipe["qualification"]["spec"]["path"]).resolve(strict=True).parent
+        expected_capacity_artifact = safe_child(
+            input_root, capacity_evidence["artifact"]["relative_path"],
+            "Source5 selected ProbeV2 capacity artifact",
+        )
+        require(bundle["artifact"]["path"] == str(expected_capacity_artifact) and
+                bundle["artifact"]["raw_sha256"] ==
+                    capacity_evidence["artifact"]["raw_sha256"],
+                "Source5 ProbeV2 capacity artifact differs from the original recipe evidence")
+        selected_capacity_artifact_pin = bundle["artifact"]
+        argv = [
+            str(normal_path), "--emit-feedback-policy-only", "--workload", "mixed",
+            "--profile", identity["profile"], "--capacity-calibration-file",
+            selected_capacity_artifact_pin["path"], "--capacity-calibration-sha256",
+            selected_capacity_artifact_pin["raw_sha256"], "--host-id",
+            identity["host_id"], "--source-sha256", identity["source_sha256"],
+            "--capacity-floor-policy-id", floor_policy_id,
+        ]
+        require(capture.get("probe_argv") == argv and
+                type(capture.get("environment")) is dict and
+                capture["environment"].get("PATH") == "/usr/bin:/bin" and
+                capture["environment"].get("TMPDIR") ==
+                    capture.get("tmpdir_initial", {}).get("path") and
+                capture.get("cwd") == str(source_root) and
+                type(capture.get("affinity")) is list and
+                capture["affinity"] == sorted(set(capture["affinity"])) and
+                type(capture.get("netns")) is int and capture["netns"] > 0,
+                "Source5 selected ProbeV2 argv/environment/host identity differs from its frozen context")
+        stdout_pin = exact_object(capture["stdout"], {"path", "raw_sha256"},
+                                  "Source5 ProbeV2 stdout pin")
+        stderr_pin = exact_object(capture["stderr"], {"path", "raw_sha256"},
+                                  "Source5 ProbeV2 stderr pin")
+        stdout_raw, stdout_sha = read_stable_bytes(
+            Path(stdout_pin["path"]), "Source5 selected ProbeV2 stdout", 512 * 1024,
+        )
+        stderr_raw, stderr_sha = read_stable_bytes(
+            Path(stderr_pin["path"]), "Source5 selected ProbeV2 stderr", 64 * 1024,
+        )
+        require(stdout_sha == stdout_pin["raw_sha256"] == probe_raw_sha and
+                stdout_raw == probe_raw and stderr_sha == stderr_pin["raw_sha256"] and
+                stderr_raw == b"",
+                "Source5 actual ProbeV2 owner stdout/stderr differs from its pinned construction probe")
     feedback_validator_pin = manifest["qualification_harness"]["feedback_validator"]
     feedback_validator_path = safe_child(source_root, feedback_validator_pin["path"], "SourceV5 feedback validator")
     feedback_validator_raw, feedback_validator_sha = read_stable_bytes(feedback_validator_path, "SourceV5 feedback validator", MAX_SOURCE_FILE_BYTES)
@@ -1506,6 +1699,21 @@ def _audit_manifest_and_binaries_v5(
         exec(compile(feedback_validator_raw, str(feedback_validator_path), "exec", dont_inherit=True), feedback_module.__dict__)
     except (SyntaxError, TypeError, ValueError) as error:
         raise SoakReadbackError(f"captured SourceV5 feedback validator cannot be compiled: {error}") from error
+    if selected_probe_context is not None:
+        require(callable(getattr(feedback_module,
+                                 "validate_probe_capture_receipt_envelope", None)),
+                "captured SourceV5 feedback validator lacks ProbeV2 receipt validation")
+        try:
+            checked_capture = feedback_module.validate_probe_capture_receipt_envelope(
+                capture_raw, capture_pin["raw_sha256"],
+                capture_pin["receipt_sha256"],
+            )
+        except Exception as error:
+            raise SoakReadbackError(
+                f"captured SourceV5 feedback validator rejected the ProbeV2 owner receipt: {error}",
+            ) from error
+        require(checked_capture == capture,
+                "captured SourceV5 feedback validator returned another ProbeV2 receipt")
     feedback_artifact = manifest["feedback_policy"]
     feedback_context_key = f"mixed/{identity['profile']}"
     contexts = feedback_artifact["policy"]["contexts"]
@@ -1529,18 +1737,56 @@ def _audit_manifest_and_binaries_v5(
     )
     probe_policy = feedback["policy"]
     require(probe_policy["version"] == feedback_artifact["policy"]["version"], "constructed feedback policy version differs from SourceV5")
-    require(probe_policy["controls"] == contexts[feedback_context_key]["controls"], "constructed feedback controls differ from SourceV5 numeric context")
+    if floor_policy_id is None:
+        require(probe_policy["controls"] == contexts[feedback_context_key]["controls"], "constructed feedback controls differ from SourceV5 numeric context")
+    else:
+        require(selected_capacity_artifact_pin is not None and
+                callable(getattr(feedback_module,
+                                 "resolve_calibrated_feedback_policy_v5", None)) and
+                callable(getattr(feedback_module,
+                                 "_check_calibrated_construction_probe_v2_inputs", None)),
+                "captured SourceV5 feedback validator lacks selected ProbeV2 APIs")
+        probe_identity = {
+            "host_id": identity["host_id"], "workload": "mixed",
+            "profile": identity["profile"], "allocator": "allocatbelt",
+            "source_sha256": identity["source_sha256"],
+            "binary_sha256": normal_sha,
+        }
+        try:
+            resolved_floor_policy = feedback_module.resolve_calibrated_feedback_policy_v5(
+                manifest, probe_value, selected_capacity_artifact_pin,
+                probe_identity, capacity_floor_policy_id=floor_policy_id,
+            )
+            feedback_module._check_calibrated_construction_probe_v2_inputs(
+                probe, manifest, selected_capacity_artifact_pin, probe_identity,
+                resolved_floor_policy, floor_policy_id,
+            )
+        except Exception as error:
+            raise SoakReadbackError(
+                f"captured SourceV5 feedback validator rejected the owned ProbeV2/capacity policy: {error}",
+            ) from error
+        require(probe_policy == resolved_floor_policy and
+                probe_policy.get("capacity_floor_policy_id") == floor_policy_id and
+                feedback_module.CAPACITY_FLOOR_POLICY_ID == floor_policy_id,
+                "constructed SourceV5 feedback policy differs from independent ProbeV2 resolution")
+        source_floor_policy = feedback_artifact["policy"].get(
+            "capacity_floor_policy",
+        )
+        require(type(source_floor_policy) is dict and
+                source_floor_policy.get("policy_id") == floor_policy_id,
+                "selected capacity-floor policy is absent from SourceV5 numeric policy")
     require(probe_policy["sample_interval_ns"] == feedback_artifact["policy"]["reader_contract"]["sample_interval_ns"] and probe_policy["minimum_dense_observations"] == contexts[feedback_context_key]["minimum_dense_observations"], "constructed feedback reader policy differs from SourceV5 policy")
-    probe_expectation = {
-        "schema": feedback_module.EXPECTATION_SCHEMA_V3,
-        "identity": {"allocator": "allocatbelt", "binary_sha256": soak_sha, "workload": "mixed", "profile": identity["profile"]},
-        "construction_probe": recipe["construction_probe"],
-        "policy": probe_policy,
-    }
-    try:
-        feedback_module.validate_construction_probe(probe_expectation, manifest)
-    except (OSError, TypeError, ValueError, getattr(feedback_module, "ValidationError", ValueError)) as error:
-        raise SoakReadbackError(f"captured SourceV5 feedback validator rejected the pinned construction probe/policy: {error}") from error
+    if floor_policy_id is None:
+        probe_expectation = {
+            "schema": feedback_module.EXPECTATION_SCHEMA_V3,
+            "identity": {"allocator": "allocatbelt", "binary_sha256": soak_sha, "workload": "mixed", "profile": identity["profile"]},
+            "construction_probe": recipe["construction_probe"],
+            "policy": probe_policy,
+        }
+        try:
+            feedback_module.validate_construction_probe(probe_expectation, manifest)
+        except (OSError, TypeError, ValueError, getattr(feedback_module, "ValidationError", ValueError)) as error:
+            raise SoakReadbackError(f"captured SourceV5 feedback validator rejected the pinned construction probe/policy: {error}") from error
     expected_source_baseline = uint(manifest["resource_domain_calibration"]["record"]["fixed_global_control_baseline"], "SourceV5 calibrated global Control baseline", positive=True)
     require(probe_policy["collector"]["expected_global_control_baseline"] == expected_source_baseline, "feedback construction probe baseline differs from SourceV5 resource calibration")
 
@@ -1937,6 +2183,7 @@ def _audit_inputs(
     *,
     require_executing_reader_path: bool = False,
     offline_context: dict[str, Any] | None = None,
+    source5_probe_capture: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     recipe, recipe_sha, raw = read_json(recipe_path, "parent soak recipe", MAX_RECIPE_BYTES)
     require(raw == canonical_bytes(recipe), "parent soak recipe is not canonical JSON")
@@ -1948,8 +2195,11 @@ def _audit_inputs(
         require(recipe["runtime"]["mode"] == selected_mode, "runner mode differs from the frozen parent recipe")
     if selected_duration is not None:
         require(recipe["runtime"]["duration_seconds"] == selected_duration, "runner duration differs from the frozen parent recipe")
+    if source5_probe_capture is None and offline_context is not None:
+        source5_probe_capture = offline_context.get("construction_probe_capture")
     source_audit = _audit_manifest_and_binaries(
         recipe, offline_context=offline_context,
+        source5_probe_capture=source5_probe_capture,
     )
     source_root = Path(source_audit["source_root"])
     expected_reader = safe_child(source_root, recipe["validator"]["path"], "recipe validator source")
@@ -2024,7 +2274,10 @@ def _current_audit_offline(
             "host_verification_pin", "application_environment",
             "pressure_origin",
     }, "Source5 Soak offline replay context")
-    require(offline_context["schema"] == SOURCE5_SOAK_OFFLINE_CONTEXT_SCHEMA,
+    require(offline_context["schema"] in {
+                SOURCE5_SOAK_OFFLINE_CONTEXT_SCHEMA,
+                SOURCE5_SOAK_OFFLINE_CONTEXT_SCHEMA_V2,
+            },
             "Source5 Soak offline replay context schema differs")
     require(type(offline_context["application_environment"]) is dict and
             type(offline_context["application_environment"].get("PATH")) is str and
@@ -2696,6 +2949,63 @@ def _launch_receipt_value(
         "artifact_budget_exceeded": details["artifact_budget_exceeded"],
         "received_signal": details["received_signal"],
     }
+    resource_budget_pin = descriptor.get("resource_budget_pin")
+    resource_monitor = descriptor.get("resource_monitor")
+    resource_monitor_prefix = descriptor.get("resource_monitor_prefix")
+    require(resource_budget_pin is None or
+            (resource_monitor is not None) != (resource_monitor_prefix is not None),
+            "Source5 bounded launch must bind one complete monitor or monitor prefix")
+    require(resource_budget_pin is not None or
+            (resource_monitor is None and resource_monitor_prefix is None),
+            "historical Source5 launch cannot carry a resource monitor")
+    if resource_budget_pin is not None:
+        exact_object(resource_budget_pin, {"path", "raw_sha256", "semantic_sha256"},
+                     "Source5 bounded launch resource-budget pin")
+        if resource_monitor is not None:
+            exact_object(resource_monitor, {
+                "schema", "budget", "stream", "row_count", "high_water",
+                "final_usage", "failure", "prefix_sha256",
+            }, "Source5 bounded launch resource-monitor summary")
+            require(resource_monitor["schema"] ==
+                        "allocatbelt.application-source5-soak-resource-monitor-summary.v1" and
+                    resource_monitor["budget"] == resource_budget_pin and
+                    type(resource_monitor["row_count"]) is int and
+                    resource_monitor["row_count"] > 0 and
+                    (resource_monitor["failure"] is None or
+                     type(resource_monitor["failure"]) is str),
+                    "Source5 bounded launch monitor summary differs from its budget")
+            receipt.update({
+                "schema": LAUNCH_SCHEMA_V2,
+                "resource_budget": resource_budget_pin,
+                "resource_monitor": resource_monitor,
+                "resource_budget_exceeded": details.get(
+                    "resource_budget_exceeded", False,
+                ),
+            })
+        else:
+            prefix = exact_object(resource_monitor_prefix, {
+                "schema", "path", "budget", "row_count", "prefix_sha256",
+                "last_row_sha256", "high_water", "failure",
+            }, "Source5 bounded launch resource-monitor prefix")
+            require(prefix["schema"] ==
+                        "allocatbelt.application-source5-soak-resource-monitor-prefix.v1" and
+                    prefix["path"] == descriptor.get("resource_monitor_path") and
+                    prefix["budget"] == resource_budget_pin and
+                    type(prefix["row_count"]) is int and prefix["row_count"] > 0 and
+                    type(prefix["prefix_sha256"]) is str and
+                    re.fullmatch(r"[0-9a-f]{64}", prefix["prefix_sha256"]) is not None and
+                    type(prefix["last_row_sha256"]) is str and
+                    re.fullmatch(r"[0-9a-f]{64}", prefix["last_row_sha256"]) is not None and
+                    prefix["failure"] is None,
+                    "Source5 bounded launch monitor prefix differs from its budget")
+            receipt.update({
+                "schema": LAUNCH_SCHEMA_V3,
+                "resource_budget": resource_budget_pin,
+                "resource_monitor_prefix": prefix,
+                "resource_budget_exceeded": details.get(
+                    "resource_budget_exceeded", False,
+                ),
+            })
     receipt["launch_receipt_sha256"] = hashlib.sha256(canonical_bytes(receipt)).hexdigest()
     return receipt
 
@@ -2719,13 +3029,26 @@ def _verify_launch_receipt(
         "child_return_code", "timed_out", "artifact_budget_exceeded", "received_signal",
         "launch_receipt_sha256",
     }
+    resource_budget_pin = audit["launch_descriptor"].get("resource_budget_pin")
+    monitor_prefix_mode = (
+        resource_budget_pin is not None and
+        receipt.get("schema") == LAUNCH_SCHEMA_V3
+    )
+    if resource_budget_pin is not None:
+        expected_keys |= {
+            "resource_budget", "resource_budget_exceeded",
+            "resource_monitor_prefix" if monitor_prefix_mode else
+                "resource_monitor",
+        }
     exact_object(receipt, expected_keys, "parent launch receipt")
     material = dict(receipt)
     claimed = material.pop("launch_receipt_sha256")
     require(digest(claimed, "launch receipt digest") == hashlib.sha256(canonical_bytes(material)).hexdigest(), "parent launch receipt digest is invalid")
     descriptor = audit["launch_descriptor"]
     static_expected = {
-        "schema": LAUNCH_SCHEMA,
+        "schema": (LAUNCH_SCHEMA_V3 if monitor_prefix_mode else
+                   LAUNCH_SCHEMA_V2 if resource_budget_pin is not None else
+                   LAUNCH_SCHEMA),
         "recipe_sha256": audit["recipe_sha256"],
         "preflight_sha256": preflight["preflight_sha256"],
         "run_id": audit["identity"]["run_id"],
@@ -2745,6 +3068,50 @@ def _verify_launch_receipt(
     }
     for name, expected in static_expected.items():
         require(receipt[name] == expected, f"parent launch receipt {name} differs from the frozen launch descriptor")
+    if resource_budget_pin is not None and not monitor_prefix_mode:
+        monitor = exact_object(receipt["resource_monitor"], {
+            "schema", "budget", "stream", "row_count", "high_water",
+            "final_usage", "failure", "prefix_sha256",
+        }, "Source5 launch resource-monitor summary")
+        stream_pin = exact_object(monitor["stream"], {"path", "raw_sha256"},
+                                  "Source5 launch resource-monitor stream pin")
+        digest(stream_pin["raw_sha256"],
+               "Source5 launch resource-monitor raw SHA-256")
+        require(receipt["resource_budget"] == resource_budget_pin and
+                monitor["schema"] ==
+                    "allocatbelt.application-source5-soak-resource-monitor-summary.v1" and
+                monitor["budget"] == resource_budget_pin and
+                stream_pin["path"] == audit["launch_descriptor"].get(
+                    "resource_monitor_path",
+                ) and
+                type(monitor["row_count"]) is int and monitor["row_count"] > 0 and
+                type(receipt["resource_budget_exceeded"]) is bool and
+                (monitor["failure"] is None or
+                 type(monitor["failure"]) is str) and
+                (monitor["failure"] is None or
+                 receipt["resource_budget_exceeded"] is True),
+                "Source5 bounded launch budget/monitor binding differs")
+    elif monitor_prefix_mode:
+        prefix = exact_object(receipt["resource_monitor_prefix"], {
+            "schema", "path", "budget", "row_count", "prefix_sha256",
+            "last_row_sha256", "high_water", "failure",
+        }, "Source5 launch resource-monitor prefix")
+        require(receipt["resource_budget"] == resource_budget_pin and
+                prefix["schema"] ==
+                    "allocatbelt.application-source5-soak-resource-monitor-prefix.v1" and
+                prefix["path"] == audit["launch_descriptor"].get(
+                    "resource_monitor_path",
+                ) and
+                prefix["budget"] == resource_budget_pin and
+                type(prefix["row_count"]) is int and prefix["row_count"] > 0 and
+                type(prefix["prefix_sha256"]) is str and
+                re.fullmatch(r"[0-9a-f]{64}", prefix["prefix_sha256"]) is not None and
+                type(prefix["last_row_sha256"]) is str and
+                re.fullmatch(r"[0-9a-f]{64}", prefix["last_row_sha256"]) is not None and
+                prefix["failure"] is None and
+                type(receipt["resource_budget_exceeded"]) is bool and
+                receipt["resource_budget_exceeded"] is False,
+                "Source5 bounded launch prefix/budget pin differs")
     require(
         receipt["executed_argv"] == descriptor["argv"]
         and type(receipt["executed_file_descriptor"]) is str
@@ -2757,6 +3124,9 @@ def _verify_launch_receipt(
     require(receipt["binary_inode"] > 0 and receipt["binary_size"] > 0, "parent launch receipt binary file identity is empty")
     require(receipt["started_monotonic_ns"] < receipt["ended_monotonic_ns"], "parent launch receipt monotonic interval is empty or reversed")
     require(type(receipt["timed_out"]) is bool and type(receipt["artifact_budget_exceeded"]) is bool, "parent launch receipt status flags are not booleans")
+    if resource_budget_pin is not None:
+        require(type(receipt["resource_budget_exceeded"]) is bool,
+                "Source5 bounded launch resource status flag is malformed")
     require(receipt["received_signal"] is None or type(receipt["received_signal"]) is int, "parent launch receipt signal is malformed")
     if receipt["received_signal"] is not None:
         uint(receipt["received_signal"], "parent launch receipt signal", maximum=64, positive=True)
@@ -2764,6 +3134,9 @@ def _verify_launch_receipt(
         require(receipt["exit_code"] == 124, "timed launch must use the stable timeout status 124")
     elif receipt["artifact_budget_exceeded"]:
         require(receipt["exit_code"] == 125, "over-budget launch must use the stable refusal status 125")
+    elif resource_budget_pin is not None and receipt["resource_budget_exceeded"]:
+        require(receipt["exit_code"] == 125,
+                "resource-budget launch refusal must use the stable status 125")
     elif receipt["received_signal"] is not None:
         require(receipt["exit_code"] == 128 + receipt["received_signal"], "signal-driven launch status differs from 128+signal")
     elif receipt["child_return_code"] < 0:
@@ -2776,6 +3149,8 @@ def _verify_launch_receipt(
             and receipt["child_return_code"] == 0
             and receipt["timed_out"] is False
             and receipt["artifact_budget_exceeded"] is False
+            and (resource_budget_pin is None or
+                 receipt["resource_budget_exceeded"] is False)
             and receipt["received_signal"] is None,
             "qualified readback requires a successful parent launch receipt",
         )
@@ -3455,9 +3830,20 @@ def _validate_pressure_proof_offline(
             pressure_info.get("condition_sha256") == recipe_pin["condition_sha256"],
             "SourceV5 offline pressure recipe raw/semantic/condition roles differ")
     reader = pressure_info.get("reader")
-    verifier = getattr(reader, "verify_source5_soak_pressure_offline", None)
+    bounded_v3 = offline_context["schema"] == \
+        SOURCE5_SOAK_OFFLINE_CONTEXT_SCHEMA_V2
+    verifier = getattr(
+        reader,
+        ("verify_source5_soak_pressure_offline_v3" if bounded_v3 else
+         "verify_source5_soak_pressure_offline"),
+        None,
+    )
     require(callable(verifier),
-            "source5_soak_pressure_offline_dependency_unavailable: captured pressure reader lacks its single-APP offline API")
+            ("source5_soak_pressure_v3_offline_dependency_unavailable: "
+             "captured pressure reader lacks its bounded host-v3 single-APP API"
+             if bounded_v3 else
+             "source5_soak_pressure_offline_dependency_unavailable: "
+             "captured pressure reader lacks its single-APP offline API"))
     condition = audit["recipe"]["qualification"]["pressure_condition"]
     origin = exact_object(offline_context["pressure_origin"], {
         "schema", "recipe_pin", "recipe_dependency_paths",
@@ -3555,10 +3941,17 @@ def _validate_artifacts_offline(
         "host_verification_pin", "application_environment",
         "pressure_origin",
     }, "Source5 Soak offline replay context")
-    require(offline_context["schema"] == SOURCE5_SOAK_OFFLINE_CONTEXT_SCHEMA and
-            audit["recipe"]["schema"] == RECIPE_SCHEMA_V2 and
-            audit["mode"] == "qualified" and audit["duration_seconds"] == QUALIFIED_SECONDS,
-            "Source5 offline replay is not the original qualified three-hour Soak")
+    require(offline_context["schema"] in {
+                SOURCE5_SOAK_OFFLINE_CONTEXT_SCHEMA,
+                SOURCE5_SOAK_OFFLINE_CONTEXT_SCHEMA_V2,
+            } and audit["recipe"]["schema"] == RECIPE_SCHEMA_V2 and
+            ((audit["mode"] == "qualified" and
+              audit["duration_seconds"] == QUALIFIED_SECONDS) or
+             (offline_context["schema"] ==
+                  SOURCE5_SOAK_OFFLINE_CONTEXT_SCHEMA_V2 and
+              audit["mode"] == "functional" and
+              0 < audit["duration_seconds"] < QUALIFIED_SECONDS)),
+            "Source5 offline replay is not a bounded qualified or functional Soak")
     launch_receipt, _launch_sha = _verify_launch_receipt(
         artifact_dir, audit, audit["preflight"], require_success=True,
     )
@@ -3627,7 +4020,10 @@ def _check_private_output_directory(path: Path) -> Path:
     return resolved
 
 
-def command_preflight(args: argparse.Namespace) -> int:
+def command_preflight(
+    args: argparse.Namespace, *,
+    source5_probe_capture: dict[str, Any] | None = None,
+) -> int:
     recipe_expected_sha = digest(args.recipe_sha256, "expected recipe SHA-256")
     expected_identity = {
         "campaign_id": args.campaign_id,
@@ -3649,6 +4045,7 @@ def command_preflight(args: argparse.Namespace) -> int:
         args.duration_seconds,
         args.runner_path,
         require_executing_reader_path=True,
+        source5_probe_capture=source5_probe_capture,
     )
     output_dir = _check_private_output_directory(args.output_dir)
     audit["launch_descriptor"] = _make_launch_descriptor(audit, output_dir, args.cpu_set)
@@ -3685,7 +4082,10 @@ def command_preflight(args: argparse.Namespace) -> int:
     return 0
 
 
-def _current_audit(args: argparse.Namespace) -> tuple[dict[str, Any], dict[str, Any]]:
+def _current_audit(
+    args: argparse.Namespace, *,
+    source5_probe_capture: dict[str, Any] | None = None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
     recipe_expected_sha = digest(args.recipe_sha256, "expected recipe SHA-256")
     # The preflight identity was written by this same recipe. Reconstruct CLI
     # pins from it only after checking the preflight file's digest below.
@@ -3705,6 +4105,7 @@ def _current_audit(args: argparse.Namespace) -> tuple[dict[str, Any], dict[str, 
         None,
         args.runner_path,
         require_executing_reader_path=True,
+        source5_probe_capture=source5_probe_capture,
     )
     output_dir = _check_private_output_directory(args.output_dir)
     audit["launch_descriptor"] = _make_launch_descriptor(audit, output_dir, args.cpu_set)
@@ -3713,14 +4114,35 @@ def _current_audit(args: argparse.Namespace) -> tuple[dict[str, Any], dict[str, 
     return audit, preflight
 
 
-def command_verify_inputs(args: argparse.Namespace) -> int:
-    audit, preflight = _current_audit(args)
+def command_verify_inputs(
+    args: argparse.Namespace, *,
+    source5_probe_capture: dict[str, Any] | None = None,
+) -> int:
+    audit, preflight = _current_audit(
+        args, source5_probe_capture=source5_probe_capture,
+    )
     launch_receipt, launch_receipt_sha = _verify_launch_receipt(
         _check_private_output_directory(args.output_dir),
         audit,
         preflight,
         require_success=False,
     )
+    audit["launch_receipt"] = launch_receipt
+    checksum, postflight = _write_verify_inputs_postflight(
+        audit, preflight, _check_private_output_directory(args.output_dir),
+        launch_receipt_sha,
+    )
+    print(json.dumps({"inputs_unchanged": True,
+                      "postflight_sha256": postflight["postflight_sha256"],
+                      "file_sha256": checksum}, sort_keys=True))
+    return 0
+
+
+def _write_verify_inputs_postflight(
+    audit: dict[str, Any], preflight: dict[str, Any], output_dir: Path,
+    launch_receipt_sha: str,
+) -> tuple[str, dict[str, Any]]:
+    """Write the legacy input-stability role from a caller's frozen audit."""
     postflight = {
         "schema": POSTFLIGHT_SCHEMA,
         "preflight_sha256": preflight["preflight_sha256"],
@@ -3734,11 +4156,41 @@ def command_verify_inputs(args: argparse.Namespace) -> int:
         "launch_receipt_sha256": launch_receipt_sha,
         "inputs_unchanged": True,
     }
-    audit["launch_receipt"] = launch_receipt
     postflight["postflight_sha256"] = hashlib.sha256(canonical_bytes(postflight)).hexdigest()
-    checksum = _write_exclusive_json(_check_private_output_directory(args.output_dir) / "soak-postflight.json", postflight)
-    print(json.dumps({"inputs_unchanged": True, "postflight_sha256": postflight["postflight_sha256"], "file_sha256": checksum}, sort_keys=True))
-    return 0
+    checksum = _write_exclusive_json(output_dir / "soak-postflight.json", postflight)
+    return checksum, postflight
+
+
+def _verify_verify_inputs_postflight(
+    audit: dict[str, Any], preflight: dict[str, Any], output_dir: Path,
+    launch_receipt_sha: str,
+) -> dict[str, Any]:
+    """Replay the exact legacy postflight role under the selected overlay."""
+    path = output_dir / "soak-postflight.json"
+    postflight, checksum, raw = read_json(
+        path, "Soak input-stability postflight", MAX_RECEIPT_BYTES,
+    )
+    expected = {
+        "schema": POSTFLIGHT_SCHEMA,
+        "preflight_sha256": preflight["preflight_sha256"],
+        "recipe_sha256": audit["recipe_sha256"],
+        "source_manifest_sha256": audit["source"]["source_manifest_sha256"],
+        "source_tree_sha256": audit["source"]["source_tree_sha256"],
+        "build_sha256": audit["source"]["build_sha256"],
+        "candidate_binary_sha256": audit["source"]["candidate_binary_sha256"],
+        "oracle_producer_binary_sha256":
+            audit["source"]["oracle_producer_binary_sha256"],
+        "reference_ring_sha256": audit["ring"]["sha256"],
+        "launch_receipt_sha256": launch_receipt_sha,
+        "inputs_unchanged": True,
+    }
+    expected["postflight_sha256"] = hashlib.sha256(
+        canonical_bytes(expected),
+    ).hexdigest()
+    require(raw == canonical_bytes(postflight) and postflight == expected,
+            "Soak input-stability postflight differs from the original overlay")
+    return {"path": str(path), "raw_sha256": checksum,
+            "postflight_sha256": postflight["postflight_sha256"]}
 
 
 def command_validate(args: argparse.Namespace) -> int:
@@ -3823,9 +4275,21 @@ def launch_process(
     on_cleanup: Any | None = None,
     timeout_from_before_popen: bool = False,
     timeout_includes_cleanup: bool = False,
+    resource_budget_monitor: Any | None = None,
 ) -> int | dict[str, Any]:
     """Run one child in a separate process group and reap it on timeout/signal."""
     require(command and all(type(arg) is str for arg in command), "launch command is malformed")
+    require(resource_budget_monitor is None or callable(resource_budget_monitor),
+            "Source5 resource-budget monitor callback is malformed")
+    if resource_budget_monitor is not None:
+        try:
+            initial_budget_stop = bool(resource_budget_monitor())
+        except BaseException as error:
+            raise SoakReadbackError(
+                f"Source5 resource monitor failed before APP Popen: {type(error).__name__}: {error}",
+            ) from error
+        require(not initial_budget_stop,
+                "Source5 resource monitor refused before APP Popen")
     cpu_ids = _parse_cpu_set(cpu_set)
     require(0 < timeout_seconds <= 14_400 and 0 < term_grace_seconds <= 60, "launch timeout is outside its finite bounds")
     cleanup_scan_reserve = 3 * OWNED_GROUP_SCAN_MAX_SECONDS
@@ -3850,6 +4314,8 @@ def launch_process(
     stop_started: float | None = None
     timed_out = False
     limit_exceeded = False
+    resource_budget_exceeded = False
+    resource_monitor_error: str | None = None
     term_sent = False
     term_sent_at: float | None = None
     kill_sent = False
@@ -3989,6 +4455,16 @@ def launch_process(
                         request_stop(signal.SIGTERM, None)
             if monitor is not None:
                 monitor(process)
+            if resource_budget_monitor is not None and not resource_budget_exceeded:
+                try:
+                    resource_budget_exceeded = bool(resource_budget_monitor())
+                except BaseException as error:
+                    resource_budget_exceeded = True
+                    resource_monitor_error = f"{type(error).__name__}: {error}"
+                if resource_budget_exceeded:
+                    limit_exceeded = True
+                    if not signal_intents:
+                        request_stop(signal.SIGTERM, None)
             consume_signal_intent()
             child_status = owner.observe()
             now = time.monotonic()
@@ -4098,6 +4574,9 @@ def launch_process(
                 "cwd": str(cwd.resolve(strict=True)) if cwd is not None else str(Path.cwd()),
                 "cpu_set": cpu_set,
             }
+            if resource_budget_monitor is not None:
+                result_value["resource_budget_exceeded"] = resource_budget_exceeded
+                result_value["resource_monitor_error"] = resource_monitor_error
         else:
             result_value = return_code
     except SoakReadbackError:
@@ -4648,6 +5127,57 @@ def _validate_pressure_proof(artifact_dir: Path, audit: dict[str, Any]) -> dict[
         condition["readiness_thresholds"],
         artifact_dir / "pressure-readback.json",
     )
+
+
+def _validate_pressure_proof_monitored(
+    artifact_dir: Path, audit: dict[str, Any], resource_monitor: Any,
+) -> dict[str, Any]:
+    """Keep postflight capacity sampling live during pressure proof replay."""
+    if resource_monitor is None:
+        return _validate_pressure_proof(artifact_dir, audit)
+    stop = threading.Event()
+    sampler_error: list[BaseException] = []
+    interval_seconds = resource_monitor.interval_ns / 1_000_000_000
+
+    def sample_until_complete() -> None:
+        try:
+            while not stop.wait(interval_seconds):
+                if resource_monitor.sample("postflight"):
+                    return
+        except BaseException as error:
+            sampler_error.append(error)
+
+    thread = threading.Thread(
+        target=sample_until_complete,
+        name="source5-soak-resource-monitor-pressure-postflight",
+        daemon=True,
+    )
+    thread.start()
+    proof: dict[str, Any] | None = None
+    proof_error: BaseException | None = None
+    try:
+        proof = _validate_pressure_proof(artifact_dir, audit)
+    except BaseException as error:
+        proof_error = error
+    finally:
+        stop.set()
+        thread.join()
+        if sampler_error:
+            resource_monitor.failure = resource_monitor.failure or (
+                f"pressure_proof_monitor_thread:{type(sampler_error[0]).__name__}:"
+                f"{sampler_error[0]}"
+            )[:4096]
+        try:
+            resource_monitor.sample("postflight", force=True)
+        except BaseException as error:
+            resource_monitor.failure = resource_monitor.failure or (
+                f"pressure_proof_monitor_final_sample:{type(error).__name__}:{error}"
+            )[:4096]
+    if proof_error is not None:
+        raise proof_error
+    require(proof is not None,
+            "Source5 monitored pressure proof returned no receipt")
+    return proof
 
 
 def _legacy_pressure_info_for_postflight(
@@ -5210,8 +5740,13 @@ def _signal_owned_pressure_worker(record: dict[str, Any], signum: int) -> bool:
         os.close(pidfd)
 
 
-def _wait_pressure_workers_gone(sessions: dict[tuple[str, int | None], dict[str, Any]], deadline: float) -> bool:
+def _wait_pressure_workers_gone(
+    sessions: dict[tuple[str, int | None], dict[str, Any]], deadline: float,
+    *, resource_monitor: Any | None = None,
+) -> bool:
     while time.monotonic() < deadline:
+        if resource_monitor is not None:
+            resource_monitor.sample("pressure_cleanup")
         _reap_adopted_pressure_workers(sessions)
         if all(_same_pressure_worker(record) is None for record in sessions.values()):
             return True
@@ -5222,18 +5757,22 @@ def _wait_pressure_workers_gone(sessions: dict[tuple[str, int | None], dict[str,
 
 def _cleanup_owned_pressure_workers(
     sessions: dict[tuple[str, int | None], dict[str, Any]], term_seconds: int, kill_seconds: int,
+    *, resource_monitor: Any | None = None,
 ) -> bool:
     if not sessions:
         return True
     for record in sessions.values():
         _signal_owned_pressure_worker(record, signal.SIGTERM)
     term_deadline = time.monotonic() + term_seconds
-    if _wait_pressure_workers_gone(sessions, term_deadline):
+    if _wait_pressure_workers_gone(
+            sessions, term_deadline, resource_monitor=resource_monitor):
         return True
     for record in sessions.values():
         _signal_owned_pressure_worker(record, signal.SIGKILL)
     kill_deadline = time.monotonic() + kill_seconds
-    return _wait_pressure_workers_gone(sessions, kill_deadline)
+    return _wait_pressure_workers_gone(
+        sessions, kill_deadline, resource_monitor=resource_monitor,
+    )
 
 
 def _signal_owned_pressure_driver(process: subprocess.Popen[bytes], signum: int, start_ticks: int | None) -> None:
@@ -5248,17 +5787,716 @@ def _signal_owned_pressure_driver(process: subprocess.Popen[bytes], signum: int,
         pass
 
 
+def _load_soak_resource_monitor_owner(
+    audit: dict[str, Any], budget: dict[str, Any],
+) -> Any:
+    source_root = Path(audit["source_root"])
+    manifest = audit["source"]["manifest"]
+    files = manifest["source"]["files"]
+    owner_pin = exact_object(budget["binding"]["monitor_owner"], {
+        "path", "raw_sha256", "mode", "size",
+    }, "Source5 FixedR8 monitor-owner pin")
+    require(owner_pin["path"] == "scripts/application-fixed-pair.py",
+            "Soak resource monitor owner path differs from FixedR8")
+    rows = [row for row in files if type(row) is dict and
+            row.get("path") == owner_pin["path"]]
+    require(len(rows) == 1,
+            "Soak resource monitor owner is absent from the typed SourceV5 inventory")
+    row = exact_object(rows[0], {"path", "kind", "mode", "sha256", "size"},
+                       "Source5 FixedR8 monitor-owner inventory row")
+    path = safe_child(source_root, owner_pin["path"],
+                      "captured FixedR8 resource monitor owner")
+    raw, actual = read_stable_bytes(path, "captured FixedR8 resource monitor owner",
+                                    MAX_SOURCE_FILE_BYTES)
+    info = path.lstat()
+    mode = f"{stat.S_IFMT(info.st_mode) | stat.S_IMODE(info.st_mode):06o}"
+    require(row["kind"] == "file" and row["sha256"] == owner_pin["raw_sha256"] == actual and
+            row["mode"] == owner_pin["mode"] == mode and
+            row["size"] == owner_pin["size"] == len(raw),
+            "FixedR8 resource-monitor owner differs from SourceV5 and its budget pin")
+    module = types.ModuleType(f"source5_soak_resource_owner_{actual}")
+    module.__file__ = str(path)
+    module.__package__ = ""
+    try:
+        exec(compile(raw, str(path), "exec", dont_inherit=True), module.__dict__)
+    except (SyntaxError, ValueError, TypeError) as error:
+        raise SoakReadbackError(
+            f"captured FixedR8 resource-monitor owner cannot be compiled: {error}",
+        ) from error
+    for name in ("_tmpdir_usage_snapshot", "_open_tmpdir_absolute_directory",
+                 "_mount_identity"):
+        require(callable(getattr(module, name, None)),
+                f"captured FixedR8 resource-monitor owner lacks {name}")
+    return module
+
+
+def _read_soak_resource_budget(
+    value: object, audit: dict[str, Any], output_root: Path,
+) -> tuple[dict[str, Any], dict[str, str]]:
+    pin = exact_object(value, {"path", "raw_sha256", "semantic_sha256"},
+                       "Source5 Soak resource-budget pin")
+    path = safe_absolute_path(pin["path"], "Source5 Soak resource-budget path")
+    digest(pin["raw_sha256"], "Source5 Soak resource-budget raw SHA-256")
+    digest(pin["semantic_sha256"], "Source5 Soak resource-budget semantic SHA-256")
+    raw, raw_sha = read_stable_bytes(path, "Source5 Soak resource budget",
+                                    64 * 1024)
+    info = path.lstat()
+    require(stat.S_ISREG(info.st_mode) and info.st_uid == os.getuid() and
+            stat.S_IMODE(info.st_mode) == 0o600 and raw_sha == pin["raw_sha256"],
+            "Source5 Soak resource budget mode/owner/raw pin differs")
+    source_root = Path(audit["source_root"]).resolve(strict=True)
+    require(path.resolve(strict=True) == path and
+            path != source_root and source_root not in path.parents and
+            path != output_root and output_root not in path.parents,
+            "Source5 Soak resource budget is aliased or inside immutable/job output")
+    try:
+        budget = json.loads(raw)
+    except (UnicodeError, json.JSONDecodeError, RecursionError) as error:
+        raise SoakReadbackError(f"Source5 Soak resource budget is invalid JSON: {error}") from error
+    budget = exact_object(budget, {
+        "schema", "binding", "layout", "schedule", "ceilings",
+        "artifact_limits", "resource_budget_sha256",
+    }, "Source5 Soak resource budget")
+    body = {key: item for key, item in budget.items()
+            if key != "resource_budget_sha256"}
+    semantic = hashlib.sha256(canonical_bytes(body)).hexdigest()
+    require(raw == canonical_bytes(budget) and
+            budget["schema"] == SOAK_RESOURCE_BUDGET_SCHEMA and
+            budget["resource_budget_sha256"] == pin["semantic_sha256"] == semantic,
+            "Source5 Soak resource budget canonical/raw/semantic digest differs")
+    binding = exact_object(budget["binding"], {
+        "campaign_id", "host_id", "job_sha256", "source_manifest",
+        "source_tree_sha256", "parent_recipe", "build_receipt",
+        "prepared_host_binding_sha256", "observed_host", "monitor_owner",
+        "soak_adapter", "soak_reader",
+    }, "Source5 Soak resource budget binding")
+    source_ref = audit["source"]
+    source_manifest = source_ref["manifest"]
+    parent_pin = budget["binding"]["parent_recipe"]
+    source_pin = budget["binding"]["source_manifest"]
+    pressure_recipe = source_ref["pressure_recipe"]["value"]
+    pressure_schedule = source_ref["pressure_recipe"]["pressure_schedule"]
+    layout = exact_object(budget["layout"], SOAK_RESOURCE_BUDGET_LAYOUT_FIELDS,
+                          "Source5 Soak resource budget layout")
+    schedule = exact_object(budget["schedule"],
+                            SOAK_RESOURCE_BUDGET_SCHEDULE_FIELDS,
+                            "Source5 Soak resource budget schedule")
+    for name, value in schedule.items():
+        uint(value, f"Source5 Soak resource schedule {name}", positive=True)
+    ceilings = exact_object(budget["ceilings"],
+                            SOAK_RESOURCE_BUDGET_CEILING_FIELDS,
+                            "Source5 Soak resource budget ceilings")
+    for name, value in ceilings.items():
+        uint(value, f"Source5 Soak resource ceiling {name}", positive=True)
+    artifact_limits = exact_object(
+        budget["artifact_limits"], SOAK_RESOURCE_BUDGET_ARTIFACT_FIELDS,
+        "Source5 Soak resource budget artifact limits",
+    )
+    for name, value in artifact_limits.items():
+        uint(value, f"Source5 Soak artifact limit {name}", positive=True)
+    expected_source = {
+        "path": audit["recipe"]["source"]["manifest_path"],
+        "raw_sha256": source_ref["source_manifest_sha256"],
+        "semantic_sha256": source_ref["source_manifest_semantic_sha256"],
+    }
+    require(binding["campaign_id"] == audit["identity"]["campaign_id"] and
+            binding["host_id"] == audit["identity"]["host_id"] and
+            binding["source_manifest"] == expected_source and
+            binding["source_tree_sha256"] == source_ref["source_tree_sha256"] and
+            type(parent_pin) is dict and
+            set(parent_pin) == {"path", "raw_sha256"} and
+            Path(parent_pin["path"]).is_absolute() and
+            parent_pin["raw_sha256"] == audit["recipe_sha256"],
+            "Source5 Soak budget source/recipe binding differs from its captured audit")
+    require(layout["output_root"] == str(output_root) and
+            layout["application_tmpdir"] ==
+                pressure_recipe["process"]["application_tmpdir_path"] and
+            layout["pressure_scratch"] ==
+                pressure_recipe["storage"]["pressure_scratch_path"] and
+            layout["probe_tmpdir"] ==
+                str(Path(layout["probe_capture_root"]) / "tmp") and
+            schedule["production_seconds"] == 10_800 ==
+                audit["duration_seconds"] and
+            schedule["application_sample_interval_ms"] == SAMPLE_INTERVAL_MS and
+            schedule["application_sample_tolerance_ns"] == SAMPLE_TOLERANCE_NS and
+            schedule["application_sample_count"] == 108_001 and
+            schedule["application_wall_timeout_seconds"] ==
+                source_ref["application_supervision"]["application_wall_timeout_seconds"] and
+            schedule["pressure_total_deadline_seconds"] ==
+                pressure_schedule["total_deadline_seconds"] and
+            schedule["authorization_effective_timeout_seconds"] > 0 and
+            0 < schedule["probe_timeout_seconds"] <= 30 and
+            0 < schedule["resource_monitor_interval_ms"] <=
+                MAX_SOAK_RESOURCE_OWNER_POLL_NS // 1_000_000 and
+            0 <= schedule["resource_monitor_tolerance_ns"] <=
+                MAX_SOAK_RESOURCE_OWNER_POLL_NS and
+            (schedule["resource_monitor_interval_ms"] * 1_000_000 +
+             schedule["resource_monitor_tolerance_ns"]) <=
+                2 * MAX_SOAK_RESOURCE_OWNER_POLL_NS and
+            artifact_limits["terminal_stream_bytes"] ==
+                audit["recipe"]["runtime"]["terminal_budget_bytes"] and
+            artifact_limits["resource_samples_bytes"] ==
+                audit["recipe"]["runtime"]["sample_budget_bytes"] and
+            artifact_limits["terminal_stream_bytes"] <= MAX_TERMINAL_BYTES and
+            artifact_limits["resource_samples_bytes"] <= MAX_SAMPLE_BYTES and
+            all(artifact_limits[name] <= MAX_RECEIPT_BYTES for name in (
+                "soak_receipt_bytes", "launch_receipt_bytes",
+                "preflight_receipt_bytes", "readback_receipt_bytes",
+                "pressure_run_receipt_bytes", "pressure_launch_bytes",
+                "pressure_binding_bytes", "pressure_ready_bytes",
+            )) and
+            ceilings["maximum_monitor_stream_bytes"] <=
+                MAX_SOAK_RESOURCE_MONITOR_STREAM_BYTES and
+            ceilings["maximum_monitor_rows"] <= MAX_SOAK_RESOURCE_MONITOR_ROWS and
+            ceilings["maximum_monitor_row_bytes"] <=
+                MAX_SOAK_RESOURCE_MONITOR_ROW_BYTES and
+            artifact_limits["resource_monitor_stream_bytes"] <=
+                ceilings["maximum_monitor_stream_bytes"] and
+            artifact_limits["owner_return_receipt_bytes"] <=
+                ceilings["durable_receipt_reserve_bytes"],
+            "Source5 Soak budget schedule differs from its independently derived audit")
+    owner = _load_soak_resource_monitor_owner(audit, budget)
+    return budget, dict(pin)
+
+
+class _SoakResourceMonitor:
+    """Append bounded origin samples using the SourceV5-pinned FixedR8 walker."""
+
+    _phases = ("preflight", "probe_capture", "preflight_audit",
+               "pressure_startup", "application", "pressure_cleanup",
+               "postflight")
+
+    def __init__(
+        self, budget: dict[str, Any], budget_pin: dict[str, str],
+        owner: Any, output_root: Path, *, resume: bool = False,
+    ) -> None:
+        self.budget = budget
+        self.budget_pin = budget_pin
+        self.owner = owner
+        self.path = output_root / "source5-soak-resource-monitor.jsonl"
+        self.maximum_bytes = budget["ceilings"]["maximum_monitor_stream_bytes"]
+        self.maximum_rows = budget["ceilings"]["maximum_monitor_rows"]
+        self.maximum_row_bytes = budget["ceilings"]["maximum_monitor_row_bytes"]
+        self.interval_ns = budget["schedule"]["resource_monitor_interval_ms"] * 1_000_000
+        self.gap_ns = self.interval_ns + budget["schedule"]["resource_monitor_tolerance_ns"]
+        self.domains = (
+            ("output", "output_root", "maximum_output_bytes", "maximum_output_inodes"),
+            ("application_tmpdir", "application_tmpdir", "maximum_application_tmpdir_bytes", "maximum_application_tmpdir_inodes"),
+            ("pressure_scratch", "pressure_scratch", "maximum_pressure_scratch_bytes", "maximum_pressure_scratch_inodes"),
+            ("probe_capture", "probe_capture_root", "maximum_probe_output_bytes", "maximum_probe_output_inodes"),
+            ("probe_tmpdir", "probe_tmpdir", "maximum_probe_tmpdir_bytes", "maximum_probe_tmpdir_inodes"),
+        )
+        self.identities: dict[str, tuple[int, int]] = {}
+        self.expected_devices: dict[str, int] = {}
+        self.last_ns: int | None = None
+        self.last_phase = "preflight"
+        self.row_count = 0
+        self.previous_sha256 = "0" * 64
+        self.prefix_hasher = hashlib.sha256()
+        self.high_water: dict[str, dict[str, int]] = {}
+        output_root = Path(budget["layout"]["output_root"])
+        pressure_root = output_root / "pressure"
+        output_roles = (
+            ("stdout.log", "application_stdout_bytes"),
+            ("stderr.log", "application_stderr_bytes"),
+            ("time.txt", "application_timing_bytes"),
+            ("soak-receipt.json", "soak_receipt_bytes"),
+            ("soak-launch.json", "launch_receipt_bytes"),
+            ("soak-preflight.json", "preflight_receipt_bytes"),
+            ("soak-postflight.json", "postflight_receipt_bytes"),
+            ("source5-soak-launch-authorization.json", "launch_authorization_bytes"),
+            ("source5-soak-postflight.json", "postflight_receipt_bytes"),
+            ("soak-readback.json", "readback_receipt_bytes"),
+            ("source5-soak-supervisor.json", "source5_supervisor_bytes"),
+            ("pressure-readback.json", "pressure_readback_bytes"),
+            ("pressure-driver.stdout.log", "pressure_driver_stdout_bytes"),
+            ("pressure-driver.stderr.log", "pressure_driver_stderr_bytes"),
+            ("source5-soak-resource-monitor.jsonl", "resource_monitor_stream_bytes"),
+            ("source5-soak-application-owner-return.json", "owner_return_receipt_bytes"),
+            ("source5-soak-pressure-owner-return.json", "owner_return_receipt_bytes"),
+            ("source5-soak-component.json", "component_receipt_bytes"),
+            ("source5-soak-failure.json", "failure_receipt_bytes"),
+            ("terminal-records.tsv", "terminal_stream_bytes"),
+            ("resource-samples.tsv", "resource_samples_bytes"),
+        )
+        self.artifact_caps = [
+            (output_root / filename, budget["artifact_limits"][limit])
+            for filename, limit in output_roles
+        ]
+        self.artifact_caps.extend((
+            (pressure_root / "run.json",
+             budget["artifact_limits"]["pressure_run_receipt_bytes"]),
+            (pressure_root / "events.jsonl",
+             budget["artifact_limits"]["pressure_events_bytes"]),
+            (pressure_root / "launch-record.json",
+             budget["artifact_limits"]["pressure_launch_bytes"]),
+            (pressure_root / "process-binding.json",
+             budget["artifact_limits"]["pressure_binding_bytes"]),
+            (pressure_root / "pressure-ready.json",
+             budget["artifact_limits"]["pressure_ready_bytes"]),
+        ))
+        self.last_usage: dict[str, Any] = {"domains": {}, "devices": {}}
+        self.failure: str | None = None
+        self.fd: int | None = None
+        self.final_summary: dict[str, Any] | None = None
+        if resume:
+            self._resume()
+        else:
+            self._create()
+
+    def _write_line(self, value: dict[str, Any], *, row: bool = False) -> bool:
+        raw = canonical_bytes(value)
+        if row and len(raw) > self.maximum_row_bytes:
+            self.failure = "resource_monitor_row_byte_bound"
+            return False
+        if self.path.lstat().st_size + len(raw) > self.maximum_bytes:
+            self.failure = "resource_monitor_stream_byte_bound"
+            return False
+        require(self.fd is not None, "Soak resource monitor stream is closed")
+        view = memoryview(raw)
+        while view:
+            written = os.write(self.fd, view)
+            require(written > 0, "Soak resource monitor stream write made no progress")
+            view = view[written:]
+        self.prefix_hasher.update(raw)
+        return True
+
+    def _create(self) -> None:
+        require(not self.path.exists() and not self.path.is_symlink(),
+                "refusing to replace Source5 Soak resource-monitor stream")
+        self.fd = os.open(
+            self.path, os.O_WRONLY | os.O_CREAT | os.O_EXCL |
+            getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0), 0o600,
+        )
+        owner_pin = self.budget["binding"]["monitor_owner"]
+        header_body = {
+            "schema": SOAK_RESOURCE_MONITOR_SCHEMA,
+            "budget": self.budget_pin,
+            "monitor_owner": owner_pin,
+            "layout": self.budget["layout"],
+            "schedule": self.budget["schedule"],
+            "ceilings": self.budget["ceilings"],
+            "started_monotonic_ns": time.monotonic_ns(),
+        }
+        header = {**header_body,
+                  "header_sha256": hashlib.sha256(canonical_bytes(header_body)).hexdigest()}
+        require(len(canonical_bytes(header)) <= self.maximum_row_bytes,
+                "Source5 resource-monitor header exceeds its row bound")
+        require(self._write_line(header),
+                "Source5 Soak resource-monitor header exceeds its stream budget")
+        os.fsync(self.fd)
+
+    def _resume(self) -> None:
+        require(self.path.is_file() and not self.path.is_symlink(),
+                "Source5 Soak resource-monitor prefix is missing")
+        header_seen = False
+        previous = "0" * 64
+        previous_time: int | None = None
+        prior_phase = "preflight"
+        row_index = 0
+        pending = bytearray()
+
+        def process_line(line: bytes) -> None:
+            nonlocal header_seen, previous, previous_time, prior_phase, row_index
+            require(len(line) <= self.maximum_row_bytes,
+                    f"Source5 resource-monitor prefix line[{row_index}] exceeds its bound")
+            try:
+                row = json.loads(line)
+            except (UnicodeError, json.JSONDecodeError, RecursionError) as error:
+                raise SoakReadbackError(
+                    f"Source5 resource-monitor prefix line[{row_index}] is invalid: {error}",
+                ) from error
+            require(type(row) is dict and canonical_bytes(row) == line,
+                    f"Source5 resource-monitor prefix line[{row_index}] is not canonical")
+            if not header_seen:
+                header_body = {key: value for key, value in row.items()
+                               if key != "header_sha256"}
+                require(row.get("schema") == SOAK_RESOURCE_MONITOR_SCHEMA and
+                        row.get("budget") == self.budget_pin and
+                        row.get("layout") == self.budget["layout"] and
+                        row.get("monitor_owner") == self.budget["binding"]["monitor_owner"] and
+                        row.get("header_sha256") == hashlib.sha256(
+                            canonical_bytes(header_body)).hexdigest(),
+                        "Source5 resource-monitor prefix header differs from its budget")
+                header_seen = True
+                self.prefix_hasher.update(line)
+                return
+            body = {key: value for key, value in row.items()
+                    if key != "row_sha256"}
+            require(row.get("schema") == SOAK_RESOURCE_MONITOR_ROW_SCHEMA and
+                    row.get("sequence") == row_index and
+                    row.get("previous_sha256") == previous and
+                    row.get("row_sha256") == hashlib.sha256(
+                        canonical_bytes(body)).hexdigest() and
+                    row.get("phase") in self._phases and
+                    self._phases.index(row["phase"]) >= self._phases.index(prior_phase),
+                    f"Source5 resource-monitor prefix row[{row_index}] chain/order differs")
+            monotonic_ns = row.get("monotonic_ns")
+            require(type(monotonic_ns) is int and monotonic_ns > 0 and
+                    (previous_time is None or
+                     0 < monotonic_ns - previous_time <= self.gap_ns),
+                    f"Source5 resource-monitor prefix row[{row_index}] timing differs")
+            self._accumulate(row.get("domains"))
+            for name, item in row["domains"].items():
+                if item["inode"] is None:
+                    self.expected_devices[name] = item["device"]
+                elif name in self.expected_devices:
+                    require(item["device"] == self.expected_devices[name],
+                            f"Source5 resource-monitor {name} moved to another device")
+                    self.expected_devices.pop(name, None)
+                    self.identities[name] = (item["device"], item["inode"])
+                elif type(item["inode"]) is int:
+                    prior = self.identities.get(name)
+                    identity = (item["device"], item["inode"])
+                    require(prior is None or prior == identity,
+                            f"Source5 resource-monitor {name} identity changed in its prefix")
+                    self.identities[name] = identity
+            self.last_usage = {"domains": row.get("domains", {}),
+                               "devices": row.get("devices", {})}
+            previous = row["row_sha256"]
+            previous_time = monotonic_ns
+            prior_phase = row["phase"]
+            self.prefix_hasher.update(line)
+            row_index += 1
+
+        with StableInput(self.path, "Source5 resource-monitor prefix",
+                         self.maximum_bytes) as stream:
+            while stream.consumed < stream.size:
+                block = stream.read(min(64 * 1024,
+                                        stream.size - stream.consumed))
+                require(bool(block),
+                        "Source5 resource-monitor prefix was truncated")
+                for byte in block:
+                    pending.append(byte)
+                    if byte == 10:
+                        process_line(bytes(pending))
+                        pending.clear()
+                    else:
+                        require(len(pending) <= self.maximum_row_bytes,
+                                "Source5 resource-monitor prefix row exceeds its cap")
+            require(not pending and header_seen,
+                    "Source5 resource-monitor prefix has a partial or missing header")
+            stream.finish()
+        self.row_count = row_index
+        self.previous_sha256 = previous
+        self.last_ns = previous_time
+        self.last_phase = prior_phase
+        self.fd = os.open(self.path, os.O_WRONLY | os.O_APPEND |
+                          getattr(os, "O_CLOEXEC", 0) |
+                          getattr(os, "O_NOFOLLOW", 0))
+
+    def _accumulate(self, domains: object) -> None:
+        require(type(domains) is dict and
+                set(domains) == {row[0] for row in self.domains},
+                "Source5 resource-monitor domain map is incomplete")
+        for name, value in domains.items():
+            require(type(value) is dict and
+                    set(value) == {"path", "device", "inode", "bytes_used",
+                                   "inode_count", "available_bytes",
+                                   "available_inodes", "bytes_limit", "inode_limit"},
+                    f"Source5 resource-monitor {name} row is malformed")
+            high = self.high_water.setdefault(name, {"bytes": 0, "inodes": 0})
+            high["bytes"] = max(high["bytes"], value["bytes_used"])
+            high["inodes"] = max(high["inodes"], value["inode_count"])
+
+    def _sample_domains(self) -> tuple[dict[str, Any], dict[str, dict[str, int]]]:
+        layout = self.budget["layout"]
+        ceilings = self.budget["ceilings"]
+        measured: dict[str, Any] = {}
+        devices: dict[int, dict[str, Any]] = {}
+        for name, path_field, byte_field, inode_field in self.domains:
+            path = Path(layout[path_field])
+            byte_limit = ceilings[byte_field]
+            inode_limit = ceilings[inode_field]
+            try:
+                named_root = path.lstat()
+            except FileNotFoundError:
+                named_root = None
+            absent_probe = (name in {"probe_capture", "probe_tmpdir"} and
+                            named_root is None)
+            if absent_probe and name in self.identities:
+                raise SoakReadbackError(
+                    f"Source5 resource-monitor {name} root disappeared or was replaced",
+                )
+            if named_root is not None:
+                require(stat.S_ISDIR(named_root.st_mode) and
+                        not stat.S_ISLNK(named_root.st_mode),
+                        f"Source5 resource-monitor {name} root is linked or not a directory")
+            stat_path = path
+            if absent_probe:
+                stat_path = path.parent
+                while not stat_path.exists() and stat_path.parent != stat_path:
+                    stat_path = stat_path.parent
+                fd = self.owner._open_tmpdir_absolute_directory(stat_path)
+                root_info = os.fstat(fd)
+                root_identity = (root_info.st_dev, root_info.st_ino)
+                usage = {"bytes_used": 0, "inode_count": 0}
+                placeholder = True
+                expected_device = self.expected_devices.get(name)
+                if expected_device is not None and root_info.st_dev != expected_device:
+                    os.close(fd)
+                    raise SoakReadbackError(
+                        f"Source5 resource-monitor {name} placeholder changed device",
+                    )
+            else:
+                fd = self.owner._open_tmpdir_absolute_directory(path)
+                root_info = os.fstat(fd)
+                if ((named_root.st_dev, named_root.st_ino,
+                     named_root.st_uid, named_root.st_mode) !=
+                    (root_info.st_dev, root_info.st_ino,
+                     root_info.st_uid, root_info.st_mode)):
+                    os.close(fd)
+                    raise SoakReadbackError(
+                        f"Source5 resource-monitor {name} root changed between stat and open",
+                    )
+                root_identity = (root_info.st_dev, root_info.st_ino)
+                placeholder = False
+                expected_device = self.expected_devices.get(name)
+                if expected_device is not None and root_info.st_dev != expected_device:
+                    os.close(fd)
+                    raise SoakReadbackError(
+                        f"Source5 resource-monitor {name} capture root changed device",
+                    )
+                self.expected_devices.pop(name, None)
+                previous = self.identities.get(name)
+                if previous is not None and previous != root_identity:
+                    os.close(fd)
+                    raise SoakReadbackError(
+                        f"Source5 resource-monitor {name} root identity changed",
+                    )
+                self.identities[name] = root_identity
+                try:
+                    usage = self.owner._tmpdir_usage_snapshot(
+                        path, byte_limit, inode_limit, root_identity,
+                        allow_descendant_enoent=True,
+                    )
+                except BaseException:
+                    os.close(fd)
+                    raise
+            try:
+                mount = self.owner._mount_identity(stat_path if placeholder else path)
+                fs = os.fstatvfs(fd)
+                available_bytes = fs.f_bavail * fs.f_frsize
+                available_inodes = fs.f_favail
+                require(mount["device"] == root_info.st_dev,
+                        f"Source5 resource-monitor {name} device changed")
+                if not placeholder:
+                    expected_identity = self.identities.get(name)
+                    if expected_identity is not None and expected_identity != root_identity:
+                        raise SoakReadbackError(
+                            f"Source5 resource-monitor {name} root identity changed",
+                        )
+                    self.identities[name] = root_identity
+                else:
+                    self.expected_devices[name] = root_info.st_dev
+                item = {
+                    "path": str(path), "device": root_info.st_dev,
+                    "inode": None if placeholder else root_info.st_ino,
+                    "bytes_used": usage["bytes_used"],
+                    "inode_count": usage["inode_count"],
+                    "available_bytes": available_bytes,
+                    "available_inodes": available_inodes,
+                    "bytes_limit": byte_limit, "inode_limit": inode_limit,
+                }
+                require(item["bytes_used"] <= byte_limit and
+                        item["inode_count"] <= inode_limit,
+                        f"Source5 resource-monitor {name} ceiling exceeded")
+                measured[name] = item
+                device = devices.setdefault(root_info.st_dev, {
+                    "available_bytes": available_bytes,
+                    "available_inodes": available_inodes,
+                    "roots": [],
+                })
+                device["available_bytes"] = min(device["available_bytes"],
+                                                available_bytes)
+                device["available_inodes"] = min(device["available_inodes"],
+                                                 available_inodes)
+                device["roots"].append(name)
+            finally:
+                os.close(fd)
+        allowance_by_device: dict[int, dict[str, int]] = {}
+        for device, device_row in devices.items():
+            roots = [next(spec for spec in self.domains if spec[0] == name)
+                     for name in device_row["roots"]]
+            roots.sort(key=lambda spec: (len(Path(layout[spec[1]]).parts),
+                                         layout[spec[1]]))
+            top_level: list[Path] = []
+            allowance_bytes = 0
+            allowance_inodes = 0
+            for name, path_field, byte_field, inode_field in roots:
+                path = Path(layout[path_field])
+                if any(path == parent or parent in path.parents
+                       for parent in top_level):
+                    continue
+                top_level.append(path)
+                allowance_bytes += max(
+                    0, ceilings[byte_field] - measured[name]["bytes_used"],
+                )
+                allowance_inodes += max(
+                    0, ceilings[inode_field] - measured[name]["inode_count"],
+                )
+            required_bytes = (ceilings["minimum_free_bytes"] +
+                              allowance_bytes +
+                              ceilings["durable_receipt_reserve_bytes"])
+            required_inodes = (ceilings["minimum_free_inodes"] +
+                               allowance_inodes +
+                               ceilings["durable_receipt_reserve_inodes"])
+            require(device_row["available_bytes"] >= required_bytes and
+                    device_row["available_inodes"] >= required_inodes,
+                    f"Source5 resource-monitor device {device} fell below its frozen free-space/reserve floor")
+            allowance_by_device[device] = {
+                "remaining_bytes": allowance_bytes,
+                "remaining_inodes": allowance_inodes,
+                "required_bytes": required_bytes,
+                "required_inodes": required_inodes,
+            }
+        device_projection = {
+            str(device): {
+                "available_bytes": row["available_bytes"],
+                "available_inodes": row["available_inodes"],
+                **allowance_by_device[device],
+            }
+            for device, row in devices.items()
+        }
+        return measured, device_projection
+
+    def _check_declared_artifact_caps(self) -> None:
+        """Enforce the caller's closed writable-role limits during live ownership."""
+        for path, maximum in self.artifact_caps:
+            try:
+                info = path.lstat()
+            except FileNotFoundError:
+                continue
+            except OSError as error:
+                raise SoakReadbackError(
+                    f"cannot inspect bounded Soak artifact {path.name}: {error}",
+                ) from error
+            require(stat.S_ISREG(info.st_mode) and not stat.S_ISLNK(info.st_mode) and
+                    info.st_nlink == 1 and info.st_uid == os.getuid() and
+                    0 <= info.st_size <= maximum,
+                    f"Source5 bounded Soak artifact role exceeded its frozen limit: {path.name}")
+
+    def sample(self, phase: str, *, force: bool = False) -> bool:
+        require(phase in self._phases,
+                "Source5 resource-monitor phase is outside the frozen schedule")
+        phase_index = self._phases.index(phase)
+        require(phase_index >= self._phases.index(self.last_phase),
+                "Source5 resource-monitor phase order moved backwards")
+        now = time.monotonic_ns()
+        if self.last_ns is not None and not force and now - self.last_ns < self.interval_ns:
+            return self.failure is not None
+        if self.last_ns is not None and now - self.last_ns > self.gap_ns:
+            self.failure = self.failure or "resource_monitor_gap_exceeded"
+        try:
+            domains, devices = self._sample_domains()
+            self._check_declared_artifact_caps()
+        except BaseException as error:
+            domains, devices = {}, {}
+            self.failure = self.failure or (
+                f"resource_monitor_scan:{type(error).__name__}:{error}"
+            )[:4096]
+        self.last_usage = {"domains": domains, "devices": devices}
+        row_body = {
+            "schema": SOAK_RESOURCE_MONITOR_ROW_SCHEMA,
+            "sequence": self.row_count,
+            "phase": phase,
+            "monotonic_ns": now,
+            "previous_sha256": self.previous_sha256,
+            "domains": domains,
+            "devices": devices,
+            "failure": self.failure,
+        }
+        row = {**row_body,
+               "row_sha256": hashlib.sha256(canonical_bytes(row_body)).hexdigest()}
+        if self.row_count >= self.maximum_rows or not self._write_line(row, row=True):
+            self.failure = self.failure or "resource_monitor_row_or_stream_bound"
+            return True
+        self.row_count += 1
+        self.previous_sha256 = row["row_sha256"]
+        self.last_ns = now
+        self.last_phase = phase
+        self._accumulate(domains)
+        if self.fd is not None:
+            os.fsync(self.fd)
+        return self.failure is not None
+
+    def close_pending(self) -> None:
+        if self.fd is not None:
+            os.fsync(self.fd)
+            os.close(self.fd)
+            self.fd = None
+
+    def pending_summary(self) -> dict[str, Any]:
+        return {
+            "schema": "allocatbelt.application-source5-soak-resource-monitor-prefix.v1",
+            "path": str(self.path),
+            "budget": self.budget_pin,
+            "row_count": self.row_count,
+            "prefix_sha256": self.prefix_hasher.hexdigest(),
+            "last_row_sha256": self.previous_sha256,
+            "high_water": self.high_water,
+            "failure": self.failure,
+        }
+
+    def finish(self, final_usage: dict[str, Any]) -> dict[str, Any]:
+        require(self.fd is not None,
+                "Source5 resource-monitor stream is already finalized")
+        prefix_sha = self.prefix_hasher.hexdigest()
+        footer_body = {
+            "schema": SOAK_RESOURCE_MONITOR_FOOTER_SCHEMA,
+            "budget": self.budget_pin,
+            "row_count": self.row_count,
+            "previous_sha256": self.previous_sha256,
+            "prefix_sha256": prefix_sha,
+            "high_water": self.high_water,
+            "final_usage": final_usage,
+            "failure": self.failure,
+            "ended_monotonic_ns": time.monotonic_ns(),
+        }
+        footer = {**footer_body,
+                  "footer_sha256": hashlib.sha256(canonical_bytes(footer_body)).hexdigest()}
+        require(len(canonical_bytes(footer)) <= self.maximum_row_bytes,
+                "Source5 resource-monitor footer exceeds its row bound")
+        require(self._write_line(footer),
+                "Source5 resource-monitor footer exceeds its stream budget")
+        os.fsync(self.fd)
+        os.close(self.fd)
+        self.fd = None
+        self.final_summary = {
+            "schema": "allocatbelt.application-source5-soak-resource-monitor-summary.v1",
+            "budget": self.budget_pin,
+            "stream": {
+                "path": str(self.path),
+                "raw_sha256": sha256_file(
+                    self.path, "Source5 resource-monitor stream",
+                    self.maximum_bytes,
+                ),
+            },
+            "row_count": self.row_count,
+            "high_water": self.high_water,
+            "final_usage": final_usage,
+            "failure": self.failure,
+            "prefix_sha256": prefix_sha,
+        }
+        return self.final_summary
+
+
 def _stop_pressure_session(
     process: subprocess.Popen[bytes], driver_start_ticks: int | None, driver_path: Path,
     recipe_sha256: str, schedule: dict[str, Any], sessions: dict[tuple[str, int | None], dict[str, Any]],
     expected_nonce: str | None = None,
     excluded_child_identities: set[tuple[int, int]] | None = None,
     ownership_event_path: Path | None = None,
+    resource_monitor: Any | None = None,
 ) -> None:
     _capture_pressure_worker_sessions(process.pid, driver_start_ticks, driver_path, recipe_sha256, schedule, sessions, expected_nonce, excluded_child_identities, ownership_event_path)
     if process.poll() is not None:
         require(
-            _cleanup_owned_pressure_workers(sessions, schedule["term_deadline_seconds"], schedule["kill_deadline_seconds"]),
+            _cleanup_owned_pressure_workers(
+                sessions, schedule["term_deadline_seconds"],
+                schedule["kill_deadline_seconds"],
+                resource_monitor=resource_monitor,
+            ),
             "authenticated pressure workers remained alive after the pressure driver exited",
         )
         if _PRESSURE_SUBREAPER_ACTIVE:
@@ -5271,14 +6509,22 @@ def _stop_pressure_session(
     _signal_owned_pressure_driver(process, signal.SIGTERM, driver_start_ticks)
     cleanup_deadline = time.monotonic() + schedule["term_deadline_seconds"] + schedule["kill_deadline_seconds"] + 5
     while process.poll() is None and time.monotonic() < cleanup_deadline:
+        if resource_monitor is not None:
+            resource_monitor.sample("pressure_cleanup")
         _capture_pressure_worker_sessions(process.pid, driver_start_ticks, driver_path, recipe_sha256, schedule, sessions, expected_nonce, excluded_child_identities, ownership_event_path)
         try:
             process.wait(timeout=min(0.1, max(0.01, cleanup_deadline - time.monotonic())))
         except subprocess.TimeoutExpired:
             pass
     if process.poll() is None:
+        if resource_monitor is not None:
+            resource_monitor.sample("pressure_cleanup", force=True)
         _capture_pressure_worker_sessions(process.pid, driver_start_ticks, driver_path, recipe_sha256, schedule, sessions, expected_nonce, excluded_child_identities, ownership_event_path)
-        cleaned = _cleanup_owned_pressure_workers(sessions, schedule["term_deadline_seconds"], schedule["kill_deadline_seconds"])
+        cleaned = _cleanup_owned_pressure_workers(
+            sessions, schedule["term_deadline_seconds"],
+            schedule["kill_deadline_seconds"],
+            resource_monitor=resource_monitor,
+        )
         _signal_owned_pressure_driver(process, signal.SIGKILL, driver_start_ticks)
         try:
             process.wait(timeout=2)
@@ -5286,9 +6532,15 @@ def _stop_pressure_session(
             raise SoakReadbackError("pressure driver remained alive after its frozen cleanup budgets") from error
         require(cleaned, "authenticated pressure workers remained alive after their frozen TERM/KILL budgets")
     else:
+        if resource_monitor is not None:
+            resource_monitor.sample("pressure_cleanup", force=True)
         _capture_pressure_worker_sessions(process.pid, driver_start_ticks, driver_path, recipe_sha256, schedule, sessions, expected_nonce, excluded_child_identities, ownership_event_path)
         require(
-            _cleanup_owned_pressure_workers(sessions, schedule["term_deadline_seconds"], schedule["kill_deadline_seconds"]),
+            _cleanup_owned_pressure_workers(
+                sessions, schedule["term_deadline_seconds"],
+                schedule["kill_deadline_seconds"],
+                resource_monitor=resource_monitor,
+            ),
             "authenticated pressure workers remained alive after the driver exited",
         )
         if _PRESSURE_SUBREAPER_ACTIVE:
@@ -5303,11 +6555,16 @@ def _wait_pressure_ready(
     expected_recipe_sha: str, expected_condition_sha: str,
     capture_workers: Any | None = None, stderr_path: Path | None = None,
     interrupt_check: Any | None = None,
+    resource_monitor: Any | None = None,
 ) -> tuple[dict[str, Any], str]:
     deadline = time.monotonic() + pressure_recipe["schedule"]["startup_deadline_seconds"]
     last_error: BaseException | None = None
     diagnostic_stderr = stderr_path or ready_path.parent / "pressure-stderr.log"
     while time.monotonic() < deadline:
+        if resource_monitor is not None and resource_monitor.sample("pressure_startup"):
+            raise SoakReadbackError(
+                "Source5 resource monitor exceeded its bound during pressure startup",
+            )
         if interrupt_check is not None:
             interrupt_check()
         if capture_workers is not None:
@@ -5329,7 +6586,10 @@ def _wait_pressure_ready(
     raise SoakReadbackError(f"pressure did not produce an independently measured, recipe-pinned readiness marker before its startup deadline{reason}; stderr tail: {_tail_text(diagnostic_stderr)}")
 
 
-def _run_pressure_supervisor_impl(args: argparse.Namespace, audit: dict[str, Any], preflight: dict[str, Any], output_dir: Path) -> int:
+def _run_pressure_supervisor_impl(
+    args: argparse.Namespace, audit: dict[str, Any], preflight: dict[str, Any],
+    output_dir: Path, *, resource_monitor: _SoakResourceMonitor | None = None,
+) -> int:
     descriptor = audit["launch_descriptor"]
     require(descriptor.get("execution_kind") in ("normal_app", "timed_soak"), "pressure supervisor requires an explicit normal_app or timed_soak descriptor")
     supervision_state = descriptor.setdefault("_supervision_state", {})
@@ -5371,6 +6631,9 @@ def _run_pressure_supervisor_impl(args: argparse.Namespace, audit: dict[str, Any
     pressure_process: subprocess.Popen[bytes] | None = None
     pressure_start_ticks: int | None = None
     pressure_started_at: float | None = None
+    pressure_started_monotonic_ns: int | None = None
+    pressure_returned_monotonic_ns: int | None = None
+    pressure_cleanup_ended_monotonic_ns: int | None = None
     application_identity: tuple[int, int] | None = None
     pressure_workers: dict[tuple[str, int | None], dict[str, Any]] = {}
     pressure_stopped = False
@@ -5402,6 +6665,28 @@ def _run_pressure_supervisor_impl(args: argparse.Namespace, audit: dict[str, Any
             callback = descriptor.get("_on_cleanup")
             if callback is not None:
                 callback(result)
+
+        def record_pressure_owner_return() -> None:
+            nonlocal pressure_returned_monotonic_ns
+            if resource_monitor is None or pressure_process is None:
+                return
+            return_code = pressure_process.poll()
+            if return_code is None or supervision_state.get("pressure_owner_result_pin"):
+                return
+            pressure_returned_monotonic_ns = pressure_returned_monotonic_ns or \
+                time.monotonic_ns()
+            owner_return = {
+                "schema": "allocatbelt.application-source5-soak-pressure-owner-return.v2",
+                "pid": pressure_process.pid,
+                "start_ticks": pressure_start_ticks,
+                "return_code": return_code,
+                "started_monotonic_ns": pressure_started_monotonic_ns,
+                "returned_monotonic_ns": pressure_returned_monotonic_ns,
+            }
+            supervision_state["pressure_owner_result_pin"] = _write_exclusive_json(
+                output_dir / "source5-soak-pressure-owner-return.json",
+                owner_return,
+            )
 
         def finish_external_interruption(signum: int) -> int:
             callback = descriptor.get("_on_interrupted")
@@ -5435,23 +6720,41 @@ def _run_pressure_supervisor_impl(args: argparse.Namespace, audit: dict[str, Any
 
         def stop_pressure_session() -> None:
             nonlocal pressure_stopped, pressure_cleanup
+            nonlocal pressure_returned_monotonic_ns
+            nonlocal pressure_cleanup_ended_monotonic_ns
             if pressure_process is None or pressure_stopped:
                 return
             pressure_cleanup = "unverified"
             supervision_state["pressure_cleanup"] = pressure_cleanup
             try:
+                if resource_monitor is not None:
+                    resource_monitor.sample("pressure_cleanup", force=True)
+                stop_kwargs = {
+                    "excluded_child_identities": (
+                        set() if application_identity is None else
+                        {application_identity}
+                    ),
+                    "ownership_event_path": pressure_dir / "events.jsonl",
+                }
+                if resource_monitor is not None:
+                    stop_kwargs["resource_monitor"] = resource_monitor
                 _stop_pressure_session(
                     pressure_process, pressure_start_ticks, driver_path,
                     descriptor["pressure_recipe_sha256"], pressure_recipe["schedule"], pressure_workers,
-                    audit["identity"]["nonce"],
-                    excluded_child_identities=set() if application_identity is None else {application_identity},
-                    ownership_event_path=pressure_dir / "events.jsonl",
+                    audit["identity"]["nonce"], **stop_kwargs,
                 )
             except BaseException:
                 pressure_cleanup = "failed"
                 supervision_state["pressure_cleanup"] = pressure_cleanup
+                if resource_monitor is not None:
+                    record_pressure_owner_return()
                 pressure_stopped = True
                 raise
+            finally:
+                if resource_monitor is not None:
+                    resource_monitor.sample("pressure_cleanup", force=True)
+            pressure_returned_monotonic_ns = pressure_returned_monotonic_ns or time.monotonic_ns()
+            pressure_cleanup_ended_monotonic_ns = time.monotonic_ns()
             pressure_cleanup = "verified"
             supervision_state["pressure_cleanup"] = pressure_cleanup
             supervision_state["pressure_driver"] = {
@@ -5460,6 +6763,8 @@ def _run_pressure_supervisor_impl(args: argparse.Namespace, audit: dict[str, Any
                 "return_code": pressure_process.returncode,
             }
             supervision_state["pressure_worker_sessions"] = list(pressure_workers.values())
+            if resource_monitor is not None:
+                record_pressure_owner_return()
             pressure_stopped = True
 
         pressure_env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "LANG": "C", "LC_ALL": "C"}
@@ -5472,6 +6777,11 @@ def _run_pressure_supervisor_impl(args: argparse.Namespace, audit: dict[str, Any
             "--ready-file", descriptor["pressure_ready_path"],
         ]
         subreaper_previous = _set_child_subreaper(True)
+        if resource_monitor is not None and resource_monitor.sample(
+                "pressure_startup", force=True):
+            raise SoakReadbackError(
+                "Source5 resource-budget monitor stopped before pressure driver Popen",
+            )
         pressure_process = subprocess.Popen(
             pressure_command,
             cwd=Path(audit["source_root"]),
@@ -5484,6 +6794,7 @@ def _run_pressure_supervisor_impl(args: argparse.Namespace, audit: dict[str, Any
         )
         pressure_cleanup = "unverified"
         pressure_started_at = time.monotonic()
+        pressure_started_monotonic_ns = time.monotonic_ns()
         try:
             pressure_start_ticks = _proc_start_ticks(pressure_process.pid)
         except SoakReadbackError as error:
@@ -5507,14 +6818,25 @@ def _run_pressure_supervisor_impl(args: argparse.Namespace, audit: dict[str, Any
         os.close(pressure_err_fd)
         pressure_err_fd = -1
 
+        readiness_kwargs = {
+            "capture_workers": capture_pressure_workers,
+            "stderr_path": pressure_stderr,
+            "interrupt_check": check_supervisor_interruption,
+        }
+        if resource_monitor is not None:
+            readiness_kwargs["resource_monitor"] = resource_monitor
         _ready, ready_sha = _wait_pressure_ready(
             pressure_process, Path(descriptor["pressure_ready_path"]), pressure_recipe,
             descriptor["pressure_recipe_sha256"], descriptor["pressure_condition_sha256"],
-            capture_workers=capture_pressure_workers,
-            stderr_path=pressure_stderr,
-            interrupt_check=check_supervisor_interruption,
+            **readiness_kwargs,
         )
         check_supervisor_interruption()
+        if resource_monitor is not None and resource_monitor.sample(
+                "pressure_startup", force=True):
+            stop_pressure_session()
+            raise SoakReadbackError(
+                "Source5 resource monitor refused after pressure readiness and before APP Popen",
+            )
         _require_source_v5_pressure_prefix(pressure_dir, pressure_info, ready_sha)
         require(set(pressure_workers) == _expected_pressure_worker_keys(pressure_recipe["schedule"]), "pressure readiness arrived before every isolated worker session was captured")
 
@@ -5541,6 +6863,8 @@ def _run_pressure_supervisor_impl(args: argparse.Namespace, audit: dict[str, Any
             supervision_state["application_binding"] = binding
             supervision_state["application_binding_sha256"] = actual_binding_sha
             supervision_state["application_attestation"] = attestation
+            if resource_monitor is not None:
+                resource_monitor.sample("application", force=True)
             callback = descriptor.get("_on_started")
             if callback is not None:
                 callback(attestation)
@@ -5551,6 +6875,28 @@ def _run_pressure_supervisor_impl(args: argparse.Namespace, audit: dict[str, Any
             if pressure_process is not None:
                 _require_pressure_live_while_application_runs(pressure_process, app_process, pressure_stderr)
 
+        launch_kwargs = {
+            "environment": descriptor["environment"],
+            "cwd": Path(descriptor["cwd"]),
+            "expected_executable_sha256": descriptor["binary_sha256"],
+            "return_details": True,
+            "on_started": bind_started_process,
+            "monitor": monitor_pressure,
+            "on_signal": record_inner_signal,
+            "on_cleanup": record_application_cleanup,
+            "timeout_from_before_popen": True,
+            "timeout_includes_cleanup": True,
+        }
+        if resource_monitor is not None:
+            first_owner_gate = [True]
+
+            def monitor_owned_application() -> bool:
+                if first_owner_gate[0]:
+                    first_owner_gate[0] = False
+                    return resource_monitor.sample("pressure_startup", force=True)
+                return resource_monitor.sample("application")
+
+            launch_kwargs["resource_budget_monitor"] = monitor_owned_application
         details = launch_process(
             command,
             args.cpu_set,
@@ -5560,18 +6906,19 @@ def _run_pressure_supervisor_impl(args: argparse.Namespace, audit: dict[str, Any
             args.timeout_seconds,
             args.term_grace_seconds,
             tuple((Path(path), maximum) for path, maximum in descriptor["monitored_files"]),
-            environment=descriptor["environment"],
-            cwd=Path(descriptor["cwd"]),
-            expected_executable_sha256=descriptor["binary_sha256"],
-            return_details=True,
-            on_started=bind_started_process,
-            monitor=monitor_pressure,
-            on_signal=record_inner_signal,
-            on_cleanup=record_application_cleanup,
-            timeout_from_before_popen=True,
-            timeout_includes_cleanup=True,
+            **launch_kwargs,
         )
         require(type(details) is dict, "external-pressure soak supervisor omitted its parent process receipt")
+        if resource_monitor is not None:
+            supervision_state["application_owner_result_pin"] = _write_exclusive_json(
+                output_dir / "source5-soak-application-owner-return.json", details,
+            )
+        if resource_monitor is not None and resource_monitor.sample(
+                "application", force=True):
+            details["resource_budget_exceeded"] = True
+            details["resource_monitor_error"] = resource_monitor.failure or \
+                "resource monitor refused at APP owner return"
+            details["status"] = 125
         if supervisor_signal["received_signal"] is not None:
             signum = supervisor_signal["received_signal"]
             record_inner_signal(signum)
@@ -5595,21 +6942,60 @@ def _run_pressure_supervisor_impl(args: argparse.Namespace, audit: dict[str, Any
         else:
             require(pressure_started_at is not None, "pressure driver start time was not captured")
             pressure_deadline = pressure_started_at + pressure_recipe["schedule"]["startup_deadline_seconds"] + pressure_recipe["schedule"]["total_deadline_seconds"] + 5
+            monitor_stopped_after_app = False
             while pressure_process.poll() is None and time.monotonic() < pressure_deadline:
                 check_supervisor_interruption()
+                if resource_monitor is not None and resource_monitor.sample("application"):
+                    monitor_stopped_after_app = True
+                    break
                 capture_pressure_workers()
                 try:
                     pressure_process.wait(timeout=0.1)
                 except subprocess.TimeoutExpired:
                     continue
+            if pressure_process.poll() is not None:
+                pressure_returned_monotonic_ns = time.monotonic_ns()
+                record_pressure_owner_return()
+            if monitor_stopped_after_app:
+                details["resource_budget_exceeded"] = True
+                details["resource_monitor_error"] = resource_monitor.failure or \
+                    "resource monitor refused during post-APP pressure supervision"
+                details["status"] = 125
+                supervision_state["details"] = details
+                supervision_state["status"] = 125
+                stop_pressure_session()
+                return 125
             if pressure_process.poll() is None:
                 stop_pressure_session()
                 raise SoakReadbackError("pressure driver did not finish within its frozen process deadline")
             capture_pressure_workers()
         check_supervisor_interruption()
         if pressure_process.poll() == 0:
+            if resource_monitor is not None and resource_monitor.sample(
+                    "pressure_cleanup", force=True):
+                details["resource_budget_exceeded"] = True
+                details["resource_monitor_error"] = resource_monitor.failure or \
+                    "resource monitor refused at pressure-owner return"
+                details["status"] = 125
+                supervision_state["details"] = details
+                supervision_state["status"] = 125
+                stop_pressure_session()
+                return 125
             require(set(pressure_workers) == _expected_pressure_worker_keys(pressure_recipe["schedule"]), "pressure driver exited without every frozen worker session having been captured")
-            require(_wait_pressure_workers_gone(pressure_workers, time.monotonic() + 1.0), "pressure driver exited before captured worker sessions were gone")
+            require(_wait_pressure_workers_gone(
+                pressure_workers, time.monotonic() + 1.0,
+                resource_monitor=resource_monitor,
+            ), "pressure driver exited before captured worker sessions were gone")
+            if resource_monitor is not None and resource_monitor.sample(
+                    "pressure_cleanup", force=True):
+                details["resource_budget_exceeded"] = True
+                details["resource_monitor_error"] = resource_monitor.failure or \
+                    "resource monitor refused during pressure-worker cleanup"
+                details["status"] = 125
+                supervision_state["details"] = details
+                supervision_state["status"] = 125
+                stop_pressure_session()
+                return 125
             pressure_cleanup = "verified"
             supervision_state["pressure_cleanup"] = pressure_cleanup
             supervision_state["pressure_driver"] = {
@@ -5618,13 +7004,36 @@ def _run_pressure_supervisor_impl(args: argparse.Namespace, audit: dict[str, Any
                 "return_code": pressure_process.returncode,
             }
             supervision_state["pressure_worker_sessions"] = list(pressure_workers.values())
+            pressure_cleanup_ended_monotonic_ns = time.monotonic_ns()
+            if resource_monitor is not None and not \
+                    supervision_state.get("pressure_owner_result_pin"):
+                record_pressure_owner_return()
+            pressure_stopped = True
+        if resource_monitor is not None and resource_monitor.failure is not None:
+            details["resource_budget_exceeded"] = True
+            details["resource_monitor_error"] = resource_monitor.failure
+            details["status"] = 125
+            supervision_state["status"] = 125
+            if not pressure_stopped:
+                stop_pressure_session()
+            supervision_state["details"] = details
+            return 125
         if pressure_process.poll() != 0:
             raise SoakReadbackError(f"pressure driver exited {pressure_process.returncode}; stderr tail: {_tail_text(pressure_stderr)}")
         supervision_state["pressure_ready_sha256"] = ready_sha
         supervision_state["pressure_cleanup"] = pressure_cleanup
-        proof = _validate_pressure_proof(output_dir, audit)
+        proof = _validate_pressure_proof_monitored(
+            output_dir, audit, resource_monitor,
+        )
         supervision_state["pressure_proof"] = proof
         check_supervisor_interruption()
+        if resource_monitor is not None:
+            resource_monitor.sample("postflight", force=True)
+            if resource_monitor.failure is not None:
+                details["resource_budget_exceeded"] = True
+                details["resource_monitor_error"] = resource_monitor.failure
+                details["status"] = 125
+                supervision_state["status"] = 125
         if descriptor.get("emit_result", True):
             print(json.dumps({
                 "exit_code": details["status"],
@@ -5672,6 +7081,7 @@ def supervise_pressure_application(
     output_root: Path,
     on_started: Any,
     on_cleanup: Any,
+    *, resource_monitor: _SoakResourceMonitor | None = None,
 ) -> dict[str, Any]:
     """Supervise one direct APP under a fresh SourceV5 pressure session.
 
@@ -5882,7 +7292,13 @@ def supervise_pressure_application(
         command=list(argv), cpu_set=cpu_set, timeout_seconds=timeout,
         term_grace_seconds=float(term_grace),
     )
-    status = _run_pressure_supervisor_impl(args, audit, preflight, output_root)
+    if resource_monitor is None:
+        status = _run_pressure_supervisor_impl(args, audit, preflight, output_root)
+    else:
+        status = _run_pressure_supervisor_impl(
+            args, audit, preflight, output_root,
+            resource_monitor=resource_monitor,
+        )
     state = execution["_supervision_state"]
     return {
         "schema": "allocatbelt.application-pressure-supervision.v1",
@@ -5905,6 +7321,7 @@ def supervise_pressure_application(
 
 def _adapt_soak_v2_launch(
     args: argparse.Namespace, audit: dict[str, Any], preflight: dict[str, Any],
+    *, artifact_limits: dict[str, int] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Restore the immutable V2 CLI contract before building the shared descriptor."""
     descriptor = audit["launch_descriptor"]
@@ -5943,6 +7360,44 @@ def _adapt_soak_v2_launch(
         "source_root": audit["source_root"],
         "readiness_thresholds": audit["recipe"]["qualification"]["pressure_condition"]["readiness_thresholds"],
     }
+    monitored_files = [
+        {"path": str(Path(descriptor["terminal_path"])),
+         "maximum_bytes": preflight["terminal_budget_bytes"]},
+        {"path": str(Path(descriptor["samples_path"])),
+         "maximum_bytes": preflight["sample_budget_bytes"]},
+    ]
+    if artifact_limits is not None:
+        exact_object(artifact_limits, {
+            "terminal_stream_bytes", "resource_samples_bytes",
+            "application_stdout_bytes", "application_stderr_bytes",
+            "application_timing_bytes", "soak_receipt_bytes",
+            "launch_receipt_bytes", "launch_authorization_bytes",
+            "preflight_receipt_bytes",
+            "postflight_receipt_bytes", "readback_receipt_bytes",
+            "source5_supervisor_bytes", "pressure_readback_bytes",
+            "pressure_events_bytes",
+            "pressure_run_receipt_bytes", "pressure_launch_bytes",
+            "pressure_binding_bytes", "pressure_ready_bytes",
+            "pressure_driver_stdout_bytes", "pressure_driver_stderr_bytes",
+            "pressure_worker_stderr_bytes", "probe_stdout_bytes",
+            "probe_stderr_bytes", "probe_owner_receipt_bytes",
+            "probe_inventory_bytes", "probe_failure_bytes",
+            "probe_capture_receipt_bytes", "resource_monitor_stream_bytes",
+            "owner_return_receipt_bytes", "host_receipt_bytes",
+            "failure_receipt_bytes", "component_receipt_bytes",
+        }, "Source5 prospective Soak artifact limits")
+        for name in ("application_stdout_bytes", "application_stderr_bytes",
+                     "application_timing_bytes"):
+            amount = uint(artifact_limits[name],
+                          f"Source5 {name} limit", positive=True)
+            monitored_files.append({
+                "path": str(Path(descriptor[{
+                    "application_stdout_bytes": "stdout_path",
+                    "application_stderr_bytes": "stderr_path",
+                    "application_timing_bytes": "timing_path",
+                }[name]])),
+                "maximum_bytes": amount,
+            })
     app_descriptor = {
         "schema": "allocatbelt.application-pressure-app-descriptor.v1",
         "execution_kind": "timed_soak",
@@ -5957,21 +7412,50 @@ def _adapt_soak_v2_launch(
         "stdout_path": str(Path(descriptor["stdout_path"])),
         "stderr_path": str(Path(descriptor["stderr_path"])),
         "timing_path": str(Path(descriptor["timing_path"])),
-        "monitored_files": [
-            {"path": str(Path(descriptor["terminal_path"])), "maximum_bytes": preflight["terminal_budget_bytes"]},
-            {"path": str(Path(descriptor["samples_path"])), "maximum_bytes": preflight["sample_budget_bytes"]},
-        ],
+        "monitored_files": monitored_files,
     }
     return pressure_info, app_descriptor
 
 
 def launch_soak_v2_application(
     args: argparse.Namespace, audit: dict[str, Any], preflight: dict[str, Any],
-    output_dir: Path, on_started: Any, on_cleanup: Any,
+    output_dir: Path, on_started: Any, on_cleanup: Any, *,
+    resource_budget_pin: object | None = None,
+    resource_monitor_context: _SoakResourceMonitor | None = None,
 ) -> dict[str, Any]:
     """Expose the owned Soak V2 lifetime and its complete supervisor receipt."""
     require(callable(on_started) and callable(on_cleanup), "Soak V2 lifecycle callbacks must be callable")
     descriptor = audit["launch_descriptor"]
+    resource_monitor = resource_monitor_context
+    resource_budget = None
+    externally_owned_monitor = resource_monitor_context is not None
+    if resource_budget_pin is not None:
+        budget, checked_pin = _read_soak_resource_budget(
+            resource_budget_pin, audit, output_dir,
+        )
+        resource_budget = budget
+        require(descriptor.get("resource_budget_pin") == checked_pin and
+                descriptor.get("resource_monitor_path") ==
+                    str(output_dir / "source5-soak-resource-monitor.jsonl"),
+                "Source5 launch descriptor does not bind its prospective resource budget/stream")
+        if externally_owned_monitor:
+            require(isinstance(resource_monitor, _SoakResourceMonitor) and
+                    resource_monitor.budget == budget and
+                    resource_monitor.budget_pin == checked_pin and
+                    resource_monitor.path == output_dir /
+                        "source5-soak-resource-monitor.jsonl" and
+                    resource_monitor.fd is not None,
+                    "Source5 caller monitor is not the live selected budget owner")
+        else:
+            owner = _load_soak_resource_monitor_owner(audit, budget)
+            resource_monitor = _SoakResourceMonitor(
+                budget, checked_pin, owner, output_dir, resume=True,
+            )
+    else:
+        require(descriptor.get("resource_budget_pin") is None and
+                descriptor.get("resource_monitor_path") is None and
+                resource_monitor_context is None,
+                "historical Source5 launch cannot use an unpinned resource monitor")
     def on_interrupted(record: dict[str, Any]) -> int:
         exit_code = 128 + record["signal"]
         cleanup_states_verified = record["application_cleanup"] in ("not_started", "verified") and record["pressure_cleanup"] in ("not_started", "verified")
@@ -5996,19 +7480,65 @@ def launch_soak_v2_application(
         print(json.dumps(receipt_value, sort_keys=True, separators=(",", ":")))
         return exit_code
 
-    pressure_info, app_descriptor = _adapt_soak_v2_launch(args, audit, preflight)
+    pressure_info, app_descriptor = _adapt_soak_v2_launch(
+        args, audit, preflight,
+        artifact_limits=(None if resource_budget is None else
+                         resource_budget["artifact_limits"]),
+    )
     app_descriptor["stdout_path"] = str(output_dir / "stdout.log")
     app_descriptor["stderr_path"] = str(output_dir / "stderr.log")
     app_descriptor["timing_path"] = str(output_dir / "time.txt")
     app_descriptor["on_interrupted"] = on_interrupted
-    receipt = supervise_pressure_application(
-        app_descriptor, pressure_info, output_dir,
-        on_started=on_started,
-        on_cleanup=on_cleanup,
-    )
+    try:
+        if resource_monitor is None:
+            receipt = supervise_pressure_application(
+                app_descriptor, pressure_info, output_dir,
+                on_started=on_started,
+                on_cleanup=on_cleanup,
+            )
+        else:
+            receipt = supervise_pressure_application(
+                app_descriptor, pressure_info, output_dir,
+                on_started=on_started,
+                on_cleanup=on_cleanup,
+                resource_monitor=resource_monitor,
+            )
+    except BaseException as error:
+        if resource_monitor is not None and resource_monitor.fd is not None:
+            resource_monitor.failure = resource_monitor.failure or (
+                f"supervisor_failure:{type(error).__name__}:{error}"
+            )[:4096]
+            try:
+                resource_monitor.sample("postflight", force=True)
+                if not externally_owned_monitor:
+                    resource_monitor.finish(resource_monitor.last_usage)
+            except BaseException:
+                # Preserve the original supervisor exception; the incomplete
+                # stream remains a fail-closed raw failure artifact.
+                pass
+        raise
     details = receipt["details"]
     if type(details) is dict:
+        if resource_monitor is not None:
+            resource_monitor.sample("postflight", force=True)
+            if externally_owned_monitor:
+                descriptor["resource_monitor_prefix"] = \
+                    resource_monitor.pending_summary()
+            else:
+                descriptor["resource_monitor"] = resource_monitor.finish(
+                    resource_monitor.last_usage,
+                )
+            if resource_monitor.failure is not None:
+                details["resource_budget_exceeded"] = True
+                details["resource_monitor_error"] = resource_monitor.failure
+                details["status"] = 125
+                receipt["status"] = 125
         launch_receipt = _launch_receipt_value(details, audit, preflight)
+        if resource_monitor is not None:
+            require(len(canonical_bytes(launch_receipt)) <=
+                    resource_monitor.budget["artifact_limits"][
+                        "launch_receipt_bytes"],
+                    "Source5 bounded Soak launch receipt exceeds its frozen artifact limit")
         launch_receipt_sha = _write_exclusive_json(output_dir / "soak-launch.json", launch_receipt)
         if receipt["status"] == 0 and not receipt["interrupted"]:
             proof = receipt["pressure_proof"]

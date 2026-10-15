@@ -15,6 +15,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from types import SimpleNamespace
 import unittest
@@ -46,6 +47,13 @@ pressure_loader = importlib.machinery.SourceFileLoader(
 pressure_spec = importlib.util.spec_from_loader(pressure_loader.name, pressure_loader)
 pressure_reader = importlib.util.module_from_spec(pressure_spec)
 pressure_loader.exec_module(pressure_reader)
+fixed_loader = importlib.machinery.SourceFileLoader(
+    "fixed_pair_for_soak_resource_monitor_tests",
+    str(SCRIPT.with_name("application-fixed-pair.py")),
+)
+fixed_spec = importlib.util.spec_from_loader(fixed_loader.name, fixed_loader)
+fixed_pair = importlib.util.module_from_spec(fixed_spec)
+fixed_loader.exec_module(fixed_pair)
 
 
 class FakeOwnedProcessGroup(module._OwnedProcessGroup):
@@ -3117,6 +3125,162 @@ class SoakReadbackTests(unittest.TestCase):
             self.assertTrue(pid_file.exists())
             self.assertTrue(heartbeat.exists())
             self.assertTrue(self._wait_heartbeat_stopped(heartbeat))
+
+    def test_pressure_proof_monitor_thread_joins_and_never_launches_an_owner(self):
+        thread_name = "source5-soak-resource-monitor-pressure-postflight"
+
+        class Monitor:
+            interval_ns = 1_000_000
+
+            def __init__(self, *, fail_sample: bool = False) -> None:
+                self.failure = None
+                self.fail_sample = fail_sample
+                self.sampled = threading.Event()
+                self.calls: list[tuple[str, bool]] = []
+
+            def sample(self, phase: str, *, force: bool = False) -> bool:
+                self.calls.append((phase, force))
+                if not force:
+                    self.sampled.set()
+                    if self.fail_sample:
+                        raise RuntimeError("sentinel monitor failure")
+                return False
+
+        def assert_sampler_joined(self) -> None:
+            self.assertFalse(any(
+                item.name == thread_name and item.is_alive()
+                for item in threading.enumerate()
+            ))
+
+        with tempfile.TemporaryDirectory(prefix="soak-pressure-proof-monitor-") as temp:
+            artifact_dir = Path(temp) / "pressure"
+            audit = {"sentinel": "audit"}
+
+            success_monitor = Monitor()
+
+            def successful_proof(_artifact_dir, _audit):
+                self.assertTrue(success_monitor.sampled.wait(timeout=2))
+                return {"proof": "successful"}
+
+            with mock.patch.object(
+                module, "_validate_pressure_proof", side_effect=successful_proof,
+            ), mock.patch.object(
+                module.subprocess, "Popen",
+                side_effect=AssertionError("postflight proof launched an owner"),
+            ) as popen:
+                proof = module._validate_pressure_proof_monitored(
+                    artifact_dir, audit, success_monitor,
+                )
+            self.assertEqual(proof, {"proof": "successful"})
+            self.assertTrue(success_monitor.calls[0][0] == "postflight")
+            self.assertEqual(success_monitor.calls[-1], ("postflight", True))
+            popen.assert_not_called()
+            assert_sampler_joined(self)
+
+            proof_error_monitor = Monitor()
+
+            def failing_proof(_artifact_dir, _audit):
+                self.assertTrue(proof_error_monitor.sampled.wait(timeout=2))
+                raise ValueError("sentinel proof failure")
+
+            with mock.patch.object(
+                module, "_validate_pressure_proof", side_effect=failing_proof,
+            ), mock.patch.object(
+                module.subprocess, "Popen",
+                side_effect=AssertionError("failed postflight proof launched an owner"),
+            ) as popen:
+                with self.assertRaisesRegex(ValueError, "sentinel proof failure"):
+                    module._validate_pressure_proof_monitored(
+                        artifact_dir, audit, proof_error_monitor,
+                    )
+            self.assertEqual(proof_error_monitor.calls[-1], ("postflight", True))
+            popen.assert_not_called()
+            assert_sampler_joined(self)
+
+            monitor_error = Monitor(fail_sample=True)
+
+            def proof_after_monitor_failure(_artifact_dir, _audit):
+                self.assertTrue(monitor_error.sampled.wait(timeout=2))
+                return {"proof": "monitor-failure-retained"}
+
+            with mock.patch.object(
+                module, "_validate_pressure_proof",
+                side_effect=proof_after_monitor_failure,
+            ), mock.patch.object(
+                module.subprocess, "Popen",
+                side_effect=AssertionError("monitor failure launched an owner"),
+            ) as popen:
+                proof = module._validate_pressure_proof_monitored(
+                    artifact_dir, audit, monitor_error,
+                )
+            self.assertEqual(proof, {"proof": "monitor-failure-retained"})
+            self.assertTrue(monitor_error.failure.startswith(
+                "pressure_proof_monitor_thread:RuntimeError:sentinel monitor failure",
+            ))
+            self.assertEqual(monitor_error.calls[-1], ("postflight", True))
+            popen.assert_not_called()
+            assert_sampler_joined(self)
+
+    def test_live_resource_monitor_stops_owned_app_and_preserves_raw_return(self):
+        with tempfile.TemporaryDirectory(prefix="allocatbelt-soak-resource-owner-") as temp:
+            output = Path(temp) / "output"
+            output.mkdir(mode=0o700)
+            monitor_calls = 0
+            cleanup_rows = []
+
+            def stop_from_live_monitor() -> bool:
+                nonlocal monitor_calls
+                monitor_calls += 1
+                return monitor_calls > 1
+
+            details = module.launch_process(
+                [sys.executable, "-c", "import time; time.sleep(60)"],
+                str(min(os.sched_getaffinity(0))),
+                output / "stdout.log", output / "stderr.log", output / "time.txt",
+                timeout_seconds=5, term_grace_seconds=0.2,
+                return_details=True,
+                on_cleanup=cleanup_rows.append,
+                resource_budget_monitor=stop_from_live_monitor,
+            )
+            self.assertGreater(monitor_calls, 0)
+            self.assertEqual(details["status"], 125)
+            self.assertTrue(details["artifact_budget_exceeded"])
+            self.assertTrue(details["resource_budget_exceeded"])
+            self.assertIn(details["child_return_code"], (-signal.SIGTERM, -signal.SIGKILL))
+            self.assertEqual(len(cleanup_rows), 1)
+            self.assertEqual(cleanup_rows[0]["return_code"], details["child_return_code"])
+            self.assertEqual(cleanup_rows[0]["status"], "verified")
+
+    def test_live_resource_preflight_refuses_before_app_popen(self):
+        with tempfile.TemporaryDirectory(prefix="allocatbelt-soak-resource-prepopen-") as temp:
+            output = Path(temp) / "output"
+            output.mkdir(mode=0o700)
+            monitor_calls = 0
+
+            def refuse_before_launch() -> bool:
+                nonlocal monitor_calls
+                monitor_calls += 1
+                return True
+
+            with mock.patch.object(
+                module.subprocess, "Popen",
+                side_effect=AssertionError("resource refusal reached APP Popen"),
+            ):
+                with self.assertRaisesRegex(
+                    module.SoakReadbackError, "refused before APP Popen",
+                ):
+                    module.launch_process(
+                        [sys.executable, "-c", "import time; time.sleep(60)"],
+                        str(min(os.sched_getaffinity(0))),
+                        output / "stdout.log", output / "stderr.log",
+                        output / "time.txt", timeout_seconds=5,
+                        return_details=True,
+                        resource_budget_monitor=refuse_before_launch,
+                    )
+            self.assertEqual(monitor_calls, 1)
+            self.assertFalse((output / "stdout.log").exists())
+            self.assertFalse((output / "stderr.log").exists())
+            self.assertFalse((output / "time.txt").exists())
 
     def test_source_v5_wall_timeout_includes_popen_callback_time(self):
         with tempfile.TemporaryDirectory(prefix="allocatbelt-soak-v2-pre-popen-timeout-") as temporary:

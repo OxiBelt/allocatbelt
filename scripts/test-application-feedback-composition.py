@@ -806,6 +806,52 @@ class CompositionContractTests(unittest.TestCase):
                         "receipt_bytes": receipt_bytes, "output_inodes": 7,
                     }
 
+                malformed_monitor_id = hashlib.sha256(
+                    (str(self.root) + allocator + probe_pin["raw_sha256"] +
+                     "bad-monitor").encode("utf-8"),
+                ).hexdigest()[:32]
+                with mock.patch.object(
+                    subprocess, "Popen",
+                    side_effect=AssertionError("malformed monitor reached Popen"),
+                ):
+                    with self.assertRaisesRegex(
+                        composition.CompositionError, "callable or None",
+                    ):
+                        composition.capture_calibrated_probe_v2(
+                            request, _sha(request_raw),
+                            {"path": str(observed_host_path),
+                             "raw_sha256": _sha(observed_host_path.read_bytes())},
+                            output_root=self.root, capture_id=malformed_monitor_id,
+                            capture_timeout_ns=30_000_000_000,
+                            storage_budget=probe_storage_budget(),
+                            resource_monitor=True,
+                        )
+                self.assertFalse((self.root / malformed_monitor_id).exists())
+
+                refused_monitor_id = hashlib.sha256(
+                    (str(self.root) + allocator + probe_pin["raw_sha256"] +
+                     "refused-monitor").encode("utf-8"),
+                ).hexdigest()[:32]
+                with mock.patch.object(
+                    subprocess, "Popen",
+                    side_effect=AssertionError("refused monitor reached Popen"),
+                ):
+                    with self.assertRaisesRegex(
+                        composition.CompositionError, "refused before ProbeV2 Popen",
+                    ):
+                        composition.capture_calibrated_probe_v2(
+                            request, _sha(request_raw),
+                            {"path": str(observed_host_path),
+                             "raw_sha256": _sha(observed_host_path.read_bytes())},
+                            output_root=self.root, capture_id=refused_monitor_id,
+                            capture_timeout_ns=30_000_000_000,
+                            storage_budget=probe_storage_budget(),
+                            resource_monitor=lambda: True,
+                        )
+                self.assertTrue(
+                    (self.root / refused_monitor_id / "capture-failure.json").is_file(),
+                )
+
                 undersized_capture_id = hashlib.sha256(
                     (str(self.root) + allocator + probe_pin["raw_sha256"] + "budget").encode("utf-8"),
                 ).hexdigest()[:32]
@@ -825,13 +871,53 @@ class CompositionContractTests(unittest.TestCase):
                 capture_id = hashlib.sha256(
                     (str(self.root) + allocator + probe_pin["raw_sha256"]).encode("utf-8"),
                 ).hexdigest()[:32]
-                capture_pin = composition.capture_calibrated_probe_v2(
-                    request, _sha(request_raw),
-                    {"path": str(observed_host_path), "raw_sha256": _sha(observed_host_path.read_bytes())},
-                    output_root=self.root, capture_id=capture_id,
-                    capture_timeout_ns=30_000_000_000,
-                    storage_budget=probe_storage_budget(),
-                )
+                monitor_calls = {"outer": 0, "tmpdir": 0}
+
+                def outer_resource_monitor() -> bool:
+                    monitor_calls["outer"] += 1
+                    return False
+
+                source_loader = composition._captured_source_module
+
+                def tracked_source_loader(
+                    source_reader: Any, source_value: dict[str, Any],
+                    relative: str, label: str,
+                ) -> tuple[Any, str]:
+                    module, module_sha = source_loader(
+                        source_reader, source_value, relative, label,
+                    )
+                    if relative == composition.FIXED_PAIR_OWNER:
+                        original_factory = module._bounded_tmpdir_monitor
+
+                        def tracked_monitor_factory(
+                            *args: Any, **kwargs: Any,
+                        ) -> Any:
+                            original_monitor = original_factory(*args, **kwargs)
+
+                            def tracked_tmpdir_monitor() -> bool:
+                                monitor_calls["tmpdir"] += 1
+                                return original_monitor()
+
+                            return tracked_tmpdir_monitor
+
+                        module._bounded_tmpdir_monitor = tracked_monitor_factory
+                    return module, module_sha
+
+                with mock.patch.object(
+                    composition, "_captured_source_module",
+                    side_effect=tracked_source_loader,
+                ):
+                    capture_pin = composition.capture_calibrated_probe_v2(
+                        request, _sha(request_raw),
+                        {"path": str(observed_host_path),
+                         "raw_sha256": _sha(observed_host_path.read_bytes())},
+                        output_root=self.root, capture_id=capture_id,
+                        capture_timeout_ns=30_000_000_000,
+                        storage_budget=probe_storage_budget(),
+                        resource_monitor=outer_resource_monitor,
+                    )
+                self.assertGreater(monitor_calls["outer"], 0)
+                self.assertGreater(monitor_calls["tmpdir"], 0)
                 failed_capture_id = hashlib.sha256(
                     (str(self.root) + allocator + probe_pin["raw_sha256"] + "deadline").encode("utf-8"),
                 ).hexdigest()[:32]
