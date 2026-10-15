@@ -93,7 +93,13 @@ def source_manifest(host_id: str) -> dict[str, Any]:
             "cargo_lock_sha256": "b" * 64,
             "files": records,
         },
-        "build": {"build_sha256": "c" * 64},
+        "build": {
+            "host_id": host_id, "rustc_release": "1.99.0",
+            "rustc_verbose": ["rustc 1.99.0"], "cargo_version": "cargo 1.99.0",
+            "target_triple": "x86_64-unknown-linux-gnu",
+            "target_cpu": "x86-64-v3", "profile": "release",
+            "features_sha256": "c" * 64, "build_inputs_sha256": "d" * 64,
+        },
         "artifacts": {
             name: {"path": f"target/app/{name}", "sha256": f"{index + 1:x}" * 64}
             for index, name in enumerate(budget.ALLOCATORS)
@@ -246,7 +252,7 @@ def fixture() -> dict[str, Any]:
             host: {"source_root": f"/source/{host}",
                    "git_commit": source_values[host]["source"]["git_commit"],
                    "source_tree_sha256": source_values[host]["source"]["source_tree_sha256"],
-                   "build_sha256": source_values[host]["build"]["build_sha256"]}
+                   "build_sha256": sha(canonical(source_values[host]["build"]))}
             for host in host_ids
         },
         "qualification_eligible": False,

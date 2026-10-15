@@ -2669,7 +2669,7 @@ def _validate_source5_manifest_value(
         require(type(item["source_root"]) is str and Path(item["source_root"]).is_absolute() and
                 item["git_commit"] == source["source"]["git_commit"] and
                 item["source_tree_sha256"] == source["source"]["source_tree_sha256"] and
-                item["build_sha256"] == source["build"]["build_sha256"],
+                item["build_sha256"] == sha256_bytes(canonical_bytes(source["build"])),
                 f"Source5 {host_id} execution source differs from its original SourceV5 manifest")
         if host_id == prepared["host_id"]:
             require(Path(item["source_root"]).resolve(strict=True) == prepared["source_root"],

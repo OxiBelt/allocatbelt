@@ -594,7 +594,7 @@ def build_host_evidence_budget_plan(
         }, f"Source5 {source_host} execution source snapshot")
         _require(row["source_tree_sha256"] == source_tree_hashes[source_host] and
                  row["git_commit"] == sources[source_host]["source"]["git_commit"] and
-                 row["build_sha256"] == sources[source_host]["build"]["build_sha256"],
+                 row["build_sha256"] == _sha(_canonical(sources[source_host]["build"])),
                  f"Source5 {source_host} execution snapshot differs from its manifest")
     files, directories, source_bytes = _typed_inventory(
         sources[host_id], host_id,

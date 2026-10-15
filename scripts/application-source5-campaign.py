@@ -369,7 +369,7 @@ def load_context(manifest_path: Path, host_id: str) -> CampaignContext:
     source_root = Path(source_root_value["source_root"]).resolve(strict=True)
     require(source_root_value["git_commit"] == source["source"]["git_commit"] and
             source_root_value["source_tree_sha256"] == source["source"]["source_tree_sha256"] and
-            source_root_value["build_sha256"] == source["build"]["build_sha256"],
+            source_root_value["build_sha256"] == sha256(canonical_bytes(source["build"])),
             "Source5 selected source/build identity differs from SourceV5")
     artifact_root = Path(manifest["artifact_root"]).resolve(strict=True)
     output_root = Path(manifest["output_root"]).resolve(strict=True)
@@ -2516,7 +2516,7 @@ def _source5_final_decision_value(
             "raw_sha256": context.source_manifest_pins[context.host_id]["raw_sha256"],
             "semantic_sha256": context.source["manifest_sha256"],
             "source_tree_sha256": context.source["source"]["source_tree_sha256"],
-            "build_sha256": context.source["build"]["build_sha256"],
+            "build_sha256": sha256(canonical_bytes(context.source["build"])),
         },
         "prepared_host_binding_sha256":
             host_rows[0]["prepared_host_binding"]["binding_sha256"],
