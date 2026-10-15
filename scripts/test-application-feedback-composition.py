@@ -1431,7 +1431,7 @@ class CompositionContractTests(unittest.TestCase):
                                                side_effect=AssertionError("offline TMPDIR check attempted Popen")):
                             with self.assertRaisesRegex(
                                 (reader.ValidationError, composition.CompositionError),
-                                "private directory",
+                                "output/TMPDIR roots are not owned private directories",
                             ):
                                 composition.compose_calibrated_policy_v5_offline(
                                     request, _sha(request_raw), replay_context=offline_replay_context,
