@@ -38,6 +38,8 @@ NON_EXPORTABLE_JOB_ROLES = frozenset({
 MAX_JSON_BYTES = 32 * 1024 * 1024
 MAX_GPG_OUTPUT_BYTES = 1 << 20
 MAX_PATH_BYTES = 4096
+# One escaped path plus the fixed digest/count fields of a plain pin.
+MAX_INLINE_PIN_BYTES = 6 * MAX_PATH_BYTES + 512
 MAX_ROWS = 1_000_000
 MAX_OBJECT_BYTES = (1 << 64) - 1
 BLOCK_BYTES = 1024 * 1024
@@ -2617,6 +2619,26 @@ def import_transfer_packet(
     finally:
         os.close(packet_fd)
 
+def _cli_pin_document(
+    file_path: str | None, inline_json: str | None, label: str,
+) -> dict[str, Any]:
+    if inline_json is not None:
+        _require(type(inline_json) is str and
+                 len(inline_json) <= MAX_INLINE_PIN_BYTES and
+                 not any(ord(char) < 32 or ord(char) == 127
+                         for char in inline_json),
+                 f"{label} inline argument exceeds its single-line pin bound")
+        raw = inline_json.encode("ascii", "strict") + b"\n"
+        _require(len(raw) <= MAX_INLINE_PIN_BYTES,
+                 f"{label} inline bytes exceed their pin bound")
+    else:
+        _require(type(file_path) is str, f"{label} pin input is missing")
+        raw, _raw_sha, _info = _read_regular_absolute(
+            file_path, MAX_JSON_BYTES, label,
+        )
+    return _parse_canonical(raw, label)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Export/import one bounded Source5 checkpoint-request packet.",
@@ -2648,10 +2670,14 @@ def main(argv: list[str] | None = None) -> int:
     publish_parser = sub.add_parser("publish-ack")
     publish_parser.add_argument("--incoming", required=True)
     publish_parser.add_argument("--budget", required=True)
-    publish_parser.add_argument("--budget-pin", required=True)
     publish_parser.add_argument("--offer", required=True)
-    publish_parser.add_argument("--offer-pin", required=True)
-    publish_parser.add_argument("--bundle-pin", required=True)
+    for pin_name in ("budget", "offer", "bundle"):
+        pin_group = publish_parser.add_mutually_exclusive_group(required=True)
+        pin_group.add_argument(f"--{pin_name}-pin")
+        pin_group.add_argument(
+            f"--{pin_name}-pin-json",
+            help="bounded canonical pin JSON without its final newline",
+        )
     args = parser.parse_args(argv)
     try:
         if args.operation == "build-ack-bundle":
@@ -2716,28 +2742,22 @@ def main(argv: list[str] | None = None) -> int:
             offer_raw, _offer_sha, _ = _read_regular_absolute(
                 args.offer, MAX_JSON_BYTES, "archive transfer offer",
             )
-            offer_pin_raw, _offer_pin_sha, _ = _read_regular_absolute(
-                args.offer_pin, MAX_JSON_BYTES, "archive transfer offer pin",
-            )
             offer_pin = _pin(
-                _parse_canonical(offer_pin_raw, "archive transfer offer pin"),
+                _cli_pin_document(args.offer_pin, args.offer_pin_json,
+                                  "archive transfer offer pin"),
                 "external archive transfer offer pin",
             )
             budget_raw, _budget_sha, _ = _read_regular_absolute(
                 args.budget, MAX_JSON_BYTES, "host evidence budget",
             )
-            budget_pin_raw, _budget_pin_sha, _ = _read_regular_absolute(
-                args.budget_pin, MAX_JSON_BYTES, "host evidence budget pin",
-            )
             budget_pin = _pin(
-                _parse_canonical(budget_pin_raw, "host evidence budget pin"),
+                _cli_pin_document(args.budget_pin, args.budget_pin_json,
+                                  "host evidence budget pin"),
                 "external host evidence budget pin",
             )
-            bundle_pin_raw, _bundle_pin_sha, _ = _read_regular_absolute(
-                args.bundle_pin, MAX_JSON_BYTES, "coordinator ACK bundle pin",
-            )
-            bundle_pin_value = _parse_canonical(
-                bundle_pin_raw, "coordinator ACK bundle pin",
+            bundle_pin_value = _cli_pin_document(
+                args.bundle_pin, args.bundle_pin_json,
+                "coordinator ACK bundle pin",
             )
             bundle_pin = _exact(bundle_pin_value, {
                 "path", "raw_sha256", "byte_count",

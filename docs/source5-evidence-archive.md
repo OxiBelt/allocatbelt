@@ -112,6 +112,14 @@ the final receiver. It takes no phase lock; the waiting controller holds that
 lock and observes only the completed final path. An invalid or partial upload
 cannot replace an existing final receiver.
 
+The publisher accepts each plain pin through either its existing pin-file
+option or the mutually exclusive `--budget-pin-json`, `--offer-pin-json` and
+`--bundle-pin-json` options. Inline pins use bounded canonical JSON without
+the final newline and undergo the same pin and publication checks. The bridge
+can therefore pass pins without creating extra host metadata files. The bundle
+pin names the exact offered host receiver, with the coordinator's raw digest
+and byte count; it does not name the coordinator's private bundle path.
+
 The request, offer, append-only host journals, source records, final ACK
 components and host index remain local/indexed according to the host evidence
 budget. Missing or invalid ACK material stops the next job and leaves the

@@ -761,11 +761,18 @@ class PacketRoundTripTests(unittest.TestCase):
                     "raw_sha256": response_pin["raw_sha256"],
                     "byte_count": response_pin["byte_count"],
                 }
-                packet.publish_ack_bundle(
-                    fixture["incoming_path"], fixture["budget_raw"],
-                    fixture["budget_pin"], canonical(offer), offer_pin,
-                    host_bundle_pin,
+                published = subprocess.run(
+                    [sys.executable, "-B", str(PACKET_PATH), "publish-ack",
+                     "--incoming", str(fixture["incoming_path"]),
+                     "--budget", fixture["budget_pin"]["path"],
+                     "--offer", str(fixture["offer_path"]),
+                     "--budget-pin-json", canonical(fixture["budget_pin"]).decode().rstrip("\n"),
+                     "--offer-pin-json", canonical(offer_pin).decode().rstrip("\n"),
+                     "--bundle-pin-json", canonical(host_bundle_pin).decode().rstrip("\n")],
+                    stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE, check=False, timeout=10,
                 )
+                self.assertEqual(published.returncode, 0, published.stderr.decode())
                 transferred = packet.read_ack_bundle(
                     fixture["receiver_path"], fixture["budget_raw"],
                     fixture["budget_pin"], canonical(offer), offer_pin,
@@ -1330,6 +1337,72 @@ class PacketRoundTripTests(unittest.TestCase):
                     fixture["execution_manifest_raw"],
                     fixture["execution_manifest_pin"],
                 )
+
+    def test_inline_pin_rejects_noncanonical_or_unbounded_input_before_read(self) -> None:
+        invalid = (
+            "{}\n", '{"x":1,"x":1}', '{ "x":1}',
+            "x" * packet.MAX_INLINE_PIN_BYTES, '{"x":"é"}',
+        )
+        for value in invalid:
+            with self.subTest(value=value[:40]):
+                with mock.patch.object(packet, "_read_regular_absolute") as reader:
+                    with self.assertRaises((packet.TransferPacketError, UnicodeError)):
+                        packet._cli_pin_document(None, value, "test pin")
+                    reader.assert_not_called()
+
+    def test_publish_cli_preserves_legacy_file_pins(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="source5-publish-legacy-pins-") as tmp:
+            root = Path(tmp)
+            fixture = self._fixture(root)
+            _packet_pin, _offer, offer_pin = self._offer(fixture)
+            raw = b"publication checks bytes; the separate host reader checks the ACK"
+            fixture["incoming_path"].write_bytes(raw)
+            os.chmod(fixture["incoming_path"], 0o600)
+            bundle_pin = {"path": str(fixture["receiver_path"]),
+                          "raw_sha256": sha(raw), "byte_count": len(raw)}
+            argv = [sys.executable, "-B", str(PACKET_PATH), "publish-ack",
+                    "--incoming", str(fixture["incoming_path"]),
+                    "--budget", fixture["budget_pin"]["path"],
+                    "--offer", str(fixture["offer_path"])]
+            for name, value in (("budget", fixture["budget_pin"]),
+                                ("offer", offer_pin), ("bundle", bundle_pin)):
+                path = root / f"{name}-pin.json"
+                path.write_bytes(canonical(value))
+                os.chmod(path, 0o600)
+                argv.extend([f"--{name}-pin", str(path)])
+            result = subprocess.run(
+                argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, check=False, timeout=10,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr.decode())
+            self.assertEqual(fixture["receiver_path"].read_bytes(), raw)
+            self.assertFalse(fixture["incoming_path"].exists())
+
+    def test_publish_cli_rejects_tampered_inline_bundle_pin_without_rename(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="source5-publish-bad-inline-pin-") as tmp:
+            fixture = self._fixture(Path(tmp))
+            _packet_pin, _offer, offer_pin = self._offer(fixture)
+            raw = b"unchanged unacknowledged incoming bytes"
+            fixture["incoming_path"].write_bytes(raw)
+            os.chmod(fixture["incoming_path"], 0o600)
+            bundle_pin = {"path": str(fixture["receiver_path"]),
+                          "raw_sha256": "0" * 64, "byte_count": len(raw)}
+            argv = [sys.executable, "-B", str(PACKET_PATH), "publish-ack",
+                    "--incoming", str(fixture["incoming_path"]),
+                    "--budget", fixture["budget_pin"]["path"],
+                    "--offer", str(fixture["offer_path"])]
+            for name, value in (("budget", fixture["budget_pin"]),
+                                ("offer", offer_pin), ("bundle", bundle_pin)):
+                argv.extend([f"--{name}-pin-json",
+                             canonical(value).decode().rstrip("\n")])
+            result = subprocess.run(
+                argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, check=False, timeout=10,
+            )
+            self.assertEqual(result.returncode, 2)
+            self.assertIn(b"Source5 transfer packet failed:", result.stderr)
+            self.assertFalse(fixture["receiver_path"].exists())
+            self.assertEqual(fixture["incoming_path"].read_bytes(), raw)
 
     def test_ack_publisher_refuses_to_replace_a_final_receiver(self) -> None:
         with tempfile.TemporaryDirectory(prefix="source5-ack-no-replace-") as tmp:
