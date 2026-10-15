@@ -129,6 +129,16 @@ capacity checks. For `--pair-kind allocator-match`, also pass
 Archive each selected case before starting another; the helper refuses to
 reuse an output directory.
 
+### Source5 evidence archive component
+
+The [per-job archive](../source5-evidence-archive.md) has focused native
+coverage: 33 archive, transfer and budget cases passed without skips or
+timeouts. The signed round-trip fixture covers disjoint coordinator copies,
+durable object storage, host acknowledgement verification and exact local
+reclamation. It uses a reduced synthetic schedule. Full-horizon journal sizing,
+campaign caller integration and the actual three-host transfer bridge remain
+pending; budget artifacts continue to report execution as unavailable.
+
 ## Qualification still required
 
 The direct child-pipe and cached buffered accounting changes passed a
