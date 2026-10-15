@@ -1264,7 +1264,7 @@ class CompositionContractTests(unittest.TestCase):
                 with mock.patch.object(subprocess, "Popen", side_effect=AssertionError("offline feedback attempted Popen")):
                     with mock.patch.object(reader, "read_stable", side_effect=reject_unrequested_trace_read):
                         with self.assertRaisesRegex(
-                            reader.ValidationError, "full independent pressure artifact request",
+                            reader.ValidationError, "closed independent pressure-pair request is required",
                         ):
                             reader.verify_feedback_offline(
                                 finalize_expectation_path, _sha(finalize_expectation_path.read_bytes()),
