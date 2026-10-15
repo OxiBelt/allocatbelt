@@ -1512,6 +1512,49 @@ mod tests {
 
   #[test]
   fn tenant_control_refusal_happens_before_process_service_threads_start() {
+    const ISOLATED: &str = "ALLOCATBELT_TEST_PROCESS_CONTROL_REFUSAL_ISOLATED";
+    if std::env::var_os(ISOLATED).is_none() {
+      let test_name = module_path!()
+        .strip_prefix("allocatbelt::")
+        .unwrap_or(module_path!());
+      let mut child = Command::new(std::env::current_exe().unwrap())
+        .args([
+          "--exact",
+          &format!(
+            "{test_name}::tenant_control_refusal_happens_before_process_service_threads_start"
+          ),
+          "--test-threads=1",
+          "--quiet",
+        ])
+        .env(ISOLATED, "1")
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .unwrap();
+      let deadline = Instant::now() + Duration::from_secs(10);
+      loop {
+        match child.try_wait() {
+          Ok(Some(status)) => {
+            assert!(
+              status.success(),
+              "isolated Control refusal test failed: {status}"
+            );
+            return;
+          }
+          Ok(None) if Instant::now() < deadline => {
+            thread::sleep(Duration::from_millis(5));
+          }
+          result => {
+            let kill_result = child.kill();
+            let wait_result = child.wait();
+            panic!(
+              "isolated Control refusal test did not complete: {result:?}; \
+               kill: {kill_result:?}; wait: {wait_result:?}"
+            );
+          }
+        }
+      }
+    }
     let (_domain, tenant) = tenant_with_control(1 << 20, 0);
     let before_threads = allocatbelt_threads();
     let before_control = tenant.snapshot().unwrap().used.get(DomainResource::Control);
