@@ -1268,6 +1268,17 @@ class Source5SoakPublicApiTests(unittest.TestCase):
 
             completion = {
                 "schema": "allocatbelt.application-source5-preparation-completion.v1",
+                "source_manifests": {
+                    selected_host: {
+                        "path": str(fixture.manifest_paths[selected_host]),
+                        "raw_sha256": fixture.manifest_raw_shas[selected_host],
+                        "semantic_sha256": fixture.manifests[selected_host][
+                            "manifest_sha256"],
+                        "source_tree_sha256": fixture.manifests[selected_host][
+                            "source"]["source_tree_sha256"],
+                    }
+                    for selected_host in fixture.host_ids
+                },
                 "pilots": [{
                     "host_id": selected_host,
                     "prepared_host_binding": binding_for(selected_host),
@@ -1297,6 +1308,7 @@ class Source5SoakPublicApiTests(unittest.TestCase):
                 plan=fixture.plan,
                 manifest={
                     "schema": self.controller.EXECUTION_SCHEMA_V2,
+                    "scope": "final_prepared",
                     "campaign_id": fixture.spec["campaign_id"],
                 },
                 modules={
@@ -1725,6 +1737,7 @@ class Source5SoakPublicApiTests(unittest.TestCase):
         context.prepared_input_completion = width_completion
         context.manifest = {
             "schema": controller.EXECUTION_SCHEMA_V4,
+            "scope": "final_prepared_bounded",
             "campaign_id": fixture.spec["campaign_id"],
             "hosts": list(fixture.host_ids),
             "modules": all_module_pins,
@@ -1944,6 +1957,88 @@ class Source5SoakPublicApiTests(unittest.TestCase):
             context, recipe_path, receipt_path, width_soak_index_path,
             soak_budget_path,
         )
+
+        v5_scope = controller.PREPARED_EXPLORATION_REUSE_SCOPE
+        v5_context = types.SimpleNamespace(**vars(context))
+        v5_context.scope = v5_scope
+        v5_context.manifest = {
+            **context.manifest,
+            "schema": controller.EXECUTION_SCHEMA_V5,
+            "scope": v5_scope,
+        }
+        v5_material_path = soak_budget_directory / "v5-materials-index.json"
+        v5_material_pin = controller.create_soak_material_index(
+            v5_context, recipe_path, receipt_path, v5_material_path,
+            soak_budget_path,
+        )
+        v5_material_index, _v5_raw, _v5_sha = soak_budget_module.read_json(
+            v5_material_path, v5_material_pin["raw_sha256"],
+            "Source5 V5 Soak materials index",
+        )
+        self.assertEqual(v5_material_index["schema"],
+                         soak_budget_module.MATERIALS_INDEX_SCHEMA_V2)
+        v5_budget, _v5_budget_pin = soak_budget_module._read_resource_budget_pin(
+            v5_material_index["resource_budget"],
+        )
+        self.assertEqual(v5_budget, soak_budget)
+        v5_recipe, _v5_recipe_raw, _v5_recipe_sha = soak_budget_module.read_json(
+            recipe_path, v5_material_index["parent_recipe"]["raw_sha256"],
+            "Source5 V5 functional fixture recipe",
+        )
+        self.assertEqual(v5_recipe["runtime"]["mode"], "functional")
+        self.assertEqual(v5_recipe["runtime"]["duration_seconds"], 2)
+        self.assertFalse(v5_recipe["qualification"]["execution_ready"])
+
+        wrong_scope_context = types.SimpleNamespace(**vars(v5_context))
+        wrong_scope_context.scope = "final_frozen"
+        with self.assertRaisesRegex(
+                controller.Source5CampaignError,
+                "exact frozen SpecV3/PlanV3 scope"):
+            controller.create_soak_material_index(
+                wrong_scope_context, recipe_path, receipt_path,
+                soak_budget_directory / "wrong-scope-index.json",
+                soak_budget_path,
+            )
+
+        bad_completion = json.loads(soak_budget_module.canonical_bytes(
+            v5_context.prepared_input_completion,
+        ))
+        selected_completion = next(
+            row for row in bad_completion["pilots"]
+            if row["host_id"] == host_id
+        )
+        selected_completion["prepared_host_binding"]["binding_sha256"] = "f" * 64
+        bad_binding_context = types.SimpleNamespace(**vars(v5_context))
+        bad_binding_context.prepared_input_completion = bad_completion
+        with self.assertRaises(soak_budget_module.Source5SoakError):
+            controller.create_soak_material_index(
+                bad_binding_context, recipe_path, receipt_path,
+                soak_budget_directory / "bad-binding-index.json",
+                soak_budget_path,
+            )
+
+        bad_receipt = {**json.loads(receipt_path.read_bytes()), "unexpected": True}
+        bad_receipt_path = soak_budget_directory / "bad-build-receipt.json"
+        bad_receipt_path.write_bytes(soak_budget_module.canonical_bytes(bad_receipt))
+        with self.assertRaises(soak_budget_module.Source5SoakError):
+            controller.create_soak_material_index(
+                v5_context, recipe_path, bad_receipt_path,
+                soak_budget_directory / "bad-receipt-index.json",
+                soak_budget_path,
+            )
+
+        bad_recipe = {**json.loads(recipe_path.read_bytes()),
+                      "schema": "allocatbelt.invalid-soak-recipe.v1"}
+        bad_recipe_path = soak_budget_directory / "bad-parent-recipe.json"
+        bad_recipe_path.write_bytes(soak_budget_module.canonical_bytes(bad_recipe))
+        with self.assertRaisesRegex(
+                soak_budget_module.Source5SoakError,
+                "not the original V2 parent recipe"):
+            controller.create_soak_material_index(
+                v5_context, bad_recipe_path, receipt_path,
+                soak_budget_directory / "bad-recipe-index.json",
+                soak_budget_path,
+            )
 
         projected = controller.build_source5_journal_width_contract(
             context, pressure_index_path, width_soak_index_path,

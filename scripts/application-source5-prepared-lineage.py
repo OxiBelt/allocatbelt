@@ -18,8 +18,23 @@ from typing import Any, Callable
 
 
 SOURCE_PATH = "scripts/application-source5-prepared-lineage.py"
+
+SOURCE5_PREPARED_INPUTS_PROVENANCE_SCHEMA_V2 = \
+    "allocatbelt.application-source5-prepared-inputs-provenance.v2"
+SOURCE5_PREPARED_INPUTS_PROVENANCE_V2_FIELDS = frozenset({
+    "schema", "preparation_pin", "final_spec_pin", "final_plan_pin",
+    "exploration_lineage",
+})
+SOURCE5_PREPARED_EXPLORATION_LINEAGE_PIN_FIELDS = frozenset({
+    "bridge_header", "record_index",
+})
+
 HEADER_SCHEMA = "allocatbelt.application-source5-prepared-exploration-bridge-header.v1"
 INDEX_ROW_SCHEMA = "allocatbelt.application-source5-prepared-exploration-index-row.v1"
+LINEAGE_PROOF_SCHEMA_V1 = \
+    "allocatbelt.application-source5-prepared-exploration-lineage-proof.v1"
+LINEAGE_PROOF_SCHEMA_V2 = \
+    "allocatbelt.application-source5-prepared-exploration-lineage-proof.v2"
 PILOT_SCHEMA = "allocatbelt.application-capacity-pilot.v1"
 LINEAGE_DIRECTORY = "preparatory-exploration-lineage-v1"
 HEADER_NAME = "bridge-header.json"
@@ -74,6 +89,17 @@ def canonical_bytes(value: object) -> bytes:
     return (text + "\n").encode("ascii")
 
 
+def _json_snapshot(value: object, label: str) -> Any:
+    """Return a detached Source-owned value containing only canonical JSON data."""
+    try:
+        return json.loads(canonical_bytes(value))
+    except (TypeError, ValueError, UnicodeError, json.JSONDecodeError,
+            RecursionError) as error:
+        raise PreparedExplorationLineageError(
+            f"{label} cannot be retained as canonical JSON: {error}",
+        ) from error
+
+
 def sha256_bytes(raw: bytes) -> str:
     require(type(raw) is bytes, "lineage hash input must be bytes")
     return hashlib.sha256(raw).hexdigest()
@@ -119,6 +145,55 @@ def _pin(value: object, label: str, *, semantic: bool = False) -> dict[str, str]
     if semantic:
         _digest(pin["semantic_sha256"], f"{label} semantic digest")
     return pin
+
+def validate_prepared_input_provenance_v2(
+    value: object, *, expected_hosts: list[str],
+) -> dict[str, Any]:
+    """Validate the exact V2 provenance wrapper without granting authority.
+
+    The selected V5 profile has two hosts. Each lineage entry preserves its
+    original raw header/index pins; no imported flag, copied records, metrics,
+    or gate assertion is accepted as a substitute.
+    """
+    require(type(expected_hosts) is list and len(expected_hosts) == 2,
+            "prepared-input provenance v2 requires the exact two-host profile")
+    hosts = [_token(host, f"prepared-input provenance host[{index}]")
+             for index, host in enumerate(expected_hosts)]
+    require(len(set(hosts)) == 2,
+            "prepared-input provenance v2 repeats a selected host")
+    provenance = exact(
+        value, set(SOURCE5_PREPARED_INPUTS_PROVENANCE_V2_FIELDS),
+        "prepared-input provenance v2",
+    )
+    require(provenance.get("schema") ==
+                SOURCE5_PREPARED_INPUTS_PROVENANCE_SCHEMA_V2,
+            "prepared-input provenance schema is not v2")
+    preparation_pin = _pin(provenance["preparation_pin"],
+                           "prepared-input v2 preparation pin")
+    final_spec_pin = _pin(provenance["final_spec_pin"],
+                          "prepared-input v2 final Spec pin")
+    final_plan_pin = _pin(provenance["final_plan_pin"],
+                          "prepared-input v2 final Plan pin")
+    lineage = exact(provenance["exploration_lineage"], set(hosts),
+                    "prepared-input v2 exploration-lineage cohort")
+    normalized_lineage: dict[str, dict[str, dict[str, str]]] = {}
+    for host in hosts:
+        row = exact(
+            lineage[host], set(SOURCE5_PREPARED_EXPLORATION_LINEAGE_PIN_FIELDS),
+            f"prepared-input v2 {host} lineage pins",
+        )
+        normalized_lineage[host] = {
+            name: dict(_pin(row[name], f"prepared-input v2 {host} {name} pin"))
+            for name in ("bridge_header", "record_index")
+        }
+    return {
+        "schema": SOURCE5_PREPARED_INPUTS_PROVENANCE_SCHEMA_V2,
+        "preparation_pin": dict(preparation_pin),
+        "final_spec_pin": dict(final_spec_pin),
+        "final_plan_pin": dict(final_plan_pin),
+        "exploration_lineage": normalized_lineage,
+    }
+
 
 
 def _pin_template(path: str) -> dict[str, str]:
@@ -1546,17 +1621,22 @@ def _replay_initial_preparatory_journal_and_ledger(
         "fresh_sourcea_gpg_replay_required": True,
         "qualification_eligible": False,
         "records": records,
+        "journal_authorizations": list(authorizations),
+        "journal_finished": [
+            finished[("exploration", job["run_id"])]
+            for job in expected_jobs
+        ],
     }
 
 
-def verify_source5_prepared_exploration_lineage(
+def _verify_source5_prepared_exploration_lineage_impl(
     final_prepared: dict[str, Any], lineage_pins: dict[str, Any], *,
     artifact_reader: Callable[[dict[str, str], int], bytes],
     campaign_module: object, input_preparation_module: object,
     campaign_inputs_module: object, chronology_module: object,
     source5_campaign_module: object, preparatory_budget_module: object,
 ) -> dict[str, Any]:
-    """Return structural/allowed-fill proof; never owner, GPG or gate authority.
+    """Perform the complete structural validation shared by both result APIs.
 
     ``artifact_reader`` accepts one exact raw pin and byte bound and returns
     bytes from a caller-closed captured store. Campaign, preparation, input,
@@ -1721,11 +1801,43 @@ def verify_source5_prepared_exploration_lineage(
         record_pin = row["job_record_pin"]
         _validate_record_against_row(canonical_bytes(record), row, campaign_id, host_id)
         _validate_indexed_archive_bytes(artifact_reader, row, pilot_max_bytes, index)
+    ancestor = {
+        "bridge_header_pin": {"path": header_pin["path"],
+                              "raw_sha256": header_pin["raw_sha256"]},
+        "record_index_pin": {"path": index_pin["path"],
+                             "raw_sha256": index_pin["raw_sha256"]},
+        "header_byte_count": len(header_raw),
+        "index_byte_count": len(index_raw),
+        "job_list_sha256": sha256_bytes(canonical_bytes(expected_jobs)),
+        "journal": {
+            "pin": initial_replay["initial_journal_pin"],
+            "byte_count": initial_replay["initial_journal_byte_count"],
+            "record_count": initial_replay["initial_journal_record_count"],
+            "head": initial_replay["initial_journal_head"],
+        },
+        "phase_ledger": {
+            "pin": initial_replay["initial_phase_ledger_pin"],
+            "byte_count": initial_replay["initial_phase_ledger_byte_count"],
+            "row_count": initial_replay["initial_phase_ledger_row_count"],
+        },
+    }
     return {
-        "schema": "allocatbelt.application-source5-prepared-exploration-lineage-proof.v1",
+        "schema": LINEAGE_PROOF_SCHEMA_V2,
         "campaign_id": campaign_id, "host_id": host_id,
         "initial_output_root": initial_output_root,
         "final_output_root": final_output_root,
+        "bridge_header": header,
+        "index_rows": rows,
+        "capture_context": {
+            "execution_manifest": initial_context["execution_manifest"],
+            "width_contract": initial_context["width_contract"],
+            "budget": initial_context["budget"],
+            "preparatory_original_pins": initial_context[
+                "preparatory_original_pins"],
+        },
+        "records": initial_records,
+        "journal_authorizations": initial_replay["journal_authorizations"],
+        "journal_finished": initial_replay["journal_finished"],
         "bridge_header_pin": {"path": header_pin["path"],
                                "raw_sha256": header_pin["raw_sha256"]},
         "record_index_pin": {"path": index_pin["path"],
@@ -1741,10 +1853,63 @@ def verify_source5_prepared_exploration_lineage(
         "initial_phase_ledger_byte_count":
             initial_replay["initial_phase_ledger_byte_count"],
         "initial_phase_ledger_row_count": initial_replay["initial_phase_ledger_row_count"],
+        "ancestor": ancestor,
         "component_replay_required": True,
         "fresh_sourcea_gpg_replay_required": True,
         "qualification_eligible": False,
     }
+
+
+def verify_source5_prepared_exploration_lineage(
+    final_prepared: dict[str, Any], lineage_pins: dict[str, Any], *,
+    artifact_reader: Callable[[dict[str, str], int], bytes],
+    campaign_module: object, input_preparation_module: object,
+    campaign_inputs_module: object, chronology_module: object,
+    source5_campaign_module: object, preparatory_budget_module: object,
+) -> dict[str, Any]:
+    """Return the legacy lean v1 structural proof without authority claims."""
+    checked = _verify_source5_prepared_exploration_lineage_impl(
+        final_prepared, lineage_pins, artifact_reader=artifact_reader,
+        campaign_module=campaign_module,
+        input_preparation_module=input_preparation_module,
+        campaign_inputs_module=campaign_inputs_module,
+        chronology_module=chronology_module,
+        source5_campaign_module=source5_campaign_module,
+        preparatory_budget_module=preparatory_budget_module,
+    )
+    lean_fields = (
+        "campaign_id", "host_id", "initial_output_root", "final_output_root",
+        "bridge_header_pin", "record_index_pin", "job_count", "callback_count",
+        "allowed_slot_fill_proved", "initial_journal_pin",
+        "initial_journal_structurally_replayed",
+        "initial_phase_ledger_structurally_replayed", "initial_journal_head",
+        "initial_journal_record_count", "initial_phase_ledger_pin",
+        "initial_phase_ledger_byte_count", "initial_phase_ledger_row_count",
+        "component_replay_required", "fresh_sourcea_gpg_replay_required",
+        "qualification_eligible",
+    )
+    return {"schema": LINEAGE_PROOF_SCHEMA_V1,
+            **{name: checked[name] for name in lean_fields}}
+
+
+def verify_source5_prepared_exploration_lineage_v2(
+    final_prepared: dict[str, Any], lineage_pins: dict[str, Any], *,
+    artifact_reader: Callable[[dict[str, str], int], bytes],
+    campaign_module: object, input_preparation_module: object,
+    campaign_inputs_module: object, chronology_module: object,
+    source5_campaign_module: object, preparatory_budget_module: object,
+) -> dict[str, Any]:
+    """Return SourceA's enriched structural proof; never authority or readiness."""
+    checked = _verify_source5_prepared_exploration_lineage_impl(
+        final_prepared, lineage_pins, artifact_reader=artifact_reader,
+        campaign_module=campaign_module,
+        input_preparation_module=input_preparation_module,
+        campaign_inputs_module=campaign_inputs_module,
+        chronology_module=chronology_module,
+        source5_campaign_module=source5_campaign_module,
+        preparatory_budget_module=preparatory_budget_module,
+    )
+    return _json_snapshot(checked, "SourceA rich prepared-exploration proof")
 
 
 def _validate_indexed_archive_bytes(
@@ -1806,4 +1971,9 @@ __all__ = [
     "project_prepared_exploration_lineage_outputs",
     "validate_prepared_exploration_lineage_documents",
     "verify_source5_prepared_exploration_lineage",
+    "verify_source5_prepared_exploration_lineage_v2",
+    "SOURCE5_PREPARED_EXPLORATION_LINEAGE_PIN_FIELDS",
+    "SOURCE5_PREPARED_INPUTS_PROVENANCE_SCHEMA_V2",
+    "SOURCE5_PREPARED_INPUTS_PROVENANCE_V2_FIELDS",
+    "validate_prepared_input_provenance_v2",
 ]

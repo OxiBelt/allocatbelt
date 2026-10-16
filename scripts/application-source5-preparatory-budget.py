@@ -1234,15 +1234,32 @@ def _validate_catalogue_transport_and_storage(
         budget, catalogue_module, catalogue_row_reader,
     )
     try:
-        manifest = catalogue.verify_path_catalogue_chunks_with_reader(
-            budget["path_catalogue"], reader,
+        fixed_v3_names = (
+            "verify_fixed_pair_v3_path_catalogue_chunks_with_reader",
+            "iter_fixed_pair_v3_path_catalogue_rows_with_reader",
+            "project_fixed_pair_archive_job_caps",
+            "project_fixed_pair_archive_readback_caps",
         )
-        job_caps = catalogue.project_archive_job_caps(
-            catalogue.iter_path_catalogue_rows_with_reader(manifest, reader),
-        )
-        readback_caps = catalogue.project_archive_readback_caps(
-            catalogue.iter_path_catalogue_rows_with_reader(manifest, reader),
-        )
+        fixed_v3_presence = [callable(getattr(catalogue, name, None))
+                             for name in fixed_v3_names]
+        _require(all(fixed_v3_presence) or not any(fixed_v3_presence),
+                 "pinned Source exposes an incomplete fixed-v3 catalogue profile")
+        if all(fixed_v3_presence):
+            manifest = catalogue.verify_fixed_pair_v3_path_catalogue_chunks_with_reader(
+                budget["path_catalogue"], reader,
+            )
+            row_iterator = catalogue.iter_fixed_pair_v3_path_catalogue_rows_with_reader
+            job_projector = catalogue.project_fixed_pair_archive_job_caps
+            readback_projector = catalogue.project_fixed_pair_archive_readback_caps
+        else:
+            manifest = catalogue.verify_path_catalogue_chunks_with_reader(
+                budget["path_catalogue"], reader,
+            )
+            row_iterator = catalogue.iter_path_catalogue_rows_with_reader
+            job_projector = catalogue.project_archive_job_caps
+            readback_projector = catalogue.project_archive_readback_caps
+        job_caps = job_projector(row_iterator(manifest, reader))
+        readback_caps = readback_projector(row_iterator(manifest, reader))
     except (OSError, TypeError, ValueError, KeyError) as error:
         raise PreparatoryBudgetError(
             f"typed Source path-catalogue projection failed: {error}",
@@ -1250,7 +1267,7 @@ def _validate_catalogue_transport_and_storage(
     jobs = budget["read_schedule"]
     capacity_pilot_path_rows = []
     capacity_pilot_role_rows = []
-    for row in catalogue.iter_path_catalogue_rows_with_reader(manifest, reader):
+    for row in row_iterator(manifest, reader):
         if row["path"] == capacity_pilot_row["path"]:
             capacity_pilot_path_rows.append(row)
         if (row["role"] == "capacity_artifact" and
@@ -1337,7 +1354,7 @@ def _validate_catalogue_transport_and_storage(
         catalogue.SOURCE5_ARCHIVE_READ_CONTROL_ROLE,
     }
     slot_rows: dict[str, dict[str, Any]] = {}
-    for row in catalogue.iter_path_catalogue_rows_with_reader(manifest, reader):
+    for row in row_iterator(manifest, reader):
         if row["role"] in slot_roles:
             _require(row["role"] not in slot_rows,
                      "preparatory catalogue repeats a reusable read slot")

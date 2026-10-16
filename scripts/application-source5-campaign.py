@@ -26,13 +26,14 @@ import types
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import Any
+from typing import Any, Callable
 
 
 EXECUTION_SCHEMA = "allocatbelt.application-source5-campaign-execution.v1"
 EXECUTION_SCHEMA_V2 = "allocatbelt.application-source5-campaign-execution.v2"
 EXECUTION_SCHEMA_V3 = "allocatbelt.application-source5-campaign-execution.v3"
 EXECUTION_SCHEMA_V4 = "allocatbelt.application-source5-campaign-execution.v4"
+EXECUTION_SCHEMA_V5 = "allocatbelt.application-source5-campaign-execution.v5"
 PREPARATORY_BUDGET_SCHEMA = \
     "allocatbelt.application-source5-preparatory-exploration-budget.v1"
 PREPARATORY_BUDGET_SOURCE_PATH = \
@@ -41,11 +42,13 @@ PREPARATORY_EXECUTION_SCHEMA = (
     "allocatbelt.application-source5-preparatory-exploration-execution.v1"
 )
 PREPARATORY_SCOPE = "preparatory_exploration"
+PREPARED_EXPLORATION_REUSE_SCOPE = "final_prepared_exploration_reuse"
 PREPARATORY_SETUP_EVENT = "source5_prepared_capacity_registered"
 PREPARATORY_WIDTH_SCHEMA = \
     "allocatbelt.application-source5-preparatory-journal-width-contract.v1"
 BOUNDED_EXECUTION_SCHEMAS = frozenset({
-    EXECUTION_SCHEMA_V3, EXECUTION_SCHEMA_V4, PREPARATORY_EXECUTION_SCHEMA,
+    EXECUTION_SCHEMA_V3, EXECUTION_SCHEMA_V4, EXECUTION_SCHEMA_V5,
+    PREPARATORY_EXECUTION_SCHEMA,
 })
 ARCHIVE_SIGNER_CONTEXT_SCHEMA_V1 = \
     "allocatbelt.application-source5-archive-signer-context.v1"
@@ -58,6 +61,10 @@ SOURCE5_INPUT_PREPARATION_SOURCE_PATH = \
     "scripts/application-source5-input-preparation.py"
 SOURCE5_PREPARED_LINEAGE_SOURCE_PATH = \
     "scripts/application-source5-prepared-lineage.py"
+SOURCE5_PREPARED_BRIDGE_BUDGET_SOURCE_PATH = \
+    "scripts/application-source5-prepared-bridge-budget.py"
+SOURCE5_LINEAGE_CAPTURE_SOURCE_PATH = \
+    "scripts/application-source5-lineage-capture.py"
 HELPER_INPUT_SCHEMA = "allocatbelt.application-source5-helper-input.v1"
 JOB_RECORD_SCHEMA = "allocatbelt.application-source5-job-record.v1"
 ANALYSIS_SCHEMA = "allocatbelt.application-source5-phase-analysis.v1"
@@ -83,6 +90,8 @@ MAX_ARCHIVE_KEYRING_BYTES = 16 * 1024 * 1024
 MAX_ARCHIVE_GPGV_BYTES = 64 * 1024 * 1024
 SOURCE5_JOURNAL_WIDTH_CONTRACT_SCHEMA = \
     "allocatbelt.application-source5-journal-width-contract.v1"
+SOURCE5_JOURNAL_WIDTH_CONTRACT_SCHEMA_V2 = \
+    "allocatbelt.application-source5-journal-width-contract.v2"
 SOURCE5_JOURNAL_EVENT_KINDS = (
     "source5_authorized", "source5_app_started",
     "source5_app_terminal", "source5_job_terminal",
@@ -118,9 +127,39 @@ class Source5CampaignError(ValueError):
     """A frozen input, prerequisite, component, or campaign gate failed."""
 
 
+def _source5_execution_scope_pair(schema: str) -> tuple[str, str]:
+    """Map each prepared execution schema to its context/manifest scope pair."""
+    mapping = {
+        EXECUTION_SCHEMA_V2: ("final_frozen", "final_prepared"),
+        EXECUTION_SCHEMA_V3: ("final_frozen", "final_prepared_bounded"),
+        EXECUTION_SCHEMA_V4: ("final_frozen", "final_prepared_bounded"),
+        EXECUTION_SCHEMA_V5: (
+            PREPARED_EXPLORATION_REUSE_SCOPE,
+            PREPARED_EXPLORATION_REUSE_SCOPE,
+        ),
+    }
+    try:
+        return mapping[schema]
+    except KeyError as error:
+        raise Source5CampaignError(
+            "Source5 prepared execution schema has no closed scope mapping",
+        ) from error
+
+
 def require(condition: bool, message: str) -> None:
     if not condition:
         raise Source5CampaignError(message)
+
+
+def _source5_validate_prepared_execution_scope(
+    schema: str, context_scope: str, manifest_scope: str,
+) -> None:
+    """Check the exact scope pair used by load_context for each schema."""
+    expected_context_scope, expected_manifest_scope = \
+        _source5_execution_scope_pair(schema)
+    require(context_scope == expected_context_scope and
+            manifest_scope == expected_manifest_scope,
+            "prepared-input execution requires its exact frozen SpecV3/PlanV3 scope")
 
 
 def canonical_bytes(value: object) -> bytes:
@@ -255,6 +294,7 @@ class CampaignContext:
     scope: str
     host_id: str
     spec: dict[str, Any]
+    spec_raw: bytes
     plan: dict[str, Any]
     plan_raw: bytes
     spec_pin: dict[str, str]
@@ -320,6 +360,11 @@ class CampaignContext:
     preparatory_budget_pin: dict[str, str] | None = None
     fixed_spec_host_pin: dict[str, str] | None = None
     prepared_fixed_host_binding: dict[str, Any] | None = None
+    prepared_input_provenance_v2: dict[str, Any] | None = None
+    prepared_exploration_proofs: dict[str, dict[str, Any]] | None = None
+    prepared_capture_declaration: dict[str, Any] | None = None
+    prepared_capture_storage_rows: list[dict[str, Any]] | None = None
+    lineage_artifact_reader: Callable[[dict[str, str], int], bytes] | None = None
 
 
 def _safe_child(root: Path, relative: object, label: str) -> Path:
@@ -444,6 +489,7 @@ def load_context(
     manifest_value: dict[str, Any] | None = None,
     manifest_raw_sha256: str | None = None,
     allow_preparatory_core: bool = False,
+    lineage_artifact_reader: Callable[[dict[str, str], int], bytes] | None = None,
 ) -> CampaignContext:
     if manifest_value is None:
         manifest_path = manifest_path.resolve(strict=True)
@@ -518,6 +564,22 @@ def load_context(
             "completion", "host_completion", "host_verification", "ledger",
             "capacity_schedule_sha256", "registration_head",
         }, "Source5 v4 bounded prepared-capacity registration")
+    elif schema == EXECUTION_SCHEMA_V5:
+        exact(manifest, (base_manifest_fields - {"capacity_completions"}) | {
+            "scope", "prepared_input_generation",
+            "prepared_capacity_registration", "archive_signer_contexts",
+            "journal_width_contracts",
+        }, "Source5 execution manifest v5")
+        manifest_scope = manifest["scope"]
+        require(manifest_scope == PREPARED_EXPLORATION_REUSE_SCOPE,
+                "Source5 execution manifest v5 accepts only prepared-exploration reuse")
+        prepared_generation = exact(manifest["prepared_input_generation"], {
+            "completion", "provenance",
+        }, "Source5 v5 prepared-input generation")
+        capacity_registration = exact(manifest["prepared_capacity_registration"], {
+            "completion", "host_completion", "host_verification", "ledger",
+            "capacity_schedule_sha256", "registration_head",
+        }, "Source5 v5 prepared-capacity registration")
     elif schema == PREPARATORY_EXECUTION_SCHEMA:
         # The active typed Source module supplies the public schema validator;
         # before modules are loaded the closed field set is kept here as well.
@@ -713,6 +775,15 @@ def load_context(
             EVIDENCE_ARCHIVE_SOURCE_PATH,
             EVIDENCE_TRANSFER_PACKET_SOURCE_PATH,
         })
+    if schema == EXECUTION_SCHEMA_V5:
+        execution_paths.update({
+            EVIDENCE_ARCHIVE_SOURCE_PATH,
+            EVIDENCE_TRANSFER_PACKET_SOURCE_PATH,
+            PREPARATORY_BUDGET_SOURCE_PATH,
+            SOURCE5_PREPARED_LINEAGE_SOURCE_PATH,
+            SOURCE5_PREPARED_BRIDGE_BUDGET_SOURCE_PATH,
+            SOURCE5_LINEAGE_CAPTURE_SOURCE_PATH,
+        })
     if schema == PREPARATORY_EXECUTION_SCHEMA:
         execution_paths.update({
             EVIDENCE_ARCHIVE_SOURCE_PATH,
@@ -721,7 +792,8 @@ def load_context(
             SOURCE5_PREPARED_LINEAGE_SOURCE_PATH,
         })
     if schema in (EXECUTION_SCHEMA_V2, EXECUTION_SCHEMA_V3,
-                  EXECUTION_SCHEMA_V4, PREPARATORY_EXECUTION_SCHEMA):
+                  EXECUTION_SCHEMA_V4, EXECUTION_SCHEMA_V5,
+                  PREPARATORY_EXECUTION_SCHEMA):
         execution_paths.add(SOURCE5_INPUT_PREPARATION_SOURCE_PATH)
     execution_source_bytes: dict[str, bytes] = {}
     for relative in sorted(expected_script_paths):
@@ -761,7 +833,7 @@ def load_context(
             callable(getattr(chronology, "authorize_source5_job_locked", None)) and
             callable(getattr(chronology, "run_authorized_source5_job_locked", None)),
             "inventory-pinned chronology lacks the Source5 locked execution API")
-    if schema == EXECUTION_SCHEMA_V4:
+    if schema in {EXECUTION_SCHEMA_V4, EXECUTION_SCHEMA_V5}:
         require(callable(getattr(
                     chronology, "refresh_source5_analysis_gate_locked", None,
                 )) and
@@ -777,7 +849,7 @@ def load_context(
                     globals().get("source5_completed_archive_read_provider"),
                     "__call__", None,
                 )),
-                "Source5 v4 requires its pinned restart-safe captured-analysis refresh APIs")
+                "bounded Source5 requires its pinned restart-safe captured-analysis refresh APIs")
     require(callable(getattr(soak_adapter, "prepare_source5_soak", None)) and
             callable(getattr(soak_adapter, "run_source5_soak", None)) and
             callable(getattr(soak_adapter, "verify_source5_soak_component", None)) and
@@ -795,6 +867,25 @@ def load_context(
                 evidence_catalogue_module, "bind_audit_budget_plan", None,
             )),
             "Source5 evidence budget/catalogue modules lack their pinned planning APIs")
+    if schema == EXECUTION_SCHEMA_V5:
+        lineage_module = loaded[SOURCE5_PREPARED_LINEAGE_SOURCE_PATH]
+        bridge_budget_module = loaded[SOURCE5_PREPARED_BRIDGE_BUDGET_SOURCE_PATH]
+        capture_module = loaded[SOURCE5_LINEAGE_CAPTURE_SOURCE_PATH]
+        require(callable(getattr(
+                    lineage_module, "verify_source5_prepared_exploration_lineage_v2", None,
+                )) and callable(getattr(
+                    lineage_module, "validate_prepared_input_provenance_v2", None,
+                )) and callable(getattr(
+                    capture_module,
+                    "PreparedExplorationLineageCaptureReaderV1", None,
+                )) and callable(getattr(
+                    bridge_budget_module,
+                    "validate_prepared_exploration_width_contract_v2", None,
+                )) and callable(getattr(
+                    bridge_budget_module,
+                    "build_prepared_exploration_capture_storage_v1", None,
+                )),
+                "Source5 v5 inventory lacks its pinned lineage, capture, and width-v2 APIs")
     if schema == PREPARATORY_EXECUTION_SCHEMA:
         preparatory_budget_module = loaded[PREPARATORY_BUDGET_SOURCE_PATH]
         require(callable(getattr(
@@ -811,18 +902,23 @@ def load_context(
                 )) and
                 callable(getattr(
                     loaded[SOURCE5_INPUT_PREPARATION_SOURCE_PATH],
-                    "materialize_prepared_host_binding", None,
+                    "materialize_prepared_host_binding_metadata_v1", None,
                 )) and
                 callable(getattr(
                     loaded[SOURCE5_INPUT_PREPARATION_SOURCE_PATH],
-                    "verify_prepared_host_binding", None,
+                    "verify_prepared_host_binding_metadata_v1", None,
+                )) and
+                callable(getattr(
+                    loaded[SOURCE5_INPUT_PREPARATION_SOURCE_PATH],
+                    "verify_prepared_capacity_generation_bounded_metadata_v1", None,
                 )) and
                 callable(getattr(
                     loaded[SOURCE5_INPUT_PREPARATION_SOURCE_PATH],
                     "capacity_pilot_maximum_bytes", None,
                 )),
                 "Source5 prep Source modules lack their exact profile and host-binding APIs")
-    if schema in {EXECUTION_SCHEMA_V4, PREPARATORY_EXECUTION_SCHEMA}:
+    if schema in {EXECUTION_SCHEMA_V4, EXECUTION_SCHEMA_V5,
+                  PREPARATORY_EXECUTION_SCHEMA}:
         evidence_archive_module = loaded[EVIDENCE_ARCHIVE_SOURCE_PATH]
         evidence_transfer_packet_module = loaded[EVIDENCE_TRANSFER_PACKET_SOURCE_PATH]
         require(callable(getattr(
@@ -851,6 +947,55 @@ def load_context(
                     evidence_transfer_packet_module, "publish_ack_bundle", None,
                 )),
                 "Source5 v4 source inventory lacks the bounded archive handoff APIs")
+        if schema == EXECUTION_SCHEMA_V5 or (
+                schema == PREPARATORY_EXECUTION_SCHEMA and
+                callable(getattr(
+                    evidence_archive_module,
+                    "build_fixed_checkpoint_request_v3", None,
+                ))):
+            require(callable(getattr(
+                        evidence_archive_module,
+                        "build_fixed_checkpoint_request_v3", None,
+                    )) and
+                    callable(getattr(
+                        evidence_budget_module,
+                        "required_archive_request_schema_v1", None,
+                    )) and
+                    callable(getattr(
+                        evidence_budget_module,
+                        "write_fixed_pair_v3_path_catalogue_chunks", None,
+                    )) and
+                    callable(getattr(
+                        evidence_budget_module,
+                        "project_fixed_pair_archive_job_caps", None,
+                    )) and
+                    callable(getattr(
+                        evidence_budget_module,
+                        "project_fixed_pair_archive_readback_caps", None,
+                    )) and
+                    callable(getattr(
+                        evidence_budget_module,
+                        "verify_fixed_pair_v3_path_catalogue_chunks_with_reader", None,
+                    )),
+                    "Source5 preparatory/V5 inventory lacks its exact fixed-checkpoint-v3 profile APIs")
+        if schema == EXECUTION_SCHEMA_V5:
+            require(callable(getattr(
+                        evidence_budget_module,
+                        "project_prepared_source5_archive_job_caps", None,
+                    )) and
+                    callable(getattr(
+                        evidence_budget_module,
+                        "project_prepared_source5_archive_readback_caps", None,
+                    )) and
+                    callable(getattr(
+                        evidence_budget_module,
+                        "write_fixed_pair_v3_path_catalogue_chunks", None,
+                    )) and
+                    callable(getattr(
+                        evidence_budget_module,
+                        "verify_prepared_source5_path_catalogue_chunks", None,
+                    )),
+                    "Source5 v5 inventory lacks its mixed fixed-v3/dynamic-tree budget APIs")
     owner_source_bytes = {
         path: execution_source_bytes[path]
         for path in evidence_catalogue_module.OWNER_PATHS.values()
@@ -863,7 +1008,14 @@ def load_context(
                     chronology, "register_source5_prepared_capacity_locked", None,
                 )),
                 "inventory-pinned chronology lacks the prepared-capacity registration bridge API")
+    if schema == EXECUTION_SCHEMA_V5:
+        require(callable(getattr(
+                    chronology,
+                    "register_source5_prepared_exploration_capacity_locked", None,
+                )),
+                "inventory-pinned chronology lacks its V5 capacity-registration API")
     prepared_completion = None
+    prepared_input_provenance_v2 = None
     try:
         for other_host, other_source in sources.items():
             campaign.verify_source_manifest(
@@ -893,6 +1045,16 @@ def load_context(
                     len(selected_exploration) == 360 and
                     selected_plan_exploration == selected_exploration,
                     "preparatory Source5 profile does not select exactly the original 360 host exploration jobs")
+        elif schema == EXECUTION_SCHEMA_V5:
+            require(spec["rates"] and spec["oracles"] and
+                    callable(getattr(campaign, "qualification_host_count", None)) and
+                    campaign.qualification_host_count(spec) == 2 and
+                    len(manifest["hosts"]) == 2,
+                    "Source5 v5 requires the validated explicit two-KVM qualification profile")
+            scope = PREPARED_EXPLORATION_REUSE_SCOPE
+            for phase in ("exploration", "aa", "confirmation", "pressure", "soak"):
+                require(plan["jobs"][phase] == campaign.build_jobs(spec, phase),
+                        f"PlanV3 {phase} jobs differ from the selected V5 original Plan derivation")
         elif spec["rates"] and spec["oracles"]:
             scope = "final_frozen"
             require(callable(getattr(
@@ -910,12 +1072,11 @@ def load_context(
                     plan["jobs"]["pressure"] == [] and
                     plan["jobs"]["confirmation"] == [],
                     "prospective Source5 PlanV3 does not contain the exact exploration-only matrix")
-        if schema in (EXECUTION_SCHEMA_V2, EXECUTION_SCHEMA_V3, EXECUTION_SCHEMA_V4):
-            expected_scope = ("final_prepared_bounded" if schema == EXECUTION_SCHEMA_V3
-                          else "final_prepared_bounded" if schema == EXECUTION_SCHEMA_V4
-                          else "final_prepared")
-            require(scope == "final_frozen" and manifest_scope == expected_scope,
-                    "prepared-input execution requires the complete frozen final SpecV3/PlanV3")
+        if schema in (EXECUTION_SCHEMA_V2, EXECUTION_SCHEMA_V3,
+                      EXECUTION_SCHEMA_V4, EXECUTION_SCHEMA_V5):
+            _source5_validate_prepared_execution_scope(
+                schema, scope, manifest_scope,
+            )
             preparation = loaded["scripts/application-source5-input-preparation.py"]
             completion_pin = exact(prepared_generation["completion"], {
                 "path", "raw_sha256", "semantic_sha256",
@@ -928,14 +1089,43 @@ def load_context(
                     Path(plan_raw_pin["path"]).parent /
                     "prepared-inputs-completion.json",
                     "prepared-input completion is not beside the exact final PlanV3 generation")
-            prepared_completion = preparation.verify_prepared_inputs_completion(
-                completion_pin, prepared_generation["provenance"],
-                source_root, input_root,
-            )
+            if schema == EXECUTION_SCHEMA_V5:
+                provenance_validator = getattr(
+                    loaded[SOURCE5_PREPARED_LINEAGE_SOURCE_PATH],
+                    "validate_prepared_input_provenance_v2", None,
+                )
+                require(callable(provenance_validator) and
+                        lineage_artifact_reader is not None,
+                        "Source5 v5 requires the Source-owned provenance-v2 validator and closed lineage reader")
+                prepared_input_provenance_v2 = provenance_validator(
+                    prepared_generation["provenance"],
+                    expected_hosts=manifest["hosts"],
+                )
+                legacy_provenance_projection = {
+                    "schema": "allocatbelt.application-source5-prepared-inputs-provenance.v1",
+                    "preparation_pin": prepared_input_provenance_v2["preparation_pin"],
+                    "spec_pin": prepared_input_provenance_v2["final_spec_pin"],
+                    "plan_pin": prepared_input_provenance_v2["final_plan_pin"],
+                }
+                recorded_verifier = getattr(
+                    preparation, "verify_prepared_inputs_completion_recorded_host", None,
+                )
+                require(callable(recorded_verifier),
+                        "Source5 v5 InputPrep lacks its recorded-host completion verifier")
+                prepared_completion = recorded_verifier(
+                    completion_pin, legacy_provenance_projection,
+                    source_root, input_root,
+                )
+            else:
+                prepared_input_provenance_v2 = None
+                prepared_completion = preparation.verify_prepared_inputs_completion(
+                    completion_pin, prepared_generation["provenance"],
+                    source_root, input_root,
+                )
             require(type(prepared_completion) is dict and
                     prepared_completion.get("schema") ==
                     ("allocatbelt.application-source5-preparation-completion.v2"
-                     if schema in BOUNDED_EXECUTION_SCHEMAS else
+                    if schema in BOUNDED_EXECUTION_SCHEMAS else
                      "allocatbelt.application-source5-preparation-completion.v1") and
                     prepared_completion.get("complete") is True and
                     prepared_completion.get("qualification_eligible") is False and
@@ -1024,7 +1214,7 @@ def load_context(
                     "preparatory capacity generation completion pin is malformed")
             try:
                 preparatory_capacity_generation = \
-                    preparation.verify_prepared_capacity_generation_bounded(
+                    preparation.verify_prepared_capacity_generation_bounded_metadata_v1(
                         generation_completion, preparation_pin,
                         source_root, input_root,
                     )
@@ -1067,7 +1257,7 @@ def load_context(
     observed = exact(manifest["observed_hosts"], set(manifest["hosts"]),
                      "Source5 observed host map")[host_id]
     observed_artifact = raw_pin(observed["artifact"], "Source5 observed host")
-    if schema == EXECUTION_SCHEMA_V4:
+    if schema in {EXECUTION_SCHEMA_V4, EXECUTION_SCHEMA_V5}:
         archive_signer_context, archive_signer_context_pin = \
             _load_archive_signer_context(manifest, host_id)
         journal_contract_map = exact(
@@ -1094,14 +1284,16 @@ def load_context(
             raise Source5CampaignError(
                 f"{host_id} journal-width contract is malformed",
             ) from error
+        expected_width_schema = (SOURCE5_JOURNAL_WIDTH_CONTRACT_SCHEMA_V2
+                                 if schema == EXECUTION_SCHEMA_V5 else
+                                 SOURCE5_JOURNAL_WIDTH_CONTRACT_SCHEMA)
         require(type(journal_width_contract) is dict and
                 journal_contract_raw == canonical_bytes(journal_width_contract) and
                 journal_contract_raw_sha == journal_contract_raw_pin["raw_sha256"] and
                 stat.S_ISREG(journal_contract_info.st_mode) and
                 journal_contract_info.st_uid == os.getuid() and
                 stat.S_IMODE(journal_contract_info.st_mode) == 0o600 and
-                journal_width_contract.get("schema") ==
-                    SOURCE5_JOURNAL_WIDTH_CONTRACT_SCHEMA and
+                journal_width_contract.get("schema") == expected_width_schema and
                 is_sha(journal_width_contract.get("contract_sha256")) and
                 journal_width_contract["contract_sha256"] ==
                     journal_contract_ref["semantic_sha256"] ==
@@ -1230,7 +1422,7 @@ def load_context(
         manifest_pin={"path": manifest_path_string,
                       "raw_sha256": manifest_sha},
         scope=scope,
-        host_id=host_id, spec=spec, plan=plan, plan_raw=plan_raw,
+        host_id=host_id, spec=spec, spec_raw=spec_raw, plan=plan, plan_raw=plan_raw,
         spec_pin={"path": spec_raw_pin["path"], "raw_sha256": spec_raw_sha},
         plan_pin={"path": plan_raw_pin["path"], "raw_sha256": plan_raw_sha},
         spec_semantic_sha256=spec_semantic, plan_semantic_sha256=plan_semantic,
@@ -1263,6 +1455,8 @@ def load_context(
         preparatory_budget=preparatory_budget,
         preparatory_budget_raw=preparatory_budget_raw,
         preparatory_budget_pin=preparatory_budget_pin,
+        prepared_input_provenance_v2=prepared_input_provenance_v2,
+        lineage_artifact_reader=lineage_artifact_reader,
     )
     if schema == PREPARATORY_EXECUTION_SCHEMA and not preparatory_core:
         _source5_prepared_host_binding(result, materialize=False)
@@ -1270,6 +1464,8 @@ def load_context(
         _validate_source5_journal_width_contract(
             result, journal_width_contract,
         )
+    if schema == EXECUTION_SCHEMA_V5:
+        _source5_validate_prepared_exploration_context(result)
     if schema == PREPARATORY_EXECUTION_SCHEMA and not preparatory_core:
         _validate_source5_preparatory_profile_artifacts(
             result, preparatory_width_contract, preparatory_width_pin,
@@ -1277,6 +1473,204 @@ def load_context(
             preparatory_budget_pin,
         )
     return result
+
+
+def _source5_validate_prepared_exploration_context(
+    context: CampaignContext,
+) -> None:
+    """Close V5 against each structural ancestor and current-only width."""
+    require(context.manifest.get("schema") == EXECUTION_SCHEMA_V5 and
+            context.scope == PREPARED_EXPLORATION_REUSE_SCOPE and
+            type(context.prepared_input_provenance_v2) is dict and
+            callable(context.lineage_artifact_reader),
+            "Source5 v5 context lacks its exact prepared provenance or captured reader")
+    expected_hosts = context.manifest["hosts"]
+    lineage_module = context.modules[SOURCE5_PREPARED_LINEAGE_SOURCE_PATH]
+    bridge_budget = context.modules[SOURCE5_PREPARED_BRIDGE_BUDGET_SOURCE_PATH]
+    verify_lineage = getattr(
+        lineage_module, "verify_source5_prepared_exploration_lineage_v2", None,
+    )
+    build_capture_storage = getattr(
+        bridge_budget, "build_prepared_exploration_capture_storage_v1", None,
+    )
+    require(callable(verify_lineage) and callable(build_capture_storage),
+            "Source5 v5 selected Source lacks its structural proof or Source-bound capture projection")
+    provenance = context.prepared_input_provenance_v2
+    require(provenance.get("schema") ==
+            "allocatbelt.application-source5-prepared-inputs-provenance.v2" and
+            type(provenance.get("exploration_lineage")) is dict and
+            set(provenance["exploration_lineage"]) == set(expected_hosts),
+            "Source5 v5 provenance does not cover the exact selected host order")
+    primary_spec_pin = {
+        "path": context.spec_pin["path"],
+        "raw_sha256": context.spec_pin["raw_sha256"],
+        "semantic_sha256": context.spec_semantic_sha256,
+    }
+    primary_plan_pin = {
+        "path": context.plan_pin["path"],
+        "raw_sha256": context.plan_pin["raw_sha256"],
+        "semantic_sha256": context.plan_semantic_sha256,
+    }
+    source_manifest_rows = [{
+        "host_id": host,
+        "path": context.source_manifest_pins[host]["path"],
+        "raw_sha256": context.source_manifest_pins[host]["raw_sha256"],
+        "semantic_sha256": context.sources[host]["manifest_sha256"],
+        "source_tree_sha256": context.sources[host]["source"]["source_tree_sha256"],
+    } for host in expected_hosts]
+    observed_by_host = {}
+    for host in expected_hosts:
+        reference = exact(context.manifest["observed_hosts"][host],
+                          {"artifact", "host_fingerprint_sha256",
+                           "controls_sha256"},
+                          f"Source5 v5 {host} observed-host reference")
+        host_rows = [row for row in context.spec.get("hosts", [])
+                     if type(row) is dict and row.get("host_id") == host]
+        require(len(host_rows) == 1,
+                f"Source5 v5 {host} immutable Spec host row is missing or repeated")
+        host_spec = host_rows[0]
+        require(is_sha(reference["host_fingerprint_sha256"]) and
+                is_sha(reference["controls_sha256"]) and
+                reference["host_fingerprint_sha256"] ==
+                    host_spec.get("host_fingerprint_sha256") and
+                type(host_spec.get("controls")) is dict and
+                reference["controls_sha256"] == sha256(canonical_bytes(
+                    host_spec["controls"],
+                )),
+                f"Source5 v5 {host} observed-host wrapper differs from its immutable Spec host")
+        pin = raw_pin(reference["artifact"],
+                      f"Source5 v5 {host} observed-host pin")
+        observed, raw, digest = read_json(
+            Path(pin["path"]), f"Source5 v5 {host} observed-host document",
+            MAX_ARTIFACT_BYTES, pin["raw_sha256"],
+        )
+        require(raw == canonical_bytes(observed) and digest == pin["raw_sha256"] and
+                is_sha(observed.get("boot_id_sha256")) and
+                type(observed.get("controls")) is dict and
+                observed.get("host_id") == host and
+                observed.get("controls") == host_spec["controls"] and
+                observed.get("controls_sha256") == reference["controls_sha256"] and
+                observed["controls_sha256"] == sha256(canonical_bytes(
+                    observed["controls"],
+                )),
+                f"Source5 v5 {host} observed-host facts differ from their raw/control pins")
+        try:
+            context.modules["scripts/application-campaign-inputs.py"].\
+                _validate_observed_host_structure(observed, host_spec, host)
+        except Exception as error:
+            raise Source5CampaignError(
+                f"Source5 v5 {host} observed-host DTO failed its frozen host contract: {error}",
+            ) from error
+        observed_by_host[host] = {
+            "path": pin["path"], "raw_sha256": pin["raw_sha256"],
+            "boot_id_sha256": observed["boot_id_sha256"],
+            "controls_sha256": observed["controls_sha256"],
+        }
+
+    def read_lineage(pin: dict[str, str], maximum: int) -> bytes:
+        if pin == {"path": context.spec_pin["path"],
+                  "raw_sha256": context.spec_pin["raw_sha256"]}:
+            raw = context.spec_raw
+        elif pin == {"path": context.plan_pin["path"],
+                    "raw_sha256": context.plan_pin["raw_sha256"]}:
+            raw = context.plan_raw
+        else:
+            raw = context.lineage_artifact_reader(dict(pin), maximum)
+        require(type(raw) is bytes and 0 < len(raw) <= maximum and
+                sha256(raw) == pin["raw_sha256"],
+                "Source5 v5 captured reader returned bytes outside the exact raw pin/bound")
+        return raw
+
+    proofs = {}
+    for host in expected_hosts:
+        final_prepared = {
+            "campaign_id": context.manifest["campaign_id"],
+            "host_id": host,
+            "output_root": str(context.output_root),
+            "original_pins": {
+                "spec": primary_spec_pin,
+                "plan": primary_plan_pin,
+                "source_manifests": source_manifest_rows,
+                "observed_host": observed_by_host[host],
+            },
+        }
+        proof = verify_lineage(
+            final_prepared, provenance["exploration_lineage"][host],
+            artifact_reader=read_lineage,
+            campaign_module=context.campaign,
+            input_preparation_module=context.modules[
+                SOURCE5_INPUT_PREPARATION_SOURCE_PATH],
+            campaign_inputs_module=context.modules[
+                "scripts/application-campaign-inputs.py"],
+            chronology_module=context.chronology,
+            source5_campaign_module=sys.modules[__name__],
+            preparatory_budget_module=context.modules[
+                PREPARATORY_BUDGET_SOURCE_PATH],
+        )
+        require(type(proof) is dict and
+                proof.get("schema") ==
+                    "allocatbelt.application-source5-prepared-exploration-lineage-proof.v2" and
+                proof.get("host_id") == host and
+                proof.get("campaign_id") == context.manifest["campaign_id"] and
+                proof.get("qualification_eligible") is False and
+                proof.get("component_replay_required") is True and
+                type(proof.get("bridge_header")) is dict and
+                type(proof.get("index_rows")) is list and
+                len(proof["index_rows"]) == 360 and
+                type(proof.get("capture_context")) is dict,
+                f"Source5 v5 {host} structural proof is incomplete or authorizing")
+        proofs[host] = proof
+
+    expected_ancestors = {
+        host: proofs[host]["ancestor"] for host in expected_hosts
+    }
+    exploration_jobs_by_host = {
+        host: [job for job in context.plan["jobs"]["exploration"]
+               if job.get("host_id") == host]
+        for host in expected_hosts
+    }
+    declaration, storage_rows = build_capture_storage(
+        expected_hosts, proofs,
+        expected_ancestors=expected_ancestors,
+        expected_exploration_jobs=exploration_jobs_by_host,
+        artifact_reader=read_lineage,
+        evidence_budget_module=context.modules[EVIDENCE_BUDGET_SOURCE_PATH],
+    )
+    budget_module = context.modules[EVIDENCE_BUDGET_SOURCE_PATH]
+    storage_rows = [budget_module._catalogue_row(
+        row, f"Source5 v5 retained ancestor metadata row[{index}]",
+    ) for index, row in enumerate(storage_rows)]
+    require(declaration.get("cohort_host_ids") == expected_hosts and
+            len(storage_rows) == len(declaration.get("objects", [])),
+            "Source5 v5 retained ancestor declarations differ from captured Source closure")
+    context.prepared_exploration_proofs = proofs
+    context.prepared_capture_declaration = declaration
+    context.prepared_capture_storage_rows = storage_rows
+
+    selected_jobs = {
+        phase: _source5_journal_jobs(context, phase)
+        for phase in ("exploration", "aa", "confirmation", "pressure", "soak")
+    }
+    width = context.journal_width_contract
+    require(type(width) is dict,
+            "Source5 v5 manifest omits its selected current width-v2 contract")
+    original_pins = _source5_original_pins_for_context(context)
+    contract, event_count, maximum_line = \
+        bridge_budget.validate_prepared_exploration_width_contract_v2(
+            width, jobs_by_phase=selected_jobs,
+            expected_campaign_id=context.manifest["campaign_id"],
+            expected_host_id=context.host_id,
+            expected_original_pins_sha256=sha256(canonical_bytes(original_pins)),
+            expected_plan_pin=primary_plan_pin,
+            expected_source_manifest_pin={
+                "path": context.source_manifest_pins[context.host_id]["path"],
+                "raw_sha256": context.source_manifest_pins[context.host_id]["raw_sha256"],
+                "semantic_sha256": context.sources[context.host_id]["manifest_sha256"],
+            },
+            expected_ancestor=proofs[context.host_id]["ancestor"],
+        )
+    require(contract is width and event_count == 97499 and maximum_line > 0,
+            "Source5 v5 selected width does not bind the exact current-only event horizon")
 
 
 def _source5_prepared_host_binding(
@@ -1289,8 +1683,8 @@ def _source5_prepared_host_binding(
                 "provenance")) is dict,
             "Source5 fixed Spec host binding requires the preparatory input generation")
     module = context.modules.get(SOURCE5_INPUT_PREPARATION_SOURCE_PATH)
-    method_name = ("materialize_prepared_host_binding" if materialize else
-                   "verify_prepared_host_binding")
+    method_name = ("materialize_prepared_host_binding_metadata_v1" if materialize else
+                   "verify_prepared_host_binding_metadata_v1")
     method = getattr(module, method_name, None)
     require(callable(method),
             f"pinned Source5 preparation module lacks {method_name}")
@@ -2306,17 +2700,17 @@ def _source5_helper_input_byte_bound(
     return len(canonical_bytes(value))
 
 
-def _source5_original_pins_for_context(
-    context: CampaignContext,
+def build_source5_original_pins_from_observed_v1(
+    context: CampaignContext, observed: dict[str, Any], observed_sha: str,
 ) -> dict[str, Any]:
-    """Rebuild chronology's exact common pin body from the prepared context."""
-    if type(context.journal_width_original_pins) is dict:
-        return context.journal_width_original_pins
-    observed, _raw, observed_sha = read_json(
-        Path(context.observed_host_pin["path"]),
-        "Source5 journal-width observed-host input", MAX_ARTIFACT_BYTES,
-        context.observed_host_pin["raw_sha256"],
-    )
+    """Build chronology's original-pin DTO from already checked observation bytes.
+
+    This pure projection does not open paths. Callers must first read the
+    observed-host JSON through the selected Source's bounded resident reader.
+    """
+    require(type(observed) is dict and is_sha(observed_sha) and
+            observed_sha == context.observed_host_pin["raw_sha256"],
+            "Source5 width observation does not match its exact raw pin")
     require(observed_sha == context.observed_host_pin["raw_sha256"] and
             type(observed.get("controls")) is dict and
             type(observed.get("cpu_affinity")) is list and
@@ -2392,6 +2786,24 @@ def _source5_original_pins_for_context(
         },
         "captured_modules": captured,
     }
+    return result
+
+
+def _source5_original_pins_for_context(
+    context: CampaignContext,
+) -> dict[str, Any]:
+    """Rebuild chronology pins after the ordinary resident host read."""
+    if type(context.journal_width_original_pins) is dict:
+        return context.journal_width_original_pins
+    observed, _raw, observed_sha = read_json(
+        Path(context.observed_host_pin["path"]),
+        "Source5 journal-width observed-host input", MAX_ARTIFACT_BYTES,
+        context.observed_host_pin["raw_sha256"],
+    )
+    result = build_source5_original_pins_from_observed_v1(
+        context, observed, observed_sha,
+    )
+    chronology = context.chronology
     validator = getattr(chronology, "_validate_chronology_original_pins", None)
     require(callable(validator),
             "pinned chronology lacks its exact original-pin validator")
@@ -3418,7 +3830,7 @@ def build_source5_journal_width_contract(
     output_path: Path | None,
 ) -> dict[str, Any]:
     """Seal the exact per-job callback widths before v4 measurement begins."""
-    require(context.scope == "final_frozen" and
+    require(context.scope in {"final_frozen", PREPARED_EXPLORATION_REUSE_SCOPE} and
             context.prepared_input_completion is not None,
             "Source5 journal-width contract requires a final prepared original cohort")
     require(host_evidence_budget_path.is_absolute() and
@@ -3431,6 +3843,7 @@ def build_source5_journal_width_contract(
     budget_paths = {
         budget_directory / "host-evidence-budget-v2.json",
         budget_directory / "host-evidence-budget-v3.json",
+        budget_directory / "host-evidence-budget-v4.json",
     }
     require(host_evidence_budget_path in budget_paths,
             "Source5 journal-width contract budget path differs from its exact v2/v3 role")
@@ -3595,6 +4008,33 @@ def build_source5_journal_width_contract(
         "failed_owner_window": failure_winner,
     }
     body["contract_sha256"] = sha256(canonical_bytes(body))
+    if context.manifest.get("schema") == EXECUTION_SCHEMA_V5:
+        require(type(context.prepared_exploration_proofs) is dict and
+                context.host_id in context.prepared_exploration_proofs,
+                "Source5 v5 width projection lacks its structural ancestor proof")
+        bridge_budget = context.modules[SOURCE5_PREPARED_BRIDGE_BUDGET_SOURCE_PATH]
+        jobs_by_phase = {
+            phase: _source5_journal_jobs(context, phase)
+            for phase in ("exploration", "aa", "confirmation", "pressure", "soak")
+        }
+        body = bridge_budget.build_prepared_exploration_width_contract_v2(
+            body, jobs_by_phase=jobs_by_phase,
+            ancestor_value=context.prepared_exploration_proofs[
+                context.host_id]["ancestor"],
+            expected_campaign_id=context.manifest["campaign_id"],
+            expected_host_id=context.host_id,
+            expected_original_pins_sha256=original_pins_sha,
+            expected_plan_pin={
+                "path": context.plan_pin["path"],
+                "raw_sha256": context.plan_pin["raw_sha256"],
+                "semantic_sha256": context.plan_semantic_sha256,
+            },
+            expected_source_manifest_pin={
+                "path": context.source_manifest_pins[context.host_id]["path"],
+                "raw_sha256": context.source_manifest_pins[context.host_id]["raw_sha256"],
+                "semantic_sha256": context.sources[context.host_id]["manifest_sha256"],
+            },
+        )
     raw = canonical_bytes(body)
     require(len(raw) <= 16 * 1024 * 1024,
             "Source5 exact journal-width contract exceeds its finite canonical metadata allowance")
@@ -5515,7 +5955,11 @@ def _source5_refresh_phase_prerequisite_gates_locked(
 def run_fixed_phase(context: CampaignContext, phase: str) -> dict[str, Any]:
     require(phase in {"exploration", "aa", "confirmation"},
             "fixed component runner only accepts original fixed-policy phases")
-    require(context.scope == "final_frozen" or phase == "exploration",
+    require(not (context.manifest.get("schema") == EXECUTION_SCHEMA_V5 and
+                 phase == "exploration"),
+            "Source5 v5 exploration is imported from the validated ancestor and can never launch a new APP")
+    require(context.scope in {"final_frozen", PREPARED_EXPLORATION_REUSE_SCOPE} or
+            phase == "exploration",
             "prospective Source5 scope is closed to exploration-only execution")
     jobs = _host_jobs(context, phase)
     disposition_byte_bound = _source5_disposition_byte_bound(context, phase)
@@ -7567,9 +8011,15 @@ def create_soak_material_index(
     resource_budget_path: Path | None = None,
 ) -> dict[str, Any]:
     """Bind one real externally built V2 recipe and receipt to the original Soak job."""
-    require(context.scope == "final_frozen" and
-            context.prepared_input_completion is not None,
-            "Source5 Soak materials require the final prepared-input generation")
+    require(type(context.manifest) is dict and
+            type(context.manifest.get("schema")) is str and
+            type(context.manifest.get("scope")) is str,
+            "Source5 Soak materials require a sealed prepared execution scope")
+    _source5_validate_prepared_execution_scope(
+        context.manifest["schema"], context.scope, context.manifest["scope"],
+    )
+    require(context.prepared_input_completion is not None,
+            "Source5 Soak materials require the prepared-input generation")
     jobs = _host_jobs(context, "soak")
     require(len(jobs) == 1,
             "Source5 host has no unique original Soak job")
@@ -7831,6 +8281,7 @@ def _source5_path_catalogue_records(
              Path(context.manifest["original_inputs"]["campaign_artifacts_root"]))
     record_spool = tempfile.TemporaryFile(mode="w+b", dir=scratch_root)
     record_spool_count = 0
+    seen_origin_paths: set[str] = set()
 
     def storage_domain(path: Path) -> str:
         matches = [root for root in writable_roots if path.is_relative_to(root)]
@@ -7908,6 +8359,8 @@ def _source5_path_catalogue_records(
                 "Source5 producer path spool exceeded the caller-reserved scratch bytes")
         record_spool.write(encoded)
         record_spool_count += 1
+        if raw_sha256 is not None:
+            seen_origin_paths.add(str(path))
         parents(path, owner, storage_root, phase, run_id)
 
     def add_tree(
@@ -8067,14 +8520,43 @@ def _source5_path_catalogue_records(
                 "prepared_completion", MAX_ARTIFACT_BYTES, "inputs",
                 "Source5 prepared-input completion",
                 semantic_sha256=completion_pin["semantic_sha256"], host=host_id)
-        provenance = exact(prepared_generation["provenance"], {
-            "schema", "preparation_pin", "final_spec_pin", "final_plan_pin",
-        }, "Source5 prepared-input provenance")
+        provenance = prepared_generation["provenance"]
+        if context.manifest.get("schema") == EXECUTION_SCHEMA_V5:
+            provenance = exact(provenance, {
+                "schema", "preparation_pin", "final_spec_pin", "final_plan_pin",
+                "exploration_lineage",
+            }, "Source5 prepared-input provenance v2")
+        else:
+            provenance = exact(provenance, {
+                "schema", "preparation_pin", "final_spec_pin", "final_plan_pin",
+            }, "Source5 prepared-input provenance")
         prep_pin = exact(provenance["preparation_pin"], {
             "path", "raw_sha256",
         }, "Source5 preparation pin")
         add_pin(prep_pin, "preparation", MAX_ARTIFACT_BYTES, "inputs",
                 "Source5 preparation", host=host_id)
+        if context.manifest.get("schema") == EXECUTION_SCHEMA_V5:
+            require(type(context.prepared_capture_storage_rows) is list and
+                    type(context.prepared_capture_declaration) is dict,
+                    "Source5 v5 catalogue lacks its complete captured-lineage closure")
+            for row in context.prepared_capture_storage_rows:
+                if row["path"] in seen_origin_paths:
+                    continue
+                origin = row["origin_pin"]
+                require(type(origin) is dict and
+                        is_sha(origin.get("raw_sha256")),
+                        "Source5 v5 captured metadata catalogue row lacks its exact raw pin")
+                add_file(
+                    row["path"], row["role"], row["max_bytes"], row["owner"],
+                    storage_root=row["storage_root"], phase=row["phase"],
+                    run_id=row["run_id"], member_index=row["member_index"],
+                    aggregate_id=row["aggregate_id"],
+                    aggregate_maximum=row["aggregate_max_bytes"],
+                    exact_size=row["max_bytes"],
+                    raw_sha256=origin["raw_sha256"],
+                    semantic_sha256=origin["semantic_sha256"],
+                    host=row["host_id"],
+                )
     if type(context.prepared_input_completion) is dict:
         for other_host, pin in context.prepared_input_completion.get(
                 "resource_budgets", {}).items():
@@ -8087,8 +8569,11 @@ def _source5_path_catalogue_records(
              raw_sha256=storage_reservation_pin["raw_sha256"],
              semantic_sha256=storage_reservation_pin["semantic_sha256"],
              file_label="Source5 caller storage reservation", host=host_id)
+    host_budget_name = ("host-evidence-budget-v4.json"
+                        if context.manifest.get("schema") == EXECUTION_SCHEMA_V5 else
+                        "host-evidence-budget-v3.json")
     host_budget_path = (artifact_root / campaign_id / "source5" / host_id /
-                        "evidence-budget" / "host-evidence-budget-v3.json")
+                        "evidence-budget" / host_budget_name)
     add_file(host_budget_path, "host_evidence_budget",
              context.chronology.MAX_SOURCE5_HOST_EVIDENCE_BUDGET_BYTES,
              "source5_controller", storage_root=str(artifact_root), host=host_id)
@@ -8943,10 +9428,18 @@ def _source5_path_catalogue_records(
     # job's canonical file-role rows before adding the corresponding transport
     # paths to the catalogue. Metadata paths are cumulative; the raw packet is
     # one transient scratch inode and is reclaimed only after signed ACK.
-    archive_caps = budget_module.project_archive_job_caps(base_catalogue_rows())
-    readback_caps_by_job = budget_module.project_archive_readback_caps(
-        base_catalogue_rows(),
-    )
+    if context.scope == PREPARED_EXPLORATION_REUSE_SCOPE:
+        archive_caps = budget_module.project_prepared_source5_archive_job_caps(
+            base_catalogue_rows(),
+        )
+        readback_caps_by_job = budget_module.project_prepared_source5_archive_readback_caps(
+            base_catalogue_rows(),
+        )
+    else:
+        archive_caps = budget_module.project_archive_job_caps(base_catalogue_rows())
+        readback_caps_by_job = budget_module.project_archive_readback_caps(
+            base_catalogue_rows(),
+        )
     expected_job_groups = set(original_jobs)
     require(set(archive_caps) == expected_job_groups and
             set(readback_caps_by_job) == expected_job_groups,
@@ -9614,9 +10107,7 @@ def _source5_remaining_storage_requirements(
         )
     credit_bytes = {root: 0 for root in roots}
     credit_inodes = {root: 0 for root in roots}
-    catalogue = budget_module.verify_path_catalogue_chunks(
-        budget["path_catalogue"],
-    )
+    catalogue = _source5_verify_budget_catalogue(context, budget, budget_module)
     always_local = (set(budget_module.ALWAYS_LOCAL_EVIDENCE_ROLES) |
                     {"journal_width_contract",
                      budget_module.SOURCE5_ARCHIVE_READ_CONTROL_ROLE})
@@ -10082,6 +10573,169 @@ def activate_source5_host_evidence_budget_v3(
             "semantic_sha256": budget["budget_sha256"]}
 
 
+def activate_source5_host_evidence_budget_v4(
+    context: CampaignContext, pressure_material_index: Path,
+    soak_material_index: Path, storage_reservation_path: Path,
+) -> dict[str, str]:
+    """Admit V5 current outputs while retaining the full logical schedule."""
+    require(context.manifest.get("schema") == EXECUTION_SCHEMA_V5 and
+            context.scope == PREPARED_EXPLORATION_REUSE_SCOPE and
+            context.prepared_input_completion is not None and
+            type(context.prepared_input_provenance_v2) is dict and
+            type(context.prepared_exploration_proofs) is dict and
+            type(context.journal_width_contract) is dict and
+            type(context.journal_width_contract_pin) is dict and
+            callable(context.lineage_artifact_reader),
+            "Source5 v4 admission requires the complete V5 prepared-exploration context")
+    budget_module = context.modules[EVIDENCE_BUDGET_SOURCE_PATH]
+    pins = {
+        "spec": {
+            "path": context.spec_pin["path"],
+            "raw_sha256": context.spec_pin["raw_sha256"],
+            "semantic_sha256": context.spec_semantic_sha256,
+        },
+        "plan": {
+            "path": context.plan_pin["path"],
+            "raw_sha256": context.plan_pin["raw_sha256"],
+            "semantic_sha256": context.plan_semantic_sha256,
+        },
+        "execution_manifest": {
+            "path": context.manifest_pin["path"],
+            "raw_sha256": context.manifest_pin["raw_sha256"],
+            "semantic_sha256": context.manifest["manifest_sha256"],
+        },
+        "source_manifests": {
+            host: {
+                "path": context.source_manifest_pins[host]["path"],
+                "raw_sha256": context.source_manifest_pins[host]["raw_sha256"],
+                "semantic_sha256": context.sources[host]["manifest_sha256"],
+            }
+            for host in context.manifest["hosts"]
+        },
+        "prepared_exploration": context.prepared_input_provenance_v2[
+            "exploration_lineage"],
+    }
+    budget_dir = _private_directory(
+        context.artifact_root / context.manifest["campaign_id"] /
+        "source5" / context.host_id / "evidence-budget",
+    )
+    path = budget_dir / "host-evidence-budget-v4.json"
+    projected_widths = build_source5_journal_width_contract(
+        context, pressure_material_index, soak_material_index, path, None,
+    )
+    _require_source5_journal_width_projection(context, projected_widths)
+    existing_budget = path.exists() or path.is_symlink()
+    reservation, reservation_pin = _validate_live_storage_reservation(
+        context, storage_reservation_path, check_space=not existing_budget,
+    )
+    width_raw = canonical_bytes(context.journal_width_contract)
+    if existing_budget:
+        existing, existing_sha, _info = read_stable(
+            path, "Source5 v4 host evidence budget", MAX_ARTIFACT_BYTES,
+        )
+        try:
+            budget = json.loads(existing)
+        except (UnicodeError, json.JSONDecodeError, RecursionError) as error:
+            raise Source5CampaignError("persisted Source5 v4 budget is malformed") from error
+        budget = budget_module.validate_host_evidence_budget_v4(
+            budget, journal_width_contract_raw=width_raw,
+            final_spec_raw=context.spec_raw,
+            lineage_artifact_reader=context.lineage_artifact_reader,
+        )
+        require(existing == canonical_bytes(budget) and
+                budget["campaign_id"] == context.manifest["campaign_id"] and
+                budget["host_id"] == context.host_id and
+                budget["original_pins"]["spec"] == pins["spec"] and
+                budget["original_pins"]["plan"] == pins["plan"] and
+                budget["original_pins"]["execution_manifest"] == pins["execution_manifest"] and
+                budget["original_pins"]["source_manifests"] == pins["source_manifests"] and
+                budget["original_pins"]["prepared_exploration"] ==
+                    pins["prepared_exploration"] and
+                budget["journal_width_contract_pin"] ==
+                    context.journal_width_contract_pin and
+                budget["storage_reservation"]["pin"] == reservation_pin,
+                "Source5 v4 budget changed after its immutable preflight")
+        context.host_evidence_budget_raw = existing
+        context.host_evidence_budget_pin = {
+            "path": str(path), "raw_sha256": existing_sha,
+            "semantic_sha256": budget["budget_sha256"],
+        }
+        context.job_path_catalogue_pins = _source5_job_catalogue_pins(
+            context, budget, budget_module,
+        )
+        _source5_restore_archive_readback_context(context, budget, budget_module)
+        with context.chronology.campaign_host_lock(
+                context.output_root, context.manifest["campaign_id"],
+                context.host_id) as lock:
+            remaining_bytes, remaining_inodes = \
+                _source5_remaining_storage_requirements(
+                    context, budget, budget_module, lock,
+                )
+            _validate_live_storage_reservation(
+                context, storage_reservation_path,
+                required_bytes_by_root=remaining_bytes,
+                required_inodes_by_root=remaining_inodes,
+            )
+        return context.host_evidence_budget_pin
+
+    catalogue_directory = _private_directory(
+        budget_dir / "path-catalogue-v4",
+    )
+    records, _pressure_materials = _source5_path_catalogue_records(
+        context, pressure_material_index, soak_material_index, reservation,
+        reservation_pin,
+    )
+    scratch_root = next(Path(row["path"]) for row in reservation["roots"]
+                        if row["role"] == "scratch")
+    catalogue = budget_module.write_fixed_pair_v3_path_catalogue_chunks(
+        records, catalogue_directory, scratch_directory_value=scratch_root,
+    )
+    audit = budget_module.build_host_evidence_budget_plan(
+        context.spec, context.plan, context.sources, context.manifest,
+        context.host_id, pins_value=pins,
+    )
+    budget = budget_module.build_host_evidence_budget_v4(
+        audit, context.owner_evidence_contract, catalogue,
+        reservation, reservation_pin,
+        journal_width_contract_value=context.journal_width_contract,
+        journal_width_contract_pin_value=context.journal_width_contract_pin,
+        journal_width_contract_raw=width_raw,
+        final_spec_raw=context.spec_raw,
+        lineage_artifact_reader=context.lineage_artifact_reader,
+    )
+    budget = budget_module.validate_host_evidence_budget_v4(
+        budget, journal_width_contract_raw=width_raw,
+        final_spec_raw=context.spec_raw,
+        lineage_artifact_reader=context.lineage_artifact_reader,
+    )
+    raw = canonical_bytes(budget)
+    raw_sha = write_new(path, raw, "Source5 v4 host evidence budget")
+    require(raw_sha == sha256(raw),
+            "Source5 v4 budget raw digest changed after persistence")
+    context.host_evidence_budget_raw = raw
+    context.host_evidence_budget_pin = {
+        "path": str(path), "raw_sha256": raw_sha,
+        "semantic_sha256": budget["budget_sha256"],
+    }
+    context.job_path_catalogue_pins = _source5_job_catalogue_pins(
+        context, budget, budget_module,
+    )
+    _source5_restore_archive_readback_context(context, budget, budget_module)
+    with context.chronology.campaign_host_lock(
+            context.output_root, context.manifest["campaign_id"],
+            context.host_id) as lock:
+        remaining_bytes, remaining_inodes = \
+            _source5_remaining_storage_requirements(
+                context, budget, budget_module, lock,
+            )
+        _validate_live_storage_reservation(
+            context, storage_reservation_path,
+            required_bytes_by_root=remaining_bytes,
+            required_inodes_by_root=remaining_inodes,
+        )
+    return context.host_evidence_budget_pin
+
+
 def _require_source5_journal_width_projection(
     context: CampaignContext, projected_widths: object,
 ) -> None:
@@ -10100,17 +10754,60 @@ def _require_source5_journal_width_projection(
             "Source5 v4 journal-width contract differs from deterministic source-side preflight recomputation")
 
 
+def _source5_has_fixed_checkpoint_v3(
+    context: CampaignContext, budget_module: Any,
+) -> bool:
+    archive = context.modules.get(EVIDENCE_ARCHIVE_SOURCE_PATH)
+    return (
+        context.scope in {PREPARATORY_SCOPE, PREPARED_EXPLORATION_REUSE_SCOPE} and
+        callable(getattr(archive, "build_fixed_checkpoint_request_v3", None)) and
+        callable(getattr(
+            budget_module, "verify_fixed_pair_v3_path_catalogue_chunks", None,
+        ))
+    )
+
+
+def _source5_verify_budget_catalogue(
+    context: CampaignContext, budget: dict[str, Any], budget_module: Any,
+) -> dict[str, Any]:
+    catalogue = budget_module.validate_path_catalogue_manifest(
+        budget["path_catalogue"],
+    )
+    if context.scope == PREPARED_EXPLORATION_REUSE_SCOPE:
+        require(callable(getattr(
+                    budget_module,
+                    "verify_prepared_source5_path_catalogue_chunks", None,
+                )),
+                "Source5 V5 budget lacks its fixed-v3/dynamic-tree catalogue verifier")
+        return budget_module.verify_prepared_source5_path_catalogue_chunks(
+            catalogue,
+        )
+    if _source5_has_fixed_checkpoint_v3(context, budget_module):
+        return budget_module.verify_fixed_pair_v3_path_catalogue_chunks(
+            catalogue,
+        )
+    return budget_module.verify_path_catalogue_chunks(catalogue)
+
+
 def _source5_restore_archive_readback_context(
     context: CampaignContext, budget: dict[str, Any], budget_module: Any,
 ) -> None:
     """Reconstruct reusable read slots and their exact Plan schedule from the pinned catalogue."""
-    catalogue = budget_module.validate_path_catalogue_manifest(
-        budget["path_catalogue"],
+    catalogue = _source5_verify_budget_catalogue(
+        context, budget, budget_module,
     )
-    catalogue = budget_module.verify_path_catalogue_chunks(catalogue)
-    readback_caps_by_job = budget_module.project_archive_readback_caps(
-        budget_module.iter_path_catalogue_rows(catalogue),
-    )
+    if context.scope == PREPARED_EXPLORATION_REUSE_SCOPE:
+        readback_caps_by_job = budget_module.project_prepared_source5_archive_readback_caps(
+            budget_module.iter_path_catalogue_rows(catalogue),
+        )
+    elif _source5_has_fixed_checkpoint_v3(context, budget_module):
+        readback_caps_by_job = budget_module.project_fixed_pair_archive_readback_caps(
+            budget_module.iter_path_catalogue_rows(catalogue),
+        )
+    else:
+        readback_caps_by_job = budget_module.project_archive_readback_caps(
+            budget_module.iter_path_catalogue_rows(catalogue),
+        )
     original_jobs = {
         (phase, job["run_id"])
         for phase in ("exploration", "aa", "confirmation", "pressure", "soak")
@@ -10284,9 +10981,7 @@ def _source5_job_catalogue_pins(
     root = (context.artifact_root / context.manifest["campaign_id"] /
             "source5" / context.host_id / "job-path-catalogues")
     result: dict[tuple[str, str], dict[str, Any]] = {}
-    catalogue = budget_module.verify_path_catalogue_chunks(
-        budget["path_catalogue"],
-    )
+    catalogue = _source5_verify_budget_catalogue(context, budget, budget_module)
     for row in budget_module.iter_path_catalogue_rows(catalogue):
         if row["role"] != "source5_job_row_catalogue":
             continue
@@ -12696,7 +13391,8 @@ def _source5_archive_context(
     require(context.host_evidence_budget_pin is not None and
             context.archive_signer_context is not None and
             context.manifest["schema"] in {
-                EXECUTION_SCHEMA_V4, PREPARATORY_EXECUTION_SCHEMA},
+                EXECUTION_SCHEMA_V4, EXECUTION_SCHEMA_V5,
+                PREPARATORY_EXECUTION_SCHEMA},
             "Source5 archive context requires a closed signed budgeted Source5 profile")
     source_pin = context.source_manifest_pins[context.host_id]
     return {
@@ -12904,11 +13600,62 @@ def _source5_create_transfer_offer(
     archive_context = _source5_archive_context(
         context, phase, job_index, predecessor_ack_pin,
     )
-    request, request_pin = archive.build_checkpoint_request(
-        archive_context, job_record_pin, job_record_raw, context.plan_raw,
-        entries, owner_receipt_bytes, request_path,
-        tree_inventories=tree_inventories,
+    request_schema_selector = getattr(
+        budget_module, "required_archive_request_schema_v1", None,
     )
+    if callable(request_schema_selector):
+        try:
+            budget_value = json.loads(context.host_evidence_budget_raw)
+        except (UnicodeError, json.JSONDecodeError, RecursionError) as error:
+            raise Source5CampaignError(
+                "Source5 archive request schema cannot read its pinned budget",
+            ) from error
+        require(context.host_evidence_budget_raw == canonical_bytes(budget_value) and
+                context.host_evidence_budget_pin["raw_sha256"] ==
+                    sha256(context.host_evidence_budget_raw),
+                "Source5 archive request schema budget changed after profile validation")
+        selected_request_schema = request_schema_selector(
+            budget_value, context.manifest, archive_context,
+        )
+    else:
+        require(context.scope not in {
+                    PREPARED_EXPLORATION_REUSE_SCOPE, PREPARATORY_SCOPE,
+                } or not callable(getattr(
+                    archive, "build_fixed_checkpoint_request_v3", None,
+                )),
+                "Source5 fixed-v3 archive API lacks its Source-owned schema selector")
+        selected_request_schema = None
+    require(selected_request_schema is None or selected_request_schema ==
+            "allocatbelt.application-source5-evidence-checkpoint-request.v3",
+            "Source5 schema selector returned an unsupported archive request schema")
+    fixed_v3_job = (
+        job.get("comparison_family") == "fixed_policy" and
+        phase in {"exploration", "aa", "confirmation"} and
+        (context.scope == PREPARATORY_SCOPE or
+         (context.scope == PREPARED_EXPLORATION_REUSE_SCOPE and
+          phase in {"aa", "confirmation"}))
+    )
+    require(not fixed_v3_job or
+            not callable(getattr(archive, "build_fixed_checkpoint_request_v3", None)) or
+            selected_request_schema ==
+                "allocatbelt.application-source5-evidence-checkpoint-request.v3",
+            "Source5 fixed-v3 job lacks its Source-owned request-schema selection")
+    if selected_request_schema == (
+            "allocatbelt.application-source5-evidence-checkpoint-request.v3"):
+        require(fixed_v3_job,
+                "Source5 request-v3 selector chose a nonfixed job")
+        require(not tree_inventories,
+                "fixed checkpoint v3 cannot carry dynamic tree inventories")
+        request, request_pin = archive.build_fixed_checkpoint_request_v3(
+            archive_context, job_record_pin, job_record_raw, context.plan_raw,
+            entries, owner_receipt_bytes, request_path,
+        )
+    else:
+        request, request_pin = archive.build_checkpoint_request(
+            archive_context, job_record_pin, job_record_raw, context.plan_raw,
+            entries, owner_receipt_bytes, request_path,
+            tree_inventories=tree_inventories,
+        )
     request_raw = canonical_bytes(request)
     require(sha256(request_raw) == request_pin["raw_sha256"] and
             request["request_sha256"] == request_pin["semantic_sha256"],
@@ -13594,9 +14341,7 @@ def _source5_capture_tree_declaration(
 def _source5_index_capture_rows(
     context: CampaignContext, budget: dict[str, Any], budget_module: Any,
 ):
-    catalogue = budget_module.verify_path_catalogue_chunks(
-        budget["path_catalogue"],
-    )
+    catalogue = _source5_verify_budget_catalogue(context, budget, budget_module)
     for declaration in budget_module.iter_path_catalogue_rows(catalogue):
         if declaration["role"] in (
                 budget_module.TRANSIENT_JOB_EVIDENCE_ROLES |
@@ -13630,11 +14375,9 @@ def _source5_index_capture_rows(
 
 
 def _source5_index_catalogue_rows(
-    budget: dict[str, Any], budget_module: Any,
+    context: CampaignContext, budget: dict[str, Any], budget_module: Any,
 ):
-    catalogue = budget_module.verify_path_catalogue_chunks(
-        budget["path_catalogue"],
-    )
+    catalogue = _source5_verify_budget_catalogue(context, budget, budget_module)
     for declaration in budget_module.iter_path_catalogue_rows(catalogue):
         if declaration["role"] in (
                 budget_module.TRANSIENT_JOB_EVIDENCE_ROLES |
@@ -13731,9 +14474,7 @@ def finalize_host_evidence(
     )
     index_directory = _private_directory(private_root / "evidence-index-v3")
     capture_directory = _private_directory(private_root / "captured-evidence-v2")
-    catalogue = budget_module.verify_path_catalogue_chunks(
-        budget["path_catalogue"],
-    )
+    catalogue = _source5_verify_budget_catalogue(context, budget, budget_module)
     transport_caps = budget["transport"]
     data_byte_bound = (
         catalogue["maximum_index_bytes"] -
@@ -13766,7 +14507,7 @@ def finalize_host_evidence(
     )
     closure = transport.validate_index_against_catalogue_v3(
         index_entries.iter_rows(),
-        _source5_index_catalogue_rows(budget, budget_module),
+        _source5_index_catalogue_rows(context, budget, budget_module),
     )
     require(closure["entry_count"] == index_root["entry_count"],
             "Source5 v3 index writer does not close over its complete original owner catalogue")
@@ -13901,6 +14642,18 @@ def run_host(context: CampaignContext, phase: str,
         require(phase in {"all", "exploration"},
                 "preparatory Source5 scope is closed to original exploration only")
         return run_preparatory_exploration(context)
+    if context.scope == PREPARED_EXPLORATION_REUSE_SCOPE:
+        require(phase != "exploration",
+                "Source5 v5 exploration is imported evidence; an explicit exploration launch is refused")
+        require(pressure_material_index is not None and
+                soak_material_index is not None and
+                storage_reservation_path is not None,
+                "Source5 v5 execution requires both producer indices and its source-pinned storage reservation")
+        context.host_evidence_budget_pin = \
+            activate_source5_host_evidence_budget_v4(
+                context, pressure_material_index, soak_material_index,
+                storage_reservation_path,
+            )
     if context.scope == "final_frozen":
         require(context.manifest["schema"] == EXECUTION_SCHEMA_V4,
                 "full Horizon host-evidence retention requires the signer-context execution manifest v4")
@@ -13928,7 +14681,7 @@ def run_host(context: CampaignContext, phase: str,
                 "next_required_input": "separately_frozen_final_spec_plan_and_source_manifests",
             }
         return run_fixed_phase(context, "exploration")
-    require(context.scope == "final_frozen",
+    require(context.scope in {"final_frozen", PREPARED_EXPLORATION_REUSE_SCOPE},
             "Source5 scope is not one of the closed prospective/final values")
     sequence = {
         "exploration": ("fixed:exploration",),
@@ -13947,6 +14700,13 @@ def run_host(context: CampaignContext, phase: str,
             "soak", "analysis:soak", "analysis:final_analysis",
         ),
     }[phase]
+    if context.scope == PREPARED_EXPLORATION_REUSE_SCOPE and phase == "all":
+        sequence = (
+            "analysis:exploration", "fixed:aa", "analysis:aa",
+            "fixed:confirmation", "analysis:fixed_analysis",
+            "pressure", "analysis:pressure_analysis",
+            "soak", "analysis:soak", "analysis:final_analysis",
+        )
     outcomes = []
     blocked = False
     for action in sequence:
@@ -14236,9 +14996,7 @@ def _source5_assert_uncompleted_catalogue_paths_absent(
     finished_keys: set[tuple[str, str]],
 ) -> None:
     """Reject exact catalogued outputs for any not-yet-consumed Plan ordinal."""
-    catalogue = budget_module.verify_path_catalogue_chunks(
-        budget["path_catalogue"],
-    )
+    catalogue = _source5_verify_budget_catalogue(context, budget, budget_module)
     for row in budget_module.iter_path_catalogue_rows(catalogue):
         if row["role"] in budget_module.FAILURE_WINDOW_ONLY_ROLES:
             path = Path(row["path"])
@@ -14393,7 +15151,7 @@ def _source5_validate_phase_root_children(
             sha256(context.preparatory_budget_raw) == context.preparatory_budget_pin["raw_sha256"],
             "preparatory phase-root catalogue is outside its exact raw budget pin")
     module = context.modules[EVIDENCE_BUDGET_SOURCE_PATH]
-    catalogue = module.verify_path_catalogue_chunks(budget["path_catalogue"])
+    catalogue = _source5_verify_budget_catalogue(context, budget, module)
     allowed = {}
     for row in module.iter_path_catalogue_rows(catalogue):
         path = Path(row["path"])
@@ -15051,10 +15809,16 @@ def _source5_preparatory_budget_ready_for_manifest(
             _source5_discard_preparatory_catalogue_chunks(
                 catalogue_directory, prior_catalogue,
             )
-        catalogue = budget_module.write_path_catalogue_chunks(
-            path_rows, catalogue_directory,
-            scratch_directory_value=scratch_root,
-        )
+        if _source5_has_fixed_checkpoint_v3(context, budget_module):
+            catalogue = budget_module.write_fixed_pair_v3_path_catalogue_chunks(
+                path_rows, catalogue_directory,
+                scratch_directory_value=scratch_root,
+            )
+        else:
+            catalogue = budget_module.write_path_catalogue_chunks(
+                path_rows, catalogue_directory,
+                scratch_directory_value=scratch_root,
+            )
         body = _source5_preparatory_budget_body(
             context, _source5_preparatory_original_pins(context),
             width, width_pin, reservation, reservation_pin, catalogue,
@@ -15829,7 +16593,7 @@ def _source5_preparatory_path_rows(
         record_bound = _source5_job_record_byte_bound(context, "exploration", job)
         add_file(record_path, "source5_job_record", record_bound,
                  "source5_controller", storage_root=str(output_root),
-                 phase="exploration", run_id=run_id)
+                 phase="exploration", run_id=run_id, host=host_id)
         add_file(phase_root / "job-records" / f"{run_id}.disposition.json",
                  "source5_job_disposition",
                  _source5_job_disposition_byte_bound(job),
@@ -15917,8 +16681,12 @@ def _source5_preparatory_path_rows(
     # The transport caps are derived from exact selected job declarations;
     # callers do not multiply a parser ceiling by 360.
     base_rows = list(all_rows) + list(directory_rows.values())
-    archive_caps = budget_module.project_archive_job_caps(base_rows)
-    readback_caps = budget_module.project_archive_readback_caps(base_rows)
+    if _source5_has_fixed_checkpoint_v3(context, budget_module):
+        archive_caps = budget_module.project_fixed_pair_archive_job_caps(base_rows)
+        readback_caps = budget_module.project_fixed_pair_archive_readback_caps(base_rows)
+    else:
+        archive_caps = budget_module.project_archive_job_caps(base_rows)
+        readback_caps = budget_module.project_archive_readback_caps(base_rows)
     expected_jobs = {("exploration", job["run_id"]) for job in jobs}
     require(set(archive_caps) == expected_jobs and
             set(readback_caps) == expected_jobs,
@@ -16182,9 +16950,7 @@ def _source5_preparatory_remaining_storage_requirements(
             "preparatory source-derived root bounds do not close over the caller reservation")
     credit_bytes = {path: 0 for path in root_paths}
     credit_inodes = {path: 0 for path in root_paths}
-    catalogue = budget_module.verify_path_catalogue_chunks(
-        budget["path_catalogue"],
-    )
+    catalogue = _source5_verify_budget_catalogue(context, budget, budget_module)
     role_rows: dict[str, dict[str, Any]] = {}
     base = (context.artifact_root / context.manifest["campaign_id"] /
             "source5" / context.host_id)
@@ -16487,9 +17253,12 @@ def _source5_restore_preparatory_archive_readback_context(
     catalogue = budget_module.validate_path_catalogue_manifest(
         budget["path_catalogue"],
     )
-    catalogue = budget_module.verify_path_catalogue_chunks(catalogue)
+    catalogue = _source5_verify_budget_catalogue(context, budget, budget_module)
     rows = budget_module.iter_path_catalogue_rows(catalogue)
-    readback_caps = budget_module.project_archive_readback_caps(rows)
+    if _source5_has_fixed_checkpoint_v3(context, budget_module):
+        readback_caps = budget_module.project_fixed_pair_archive_readback_caps(rows)
+    else:
+        readback_caps = budget_module.project_archive_readback_caps(rows)
     expected_jobs = {("exploration", job["run_id"])
                      for job in _host_jobs(context, "exploration")}
     require(set(readback_caps) == expected_jobs,
@@ -16665,12 +17434,20 @@ def _validate_source5_preparatory_budget_arithmetic(
     """Recompute transfer, readback, retention, and per-root prep bounds."""
     jobs = _host_jobs(context, "exploration")
     expected_keys = {("exploration", job["run_id"]) for job in jobs}
-    archive_caps = budget_module.project_archive_job_caps(
-        budget_module.iter_path_catalogue_rows(catalogue),
-    )
-    readback_caps = budget_module.project_archive_readback_caps(
-        budget_module.iter_path_catalogue_rows(catalogue),
-    )
+    if _source5_has_fixed_checkpoint_v3(context, budget_module):
+        archive_caps = budget_module.project_fixed_pair_archive_job_caps(
+            budget_module.iter_path_catalogue_rows(catalogue),
+        )
+        readback_caps = budget_module.project_fixed_pair_archive_readback_caps(
+            budget_module.iter_path_catalogue_rows(catalogue),
+        )
+    else:
+        archive_caps = budget_module.project_archive_job_caps(
+            budget_module.iter_path_catalogue_rows(catalogue),
+        )
+        readback_caps = budget_module.project_archive_readback_caps(
+            budget_module.iter_path_catalogue_rows(catalogue),
+        )
     require(set(archive_caps) == expected_keys and
             set(readback_caps) == expected_keys,
             "preparatory budget path catalogue has another job-group closure")
@@ -16931,10 +17708,9 @@ def _validate_source5_preparatory_profile_artifacts(
             budget_value["owner_contract"] ==
                 context.owner_evidence_contract,
             "preparatory budget original pins/owner contract differ from the selected Source")
-    catalogue = budget_module.validate_path_catalogue_manifest(
-        budget_value["path_catalogue"],
+    catalogue = _source5_verify_budget_catalogue(
+        context, budget_value, budget_module,
     )
-    catalogue = budget_module.verify_path_catalogue_chunks(catalogue)
     _source5_validate_preparatory_lineage_catalogue(context, catalogue, budget_module)
     width_rows = [row for row in budget_module.iter_path_catalogue_rows(catalogue)
                   if row["role"] == "preparatory_journal_width_contract"]
@@ -17201,7 +17977,7 @@ def _source5_preparatory_dispatch_storage_requirements(
     finished = {("exploration", job["run_id"]) for job in jobs[:index]}
     require(set(state["source5_finished"]) == state["source5_seen_jobs"] == finished,
             "preparatory dispatch state is not its exact completed prefix")
-    catalogue = module.verify_path_catalogue_chunks(budget["path_catalogue"])
+    catalogue = _source5_verify_budget_catalogue(context, budget, module)
     _source5_assert_uncompleted_catalogue_paths_absent(
         context, budget, module, finished,
     )

@@ -59,6 +59,9 @@ class Source5ChronologyApiTests(unittest.TestCase):
         cls.module = load_source("source5_chronology_test", CHRONOLOGY_PATH)
         cls.tree = ast.parse(CHRONOLOGY_PATH.read_bytes(), filename=str(CHRONOLOGY_PATH))
         cls.campaign = load_source("source5_campaign_deadline_test", CAMPAIGN_PATH)
+        cls.controller = load_source(
+            "source5_campaign_metadata_handoff_test", CONTROLLER_PATH,
+        )
 
     def test_app_cleanup_gate_rejects_unverified_pressure_or_fixed_cleanup(self) -> None:
         clean_fixed = {
@@ -969,6 +972,236 @@ class Source5ChronologyApiTests(unittest.TestCase):
             signal.pthread_sigmask(signal.SIG_SETMASK, old_mask)
         self.assertIs(signal.getsignal(signal.SIGUSR2), old_handler)
         self.assertEqual(signal.pthread_sigmask(signal.SIG_BLOCK, set()), old_mask)
+
+    def test_preparatory_loader_names_only_metadata_generation_and_binding_apis(self) -> None:
+        load_context = function(
+            ast.parse(CONTROLLER_PATH.read_bytes(), filename=str(CONTROLLER_PATH)),
+            "load_context",
+        )
+        context_calls = {
+            node.func.attr for node in ast.walk(load_context)
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+        }
+        context_source = ast.get_source_segment(
+            CONTROLLER_PATH.read_text(encoding="utf-8"), load_context,
+        )
+        self.assertIn("verify_prepared_capacity_generation_bounded_metadata_v1",
+                      context_calls)
+        self.assertNotIn("verify_prepared_capacity_generation_bounded", context_calls)
+        for name in (
+            "materialize_prepared_host_binding_metadata_v1",
+            "verify_prepared_host_binding_metadata_v1",
+        ):
+            self.assertIn(name, context_source)
+        binding = function(
+            ast.parse(CONTROLLER_PATH.read_bytes(), filename=str(CONTROLLER_PATH)),
+            "_source5_prepared_host_binding",
+        )
+        binding_source = ast.get_source_segment(
+            CONTROLLER_PATH.read_text(encoding="utf-8"), binding,
+        )
+        self.assertIn("materialize_prepared_host_binding_metadata_v1", binding_source)
+        self.assertIn("verify_prepared_host_binding_metadata_v1", binding_source)
+        self.assertNotIn('"materialize_prepared_host_binding"', binding_source)
+        self.assertNotIn('"verify_prepared_host_binding"', binding_source)
+
+    def test_h_prepared_host_binding_uses_real_metadata_materializer_and_verifier(self) -> None:
+        """A nested structural peer-ELF fixture exercises H's real InputPrep calls."""
+        support = load_source(
+            "source5_preparatory_metadata_handoff_fixture_source",
+            ROOT / "scripts/test-application-source5-input-preparation.py",
+        )
+        fixture_type = support.RecordedHistoricalGlobalReaderTests
+        fixture_type.setUpClass()
+        builder = fixture_type()
+        preparation = load_source(
+            "source5_preparatory_metadata_handoff_inputprep",
+            PREPARATION_PATH,
+        )
+        with tempfile.TemporaryDirectory(prefix="source5-h-metadata-binding-") as temporary:
+            fixture = builder._metadata_intent_fixture(Path(temporary))
+            host_id = fixture["host_ids"][0]
+            source_root = fixture["source_root"]
+            input_root = fixture["input_root"]
+            context = types.SimpleNamespace(
+                manifest={
+                    "schema": self.controller.PREPARATORY_EXECUTION_SCHEMA,
+                    "preparatory_capacity_generation": {"provenance": {
+                        "preparation_pin": {
+                            "path": fixture["preparation_pin"]["path"],
+                            "raw_sha256": fixture["preparation_pin"]["sha256"],
+                        },
+                    }},
+                },
+                modules={
+                    self.controller.SOURCE5_INPUT_PREPARATION_SOURCE_PATH:
+                        preparation,
+                },
+                spec_pin={
+                    "path": fixture["spec_pin"]["path"],
+                    "raw_sha256": fixture["spec_pin"]["sha256"],
+                },
+                source_root=source_root, input_root=input_root, host_id=host_id,
+            )
+            materialized = self.controller._source5_prepared_host_binding(
+                context, materialize=True,
+            )
+            verified = self.controller._source5_prepared_host_binding(
+                context, materialize=False,
+            )
+            self.assertEqual(materialized, verified)
+            self.assertEqual(
+                context.fixed_spec_host_pin,
+                materialized["fixed_spec_host_pin"],
+            )
+            self.assertEqual(
+                context.prepared_fixed_host_binding,
+                materialized["prepared_host_binding"],
+            )
+
+    def test_named_capacity_generation_verifier_loads_nested_two_host_metadata(self) -> None:
+        """Real metadata replay reaches the expected missing capacity-evidence edge."""
+        support = load_source(
+            "source5_prep_generation_metadata_fixture_source",
+            ROOT / "scripts/test-application-source5-input-preparation.py",
+        )
+        fixture_type = support.RecordedHistoricalGlobalReaderTests
+        fixture_type.setUpClass()
+        fixture_builder = fixture_type()
+        preparation = load_source(
+            "source5_prep_generation_metadata_inputprep",
+            PREPARATION_PATH,
+        )
+        with tempfile.TemporaryDirectory(prefix="source5-h-metadata-generation-") as temporary:
+            fixture = fixture_builder._metadata_intent_fixture(Path(temporary))
+            source_inputs = fixture["source_inputs"]
+            source_root, input_root = fixture["source_root"], fixture["input_root"]
+            host_ids = fixture["host_ids"]
+            self.assertEqual(len(host_ids), 2)
+            self.assertTrue(
+                Path(fixture["preparation_pin"]["path"]).is_relative_to(input_root),
+            )
+            self.assertNotEqual(Path(fixture["preparation_pin"]["path"]).parent,
+                                input_root)
+            first_artifact = fixture["sources"][host_ids[0]]["artifacts"]["allocatbelt"]
+            peer_artifact = fixture["sources"][host_ids[1]]["artifacts"]["allocatbelt"]
+            self.assertEqual(first_artifact["path"], peer_artifact["path"])
+            self.assertNotEqual(first_artifact["sha256"], peer_artifact["sha256"])
+            ceilings = {
+                "maximum_job_output_bytes": 1_073_741_824,
+                "maximum_job_output_inodes": 1024,
+                "maximum_generation_bytes": 2_147_483_648,
+                "maximum_generation_inodes": 8192,
+                "maximum_tmpdir_bytes": 1_073_741_824,
+                "maximum_tmpdir_inodes": 4096,
+                "maximum_trace_file_bytes": 536_870_912,
+                "durable_receipt_reserve_bytes": 1_048_576,
+                "durable_receipt_reserve_inodes": 8,
+                "minimum_free_bytes": 2_147_483_648,
+                "minimum_free_inodes": 10_000,
+                "monitor_sample_interval_milliseconds": 100,
+                "process_deadline_seconds":
+                    fixture["preparation"]["core"]["deadlines"]["process_seconds"],
+            }
+            budgets = {}
+            capacity_rows = []
+            for index, host_id in enumerate(host_ids):
+                budget = source_inputs.build_preparation_resource_budget(
+                    fixture["preparation"], fixture["preparation_full_pin"],
+                    host_id, ceilings,
+                )
+                budget_path = input_root / "resource-budgets" / f"{host_id}.json"
+                budget_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+                os.chmod(budget_path.parent, 0o700)
+                budget_raw = source_inputs._canonical(budget)
+                budget_path.write_bytes(budget_raw)
+                budget_path.chmod(0o600)
+                budget_pin = {
+                    "path": str(budget_path),
+                    "raw_sha256": hashlib.sha256(budget_raw).hexdigest(),
+                    "semantic_sha256": budget["resource_budget_sha256"],
+                }
+                budgets[host_id] = budget_pin
+                completion_path = input_root / "capacity-preparations" / host_id / \
+                    "capacity-preparation-bounded-completion.json"
+                completion_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+                os.chmod(completion_path.parent.parent, 0o700)
+                os.chmod(completion_path.parent, 0o700)
+                capacity_rows.append({
+                    "host_id": host_id,
+                    "completion": {
+                        "path": str(completion_path),
+                        "raw_sha256": str(index + 1) * 64,
+                    },
+                    "host_verification": {
+                        "path": str(completion_path.with_name("host-verification.json")),
+                        "raw_sha256": str(index + 3) * 64,
+                        "receipt_sha256": str(index + 4) * 64,
+                    },
+                    "evidence_path_map": {
+                        "schema": support.capacity_stage.EVIDENCE_PATH_MAP_SCHEMA,
+                        "entries": [{"origin": str(input_root),
+                                     "local": str(input_root)}],
+                    },
+                    "completion_sha256": str(index + 5) * 64,
+                    "ledger": {
+                        "path": str(completion_path.with_name("capacity-ledger.jsonl")),
+                        "raw_sha256": str(index + 6) * 64,
+                        "terminal_head": str(index + 7) * 64,
+                    },
+                    "capacity_preparation_templates_sha256": str(index + 8) * 64,
+                    "entries": [], "resource_budget": budget_pin,
+                    "resource_monitor": {
+                        "schema": "allocatbelt.application-capacity-preparation-resource-monitor.v1",
+                        "report_count": 30,
+                    },
+                })
+            body = {
+                "schema": preparation.PREPARED_CAPACITY_GENERATION_SCHEMA,
+                "campaign_id": fixture["preparation"]["core"]["campaign_id"],
+                "preparation": {
+                    "path": fixture["preparation_pin"]["path"],
+                    "raw_sha256": fixture["preparation_pin"]["sha256"],
+                    "semantic_sha256": fixture["preparation"]["preparation_sha256"],
+                },
+                "capacity_preparations": capacity_rows,
+                "resource_budgets": budgets,
+                "complete": True, "qualification_eligible": False,
+            }
+            generation_value = {
+                **body,
+                "generation_sha256": hashlib.sha256(
+                    source_inputs._canonical(body),
+                ).hexdigest(),
+            }
+            generation_path = input_root / "prepared-capacity-generation.json"
+            generation_raw = source_inputs._canonical(generation_value)
+            generation_path.write_bytes(generation_raw)
+            generation_path.chmod(0o600)
+            generation_pin = {
+                "path": str(generation_path),
+                "raw_sha256": hashlib.sha256(generation_raw).hexdigest(),
+                "semantic_sha256": generation_value["generation_sha256"],
+            }
+            calls = []
+            real_reader = preparation.read_preparation_intent_metadata_v1
+
+            def read_metadata(*args, **kwargs):
+                calls.append((args, kwargs))
+                return real_reader(*args, **kwargs)
+
+            with patch.object(preparation, "read_preparation_intent_metadata_v1",
+                              side_effect=read_metadata):
+                with self.assertRaises(preparation.PreparationError):
+                    preparation.verify_prepared_capacity_generation_bounded_metadata_v1(
+                        generation_pin, fixture["preparation_pin"],
+                        source_root, input_root,
+                    )
+            self.assertEqual(len(calls), 1)
+            self.assertEqual(calls[0][0], (
+                fixture["preparation_pin"], source_root, input_root,
+            ))
+            self.assertFalse(generation_path.is_symlink())
 
 
 class Source5PressureAndAnalysisApiTests(unittest.TestCase):

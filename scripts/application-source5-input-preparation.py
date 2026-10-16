@@ -2050,6 +2050,7 @@ def _export_capacity_pilot_impl(
     *, captured_read_provider: Any = None, before_publication: Any = None,
     recorded_host: bool,
     global_artifact_reader: Callable[[dict[str, str], int], bytes] | None = None,
+    original_metadata: bool = False,
 ) -> dict[str, Any]:
     """Replay six original fixed-pair receipts per context/allocator and export the rate pilot.
 
@@ -2063,6 +2064,11 @@ def _export_capacity_pilot_impl(
              "capacity-pilot before-publication hook must be absent or callable")
     _require(global_artifact_reader is None or recorded_host,
              "historical global metadata reader is reserved for recorded-host pilot replay")
+    _require(type(original_metadata) is bool and
+             (not original_metadata or
+              (not recorded_host and global_artifact_reader is None and
+               callable(getattr(captured_read_provider, "open_view", None)))),
+             "original metadata pilot replay requires the captured original-host route")
     pins = _exact(preparation_final_pins, {
         "preparation", "spec", "plan", "source_root", "input_root", "campaign_artifacts_root",
         "prepared_host_binding", "output",
@@ -2083,13 +2089,24 @@ def _export_capacity_pilot_impl(
                  "campaign-artifact root pin must be a normalized absolute path string")
     _require(not _lexically_within(source_root, campaign_artifacts_root),
              "capacity-pilot campaign artifact root must remain outside SourceV5")
-    intent_reader = (read_preparation_intent_metadata_v1
-                     if recorded_host and global_artifact_reader is not None else
-                     read_preparation_intent)
+    if original_metadata or (recorded_host and global_artifact_reader is not None):
+        intent_reader = read_preparation_intent_metadata_v1
+    else:
+        intent_reader = read_preparation_intent
     preparation, sources, campaign, inputs = intent_reader(
         pins["preparation"], source_root, input_root,
     )
     _require(host_id in sources, "capacity-pilot host is not in the full SourceV5 cohort")
+    if original_metadata:
+        try:
+            campaign.verify_source_manifest(
+                sources[host_id], source_root=source_root,
+                verify_artifacts=True,
+            )
+        except Exception as error:
+            raise PreparationError(
+                f"{host_id} selected original SourceV5 full verification failed: {error}",
+            ) from error
     spec, spec_raw, spec_raw_sha = _read_generation_json_pin(
         pins["spec"], "initial empty-rate SpecV3", MAX_REQUEST_BYTES,
         global_artifact_reader if recorded_host else None,
@@ -2318,6 +2335,30 @@ def export_capacity_pilot(
         preparation_final_pins, verified_fixed_records, host_id,
         captured_read_provider=captured_read_provider,
         before_publication=before_publication, recorded_host=False,
+    )
+
+
+def export_capacity_pilot_original_metadata_v1(
+    preparation_final_pins: dict[str, Any],
+    verified_fixed_records: list[dict[str, Any]],
+    host_id: str,
+    *, captured_read_provider: Any,
+    before_publication: Any = None,
+) -> dict[str, Any]:
+    """Replay original captured pairs with metadata-only peer Source loading.
+
+    The selected Source still receives its full artifact verification before
+    any captured view opens. Pair reconstruction remains on the original
+    Fixed owner route and retains the resident Spec, Plan, host, and output
+    checks used by ``export_capacity_pilot``.
+    """
+    _require(callable(getattr(captured_read_provider, "open_view", None)),
+             "original metadata pilot export requires an open_view provider")
+    return _export_capacity_pilot_impl(
+        preparation_final_pins, verified_fixed_records, host_id,
+        captured_read_provider=captured_read_provider,
+        before_publication=before_publication,
+        recorded_host=False, original_metadata=True,
     )
 
 

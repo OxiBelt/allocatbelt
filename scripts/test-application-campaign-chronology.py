@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import inspect
 from contextlib import contextmanager
 import hashlib
 import importlib.machinery
@@ -18,6 +19,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import types
 import unittest
 from unittest.mock import patch
 from pathlib import Path
@@ -4120,6 +4122,1252 @@ class ProcessLivenessHelperTests(unittest.TestCase):
                     with self.assertRaises(type(error)):
                         CampaignChronologyCliTests._wait_for_pid_not_live(self, 123456)
 
+
+class Source5InputPrepConsumerPortTests(unittest.TestCase):
+    """Exercise the named Source metadata consumers and routing-only seams."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.chronology = load_script(
+            SCRIPT_DIR / "application-campaign-chronology.py",
+            "source5_inputprep_consumer_port_target",
+        )
+        cls.inputprep_tests = load_script(
+            SCRIPT_DIR / "test-application-source5-input-preparation.py",
+            "source5_inputprep_consumer_fixture_source",
+        )
+        cls.fixture_type = cls.inputprep_tests.RecordedHistoricalGlobalReaderTests
+        cls.fixture_type.setUpClass()
+        cls.fixture_builder = cls.fixture_type()
+
+    def _metadata_fixture(self, root: Path) -> dict[str, Any]:
+        """Build the captured SourceV5 structural fixture; it is not run evidence."""
+        return self.fixture_builder._metadata_intent_fixture(root)
+
+    def _captured_preparation(self, fixture: dict[str, Any], host_id: str | None = None):
+        chronology = self.chronology
+        selected = host_id or fixture["host_ids"][0]
+        return chronology._source5_captured_source_module(
+            {"source_root": fixture["source_root"],
+             "source": fixture["sources"][selected]},
+            "scripts/application-source5-input-preparation.py",
+            "Source5 consumer-port captured preparation helper",
+        )
+
+    def _preparatory_generation(self, fixture: dict[str, Any]):
+        chronology = self.chronology
+        input_root = fixture["input_root"]
+        spec = copy.deepcopy(fixture["spec"])
+        spec["rates"] = []
+        spec["oracles"] = []
+        spec_path = Path(fixture["spec_pin"]["path"])
+        spec_raw = fixture["campaign"].canonical_bytes(spec)
+        spec_path.write_bytes(spec_raw)
+        spec_path.chmod(0o600)
+        spec_sha = hashlib.sha256(spec_raw).hexdigest()
+        plan_path = input_root / "consumer-port-initial-plan.json"
+        plan_raw = fixture["campaign"].canonical_bytes({
+            "schema": "allocatbelt.application-campaign-plan.v3",
+            "campaign_id": fixture["preparation"]["core"]["campaign_id"],
+        })
+        plan_path.write_bytes(plan_raw)
+        plan_path.chmod(0o600)
+        plan_sha = hashlib.sha256(plan_raw).hexdigest()
+        selected_host = fixture["host_ids"][0]
+        prepared = {
+            "campaign_id": fixture["preparation"]["core"]["campaign_id"],
+            "source_root": fixture["source_root"],
+            "input_root": input_root,
+            "source": fixture["sources"][selected_host],
+            "sources": fixture["sources"],
+            "spec": spec,
+            "prepared": {
+                "spec_path": spec_path, "spec_raw_sha256": spec_sha,
+                "plan_path": plan_path, "plan_raw_sha256": plan_sha,
+            },
+        }
+        preparation_pin = {
+            "path": fixture["preparation_pin"]["path"],
+            "raw_sha256": fixture["preparation_pin"]["sha256"],
+        }
+        generation = {
+            "completion": {
+                "path": str(input_root / "prepared-capacity-generation.json"),
+                "raw_sha256": "d" * 64,
+                "semantic_sha256": "e" * 64,
+            },
+            "provenance": {
+                "schema": chronology.SOURCE5_PREPARATORY_CAPACITY_PROVENANCE_SCHEMA,
+                "preparation_pin": preparation_pin,
+                "initial_spec_pin": {
+                    "path": str(spec_path), "raw_sha256": spec_sha,
+                },
+                "initial_plan_pin": {
+                    "path": str(plan_path), "raw_sha256": plan_sha,
+                },
+            },
+        }
+        return prepared, generation
+
+    def test_source_refs_check_the_validated_host_set_and_exact_source_pins(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="source5-consumer-source-refs-") as temporary:
+            fixture = self._metadata_fixture(Path(temporary))
+            helper = self._captured_preparation(fixture)
+            intent, sources, _campaign, inputs = helper.read_preparation_intent_metadata_v1(
+                fixture["preparation_pin"], fixture["source_root"], fixture["input_root"],
+            )
+            spec = copy.deepcopy(fixture["spec"])
+            core = inputs.preparation_core_from_spec(spec)
+            self.assertEqual(core, intent["core"])
+            host_ids = {host["host_id"] for host in core["hosts"]}
+            helper._verify_spec_source_refs(spec, intent, sources, host_ids)
+
+            changed_host = copy.deepcopy(spec)
+            changed_host["hosts"][0]["host_id"] = "changed-host"
+            missing_host = copy.deepcopy(spec)
+            missing_host["hosts"].pop()
+            extra_host = copy.deepcopy(spec)
+            extra_host["hosts"].append({**copy.deepcopy(spec["hosts"][0]),
+                                         "host_id": "extra-host"})
+            extra_source = dict(sources)
+            extra_source["extra-host"] = next(iter(sources.values()))
+            changed_path = copy.deepcopy(spec)
+            changed_path["source_manifests"][0]["relative_path"] = "sources/other.json"
+            changed_semantic = copy.deepcopy(spec)
+            changed_semantic["source_manifests"][0]["sha256"] = "0" * 64
+            failures = (
+                (changed_host, sources, "host set"),
+                (missing_host, sources, "host set"),
+                (extra_host, sources, "host set"),
+                (spec, {key: value for key, value in sources.items()
+                        if key != fixture["host_ids"][0]}, "host set"),
+                (spec, extra_source, "host set"),
+                (changed_path, sources, "paths/semantic pins"),
+                (changed_semantic, sources, "pinned cohort manifest"),
+            )
+            for bad_spec, bad_sources, message in failures:
+                with self.subTest(message=message, source_count=len(bad_sources)):
+                    with self.assertRaisesRegex(helper.PreparationError, message):
+                        helper._verify_spec_source_refs(
+                            bad_spec, intent, bad_sources, host_ids,
+                        )
+
+    def test_preparatory_consumer_uses_nested_metadata_replay_and_stops_at_missing_evidence(self) -> None:
+        chronology = self.chronology
+        with tempfile.TemporaryDirectory(prefix="source5-consumer-capacity-") as temporary:
+            fixture = self._metadata_fixture(Path(temporary))
+            prepared, generation = self._preparatory_generation(fixture)
+            observations: dict[str, list[Any]] = {
+                "intent": [], "source_refs": [], "capacity_verify": [],
+            }
+            real_load = chronology._load_module
+
+            def load_and_track(raw, path, label):
+                module = real_load(raw, path, label)
+                if Path(path).name != "application-source5-input-preparation.py":
+                    return module
+                original_intent = module.read_preparation_intent_metadata_v1
+                original_refs = module._verify_spec_source_refs
+                original_verify = module.verify_prepared_capacity_generation_bounded_metadata_v1
+
+                def read_intent(*args, **kwargs):
+                    observations["intent"].append((args, kwargs))
+                    return original_intent(*args, **kwargs)
+
+                def verify_refs(*args, **kwargs):
+                    observations["source_refs"].append((args, kwargs))
+                    return original_refs(*args, **kwargs)
+
+                def verify_capacity(*args, **kwargs):
+                    observations["capacity_verify"].append((args, kwargs))
+                    return original_verify(*args, **kwargs)
+
+                module.read_preparation_intent_metadata_v1 = read_intent
+                module._verify_spec_source_refs = verify_refs
+                module.verify_prepared_capacity_generation_bounded_metadata_v1 = verify_capacity
+                return module
+
+            with patch.object(chronology, "_load_module", side_effect=load_and_track):
+                with self.assertRaisesRegex(
+                        chronology.ChronologyError,
+                        "cannot safely open prepared capacity generation"):
+                    chronology._verify_source5_preparatory_input_generation(
+                        prepared, generation,
+                    )
+            self.assertEqual(len(observations["intent"]), 1)
+            self.assertEqual(observations["intent"][0][0], (
+                {"path": generation["provenance"]["preparation_pin"]["path"],
+                 "sha256": generation["provenance"]["preparation_pin"]["raw_sha256"]},
+                fixture["source_root"], fixture["input_root"],
+            ))
+            self.assertEqual(len(observations["source_refs"]), 1)
+            ref_args = observations["source_refs"][0][0]
+            self.assertEqual(ref_args[0], prepared["spec"])
+            self.assertEqual(ref_args[3], {
+                host["host_id"] for host in prepared["spec"]["hosts"]
+            })
+            self.assertEqual(len(observations["capacity_verify"]), 1)
+            self.assertEqual(observations["capacity_verify"][0][0], (
+                generation["completion"],
+                {"path": generation["provenance"]["preparation_pin"]["path"],
+                 "sha256": generation["provenance"]["preparation_pin"]["raw_sha256"]},
+                fixture["source_root"], fixture["input_root"],
+            ))
+            self.assertFalse((fixture["input_root"] /
+                              "prepared-capacity-generation.json").exists())
+
+            helper = self._captured_preparation(fixture)
+            with self.assertRaisesRegex(helper.PreparationError,
+                                        "full manifest verifier rejected"):
+                helper.read_preparation_intent(
+                    fixture["preparation_pin"], fixture["source_root"],
+                    fixture["input_root"],
+                )
+
+            wrong_root = dict(prepared)
+            wrong_root["input_root"] = fixture["input_root"].parent / "wrong-root"
+            with self.assertRaisesRegex(
+                    chronology.ChronologyError, "outside its original input root"):
+                chronology._verify_source5_preparatory_input_generation(
+                    wrong_root, generation,
+                )
+            traversing = copy.deepcopy(generation)
+            traversing["provenance"]["preparation_pin"]["path"] = str(
+                fixture["input_root"] / ".." / "outside" / "preparation-intent.json",
+            )
+            with self.assertRaisesRegex(
+                    chronology.ChronologyError, "outside its original input root"):
+                chronology._verify_source5_preparatory_input_generation(
+                    prepared, traversing,
+                )
+
+            fallback_calls = []
+
+            def remove_metadata_api(raw, path, label):
+                module = real_load(raw, path, label)
+                if Path(path).name == "application-source5-input-preparation.py":
+                    del module.read_preparation_intent_metadata_v1
+                    module.read_preparation_intent = lambda *args, **kwargs: fallback_calls.append(args)
+                return module
+
+            with patch.object(chronology, "_load_module", side_effect=remove_metadata_api):
+                with self.assertRaisesRegex(
+                        chronology.ChronologyError,
+                        "lacks named metadata capacity replay APIs"):
+                    chronology._verify_source5_preparatory_input_generation(
+                        prepared, generation,
+                    )
+            self.assertEqual(fallback_calls, [])
+
+    def test_fixed_host_consumer_uses_readonly_metadata_binding(self) -> None:
+        chronology = self.chronology
+        with tempfile.TemporaryDirectory(prefix="source5-consumer-host-binding-") as temporary:
+            fixture = self._metadata_fixture(Path(temporary))
+            helper = self._captured_preparation(fixture)
+            spec = copy.deepcopy(fixture["spec"])
+            spec["rates"] = []
+            spec["oracles"] = []
+            spec_path = Path(fixture["spec_pin"]["path"])
+            spec_raw = fixture["campaign"].canonical_bytes(spec)
+            spec_path.write_bytes(spec_raw)
+            spec_path.chmod(0o600)
+            spec_raw_sha = hashlib.sha256(spec_raw).hexdigest()
+            spec_pin = {"path": str(spec_path), "sha256": spec_raw_sha}
+            host_id = fixture["host_ids"][0]
+            preparation_pin = fixture["preparation_pin"]
+            materialized = helper.materialize_prepared_host_binding_metadata_v1(
+                preparation_pin, spec_pin, fixture["source_root"],
+                fixture["input_root"], host_id,
+            )
+            preparation, _sources, _campaign, _inputs = \
+                helper.read_preparation_intent_metadata_v1(
+                    preparation_pin, fixture["source_root"], fixture["input_root"],
+                )
+            observed_pin = preparation["observed_hosts"][host_id]
+            host_context_path = fixture["input_root"] / observed_pin["relative_path"]
+            host_context = json.loads(host_context_path.read_text(encoding="utf-8"))
+            prepared = {
+                "source_root": fixture["source_root"],
+                "input_root": fixture["input_root"],
+                "host_id": host_id,
+                "spec": spec,
+                "source": fixture["sources"][host_id],
+                "prepared": {"host_context": host_context},
+                "original_pins": {
+                    "spec": {"path": str(spec_path), "raw_sha256": spec_raw_sha},
+                    "observed_host": {
+                        "path": str(host_context_path),
+                        "raw_sha256": observed_pin["raw_sha256"],
+                    },
+                },
+            }
+            generation = {"provenance": {"preparation_pin": {
+                "path": preparation_pin["path"],
+                "raw_sha256": preparation_pin["sha256"],
+            }}}
+            real_capture = chronology._source5_captured_source_module
+            verifier_calls = []
+            ordinary_calls = []
+
+            def capture_and_track(value, relative, label):
+                module = real_capture(value, relative, label)
+                if relative.endswith("application-source5-input-preparation.py"):
+                    actual_verifier = module.verify_prepared_host_binding_metadata_v1
+                    ordinary_verifier = module.verify_prepared_host_binding
+
+                    def verify_metadata(*args, **kwargs):
+                        verifier_calls.append((args, kwargs))
+                        return actual_verifier(*args, **kwargs)
+
+                    def verify_ordinary(*args, **kwargs):
+                        ordinary_calls.append((args, kwargs))
+                        return ordinary_verifier(*args, **kwargs)
+
+                    module.verify_prepared_host_binding_metadata_v1 = verify_metadata
+                    module.verify_prepared_host_binding = verify_ordinary
+                return module
+
+            with patch.object(chronology, "_source5_captured_source_module",
+                              side_effect=capture_and_track):
+                result = chronology._source5_preparatory_fixed_host_inputs(
+                    prepared, generation,
+                )
+            self.assertEqual(len(verifier_calls), 1)
+            self.assertEqual(verifier_calls[0][0], (
+                {"path": preparation_pin["path"], "sha256": preparation_pin["sha256"]},
+                {"path": str(spec_path), "sha256": spec_raw_sha},
+                fixture["source_root"], fixture["input_root"], host_id,
+            ))
+            self.assertEqual(ordinary_calls, [])
+            self.assertEqual(result, materialized)
+
+            with self.assertRaisesRegex(helper.PreparationError,
+                                        "full manifest verifier rejected"):
+                helper.verify_prepared_host_binding(
+                    preparation_pin, spec_pin, fixture["source_root"],
+                    fixture["input_root"], host_id,
+                )
+
+            fallback_calls = []
+            legacy_only = types.SimpleNamespace(
+                verify_prepared_host_binding=lambda *args, **kwargs:
+                    fallback_calls.append((args, kwargs)),
+            )
+            with patch.object(chronology, "_source5_captured_source_module",
+                              return_value=legacy_only):
+                with self.assertRaisesRegex(
+                        chronology.ChronologyError,
+                        "lacks named read-only metadata host verification"):
+                    chronology._source5_preparatory_fixed_host_inputs(
+                        prepared, generation,
+                    )
+            self.assertEqual(fallback_calls, [])
+
+    def _routing_case(self, root: Path, *, v5: bool, full_spec: bool = False):
+        chronology = self.chronology
+        source_root = root / "source"
+        input_root = root / "inputs"
+        source_root.mkdir(mode=0o700)
+        input_root.mkdir(mode=0o700)
+        spec_path = input_root / "spec.json"
+        plan_path = input_root / "plan.json"
+        preparation_path = input_root / "preparation-generations" / "campaign" / "intent.json"
+        preparation_path.parent.mkdir(mode=0o700, parents=True)
+        host_ids = ["host-a", "host-b"]
+        completion = {
+            "schema": "allocatbelt.application-source5-preparation-completion.v2",
+            "complete": True, "qualification_eligible": False,
+            "campaign_id": "consumer-routing-campaign",
+            "preparation": {}, "final_spec": {}, "final_plan": {},
+            "source_manifests": {}, "capacity_preparations": [],
+            "pressure_calibrations": [], "pilots": [], "oracles": [],
+            "filled_slots": {}, "ledger_heads": [], "resource_budgets": {},
+        }
+        completion["completion_sha256"] = chronology.sha256_bytes(
+            chronology.canonical_bytes(completion),
+        )
+        completion_path = input_root / "prepared-inputs-completion.json"
+        completion_raw = chronology.canonical_bytes(completion)
+        completion_path.write_bytes(completion_raw)
+        completion_pin = {
+            "path": str(completion_path),
+            "raw_sha256": chronology.sha256_bytes(completion_raw),
+            "semantic_sha256": completion["completion_sha256"],
+        }
+        provenance = {
+            "schema": (chronology.SOURCE5_PREPARED_INPUTS_PROVENANCE_SCHEMA_V2
+                       if v5 else
+                       "allocatbelt.application-source5-prepared-inputs-provenance.v1"),
+            "preparation_pin": {
+                "path": str(preparation_path), "raw_sha256": "a" * 64,
+            },
+            "final_spec_pin": {"path": str(spec_path), "raw_sha256": "b" * 64},
+            "final_plan_pin": {"path": str(plan_path), "raw_sha256": "c" * 64},
+        }
+        if v5:
+            provenance["exploration_lineage"] = {}
+        generation = {"completion": completion_pin, "provenance": provenance}
+        manifest = {
+            "schema": (chronology.SOURCE5_EXECUTION_SCHEMA_V5 if v5 else
+                       chronology.SOURCE5_EXECUTION_SCHEMA_V3),
+            "prepared_input_generation": generation,
+        }
+        jobs = {phase: [] for phase in (
+            "exploration", "aa", "confirmation", "pressure", "soak",
+        )}
+        spec = {
+            "hosts": [{"host_id": host_id} for host_id in host_ids],
+            "rates": ([{}] if full_spec else []),
+            "oracles": ([{}] if full_spec else []),
+        }
+        # Routing tests replace _source_file; this placeholder satisfies the
+        # A6 input shape and is not a captured Source manifest.
+        prepared = {
+            "campaign_id": "consumer-routing-campaign",
+            "source_root": source_root,
+            "input_root": input_root,
+            "source": {"fixture_scope": "routing_only", "source": {"files": []}},
+            "spec": spec,
+            "plan": {"jobs": jobs},
+            "controller": types.SimpleNamespace(build_jobs=lambda _spec, phase: jobs[phase]),
+            "prepared": {
+                "spec_path": spec_path, "spec_raw_sha256": "b" * 64,
+                "spec_semantic_sha256": "d" * 64,
+                "plan_path": plan_path, "plan_raw_sha256": "c" * 64,
+                "plan_semantic_sha256": "e" * 64,
+            },
+        }
+        return prepared, manifest, completion, completion_pin
+
+    def test_recorded_and_ordinary_routes_forward_only_their_closed_arguments(self) -> None:
+        """Call spies check routing only; they do not claim completion replay."""
+        chronology = self.chronology
+        providers = {"host-a": object(), "host-b": object()}
+        reader_calls = []
+
+        def reader(*args):
+            reader_calls.append(args)
+            return b"captured"
+
+        def run_probe(*, v5: bool, providers_value, reader_value):
+            calls = []
+
+            def fail_after_capture(*args, **kwargs):
+                calls.append((args, kwargs))
+                raise RuntimeError("routing probe only")
+
+            helper = types.SimpleNamespace(
+                verify_prepared_inputs_completion=fail_after_capture,
+            )
+            if v5:
+                helper.verify_prepared_inputs_completion_recorded_host = fail_after_capture
+            with tempfile.TemporaryDirectory(prefix="source5-consumer-routing-") as temporary:
+                prepared, manifest, _completion, completion_pin = self._routing_case(
+                    Path(temporary), v5=v5, full_spec=True,
+                )
+
+                def captured(_prepared, _relative, label):
+                    if label == "Source5 prepared-input provenance v2 validator":
+                        return types.SimpleNamespace(
+                            validate_prepared_input_provenance_v2=lambda _value, *, expected_hosts: {
+                                "preparation_pin": manifest["prepared_input_generation"]["provenance"]["preparation_pin"],
+                                "final_spec_pin": manifest["prepared_input_generation"]["provenance"]["final_spec_pin"],
+                                "final_plan_pin": manifest["prepared_input_generation"]["provenance"]["final_plan_pin"],
+                                "exploration_lineage": {},
+                            },
+                        )
+                    raise AssertionError(f"unexpected captured Source module: {label}")
+
+                with patch.object(chronology, "_source5_captured_source_module",
+                                  side_effect=captured), \
+                     patch.object(chronology, "_source_file",
+                                  return_value=(b"captured helper", "f" * 64, {})), \
+                     patch.object(chronology, "_load_module", return_value=helper):
+                    with self.assertRaisesRegex(chronology.ChronologyError,
+                                                "routing probe only"):
+                        chronology._verify_source5_prepared_input_generation(
+                            manifest, prepared,
+                            captured_pilot_read_providers=providers_value,
+                            global_artifact_reader=reader_value,
+                        )
+            self.assertEqual(len(calls), 1)
+            return calls[0], completion_pin, prepared, manifest
+
+        (recorded_args, recorded_kwargs), completion_pin, prepared, manifest = run_probe(
+            v5=True, providers_value=providers, reader_value=reader,
+        )
+        self.assertEqual(recorded_args, (
+            completion_pin, {
+                "schema": "allocatbelt.application-source5-prepared-inputs-provenance.v1",
+                "preparation_pin": manifest["prepared_input_generation"]["provenance"]["preparation_pin"],
+                "final_spec_pin": manifest["prepared_input_generation"]["provenance"]["final_spec_pin"],
+                "final_plan_pin": manifest["prepared_input_generation"]["provenance"]["final_plan_pin"],
+            }, prepared["source_root"], prepared["input_root"],
+        ))
+        self.assertIs(recorded_kwargs["captured_pilot_read_providers"], providers)
+        self.assertIs(recorded_kwargs["global_artifact_reader"], reader)
+        self.assertEqual(reader_calls, [])
+
+        (ordinary_args, ordinary_kwargs), ordinary_pin, _prepared, _manifest = run_probe(
+            v5=False, providers_value=None, reader_value=None,
+        )
+        self.assertEqual(ordinary_args[0], ordinary_pin)
+        self.assertEqual(ordinary_kwargs, {})
+        self.assertEqual(reader_calls, [])
+
+    def test_reader_rejects_non_v5_routes_and_v5_restart_does_not_replay(self) -> None:
+        chronology = self.chronology
+        reader_calls = []
+        reader = lambda *args: reader_calls.append(args) or b"captured"
+        with self.assertRaisesRegex(
+                chronology.ChronologyError, "must be absent or callable"):
+            chronology._verify_source5_prepared_input_generation(
+                None, {}, global_artifact_reader=object(),
+            )
+        ordinary_calls = []
+        recorded_calls = []
+
+        def ordinary(*args, **kwargs):
+            ordinary_calls.append((args, kwargs))
+            raise RuntimeError("ordinary route should not be selected")
+
+        def recorded(*args, **kwargs):
+            recorded_calls.append((args, kwargs))
+            raise RuntimeError("recorded route should not run without providers")
+
+        helper = types.SimpleNamespace(
+            verify_prepared_inputs_completion=ordinary,
+            verify_prepared_inputs_completion_recorded_host=recorded,
+        )
+        with tempfile.TemporaryDirectory(prefix="source5-consumer-restart-") as temporary:
+            prepared, manifest, _completion, _pin = self._routing_case(
+                Path(temporary), v5=True, full_spec=False,
+            )
+            def captured(_prepared, _relative, label):
+                return types.SimpleNamespace(
+                    validate_prepared_input_provenance_v2=lambda _value, *, expected_hosts: {
+                        "preparation_pin": manifest["prepared_input_generation"]["provenance"]["preparation_pin"],
+                        "final_spec_pin": manifest["prepared_input_generation"]["provenance"]["final_spec_pin"],
+                        "final_plan_pin": manifest["prepared_input_generation"]["provenance"]["final_plan_pin"],
+                        "exploration_lineage": {},
+                    },
+                )
+
+            with patch.object(chronology, "_source5_captured_source_module",
+                              side_effect=captured), \
+                 patch.object(chronology, "_source_file",
+                              return_value=(b"captured helper", "f" * 64, {})), \
+                 patch.object(chronology, "_load_module", return_value=helper):
+                with self.assertRaisesRegex(
+                        chronology.ChronologyError,
+                        "requires the exact frozen full original PlanV3 phase schedule"):
+                    chronology._verify_source5_prepared_input_generation(
+                        manifest, prepared, captured_pilot_read_providers=None,
+                        global_artifact_reader=reader,
+                    )
+            self.assertIs(prepared.get("source5_prepared_input_replay_required"), True)
+            self.assertEqual(ordinary_calls, [])
+            self.assertEqual(recorded_calls, [])
+            self.assertEqual(reader_calls, [])
+
+        with tempfile.TemporaryDirectory(prefix="source5-consumer-non-v5-reader-") as temporary:
+            prepared, manifest, _completion, _pin = self._routing_case(
+                Path(temporary), v5=False,
+            )
+            with self.assertRaisesRegex(
+                    chronology.ChronologyError,
+                    "reserved for recorded V5 completion replay"):
+                chronology._verify_source5_prepared_input_generation(
+                    manifest, prepared, global_artifact_reader=reader,
+                )
+            with self.assertRaisesRegex(
+                    chronology.ChronologyError,
+                    "reserved for recorded V5 completion replay"):
+                chronology._validate_source5_manifest_value(
+                    {"schema": chronology.SOURCE5_EXECUTION_SCHEMA_V3}, b"", prepared,
+                    global_artifact_reader=reader,
+                )
+            self.assertEqual(ordinary_calls, [])
+            self.assertEqual(recorded_calls, [])
+
+        with tempfile.TemporaryDirectory(prefix="source5-consumer-missing-recorded-api-") as temporary:
+            prepared, manifest, _completion, _pin = self._routing_case(
+                Path(temporary), v5=True, full_spec=True,
+            )
+            fallback_calls = []
+            helper_without_recorded_api = types.SimpleNamespace(
+                verify_prepared_inputs_completion=lambda *args, **kwargs:
+                    fallback_calls.append((args, kwargs)),
+            )
+
+            def captured(_prepared, _relative, label):
+                return types.SimpleNamespace(
+                    validate_prepared_input_provenance_v2=lambda _value, *, expected_hosts: {
+                        "preparation_pin": manifest["prepared_input_generation"]["provenance"]["preparation_pin"],
+                        "final_spec_pin": manifest["prepared_input_generation"]["provenance"]["final_spec_pin"],
+                        "final_plan_pin": manifest["prepared_input_generation"]["provenance"]["final_plan_pin"],
+                        "exploration_lineage": {},
+                    },
+                )
+
+            with patch.object(chronology, "_source5_captured_source_module",
+                              side_effect=captured), \
+                 patch.object(chronology, "_source_file",
+                              return_value=(b"captured helper", "f" * 64, {})), \
+                 patch.object(chronology, "_load_module",
+                              return_value=helper_without_recorded_api):
+                with self.assertRaisesRegex(
+                        chronology.ChronologyError,
+                        "lacks the selected completion verifier"):
+                    chronology._verify_source5_prepared_input_generation(
+                        manifest, prepared,
+                        captured_pilot_read_providers={
+                            "host-a": object(), "host-b": object(),
+                        },
+                        global_artifact_reader=reader,
+                    )
+            self.assertEqual(fallback_calls, [])
+
+    def test_manifest_validator_forwards_recorded_reader_and_missing_api_refuses(self) -> None:
+        chronology = self.chronology
+        providers = {"host-a": object(), "host-b": object()}
+        reader = lambda _pin, _maximum: b"captured"
+        hosts = ["host-a", "host-b"]
+        jobs = {phase: [] for phase in (
+            "exploration", "aa", "confirmation", "pressure", "soak",
+        )}
+        spec = {"hosts": [{"host_id": host} for host in hosts],
+                "rates": [{}], "oracles": [{}]}
+        prepared = {
+            "spec": spec, "plan": {"jobs": jobs},
+            "controller": types.SimpleNamespace(build_jobs=lambda _spec, phase: jobs[phase]),
+        }
+        manifest = {
+            "schema": chronology.SOURCE5_EXECUTION_SCHEMA_V5,
+            "scope": chronology.SOURCE5_EXECUTION_SCOPE_V5,
+            "qualification_eligible": False,
+            "phase_order": [
+                "exploration", "aa", "confirmation", "fixed_analysis", "pressure",
+                "pressure_analysis", "soak", "final_analysis",
+            ],
+            "prepared_input_generation": {},
+        }
+        forwarded = []
+
+        def capture_verify(*args, **kwargs):
+            forwarded.append((args, kwargs))
+            return {"route": "captured"}
+
+        with patch.object(chronology, "_exact", side_effect=lambda value, *_args: value), \
+             patch.object(chronology, "_source5_validate_manifest_identity"), \
+             patch.object(chronology, "_source5_validate_manifest_source_bindings"), \
+             patch.object(chronology, "_source5_journal_width_contract_pin_map",
+                          return_value={host: {} for host in hosts}), \
+             patch.object(chronology, "_verify_source5_prepared_input_generation",
+                          side_effect=capture_verify):
+            chronology._validate_source5_manifest_value(
+                manifest, b"manifest", prepared,
+                captured_pilot_read_providers=providers,
+                global_artifact_reader=reader,
+            )
+        self.assertEqual(len(forwarded), 1)
+        self.assertIs(forwarded[0][1]["captured_pilot_read_providers"], providers)
+        self.assertIs(forwarded[0][1]["global_artifact_reader"], reader)
+
+        with tempfile.TemporaryDirectory(prefix="source5-consumer-unsupported-api-") as temporary:
+            fixture = self._metadata_fixture(Path(temporary))
+            prepared_input, generation = self._preparatory_generation(fixture)
+            real_load = chronology._load_module
+            ordinary_calls = []
+
+            def remove_recorded_api(raw, path, label):
+                module = real_load(raw, path, label)
+                if Path(path).name == "application-source5-input-preparation.py":
+                    del module.verify_prepared_capacity_generation_bounded_metadata_v1
+                    module.verify_prepared_capacity_generation_bounded = \
+                        lambda *args, **kwargs: ordinary_calls.append(args)
+                return module
+
+            with patch.object(chronology, "_load_module", side_effect=remove_recorded_api):
+                with self.assertRaisesRegex(
+                        chronology.ChronologyError,
+                        "lacks named metadata capacity replay APIs"):
+                    chronology._verify_source5_preparatory_input_generation(
+                        prepared_input, generation,
+                    )
+            self.assertEqual(ordinary_calls, [])
+
+    def test_held_original_pilot_selects_named_metadata_exporter_without_changing_hook(self) -> None:
+        """A routing spy checks SourceA's held exporter seam only."""
+        chronology = self.chronology
+        with tempfile.TemporaryDirectory(prefix="source5-original-pilot-getter-") as temporary:
+            root = Path(temporary)
+            source_root = root / "source"
+            input_root = root / "inputs"
+            source_root.mkdir(mode=0o700)
+            input_root.mkdir(mode=0o700)
+            artifact_root = root / "campaign-artifacts"
+            artifact_root.mkdir(mode=0o700)
+            output_path = root / "pilot.json"
+            provider = object()
+            preparation_pin = {
+                "path": str(input_root / "preparation-generations" / "campaign" / "intent.json"),
+                "raw_sha256": "a" * 64,
+            }
+            spec_pin = {"path": str(input_root / "initial-spec.json"),
+                        "raw_sha256": "b" * 64}
+            plan_pin = {"path": str(input_root / "initial-plan.json"),
+                        "raw_sha256": "c" * 64}
+            binding = {"binding_sha256": "d" * 64}
+            manifest = {
+                "schema": chronology.SOURCE5_PREPARATORY_EXECUTION_SCHEMA_V1,
+                "original_inputs": {
+                    "campaign_artifacts_root": str(artifact_root),
+                },
+            }
+            h_modules = {
+                name: types.ModuleType(f"routing_only_{name}")
+                for name in ("campaign", "evidence_budget", "fixed_pair")
+            }
+            input_preparation = types.ModuleType("routing_only_inputprep")
+            input_preparation.__file__ = str(
+                source_root / "scripts/application-source5-input-preparation.py",
+            )
+            h_modules["input_preparation"] = input_preparation
+            prepared = {
+                "source5_execution_manifest": manifest,
+                "source5_preparatory_capacity_generation": {
+                    "provenance": {"preparation_pin": preparation_pin},
+                },
+                "source5_fixed_spec_host_pin": {"path": str(input_root / "fixed-spec-hosts/host-a.json"),
+                                                  "raw_sha256": "e" * 64},
+                "source5_prepared_fixed_host_binding": binding,
+                "_source5_preparatory_h_modules": h_modules,
+                "source_root": source_root, "input_root": input_root,
+                "source5_execution_manifest_pin": {
+                    "path": str(input_root / "execution-manifest.json"),
+                    "raw_sha256": "f" * 64,
+                },
+                "original_pins": {"spec": spec_pin, "plan": plan_pin},
+                "host_id": "host-a", "campaign_id": "campaign-original-pilot",
+            }
+            state = {
+                "source5_pending": None, "source5_cleanup_blocked": False,
+                "source5_failed_owner_window": False, "head": "0" * 64,
+                "record_count": 0,
+            }
+            fixed_inputs = {
+                "fixed_spec_host_pin": prepared["source5_fixed_spec_host_pin"],
+                "prepared_host_binding": binding,
+            }
+            calls = []
+            before_publication = lambda *_args: None
+
+            def exporter(pins, records, host_id, *, captured_read_provider,
+                         before_publication=None):
+                calls.append((pins, records, host_id, captured_read_provider,
+                              before_publication))
+                raise RuntimeError("routing probe only; no owner replay")
+
+            input_preparation.export_capacity_pilot_original_metadata_v1 = exporter
+            with patch.object(
+                    chronology, "_prepare_source5_preparatory_context_held",
+                    return_value=(manifest, prepared, state, {"raw_sha256": "f" * 64}),
+            ), patch.object(
+                    chronology, "_source5_preparatory_fixed_host_inputs",
+                    return_value=fixed_inputs,
+            ), patch.object(
+                    chronology, "_source5_preparatory_capacity_pilot_reservation_held",
+                    return_value=({}, output_path, 1_000_000, {}),
+            ), patch.object(
+                    chronology, "_source5_preparatory_capacity_pilot_records_held",
+                    return_value=([], []),
+            ), patch.object(
+                    chronology, "_Source5PreparatoryCapacityPilotReadProvider",
+                    return_value=provider,
+            ):
+                with self.assertRaisesRegex(
+                        chronology.ChronologyError, "routing probe only"):
+                    chronology._source5_export_preparatory_capacity_pilot_held(
+                        object(), {"path": str(input_root / "manifest.json"),
+                                   "sha256": "1" * 64}, object(),
+                    )
+            self.assertEqual(len(calls), 1)
+            pins, records, host_id, passed_provider, hook = calls[0]
+            self.assertEqual(records, [])
+            self.assertEqual(host_id, "host-a")
+            self.assertIs(passed_provider, provider)
+            self.assertTrue(callable(hook))
+            self.assertEqual(pins, {
+                "preparation": {"path": preparation_pin["path"],
+                                "sha256": preparation_pin["raw_sha256"]},
+                "spec": {"path": spec_pin["path"], "sha256": spec_pin["raw_sha256"]},
+                "plan": {"path": plan_pin["path"], "sha256": plan_pin["raw_sha256"]},
+                "source_root": str(source_root), "input_root": str(input_root),
+                "campaign_artifacts_root": str(artifact_root),
+                "prepared_host_binding": binding, "output": str(output_path),
+            })
+            self.assertIsNotNone(before_publication)
+
+class Source5V5ExplorationLaunchGuardTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.chronology = load_script(
+            SCRIPT_DIR / "application-campaign-chronology.py",
+            "source5_v5_exploration_launch_guard_test_target",
+        )
+
+    def test_v5_exploration_is_refused_but_fixed_phases_remain_launchable(self) -> None:
+        chronology = self.chronology
+        with self.assertRaisesRegex(
+                chronology.ChronologyError,
+                "imported ancestor and cannot launch an APP"):
+            chronology._source5_require_launchable_phase(
+                chronology.SOURCE5_EXECUTION_SCHEMA_V5, "exploration",
+            )
+        for phase in ("aa", "confirmation", "pressure", "soak"):
+            with self.subTest(phase=phase):
+                self.assertIsNone(chronology._source5_require_launchable_phase(
+                    chronology.SOURCE5_EXECUTION_SCHEMA_V5, phase,
+                ))
+
+    def test_legacy_exploration_scope_is_unchanged(self) -> None:
+        chronology = self.chronology
+        for schema in (chronology.SOURCE5_EXECUTION_SCHEMA,
+                       chronology.SOURCE5_EXECUTION_SCHEMA_V2,
+                       chronology.SOURCE5_EXECUTION_SCHEMA_V3,
+                       chronology.SOURCE5_EXECUTION_SCHEMA_V4):
+            with self.subTest(schema=schema):
+                self.assertIsNone(chronology._source5_require_launchable_phase(
+                    schema, "exploration",
+                ))
+
+    def test_v5_width_horizon_excludes_only_old_exploration_callbacks(self) -> None:
+        chronology = self.chronology
+        plan = {"jobs": {
+            "exploration": [{"host_id": "host-kvm-a"}],
+            "aa": [{"host_id": "host-kvm-a"}] * 2,
+            "confirmation": [{"host_id": "host-kvm-a"}] * 3,
+            "pressure": [{"host_id": "host-kvm-a"}] * 4,
+            "soak": [{"host_id": "host-kvm-a"}],
+        }}
+        fixed = [{"event": "source5_prepared_capacity_registered",
+                  "phase": "registration", "count": 1,
+                  "maximum_line_bytes": 1024}] + [
+            {"event": "source5_analysis", "phase": phase, "count": 1,
+             "maximum_line_bytes": 2048 + index}
+            for index, phase in enumerate(chronology._SOURCE5_ANALYSIS_PHASES)
+        ]
+        contract = {
+            "fixed_event_widths": fixed, "job_rows": [],
+            "total_event_count": 65, "total_event_bytes": 100_000,
+            "failed_owner_window": {"failed_event_count_uplift": 0},
+        }
+        projection = chronology._source5_plan_event_projection(
+            plan, {"host_id": "host-kvm-a",
+                   "scope": chronology.SOURCE5_EXECUTION_SCOPE_V5},
+            {"schema": chronology.SOURCE5_EXECUTION_SCHEMA_V5,
+             "journal_width_contracts": {"host-kvm-a": {}}},
+            contract,
+        )
+        self.assertEqual(projection["job_counts"]["exploration"], 1)
+        self.assertEqual(projection["counted_phases"],
+                         ["aa", "confirmation", "pressure", "soak"])
+        self.assertEqual(projection["paired_job_event_count"], 54)
+        self.assertEqual(projection["soak_job_event_count"], 4)
+        self.assertEqual(projection["successful_callback_events"], 65)
+        self.assertEqual(projection["maximum_journal_bytes"], 100_000)
+
+    def test_bounded_profiles_fail_closed_without_per_event_width_projection(self) -> None:
+        chronology = self.chronology
+        for schema in (chronology.SOURCE5_EXECUTION_SCHEMA_V4,
+                       chronology.SOURCE5_EXECUTION_SCHEMA_V5,
+                       chronology.SOURCE5_PREPARATORY_EXECUTION_SCHEMA_V1):
+            with self.subTest(schema=schema):
+                with self.assertRaisesRegex(
+                        chronology.ChronologyError,
+                        "requires its validated source-derived width projection"):
+                    chronology._source5_event_width_projection({
+                        "source5_execution_schema": schema,
+                    })
+        self.assertIsNone(chronology._source5_event_width_projection({
+            "source5_execution_schema": chronology.SOURCE5_EXECUTION_SCHEMA_V3,
+        }))
+
+    def test_v5_and_legacy_execution_schemas_require_the_matching_provenance_version(self) -> None:
+        chronology = self.chronology
+        chronology._source5_validate_provenance_profile_correlation(
+            chronology.SOURCE5_EXECUTION_SCHEMA_V5,
+            {"schema": chronology.SOURCE5_PREPARED_INPUTS_PROVENANCE_SCHEMA_V2},
+        )
+        chronology._source5_validate_provenance_profile_correlation(
+            chronology.SOURCE5_EXECUTION_SCHEMA_V4,
+            {"schema": "allocatbelt.application-source5-prepared-inputs-provenance.v1"},
+        )
+        for schema, provenance_schema in (
+            (chronology.SOURCE5_EXECUTION_SCHEMA_V5,
+             "allocatbelt.application-source5-prepared-inputs-provenance.v1"),
+            (chronology.SOURCE5_EXECUTION_SCHEMA_V4,
+             chronology.SOURCE5_PREPARED_INPUTS_PROVENANCE_SCHEMA_V2),
+        ):
+            with self.subTest(schema=schema, provenance_schema=provenance_schema):
+                with self.assertRaisesRegex(
+                        chronology.ChronologyError,
+                        "requires provenance v2"):
+                    chronology._source5_validate_provenance_profile_correlation(
+                        schema, {"schema": provenance_schema},
+                    )
+
+    def test_v5_completion_envelope_recomputes_exact_self_digest(self) -> None:
+        chronology = self.chronology
+        completion = {
+            "schema": "allocatbelt.application-source5-preparation-completion.v2",
+            "complete": True, "qualification_eligible": False,
+            "campaign_id": "v5-completion-envelope",
+            "preparation": {}, "final_spec": {}, "final_plan": {},
+            "source_manifests": {}, "capacity_preparations": [],
+            "pressure_calibrations": [], "pilots": [], "oracles": [],
+            "filled_slots": {}, "ledger_heads": [], "resource_budgets": {},
+        }
+        completion["completion_sha256"] = chronology.sha256_bytes(
+            chronology.canonical_bytes(completion),
+        )
+        checked = chronology._source5_validate_v5_completion_envelope(
+            completion, completion["completion_sha256"],
+        )
+        self.assertEqual(checked, completion)
+        stale = copy.deepcopy(completion)
+        stale["campaign_id"] = "tampered"
+        with self.assertRaisesRegex(chronology.ChronologyError, "semantic digest"):
+            chronology._source5_validate_v5_completion_envelope(
+                stale, completion["completion_sha256"],
+            )
+        extra = {**completion, "imported": True}
+        with self.assertRaisesRegex(chronology.ChronologyError, "unexpected field set"):
+            chronology._source5_validate_v5_completion_envelope(
+                extra, completion["completion_sha256"],
+            )
+
+    def test_new_registration_signature_requires_the_closed_width_and_pilot_inputs(self) -> None:
+        chronology = self.chronology
+        parameters = inspect.signature(
+            chronology.register_source5_prepared_exploration_capacity_locked,
+        ).parameters
+        self.assertTrue({"artifact_reader", "captured_pilot_read_providers",
+                         "journal_width_contract_pin"}.issubset(parameters))
+
+    def test_v5_registration_refuses_before_pilot_provider_consumption(self) -> None:
+        chronology = self.chronology
+        with self.assertRaisesRegex(
+                chronology.ChronologyError,
+                "disabled until SourceA replays the complete recorded-host InputPrep generation"):
+            chronology._source5_require_authenticated_pilot_provider_cohort()
+        source = (SCRIPT_DIR / "application-campaign-chronology.py").read_text()
+        start = source.index("def register_source5_prepared_exploration_capacity_locked(")
+        end = source.index("\ndef _inventory_runner_pin(", start)
+        body = source[start:end]
+        self.assertIn("_source5_verify_captured_prepared_ack_cohort_held(", body)
+        self.assertIn("_source5_require_authenticated_pilot_provider_cohort()", body)
+        self.assertLess(
+            body.index("_source5_verify_captured_prepared_ack_cohort_held("),
+            body.index("_source5_require_authenticated_pilot_provider_cohort()"),
+        )
+        self.assertNotIn("_verify_source5_prepared_input_generation(", body)
+        self.assertNotIn("_append_event(", body)
+
+    def test_closed_old_origin_reader_never_falls_back_to_ambient_paths(self) -> None:
+        chronology = self.chronology
+        raw = b"captured-old-origin"
+        pin = {"path": "/old/origin.json", "raw_sha256": chronology.sha256_bytes(raw)}
+        calls = []
+
+        def reader(request, maximum):
+            calls.append((request, maximum))
+            if request["path"] != pin["path"]:
+                raise AssertionError("reader received an undeclared origin")
+            return raw
+
+        self.assertEqual(
+            chronology._source5_read_captured_raw_pin(reader, pin, len(raw), "old origin"),
+            raw,
+        )
+        self.assertEqual(len(calls), 1)
+        with self.assertRaisesRegex(chronology.ChronologyError, "closed captured raw pin"):
+            chronology._source5_read_captured_raw_pin(
+                reader, {**pin, "raw_sha256": "0" * 64}, len(raw), "old origin",
+            )
+        with self.assertRaisesRegex(chronology.ChronologyError, "exact closed captured raw pin"):
+            chronology._source5_read_captured_raw_pin(reader, pin, len(raw) - 1, "old origin")
+
+    def test_captured_old_ack_windows_join_exact_journal_order(self) -> None:
+        chronology = self.chronology
+        rows, records, authorizations, finished = [], [], [], []
+        for index in range(360):
+            job = {"phase": "exploration", "host_id": "host-kvm-a",
+                   "ordinal": index % 6 + 1, "run_id": f"old-window-{index:03d}"}
+            job_sha = chronology.sha256_bytes(chronology.canonical_bytes(job))
+            terminal = {"state_claim": "valid_pair", "event_head": f"{index + 1:064x}",
+                        "details": {"component_sha256": "a" * 64,
+                                    "process_metrics_sha256": "b" * 64}}
+            auth = {
+                "authorization_id": f"source5-{index:048x}", "phase": "exploration",
+                "job_index": index, "job": job, "job_run_id": job["run_id"],
+                "job_sha256": job_sha, "members_sha256": "c" * 64,
+                "capacity_registration_head": "d" * 64,
+                "authorization_head": f"{index + 1000:064x}",
+                "execution_manifest": {"path": "/old/execution.json", "raw_sha256": "e" * 64},
+                "helper_input": {"path": "/old/helper.json", "raw_sha256": "f" * 64},
+                "helper_module": {"path": "scripts/helper.py", "sha256": "1" * 64},
+                "capacity_completion": {"path": "/old/capacity.json", "raw_sha256": "2" * 64},
+                "capacity_ledger_raw_sha256": "3" * 64,
+                "capacity_terminal_head": "4" * 64,
+                "capacity_schedule_sha256": "5" * 64,
+                "prerequisites": [], "input_snapshot_sha256": "6" * 64,
+                "output_root": "/old/output", "outer_deadline_seconds": 1,
+                "effective_timeout_seconds": 1, "member_count": 2,
+                "members": [{"index": 0}, {"index": 1}],
+                "starts": [{"member_index": 0}, {"member_index": 1}],
+                "terminals": [{"member_index": 0}, {"member_index": 1}],
+                "job_terminal": terminal,
+                "authorization_record_count": index * 6 + 2,
+            }
+            rows.append({"row_index": index, "job": job, "job_sha256": job_sha})
+            records.append({"job": job})
+            authorizations.append(auth)
+            finished.append({"phase": "exploration", "job_run_id": job["run_id"],
+                             "authorization_id": auth["authorization_id"],
+                             "authorization_head": auth["authorization_head"],
+                             "job_terminal": terminal})
+        proof = {
+            "schema": "allocatbelt.application-source5-prepared-exploration-lineage-proof.v2",
+            "campaign_id": "old-ack-window-fixture", "host_id": "host-kvm-a",
+            "initial_output_root": "/old/output", "final_output_root": "/new/output",
+            "bridge_header": {}, "index_rows": rows, "capture_context": {},
+            "records": records, "journal_authorizations": authorizations,
+            "journal_finished": finished,
+            "bridge_header_pin": {"path": "/old/header", "raw_sha256": "7" * 64},
+            "record_index_pin": {"path": "/old/index", "raw_sha256": "8" * 64},
+            "job_count": 360, "callback_count": 2160,
+            "allowed_slot_fill_proved": True,
+            "initial_journal_pin": {"path": "/old/journal", "raw_sha256": "9" * 64},
+            "initial_journal_structurally_replayed": True,
+            "initial_phase_ledger_structurally_replayed": True,
+            "initial_journal_head": "a" * 64,
+            "initial_journal_record_count": 2161,
+            "initial_phase_ledger_pin": {"path": "/old/ledger", "raw_sha256": "b" * 64},
+            "initial_phase_ledger_byte_count": 360,
+            "initial_phase_ledger_row_count": 360,
+            "ancestor": {}, "component_replay_required": True,
+            "fresh_sourcea_gpg_replay_required": True,
+            "qualification_eligible": False,
+        }
+        joined = chronology._source5_prepared_ack_window_inputs(proof)
+        self.assertEqual(len(joined), 360)
+        self.assertEqual([window[2]["job_index"] for window in joined], list(range(360)))
+        swapped = copy.deepcopy(proof)
+        swapped["journal_authorizations"][1]["job_run_id"] = \
+            swapped["journal_authorizations"][0]["job_run_id"]
+        with self.assertRaisesRegex(chronology.ChronologyError, "ordered Plan window"):
+            chronology._source5_prepared_ack_window_inputs(swapped)
+
+    def test_captured_ack_archive_receives_closed_raw_reader_without_staging(self) -> None:
+        source = (SCRIPT_DIR / "application-campaign-chronology.py").read_text()
+        start = source.index("def _source5_verify_captured_prepared_ack_cohort_held(")
+        end = source.index("\ndef _source5_captured_journal_width_contract(", start)
+        body = source[start:end]
+        self.assertLess(body.index("checked_budget = validate_host_budget("),
+                        body.index("archive_proof = verify_ack("))
+        self.assertIn("catalogue_row_reader=closed_catalogue_reader", body)
+        self.assertIn("captured_preparatory_artifact_reader=", body)
+        self.assertIn("captured_keyring_reader=captured_keyring_reader", body)
+        self.assertNotIn("TemporaryDirectory", body)
+        self.assertNotIn("cache.stage(", body)
+        self.assertNotIn("budget_dependency_map_raw=", body)
+        self.assertNotIn("budget_catalogue_map_raw=", body)
+
+    def test_lineage_registration_proofs_cover_both_cohort_hosts(self) -> None:
+        chronology = self.chronology
+        hosts = ["host-kvm-a", "host-kvm-b"]
+        store = {}
+        provenance = {"exploration_lineage": {}}
+        observed_by_host = {}
+        for index, host in enumerate(hosts):
+            observed = {
+                "schema": "synthetic-component-observed-host.v1",
+                "host_id": host, "boot_id_sha256": str(index + 1) * 64,
+                "controls_sha256": str(index + 3) * 64,
+                "controls": {"component_scope": "structural-fixture"},
+                "cpu_affinity": [index],
+                "network_namespace_inode": index + 1,
+            }
+            observed_raw = chronology.canonical_bytes(observed)
+            observed_pin = {
+                "path": f"/old/{host}/observed.json",
+                "raw_sha256": chronology.sha256_bytes(observed_raw),
+                "boot_id_sha256": observed["boot_id_sha256"],
+                "controls_sha256": observed["controls_sha256"],
+            }
+            header = {
+                "campaign_id": "cohort-lineage-component",
+                "host_id": host,
+                "initial": {"observed_host_pin": observed_pin},
+            }
+            header_raw = chronology.canonical_bytes(header)
+            header_pin = {
+                "path": f"/old/{host}/bridge-header.json",
+                "raw_sha256": chronology.sha256_bytes(header_raw),
+            }
+            index_pin = {
+                "path": f"/old/{host}/record-index.jsonl",
+                "raw_sha256": str(index + 5) * 64,
+            }
+            store[header_pin["path"]] = header_raw
+            store[observed_pin["path"]] = observed_raw
+            provenance["exploration_lineage"][host] = {
+                "bridge_header": header_pin, "record_index": index_pin,
+            }
+            observed_by_host[host] = {**observed_pin,
+                "controls": observed["controls"],
+                "cpu_affinity": observed["cpu_affinity"],
+                "network_namespace_inode": observed["network_namespace_inode"],
+            }
+
+        def closed_reader(pin, maximum):
+            raw = store.get(pin["path"])
+            if (raw is None or len(raw) > maximum or
+                    chronology.sha256_bytes(raw) != pin["raw_sha256"]):
+                raise AssertionError("closed cohort reader rejected a pin")
+            return raw
+
+        calls = []
+
+        class FakeLineage:
+            def verify_source5_prepared_exploration_lineage_v2(
+                    self, final_prepared, lineage_pins, **_kwargs):
+                host = final_prepared["host_id"]
+                calls.append((host, final_prepared["original_pins"]["observed_host"]))
+                return {
+                    "schema": "allocatbelt.application-source5-prepared-exploration-lineage-proof.v2",
+                    "campaign_id": final_prepared["campaign_id"],
+                    "host_id": host, "job_count": 360,
+                    "callback_count": 2160,
+                    "component_replay_required": True,
+                    "fresh_sourcea_gpg_replay_required": True,
+                    "qualification_eligible": False,
+                    "index_rows": [{} for _ in range(360)],
+                }
+
+        selected_original = {
+            "schema": chronology.CHRONOLOGY_SCHEMA,
+            "campaign_id": "cohort-lineage-component",
+            "host_id": hosts[0],
+            "spec": {"path": "/final/spec.json", "raw_sha256": "a" * 64,
+                     "semantic_sha256": "b" * 64},
+            "plan": {"path": "/final/plan.json", "raw_sha256": "c" * 64,
+                     "semantic_sha256": "d" * 64},
+            "source_manifests": [],
+            "observed_host": observed_by_host[hosts[0]],
+        }
+        prepared = {
+            "campaign_id": "cohort-lineage-component", "host_id": hosts[0],
+            "output_root": Path("/final/output"),
+            "spec": {"hosts": [{"host_id": host} for host in hosts]},
+            "original_pins": selected_original,
+        }
+        with patch.object(chronology, "_SOURCE5_OWN_MODULE", chronology):
+            proofs = chronology._source5_verify_prepared_exploration_lineage_cohort(
+                prepared, provenance, FakeLineage(), artifact_reader=closed_reader,
+                campaign_module=object(), input_preparation_module=object(),
+                campaign_inputs_module=object(), source5_campaign_module=object(),
+                preparatory_budget_module=object(),
+            )
+        self.assertEqual(list(proofs), hosts)
+        self.assertEqual([host for host, _observed in calls], hosts)
+        self.assertEqual(
+            [observed["path"] for _host, observed in calls],
+            [observed_by_host[host]["path"] for host in hosts],
+        )
+        malformed = copy.deepcopy(provenance)
+        del malformed["exploration_lineage"][hosts[1]]
+        with self.assertRaisesRegex(chronology.ChronologyError, "exact two-host cohort"):
+            chronology._source5_verify_prepared_exploration_lineage_cohort(
+                prepared, malformed, FakeLineage(), artifact_reader=closed_reader,
+                campaign_module=object(), input_preparation_module=object(),
+                campaign_inputs_module=object(), source5_campaign_module=object(),
+                preparatory_budget_module=object(),
+            )
+
+    def test_structural_registration_accepts_only_two_host_v2_lineage_shape(self) -> None:
+        chronology = self.chronology
+        hosts = ["host-kvm-a", "host-kvm-b"]
+
+        def pin(path: str, digit: str) -> dict[str, str]:
+            return {"path": path, "raw_sha256": digit * 64}
+
+        provenance = {
+            "schema": chronology.SOURCE5_PREPARED_INPUTS_PROVENANCE_SCHEMA_V2,
+            "preparation_pin": pin("/private/input/preparation.json", "1"),
+            "final_spec_pin": pin("/private/input/spec.json", "2"),
+            "final_plan_pin": pin("/private/input/plan.json", "3"),
+            "exploration_lineage": {
+                host: {
+                    "bridge_header": pin(
+                        f"/private/old/{host}/bridge-header.json", "4",
+                    ),
+                    "record_index": pin(
+                        f"/private/old/{host}/record-index.jsonl", "5",
+                    ),
+                }
+                for host in hosts
+            },
+        }
+        details = {
+            "campaign_id": "campaign-v5", "host_id": hosts[0],
+            "completion": {
+                **pin("/private/input/prepared-inputs-completion.json", "6"),
+                "semantic_sha256": "7" * 64,
+            },
+            "provenance": provenance,
+            "host_completion": {
+                "path": "/private/input/host-completion.json",
+                "raw_sha256": "8" * 64, "semantic_sha256": "9" * 64,
+            },
+            "host_verification": {
+                "path": "/private/input/host-verification.json",
+                "raw_sha256": "a" * 64, "receipt_sha256": "b" * 64,
+            },
+            "capacity_ledger": {
+                "path": "/private/input/ledger.jsonl",
+                "raw_sha256": "c" * 64, "terminal_head": "d" * 64,
+            },
+            "capacity_schedule_sha256": "e" * 64,
+            "entries": [{"entry": index} for index in range(15)],
+            "qualification_eligible": False,
+            "controller_chronology_proven": False,
+        }
+
+        def structural_index(registration_details):
+            item = {
+                "sequence": 1, "record_sha256": "f" * 64,
+                "previous_sha256": "0" * 64,
+                "record": {
+                    "monotonic_ns": 1,
+                    "event": "source5_prepared_capacity_registered",
+                },
+                "details": registration_details,
+            }
+            return chronology._journal_structural_index(
+                [item], "campaign-v5", hosts[0], "0" * 64,
+            )
+
+        index = structural_index(details)
+        self.assertEqual(len(index["registrations"]), 1)
+        self.assertEqual(index["registrations"][0]["details"]["provenance"],
+                         provenance)
+        malformed = copy.deepcopy(details)
+        del malformed["provenance"]["exploration_lineage"][hosts[1]]
+        with self.assertRaisesRegex(chronology.ChronologyError, "two hosts"):
+            structural_index(malformed)
 
 if __name__ == "__main__":
     raise SystemExit(unittest.main())

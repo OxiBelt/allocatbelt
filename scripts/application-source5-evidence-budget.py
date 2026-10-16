@@ -30,8 +30,11 @@ EXECUTION_SCHEMAS = {
     "allocatbelt.application-source5-campaign-execution.v2",
     "allocatbelt.application-source5-campaign-execution.v3",
     "allocatbelt.application-source5-campaign-execution.v4",
+    "allocatbelt.application-source5-campaign-execution.v5",
 }
 TWO_KVM_QUALIFICATION_PROFILE = "two_kvm_hosts_v1"
+SOURCE5_PREPARED_EXPLORATION_ADMISSION_PROFILE = \
+    "source5_prepared_exploration_reuse_v1"
 PHASES = ("exploration", "aa", "confirmation", "pressure", "soak")
 ALLOCATORS = ("allocatbelt", "mimalloc-secure", "mimalloc-standard", "system")
 LOADS = (70, 90)
@@ -64,6 +67,12 @@ SOAK_SAMPLE_BYTES_CAP = 96 * 1024 * 1024
 PATH_CATALOGUE_SCHEMA_V2 = "allocatbelt.application-source5-host-path-catalogue.v2"
 RETENTION_POLICY_SCHEMA_V2 = "allocatbelt.application-source5-between-pair-retention.v2"
 RETENTION_POLICY_MODE_V2 = "verified_between_pair_offload_v1"
+FIXED_CHECKPOINT_REQUEST_SCHEMA_V3 = (
+    "allocatbelt.application-source5-evidence-checkpoint-request.v3"
+)
+FIXED_CHECKPOINT_SCHEMA_V3 = (
+    "allocatbelt.application-source5-evidence-job-checkpoint.v3"
+)
 SUCCESS_EMPTY_TMP_TREE_ROLES = frozenset({"normal_app_output"})
 ARCHIVE_SIGNATURE_QUOTA_BYTES = 4096
 ACK_BUNDLE_ALTERNATIVE_ROLES = frozenset({
@@ -138,7 +147,17 @@ INDEX_MANIFEST_FANOUT = 128
 MAX_CAPTURED_STORE_ROOT_BYTES = 16 * 1024 * 1024
 HOST_BUDGET_SCHEMA_V2 = "allocatbelt.application-source5-host-evidence-budget.v2"
 HOST_BUDGET_SCHEMA_V3 = "allocatbelt.application-source5-host-evidence-budget.v3"
+HOST_BUDGET_SCHEMA_V4 = "allocatbelt.application-source5-host-evidence-budget.v4"
+PREPARATORY_BUDGET_SCHEMA = (
+    "allocatbelt.application-source5-preparatory-exploration-budget.v1"
+)
+PREPARATORY_EXECUTION_SCHEMA = (
+    "allocatbelt.application-source5-preparatory-exploration-execution.v1"
+)
+EXECUTION_SCHEMA_V5 = "allocatbelt.application-source5-campaign-execution.v5"
 SOURCE5_V3_ADMISSION_PROFILE = "source5_width_v4_captured_replay_v1"
+SOURCE5_JOURNAL_WIDTH_CONTRACT_SCHEMA_V2 = \
+    "allocatbelt.application-source5-journal-width-contract.v2"
 STORAGE_RESERVATION_SCHEMA_V1 = "allocatbelt.application-source5-evidence-storage-reservation.v1"
 JOURNAL_WIDTH_CONTRACT_SCHEMA = \
     "allocatbelt.application-source5-journal-width-contract.v1"
@@ -332,6 +351,377 @@ def _pin(value: Any, label: str) -> dict[str, str]:
     _digest(pin["raw_sha256"], f"{label} raw SHA-256")
     _digest(pin["semantic_sha256"], f"{label} semantic SHA-256")
     return pin
+
+
+def _raw_origin_pin(value: Any, label: str) -> dict[str, str]:
+    """Validate the exact two-field raw pin used by captured lineage reads."""
+    pin = _exact(value, {"path", "raw_sha256"}, label)
+    path = pin["path"]
+    _require(type(path) is str and path.startswith("/") and
+             len(path.encode("utf-8", "strict")) <= MAX_PATH_BYTES and
+             PurePosixPath(path).as_posix() == path and
+             ".." not in PurePosixPath(path).parts and
+             "." not in PurePosixPath(path).parts and path != "/" and
+             not path.endswith("/") and "\\" not in path and "\x00" not in path,
+             f"{label} path is not a normalized absolute origin")
+    _digest(pin["raw_sha256"], f"{label} raw SHA-256")
+    return pin
+
+
+def _prepared_lineage_catalogue_role_matches(
+    expected_role: str, actual_role: str,
+) -> bool:
+    """Allow only the exact old-to-current role projections used by V5."""
+    if expected_role == "evidence_index":
+        return actual_role in {"preparation", "evidence_index"}
+    if expected_role == "fixed_spec_host":
+        return actual_role == "observed_host"
+    if expected_role == "journal_width_contract":
+        return actual_role in {
+            "journal_width_contract",
+            "preparatory_journal_width_contract",
+        }
+    return actual_role == expected_role
+
+
+def _prepared_lineage_catalogue_rows_for_host(
+    expected_rows: dict[str, dict[str, Any]], host_id: str,
+) -> dict[str, dict[str, Any]]:
+    """Select origins expected in this old catalogue, apart from storage host."""
+    return {
+        path: row for path, row in expected_rows.items()
+        if row["role"] != "source5_job_row_catalogue" and
+        host_id in row["catalogue_hosts"]
+    }
+
+
+def _source5_indexed_raw_pin_projection(value: object, label: str) -> dict[str, str]:
+    """Validate a Source-issued raw, semantic, or signer pin for indexed binding."""
+    allowed = {"path", "raw_sha256", "semantic_sha256", "signer_fingerprint"}
+    _require(type(value) is dict and {"path", "raw_sha256"} <= set(value) and
+             set(value) <= allowed,
+             f"{label} contains unknown fields or lacks its raw pin")
+    pin = _raw_origin_pin({
+        "path": value["path"], "raw_sha256": value["raw_sha256"],
+    }, label)
+    if "semantic_sha256" in value:
+        _digest(value["semantic_sha256"], f"{label} semantic digest")
+    if "signer_fingerprint" in value:
+        _require(type(value["signer_fingerprint"]) is str and
+                 re.fullmatch(r"[A-F0-9]{40}|[A-F0-9]{64}",
+                              value["signer_fingerprint"]) is not None,
+                 f"{label} signer fingerprint is malformed")
+    return pin
+
+
+def source5_indexed_reservation_binding_v1(
+    index_row: object, pin_value: object, role: str, job: object, *,
+    initial_output_root: str, campaign_id: str, selected_host: str,
+    old_rows: dict[str, dict[str, Any]],
+) -> tuple[dict[str, str], dict[str, Any]]:
+    """Join one validated Source5 index pin to its exact old reservation row.
+
+    Durable ACK/signature paths remain their raw origin identity. Only their
+    old-catalogue lookup uses the exact host-local H6 reservation leaf.
+    """
+    roles = {
+        "source5_job_record", "source5_checkpoint_request",
+        "source5_checkpoint", "source5_object_manifest",
+        "source5_archive_ack", "source5_archive_signature",
+    }
+    _require(role in roles, "prepared capture indexed role is unsupported")
+    _require(type(index_row) is dict and type(job) is dict and
+             job.get("phase") == "exploration" and
+             job.get("host_id") == selected_host,
+             "prepared capture indexed reservation job join is malformed")
+    run_id = _token(job.get("run_id"), "prepared capture indexed run ID")
+    ordinal = _uint(job.get("ordinal"),
+                    "prepared capture indexed job ordinal", positive=True)
+    job_sha = _digest(index_row.get("job_sha256"),
+                      "prepared capture indexed job digest")
+    _require(type(initial_output_root) is str and
+             initial_output_root.startswith("/") and
+             PurePosixPath(initial_output_root).as_posix() == initial_output_root and
+             "\\" not in initial_output_root and "\x00" not in initial_output_root and
+             ".." not in PurePosixPath(initial_output_root).parts and
+             "." not in PurePosixPath(initial_output_root).parts and
+             not initial_output_root.endswith("/"),
+             "prepared capture initial output root is not normalized")
+    campaign_id = _token(campaign_id, "prepared capture campaign ID")
+    selected_host = _token(selected_host, "prepared capture selected host ID")
+    pin = _source5_indexed_raw_pin_projection(
+        pin_value, f"prepared capture indexed {role} origin pin",
+    )
+    leaf = f"{ordinal:06d}-{job_sha}"
+    metadata_root = str(PurePosixPath(initial_output_root) / campaign_id /
+                        "chronology" / selected_host /
+                        "evidence-checkpoints" / "exploration")
+    if role == "source5_job_record":
+        reservation_path = str(
+            PurePosixPath(initial_output_root) / campaign_id / "source5" /
+            selected_host / "exploration" / "job-records" / f"{run_id}.json",
+        )
+        _require(pin["path"] == reservation_path,
+                 "prepared capture job-record pin differs from its canonical H6 path")
+    else:
+        suffixes = {
+            "source5_checkpoint_request": f"{leaf}.request.json",
+            "source5_checkpoint": f"{leaf}.checkpoint.json",
+            "source5_object_manifest": f"{leaf}.object-manifest.json",
+            "source5_archive_ack": f"{leaf}.ack.json",
+            "source5_archive_signature": f"{leaf}.ack.sig",
+        }
+        reservation_path = str(PurePosixPath(metadata_root) / suffixes[role])
+        if role in {"source5_archive_ack", "source5_archive_signature"}:
+            archive = index_row.get("archive_pins")
+            _require(type(archive) is dict,
+                     "prepared capture indexed ACK/signature pins are malformed")
+            ack = _source5_indexed_raw_pin_projection(
+                archive.get("ack_pin"), "prepared capture durable ACK pin",
+            )
+            signature = _source5_indexed_raw_pin_projection(
+                archive.get("signature_pin"),
+                "prepared capture durable signature pin",
+            )
+            ack_path = PurePosixPath(ack["path"])
+            signature_path = PurePosixPath(signature["path"])
+            _require(ack_path.name == f"{leaf}.json" and
+                     ack_path.parent.name == "exploration" and
+                     ack_path.parent.parent.name == "acks" and
+                     signature_path.name == f"{leaf}.sig" and
+                     signature_path.parent.name == "exploration" and
+                     signature_path.parent.parent.name == "signatures" and
+                     signature_path.parent.parent.parent.name == "acks" and
+                     ack_path.parent.parent == signature_path.parent.parent.parent,
+                     "prepared capture durable ACK/signature leaf or Root hierarchy differs")
+            expected_durable_pin = (
+                ack if role == "source5_archive_ack" else signature
+            )
+            _require(pin == expected_durable_pin,
+                     f"prepared capture indexed {role} identity differs from its durable pin")
+        else:
+            _require(pin["path"] == reservation_path,
+                     f"prepared capture indexed {role} pin differs from its canonical H6 path")
+
+    row = old_rows.get(reservation_path)
+    _require(type(row) is dict and row.get("kind") == "file" and
+             row.get("path") == reservation_path and row.get("role") == role and
+             row.get("host_id") == selected_host and
+             row.get("phase") == "exploration" and
+             row.get("run_id") == run_id and
+             type(row.get("max_file_bytes")) is int and
+             row["max_file_bytes"] > 0,
+             f"prepared capture {role} differs from its exact old Source reservation")
+    origin = row.get("origin_pin")
+    if origin is not None:
+        origin = _exact(origin, {"raw_sha256", "semantic_sha256"},
+                        f"prepared capture {role} old Source origin")
+        _digest(origin["raw_sha256"],
+                f"prepared capture {role} old Source raw origin")
+        _require(origin["raw_sha256"] == pin["raw_sha256"] and
+                 (type(pin_value) is not dict or
+                  "semantic_sha256" not in pin_value or
+                  origin["semantic_sha256"] is None or
+                  origin["semantic_sha256"] == pin_value["semantic_sha256"]),
+                 f"prepared capture {role} differs from its old Source origin pin")
+    return pin, row
+
+
+def source5_preparatory_shared_originals_v1(
+    cohort_values: object,
+) -> dict[str, Any]:
+    """Verify the exact shared SourceH preparation/generation inputs for a cohort."""
+    _require(type(cohort_values) is list and len(cohort_values) in (2, 3),
+             "prepared capture shared SourceH inputs require the exact host cohort")
+    host_ids = []
+    shared_by_host = {}
+    execution_host_orders = []
+    for index, value in enumerate(cohort_values):
+        item = _exact(value, {
+            "host_id", "original_pins", "execution_manifest", "header",
+        }, f"prepared capture shared SourceH cohort input[{index}]")
+        host = _token(item["host_id"],
+                      f"prepared capture shared SourceH host[{index}]")
+        _require(host not in host_ids,
+                 "prepared capture shared SourceH cohort repeats a host")
+        host_ids.append(host)
+        original = _exact(item["original_pins"], {
+            "preparation", "capacity_generation", "initial_spec", "initial_plan",
+            "source_manifests", "observed_hosts", "typed_modules",
+            "archive_signer_context", "capacity_registration",
+            "execution_basis_sha256",
+        }, f"prepared capture {host} SourceH original pins")
+        preparation_pin = _raw_origin_pin(
+            original["preparation"],
+            f"prepared capture {host} original preparation pin",
+        )
+        capacity_generation = _exact(original["capacity_generation"], {
+            "path", "raw_sha256", "semantic_sha256", "provenance",
+        }, f"prepared capture {host} original capacity-generation pin")
+        generation_pin = _pin({key: capacity_generation[key] for key in (
+            "path", "raw_sha256", "semantic_sha256",
+        )}, f"prepared capture {host} original capacity-generation pin")
+        generation_provenance = _exact(capacity_generation["provenance"], {
+            "schema", "preparation_pin", "initial_spec_pin", "initial_plan_pin",
+        }, f"prepared capture {host} original capacity-generation provenance")
+        execution_manifest = item["execution_manifest"]
+        _require(type(execution_manifest) is dict and
+                 execution_manifest.get("schema") == PREPARATORY_EXECUTION_SCHEMA and
+                 execution_manifest.get("host_id") == host and
+                 type(execution_manifest.get("campaign_id")) is str,
+                 f"prepared capture {host} SourceH execution manifest is malformed")
+        execution_hosts = execution_manifest.get("hosts")
+        _require(type(execution_hosts) is list and len(execution_hosts) ==
+                 len(cohort_values),
+                 f"prepared capture {host} execution host cohort is malformed")
+        execution_hosts = [
+            _token(peer_host,
+                   f"prepared capture {host} execution host[{peer_index}]")
+            for peer_index, peer_host in enumerate(execution_hosts)
+        ]
+        _require(len(set(execution_hosts)) == len(execution_hosts) and
+                 host in execution_hosts,
+                 f"prepared capture {host} execution host cohort is malformed")
+        execution_host_orders.append(execution_hosts)
+        manifest_generation = _exact(
+            execution_manifest.get("preparatory_capacity_generation"),
+            {"completion", "provenance"},
+            f"prepared capture {host} execution capacity generation",
+        )
+        manifest_generation_pin = _pin(
+            manifest_generation["completion"],
+            f"prepared capture {host} execution capacity-generation pin",
+        )
+        provenance_preparation_pin = _raw_origin_pin(
+            generation_provenance["preparation_pin"],
+            f"prepared capture {host} generation preparation provenance pin",
+        )
+        _require(generation_provenance["schema"] ==
+                 "allocatbelt.application-source5-preparatory-capacity-provenance.v1" and
+                 generation_pin == manifest_generation_pin and
+                 generation_provenance == manifest_generation["provenance"] and
+                 preparation_pin == provenance_preparation_pin,
+                 f"prepared capture {host} SourceH preparation/generation join differs")
+        header = item["header"]
+        _require(type(header) is dict and header.get("host_id") == host and
+                 header.get("campaign_id") == execution_manifest["campaign_id"] and
+                 type(header.get("initial")) is dict and
+                 header["initial"].get("capacity_generation_sha256") ==
+                    generation_pin["semantic_sha256"],
+                 f"prepared capture {host} header generation identity differs")
+        source_rows = header["initial"].get("source_manifest_pins")
+        _require(type(source_rows) is list and
+                 [row.get("host_id") for row in source_rows if type(row) is dict] ==
+                    execution_hosts,
+                 f"prepared capture {host} header Source cohort order differs")
+        for original_name, header_name, provenance_name in (
+            ("initial_spec", "spec_pin", "initial_spec_pin"),
+            ("initial_plan", "plan_pin", "initial_plan_pin"),
+        ):
+            original_pin = _pin(
+                original[original_name],
+                f"prepared capture {host} original {original_name} pin",
+            )
+            provenance_pin = _raw_origin_pin(
+                generation_provenance[provenance_name],
+                f"prepared capture {host} generation {provenance_name}",
+            )
+            header_pin = _pin(
+                header["initial"][header_name],
+                f"prepared capture {host} header initial {original_name} pin",
+            )
+            _require({key: original_pin[key] for key in ("path", "raw_sha256")} ==
+                     provenance_pin and original_pin == header_pin,
+                     f"prepared capture {host} generation {provenance_name} differs")
+        shared_by_host[host] = {
+            "preparation": preparation_pin,
+            "capacity_generation": {
+                **generation_pin, "provenance": generation_provenance,
+            },
+        }
+    shared_values = list(shared_by_host.values())
+    shared = shared_values[0]
+    _require(all(order == execution_host_orders[0]
+                 for order in execution_host_orders[1:]) and
+             execution_host_orders[0] == host_ids and
+             all(value == shared for value in shared_values[1:]),
+             "prepared capture shared SourceH preparation/generation pins differ across the cohort")
+    return shared
+
+
+def _source5_prepared_lineage_indexed_rows_v4(
+    expected_rows: dict[str, dict[str, Any]],
+    index_rows: list[dict[str, Any]], old_rows: dict[str, dict[str, Any]], *,
+    initial_output_root: str, campaign_id: str, selected_host: str,
+) -> dict[str, dict[str, Any]]:
+    """Re-key durable indexed pins to exact old H6 reservation paths for V4."""
+    _require(type(expected_rows) is dict and type(index_rows) is list and
+             len(index_rows) == 360 and type(old_rows) is dict,
+             "Source5 v4 indexed old-reservation inputs are malformed")
+    needed = _prepared_lineage_catalogue_rows_for_host(
+        expected_rows, selected_host,
+    )
+    phase_roles = {
+        "source5_job_record", "source5_checkpoint_request",
+        "source5_checkpoint", "source5_object_manifest",
+        "source5_archive_ack", "source5_archive_signature",
+    }
+    for row_index, index_row in enumerate(index_rows):
+        _require(type(index_row) is dict and
+                 index_row.get("row_index") == row_index and
+                 type(index_row.get("job")) is dict,
+                 f"Source5 v4 indexed row[{row_index}] is malformed")
+        job = index_row["job"]
+        _require(job.get("host_id") == selected_host and
+                 job.get("phase") == "exploration" and
+                 index_row.get("job_sha256") == _sha(_canonical(job)),
+                 f"Source5 v4 indexed row[{row_index}] changed its exact job join")
+        archive = _exact(index_row.get("archive_pins"), {
+            "request_pin", "checkpoint_pin", "object_manifest_pin",
+            "ack_pin", "signature_pin",
+        }, f"Source5 v4 indexed row[{row_index}] archive pins")
+        entries = (
+            (index_row.get("job_record_pin"), "source5_job_record"),
+            *((archive[name], role) for name, role in (
+                ("request_pin", "source5_checkpoint_request"),
+                ("checkpoint_pin", "source5_checkpoint"),
+                ("object_manifest_pin", "source5_object_manifest"),
+                ("ack_pin", "source5_archive_ack"),
+                ("signature_pin", "source5_archive_signature"),
+            )),
+        )
+        seen_roles = set()
+        for pin_value, role in entries:
+            pin, reservation = source5_indexed_reservation_binding_v1(
+                index_row, pin_value, role, job,
+                initial_output_root=initial_output_root,
+                campaign_id=campaign_id, selected_host=selected_host,
+                old_rows=old_rows,
+            )
+            expected = expected_rows.get(pin["path"])
+            _require(role in phase_roles and role not in seen_roles and
+                     type(expected) is dict and
+                     expected.get("raw_sha256") == pin["raw_sha256"] and
+                     expected.get("role") == role and
+                     expected.get("host_id") == selected_host and
+                     expected.get("phase") == "exploration" and
+                     expected.get("run_id") == job["run_id"] and
+                     selected_host in expected.get("catalogue_hosts", set()) and
+                     type(expected.get("byte_count")) is int and
+                     expected["byte_count"] > 0 and
+                     reservation["max_file_bytes"] >= expected["byte_count"],
+                     f"Source5 v4 indexed {role} differs from its exact captured row/cap")
+            previous = needed.pop(pin["path"], None)
+            _require(previous == expected,
+                     f"Source5 v4 indexed {role} is absent from its selected host catalogue closure")
+            reservation_path = reservation["path"]
+            _require(reservation_path not in needed,
+                     f"Source5 v4 indexed {role} aliases another old reservation")
+            needed[reservation_path] = expected
+            seen_roles.add(role)
+        _require(seen_roles == phase_roles,
+                 f"Source5 v4 indexed row[{row_index}] omits an exact reservation role")
+    return needed
 
 
 def _typed_inventory(source: dict[str, Any], host_id: str) -> tuple[list[dict[str, Any]], set[str], int]:
@@ -634,14 +1024,34 @@ def build_host_evidence_budget_plan(
     counts = host_schedule[host_id]["job_counts"]
     phase_hashes = host_schedule[host_id]["phase_job_list_sha256"]
 
-    pins = _exact(pins_value, {
+    prepared_reuse = execution_manifest.get("schema") == \
+        "allocatbelt.application-source5-campaign-execution.v5"
+    pin_fields = {
         "spec", "plan", "execution_manifest", "source_manifests",
-    }, "original budget pins")
+    } | ({"prepared_exploration"} if prepared_reuse else set())
+    pins = _exact(pins_value, pin_fields, "original budget pins")
     spec_pin = _pin(pins["spec"], "original SpecV3 pin")
     plan_pin = _pin(pins["plan"], "original PlanV3 pin")
     execution_pin = _pin(pins["execution_manifest"],
                          "original execution-manifest pin")
     execution_schema = execution_manifest["schema"]
+    prepared_exploration = None
+    if prepared_reuse:
+        prepared_exploration = _exact(
+            pins["prepared_exploration"], set(host_ids),
+            "prepared exploration original host pins",
+        )
+        for selected_host in host_ids:
+            lineage = _exact(prepared_exploration[selected_host], {
+                "bridge_header", "record_index",
+            }, f"prepared exploration {selected_host} raw pins")
+            for role in ("bridge_header", "record_index"):
+                pin = _exact(lineage[role], {"path", "raw_sha256"},
+                             f"prepared exploration {selected_host} {role} pin")
+                _require(type(pin["path"]) is str and pin["path"].startswith("/"),
+                         f"prepared exploration {selected_host} {role} path is malformed")
+                _digest(pin["raw_sha256"],
+                        f"prepared exploration {selected_host} {role} raw digest")
     source_pins = _exact(pins["source_manifests"], set(host_ids),
                          "original SourceV5 host manifest pins")
     sources = _exact(source_manifest_values, set(host_ids),
@@ -775,6 +1185,9 @@ def build_host_evidence_budget_plan(
     lower_bound_store_entries = lower_bound_index_entries + 2
     paired_jobs = fixed_jobs + counts["pressure"]
     maximum_callbacks = 1 + 6 + 6 * paired_jobs + 4 * counts["soak"]
+    if prepared_reuse:
+        current_paired_jobs = counts["aa"] + counts["confirmation"] + counts["pressure"]
+        maximum_callbacks = 1 + 6 + 6 * current_paired_jobs + 4 * counts["soak"]
     maximum_journal_bytes = min(
         CORE_ROLE_BYTES_CAP, maximum_callbacks * MAX_EVENT_BYTES,
     )
@@ -813,6 +1226,8 @@ def build_host_evidence_budget_plan(
             "execution_manifest": execution_pin,
             "source_manifests": source_pins,
             "source_tree_sha256": source_tree_hashes[host_id],
+            **({"prepared_exploration": prepared_exploration}
+               if prepared_reuse else {}),
         },
         "schedule": {
             "job_counts": counts,
@@ -1038,7 +1453,7 @@ def _archive_pin_bound(path: str | None = None) -> dict[str, str]:
 
 
 def _archive_empty_tmp_proof_bounds(
-    phase: str, *, archive_v2: bool,
+    phase: str, *, archive_v2: bool, fixed_v3: bool = False,
 ) -> list[dict[str, Any]]:
     maximum_path = ARCHIVE_ESCAPED_MAX_PATH
     base = [{
@@ -1058,6 +1473,14 @@ def _archive_empty_tmp_proof_bounds(
         "bytes_used": 0, "file_count": 0, "directory_count": 0,
         "bytes_limit": MAX_U64, "inode_limit": MAX_U64,
     } for ordinal in range(2)]
+    if fixed_v3:
+        _require(phase in {"exploration", "aa", "confirmation"},
+                 "fixed checkpoint v3 proofs are limited to original fixed phases")
+        probe = [{**item, "domain": "probe_tmpdir"} for item in base]
+        return sorted([*base, *probe],
+                      key=lambda item: (item["role"],
+                                        item["member_ordinal"],
+                                        item.get("domain", "")))
     if not archive_v2:
         return base
     if phase in {"exploration", "aa", "confirmation"}:
@@ -1084,7 +1507,7 @@ def _archive_empty_tmp_proof_bounds(
 
 def _archive_fixed_request_value(
     phase: str, receipt_roles: Iterable[str], *, archive_v2: bool = False,
-    tree_inventory_count: int = 0,
+    tree_inventory_count: int = 0, fixed_v3: bool = False,
 ) -> dict[str, Any]:
     """Maximum accepted request envelope outside its exact object entries."""
     maximum_pin = _archive_pin_bound()
@@ -1107,11 +1530,10 @@ def _archive_fixed_request_value(
         for role in sorted(set(receipt_roles))
     }
     body = {
-        "schema": (
-            "allocatbelt.application-source5-evidence-checkpoint-request.v2"
-            if archive_v2 else
-            "allocatbelt.application-source5-evidence-checkpoint-request.v1"
-        ),
+        "schema": (FIXED_CHECKPOINT_REQUEST_SCHEMA_V3 if fixed_v3 else
+                   "allocatbelt.application-source5-evidence-checkpoint-request.v2"
+                   if archive_v2 else
+                   "allocatbelt.application-source5-evidence-checkpoint-request.v1"),
         "context": context,
         "job_record_pin": {"path": maximum_path, "raw_sha256": "f" * 64},
         "authorization": {
@@ -1123,11 +1545,11 @@ def _archive_fixed_request_value(
         "predecessor_ack_pin": maximum_pin,
         "owner_receipt_pins": receipt_pins,
         "empty_tmp_proofs": _archive_empty_tmp_proof_bounds(
-            phase, archive_v2=archive_v2,
+            phase, archive_v2=archive_v2, fixed_v3=fixed_v3,
         ),
         "entries": [], "request_sha256": "f" * 64,
     }
-    if archive_v2:
+    if archive_v2 and not fixed_v3:
         body["tree_inventories"] = []
     return body
 
@@ -1135,16 +1557,18 @@ def _archive_fixed_request_value(
 def _archive_fixed_request_bound(
     phase: str, receipt_roles: Iterable[str], *, archive_v2: bool = False,
     tree_inventory_bytes: int = 0, tree_inventory_count: int = 0,
+    fixed_v3: bool = False,
 ) -> int:
-    _require(archive_v2 or
+    _require(archive_v2 or fixed_v3 or
              (tree_inventory_bytes == 0 and tree_inventory_count == 0),
              "Source5 v1 request cannot carry typed tree inventory rows")
     body_bytes = len(_canonical(_archive_fixed_request_value(
         phase, receipt_roles, archive_v2=archive_v2,
         tree_inventory_count=tree_inventory_count,
+        fixed_v3=fixed_v3,
     )))
-    return (body_bytes + tree_inventory_bytes +
-            max(0, tree_inventory_count - 1))
+    return (body_bytes + (0 if fixed_v3 else tree_inventory_bytes) +
+            (0 if fixed_v3 else max(0, tree_inventory_count - 1)))
 
 
 def _archive_manifest_entry_bound(row: dict[str, Any]) -> bytes:
@@ -1255,18 +1679,17 @@ def _archive_ack_bundle_bounds(
     phase: str, run_id: str, receipt_roles: Iterable[str], entry_count: int,
     checkpoint_entry_bytes: int, manifest_entry_bytes: int, *,
     archive_v2: bool = False, tree_inventory_bytes: int = 0,
-    tree_inventory_count: int = 0,
+    tree_inventory_count: int = 0, fixed_v3: bool = False,
 ) -> dict[str, int]:
     """Bound each canonical response member and the four-file PAX envelope."""
     maximum_pin = _archive_pin_bound()
     maximum_path = "/" + ("x" * (MAX_PATH_BYTES - 1))
     request_pin = maximum_pin
     checkpoint = {
-        "schema": (
-            "allocatbelt.application-source5-evidence-job-checkpoint.v2"
-            if archive_v2 else
-            "allocatbelt.application-source5-evidence-job-checkpoint.v1"
-        ),
+        "schema": (FIXED_CHECKPOINT_SCHEMA_V3 if fixed_v3 else
+                   "allocatbelt.application-source5-evidence-job-checkpoint.v2"
+                   if archive_v2 else
+                   "allocatbelt.application-source5-evidence-job-checkpoint.v1"),
         "request_pin": request_pin,
         "context": {
             "schema": "allocatbelt.application-source5-evidence-archive-context.v1",
@@ -1290,12 +1713,12 @@ def _archive_ack_bundle_bounds(
             phase, receipt_roles,
         )["owner_receipt_pins"],
         "empty_tmp_proofs": _archive_empty_tmp_proof_bounds(
-            phase, archive_v2=archive_v2,
+            phase, archive_v2=archive_v2, fixed_v3=fixed_v3,
         ),
         "object_manifest_pin": maximum_pin,
         "entries": [], "checkpoint_sha256": "f" * 64,
     }
-    if archive_v2:
+    if archive_v2 and not fixed_v3:
         checkpoint["tree_inventories"] = []
     manifest = {
         "schema": "allocatbelt.application-source5-evidence-object-manifest.v1",
@@ -1332,8 +1755,9 @@ def _archive_ack_bundle_bounds(
         "ack_sha256": "f" * 64,
     }
     checkpoint_bytes = (len(_canonical(checkpoint)) + checkpoint_entry_bytes +
-                        max(0, entry_count - 1) + tree_inventory_bytes +
-                        max(0, tree_inventory_count - 1))
+                        max(0, entry_count - 1) +
+                        (0 if fixed_v3 else tree_inventory_bytes) +
+                        (0 if fixed_v3 else max(0, tree_inventory_count - 1)))
     manifest_bytes = (len(_canonical(manifest)) + manifest_entry_bytes +
                       max(0, entry_count - 1))
     ack_bytes = len(_canonical(ack))
@@ -1460,6 +1884,11 @@ def _archive_job_stats_add(
         "validation_record_bytes": 0,
         "receipt_roles": set(),
     })
+    if row["role"] in {"component_receipt", "fixed_pair_host_receipt"}:
+        if row["owner"] == "fixed_pair":
+            stats.setdefault("fixed_pair_receipt_roles", set()).add(row["role"])
+        elif row["role"] == "fixed_pair_host_receipt":
+            stats["invalid_fixed_pair_host_owner"] = True
     stats["file_count"] += 1
     stats["request_entry_bytes"] += len(_archive_request_entry_bound(row))
     stats["manifest_entry_bytes"] += len(_archive_manifest_entry_bound(row))
@@ -1498,13 +1927,31 @@ def _archive_job_stats_add(
 
 def _archive_caps_from_stats(
     groups: dict[tuple[str, str], dict[str, Any]],
+    *, prepared_source5_profile: bool = False,
 ) -> dict[tuple[str, str], dict[str, int]]:
     result: dict[tuple[str, str], dict[str, int]] = {}
+    fixed_groups: set[tuple[str, str]] = set()
+    if prepared_source5_profile:
+        fixed_roles = {"component_receipt", "fixed_pair_host_receipt"}
+        for group, stats in groups.items():
+            _require(not stats.get("invalid_fixed_pair_host_owner", False),
+                     "fixed-pair host receipt is not owned by the fixed-pair producer")
+            roles = stats.get("fixed_pair_receipt_roles", set())
+            _require(not roles or roles == fixed_roles,
+                     f"Source5 fixed group {group} lacks its exact paired owner receipts")
+            if roles:
+                _require(stats["phase"] in {"exploration", "aa", "confirmation"} and
+                         not stats.get("dynamic_tree_rows") and
+                         not stats.get("probe_inventory_caps") and
+                         not stats.get("archive_v2"),
+                         f"Source5 fixed group {group} is outside the tree-free fixed v3 profile")
+                fixed_groups.add(group)
     for group, stats in groups.items():
         _require(stats["validation_record_count"] <= 1,
                  f"Source5 {group} has duplicate always-local validation records")
-        archive_v2 = bool(stats.get("archive_v2") or
-                          stats["dynamic_tree_rows"])
+        fixed_v3 = group in fixed_groups
+        archive_v2 = (not fixed_v3 and bool(stats.get("archive_v2") or
+                                            stats["dynamic_tree_rows"]))
         request_entry_bytes = stats["request_entry_bytes"]
         manifest_entry_bytes = stats["manifest_entry_bytes"]
         stage_entry_bytes = stats["stage_entry_bytes"]
@@ -1554,6 +2001,7 @@ def _archive_caps_from_stats(
                  f"Source5 {group} archive closure exceeds its finite entry or payload budget")
         request_bytes = (_archive_fixed_request_bound(
             stats["phase"], stats["receipt_roles"], archive_v2=archive_v2,
+            fixed_v3=fixed_v3,
             tree_inventory_bytes=tree_inventory_bytes,
             tree_inventory_count=len(dynamic_tree_rows),
         ) + request_entry_bytes + max(0, file_count - 1))
@@ -1569,6 +2017,7 @@ def _archive_caps_from_stats(
             stats["phase"], group[1], stats["receipt_roles"],
             file_count, request_entry_bytes, manifest_entry_bytes,
             archive_v2=archive_v2,
+            fixed_v3=fixed_v3,
             tree_inventory_bytes=tree_inventory_bytes,
             tree_inventory_count=len(dynamic_tree_rows),
         )
@@ -1678,6 +2127,31 @@ def project_archive_job_caps(rows: Iterable[dict[str, Any]]) -> dict[tuple[str, 
     }
 
 
+def _project_prepared_source5_archive_caps(
+    rows: Iterable[dict[str, Any]], *, readback: bool,
+) -> dict[tuple[str, str], dict[str, int]]:
+    groups: dict[tuple[str, str], dict[str, Any]] = {}
+    for row in rows:
+        _archive_job_stats_add(groups, _catalogue_row(
+            row, "prepared Source5 archive projection row",
+        ))
+    _require(bool(groups),
+             "prepared Source5 archive projection has no original jobs")
+    projected = _archive_caps_from_stats(
+        groups, prepared_source5_profile=True,
+    )
+    if readback:
+        return _archive_readback_projection(projected)
+    public_fields = (
+        "checkpoint_request_bytes", "transfer_packet_bytes",
+        "checkpoint_bytes", "object_manifest_bytes", "archive_ack_bytes",
+        "signature_bytes", "ack_bundle_bytes", "stage_map_bytes",
+        "transfer_offer_bytes",
+    )
+    return {group: {field: caps[field] for field in public_fields}
+            for group, caps in projected.items()}
+
+
 def project_archive_readback_caps(
     rows: Iterable[dict[str, Any]],
 ) -> dict[tuple[str, str], dict[str, int]]:
@@ -1688,6 +2162,14 @@ def project_archive_readback_caps(
     _require(bool(groups),
              "Source5 archive readback has no exact per-job owner objects")
     projected = _archive_caps_from_stats(groups)
+    return _archive_readback_projection(projected)
+
+
+def _archive_readback_projection(
+    projected: dict[tuple[str, str], dict[str, int]],
+) -> dict[tuple[str, str], dict[str, int]]:
+    _require(bool(projected),
+             "Source5 archive readback has no exact per-job owner objects")
     result: dict[tuple[str, str], dict[str, int]] = {}
     maximum_request_bytes = 0
     maximum_response_bytes = 0
@@ -1750,7 +2232,75 @@ def project_archive_readback_caps(
     return result
 
 
-def _retention_projection(rows: Iterable[dict[str, Any]]) -> dict[str, Any]:
+def project_prepared_source5_archive_job_caps(
+    rows: Iterable[dict[str, Any]],
+) -> dict[tuple[str, str], dict[str, int]]:
+    """Project fixed checkpoint-v3 and dynamic Source5 job caps by exact rows."""
+    return _project_prepared_source5_archive_caps(rows, readback=False)
+
+
+def project_prepared_source5_archive_readback_caps(
+    rows: Iterable[dict[str, Any]],
+) -> dict[tuple[str, str], dict[str, int]]:
+    """Project readback caps for the prepared Source5 fixed/dynamic profile."""
+    return _project_prepared_source5_archive_caps(rows, readback=True)
+
+
+def _fixed_pair_groups(
+    rows: Iterable[dict[str, Any]],
+) -> set[tuple[str, str]]:
+    receipt_counts: dict[tuple[str, str], dict[str, int]] = {}
+    for row_value in rows:
+        row = _catalogue_row(row_value, "fixed Source5 archive profile row")
+        if row["role"] not in {"component_receipt", "fixed_pair_host_receipt"}:
+            continue
+        if row["owner"] != "fixed_pair":
+            _require(row["role"] != "fixed_pair_host_receipt",
+                     "fixed-pair host receipt has another owner")
+            continue
+        _require(row["phase"] in {"exploration", "aa", "confirmation"} and
+                 row["run_id"] is not None and row["kind"] == "file",
+                 "fixed-pair receipt is outside an exact fixed job row")
+        group = (row["phase"], row["run_id"])
+        roles = receipt_counts.setdefault(group, {})
+        roles[row["role"]] = roles.get(row["role"], 0) + 1
+        _require(roles[row["role"]] == 1,
+                 f"fixed-pair group {group} repeats owner receipt role {row['role']}")
+    expected = {"component_receipt", "fixed_pair_host_receipt"}
+    for group, roles in receipt_counts.items():
+        _require(set(roles) == expected,
+                 f"fixed-pair group {group} lacks its exact paired owner receipts")
+    return set(receipt_counts)
+
+
+def project_fixed_pair_archive_job_caps(
+    rows: Iterable[dict[str, Any]],
+) -> dict[tuple[str, str], dict[str, int]]:
+    materialized = [_catalogue_row(row, "fixed Source5 archive row")
+                    for row in rows]
+    groups = _fixed_pair_groups(materialized)
+    _require(bool(groups), "fixed Source5 archive projection has no fixed jobs")
+    projected = project_prepared_source5_archive_job_caps(materialized)
+    return {group: projected[group] for group in groups}
+
+
+def project_fixed_pair_archive_readback_caps(
+    rows: Iterable[dict[str, Any]],
+) -> dict[tuple[str, str], dict[str, int]]:
+    materialized = [_catalogue_row(row, "fixed Source5 archive row")
+                    for row in rows]
+    projected = project_prepared_source5_archive_readback_caps(materialized)
+    # The fixed profile has no dynamic-tree contribution and is confined to
+    # the three original fixed-pair phases. Selection is derived from exact
+    # fixed owner receipt rows below.
+    groups = _fixed_pair_groups(materialized)
+    _require(bool(groups), "fixed Source5 readback projection has no fixed jobs")
+    return {group: projected[group] for group in groups}
+
+
+def _retention_projection(
+    rows: Iterable[dict[str, Any]], *, prepared_source5_profile: bool = False,
+) -> dict[str, Any]:
     """Derive host-local peak and full-index bounds under one sealed job window.
 
     Every named regular-file role remains in the all-original-job index. A
@@ -2135,7 +2685,10 @@ def _retention_projection(rows: Iterable[dict[str, Any]]) -> dict[str, Any]:
          for phase, suffix in failure_suffix_bytes_by_phase.items()),
         default=max(failure_job_bytes_by_phase.values(), default=0),
     )
-    archive_caps = _archive_caps_from_stats(archive_job_stats)
+    archive_caps = _archive_caps_from_stats(
+        archive_job_stats,
+        prepared_source5_profile=prepared_source5_profile,
+    )
     _require(bool(archive_caps),
              "Source5 exact path catalogue has no original per-job archive closure")
     expected_archive_roles = {
@@ -2355,9 +2908,10 @@ def _captured_store_root_bound(metadata_chunk_count: int) -> int:
     return empty_root + metadata_chunk_count * (descriptor_bytes + 1)
 
 
-def write_path_catalogue_chunks(
+def _write_path_catalogue_chunks(
     records: Iterable[object], output_directory_value: object,
     *, scratch_directory_value: object | None = None,
+    prepared_source5_profile: bool = False,
 ) -> dict[str, Any]:
     """Externally sort an exact path catalogue with bounded resident memory."""
     output_directory = Path(output_directory_value)
@@ -2591,7 +3145,10 @@ def write_path_catalogue_chunks(
                              "generated Source5 path catalogue row is not canonical")
                     yield row
 
-    retention = _retention_projection(catalogue_rows_from_chunks())
+    retention = _retention_projection(
+        catalogue_rows_from_chunks(),
+        prepared_source5_profile=prepared_source5_profile,
+    )
     grouped_bytes = sum(min(total, maximum)
                         for maximum, total, _root in grouped_allowances.values())
     maximum_payload_bytes = (
@@ -2671,6 +3228,29 @@ def write_path_catalogue_chunks(
         "role_byte_bounds": dict(sorted(role_byte_bounds.items())),
     }
     return {**body, "semantic_sha256": _sha(_canonical(body))}
+
+
+def write_path_catalogue_chunks(
+    records: Iterable[object], output_directory_value: object,
+    *, scratch_directory_value: object | None = None,
+) -> dict[str, Any]:
+    """Write the unchanged legacy v1/v2 archive-profile catalogue."""
+    return _write_path_catalogue_chunks(
+        records, output_directory_value,
+        scratch_directory_value=scratch_directory_value,
+    )
+
+
+def write_fixed_pair_v3_path_catalogue_chunks(
+    records: Iterable[object], output_directory_value: object,
+    *, scratch_directory_value: object | None = None,
+) -> dict[str, Any]:
+    """Write the Source-owned fixed-v3 plus dynamic-Source5 catalogue profile."""
+    return _write_path_catalogue_chunks(
+        records, output_directory_value,
+        scratch_directory_value=scratch_directory_value,
+        prepared_source5_profile=True,
+    )
 
 
 def validate_path_catalogue_manifest(value: object) -> dict[str, Any]:
@@ -3033,6 +3613,7 @@ def _read_stable_catalogue_chunk(chunk: dict[str, Any], index: int) -> bytes:
 def _catalogue_derived_bounds(
     manifest: dict[str, Any], rows: Iterable[dict[str, Any]],
     retention_rows: Iterable[dict[str, Any]],
+    *, prepared_source5_profile: bool = False,
 ) -> dict[str, Any]:
     root_bytes: dict[str, int] = {}
     root_inodes: dict[str, int] = {}
@@ -3102,7 +3683,10 @@ def _catalogue_derived_bounds(
         grouped_bytes += min(amount, maximum)
         if root is not None:
             root_bytes[root] -= amount - min(amount, maximum)
-    retention = _retention_projection(retention_rows)
+    retention = _retention_projection(
+        retention_rows,
+        prepared_source5_profile=prepared_source5_profile,
+    )
     maximum_payload = (
         grouped_bytes + ungrouped_bytes +
         retention["maximum_failure_window_tmp_payload_bytes"] +
@@ -3208,6 +3792,20 @@ def verify_path_catalogue_chunks(value: object) -> dict[str, Any]:
     return manifest
 
 
+def verify_fixed_pair_v3_path_catalogue_chunks(value: object) -> dict[str, Any]:
+    """Verify a Source fixed-v3 catalogue from its original pinned paths."""
+    manifest = validate_fixed_pair_v3_path_catalogue_manifest(value)
+    derived = _catalogue_derived_bounds(
+        manifest, iter_path_catalogue_rows(manifest),
+        iter_path_catalogue_rows(manifest),
+        prepared_source5_profile=True,
+    )
+    for name, amount in derived.items():
+        _require(manifest[name] == amount,
+                 f"fixed-v3 Source5 catalogue {name} differs from its exact row projection")
+    return manifest
+
+
 def iter_path_catalogue_rows_with_reader(
     value: object, reader,
 ) -> Iterator[dict[str, Any]]:
@@ -3263,6 +3861,58 @@ def verify_path_catalogue_chunks_with_reader(value: object, reader) -> dict[str,
         _require(manifest[name] == amount,
                  f"captured Source5 catalogue {name} differs from its exact row-stream projection")
     return manifest
+
+
+def validate_fixed_pair_v3_path_catalogue_manifest(
+    value: object,
+) -> dict[str, Any]:
+    """Validate the unchanged manifest wire shape for Source fixed-v3 rows."""
+    return validate_path_catalogue_manifest(value)
+
+
+def iter_fixed_pair_v3_path_catalogue_rows_with_reader(
+    value: object, reader,
+) -> Iterator[dict[str, Any]]:
+    """Stream raw-pinned rows for the Source fixed-v3 catalogue profile."""
+    yield from iter_path_catalogue_rows_with_reader(value, reader)
+
+
+def verify_fixed_pair_v3_path_catalogue_chunks_with_reader(
+    value: object, reader,
+) -> dict[str, Any]:
+    """Verify exact catalogue rows with fixed-v3 and dynamic Source5 caps."""
+    manifest = validate_fixed_pair_v3_path_catalogue_manifest(value)
+    derived = _catalogue_derived_bounds(
+        manifest,
+        iter_fixed_pair_v3_path_catalogue_rows_with_reader(manifest, reader),
+        iter_fixed_pair_v3_path_catalogue_rows_with_reader(manifest, reader),
+        prepared_source5_profile=True,
+    )
+    for name, amount in derived.items():
+        _require(manifest[name] == amount,
+                 f"fixed-v3 Source5 catalogue {name} differs from its exact row projection")
+    return manifest
+
+
+def verify_prepared_source5_path_catalogue_chunks_with_reader(
+    value: object, reader,
+) -> dict[str, Any]:
+    """Verify V5 fixed-v3 rows and pressure/Soak dynamic-tree rows together."""
+    return verify_fixed_pair_v3_path_catalogue_chunks_with_reader(value, reader)
+
+
+def verify_prepared_source5_path_catalogue_chunks(
+    value: object,
+) -> dict[str, Any]:
+    """Verify a V5 fixed-v3 plus pressure/Soak dynamic profile from disk."""
+    return verify_fixed_pair_v3_path_catalogue_chunks(value)
+
+
+def iter_prepared_source5_path_catalogue_rows_with_reader(
+    value: object, reader,
+) -> Iterator[dict[str, Any]]:
+    """Stream rows after the caller authenticates the prepared Source5 profile."""
+    yield from iter_fixed_pair_v3_path_catalogue_rows_with_reader(value, reader)
 
 
 def build_storage_reservation_value(
@@ -3612,6 +4262,283 @@ def _validate_journal_width_contract_summary(
     return contract, expected_total_count, maximum_line_bytes
 
 
+def _verify_captured_prepared_width_contract_v2(
+    pin_value: object, raw_value: object,
+) -> tuple[dict[str, Any], bytes, dict[str, Any]]:
+    pin = _exact(pin_value, {"path", "raw_sha256", "semantic_sha256"},
+                 "Source5 v5 journal-width contract pin")
+    _pin(pin, "Source5 v5 journal-width contract pin")
+    _require(type(raw_value) is bytes and
+             0 < len(raw_value) <= MAX_JOURNAL_WIDTH_CONTRACT_BYTES and
+             _sha(raw_value) == pin["raw_sha256"],
+             "Source5 v5 journal-width contract captured bytes differ from their raw pin")
+    try:
+        value = json.loads(raw_value)
+    except (UnicodeError, json.JSONDecodeError, RecursionError) as error:
+        raise BudgetPlanError("Source5 v5 journal-width contract is malformed") from error
+    _require(type(value) is dict and raw_value == _canonical(value) and
+             value.get("schema") == SOURCE5_JOURNAL_WIDTH_CONTRACT_SCHEMA_V2 and
+             value.get("contract_sha256") == pin["semantic_sha256"] ==
+                 _sha(_canonical({key: item for key, item in value.items()
+                                  if key != "contract_sha256"})),
+             "Source5 v5 width-v2 canonical/raw/semantic identities differ")
+    return value, raw_value, pin
+
+
+def _validate_prepared_width_v2_summary(
+    contract_value: object, audit: dict[str, Any], owner_contract_value: object,
+) -> tuple[dict[str, Any], int, int]:
+    """Check v2 current-only widths and full logical schedule accounting."""
+    fields = {
+        "schema", "campaign_id", "host_id", "original_pins_sha256",
+        "plan_pin", "source_manifest_pin", "owner_pins", "job_rows",
+        "phase_totals", "fixed_event_widths", "total_event_count",
+        "total_event_bytes", "failed_owner_window", "contract_sha256",
+        "admission_profile", "ancestor",
+    }
+    contract = _exact(contract_value, fields, "Source5 prepared width-v2 contract")
+    body = {key: value for key, value in contract.items()
+            if key != "contract_sha256"}
+    original = audit["original_pins"]
+    host_id = audit["host_id"]
+    source_pins = original.get("source_manifests")
+    _require(contract["schema"] == SOURCE5_JOURNAL_WIDTH_CONTRACT_SCHEMA_V2 and
+             contract["admission_profile"] == SOURCE5_PREPARED_EXPLORATION_ADMISSION_PROFILE and
+             contract["campaign_id"] == audit["campaign_id"] and
+             contract["host_id"] == host_id and
+             _digest(contract["contract_sha256"], "Source5 v5 width digest") ==
+                 _sha(_canonical(body)) and
+             contract["plan_pin"] == original["plan"] and
+             type(source_pins) is dict and
+             contract["source_manifest_pin"] == source_pins[host_id],
+             "Source5 v5 width campaign/host/Plan/Source identity differs")
+    _digest(contract["original_pins_sha256"],
+            "Source5 v5 width original-pin digest")
+
+    catalogue_owner_pins = (owner_contract_value.get("owner_source_pins")
+                            if type(owner_contract_value) is dict else None)
+    audit_owner_pins = audit.get("producer_catalogue", {}).get("owner_schema_pins")
+    catalogue_roles = {
+        "fixed_pair", "pressure_pair", "source5_controller", "source5_soak",
+        "soak_reader", "offline_dispatcher", "chronology", "evidence_transport",
+    }
+    audit_roles = {
+        "fixed_pair", "pressure_pair", "source5_controller", "source5_soak",
+        "soak_reader", "feedback_composer", "feedback_reader",
+        "pressure_reader", "evidence_transport",
+    }
+    _require(type(catalogue_owner_pins) is dict and
+             set(catalogue_owner_pins) == catalogue_roles and
+             (audit_owner_pins is None or
+              (type(audit_owner_pins) is dict and set(audit_owner_pins) == audit_roles)),
+             "Source5 v5 width audit lacks its exact owner source profiles")
+    expected_owner_pins: dict[str, dict[str, Any]] = {}
+    for role, pin_value in catalogue_owner_pins.items():
+        row = _exact(pin_value, {"path", "raw_sha256", "byte_count"},
+                     f"Source5 v5 catalogue owner pin {role}")
+        _require(type(row["path"]) is str and bool(row["path"]) and
+                 _digest(row["raw_sha256"], f"Source5 v5 owner {role} digest") ==
+                     row["raw_sha256"],
+                 f"Source5 v5 catalogue owner pin {role} is malformed")
+        _uint(row["byte_count"], f"Source5 v5 owner {role} byte count", positive=True)
+        expected_owner_pins[role] = dict(row)
+    width_owner = _exact(contract["owner_pins"], catalogue_roles | audit_roles,
+                         "Source5 v5 width owner pin map")
+    if audit_owner_pins is not None:
+        for role, row_value in audit_owner_pins.items():
+            row = _exact(row_value, {"path", "mode", "sha256", "size"},
+                         f"Source5 v5 audit owner pin {role}")
+            normalized = {"path": row["path"], "raw_sha256": row["sha256"],
+                          "byte_count": row["size"]}
+            _require(row["mode"] in {"100644", "100755"} and
+                     _digest(normalized["raw_sha256"], f"Source5 v5 audit owner {role} digest") ==
+                         normalized["raw_sha256"],
+                     f"Source5 v5 audit owner pin {role} is malformed")
+            _uint(normalized["byte_count"], f"Source5 v5 audit owner {role} bytes", positive=True)
+            prior = expected_owner_pins.get(role)
+            _require(prior is None or prior == normalized,
+                     f"Source5 v5 width owner {role} differs between selected Source profiles")
+            expected_owner_pins[role] = normalized
+    else:
+        for role in audit_roles - catalogue_roles:
+            row = _exact(width_owner[role], {"path", "raw_sha256", "byte_count"},
+                         f"Source5 v5 budget-only width owner pin {role}")
+            _require(type(row["path"]) is str and bool(row["path"]),
+                     f"Source5 v5 budget-only width owner pin {role} path is malformed")
+            _digest(row["raw_sha256"], f"Source5 v5 budget-only owner {role} digest")
+            _uint(row["byte_count"], f"Source5 v5 budget-only owner {role} bytes", positive=True)
+            expected_owner_pins[role] = dict(row)
+    _require(set(expected_owner_pins) == set(width_owner) and
+             width_owner == expected_owner_pins,
+             "Source5 v5 width owner pins differ from the exact selected Source")
+
+    prepared = _exact(original.get("prepared_exploration"), set(source_pins),
+                      "Source5 v5 prepared-exploration host pins")
+    ancestor = _exact(contract["ancestor"], {
+        "bridge_header_pin", "record_index_pin", "header_byte_count",
+        "index_byte_count", "job_list_sha256", "journal", "phase_ledger",
+    }, "Source5 v5 width ancestor")
+    for pin_name, label in (("bridge_header_pin", "bridge header"),
+                            ("record_index_pin", "record index")):
+        pin = _exact(ancestor[pin_name], {"path", "raw_sha256"},
+                     f"Source5 v5 ancestor {label} pin")
+        _raw_origin_pin(pin, f"Source5 v5 ancestor {label} pin")
+    _uint(ancestor["header_byte_count"], "Source5 v5 header byte count", positive=True)
+    _uint(ancestor["index_byte_count"], "Source5 v5 index byte count", positive=True)
+    _digest(ancestor["job_list_sha256"], "Source5 v5 ancestor job-list digest")
+    lineage_pin = _exact(prepared[host_id], {"bridge_header", "record_index"},
+                         "Source5 v5 selected provenance pins")
+    _require(ancestor["bridge_header_pin"] == lineage_pin["bridge_header"] and
+             ancestor["record_index_pin"] == lineage_pin["record_index"],
+             "Source5 v5 width ancestor differs from the full provenance-v2 host map")
+    journal = _exact(ancestor["journal"], {
+        "pin", "byte_count", "record_count", "head",
+    }, "Source5 v5 ancestor journal")
+    _raw_origin_pin(journal["pin"], "Source5 v5 ancestor journal pin")
+    _require(_uint(journal["byte_count"], "Source5 v5 journal byte count", positive=True) > 0 and
+             journal["record_count"] == 2161 and type(journal["record_count"]) is int,
+             "Source5 v5 ancestor journal count differs from the exact initial horizon")
+    _digest(journal["head"], "Source5 v5 ancestor journal head")
+    ledger = _exact(ancestor["phase_ledger"], {
+        "pin", "byte_count", "row_count",
+    }, "Source5 v5 ancestor phase ledger")
+    _raw_origin_pin(ledger["pin"], "Source5 v5 ancestor phase-ledger pin")
+    _uint(ledger["byte_count"], "Source5 v5 phase-ledger byte count", positive=True)
+    _require(ledger["row_count"] == 360 and type(ledger["row_count"]) is int,
+             "Source5 v5 ancestor phase ledger row count differs")
+
+    counts = {"exploration": 0, "aa": 48, "confirmation": 8100,
+              "pressure": 8100, "soak": 1}
+    expected_events = {"exploration": 0, "aa": 288,
+                       "confirmation": 48600, "pressure": 48600, "soak": 4}
+    _require(type(contract["phase_totals"]) is list and
+             len(contract["phase_totals"]) == len(PHASES) and
+             type(contract["job_rows"]) is list and
+             len(contract["job_rows"]) == 16249,
+             "Source5 v5 width rows do not close over current jobs only")
+    phase_totals = []
+    winner = None
+    maximum_line = 0
+    successful_event_count = 0
+    successful_event_bytes = 0
+    position = 0
+    run_ids = set()
+    row_fields = {
+        "phase", "job_index", "ordinal", "run_id", "job_sha256",
+        "event_counts", "maximum_event_bytes_by_kind", "failed_event_counts",
+        "failed_event_bytes_by_kind", "success_job_bytes", "failed_window_bytes",
+        "failed_event_count", "failed_event_count_uplift", "byte_uplift",
+    }
+    event_names = ("source5_authorized", "source5_app_started",
+                   "source5_app_terminal", "source5_job_terminal")
+    for phase in PHASES:
+        if phase == "exploration":
+            phase_totals.append({"phase": phase, "job_count": 0,
+                                 "event_count": 0, "success_event_bytes": 0})
+            continue
+        phase_count = 0
+        phase_bytes = 0
+        member_count = 1 if phase == "soak" else 2
+        event_counts = {
+            "source5_authorized": 1,
+            "source5_app_started": member_count,
+            "source5_app_terminal": member_count,
+            "source5_job_terminal": 1,
+        }
+        _require(sum(event_counts.values()) * counts[phase] == expected_events[phase],
+                 "Source5 v5 current phase callback shape differs")
+        for index in range(counts[phase]):
+            row = _exact(contract["job_rows"][position], row_fields,
+                         f"Source5 v5 width {phase} row[{index}]")
+            position += 1
+            _require(row["phase"] == phase and row["job_index"] == index and
+                     type(row["ordinal"]) is int and row["ordinal"] > 0 and
+                     type(row["run_id"]) is str and bool(row["run_id"]) and
+                     row["run_id"] not in run_ids and
+                     _digest(row["job_sha256"], f"Source5 v5 {phase} job digest") ==
+                         row["job_sha256"] and row["event_counts"] == event_counts and
+                     row["failed_event_counts"] == event_counts,
+                     f"Source5 v5 width {phase} row order/identity/callbacks differ")
+            run_ids.add(row["run_id"])
+            success = _exact(row["maximum_event_bytes_by_kind"], set(event_names),
+                             "Source5 v5 success event widths")
+            failed = _exact(row["failed_event_bytes_by_kind"], set(event_names),
+                            "Source5 v5 failed event widths")
+            for name in event_names:
+                _uint(success[name], f"Source5 v5 {phase}.{name} success", positive=True)
+                _uint(failed[name], f"Source5 v5 {phase}.{name} failed", positive=True)
+                _require(success[name] <= MAX_EVENT_BYTES and failed[name] <= MAX_EVENT_BYTES,
+                         "Source5 v5 event width exceeds its finite ceiling")
+                maximum_line = max(maximum_line, success[name], failed[name])
+            success_bytes = sum(event_counts[name] * success[name] for name in event_names)
+            failed_bytes = sum(event_counts[name] * failed[name] for name in event_names)
+            event_count = sum(event_counts.values())
+            _require(row["success_job_bytes"] == success_bytes and
+                     row["failed_window_bytes"] == failed_bytes and
+                     row["failed_event_count"] == event_count and
+                     row["failed_event_count_uplift"] == 0 and
+                     row["byte_uplift"] == max(0, failed_bytes - success_bytes),
+                     f"Source5 v5 width {phase} byte/event arithmetic differs")
+            phase_count += event_count
+            phase_bytes += success_bytes
+            candidate = {key: row[key] for key in (
+                "phase", "job_index", "ordinal", "run_id", "job_sha256",
+                "failed_event_count", "failed_event_count_uplift",
+                "failed_window_bytes", "success_job_bytes", "byte_uplift",
+            )}
+            if winner is None or (candidate["byte_uplift"],
+                                  candidate["failed_event_count_uplift"]) > (
+                                      winner["byte_uplift"],
+                                      winner["failed_event_count_uplift"]):
+                winner = candidate
+        phase_totals.append({"phase": phase, "job_count": counts[phase],
+                             "event_count": phase_count,
+                             "success_event_bytes": phase_bytes})
+        successful_event_count += phase_count
+        successful_event_bytes += phase_bytes
+    _require(position == len(contract["job_rows"]) and
+             contract["phase_totals"] == phase_totals and
+             successful_event_count == 97492,
+             "Source5 v5 width current phase totals differ")
+    fixed_expected = [
+        ("source5_prepared_capacity_registered", "registration"),
+        *(('source5_analysis', phase) for phase in (
+            "exploration", "aa", "fixed_analysis", "pressure_analysis",
+            "soak", "final_analysis",
+        )),
+    ]
+    _require(type(contract["fixed_event_widths"]) is list and
+             len(contract["fixed_event_widths"]) == len(fixed_expected),
+             "Source5 v5 fixed event widths omit registration/analysis events")
+    fixed_count = 0
+    fixed_bytes = 0
+    for index, (row_value, identity) in enumerate(zip(
+            contract["fixed_event_widths"], fixed_expected, strict=True)):
+        row = _exact(row_value, {
+            "event", "phase", "count", "maximum_line_bytes",
+        }, f"Source5 v5 fixed event[{index}]")
+        width = _uint(row["maximum_line_bytes"],
+                      f"Source5 v5 fixed event[{index}] width", positive=True)
+        _require((row["event"], row["phase"]) == identity and
+                 row["count"] == 1 and width <= MAX_EVENT_BYTES,
+                 f"Source5 v5 fixed event[{index}] identity/width differs")
+        fixed_count += 1
+        fixed_bytes += width
+        maximum_line = max(maximum_line, width)
+    _require(winner is not None and contract["failed_owner_window"] == winner and
+             contract["total_event_count"] == fixed_count + successful_event_count == 97499 and
+             contract["total_event_bytes"] ==
+                 fixed_bytes + successful_event_bytes + max(0, winner["byte_uplift"]),
+             "Source5 v5 current event/failure-window totals differ")
+    _require(audit["schedule"].get("total_job_count") == 16609 and
+             audit["schedule"].get("job_counts") == {
+                 "exploration": 360, "aa": 48, "confirmation": 8100,
+                 "pressure": 8100, "soak": 1,
+             },
+             "Source5 v5 width is not bound to the full 16,609-job logical Plan")
+    return contract, contract["total_event_count"], maximum_line
+
+
 def _build_host_evidence_budget_projection(
     audit_value: object, contract_value: object,
     catalogue_value: object, reservation_value: object,
@@ -3635,7 +4562,10 @@ def _build_host_evidence_budget_projection(
     _require(audit.get("budget_plan_sha256") == _sha(_canonical(audit_body)),
              "Source5 v2 schedule audit digest differs")
     catalogue = validate_path_catalogue_manifest(catalogue_value)
-    catalogue = verify_path_catalogue_chunks(catalogue)
+    if budget_schema == HOST_BUDGET_SCHEMA_V4:
+        catalogue = verify_fixed_pair_v3_path_catalogue_chunks(catalogue)
+    else:
+        catalogue = verify_path_catalogue_chunks(catalogue)
     retention = catalogue["retention_policy"]
     total_original_jobs = audit["schedule"]["total_job_count"]
     expected_metadata_roles = ARCHIVE_LOCAL_METADATA_ROLES
@@ -3743,22 +4673,31 @@ def _build_host_evidence_budget_projection(
         journal_width_contract_raw is not None,
     )
     _require(len(set(width_inputs)) == 1 and
-             (execution_schema ==
-              "allocatbelt.application-source5-campaign-execution.v4" or
+             (execution_schema in {
+                  "allocatbelt.application-source5-campaign-execution.v4",
+                  "allocatbelt.application-source5-campaign-execution.v5",
+              } or
               not any(width_inputs)),
-             "Source5 journal-width contract inputs are partial or outside execution v4")
+             "Source5 journal-width contract inputs are partial or outside bounded execution")
     width_contract_bound = all(width_inputs)
-    _require(budget_schema in {HOST_BUDGET_SCHEMA_V2, HOST_BUDGET_SCHEMA_V3},
+    _require(budget_schema in {HOST_BUDGET_SCHEMA_V2, HOST_BUDGET_SCHEMA_V3,
+                               HOST_BUDGET_SCHEMA_V4},
              "Source5 budget projection schema is unsupported")
     if budget_schema == HOST_BUDGET_SCHEMA_V2:
         _require(admission_profile is None,
                  "legacy Source5 v2 budget cannot carry an admission profile")
-    else:
+    elif budget_schema == HOST_BUDGET_SCHEMA_V3:
         _require(admission_profile == SOURCE5_V3_ADMISSION_PROFILE and
                  execution_schema ==
                     "allocatbelt.application-source5-campaign-execution.v4" and
                  width_contract_bound,
                  "Source5 ready v3 requires its exact v4 admission profile and width contract")
+    else:
+        _require(admission_profile == SOURCE5_PREPARED_EXPLORATION_ADMISSION_PROFILE and
+                 execution_schema ==
+                    "allocatbelt.application-source5-campaign-execution.v5" and
+                 width_contract_bound,
+                 "Source5 ready v4 requires its exact V5 profile and width contract")
     if width_contract_bound:
         _require(cleanup_policy_bound,
                  "Source5 v4 catalogue omits exact failed-cleanup retention rows")
@@ -3768,10 +4707,16 @@ def _build_host_evidence_budget_projection(
     journal_width_contract_pin = None
     journal_width_contract = None
     if width_contract_bound:
-        journal_width_contract, width_event_count, maximum_line_bytes = \
-            _validate_journal_width_contract_summary(
-                journal_width_contract_value, audit, contract,
-            )
+        if budget_schema == HOST_BUDGET_SCHEMA_V4:
+            journal_width_contract, width_event_count, maximum_line_bytes = \
+                _validate_prepared_width_v2_summary(
+                    journal_width_contract_value, audit, contract,
+                )
+        else:
+            journal_width_contract, width_event_count, maximum_line_bytes = \
+                _validate_journal_width_contract_summary(
+                    journal_width_contract_value, audit, contract,
+                )
         journal_width_contract_pin = _exact(
             journal_width_contract_pin_value,
             {"path", "raw_sha256", "semantic_sha256"},
@@ -3779,15 +4724,21 @@ def _build_host_evidence_budget_projection(
         )
         _pin(journal_width_contract_pin,
              "Source5 journal-width contract raw/semantic pin")
-        pinned_contract, _width_raw, _width_pin = \
-            _verify_captured_journal_width_contract(
-                journal_width_contract_pin, journal_width_contract_raw,
-            )
+        if budget_schema == HOST_BUDGET_SCHEMA_V4:
+            pinned_contract, _width_raw, _width_pin = \
+                _verify_captured_prepared_width_contract_v2(
+                    journal_width_contract_pin, journal_width_contract_raw,
+                )
+        else:
+            pinned_contract, _width_raw, _width_pin = \
+                _verify_captured_journal_width_contract(
+                    journal_width_contract_pin, journal_width_contract_raw,
+                )
         _require(pinned_contract == journal_width_contract and
                  journal_width_contract_pin["semantic_sha256"] ==
                     journal_width_contract["contract_sha256"] and
                  width_event_count == schedule["maximum_callback_events"],
-                 "Source5 v4 journal-width contract body/pin differs from the original Plan audit")
+                 "Source5 bounded journal-width contract body/pin differs from the source audit")
         schedule["maximum_callback_events"] = width_event_count
         schedule["maximum_callback_event_bytes"] = maximum_line_bytes
         schedule["worst_case_journal_bytes"] = \
@@ -3949,7 +4900,7 @@ def _build_host_evidence_budget_projection(
     if journal_width_contract_pin is not None:
         body_projection["execution_manifest_schema"] = execution_schema
         body_projection["journal_width_contract_pin"] = journal_width_contract_pin
-    if budget_schema == HOST_BUDGET_SCHEMA_V3:
+    if budget_schema in {HOST_BUDGET_SCHEMA_V3, HOST_BUDGET_SCHEMA_V4}:
         expected_counts = {
             "exploration": 360, "aa": 48, "confirmation": 8100,
             "pressure": 8100, "soak": 1,
@@ -3959,18 +4910,23 @@ def _build_host_evidence_budget_projection(
             "confirmation": (8100, 48600), "pressure": (8100, 48600),
             "soak": (1, 4),
         }
+        expected_callback_count = 99659 if budget_schema == HOST_BUDGET_SCHEMA_V3 else 97499
+        expected_width_rows = 16609 if budget_schema == HOST_BUDGET_SCHEMA_V3 else 16249
         _require(schedule["job_counts"] == expected_counts and
                  schedule["total_job_count"] == 16609 and
-                 schedule["maximum_callback_events"] == 99659 and
+                 schedule["maximum_callback_events"] == expected_callback_count and
                  journal_width_contract is not None and
-                 journal_width_contract["total_event_count"] == 99659 and
-                 len(journal_width_contract["job_rows"]) == 16609 and
+                 journal_width_contract["total_event_count"] == expected_callback_count and
+                 len(journal_width_contract["job_rows"]) == expected_width_rows and
                  type(journal_width_contract["phase_totals"]) is list and
                  [(row.get("phase"), row.get("job_count"), row.get("event_count"))
                   for row in journal_width_contract["phase_totals"]] ==
-                    [(phase, *expected_phase_events[phase])
-                     for phase in PHASES],
-                 "Source5 ready v3 requires the exact original 16,609-job/99,659-callback horizon")
+                    ([(phase, *expected_phase_events[phase])
+                      for phase in PHASES] if budget_schema == HOST_BUDGET_SCHEMA_V3 else
+                     [("exploration", 0, 0), ("aa", 48, 288),
+                      ("confirmation", 8100, 48600),
+                      ("pressure", 8100, 48600), ("soak", 1, 4)]),
+                 "Source5 ready budget requires the exact logical/current callback domains")
         all_counts = schedule.get("all_host_job_counts")
         audit_pins = audit.get("original_pins")
         original_source_pins = (
@@ -4057,6 +5013,44 @@ def build_host_evidence_budget_v3(
     )
 
 
+def build_host_evidence_budget_v4(
+    audit_value: object, contract_value: object,
+    catalogue_value: object, reservation_value: object,
+    reservation_pin_value: object, *,
+    journal_width_contract_value: object,
+    journal_width_contract_pin_value: object,
+    journal_width_contract_raw: bytes,
+    final_spec_raw: bytes,
+    lineage_artifact_reader,
+    catalogue_row_reader=None,
+) -> dict[str, Any]:
+    """Build the V5 current-journal budget over the full logical Plan."""
+    _require(type(audit_value) is dict and
+             audit_value.get("execution_manifest_schema") ==
+                "allocatbelt.application-source5-campaign-execution.v5" and
+             type(journal_width_contract_value) is dict and
+             type(journal_width_contract_pin_value) is dict and
+             type(journal_width_contract_raw) is bytes and
+             type(final_spec_raw) is bytes and callable(lineage_artifact_reader),
+             "Source5 v4 budget requires exact V5 inputs, width-v2 bytes, and a closed lineage reader")
+    result = _build_host_evidence_budget_projection(
+        audit_value, contract_value, catalogue_value, reservation_value,
+        reservation_pin_value,
+        journal_width_contract_value=journal_width_contract_value,
+        journal_width_contract_pin_value=journal_width_contract_pin_value,
+        journal_width_contract_raw=journal_width_contract_raw,
+        budget_schema=HOST_BUDGET_SCHEMA_V4,
+        admission_profile=SOURCE5_PREPARED_EXPLORATION_ADMISSION_PROFILE,
+    )
+    return validate_host_evidence_budget_v4(
+        result,
+        journal_width_contract_raw=journal_width_contract_raw,
+        final_spec_raw=final_spec_raw,
+        lineage_artifact_reader=lineage_artifact_reader,
+        catalogue_row_reader=catalogue_row_reader,
+    )
+
+
 def _validate_source5_v3_ready_state(value: object) -> None:
     """Require literal JSON booleans in the ready-but-unqualified v3 flags."""
     readiness = _exact(value, {
@@ -4073,10 +5067,616 @@ def _validate_source5_v3_ready_state(value: object) -> None:
              "Source5 v3 readiness flags are not the exact literal ready/unqualified booleans")
 
 
+def _read_lineage_pin_v4(
+    artifact_reader, pin_value: object, maximum: int, label: str,
+) -> bytes:
+    pin = _raw_origin_pin(pin_value, f"{label} raw pin")
+    try:
+        raw = artifact_reader(dict(pin), maximum)
+    except Exception as error:
+        raise BudgetPlanError(
+            f"{label} is unavailable from the closed lineage capture store",
+        ) from error
+    _require(type(raw) is bytes and 0 < len(raw) <= maximum and
+             _sha(raw) == pin["raw_sha256"],
+             f"{label} captured bytes differ from their exact raw pin/cap")
+    return raw
+
+
+def _validate_prepared_journal_chain_v4(
+    raw: bytes, campaign_id: str, host_id: str, expected_head: str,
+) -> None:
+    """Check the raw predecessor chain and terminal head for 2,161 rows."""
+    lines = raw.splitlines(keepends=True)
+    _require(len(lines) == 2161 and all(
+        line.endswith(b"\n") and b"\r" not in line for line in lines
+    ), "Source5 v4 ancestor journal framing/count differs")
+    previous = "0" * 64
+    for sequence, line in enumerate(lines, start=1):
+        try:
+            envelope = json.loads(line)
+        except (UnicodeError, json.JSONDecodeError, RecursionError) as error:
+            raise BudgetPlanError(
+                f"Source5 v4 ancestor journal row[{sequence - 1}] is malformed",
+            ) from error
+        _require(type(envelope) is dict and line == _canonical(envelope),
+                 f"Source5 v4 ancestor journal row[{sequence - 1}] is noncanonical")
+        envelope = _exact(envelope, {
+            "previous_sha256", "record", "record_sha256",
+        }, f"Source5 v4 ancestor journal row[{sequence - 1}]")
+        record = envelope["record"]
+        _require(type(record) is dict and
+                 record.get("sequence") == sequence and
+                 record.get("campaign_id") == campaign_id and
+                 record.get("host_id") == host_id and
+                 envelope["previous_sha256"] == previous,
+                 f"Source5 v4 ancestor journal row[{sequence - 1}] identity/chain differs")
+        digest = _sha(_canonical({"previous_sha256": previous, "record": record}))
+        _require(envelope["record_sha256"] == digest,
+                 f"Source5 v4 ancestor journal row[{sequence - 1}] digest differs")
+        previous = digest
+    _require(previous == expected_head,
+             "Source5 v4 ancestor journal terminal head differs from its header/width pins")
+
+
+def _validate_prepared_lineage_budget_v4(
+    budget: dict[str, Any], width: dict[str, Any], final_spec_raw: bytes,
+    lineage_artifact_reader, catalogue: dict[str, Any], *, catalogue_row_reader=None,
+) -> None:
+    """Bind captured ancestor bytes and current catalogue to the exact profile."""
+    try:
+        spec = json.loads(final_spec_raw)
+    except (UnicodeError, json.JSONDecodeError, RecursionError) as error:
+        raise BudgetPlanError("Source5 v4 final Spec bytes are malformed") from error
+    _require(type(spec) is dict and final_spec_raw == _canonical(spec) and
+             spec.get("schema") == SPEC_SCHEMA and
+             spec.get("campaign_id") == budget["campaign_id"],
+             "Source5 v4 final Spec bytes are not the selected canonical SpecV3")
+    spec_pin = _pin(budget["original_pins"].get("spec"),
+                    "Source5 v4 actual final Spec pin")
+    _require(_sha(final_spec_raw) == spec_pin["raw_sha256"] and
+             _sha(_canonical(spec)) == spec_pin["semantic_sha256"],
+             "Source5 v4 final Spec raw/semantic bytes differ from budget original pins")
+    host_ids = _validated_spec_host_ids(spec)
+    _require(len(host_ids) == 2 and budget["host_id"] in host_ids and
+             set(budget["original_pins"]["source_manifests"]) == set(host_ids),
+             "Source5 v4 requires the complete explicit two-KVM host profile")
+    prepared = _exact(budget["original_pins"].get("prepared_exploration"),
+                      set(host_ids), "Source5 v4 prepared-exploration host pins")
+    ancestor = _exact(width["ancestor"], {
+        "bridge_header_pin", "record_index_pin", "header_byte_count",
+        "index_byte_count", "job_list_sha256", "journal", "phase_ledger",
+    }, "Source5 v4 selected ancestor width DTO")
+    selected = budget["host_id"]
+    _require(ancestor["bridge_header_pin"] == prepared[selected]["bridge_header"] and
+             ancestor["record_index_pin"] == prepared[selected]["record_index"],
+             "Source5 v4 width ancestor differs from its exact provenance-v2 host pins")
+    current_rows = (iter_path_catalogue_rows(catalogue)
+                    if catalogue_row_reader is None else
+                    iter_path_catalogue_rows_with_reader(
+                        catalogue, catalogue_row_reader,
+                    ))
+    retained_roles = {
+        "preparation", "evidence_index", "journal", "source5_phase_ledger",
+        "source_manifest", "spec_v3", "plan_v3", "execution_manifest",
+        "observed_host", "host_evidence_budget", "journal_width_contract",
+        "fixed_spec_host",
+        "preparatory_journal_width_contract", "capacity_artifact",
+        "capacity_completion", "capacity_host_receipt", "capacity_ledger",
+        "source5_archive_signer_context", "source5_archive_signer_keyring",
+        "source5_archive_signer_gpgv", "source5_job_row_catalogue",
+        "source5_job_record", *ARCHIVE_LOCAL_METADATA_ROLES,
+    }
+    captured_rows: dict[str, dict[str, Any]] = {}
+    for row in current_rows:
+        if row["role"] not in retained_roles:
+            continue
+        _require(row["path"] not in captured_rows,
+                 f"Source5 v4 retained catalogue repeats {row['path']}")
+        captured_rows[row["path"]] = row
+
+    def captured_cap(pin: dict[str, str], label: str) -> int:
+        row = captured_rows.get(pin["path"])
+        _require(type(row) is dict and row["kind"] == "file" and
+                 (row["origin_pin"] is None or
+                  row["origin_pin"].get("raw_sha256") == pin["raw_sha256"]),
+                 f"{label} has no matching authenticated current catalogue row")
+        return row["max_bytes"]
+
+    expected_catalogue_rows: dict[str, dict[str, Any]] = {}
+    catalogue_owner_host: str | None = None
+
+    def expect_catalogue_row(
+        pin: dict[str, str], byte_count: int, role: str | None,
+        host: str, phase: str | None = None, run_id: str | None = None,
+    ) -> None:
+        _require(catalogue_owner_host in host_ids,
+                 "Source5 v4 retained origin has no old-catalogue owner")
+        prior = expected_catalogue_rows.get(pin["path"])
+        expected = {"raw_sha256": pin["raw_sha256"], "byte_count": byte_count,
+                    "role": role, "host_id": host, "phase": phase,
+                    "run_id": run_id}
+        if prior is None:
+            expected["catalogue_hosts"] = {catalogue_owner_host}
+            expected_catalogue_rows[pin["path"]] = expected
+        else:
+            _require(all(prior.get(field) == expected[field] for field in expected),
+                     f"Source5 v4 captured origin {pin['path']} has conflicting Source descriptors")
+            prior["catalogue_hosts"].add(catalogue_owner_host)
+
+    index_jobs_by_host = {}
+    index_rows_by_host = {}
+    headers_by_host = {}
+    old_budgets_by_host = {}
+    execution_manifests_by_host = {}
+    for host in host_ids:
+        catalogue_owner_host = host
+        host_pins = _exact(prepared[host], {"bridge_header", "record_index"},
+                           f"Source5 v4 {host} provenance-v2 pins")
+        header_raw = _read_lineage_pin_v4(
+            lineage_artifact_reader, host_pins["bridge_header"],
+            captured_cap(host_pins["bridge_header"], f"{host} bridge header"),
+            f"Source5 v4 {host} bridge header",
+        )
+        if host == selected:
+            _require(len(header_raw) == ancestor["header_byte_count"],
+                     "Source5 v4 width header byte count differs from captured header")
+        expect_catalogue_row(host_pins["bridge_header"], len(header_raw),
+                             "preparation", host)
+        try:
+            header = json.loads(header_raw)
+        except (UnicodeError, json.JSONDecodeError, RecursionError) as error:
+            raise BudgetPlanError(f"Source5 v4 {host} bridge header is malformed") from error
+        _require(type(header) is dict and header_raw == _canonical(header) and
+                 header.get("schema") ==
+                    "allocatbelt.application-source5-prepared-exploration-bridge-header.v1" and
+                 header.get("campaign_id") == budget["campaign_id"] and
+                 header.get("host_id") == host and header.get("scope") == "initial_only" and
+                 header.get("qualification_eligible") is False,
+                 f"Source5 v4 {host} bridge header identity/scope differs")
+        initial = header.get("initial")
+        _require(type(initial) is dict,
+                 f"Source5 v4 {host} bridge header has no original context")
+        headers_by_host[host] = header
+        old_budget_full_pin = _pin(
+            initial["host_budget_pin"],
+            f"Source5 v4 {host} old host-budget full pin",
+        )
+        old_budget_raw_pin = {
+            "path": old_budget_full_pin["path"],
+            "raw_sha256": old_budget_full_pin["raw_sha256"],
+        }
+        old_budget_raw = _read_lineage_pin_v4(
+            lineage_artifact_reader, old_budget_raw_pin,
+            captured_cap(old_budget_raw_pin, f"{host} old host budget"),
+            f"Source5 v4 {host} old host budget",
+        )
+        try:
+            old_budget = json.loads(old_budget_raw)
+        except (UnicodeError, json.JSONDecodeError, RecursionError) as error:
+            raise BudgetPlanError(
+                f"Source5 v4 {host} old host budget is malformed",
+            ) from error
+        _require(old_budget_raw == _canonical(old_budget) and
+                 old_budget.get("budget_sha256") ==
+                    old_budget_full_pin["semantic_sha256"] ==
+                    _sha(_canonical({key: value for key, value in old_budget.items()
+                                     if key != "budget_sha256"})) and
+                 old_budget.get("schema") == PREPARATORY_BUDGET_SCHEMA and
+                 old_budget.get("campaign_id") == budget["campaign_id"] and
+                 old_budget.get("host_id") == host,
+                 f"Source5 v4 {host} old budget canonical/semantic pin differs")
+        old_budgets_by_host[host] = old_budget
+        global_pins = (
+            (header["journal"]["pin"], "journal", host),
+            (header["phase_ledger"]["pin"], "source5_phase_ledger", host),
+            (initial["execution_manifest_pin"], "execution_manifest", None),
+            (initial["spec_pin"], "spec_v3", None),
+            (initial["plan_pin"], "plan_v3", None),
+            (initial["observed_host_pin"], "observed_host", host),
+            (initial["host_budget_pin"], "host_evidence_budget", host),
+            (initial["journal_width_pin"], "journal_width_contract", host),
+            (initial["fixed_spec_host_pin"], "fixed_spec_host", host),
+            (initial["signer_context_pin"], "source5_archive_signer_context", host),
+            (header["pilot"]["pin"], "capacity_artifact", host),
+        )
+        for pin_value, role, pin_host in global_pins:
+            pin = {"path": pin_value["path"],
+                   "raw_sha256": pin_value["raw_sha256"]}
+            raw = (old_budget_raw if role == "host_evidence_budget" else
+                   _read_lineage_pin_v4(
+                       lineage_artifact_reader, pin,
+                       captured_cap(pin, f"{host} {role}"),
+                       f"Source5 v4 {host} {role}",
+                   ))
+            if role == "execution_manifest":
+                execution_full_pin = _pin(
+                    pin_value,
+                    f"Source5 v4 {host} execution-manifest full pin",
+                )
+                try:
+                    execution_manifest = json.loads(raw)
+                except (UnicodeError, json.JSONDecodeError, RecursionError) as error:
+                    raise BudgetPlanError(
+                        f"Source5 v4 {host} execution manifest is malformed",
+                    ) from error
+                _require(type(execution_manifest) is dict and
+                         raw == _canonical(execution_manifest) and
+                         execution_manifest.get("schema") == PREPARATORY_EXECUTION_SCHEMA and
+                         execution_manifest.get("campaign_id") == budget["campaign_id"] and
+                         execution_manifest.get("host_id") == host and
+                         execution_manifest.get("manifest_sha256") ==
+                            execution_full_pin["semantic_sha256"] ==
+                            _sha(_canonical({key: value for key, value in
+                                             execution_manifest.items()
+                                             if key != "manifest_sha256"})),
+                         f"Source5 v4 {host} execution manifest pin/schema differs")
+                execution_manifests_by_host[host] = execution_manifest
+            if role == "journal":
+                _require(len(raw) == header["journal"]["byte_count"] and
+                         len(raw.splitlines()) == 2161 and
+                         header["journal"]["record_count"] == 2161,
+                         f"Source5 v4 {host} captured initial journal count/bytes differ")
+            elif role == "source5_phase_ledger":
+                _require(len(raw.splitlines()) == 360 and
+                         header["phase_ledger"]["row_count"] == 360,
+                         f"Source5 v4 {host} captured initial phase ledger row count differs")
+            expect_catalogue_row(pin, len(raw), role, pin_host)
+        source_rows = initial.get("source_manifest_pins")
+        _require(type(source_rows) is list and len(source_rows) == len(host_ids) and
+                 {row.get("host_id") for row in source_rows if type(row) is dict} ==
+                    set(host_ids),
+                 f"Source5 v4 {host} header Source cohort differs")
+        for row in source_rows:
+            source_pin = budget["original_pins"]["source_manifests"].get(row["host_id"])
+            _require(type(source_pin) is dict and all(
+                row.get(field) == source_pin.get(field)
+                for field in ("path", "raw_sha256", "semantic_sha256")
+            ), f"Source5 v4 {host} header changed {row.get('host_id')} Source pins")
+            raw_pin_value = {"path": row["path"],
+                             "raw_sha256": row["raw_sha256"]}
+            source_raw = _read_lineage_pin_v4(
+                lineage_artifact_reader, raw_pin_value,
+                captured_cap(raw_pin_value, f"{row['host_id']} source manifest"),
+                f"Source5 v4 {row['host_id']} source manifest",
+            )
+            expect_catalogue_row(raw_pin_value, len(source_raw),
+                                 "source_manifest", row["host_id"])
+        header_index = header.get("record_index")
+        _require(type(header_index) is dict and
+                 header_index.get("pin") == host_pins["record_index"] and
+                 header_index.get("row_count") == 360,
+                 f"Source5 v4 {host} header/index pin or row count differs")
+        index_raw = _read_lineage_pin_v4(
+            lineage_artifact_reader, host_pins["record_index"],
+            captured_cap(host_pins["record_index"], f"{host} record index"),
+            f"Source5 v4 {host} record index",
+        )
+        expect_catalogue_row(host_pins["record_index"], len(index_raw),
+                             "evidence_index", host)
+        lines = index_raw.splitlines(keepends=True)
+        _require(len(lines) == 360 and all(
+            line.endswith(b"\n") and b"\r" not in line for line in lines
+        ), f"Source5 v4 {host} index does not contain 360 canonical rows")
+        jobs = []
+        indexed_rows = []
+        run_ids = set()
+        for index, line in enumerate(lines):
+            try:
+                row = json.loads(line)
+            except (UnicodeError, json.JSONDecodeError, RecursionError) as error:
+                raise BudgetPlanError(
+                    f"Source5 v4 {host} index row[{index}] is malformed",
+                ) from error
+            _require(type(row) is dict and line == _canonical(row) and
+                     row.get("schema") ==
+                         "allocatbelt.application-source5-prepared-exploration-index-row.v1" and
+                     row.get("row_index") == index and type(row.get("job")) is dict and
+                     row["job"].get("host_id") == host and
+                     row["job"].get("phase") == "exploration" and
+                     row.get("job_sha256") == _sha(_canonical(row["job"])) and
+                     row["job"].get("run_id") not in run_ids,
+                     f"Source5 v4 {host} index row[{index}] changed original job identity/order")
+            run_ids.add(row["job"]["run_id"])
+            jobs.append(row["job"])
+            indexed_rows.append(row)
+            archive = row.get("archive_pins")
+            _require(type(archive) is dict,
+                     f"Source5 v4 {host} index row[{index}] archive pins are malformed")
+            pin_roles = ((row.get("job_record_pin"), "source5_job_record"),) + tuple(
+                (archive.get(name), role) for name, role in (
+                    ("request_pin", "source5_checkpoint_request"),
+                    ("checkpoint_pin", "source5_checkpoint"),
+                    ("object_manifest_pin", "source5_object_manifest"),
+                    ("ack_pin", "source5_archive_ack"),
+                    ("signature_pin", "source5_archive_signature"),
+                )
+            )
+            for pin_value, expected_role in pin_roles:
+                pin = _exact(pin_value, {"path", "raw_sha256"} |
+                             ({"semantic_sha256", "signer_fingerprint"} &
+                              (set(pin_value) if type(pin_value) is dict else set())),
+                             f"Source5 v4 {host} index row[{index}] raw object pin")
+                raw = _read_lineage_pin_v4(
+                    lineage_artifact_reader,
+                    {"path": pin["path"], "raw_sha256": pin["raw_sha256"]},
+                    captured_cap({"path": pin["path"],
+                                  "raw_sha256": pin["raw_sha256"]},
+                                 f"{host} indexed {expected_role}"),
+                    f"Source5 v4 {host} indexed archive object",
+                )
+                expect_catalogue_row(
+                    {"path": pin["path"], "raw_sha256": pin["raw_sha256"]},
+                    len(raw), expected_role, host, "exploration",
+                    row["job"]["run_id"],
+                )
+        index_jobs_by_host[host] = jobs
+        index_rows_by_host[host] = indexed_rows
+        if host == selected:
+            _require(_sha(_canonical(jobs)) == ancestor["job_list_sha256"] and
+                     len(index_raw) == ancestor["index_byte_count"],
+                     "Source5 v4 width ancestor differs from the exact captured record index")
+            journal = _exact(header.get("journal"), {
+                "pin", "byte_count", "record_count", "head",
+            }, "Source5 v4 selected initial journal")
+            ledger = _exact(header.get("phase_ledger"), {
+                "pin", "row_count",
+            }, "Source5 v4 selected phase ledger")
+            _require(journal["pin"] == ancestor["journal"]["pin"] and
+                     journal["byte_count"] == ancestor["journal"]["byte_count"] and
+                     journal["head"] == ancestor["journal"]["head"] and
+                     journal["record_count"] == 2161 and
+                     ledger["pin"] == ancestor["phase_ledger"]["pin"] and
+                     ledger["row_count"] == 360,
+                     "Source5 v4 selected header/journal/ledger differs from width ancestor")
+            journal_raw = _read_lineage_pin_v4(
+                lineage_artifact_reader, journal["pin"],
+                captured_cap(journal["pin"], "selected ancestor journal"),
+                "Source5 v4 selected ancestor journal",
+            )
+            ledger_raw = _read_lineage_pin_v4(
+                lineage_artifact_reader, ledger["pin"],
+                captured_cap(ledger["pin"], "selected ancestor phase ledger"),
+                "Source5 v4 selected ancestor phase ledger",
+            )
+            expect_catalogue_row(journal["pin"], len(journal_raw), "journal", host)
+            expect_catalogue_row(ledger["pin"], len(ledger_raw),
+                                 "source5_phase_ledger", host)
+            _require(len(journal_raw) == ancestor["journal"]["byte_count"] and
+                     len(journal_raw.splitlines()) == 2161 and
+                     len(ledger_raw) == ancestor["phase_ledger"]["byte_count"] and
+                     len(ledger_raw.splitlines()) == 360,
+                     "Source5 v4 selected ancestor journal/ledger actual counts differ")
+            _validate_prepared_journal_chain_v4(
+                journal_raw, budget["campaign_id"], selected,
+                ancestor["journal"]["head"],
+            )
+
+    shared_originals = source5_preparatory_shared_originals_v1([
+        {
+            "host_id": host,
+            "original_pins": old_budgets_by_host[host]["original_pins"],
+            "execution_manifest": execution_manifests_by_host[host],
+            "header": headers_by_host[host],
+        }
+        for host in host_ids
+    ])
+
+    # Existing old catalogue chunks are part of retained ancestry. Their caps
+    # and raw sizes come from the old signed budget manifest, then the closed
+    # reader proves the actual bytes before the current catalogue may reserve
+    # them.
+    for host in host_ids:
+        catalogue_owner_host = host
+        header = headers_by_host[host]
+        old_budget = old_budgets_by_host[host]
+        old_catalogue = old_budget.get("path_catalogue")
+        _require(type(old_catalogue) is dict,
+                 f"Source5 v4 {host} old budget lacks its path catalogue")
+        chunk_pins = {chunk["path"]: chunk for chunk in old_catalogue["chunks"]}
+        def read_old_catalogue_chunk(path: str, maximum: int) -> bytes:
+            chunk = chunk_pins.get(path)
+            _require(type(chunk) is dict and maximum == chunk["byte_count"],
+                     "Source5 v4 old catalogue requested an undeclared chunk")
+            return _read_lineage_pin_v4(
+                lineage_artifact_reader,
+                {"path": path, "raw_sha256": chunk["raw_sha256"]},
+                captured_cap({"path": path, "raw_sha256": chunk["raw_sha256"]},
+                             f"{host} old catalogue chunk"),
+                "Source5 v4 old catalogue chunk",
+            )
+        old_verified = verify_fixed_pair_v3_path_catalogue_chunks_with_reader(
+            old_catalogue, read_old_catalogue_chunk,
+        )
+        for chunk in old_verified["chunks"]:
+            raw = read_old_catalogue_chunk(chunk["path"], chunk["byte_count"])
+            expect_catalogue_row(
+                {"path": chunk["path"], "raw_sha256": chunk["raw_sha256"]},
+                len(raw), "source5_job_row_catalogue", host,
+            )
+        old_indexed_rows = {}
+        indexed_roles = {
+            "source5_job_record", "source5_checkpoint_request",
+            "source5_checkpoint", "source5_object_manifest",
+            "source5_archive_ack", "source5_archive_signature",
+        }
+        for source_row in iter_fixed_pair_v3_path_catalogue_rows_with_reader(
+                old_verified, read_old_catalogue_chunk):
+            if source_row["kind"] != "file" or source_row["role"] not in indexed_roles:
+                continue
+            _require(source_row["path"] not in old_indexed_rows,
+                     f"Source5 v4 {host} old indexed reservation path is duplicated")
+            old_indexed_rows[source_row["path"]] = source_row
+        needed = _source5_prepared_lineage_indexed_rows_v4(
+            expected_catalogue_rows, index_rows_by_host[host], old_indexed_rows,
+            initial_output_root=headers_by_host[host]["initial_output_root"],
+            campaign_id=budget["campaign_id"], selected_host=host,
+        )
+        source_proven_unpinned_roles = {
+            "preparation", "evidence_index", "journal",
+            "source5_phase_ledger", "capacity_artifact",
+            "host_evidence_budget", "execution_manifest",
+        }
+        source_rows_seen = set()
+        retained_global_roles = {
+            "preparation", "source_manifest", "spec_v3", "plan_v3",
+            "execution_manifest", "observed_host", "host_evidence_budget",
+            "journal_width_contract", "preparatory_journal_width_contract",
+            "capacity_completion", "capacity_host_receipt", "capacity_ledger",
+            "source5_archive_signer_context", "source5_archive_signer_keyring",
+            "source5_archive_signer_gpgv",
+        }
+        shared_rows = {
+            shared_originals["preparation"]["path"]: (
+                "preparation", shared_originals["preparation"]["raw_sha256"], None,
+            ),
+            shared_originals["capacity_generation"]["path"]: (
+                "capacity_completion",
+                shared_originals["capacity_generation"]["raw_sha256"],
+                shared_originals["capacity_generation"]["semantic_sha256"],
+            ),
+        }
+        shared_rows_seen = set()
+        for source_row in iter_fixed_pair_v3_path_catalogue_rows_with_reader(
+                old_verified, read_old_catalogue_chunk):
+            expected = needed.get(source_row["path"])
+            if expected is not None:
+                expected_role = expected["role"]
+                role_matches = _prepared_lineage_catalogue_role_matches(
+                    expected_role, source_row["role"],
+                )
+                pin = source_row.get("origin_pin")
+                if source_row["path"] in shared_rows:
+                    source_host_matches = source_row["host_id"] == host
+                elif expected["host_id"] is None:
+                    source_host_matches = source_row["host_id"] in {None, host}
+                else:
+                    source_host_matches = source_row["host_id"] == expected["host_id"]
+                origin_matches = (
+                    (pin is not None and
+                     pin.get("raw_sha256") == expected["raw_sha256"]) or
+                    (pin is None and expected_role in
+                     (indexed_roles | source_proven_unpinned_roles))
+                )
+                _require(role_matches and
+                         origin_matches and
+                         source_row["max_file_bytes"] >= expected["byte_count"] and
+                         source_host_matches and
+                         (expected["phase"] is None or
+                          source_row["phase"] == expected["phase"]) and
+                         (expected["run_id"] is None or
+                          source_row["run_id"] == expected["run_id"]),
+                         f"Source5 v4 {host} retained origin differs from its old Source catalogue")
+                source_rows_seen.add(source_row["path"])
+            role = source_row["role"]
+            origin_pin = source_row.get("origin_pin")
+            expected_owner = expected_catalogue_rows.get(source_row["path"])
+            shared_row = shared_rows.get(source_row["path"])
+            if (source_row["kind"] != "file" or
+                    source_row["phase"] is not None or
+                    role not in retained_global_roles or
+                    (expected_owner is not None and
+                     host in expected_owner["catalogue_hosts"] and
+                     shared_row is None) or
+                    type(origin_pin) is not dict or
+                    type(origin_pin.get("raw_sha256")) is not str):
+                if shared_row is not None and (
+                        type(origin_pin) is not dict or
+                        type(origin_pin.get("raw_sha256")) is not str):
+                    _require(False,
+                             f"Source5 v4 {host} shared SourceH row lacks its exact raw origin")
+                continue
+            descriptor_role = ("journal_width_contract"
+                               if role == "preparatory_journal_width_contract" else
+                               role)
+            descriptor_host = source_row["host_id"]
+            if shared_row is not None:
+                shared_role, shared_raw, shared_semantic = shared_row
+                _require(role == shared_role and source_row["host_id"] == host and
+                         source_row["owner"] == {
+                             "preparation": "inputs",
+                             "capacity_completion": "capacity_stage",
+                         }[shared_role] and
+                         source_row["run_id"] is None and
+                         origin_pin["raw_sha256"] == shared_raw and
+                         origin_pin.get("semantic_sha256") == shared_semantic,
+                         f"Source5 v4 {host} shared SourceH row differs from exact provenance")
+                descriptor_host = None
+                shared_rows_seen.add(shared_role)
+            elif descriptor_role in {
+                "spec_v3", "plan_v3", "execution_manifest",
+                "source5_archive_signer_keyring", "source5_archive_signer_gpgv",
+            }:
+                descriptor_host = None
+            source_pin = {"path": source_row["path"],
+                          "raw_sha256": origin_pin["raw_sha256"]}
+            raw = _read_lineage_pin_v4(
+                lineage_artifact_reader, source_pin,
+                captured_cap(source_pin, f"{host} retained {descriptor_role}"),
+                f"Source5 v4 {host} retained {descriptor_role}",
+            )
+            expect_catalogue_row(
+                source_pin, len(raw), descriptor_role, descriptor_host,
+            )
+        _require(set(needed) <= source_rows_seen,
+                 f"Source5 v4 {host} old Source catalogue omits retained origins")
+        _require(shared_rows_seen == {"preparation", "capacity_completion"},
+                 f"Source5 v4 {host} old catalogue omits its provenance-checked shared inputs")
+
+    current_rows = (iter_path_catalogue_rows(catalogue)
+                    if catalogue_row_reader is None else
+                    iter_path_catalogue_rows_with_reader(
+                        catalogue, catalogue_row_reader,
+                    ))
+    current_seen = set()
+    for row in current_rows:
+        expected = expected_catalogue_rows.get(row["path"])
+        if expected is None:
+            continue
+        _require(row["path"] not in current_seen and
+                 row["role"] == expected["role"] and
+                 row["host_id"] == expected["host_id"] and
+                 row["phase"] == expected["phase"] and
+                 row["run_id"] == expected["run_id"] and
+                 row["max_bytes"] == expected["byte_count"] and
+                 row["max_file_bytes"] == expected["byte_count"] and
+                 type(row["origin_pin"]) is dict and
+                 row["origin_pin"].get("raw_sha256") == expected["raw_sha256"],
+                 f"Source5 v4 current catalogue changes captured origin {row['path']}")
+        current_seen.add(row["path"])
+    _require(set(expected_catalogue_rows) == current_seen,
+             "Source5 v4 current catalogue omits captured lineage origins")
+    current_rows = (iter_path_catalogue_rows(catalogue)
+                    if catalogue_row_reader is None else
+                    iter_path_catalogue_rows_with_reader(
+                        catalogue, catalogue_row_reader,
+                    ))
+    seen_current = set()
+    for row in current_rows:
+        expected = expected_catalogue_rows.get(row["path"])
+        if expected is None:
+            continue
+        _require(row["path"] not in seen_current and
+                 row["role"] == expected["role"] and
+                 row["host_id"] == expected["host_id"] and
+                 row["phase"] == expected["phase"] and
+                 row["run_id"] == expected["run_id"] and
+                 row["max_bytes"] == expected["byte_count"] and
+                 row["max_file_bytes"] == expected["byte_count"] and
+                 type(row["origin_pin"]) is dict and
+                 row["origin_pin"].get("raw_sha256") == expected["raw_sha256"],
+                 f"Source5 v4 current catalogue changes captured origin {row['path']}")
+        seen_current.add(row["path"])
+    _require(set(expected_catalogue_rows) == seen_current,
+             "Source5 v4 current catalogue omits exact captured lineage origins")
+
+
 def _validate_host_evidence_budget_common(
     value: object, *, expected_schema: str,
     journal_width_contract_raw: bytes | None = None,
     catalogue_row_reader=None,
+    final_spec_raw: bytes | None = None,
+    lineage_artifact_reader=None,
 ) -> dict[str, Any]:
     """Validate either closed budget version without changing its body."""
     legacy_fields = {
@@ -4119,19 +5719,26 @@ def _validate_host_evidence_budget_common(
                  budget["execution_blockers"] == expected_blockers and
                  budget["readiness"] == expected_readiness,
                  "Source5 v2 budget readiness differs from the pre-execution state")
-    elif expected_schema == HOST_BUDGET_SCHEMA_V3:
+    elif expected_schema in {HOST_BUDGET_SCHEMA_V3, HOST_BUDGET_SCHEMA_V4}:
         budget = _exact(value, ready_v3_fields,
-                        "Source5 ready host evidence budget v3")
+                        "Source5 ready host evidence budget")
         width_is_bound = True
         _validate_source5_v3_ready_state(budget.get("readiness"))
-        _require(budget["schema"] == HOST_BUDGET_SCHEMA_V3 and
-                 budget["admission_profile"] ==
-                    SOURCE5_V3_ADMISSION_PROFILE and
-                 budget["execution_manifest_schema"] ==
-                    "allocatbelt.application-source5-campaign-execution.v4" and
+        expected_profile = (SOURCE5_PREPARED_EXPLORATION_ADMISSION_PROFILE
+                            if expected_schema == HOST_BUDGET_SCHEMA_V4 else
+                            SOURCE5_V3_ADMISSION_PROFILE)
+        expected_execution = ("allocatbelt.application-source5-campaign-execution.v5"
+                              if expected_schema == HOST_BUDGET_SCHEMA_V4 else
+                              "allocatbelt.application-source5-campaign-execution.v4")
+        _require(budget["schema"] == expected_schema and
+                 budget["admission_profile"] == expected_profile and
+                 budget["execution_manifest_schema"] == expected_execution and
                  budget["execution_blockers"] == [] and
-                 journal_width_contract_raw is not None,
-                 "Source5 v3 admission profile or ready-but-unqualified state differs")
+                 journal_width_contract_raw is not None and
+                 (expected_schema != HOST_BUDGET_SCHEMA_V4 or
+                  (type(final_spec_raw) is bytes and
+                   callable(lineage_artifact_reader))),
+                 "Source5 ready admission profile or ready-but-unqualified state differs")
     else:
         raise BudgetPlanError("unsupported Source5 host evidence budget validator")
 
@@ -4144,9 +5751,23 @@ def _validate_host_evidence_budget_common(
     expected_host_ids = set(original_source_pins) if type(original_source_pins) is dict else set()
     _require(len(expected_host_ids) in (2, 3) and budget["host_id"] in expected_host_ids,
              "Source5 budget original pins do not bind a complete supported host map")
+    if expected_schema == HOST_BUDGET_SCHEMA_V4:
+        _exact(budget["original_pins"], {
+            "spec", "plan", "execution_manifest", "source_manifests",
+            "source_tree_sha256", "prepared_exploration",
+        }, "Source5 v4 six-key original pins")
+        _exact(budget["original_pins"]["prepared_exploration"],
+               expected_host_ids, "Source5 v4 prepared host lineage pins")
     catalogue = validate_path_catalogue_manifest(budget["path_catalogue"])
     if width_is_bound:
-        if catalogue_row_reader is None:
+        if expected_schema == HOST_BUDGET_SCHEMA_V4:
+            if catalogue_row_reader is None:
+                catalogue = verify_prepared_source5_path_catalogue_chunks(catalogue)
+            else:
+                catalogue = verify_prepared_source5_path_catalogue_chunks_with_reader(
+                    catalogue, catalogue_row_reader,
+                )
+        elif catalogue_row_reader is None:
             catalogue = verify_path_catalogue_chunks(catalogue)
         else:
             catalogue = verify_path_catalogue_chunks_with_reader(
@@ -4157,20 +5778,37 @@ def _validate_host_evidence_budget_common(
         width_pin = _exact(width_pin_value, {
             "path", "raw_sha256", "semantic_sha256",
         }, "Source5 v2 journal-width contract pin")
-        width_contract, width_raw, _width_pin = \
-            _verify_captured_journal_width_contract(
-                width_pin, journal_width_contract_raw,
-            )
+        if expected_schema == HOST_BUDGET_SCHEMA_V4:
+            width_contract, width_raw, _width_pin = \
+                _verify_captured_prepared_width_contract_v2(
+                    width_pin, journal_width_contract_raw,
+                )
+        else:
+            width_contract, width_raw, _width_pin = \
+                _verify_captured_journal_width_contract(
+                    width_pin, journal_width_contract_raw,
+                )
         audit_projection = {
             "campaign_id": budget["campaign_id"],
             "host_id": budget["host_id"],
             "original_pins": budget["original_pins"],
             "schedule": budget["schedule"],
         }
-        width_contract, width_event_count, width_maximum_line = \
-            _validate_journal_width_contract_summary(
-            width_contract, audit_projection, budget["owner_contract"],
-        )
+        if expected_schema == HOST_BUDGET_SCHEMA_V4:
+            width_contract, width_event_count, width_maximum_line = \
+                _validate_prepared_width_v2_summary(
+                    width_contract, audit_projection, budget["owner_contract"],
+                )
+            _validate_prepared_lineage_budget_v4(
+                budget, width_contract, final_spec_raw,
+                lineage_artifact_reader, catalogue,
+                catalogue_row_reader=catalogue_row_reader,
+            )
+        else:
+            width_contract, width_event_count, width_maximum_line = \
+                _validate_journal_width_contract_summary(
+                    width_contract, audit_projection, budget["owner_contract"],
+                )
         _require(budget["schedule"].get("maximum_callback_events") ==
                     width_event_count and
                  budget["schedule"].get("maximum_callback_event_bytes") ==
@@ -4204,6 +5842,30 @@ def _validate_host_evidence_budget_common(
                          {phase: row.get(phase) for phase in PHASES} == expected_counts
                          for row in all_counts.values()),
                      "Source5 v3 does not preserve the exact complete original host schedule map")
+        elif expected_schema == HOST_BUDGET_SCHEMA_V4:
+            expected_counts = {
+                "exploration": 360, "aa": 48, "confirmation": 8100,
+                "pressure": 8100, "soak": 1,
+            }
+            counts = budget["schedule"].get("job_counts")
+            all_counts = budget["schedule"].get("all_host_job_counts")
+            _require(counts == expected_counts and
+                     budget["schedule"].get("total_job_count") == 16609 and
+                     budget["schedule"].get("maximum_callback_events") == 97499 and
+                     width_event_count == 97499 and
+                     len(width_contract["job_rows"]) == 16249 and
+                     type(width_contract.get("phase_totals")) is list and
+                     [(row.get("phase"), row.get("job_count"), row.get("event_count"))
+                      for row in width_contract["phase_totals"]] == [
+                          ("exploration", 0, 0), ("aa", 48, 288),
+                          ("confirmation", 8100, 48600),
+                          ("pressure", 8100, 48600), ("soak", 1, 4),
+                      ] and type(all_counts) is dict and
+                     set(all_counts) == expected_host_ids and
+                     all(type(row) is dict and
+                         {phase: row.get(phase) for phase in PHASES} == expected_counts
+                         for row in all_counts.values()),
+                     "Source5 v4 schedule does not preserve logical 16,609 jobs/current 97,499 events")
         width_row = None
         width_row_count = 0
         rows = (iter_path_catalogue_rows(catalogue)
@@ -4446,9 +6108,161 @@ def validate_host_evidence_budget_v3(
     )
 
 
+def validate_host_evidence_budget_v4(
+    value: object, *, journal_width_contract_raw: bytes,
+    final_spec_raw: bytes, lineage_artifact_reader,
+    catalogue_row_reader=None,
+) -> dict[str, Any]:
+    """Validate V5 budget.v4 with separate logical/current horizons and captured ancestry."""
+    _require(type(journal_width_contract_raw) is bytes and
+             type(final_spec_raw) is bytes and callable(lineage_artifact_reader),
+             "Source5 v4 requires exact width bytes, final Spec bytes, and a closed lineage reader")
+    return _validate_host_evidence_budget_common(
+        value, expected_schema=HOST_BUDGET_SCHEMA_V4,
+        journal_width_contract_raw=journal_width_contract_raw,
+        catalogue_row_reader=catalogue_row_reader,
+        final_spec_raw=final_spec_raw,
+        lineage_artifact_reader=lineage_artifact_reader,
+    )
+
+
+def required_archive_request_schema_v1(
+    budget_value: object, execution_manifest_value: object,
+    context_value: object,
+) -> str | None:
+    """Select the request wire schema from the validated Source5 profile.
+
+    This selector is called only after the execution, budget, and archive
+    context have been validated against their typed Source pins.  A missing
+    result preserves the existing V1/V2 request API for legacy profiles.
+    """
+    _require(type(budget_value) is dict,
+             "Source5 request-schema selected budget is not an object")
+    budget = budget_value
+    execution = execution_manifest_value
+    _require(type(execution) is dict and
+             type(execution.get("schema")) is str and
+             type(context_value) is dict,
+             "Source5 request-schema selector inputs are malformed")
+    context = _exact(context_value, {
+        "schema", "campaign_id", "host_id", "phase", "job_index",
+        "source_manifest_pin", "execution_manifest_pin", "plan_pin",
+        "resource_budget_pin", "predecessor_ack_pin",
+        "authorized_signer_fingerprint",
+    }, "Source5 request-schema archive context")
+    _require(context["schema"] ==
+             "allocatbelt.application-source5-evidence-archive-context.v1" and
+             type(context["campaign_id"]) is str and
+             type(context["host_id"]) is str and
+             context["phase"] in PHASES and
+             type(context["job_index"]) is int and
+             context["job_index"] >= 0,
+             "Source5 request-schema archive context identity is malformed")
+    budget_schema = budget.get("schema")
+    execution_schema = execution.get("schema")
+    if budget_schema == HOST_BUDGET_SCHEMA_V4:
+        _require(execution_schema == EXECUTION_SCHEMA_V5,
+                 "Source5 budget.v4 is not bound to execution.v5")
+    elif execution_schema == EXECUTION_SCHEMA_V5:
+        _require(budget_schema == HOST_BUDGET_SCHEMA_V4,
+                 "Source5 execution.v5 requires its exact budget.v4")
+    elif (budget_schema == PREPARATORY_BUDGET_SCHEMA or
+          execution_schema == PREPARATORY_EXECUTION_SCHEMA):
+        _require(budget_schema == PREPARATORY_BUDGET_SCHEMA and
+                 execution_schema == PREPARATORY_EXECUTION_SCHEMA,
+                 "Source5 preparatory execution and budget schemas disagree")
+    else:
+        known_legacy_budgets = {
+            HOST_BUDGET_SCHEMA_V2, HOST_BUDGET_SCHEMA_V3,
+            "allocatbelt.application-source5-host-evidence-budget.v1",
+        }
+        known_legacy_executions = {
+            "allocatbelt.application-source5-campaign-execution.v2",
+            "allocatbelt.application-source5-campaign-execution.v3",
+            "allocatbelt.application-source5-campaign-execution.v4",
+        }
+        _require(budget_schema in known_legacy_budgets and
+                 execution_schema in known_legacy_executions,
+                 "Source5 request-schema selector received an unsupported profile pair")
+        return None
+    require_profile = budget_schema in {
+        HOST_BUDGET_SCHEMA_V4, PREPARATORY_BUDGET_SCHEMA,
+    }
+    if not require_profile:
+        return None
+    _require(budget.get("campaign_id") == context["campaign_id"] and
+             budget.get("host_id") == context["host_id"] and
+             type(budget.get("budget_sha256")) is str and
+             _digest(budget["budget_sha256"],
+                     "Source5 request-schema budget digest") ==
+                 budget["budget_sha256"],
+             "Source5 request-schema budget does not bind the archive context")
+    budget_pin = _pin(context["resource_budget_pin"],
+                      "Source5 request-schema budget pin")
+    _require(budget_pin["semantic_sha256"] == budget["budget_sha256"],
+             "Source5 request-schema budget pin has another semantic body")
+    execution_pin = _pin(context["execution_manifest_pin"],
+                         "Source5 request-schema execution pin")
+    _require(execution.get("campaign_id") == context["campaign_id"] and
+             execution.get("manifest_sha256") ==
+                 execution_pin["semantic_sha256"],
+             "Source5 request-schema execution identity differs from the archive context")
+    execution_hosts = execution.get("hosts")
+    _require(type(execution_hosts) is list and len(execution_hosts) == 2 and
+             all(type(host) is str and host for host in execution_hosts) and
+             len(set(execution_hosts)) == 2,
+             "Source5 fixed-v3 request requires an exact two-host execution map")
+    pins = budget.get("original_pins")
+    source_manifests = pins.get("source_manifests") if type(pins) is dict else None
+    _require(type(source_manifests) is dict and
+             len(source_manifests) == 2 and
+             set(source_manifests) == set(execution_hosts) and
+             context["host_id"] in source_manifests,
+             "Source5 fixed-v3 request requires the explicit two-KVM host map")
+    if budget_schema == HOST_BUDGET_SCHEMA_V4:
+        original_execution = pins.get("execution_manifest")
+        host_counts = budget.get("schedule", {}).get("all_host_job_counts")
+        host_schedule = host_counts.get(context["host_id"]) if type(host_counts) is dict else None
+        current_count = host_schedule.get(context["phase"]) if type(host_schedule) is dict else None
+        if context["phase"] == "exploration":
+            raise BudgetPlanError(
+                "Source5 V5 exploration reuses its captured predecessor and cannot launch a new request",
+            )
+        _require(execution_schema == EXECUTION_SCHEMA_V5 and
+                 context["phase"] in {"aa", "confirmation", "pressure", "soak"} and
+                 type(current_count) is int and 0 <= context["job_index"] < current_count and
+                 _pin(original_execution,
+                      "Source5 request-schema original execution pin") == execution_pin,
+                 "Source5 V5 request phase or execution pin is outside its admitted current horizon")
+        if context["phase"] in {"aa", "confirmation"}:
+            return FIXED_CHECKPOINT_REQUEST_SCHEMA_V3
+        return None
+    _require(execution_schema == PREPARATORY_EXECUTION_SCHEMA and
+             context["phase"] == "exploration" and
+             budget.get("profile") == "preparatory_exploration_360_v1",
+             "Source5 preparatory fixed-v3 requests are limited to its exact exploration profile")
+    schedule = budget.get("read_schedule")
+    _require(type(schedule) is list and len(schedule) == 360 and
+             0 <= context["job_index"] < len(schedule) and
+             type(schedule[context["job_index"]]) is dict,
+             "Source5 preparatory v3 request index is outside its exact 360-job budget")
+    selected = schedule[context["job_index"]]
+    selected_job = selected.get("job") if type(selected) is dict else None
+    _require(selected.get("job_index") == context["job_index"] and
+             selected.get("request_ordinal") == context["job_index"] and
+             selected.get("analysis_phase") == "exploration" and
+             type(selected_job) is dict and
+             selected_job.get("host_id") == context["host_id"] and
+             selected_job.get("comparison_family") == "fixed_policy" and
+             selected.get("job_sha256") == _sha(_canonical(selected_job)),
+             "Source5 preparatory v3 request does not select its exact original fixed job row")
+    return FIXED_CHECKPOINT_REQUEST_SCHEMA_V3
+
+
 def validate_host_evidence_budget(
     value: object, *, journal_width_contract_raw: bytes | None = None,
-    catalogue_row_reader=None,
+    catalogue_row_reader=None, final_spec_raw: bytes | None = None,
+    lineage_artifact_reader=None,
 ) -> dict[str, Any]:
     """Closed-version dispatch for SourceH, archive and packet consumers."""
     _require(type(value) is dict,
@@ -4461,6 +6275,13 @@ def validate_host_evidence_budget(
     if value.get("schema") == HOST_BUDGET_SCHEMA_V3:
         return validate_host_evidence_budget_v3(
             value, journal_width_contract_raw=journal_width_contract_raw,
+            catalogue_row_reader=catalogue_row_reader,
+        )
+    if value.get("schema") == HOST_BUDGET_SCHEMA_V4:
+        return validate_host_evidence_budget_v4(
+            value, journal_width_contract_raw=journal_width_contract_raw,
+            final_spec_raw=final_spec_raw,
+            lineage_artifact_reader=lineage_artifact_reader,
             catalogue_row_reader=catalogue_row_reader,
         )
     raise BudgetPlanError("unsupported Source5 host evidence budget schema")

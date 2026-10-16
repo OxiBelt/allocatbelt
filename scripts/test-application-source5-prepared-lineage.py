@@ -4,11 +4,17 @@ from __future__ import annotations
 
 import importlib.util
 import copy
+import hashlib
 import json
+import os
+import shutil
 import sys
+import stat
 import types
 import unittest
+import tempfile
 from pathlib import Path, PurePosixPath
+from typing import Callable
 
 
 SOURCE = Path(__file__).with_name("application-source5-prepared-lineage.py")
@@ -54,6 +60,10 @@ source5_campaign = load_sibling_module(
 fixed_pair = load_sibling_module(
     "application-fixed-pair.py", "source5_prepared_lineage_fixed_pair_tests",
 )
+producer_support = load_sibling_module(
+    "test-full-profile-preparatory-producer-support.py",
+    "source5_full_profile_prep_producer_support_tests",
+)
 
 
 def original_jobs(host_id: str = "host-kvm-a") -> list[dict[str, object]]:
@@ -71,8 +81,20 @@ def original_jobs(host_id: str = "host-kvm-a") -> list[dict[str, object]]:
     ]
 
 
-def synthetic_full_replay_case():
+def synthetic_full_replay_case(*, generated=None):
     """Build a SourceA protocol-component chain, with no observed process facts."""
+    lineage = globals()["lineage"]
+    chronology = globals()["chronology"]
+    campaign_core = globals()["campaign_core"]
+    prep_budget = globals()["prep_budget"]
+    source5_campaign = globals()["source5_campaign"]
+    if generated is not None:
+        typed_modules = generated[0].modules
+        lineage = typed_modules["scripts/application-source5-prepared-lineage.py"]
+        chronology = typed_modules["scripts/application-campaign-chronology.py"]
+        campaign_core = typed_modules["scripts/application-campaign.py"]
+        prep_budget = typed_modules["scripts/application-source5-preparatory-budget.py"]
+        source5_campaign = typed_modules["scripts/application-source5-campaign.py"]
     campaign_id, host_id = "synthetic-lineage", "host-kvm-a"
     output_root = "/tmp/synthetic-initial-output"
     spec = {
@@ -233,6 +255,150 @@ def synthetic_full_replay_case():
             "capacity_registration_head": None,
         },
     }
+    expected_setup_head = None
+    generated_fixture = None
+    generated_artifacts = None
+    setup_details = {
+        "campaign_id": campaign_id, "host_id": host_id,
+        "completion": generation_completion, "provenance": generation["provenance"],
+        "host_completion": host_completion, "host_verification": host_verification,
+        "capacity_ledger": capacity_ledger,
+        "capacity_schedule_sha256": schedule_sha256,
+        "entries": [{"entry": index} for index in range(15)],
+        "qualification_eligible": False, "controller_chronology_proven": False,
+    }
+
+    if generated is not None:
+        generated_fixture, generated_artifacts, original_pins, setup_details, \
+            expected_setup_head = generated
+        lineage = generated_fixture.lineage_module
+        chronology = generated_fixture.chronology
+        campaign_core = generated_fixture.campaign
+        prep_budget = generated_fixture.prep_module
+        source5_campaign = generated_fixture.controller
+        campaign_id = generated_fixture.spec["campaign_id"]
+        host_id = generated_fixture.host_id
+        output_root = str(generated_fixture.output_root)
+        spec = generated_fixture.spec
+        jobs = [job for job in generated_fixture.plan["jobs"]["exploration"]
+                if job["host_id"] == host_id]
+        digest = lambda value: hashlib.sha256(value.encode("utf-8")).hexdigest()
+        spec_pin = {
+            "path": str(generated_fixture.spec_path),
+            "raw_sha256": generated_fixture.spec_sha256,
+            "semantic_sha256": generated_fixture.spec_semantic,
+        }
+        plan_pin = {
+            "path": str(generated_fixture.plan_path),
+            "raw_sha256": generated_fixture.plan_file_sha256,
+            "semantic_sha256": generated_fixture.plan_semantic,
+        }
+        source_pins = []
+        for selected_host in generated_fixture.fixture.host_ids:
+            source_doc = generated_fixture.fixture.manifests[selected_host]
+            source_pins.append({
+                "host_id": selected_host,
+                "path": str(generated_fixture.fixture.manifest_paths[selected_host]),
+                "raw_sha256": generated_fixture.fixture.manifest_raw_shas[selected_host],
+                "semantic_sha256": source_doc["manifest_sha256"],
+                "source_tree_sha256": source_doc["source"]["source_tree_sha256"],
+            })
+        observed = original_pins["observed_host"]
+        width_contract = generated_artifacts["width"]
+        width_projection, event_projection = \
+            chronology._source5_preparatory_journal_projection(
+                width_contract, jobs, host_id,
+            )
+        generation_completion = generated_fixture.generation_completion
+        generation = generated_artifacts["manifest"][
+            "preparatory_capacity_generation"]
+        registration = generated_artifacts["manifest"][
+            "preparatory_capacity_registration"]
+        selected_capacity = next(
+            row for row in generated_fixture.generation["capacity_preparations"]
+            if row["host_id"] == host_id
+        )
+        host_completion = {
+            **selected_capacity["completion"],
+            "semantic_sha256": selected_capacity["completion_sha256"],
+        }
+        host_verification = selected_capacity["host_verification"]
+        capacity_ledger = selected_capacity["ledger"]
+        schedule_sha256 = selected_capacity[
+            "capacity_preparation_templates_sha256"]
+        execution_manifest = generated_artifacts["manifest"]
+        execution_raw = generated_artifacts["manifest_raw"]
+        execution_pin = {
+            "path": str(generated_fixture.manifest_path),
+            "raw_sha256": chronology.sha256_bytes(execution_raw),
+            "semantic_sha256": execution_manifest["manifest_sha256"],
+        }
+        budget_source_pin = generated_artifacts["budget_pin"]
+        width_source_pin = generated_artifacts["width_pin"]
+        fixed_spec_host_pin = {
+            **generated_fixture.context.fixed_spec_host_pin,
+            "semantic_sha256": generated_fixture.context.prepared_fixed_host_binding[
+                "spec_host_semantic_sha256"],
+        }
+        signer_pin = generated_fixture.signer_pin
+        signer = generated_fixture.signer_context
+        header = {
+            "campaign_id": campaign_id,
+            "host_id": host_id,
+            "initial_output_root": output_root,
+            "initial": {
+                "execution_manifest_pin": execution_pin,
+                "spec_pin": spec_pin,
+                "plan_pin": plan_pin,
+                "source_manifest_pins": source_pins,
+                "observed_host_pin": {
+                    key: observed[key] for key in (
+                        "path", "raw_sha256", "boot_id_sha256", "controls_sha256",
+                    )
+                },
+                "capacity_generation_sha256":
+                    generation_completion["semantic_sha256"],
+                "capacity_registration_head": expected_setup_head,
+                "host_budget_pin": {
+                    key: budget_source_pin[key]
+                    for key in ("path", "raw_sha256", "semantic_sha256")
+                },
+                "journal_width_pin": {
+                    key: width_source_pin[key]
+                    for key in ("path", "raw_sha256", "semantic_sha256")
+                },
+                "fixed_spec_host_pin": fixed_spec_host_pin,
+                "prepared_host_binding_sha256":
+                    generated_fixture.context.prepared_fixed_host_binding[
+                        "binding_sha256"],
+                "signer_context_pin": signer_pin,
+                "signer_fingerprint": signer[
+                    "authorized_primary_fingerprint"],
+                "maximum_signature_bytes": signer["maximum_signature_bytes"],
+            },
+        }
+        original_context = {
+            "original_pins": original_pins,
+            "execution_manifest": execution_manifest,
+            "width_projection": width_projection,
+            "event_projection": event_projection,
+            "cleanup_limits": chronology._source5_cleanup_limits_from_budget(
+                generated_artifacts["budget"],
+            ),
+            "phase_ledger_maximum_bytes": generated_artifacts["budget"][
+                "schedule"]["maximum_phase_ledger_bytes"],
+            "phase_ledger_record_maximum_bytes": chronology.MAX_EVENT_BYTES,
+        }
+        expected_projection = lineage.project_prepared_exploration_lineage_outputs(
+            campaign_id, host_id, output_root, jobs,
+        )
+        journal_path = str(Path(output_root) / campaign_id / "chronology" /
+                           host_id / "dispatch-journal.jsonl")
+        ledger_path = str(Path(output_root) / campaign_id / "source5" /
+                          host_id / "exploration" / "controller-ledger.jsonl")
+        record_store = {}
+        index_rows = []
+        pilot_pair_by_key = {}
     journal_path = f"{output_root}/{campaign_id}/chronology/{host_id}/dispatch-journal.jsonl"
     ledger_path = (f"{output_root}/{campaign_id}/source5/{host_id}/exploration/"
                    "controller-ledger.jsonl")
@@ -259,34 +425,30 @@ def synthetic_full_replay_case():
         previous = last_record_sha = record_sha
         return record_sha
 
-    setup_details = {
-        "campaign_id": campaign_id, "host_id": host_id,
-        "completion": generation_completion, "provenance": generation["provenance"],
-        "host_completion": host_completion, "host_verification": host_verification,
-        "capacity_ledger": capacity_ledger,
-        "capacity_schedule_sha256": schedule_sha256,
-        "entries": [{"entry": index} for index in range(15)],
-        "qualification_eligible": False, "controller_chronology_proven": False,
-    }
     registration_head = append_event(
         "source5_prepared_capacity_registered", setup_details,
     )
+    if expected_setup_head is not None and registration_head != expected_setup_head:
+        raise AssertionError(
+            "generated H6 registration head differs from its exact first SourceA event",
+        )
     registration["registration_head"] = registration_head
     header["initial"]["capacity_registration_head"] = registration_head
-    original_context = {
-        "original_pins": original_pins,
-        "execution_manifest": {
-            "preparatory_capacity_generation": generation,
-            "preparatory_capacity_registration": registration,
-        },
-        "width_projection": width_projection,
-        "event_projection": event_projection,
-        "cleanup_limits": {},
-        # This low-level SourceA parser component uses only a finite test
-        # allowance; production calls receive the exact verified prep schedule.
-        "phase_ledger_maximum_bytes": lineage.HOST_JOB_COUNT * lineage.MAX_RECORD_BYTES,
-        "phase_ledger_record_maximum_bytes": chronology.MAX_EVENT_BYTES,
-    }
+    if generated_fixture is None:
+        original_context = {
+            "original_pins": original_pins,
+            "execution_manifest": {
+                "preparatory_capacity_generation": generation,
+                "preparatory_capacity_registration": registration,
+            },
+            "width_projection": width_projection,
+            "event_projection": event_projection,
+            "cleanup_limits": {},
+            # This low-level SourceA parser component uses only a finite test
+            # allowance; production calls receive the exact verified prep schedule.
+            "phase_ledger_maximum_bytes": lineage.HOST_JOB_COUNT * lineage.MAX_RECORD_BYTES,
+            "phase_ledger_record_maximum_bytes": chronology.MAX_EVENT_BYTES,
+        }
     index_rows: list[dict[str, object]] = []
     ledger_lines: list[bytes] = []
     record_store: dict[str, bytes] = {}
@@ -300,6 +462,34 @@ def synthetic_full_replay_case():
              "allocator": job["allocator"]}
             for executor in ("bounded", "tokio")
         ]
+        helper_input_path = f"{output_root}/{campaign_id}/helper/{job['run_id']}.json"
+        helper_input_raw = chronology.canonical_bytes({
+            "campaign_id": campaign_id, "host_id": host_id,
+            "run_id": job["run_id"], "members": members,
+            "qualification_eligible": False,
+        })
+        if generated_fixture is None:
+            helper_module = {
+                "path": "scripts/application-fixed-pair.py",
+                "sha256": digest("8"), "size": 1,
+                "mode": "100644", "kind": "file",
+            }
+            helper_input_sha256 = digest("7")
+        else:
+            typed_helper = next(
+                row for row in generated_fixture.fixture.manifests[host_id][
+                    "source"]["files"]
+                if row["path"] == "scripts/application-fixed-pair.py"
+            )
+            helper_module = {
+                "path": typed_helper["path"],
+                "sha256": typed_helper["sha256"],
+                "size": typed_helper["size"],
+                "mode": typed_helper["mode"],
+                "kind": "file",
+            }
+            helper_input_sha256 = chronology.sha256_bytes(helper_input_raw)
+            record_store[helper_input_path] = helper_input_raw
         authorization = {
             "authorization_id": "", "campaign_id": campaign_id,
             "host_id": host_id, "phase": "exploration", "job_index": job_index,
@@ -309,11 +499,9 @@ def synthetic_full_replay_case():
             "members_sha256": chronology.sha256_bytes(chronology.canonical_bytes(members)),
             "execution_manifest": {"path": execution_pin["path"],
                                    "raw_sha256": execution_pin["raw_sha256"]},
-            "helper_input": {"path": f"{output_root}/{campaign_id}/helper/{job['run_id']}.json",
-                             "raw_sha256": digest("7")},
-            "helper_module": {"path": "scripts/application-fixed-pair.py",
-                              "sha256": digest("8"), "size": 1,
-                              "mode": "100644", "kind": "file"},
+            "helper_input": {"path": helper_input_path,
+                             "raw_sha256": helper_input_sha256},
+            "helper_module": helper_module,
             "capacity_registration_head": registration_head,
             "capacity_completion": {"path": host_completion["path"],
                                     "raw_sha256": host_completion["raw_sha256"]},
@@ -322,7 +510,9 @@ def synthetic_full_replay_case():
             "capacity_schedule_sha256": schedule_sha256,
             "prerequisites": {}, "outer_deadline_seconds": 30,
             "effective_timeout_seconds": 30,
-            "input_snapshot_sha256": digest("9"),
+            "input_snapshot_sha256": (helper_input_sha256
+                                       if generated_fixture is not None
+                                       else digest("9")),
             "output_root": pair_root,
             "qualification_eligible": False,
             "host_evidence_budget": {}, "tmpdir_budget": {},
@@ -336,17 +526,58 @@ def synthetic_full_replay_case():
         authorization_id = append_event("source5_authorized", authorization)
         start_heads, terminal_heads = [], []
         start_events, terminal_events, member_processes = [], [], []
-        overlay_sha = digest(str(job_index % 10))
+        if generated_fixture is None:
+            overlay_sha = digest(str(job_index % 10))
+            receipt_sha = digest("a")
+            host_receipt_sha = digest("b")
+            host_verification_sha = digest("c")
+            overlay_path = f"{output_root}/{campaign_id}/overlay/{job['run_id']}.json"
+            receipt_path = f"{output_root}/{campaign_id}/receipt/{job['run_id']}.json"
+            host_receipt_path = f"{output_root}/{campaign_id}/host/{job['run_id']}.json"
+        else:
+            process_rows = [{
+                "executor": executor, "completed_on_time": "1",
+                "completed_late": "0", "attempted": "1", "admitted": "1",
+                "rejected_full": "0", "rejected_resource": "0",
+            } for executor in ("bounded", "tokio")]
+            overlay_raw = chronology.canonical_bytes({
+                "schema": "allocatbelt.application-fixed-pair-execution-overlay.v1",
+                "campaign_id": campaign_id, "host_id": host_id,
+                "run_id": job["run_id"], "members": members,
+                "qualification_eligible": False,
+            })
+            receipt_raw = chronology.canonical_bytes({
+                "schema": "allocatbelt.application-fixed-pair-execution-receipt.v1",
+                "campaign_id": campaign_id, "host_id": host_id,
+                "run_id": job["run_id"], "status": "valid_pair",
+                "process_rows": process_rows,
+                "qualification_eligible": False,
+            })
+            host_receipt_raw = chronology.canonical_bytes({
+                "schema": "synthetic.structural-fixed-host-receipt.v1",
+                "campaign_id": campaign_id, "host_id": host_id,
+                "run_id": job["run_id"], "qualification_eligible": False,
+            })
+            overlay_sha = chronology.sha256_bytes(overlay_raw)
+            receipt_sha = chronology.sha256_bytes(receipt_raw)
+            host_receipt_sha = chronology.sha256_bytes(host_receipt_raw)
+            host_verification_sha = chronology.sha256_bytes(
+                chronology.canonical_bytes({"receipt_sha256": host_receipt_sha}),
+            )
+            overlay_path = f"{output_root}/{campaign_id}/overlay/{job['run_id']}.json"
+            receipt_path = f"{output_root}/{campaign_id}/receipt/{job['run_id']}.json"
+            host_receipt_path = f"{output_root}/{campaign_id}/host/{job['run_id']}.json"
+            record_store[overlay_path] = overlay_raw
+            record_store[receipt_path] = receipt_raw
+            record_store[host_receipt_path] = host_receipt_raw
         evidence = {
             "kind": "source5_fixed_pair",
-            "overlay": {"path": f"{output_root}/{campaign_id}/overlay/{job['run_id']}.json",
-                        "raw_sha256": overlay_sha},
-            "receipt": {"path": f"{output_root}/{campaign_id}/receipt/{job['run_id']}.json",
-                        "raw_sha256": digest("a")},
+            "overlay": {"path": overlay_path, "raw_sha256": overlay_sha},
+            "receipt": {"path": receipt_path, "raw_sha256": receipt_sha},
             "host_receipt": {
-                "path": f"{output_root}/{campaign_id}/host/{job['run_id']}.json",
-                "raw_sha256": digest("b"),
-                "host_verification_sha256": digest("c"),
+                "path": host_receipt_path,
+                "raw_sha256": host_receipt_sha,
+                "host_verification_sha256": host_verification_sha,
             },
             "execution_manifest": authorization["execution_manifest"],
         }
@@ -440,25 +671,141 @@ def synthetic_full_replay_case():
         leaf = f"{job['ordinal']:06d}-{chronology.sha256_bytes(chronology.canonical_bytes(job))}"
         metadata = (f"{output_root}/{campaign_id}/chronology/{host_id}/"
                     "evidence-checkpoints/exploration")
-        ack_path = f"/tmp/synthetic-root/acks/exploration/{leaf}.json"
-        signature_path = f"/tmp/synthetic-root/acks/signatures/exploration/{leaf}.sig"
-        archive_pins = {
-            "request_pin": {"path": f"{metadata}/{leaf}.request.json",
-                            "raw_sha256": digest("e"), "semantic_sha256": digest("f")},
-            "checkpoint_pin": {"path": f"{metadata}/{leaf}.checkpoint.json",
-                                "raw_sha256": digest("1"), "semantic_sha256": digest("2")},
-            "object_manifest_pin": {"path": f"{metadata}/{leaf}.object-manifest.json",
-                                     "raw_sha256": digest("3"), "semantic_sha256": digest("4")},
-            "ack_pin": {"path": ack_path, "raw_sha256": digest("5"),
-                        "semantic_sha256": digest("6")},
-            "signature_pin": {"path": signature_path,
-                               "raw_sha256": digest("7"),
-                               "signer_fingerprint": "A" * 40},
-        }
+        if generated_fixture is None:
+            ack_path = f"/tmp/synthetic-root/acks/exploration/{leaf}.json"
+            signature_path = f"/tmp/synthetic-root/acks/signatures/exploration/{leaf}.sig"
+            archive_pins = {
+                "request_pin": {"path": f"{metadata}/{leaf}.request.json",
+                                "raw_sha256": digest("e"), "semantic_sha256": digest("f")},
+                "checkpoint_pin": {"path": f"{metadata}/{leaf}.checkpoint.json",
+                                    "raw_sha256": digest("1"), "semantic_sha256": digest("2")},
+                "object_manifest_pin": {"path": f"{metadata}/{leaf}.object-manifest.json",
+                                         "raw_sha256": digest("3"), "semantic_sha256": digest("4")},
+                "ack_pin": {"path": ack_path, "raw_sha256": digest("5"),
+                            "semantic_sha256": digest("6")},
+                "signature_pin": {"path": signature_path,
+                                   "raw_sha256": digest("7"),
+                                   "signer_fingerprint": "A" * 40},
+            }
+            pilot_pair_sha = digest("8")
+        else:
+            record_pin = {
+                "path": record_path,
+                "raw_sha256": chronology.sha256_bytes(record_raw),
+            }
+            request_body = {
+                "schema": "allocatbelt.application-source5-evidence-checkpoint-request.structural-v1",
+                "campaign_id": campaign_id, "host_id": host_id,
+                "job": job, "job_record_pin": record_pin,
+            }
+            request_semantic = chronology.sha256_bytes(
+                chronology.canonical_bytes(request_body),
+            )
+            request_value = {
+                **request_body, "request_sha256": request_semantic,
+            }
+            request_raw = chronology.canonical_bytes(request_value)
+            request_pin = {
+                "path": f"{metadata}/{leaf}.request.json",
+                "raw_sha256": chronology.sha256_bytes(request_raw),
+                "semantic_sha256": request_semantic,
+            }
+            checkpoint_body = {
+                "schema": "allocatbelt.application-source5-evidence-checkpoint.structural-v1",
+                "request_pin": request_pin,
+                "job_record_pin": record_pin,
+            }
+            checkpoint_semantic = chronology.sha256_bytes(
+                chronology.canonical_bytes(checkpoint_body),
+            )
+            checkpoint_value = {
+                **checkpoint_body, "checkpoint_sha256": checkpoint_semantic,
+            }
+            checkpoint_raw = chronology.canonical_bytes(checkpoint_value)
+            checkpoint_pin = {
+                "path": f"{metadata}/{leaf}.checkpoint.json",
+                "raw_sha256": chronology.sha256_bytes(checkpoint_raw),
+                "semantic_sha256": checkpoint_semantic,
+            }
+            manifest_body = {
+                "schema": "allocatbelt.application-source5-evidence-object-manifest.structural-v1",
+                "objects": [{"path": record_path,
+                             "raw_sha256": record_pin["raw_sha256"]}],
+            }
+            manifest_semantic = chronology.sha256_bytes(
+                chronology.canonical_bytes(manifest_body),
+            )
+            manifest_value = {
+                **manifest_body, "manifest_sha256": manifest_semantic,
+            }
+            manifest_raw = chronology.canonical_bytes(manifest_value)
+            object_manifest_pin = {
+                "path": f"{metadata}/{leaf}.object-manifest.json",
+                "raw_sha256": chronology.sha256_bytes(manifest_raw),
+                "semantic_sha256": manifest_semantic,
+            }
+            ack_path = (
+                f"{generated_fixture.evidence_root}/archive-root/acks/"
+                f"exploration/{leaf}.json"
+            )
+            signature_path = (
+                f"{generated_fixture.evidence_root}/archive-root/acks/"
+                f"signatures/exploration/{leaf}.sig"
+            )
+            signature_fingerprint = generated_fixture.signer_context[
+                "authorized_primary_fingerprint"]
+            ack_body = {
+                "schema": "allocatbelt.application-source5-evidence-ack.structural-v1",
+                "checkpoint_pin": checkpoint_pin,
+                "object_manifest_pin": object_manifest_pin,
+                "signer_fingerprint": signature_fingerprint,
+            }
+            ack_semantic = chronology.sha256_bytes(
+                chronology.canonical_bytes(ack_body),
+            )
+            ack_value = {**ack_body, "ack_sha256": ack_semantic}
+            ack_raw = chronology.canonical_bytes(ack_value)
+            signature_raw = (
+                b"synthetic structural signature witness for " +
+                job["run_id"].encode("ascii") + b"\n"
+            )
+            archive_pins = {
+                "request_pin": request_pin,
+                "checkpoint_pin": checkpoint_pin,
+                "object_manifest_pin": object_manifest_pin,
+                "ack_pin": {
+                    "path": ack_path,
+                    "raw_sha256": chronology.sha256_bytes(ack_raw),
+                    "semantic_sha256": ack_semantic,
+                },
+                "signature_pin": {
+                    "path": signature_path,
+                    "raw_sha256": chronology.sha256_bytes(signature_raw),
+                    "signer_fingerprint": signature_fingerprint,
+                },
+            }
+            record_store.update({
+                request_pin["path"]: request_raw,
+                checkpoint_pin["path"]: checkpoint_raw,
+                object_manifest_pin["path"]: manifest_raw,
+                ack_path: ack_raw,
+                signature_path: signature_raw,
+            })
+            pair_binding = {
+                "overlay_raw_sha256": evidence["overlay"]["raw_sha256"],
+                "receipt_raw_sha256": evidence["receipt"]["raw_sha256"],
+                "verified_receipt_sha256": evidence["receipt"]["raw_sha256"],
+                "run_id": job["run_id"],
+            }
+            pilot_pair_sha = chronology.sha256_bytes(
+                chronology.canonical_bytes(pair_binding),
+            )
+            pilot_pair_by_key[(job["family"], job["profile"],
+                               job["allocator"], job["ordinal"])] = pilot_pair_sha
         index_rows.append(lineage.build_prepared_exploration_lineage_index_row(
             job_index, job, campaign_id, host_id, output_root,
             {"path": record_path, "raw_sha256": chronology.sha256_bytes(record_raw)},
-            archive_pins, digest("8"), record,
+            archive_pins, pilot_pair_sha, record,
         ))
     journal_raw = b"".join(journal_lines)
     ledger_raw = b"".join(ledger_lines)
@@ -475,6 +822,93 @@ def synthetic_full_replay_case():
             "row_count": len(jobs),
         },
     })
+    generated_documents = None
+    if generated_fixture is not None:
+        pilot_cells = []
+        for cell in spec["cells"]:
+            for allocator in campaign_core.ALLOCATORS:
+                pairs = []
+                for ordinal in range(1, 7):
+                    key = (cell["family"], cell["profile"], allocator, ordinal)
+                    pairs.append({
+                        "ordinal": ordinal,
+                        "bounded_status": "valid", "tokio_status": "valid",
+                        "bounded_on_time": 1, "bounded_late": 0,
+                        "bounded_attempted": 1, "bounded_admitted": 1,
+                        "bounded_rejected": 0,
+                        "tokio_on_time": 1, "tokio_late": 0,
+                        "tokio_attempted": 1, "tokio_admitted": 1,
+                        "tokio_rejected": 0,
+                        "raw_pair_sha256": pilot_pair_by_key[key],
+                    })
+                pilot_cells.append({
+                    "family": cell["family"], "profile": cell["profile"],
+                    "allocator": allocator, "pairs": pairs,
+                })
+        pilot = {
+            "schema": lineage.PILOT_SCHEMA,
+            "spec_sha256": campaign_core.preregistration_digest(spec),
+            "host_id": host_id, "cells": pilot_cells,
+        }
+        pilot_raw = chronology.canonical_bytes(pilot)
+        pilot_sha = chronology.sha256_bytes(pilot_raw)
+        pilot_maximum = generated_fixture.input_preparation.capacity_pilot_maximum_bytes(
+            spec, host_id, campaign_core.ALLOCATORS, pilot["spec_sha256"],
+        )
+        if len(pilot_raw) > pilot_maximum:
+            raise AssertionError("synthetic pilot exceeds the actual Source cap")
+        # Lineage only joins the original pair digests. These counts remain
+        # explicitly synthetic fixture shape; this structural milestone does
+        # not derive rates or make a readiness decision.
+        pilot_path = (f"{output_root}/{campaign_id}/source5/{host_id}/exploration/"
+                      "capacity-pilot.json")
+
+        projected_outputs = lineage.project_prepared_exploration_lineage_outputs(
+            campaign_id, host_id, output_root, jobs,
+        )
+        index_path = projected_outputs["index"]["path"]
+        index_raw = chronology._source5_preparatory_lineage_index_bytes(
+            index_rows, projected_outputs["index"]["max_bytes"],
+        )
+        record_index_pin = {
+            "path": index_path,
+            "raw_sha256": chronology.sha256_bytes(index_raw),
+        }
+        pilot_pin = {
+            "path": pilot_path, "raw_sha256": pilot_sha,
+            "semantic_sha256": campaign_core.digest_object(pilot),
+        }
+        header = lineage.build_prepared_exploration_bridge_header(
+            campaign_id, host_id, output_root, header["initial"],
+            header["journal"], header["phase_ledger"], pilot_pin,
+            record_index_pin,
+        )
+        header_raw = chronology.canonical_bytes(header)
+        header_path = projected_outputs["header"]["path"]
+        record_store.update({
+            pilot_path: pilot_raw,
+            index_path: index_raw,
+            header_path: header_raw,
+            journal_path: journal_raw,
+            ledger_path: ledger_raw,
+        })
+        generated_documents = {
+            "header": header, "header_raw": header_raw,
+            "header_pin": {
+                "path": header_path,
+                "raw_sha256": chronology.sha256_bytes(header_raw),
+            },
+            "index_raw": index_raw, "index_pin": record_index_pin,
+            "pilot": pilot, "pilot_raw": pilot_raw,
+            "pilot_pin": pilot_pin,
+            "final_prepared": {
+                "campaign_id": campaign_id,
+                "host_id": host_id,
+                "output_root": str(generated_fixture.view_root / "final-output"),
+                "original_pins": copy.deepcopy(original_pins),
+                "source5_preparatory_capacity_generation": copy.deepcopy(generation),
+            },
+        }
     def artifact_reader(pin: dict[str, str], maximum: int) -> bytes:
         value = record_store.get(pin["path"])
         if value is None or len(value) > maximum or chronology.sha256_bytes(value) != pin["raw_sha256"]:
@@ -487,11 +921,293 @@ def synthetic_full_replay_case():
         "width_contract": width_contract,
         "journal_raw": journal_raw, "phase_ledger_raw": ledger_raw,
         "artifact_reader": artifact_reader,
+        "record_store": record_store,
+        "generated_documents": generated_documents,
         "chronology_module": chronology,
         "campaign_module": campaign_core,
         "preparatory_budget_module": prep_budget,
         "source5_campaign_module": source5_campaign,
+        "lineage_module": lineage,
     }
+
+
+def _write_origin_file(path: str, raw: bytes, mode: int = 0o600) -> None:
+    target = Path(path)
+    target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if target.exists():
+        info = target.lstat()
+        if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or
+                stat.S_IMODE(info.st_mode) != mode or target.read_bytes() != raw):
+            raise AssertionError("fixture origin already exists with different bytes")
+        return
+    descriptor = os.open(
+        target, os.O_WRONLY | os.O_CREAT | os.O_EXCL |
+        getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0), mode,
+    )
+    try:
+        os.fchmod(descriptor, mode)
+        offset = 0
+        while offset < len(raw):
+            offset += os.write(descriptor, raw[offset:])
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _capture_and_remove_origins(
+    origins: dict[str, bytes], capture_root: Path, *,
+    origin_modes: dict[str, int] | None = None,
+) -> tuple[
+    dict[str, tuple[str, Path, int]],
+    Callable[[dict[str, str], int], bytes],
+    list[tuple[str, int]],
+]:
+    """Copy exact old payload bytes to a private 0400 closed capture reader."""
+    capture_root.mkdir(mode=0o700)
+    capture_root.chmod(0o700)
+    captured: dict[str, tuple[str, Path, int]] = {}
+    origin_to_capture: dict[tuple[str, str], tuple[Path, int]] = {}
+    expected_modes = {} if origin_modes is None else dict(origin_modes)
+    if not set(expected_modes) <= set(origins):
+        raise AssertionError("origin mode map names an uncaptured source")
+    for index, (origin, raw) in enumerate(sorted(origins.items())):
+        if type(raw) is not bytes or not raw:
+            raise AssertionError("closed lineage fixture needs nonempty exact bytes")
+        expected_mode = expected_modes.get(origin, 0o600)
+        _write_origin_file(origin, raw, expected_mode)
+        source = Path(origin)
+        info = source.lstat()
+        if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or
+                stat.S_IMODE(info.st_mode) != expected_mode or source.read_bytes() != raw):
+            raise AssertionError("historical lineage origin is not the expected private file")
+        captured_path = capture_root / f"{index:04d}.bin"
+        descriptor = os.open(
+            captured_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL |
+            getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0), 0o400,
+        )
+        try:
+            os.fchmod(descriptor, 0o400)
+            offset = 0
+            while offset < len(raw):
+                offset += os.write(descriptor, raw[offset:])
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        raw_sha256 = hashlib.sha256(raw).hexdigest()
+        captured[captured_path.as_posix()] = (raw_sha256, captured_path, len(raw))
+        origin_to_capture[(origin, raw_sha256)] = (captured_path, len(raw))
+
+    if stat.S_IMODE(capture_root.lstat().st_mode) != 0o700:
+        raise AssertionError("closed capture root is not private")
+    expected_children = {path.name for _sha, path, _size in captured.values()}
+    if {path.name for path in capture_root.iterdir()} != expected_children:
+        raise AssertionError("closed capture root contains unlisted children")
+
+    for origin in origins:
+        Path(origin).unlink()
+    if any(Path(origin).exists() or Path(origin).is_symlink() for origin in origins):
+        raise AssertionError("a historical origin remained available after capture")
+
+    reads: list[tuple[str, int]] = []
+
+    def reader(pin: dict[str, str], maximum_bytes: int) -> bytes:
+        if type(pin) is not dict or set(pin) != {"path", "raw_sha256"}:
+            raise AssertionError("SourceA reader did not receive an exact raw-only pin")
+        if type(maximum_bytes) is not int or maximum_bytes <= 0:
+            raise AssertionError("SourceA reader received an invalid Source byte cap")
+        path = pin["path"]
+        expected = origin_to_capture.get((path, pin["raw_sha256"]))
+        if expected is None or expected[1] > maximum_bytes:
+            raise OSError("closed SourceA reader rejected an uncaptured or over-cap origin")
+        captured_path, size = expected
+        descriptor = os.open(
+            captured_path, os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) |
+            getattr(os, "O_NOFOLLOW", 0),
+        )
+        try:
+            info = os.fstat(descriptor)
+            if (not stat.S_ISREG(info.st_mode) or stat.S_IMODE(info.st_mode) != 0o400 or
+                    info.st_nlink != 1 or info.st_size != size or info.st_size > maximum_bytes):
+                raise OSError("closed SourceA capture file changed custody or size")
+            raw = os.read(descriptor, maximum_bytes + 1)
+            if len(raw) != size or hashlib.sha256(raw).hexdigest() != pin["raw_sha256"]:
+                raise OSError("closed SourceA capture file changed its raw digest")
+        finally:
+            os.close(descriptor)
+        reads.append((path, maximum_bytes))
+        return raw
+
+    return captured, reader, reads
+
+
+def _generated_lineage_origin_bytes(
+    fixture, artifacts: dict[str, object], case: dict[str, object],
+) -> dict[str, bytes]:
+    origins: dict[str, bytes] = {}
+
+    def add(path: str | Path, raw: bytes) -> None:
+        key = str(path)
+        if type(raw) is not bytes or not raw:
+            raise AssertionError(f"generated lineage origin {key} has no exact bytes")
+        previous = origins.get(key)
+        if previous is not None and previous != raw:
+            raise AssertionError(f"generated lineage origin {key} changed bytes")
+        origins[key] = raw
+
+    add(fixture.spec_path, fixture.spec_raw)
+    add(fixture.plan_path, fixture.plan_raw)
+    for host in fixture.fixture.host_ids:
+        add(fixture.fixture.manifest_paths[host],
+            fixture.fixture.manifest_paths[host].read_bytes())
+        observed_path = Path(fixture.observed_pins[host]["path"])
+        add(observed_path, observed_path.read_bytes())
+    add(fixture.manifest_path, artifacts["manifest_raw"])
+    add(artifacts["width_pin"]["path"],
+        Path(artifacts["width_pin"]["path"]).read_bytes())
+    add(artifacts["budget_pin"]["path"],
+        Path(artifacts["budget_pin"]["path"]).read_bytes())
+    add(fixture.signer_pin["path"],
+        fixture.controller.canonical_bytes(fixture.signer_context))
+    for signer_field in ("keyring_pin", "gpgv_pin"):
+        signer_tool = fixture.signer_context[signer_field]
+        add(signer_tool["path"], Path(signer_tool["path"]).read_bytes())
+    fixed_host_path = fixture.context.fixed_spec_host_pin["path"]
+    add(fixed_host_path, Path(fixed_host_path).read_bytes())
+
+    generation_path = fixture.generation_completion["path"]
+    add(generation_path, Path(generation_path).read_bytes())
+    preparation_path = fixture.generation["provenance"]["preparation_pin"]["path"]
+    add(preparation_path, Path(preparation_path).read_bytes())
+    selected = next(row for row in fixture.generation["capacity_preparations"]
+                    if row["host_id"] == fixture.host_id)
+    for pin in (
+        selected["completion"], selected["host_verification"], selected["ledger"],
+    ):
+        add(pin["path"], Path(pin["path"]).read_bytes())
+    for entry in selected["entries"]:
+        for role in ("request", "artifact", "receipt"):
+            pin = entry[role]
+            add(pin["path"], Path(pin["path"]).read_bytes())
+    for pin in fixture.generation["resource_budgets"].values():
+        add(pin["path"], Path(pin["path"]).read_bytes())
+
+    catalogue = artifacts["budget"]["path_catalogue"]
+    chunks = {row["path"]: row for row in catalogue["chunks"]}
+
+    def read_chunk(path: str, maximum_bytes: int) -> bytes:
+        chunk = chunks.get(path)
+        if type(chunk) is not dict or maximum_bytes != chunk["byte_count"]:
+            raise AssertionError("generated H6 reader requested an undeclared catalogue chunk")
+        raw = Path(path).read_bytes()
+        if (len(raw) != maximum_bytes or
+                hashlib.sha256(raw).hexdigest() != chunk["raw_sha256"]):
+            raise AssertionError("generated H6 catalogue chunk differs from its raw pin")
+        add(path, raw)
+        return raw
+
+    for chunk in catalogue["chunks"]:
+        read_chunk(chunk["path"], chunk["byte_count"])
+    retained_global_roles = {
+        "preparation", "source_manifest", "spec_v3", "plan_v3",
+        "execution_manifest", "observed_host", "host_evidence_budget",
+        "journal_width_contract", "preparatory_journal_width_contract",
+        "capacity_artifact", "capacity_completion", "capacity_host_receipt",
+        "capacity_ledger", "source5_archive_signer_context",
+        "source5_archive_signer_keyring", "source5_archive_signer_gpgv",
+        "journal", "source5_phase_ledger", "source5_job_record",
+        "source5_checkpoint_request", "source5_checkpoint",
+        "source5_object_manifest", "source5_archive_ack",
+        "source5_archive_signature", "source5_stage_map",
+    }
+    for row in fixture.budget_module.iter_fixed_pair_v3_path_catalogue_rows_with_reader(
+            catalogue, read_chunk):
+        if (row["kind"] != "file" or row.get("phase") is not None or
+                row["role"] not in retained_global_roles):
+            continue
+        origin = row.get("origin_pin")
+        if type(origin) is dict and type(origin.get("raw_sha256")) is str:
+            raw = Path(row["path"]).read_bytes()
+            if hashlib.sha256(raw).hexdigest() != origin["raw_sha256"]:
+                raise AssertionError("generated H6 catalogue origin differs from its raw pin")
+            add(row["path"], raw)
+
+    for path, raw in case["record_store"].items():
+        add(path, raw)
+    return origins
+
+
+def _merge_generated_lineage_origins(
+    generated: list[tuple[object, dict[str, object], dict[str, object]]],
+) -> tuple[dict[str, bytes], dict[str, int]]:
+    origins: dict[str, bytes] = {}
+    origin_modes: dict[str, int] = {}
+    for fixture, artifacts, case in generated:
+        for path, raw in _generated_lineage_origin_bytes(
+                fixture, artifacts, case).items():
+            prior = origins.get(path)
+            if prior is not None and prior != raw:
+                raise AssertionError(
+                    f"shared generated lineage origin {path} changed across host views",
+                )
+            origins[path] = raw
+        gpgv_path = fixture.signer_context["gpgv_pin"]["path"]
+        mode = stat.S_IMODE(Path(gpgv_path).lstat().st_mode)
+        previous_mode = origin_modes.get(gpgv_path)
+        if previous_mode is not None and previous_mode != mode:
+            raise AssertionError("shared generated GPGV executable mode changed")
+        origin_modes[gpgv_path] = mode
+    return origins, origin_modes
+
+
+def _materialize_production_capture(
+    declaration: dict[str, object],
+    artifact_reader: Callable[[dict[str, str], int], bytes],
+    capture_module: types.ModuleType,
+    capture_root: Path,
+) -> tuple[dict[str, object], object]:
+    capture_root.mkdir(mode=0o700)
+    capture_root.chmod(0o700)
+    objects_root = capture_root / "objects"
+    objects_root.mkdir(mode=0o700)
+    objects_root.chmod(0o700)
+    manifest_rows = []
+    for index, descriptor in enumerate(declaration["objects"]):
+        pin = dict(descriptor["origin_pin"])
+        raw = artifact_reader(pin, descriptor["maximum_bytes"])
+        if (type(raw) is not bytes or not raw or
+                len(raw) > descriptor["maximum_bytes"] or
+                hashlib.sha256(raw).hexdigest() != pin["raw_sha256"]):
+            raise AssertionError("production capture source object differs from its declaration")
+        relative = f"objects/{index:08d}.bin"
+        local = capture_root / relative
+        fd = os.open(
+            local, os.O_WRONLY | os.O_CREAT | os.O_EXCL |
+            getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0), 0o400,
+        )
+        try:
+            os.fchmod(fd, 0o400)
+            offset = 0
+            while offset < len(raw):
+                offset += os.write(fd, raw[offset:])
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        info = local.lstat()
+        if (not stat.S_ISREG(info.st_mode) or stat.S_IMODE(info.st_mode) != 0o400 or
+                info.st_nlink != 1 or info.st_size != len(raw)):
+            raise AssertionError("production capture object lacks exact private file custody")
+        manifest_rows.append({
+            "origin_pin": pin, "local_relative_path": relative,
+            "byte_count": len(raw),
+        })
+    manifest = {
+        "schema": capture_module.CAPTURE_MANIFEST_SCHEMA,
+        "objects": manifest_rows,
+    }
+    reader = capture_module.PreparedExplorationLineageCaptureReaderV1(
+        declaration, manifest, str(capture_root),
+    )
+    return manifest, reader
 
 
 def producer_shaped_initial_context_case():
@@ -1023,47 +1739,6 @@ def producer_shaped_initial_context_case():
     }
 
 
-class CapturedReaderPinContractTests(unittest.TestCase):
-    def test_semantic_document_pin_reaches_exact_raw_reader(self) -> None:
-        raw = lineage.canonical_bytes({"schema": "captured-document-component"})
-        pin = {
-            "path": "/absent-origin/initial-spec.json",
-            "raw_sha256": lineage.sha256_bytes(raw),
-            "semantic_sha256": "e" * 64,
-        }
-        original_pin = dict(pin)
-        reads = []
-
-        def closed_reader(raw_pin, maximum):
-            self.assertEqual(set(raw_pin), {"path", "raw_sha256"})
-            self.assertEqual(raw_pin["path"], pin["path"])
-            self.assertEqual(raw_pin["raw_sha256"], lineage.sha256_bytes(raw))
-            reads.append((dict(raw_pin), maximum))
-            return raw
-
-        self.assertEqual(
-            lineage._reader_bytes(closed_reader, pin, len(raw), "captured Spec"),
-            raw,
-        )
-        self.assertEqual(pin, original_pin)
-        self.assertEqual(len(reads), 1)
-
-    def test_raw_projection_preserves_digest_and_byte_bounds(self) -> None:
-        raw = b"captured bytes\n"
-        pin = {
-            "path": "/absent-origin/metadata.json",
-            "raw_sha256": lineage.sha256_bytes(raw),
-            "semantic_sha256": "e" * 64,
-        }
-        for changed_raw, maximum in ((raw + b"changed", 128), (raw, len(raw) - 1)):
-            with self.subTest(raw=changed_raw, maximum=maximum):
-                with self.assertRaises(lineage.PreparedExplorationLineageError):
-                    lineage._reader_bytes(
-                        lambda _pin, _maximum: changed_raw,
-                        pin, maximum, "captured metadata",
-                    )
-
-
 class PreparedLineageProjectionTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
@@ -1378,6 +2053,1331 @@ class PreparedLineageProjectionTests(unittest.TestCase):
                             for line in lines))
         with self.assertRaises(chronology.ChronologyError):
             chronology._source5_preparatory_lineage_index_bytes(rows, exact_cap - 1)
+
+    def test_v2_provenance_requires_exact_two_host_raw_pin_map(self) -> None:
+        hosts = ["host-kvm-a", "host-kvm-b"]
+        digest = "a" * 64
+
+        def pin(path: str) -> dict[str, str]:
+            return {"path": path, "raw_sha256": digest}
+
+        provenance = {
+            "schema": lineage.SOURCE5_PREPARED_INPUTS_PROVENANCE_SCHEMA_V2,
+            "preparation_pin": pin("/tmp/final/preparation.json"),
+            "final_spec_pin": pin("/tmp/final/spec.json"),
+            "final_plan_pin": pin("/tmp/final/plan.json"),
+            "exploration_lineage": {
+                host: {
+                    "bridge_header": pin(f"/tmp/initial/{host}/bridge-header.json"),
+                    "record_index": pin(f"/tmp/initial/{host}/record-index.jsonl"),
+                }
+                for host in hosts
+            },
+        }
+        checked = lineage.validate_prepared_input_provenance_v2(
+            provenance, expected_hosts=hosts,
+        )
+        self.assertEqual(checked, provenance)
+        for changed in (
+            {**provenance, "imported": True},
+            {**provenance, "exploration_lineage": {
+                hosts[0]: provenance["exploration_lineage"][hosts[0]],
+            }},
+        ):
+            with self.subTest(fields=tuple(sorted(changed))):
+                with self.assertRaises(lineage.PreparedExplorationLineageError):
+                    lineage.validate_prepared_input_provenance_v2(
+                        changed, expected_hosts=hosts,
+                    )
+        bad_pin = copy.deepcopy(provenance)
+        bad_pin["exploration_lineage"][hosts[0]]["record_index"][
+            "semantic_sha256"
+        ] = digest
+        with self.assertRaises(lineage.PreparedExplorationLineageError):
+            lineage.validate_prepared_input_provenance_v2(
+                bad_pin, expected_hosts=hosts,
+            )
+
+
+class GeneratedH6PublicLineageTests(unittest.TestCase):
+    """Synthetic structure only: no APP, owner, GPG, or qualification claim."""
+
+    def test_generated_h6_budget_reaches_public_sourcea_lineage_through_0400_capture(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="source5-generated-lineage-") as directory:
+            fixture = producer_support.PreparatoryProducerFixture(
+                Path(directory), two_kvm_profile=True,
+            )
+            try:
+                original_pins, setup_details, setup_head = \
+                    fixture.bind_registration_to_sourcea_first_event()
+                artifacts = fixture.build()
+                for host_id in fixture.fixture.host_ids:
+                    observed_hash = fixture.observed_values[host_id]["controls_sha256"]
+                    self.assertEqual(
+                        artifacts["manifest"]["observed_hosts"][host_id][
+                            "host_fingerprint_sha256"],
+                        observed_hash,
+                    )
+                    self.assertEqual(
+                        artifacts["manifest"]["observed_hosts"][host_id][
+                            "controls_sha256"],
+                        observed_hash,
+                    )
+                # This is the actual H6 full validator over the generated
+                # execution/Plan/Spec/width/source/catalogue bytes and chunks.
+                fixture.validator(artifacts["budget"], artifacts["manifest"])
+                self.assertEqual(len(artifacts["budget"]["read_schedule"]), 360)
+                self.assertEqual(artifacts["width"]["total_event_count"], 2161)
+
+                case = synthetic_full_replay_case(generated=(
+                    fixture, artifacts, original_pins, setup_details, setup_head,
+                ))
+                documents = case["generated_documents"]
+                self.assertIsNotNone(documents)
+                self.assertEqual(len(case["jobs"]), 360)
+                self.assertEqual(len(case["rows"]), 360)
+                self.assertEqual(
+                    documents["header"]["initial"]["capacity_registration_head"],
+                    setup_head,
+                )
+
+                origins = _generated_lineage_origin_bytes(fixture, artifacts, case)
+                signer_executable_path = fixture.signer_context["gpgv_pin"]["path"]
+                captured, reader, reads = _capture_and_remove_origins(
+                    origins, Path(directory) / "closed-capture",
+                    origin_modes={
+                        signer_executable_path: stat.S_IMODE(
+                            Path(signer_executable_path).lstat().st_mode,
+                        ),
+                    },
+                )
+                self.assertTrue(captured)
+                self.assertTrue(all(Path(module.__file__).is_file()
+                                    for module in fixture.modules.values()))
+                for _sha, path, _size in captured.values():
+                    info = path.lstat()
+                    self.assertTrue(stat.S_ISREG(info.st_mode))
+                    self.assertEqual(stat.S_IMODE(info.st_mode), 0o400)
+                    self.assertEqual(info.st_nlink, 1)
+
+                header_pin = documents["header_pin"]
+                sourcea_lineage = case["lineage_module"]
+                with self.assertRaises(AssertionError):
+                    reader({**header_pin, "semantic_sha256": "0" * 64}, 256 * 1024)
+                with self.assertRaises(OSError):
+                    reader({"path": header_pin["path"],
+                            "raw_sha256": "0" * 64}, 256 * 1024)
+                with self.assertRaises(OSError):
+                    reader({"path": "/tmp/unlisted-lineage-origin.json",
+                            "raw_sha256": "0" * 64}, 256 * 1024)
+
+                proof = sourcea_lineage.verify_source5_prepared_exploration_lineage(
+                    documents["final_prepared"],
+                    {"bridge_header": documents["header_pin"],
+                     "record_index": documents["index_pin"]},
+                    artifact_reader=reader,
+                    campaign_module=fixture.campaign,
+                    input_preparation_module=fixture.input_preparation,
+                    campaign_inputs_module=fixture.inputs_module,
+                    chronology_module=fixture.chronology,
+                    source5_campaign_module=fixture.controller,
+                    preparatory_budget_module=fixture.prep_module,
+                )
+                self.assertEqual(proof["job_count"], 360)
+                self.assertEqual(proof["callback_count"], 2160)
+                self.assertEqual(proof["initial_journal_record_count"], 2161)
+                self.assertEqual(proof["initial_phase_ledger_row_count"], 360)
+                self.assertTrue(proof["allowed_slot_fill_proved"])
+                self.assertTrue(proof["component_replay_required"])
+                self.assertTrue(proof["fresh_sourcea_gpg_replay_required"])
+                self.assertFalse(proof["qualification_eligible"])
+
+                indexed_paths = set()
+                for row in case["rows"]:
+                    indexed_paths.add(row["job_record_pin"]["path"])
+                    indexed_paths.update(
+                        pin["path"] for pin in row["archive_pins"].values()
+                    )
+                read_counts = {}
+                for path, _maximum in reads:
+                    if path in indexed_paths:
+                        read_counts[path] = read_counts.get(path, 0) + 1
+                self.assertEqual(len(indexed_paths), 2160)
+                self.assertEqual(set(read_counts), indexed_paths)
+                self.assertTrue(all(count == 1 for count in read_counts.values()))
+
+                wrong_head = copy.deepcopy(documents["header"])
+                wrong_head["initial"]["capacity_registration_head"] = "0" * 64
+                with self.assertRaises(sourcea_lineage.PreparedExplorationLineageError):
+                    sourcea_lineage._replay_initial_preparatory_journal_and_ledger(
+                        wrong_head, case["jobs"], case["rows"],
+                        case["original_context"], artifact_reader=reader,
+                        chronology_module=fixture.chronology,
+                        campaign_module=fixture.campaign,
+                        journal_raw=case["journal_raw"],
+                        phase_ledger_raw=case["phase_ledger_raw"],
+                    )
+            finally:
+                fixture.close()
+
+
+class GeneratedH6RichLineageProofTests(unittest.TestCase):
+    """Real H6 bytes exercise the additive rich proof and A6 window join."""
+
+    def test_generated_v2_matches_lean_and_projects_actual_a6_windows(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="source5-generated-rich-lineage-") as directory:
+            fixture = producer_support.PreparatoryProducerFixture(
+                Path(directory), two_kvm_profile=True,
+            )
+            try:
+                original_pins, setup_details, setup_head = \
+                    fixture.bind_registration_to_sourcea_first_event()
+                artifacts = fixture.build()
+                fixture.validator(artifacts["budget"], artifacts["manifest"])
+                case = synthetic_full_replay_case(generated=(
+                    fixture, artifacts, original_pins, setup_details, setup_head,
+                ))
+                documents = case["generated_documents"]
+                origins = _generated_lineage_origin_bytes(fixture, artifacts, case)
+                gpgv_path = fixture.signer_context["gpgv_pin"]["path"]
+                _captured, reader, _reads = _capture_and_remove_origins(
+                    origins, Path(directory) / "rich-closed-capture",
+                    origin_modes={
+                        gpgv_path: stat.S_IMODE(Path(gpgv_path).lstat().st_mode),
+                    },
+                )
+                sourcea = fixture.lineage_module
+                lineage_pins = {
+                    "bridge_header": documents["header_pin"],
+                    "record_index": documents["index_pin"],
+                }
+                verifier_args = {
+                    "artifact_reader": reader,
+                    "campaign_module": fixture.campaign,
+                    "input_preparation_module": fixture.input_preparation,
+                    "campaign_inputs_module": fixture.inputs_module,
+                    "chronology_module": fixture.chronology,
+                    "source5_campaign_module": fixture.controller,
+                    "preparatory_budget_module": fixture.prep_module,
+                }
+                lean = sourcea.verify_source5_prepared_exploration_lineage(
+                    documents["final_prepared"], lineage_pins, **verifier_args,
+                )
+                rich = sourcea.verify_source5_prepared_exploration_lineage_v2(
+                    documents["final_prepared"], lineage_pins, **verifier_args,
+                )
+
+                lean_fields = {
+                    "schema", "campaign_id", "host_id", "initial_output_root",
+                    "final_output_root", "bridge_header_pin", "record_index_pin",
+                    "job_count", "callback_count", "allowed_slot_fill_proved",
+                    "initial_journal_pin", "initial_journal_structurally_replayed",
+                    "initial_phase_ledger_structurally_replayed", "initial_journal_head",
+                    "initial_journal_record_count", "initial_phase_ledger_pin",
+                    "initial_phase_ledger_byte_count", "initial_phase_ledger_row_count",
+                    "component_replay_required", "fresh_sourcea_gpg_replay_required",
+                    "qualification_eligible",
+                }
+                rich_fields = lean_fields | {
+                    "bridge_header", "index_rows", "capture_context", "records",
+                    "journal_authorizations", "journal_finished", "ancestor",
+                }
+                self.assertEqual(set(lean), lean_fields)
+                self.assertEqual(lean["schema"],
+                                 "allocatbelt.application-source5-prepared-exploration-lineage-proof.v1")
+                self.assertEqual(set(rich), rich_fields)
+                self.assertEqual(rich["schema"],
+                                 "allocatbelt.application-source5-prepared-exploration-lineage-proof.v2")
+                lean_projection = {key: rich[key] for key in lean_fields}
+                lean_projection["schema"] = lean["schema"]
+                self.assertEqual(lean, lean_projection)
+
+                self.assertEqual(rich["bridge_header"], documents["header"])
+                self.assertEqual(rich["index_rows"], case["rows"])
+                self.assertEqual(set(rich["capture_context"]), {
+                    "execution_manifest", "width_contract", "budget",
+                    "preparatory_original_pins",
+                })
+                self.assertEqual(rich["capture_context"]["execution_manifest"],
+                                 artifacts["manifest"])
+                self.assertEqual(rich["capture_context"]["width_contract"],
+                                 artifacts["width"])
+                self.assertEqual(rich["capture_context"]["budget"],
+                                 artifacts["budget"])
+                self.assertEqual(rich["capture_context"]["preparatory_original_pins"],
+                                 artifacts["budget"]["original_pins"])
+
+                attach_root = Path(directory) / "prepared-context-lock-root"
+                attach_root.mkdir(mode=0o700)
+                prepared_context = {
+                    "source5_execution_schema": fixture.controller.EXECUTION_SCHEMA_V5,
+                    "source5_prepared_input_provenance_v2": rich,
+                    "source5_journal_width_contract_pin": artifacts["width_pin"],
+                    "campaign_id": fixture.spec["campaign_id"],
+                    "host_id": fixture.host_id,
+                    "plan": fixture.plan,
+                }
+                with fixture.chronology.campaign_host_lock(
+                        attach_root, fixture.spec["campaign_id"], fixture.host_id) as lock:
+                    attached = fixture.chronology._source5_attach_prepared_exploration_context(
+                        lock, prepared_context, rich,
+                    )
+                self.assertIs(
+                    attached,
+                    prepared_context["source5_prepared_exploration_ancestor"],
+                )
+                self.assertEqual(len(attached["index_rows"]), 360)
+                for index, authorization in enumerate(rich["journal_authorizations"]):
+                    row = attached["index_rows"][index]
+                    self.assertEqual(row["row_index"], index)
+                    self.assertEqual(
+                        row["job_sha256"],
+                        fixture.chronology.sha256_bytes(
+                            fixture.chronology.canonical_bytes(row["job"]),
+                        ),
+                    )
+                    self.assertEqual(authorization["job_index"], row["row_index"])
+                    self.assertEqual(authorization["job_sha256"], row["job_sha256"])
+
+                expected_jobs = case["jobs"]
+                expected_records = [
+                    json.loads(line)
+                    for line in case["phase_ledger_raw"].splitlines()
+                ]
+                self.assertEqual(len(rich["records"]), 360)
+                self.assertEqual(rich["records"], expected_records)
+                authorization_fields = {
+                    "authorization_id", "phase", "job_index", "job", "job_run_id",
+                    "job_sha256", "members_sha256", "capacity_registration_head",
+                    "authorization_head", "execution_manifest", "helper_input",
+                    "helper_module", "capacity_completion", "capacity_ledger_raw_sha256",
+                    "capacity_terminal_head", "capacity_schedule_sha256", "prerequisites",
+                    "input_snapshot_sha256", "output_root", "outer_deadline_seconds",
+                    "effective_timeout_seconds", "member_count", "members", "starts",
+                    "terminals", "job_terminal", "authorization_record_count",
+                }
+                finished_fields = {
+                    "phase", "job_run_id", "authorization_id",
+                    "authorization_head", "job_terminal",
+                }
+                self.assertEqual(len(rich["journal_authorizations"]), 360)
+                self.assertEqual(len(rich["journal_finished"]), 360)
+                for index, (job, authorization, finished) in enumerate(zip(
+                        expected_jobs, rich["journal_authorizations"],
+                        rich["journal_finished"], strict=True)):
+                    self.assertEqual(set(authorization), authorization_fields)
+                    self.assertEqual(set(finished), finished_fields)
+                    self.assertEqual(authorization["job"], job)
+                    self.assertEqual(authorization["job_index"], index)
+                    self.assertEqual(authorization["job_run_id"], job["run_id"])
+                    self.assertEqual(authorization["authorization_record_count"],
+                                     index * 6 + 2)
+                    self.assertEqual(finished["job_run_id"], job["run_id"])
+                    self.assertEqual(finished["authorization_id"],
+                                     authorization["authorization_id"])
+                    self.assertEqual(finished["authorization_head"],
+                                     authorization["authorization_head"])
+                    self.assertEqual(finished["job_terminal"],
+                                     authorization["job_terminal"])
+
+                ancestor = rich["ancestor"]
+                self.assertEqual(set(ancestor), {
+                    "bridge_header_pin", "record_index_pin", "header_byte_count",
+                    "index_byte_count", "job_list_sha256", "journal", "phase_ledger",
+                })
+                self.assertEqual(ancestor["bridge_header_pin"], documents["header_pin"])
+                self.assertEqual(ancestor["record_index_pin"], documents["index_pin"])
+                self.assertEqual(ancestor["header_byte_count"],
+                                 len(documents["header_raw"]))
+                self.assertEqual(ancestor["index_byte_count"],
+                                 len(documents["index_raw"]))
+                self.assertEqual(ancestor["job_list_sha256"],
+                                 fixture.chronology.sha256_bytes(
+                                     fixture.chronology.canonical_bytes(expected_jobs),
+                                 ))
+                self.assertEqual(set(ancestor["journal"]), {
+                    "pin", "byte_count", "record_count", "head",
+                })
+                self.assertEqual(ancestor["journal"]["pin"], documents["header"]["journal"]["pin"])
+                self.assertEqual(ancestor["journal"]["byte_count"],
+                                 len(case["journal_raw"]))
+                self.assertEqual(ancestor["journal"]["record_count"], 2161)
+                self.assertEqual(ancestor["journal"]["head"],
+                                 documents["header"]["journal"]["head"])
+                self.assertEqual(set(ancestor["phase_ledger"]), {
+                    "pin", "byte_count", "row_count",
+                })
+                self.assertEqual(ancestor["phase_ledger"]["pin"],
+                                 documents["header"]["phase_ledger"]["pin"])
+                self.assertEqual(ancestor["phase_ledger"]["byte_count"],
+                                 len(case["phase_ledger_raw"]))
+                self.assertEqual(ancestor["phase_ledger"]["row_count"], 360)
+
+                windows = fixture.chronology._source5_prepared_ack_window_inputs(rich)
+                self.assertEqual(len(windows), 360)
+                for index, (index_row, record, authorization, finished) in enumerate(windows):
+                    self.assertEqual(index_row, rich["index_rows"][index])
+                    self.assertEqual(record, rich["records"][index])
+                    self.assertEqual(authorization, rich["journal_authorizations"][index])
+                    self.assertEqual(finished, rich["journal_finished"][index])
+                with self.assertRaises(fixture.chronology.ChronologyError):
+                    fixture.chronology._source5_prepared_ack_window_inputs(lean)
+
+                def swap_authorization_windows(proof: dict[str, object]) -> None:
+                    rows = proof["journal_authorizations"]
+                    rows[0], rows[1] = rows[1], rows[0]
+
+                def swap_records(proof: dict[str, object]) -> None:
+                    rows = proof["records"]
+                    rows[0], rows[1] = rows[1], rows[0]
+
+                def alter_sequence(proof: dict[str, object]) -> None:
+                    proof["journal_authorizations"][0][
+                        "authorization_record_count"] += 1
+
+                def alter_job_hash(proof: dict[str, object]) -> None:
+                    proof["journal_authorizations"][0]["job_sha256"] = "0" * 64
+
+                def remove_start(proof: dict[str, object]) -> None:
+                    proof["journal_authorizations"][0]["starts"].pop()
+
+                def alter_finished_terminal(proof: dict[str, object]) -> None:
+                    proof["journal_finished"][0]["authorization_id"] = "mismatched"
+
+                def remove_exact_key(proof: dict[str, object]) -> None:
+                    del proof["ancestor"]
+
+                def remove_authorization_key(proof: dict[str, object]) -> None:
+                    del proof["journal_authorizations"][0]["members"]
+
+                def remove_finished_key(proof: dict[str, object]) -> None:
+                    del proof["journal_finished"][0]["job_terminal"]
+
+                for label, corrupt in (
+                    ("missing rich proof key", remove_exact_key),
+                    ("missing authorization key", remove_authorization_key),
+                    ("missing finished key", remove_finished_key),
+                    ("authorization sequence", alter_sequence),
+                    ("job/index binding", swap_records),
+                    ("authorization member window", swap_authorization_windows),
+                    ("job hash", alter_job_hash),
+                    ("start cardinality", remove_start),
+                    ("finished terminal join", alter_finished_terminal),
+                ):
+                    corrupted = copy.deepcopy(rich)
+                    corrupt(corrupted)
+                    with self.subTest(window_corruption=label):
+                        with self.assertRaises(fixture.chronology.ChronologyError):
+                            fixture.chronology._source5_prepared_ack_window_inputs(
+                                corrupted,
+                            )
+
+                tamper_paths = {
+                    documents["header_pin"]["path"],
+                    documents["index_pin"]["path"],
+                    documents["header"]["journal"]["pin"]["path"],
+                    documents["header"]["phase_ledger"]["pin"]["path"],
+                    documents["header"]["pilot"]["pin"]["path"],
+                    case["rows"][0]["archive_pins"]["request_pin"]["path"],
+                }
+                journal_path = documents["header"]["journal"]["pin"]["path"]
+                member_digest = rich["journal_authorizations"][0][
+                    "members_sha256"].encode("ascii")
+                member_digest_marker = b'"members_sha256":"' + member_digest + b'"'
+
+                def replace_journal_event_field(
+                    raw: bytes, event: bytes, old: bytes, new: bytes,
+                ) -> bytes:
+                    event_position = raw.find(event)
+                    if event_position < 0:
+                        raise AssertionError("journal event marker was not present")
+                    line_start = raw.rfind(b"\n", 0, event_position) + 1
+                    line_end = raw.find(b"\n", event_position)
+                    if line_end < 0:
+                        raise AssertionError("journal event is not newline terminated")
+                    line = raw[line_start:line_end]
+                    changed_line = line.replace(old, new, 1)
+                    if changed_line == line:
+                        raise AssertionError("journal event field marker was not present")
+                    return raw[:line_start] + changed_line + raw[line_end:]
+
+                for target in sorted(tamper_paths):
+                    read_before = len(_reads)
+
+                    def tampering_reader(
+                        pin: dict[str, str], maximum: int, *,
+                        selected_path: str = target,
+                    ) -> bytes:
+                        raw = reader(pin, maximum)
+                        if pin["path"] != selected_path:
+                            return raw
+                        if selected_path == journal_path:
+                            # Change real authorization-member and APP-start fields;
+                            # both Source routes must reject the journal's old raw pin.
+                            changed = replace_journal_event_field(
+                                raw, b'"event":"source5_authorized"',
+                                member_digest_marker,
+                                b'"members_sha256":"' + b"0" * 64 + b'"',
+                            )
+                            changed = replace_journal_event_field(
+                                changed, b'"event":"source5_app_started"',
+                                b'"member_index":0', b'"member_index":1',
+                            )
+                            return changed
+                        return raw + b"\x00"
+
+                    for verifier in (
+                        sourcea.verify_source5_prepared_exploration_lineage,
+                        sourcea.verify_source5_prepared_exploration_lineage_v2,
+                    ):
+                        with self.assertRaises(sourcea.PreparedExplorationLineageError):
+                            verifier(
+                                documents["final_prepared"], lineage_pins,
+                                **{**verifier_args, "artifact_reader": tampering_reader},
+                            )
+                    self.assertTrue(
+                        any(path == target for path, _maximum in _reads[read_before:]),
+                        f"closed reader did not receive the tampered source pin {target}",
+                    )
+
+                def refusing_reader(_pin: dict[str, str], _maximum: int) -> bytes:
+                    raise OSError("closed proof reader refused the raw pin")
+
+                for verifier in (
+                    sourcea.verify_source5_prepared_exploration_lineage,
+                    sourcea.verify_source5_prepared_exploration_lineage_v2,
+                ):
+                    with self.assertRaises(OSError):
+                        verifier(
+                            documents["final_prepared"], lineage_pins,
+                            **{**verifier_args, "artifact_reader": refusing_reader},
+                        )
+                    changed_pins = copy.deepcopy(lineage_pins)
+                    changed_pins["bridge_header"]["raw_sha256"] = "0" * 64
+                    successful_read_count = len(_reads)
+                    with self.assertRaises(OSError):
+                        verifier(
+                            documents["final_prepared"], changed_pins,
+                            **verifier_args,
+                        )
+                    self.assertEqual(len(_reads), successful_read_count)
+                    changed_pins = copy.deepcopy(lineage_pins)
+                    changed_pins["record_index"]["raw_sha256"] = "0" * 64
+                    successful_read_count = len(_reads)
+                    with self.assertRaises(sourcea.PreparedExplorationLineageError):
+                        verifier(
+                            documents["final_prepared"], changed_pins,
+                            **verifier_args,
+                        )
+                    self.assertEqual(
+                        _reads[successful_read_count:],
+                        [(lineage_pins["bridge_header"]["path"], 256 * 1024)],
+                    )
+
+                missing_v2_context = types.SimpleNamespace(
+                    manifest={
+                        "schema": fixture.controller.EXECUTION_SCHEMA_V5,
+                        "hosts": [fixture.host_id],
+                    },
+                    scope=fixture.controller.PREPARED_EXPLORATION_REUSE_SCOPE,
+                    prepared_input_provenance_v2={},
+                    lineage_artifact_reader=reader,
+                    modules={
+                        fixture.controller.SOURCE5_PREPARED_LINEAGE_SOURCE_PATH:
+                            sourcea,
+                        fixture.controller.SOURCE5_PREPARED_BRIDGE_BUDGET_SOURCE_PATH:
+                            fixture.bridge_budget_module,
+                    },
+                )
+                self.assertTrue(callable(
+                    sourcea.verify_source5_prepared_exploration_lineage,
+                ))
+                rich_verifier = sourcea.verify_source5_prepared_exploration_lineage_v2
+                delattr(sourcea, "verify_source5_prepared_exploration_lineage_v2")
+                try:
+                    with self.assertRaisesRegex(
+                            fixture.controller.Source5CampaignError,
+                            "lacks its structural proof"):
+                        fixture.controller._source5_validate_prepared_exploration_context(
+                            missing_v2_context,
+                        )
+                finally:
+                    sourcea.verify_source5_prepared_exploration_lineage_v2 = rich_verifier
+            finally:
+                fixture.close()
+
+
+class GeneratedH6TwoHostBridgeTests(unittest.TestCase):
+    """Synthetic two-host Source closure only; no native authority claim."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        super().setUpClass()
+        cls._temporary = tempfile.TemporaryDirectory(
+            prefix="source5-generated-two-host-bridge-",
+        )
+        cls.root = Path(cls._temporary.name)
+        cls.fixture = None
+        cls.capture_reader = None
+        try:
+            cls.fixture = producer_support.PreparatoryProducerFixture(
+                cls.root, two_kvm_profile=True,
+            )
+            cls.host_ids = list(cls.fixture.host_order)
+            if (len(cls.host_ids) != 2 or
+                    [row["host_id"] for row in cls.fixture.spec["hosts"]] != cls.host_ids):
+                raise AssertionError("two-host fixture changed its canonical cohort order")
+            cls.views = {
+                host: cls.fixture.selected_host_view(host)
+                for host in cls.host_ids
+            }
+            cls.artifacts_by_host = {}
+            cls.cases_by_host = {}
+            cls.setup_by_host = {}
+            cls.catalogue_pins_by_host = {}
+            cls.producer_pins_by_host = {}
+            cls.proofs = {}
+            for host in cls.host_ids:
+                view = cls.views[host]
+                original_pins, setup_details, setup_head = \
+                    view.bind_registration_to_sourcea_first_event()
+                artifacts = view.build()
+                view.validator(artifacts["budget"], artifacts["manifest"])
+                case = synthetic_full_replay_case(generated=(
+                    view, artifacts, original_pins, setup_details, setup_head,
+                ))
+                if (len(case["jobs"]) != 360 or len(case["rows"]) != 360 or
+                        artifacts["width"]["total_event_count"] != 2161 or
+                        len(artifacts["budget"]["read_schedule"]) != 360):
+                    raise AssertionError("generated H6 host view lost its exact source schedule")
+                cls.artifacts_by_host[host] = artifacts
+                cls.cases_by_host[host] = case
+                cls.setup_by_host[host] = (original_pins, setup_details, setup_head)
+                cls.catalogue_pins_by_host[host] = copy.deepcopy(
+                    artifacts["budget"]["path_catalogue"]["chunks"],
+                )
+                cls.producer_pins_by_host[host] = {
+                    "budget": copy.deepcopy(artifacts["budget_pin"]),
+                    "width": copy.deepcopy(artifacts["width_pin"]),
+                    "execution": copy.deepcopy(view.context.manifest_pin),
+                }
+
+            first, second = (cls.views[host] for host in cls.host_ids)
+            for view in (first, second):
+                if (view.spec_pin != first.spec_pin or view.plan_pin != first.plan_pin or
+                        view.spec_raw != first.spec_raw or view.plan_raw != first.plan_raw or
+                        tuple(view.fixture.host_ids) != tuple(cls.host_ids)):
+                    raise AssertionError("host views do not share the exact initial Spec/Plan cohort")
+            if (first.artifact_root == second.artifact_root or
+                    first.output_root == second.output_root or
+                    first.scratch_root == second.scratch_root or
+                    first.evidence_root == second.evidence_root or
+                    first.signer_pin["path"] == second.signer_pin["path"]):
+                raise AssertionError("host views share a selected-host artifact root/context")
+            if (first.context.source_manifest_pins != second.context.source_manifest_pins or
+                    first.context.manifest["hosts"] != second.context.manifest["hosts"] or
+                    first.context.host_id == second.context.host_id or
+                    first.registration is second.registration or
+                    first.signer_context["host_id"] != first.host_id or
+                    second.signer_context["host_id"] != second.host_id or
+                    first.signer_context["keyring_pin"] != second.signer_context["keyring_pin"] or
+                    first.signer_context["gpgv_pin"] != second.signer_context["gpgv_pin"]):
+                raise AssertionError("selected-host contexts do not preserve their shared cohort")
+            for view in (first, second):
+                for relative in (
+                    "scripts/application-source5-prepared-lineage.py",
+                    "scripts/application-source5-prepared-bridge-budget.py",
+                    "scripts/application-source5-lineage-capture.py",
+                    "scripts/application-source5-evidence-budget.py",
+                ):
+                    module = view.modules[relative]
+                    expected_path = str(view.fixture.root / relative)
+                    if (not isinstance(module, types.ModuleType) or
+                            module.__file__ != expected_path or
+                            sys.modules.get(module.__name__) is not module or
+                            type(getattr(module, "__source5_typed_pin__", None)) is not dict):
+                        raise AssertionError("two-host Source algorithm is not a typed registered module")
+            if first.budget_module.__source5_typed_pin__.get("path") != \
+                    "scripts/application-source5-evidence-budget.py":
+                raise AssertionError("two-host bridge lacks the selected typed catalogue module")
+
+            generated = [
+                (cls.views[host], cls.artifacts_by_host[host], cls.cases_by_host[host])
+                for host in cls.host_ids
+            ]
+            cls.origins, cls.origin_modes = _merge_generated_lineage_origins(generated)
+            cls.captured, raw_reader, cls.raw_reads = _capture_and_remove_origins(
+                cls.origins, cls.root / "closed-original-capture",
+                origin_modes=cls.origin_modes,
+            )
+            cls.raw_reader = staticmethod(raw_reader)
+            if any(Path(path).exists() or Path(path).is_symlink()
+                   for path in cls.origins):
+                raise AssertionError("a historical payload origin remained available")
+            if not all(Path(module.__file__).is_file()
+                       for view in cls.views.values()
+                       for module in view.modules.values()):
+                raise AssertionError("closed origin capture removed a selected typed Source file")
+
+            for host in cls.host_ids:
+                view = cls.views[host]
+                case = cls.cases_by_host[host]
+                documents = case["generated_documents"]
+                if type(documents) is not dict:
+                    raise AssertionError("generated H6 host view omitted SourceA documents")
+                proof = case["lineage_module"].verify_source5_prepared_exploration_lineage_v2(
+                    documents["final_prepared"],
+                    {"bridge_header": documents["header_pin"],
+                     "record_index": documents["index_pin"]},
+                    artifact_reader=cls.raw_reader,
+                    campaign_module=view.campaign,
+                    input_preparation_module=view.input_preparation,
+                    campaign_inputs_module=view.inputs_module,
+                    chronology_module=view.chronology,
+                    source5_campaign_module=view.controller,
+                    preparatory_budget_module=view.prep_module,
+                )
+                cls.proofs[host] = proof
+
+            cls.bridge_reads = []
+
+            def bridge_reader(pin: dict[str, str], maximum_bytes: int) -> bytes:
+                cls.bridge_reads.append((pin["path"], maximum_bytes))
+                return cls.raw_reader(pin, maximum_bytes)
+
+            cls.old_rows_by_host = {}
+            for host in cls.host_ids:
+                view = cls.views[host]
+                catalogue = cls.artifacts_by_host[host]["budget"]["path_catalogue"]
+                chunks = {row["path"]: row for row in catalogue["chunks"]}
+
+                def read_chunk(path: str, maximum_bytes: int,
+                               _chunks=chunks) -> bytes:
+                    chunk = _chunks.get(path)
+                    if type(chunk) is not dict or maximum_bytes != chunk["byte_count"]:
+                        raise AssertionError("fixture catalogue requested an undeclared chunk")
+                    return cls.raw_reader(
+                        {"path": path, "raw_sha256": chunk["raw_sha256"]},
+                        maximum_bytes,
+                    )
+
+                rows = view.budget_module.iter_fixed_pair_v3_path_catalogue_rows_with_reader(
+                    catalogue, read_chunk,
+                )
+                cls.old_rows_by_host[host] = {
+                    row["path"]: row for row in rows
+                    if row["kind"] == "file"
+                }
+
+            cls.expected_jobs = {
+                host: [row for row in first.plan["jobs"]["exploration"]
+                       if row["host_id"] == host]
+                for host in cls.host_ids
+            }
+            cls.bridge_module = first.bridge_budget_module
+            cls.capture_module = first.lineage_capture_module
+            cls.declaration, cls.storage_rows = \
+                cls.bridge_module.build_prepared_exploration_capture_storage_v1(
+                    cls.host_ids, cls.proofs,
+                    expected_ancestors={
+                        host: cls.proofs[host]["ancestor"] for host in cls.host_ids
+                    },
+                    expected_exploration_jobs=cls.expected_jobs,
+                    artifact_reader=bridge_reader,
+                    evidence_budget_module=first.budget_module,
+                )
+            cls.capture_root = cls.root / "production-capture"
+            cls.capture_manifest, cls.capture_reader = _materialize_production_capture(
+                cls.declaration, cls.raw_reader, cls.capture_module,
+                cls.capture_root,
+            )
+            cls.production_proofs = {}
+            for host in cls.host_ids:
+                view = cls.views[host]
+                documents = cls.cases_by_host[host]["generated_documents"]
+                cls.production_proofs[host] = \
+                    cls.cases_by_host[host]["lineage_module"].verify_source5_prepared_exploration_lineage_v2(
+                        documents["final_prepared"],
+                        {"bridge_header": documents["header_pin"],
+                         "record_index": documents["index_pin"]},
+                        artifact_reader=cls.capture_reader,
+                        campaign_module=view.campaign,
+                        input_preparation_module=view.input_preparation,
+                        campaign_inputs_module=view.inputs_module,
+                        chronology_module=view.chronology,
+                        source5_campaign_module=view.controller,
+                        preparatory_budget_module=view.prep_module,
+                    )
+            cls.rebuilt_declaration, cls.rebuilt_storage_rows = \
+                cls.bridge_module.build_prepared_exploration_capture_storage_v1(
+                    cls.host_ids, cls.production_proofs,
+                    expected_ancestors={
+                        host: cls.production_proofs[host]["ancestor"]
+                        for host in cls.host_ids
+                    },
+                    expected_exploration_jobs=cls.expected_jobs,
+                    artifact_reader=cls.capture_reader,
+                    evidence_budget_module=first.budget_module,
+                )
+        except BaseException:
+            if cls.capture_reader is not None:
+                cls.capture_reader.close()
+            if cls.fixture is not None:
+                cls.fixture.close()
+            cls._temporary.cleanup()
+            raise
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        try:
+            if cls.capture_reader is not None:
+                cls.capture_reader.close()
+            if cls.fixture is not None:
+                cls.fixture.close()
+        finally:
+            cls._temporary.cleanup()
+            super().tearDownClass()
+
+    def _indexed_binding(self, host: str, row_index: int, role: str):
+        index_row = self.proofs[host]["index_rows"][row_index]
+        if role == "source5_job_record":
+            pin_value = index_row["job_record_pin"]
+        else:
+            archive_key = {
+                "source5_checkpoint_request": "request_pin",
+                "source5_checkpoint": "checkpoint_pin",
+                "source5_object_manifest": "object_manifest_pin",
+                "source5_archive_ack": "ack_pin",
+                "source5_archive_signature": "signature_pin",
+            }[role]
+            pin_value = index_row["archive_pins"][archive_key]
+        return index_row, pin_value, index_row["job"]
+
+    def _initial_output_root(self, host: str) -> str:
+        return self.cases_by_host[host]["generated_documents"]["header"][
+            "initial_output_root"]
+
+    def test_generated_two_host_bridge_replays_from_production_capture(self) -> None:
+        self.assertEqual(self.declaration["cohort_host_ids"], self.host_ids)
+        indexed = [row for row in self.declaration["objects"]
+                   if row["phase"] == "exploration"]
+        self.assertEqual(len(indexed), 4320)
+        expected_roles = {
+            "source5_job_record", "source5_checkpoint_request",
+            "source5_checkpoint", "source5_object_manifest",
+            "source5_archive_ack", "source5_archive_signature",
+        }
+        for host in self.host_ids:
+            host_rows = [row for row in indexed if row["host_id"] == host]
+            self.assertEqual(len(host_rows), 2160)
+            by_job = {}
+            for row in host_rows:
+                key = (row["host_id"], row["row_index"])
+                by_job.setdefault(key, set()).add(row["role"])
+                job = self.expected_jobs[host][row["row_index"]]
+                self.assertEqual(row["run_id"], job["run_id"])
+                self.assertEqual(row["job_sha256"],
+                                 hashlib.sha256(self.views[host].chronology.canonical_bytes(job)).hexdigest())
+            self.assertEqual(set(by_job), {
+                (host, row_index) for row_index in range(360)
+            })
+            self.assertTrue(all(roles == expected_roles for roles in by_job.values()))
+
+        for host in self.host_ids:
+            artifacts = self.artifacts_by_host[host]
+            documents = self.cases_by_host[host]["generated_documents"]
+            original_pins, _setup, _head = self.setup_by_host[host]
+            self.assertEqual(
+                artifacts["budget"]["path_catalogue"]["chunks"],
+                self.catalogue_pins_by_host[host],
+            )
+            self.assertEqual(artifacts["budget_pin"],
+                             self.producer_pins_by_host[host]["budget"])
+            self.assertEqual(artifacts["width_pin"],
+                             self.producer_pins_by_host[host]["width"])
+            self.assertEqual(artifacts["budget"],
+                             self.proofs[host]["capture_context"]["budget"])
+            self.assertEqual(artifacts["width"],
+                             self.proofs[host]["capture_context"]["width_contract"])
+            self.assertEqual(artifacts["manifest"],
+                             self.proofs[host]["capture_context"]["execution_manifest"])
+            self.assertEqual(
+                self.producer_pins_by_host[host]["execution"],
+                {key: documents["header"]["initial"]["execution_manifest_pin"][key]
+                 for key in ("path", "raw_sha256")},
+            )
+            self.assertEqual(
+                artifacts["budget"]["original_pins"],
+                self.proofs[host]["capture_context"]["preparatory_original_pins"],
+            )
+            case = self.cases_by_host[host]
+            self.assertEqual(original_pins, case["original_context"]["original_pins"])
+            first_event = json.loads(case["journal_raw"].splitlines()[0])
+            self.assertEqual(first_event["record"]["original_pins"], original_pins)
+            for proof in (self.proofs[host], self.production_proofs[host]):
+                self.assertEqual(proof["job_count"], 360)
+                self.assertEqual(proof["callback_count"], 2160)
+                self.assertEqual(proof["initial_journal_record_count"], 2161)
+                self.assertEqual(proof["initial_phase_ledger_row_count"], 360)
+                self.assertEqual(len(proof["index_rows"]), 360)
+                self.assertTrue(proof["allowed_slot_fill_proved"])
+                self.assertTrue(proof["component_replay_required"])
+                self.assertTrue(proof["fresh_sourcea_gpg_replay_required"])
+                self.assertFalse(proof["qualification_eligible"])
+
+        self.assertEqual(self.declaration, self.rebuilt_declaration)
+        self.assertEqual(self.storage_rows, self.rebuilt_storage_rows)
+        self.assertEqual(len(self.storage_rows), len(self.declaration["objects"]))
+        sourceh_original = self.proofs[self.host_ids[0]]["capture_context"][
+            "preparatory_original_pins"]
+        shared_inputs = (
+            (sourceh_original["preparation"], "preparation"),
+            (sourceh_original["capacity_generation"], "capacity_completion"),
+        )
+        for pin, role in shared_inputs:
+            matches = [row for row in self.declaration["objects"]
+                       if row["origin_pin"]["path"] == pin["path"] and
+                       row["origin_pin"]["raw_sha256"] == pin["raw_sha256"]]
+            self.assertEqual(len(matches), 1)
+            self.assertEqual(matches[0]["role"], role)
+            self.assertIsNone(matches[0]["host_id"])
+            self.assertIsNone(matches[0]["phase"])
+        storage_by_pin = {
+            (row["path"], row["origin_pin"]["raw_sha256"]): row
+            for row in self.storage_rows
+        }
+        for descriptor in indexed:
+            key = (descriptor["origin_pin"]["path"],
+                   descriptor["origin_pin"]["raw_sha256"])
+            storage = storage_by_pin[key]
+            self.assertEqual(storage["role"], descriptor["role"])
+            self.assertEqual(storage["host_id"], descriptor["host_id"])
+            self.assertEqual(storage["max_bytes"], descriptor["byte_count"])
+            self.assertEqual(storage["max_file_bytes"], descriptor["byte_count"])
+            self.assertEqual(storage["origin_pin"]["raw_sha256"], key[1])
+            if descriptor["role"] in {
+                    "source5_archive_ack", "source5_archive_signature"}:
+                self.assertEqual(storage["path"], descriptor["origin_pin"]["path"])
+        self.capture_reader.storage_usage()
+
+    def test_indexed_alias_rejects_crossed_leaf_host_or_role(self) -> None:
+        host, other_host = self.host_ids
+        bridge = self.bridge_module
+        row, pin, job = self._indexed_binding(host, 0, "source5_archive_ack")
+        view = self.views[host]
+        args = {
+            "initial_output_root": self._initial_output_root(host),
+            "campaign_id": view.spec["campaign_id"],
+            "selected_host": host,
+            "old_rows": self.old_rows_by_host[host],
+            "evidence_budget_module": view.budget_module,
+        }
+        leaf = f"{job['ordinal']:06d}-{row['job_sha256']}"
+
+        wrong_leaf = copy.deepcopy(row)
+        wrong_leaf["archive_pins"]["ack_pin"]["path"] = \
+            wrong_leaf["archive_pins"]["ack_pin"]["path"].replace(
+                f"{leaf}.json", f"{leaf}.wrong.json",
+            )
+        with self.assertRaises(bridge.PreparedBridgeBudgetError):
+            bridge._source5_indexed_reservation_binding(
+                wrong_leaf, wrong_leaf["archive_pins"]["ack_pin"],
+                "source5_archive_ack", job, **args,
+            )
+
+        wrong_root = copy.deepcopy(row)
+        wrong_root["archive_pins"]["signature_pin"]["path"] = str(
+            self.views[other_host].evidence_root / "archive-root" / "acks" /
+            "signatures" / "exploration" / f"{leaf}.sig",
+        )
+        with self.assertRaises(bridge.PreparedBridgeBudgetError):
+            bridge._source5_indexed_reservation_binding(
+                wrong_root, wrong_root["archive_pins"]["ack_pin"],
+                "source5_archive_ack", job, **args,
+            )
+
+        request_row, request_pin, request_job = self._indexed_binding(
+            host, 0, "source5_checkpoint_request",
+        )
+        crossed_host = copy.deepcopy(request_job)
+        crossed_host["host_id"] = other_host
+        with self.assertRaises(bridge.PreparedBridgeBudgetError):
+            bridge._source5_indexed_reservation_binding(
+                request_row, request_pin, "source5_checkpoint_request",
+                crossed_host,
+                initial_output_root=self._initial_output_root(host),
+                campaign_id=view.spec["campaign_id"], selected_host=host,
+                old_rows=self.old_rows_by_host[host],
+                evidence_budget_module=view.budget_module,
+            )
+        crossed_run = copy.deepcopy(request_job)
+        crossed_run["run_id"] = self.expected_jobs[other_host][0]["run_id"]
+        with self.assertRaises(bridge.PreparedBridgeBudgetError):
+            bridge._source5_indexed_reservation_binding(
+                request_row, request_pin, "source5_checkpoint_request",
+                crossed_run,
+                initial_output_root=self._initial_output_root(host),
+                campaign_id=view.spec["campaign_id"], selected_host=host,
+                old_rows=self.old_rows_by_host[host],
+                evidence_budget_module=view.budget_module,
+            )
+
+        metadata = (PurePosixPath(request_pin["path"]).parent)
+        ack_like = {**request_pin, "path": str(metadata / f"{leaf}.ack.json")}
+        with self.assertRaises(bridge.PreparedBridgeBudgetError):
+            bridge._source5_indexed_reservation_binding(
+                request_row, ack_like, "source5_checkpoint_request",
+                request_job,
+                initial_output_root=self._initial_output_root(host),
+                campaign_id=view.spec["campaign_id"], selected_host=host,
+                old_rows=self.old_rows_by_host[host],
+                evidence_budget_module=view.budget_module,
+            )
+
+    def test_indexed_binding_retains_pinned_origin_and_old_cap(self) -> None:
+        host = self.host_ids[0]
+        role = "source5_checkpoint_request"
+        index_row, pin_value, job = self._indexed_binding(host, 0, role)
+        original_root = self.cases_by_host[host]["generated_documents"][
+            "header"]["initial_output_root"]
+        kwargs = {
+            "initial_output_root": original_root,
+            "campaign_id": self.views[host].spec["campaign_id"],
+            "selected_host": host,
+            "evidence_budget_module": self.views[host].budget_module,
+        }
+        row_map = self.old_rows_by_host[host]
+        pin, reservation = self.bridge_module._source5_indexed_reservation_binding(
+            index_row, pin_value, role, job, old_rows=row_map, **kwargs,
+        )
+        mismatch_rows = dict(row_map)
+        mismatched = copy.deepcopy(reservation)
+        mismatched["origin_pin"] = {
+            "raw_sha256": "0" * 64, "semantic_sha256": None,
+        }
+        mismatch_rows[reservation["path"]] = mismatched
+        budget_module = self.views[host].budget_module
+        with self.assertRaises(budget_module.BudgetPlanError):
+            budget_module.source5_indexed_reservation_binding_v1(
+                index_row, pin_value, role, job,
+                old_rows=mismatch_rows, **{
+                    key: value for key, value in kwargs.items()
+                    if key != "evidence_budget_module"
+                },
+            )
+        with self.assertRaises(self.bridge_module.PreparedBridgeBudgetError):
+            self.bridge_module._source5_indexed_reservation_binding(
+                index_row, pin_value, role, job,
+                old_rows=mismatch_rows, **kwargs,
+            )
+
+        wrong_semantic_rows = dict(row_map)
+        wrong_semantic = copy.deepcopy(reservation)
+        bad_semantic = ("0" * 64 if pin_value["semantic_sha256"] != "0" * 64
+                        else "f" * 64)
+        wrong_semantic["origin_pin"] = {
+            "raw_sha256": pin_value["raw_sha256"],
+            "semantic_sha256": bad_semantic,
+        }
+        wrong_semantic_rows[reservation["path"]] = wrong_semantic
+        with self.assertRaises(budget_module.BudgetPlanError):
+            budget_module.source5_indexed_reservation_binding_v1(
+                index_row, pin_value, role, job,
+                old_rows=wrong_semantic_rows, **{
+                    key: value for key, value in kwargs.items()
+                    if key != "evidence_budget_module"
+                },
+            )
+        with self.assertRaises(self.bridge_module.PreparedBridgeBudgetError):
+            self.bridge_module._source5_indexed_reservation_binding(
+                index_row, pin_value, role, job,
+                old_rows=wrong_semantic_rows, **kwargs,
+            )
+
+        missing_rows = dict(row_map)
+        missing_rows.pop(reservation["path"])
+        with self.assertRaises(budget_module.BudgetPlanError):
+            budget_module.source5_indexed_reservation_binding_v1(
+                index_row, pin_value, role, job,
+                old_rows=missing_rows, **{
+                    key: value for key, value in kwargs.items()
+                    if key != "evidence_budget_module"
+                },
+            )
+
+        descriptor = next(row for row in self.declaration["objects"]
+                          if row["host_id"] == host and row["row_index"] == 0 and
+                          row["role"] == role)
+        actual_count = descriptor["byte_count"]
+        self.assertGreater(actual_count, 1)
+        low_rows = dict(row_map)
+        low_cap_row = copy.deepcopy(reservation)
+        low_cap_row["max_file_bytes"] = actual_count - 1
+        low_rows[reservation["path"]] = low_cap_row
+        low_pin, low_reservation = \
+            self.bridge_module._source5_indexed_reservation_binding(
+                index_row, pin_value, role, job,
+                old_rows=low_rows, **kwargs,
+            )
+        with self.assertRaises(OSError):
+            self.raw_reader(low_pin, low_reservation["max_file_bytes"])
+
+        by_path = {}
+        for path, maximum in self.bridge_reads:
+            by_path.setdefault(path, []).append(maximum)
+        old_paths_by_host = {host: set() for host in self.host_ids}
+        for descriptor in (row for row in self.declaration["objects"]
+                           if row["phase"] == "exploration"):
+            row_index = descriptor["row_index"]
+            index_row = self.proofs[descriptor["host_id"]]["index_rows"][row_index]
+            role = descriptor["role"]
+            if role == "source5_job_record":
+                pin_value = index_row["job_record_pin"]
+            else:
+                archive_key = {
+                    "source5_checkpoint_request": "request_pin",
+                    "source5_checkpoint": "checkpoint_pin",
+                    "source5_object_manifest": "object_manifest_pin",
+                    "source5_archive_ack": "ack_pin",
+                    "source5_archive_signature": "signature_pin",
+                }[role]
+                pin_value = index_row["archive_pins"][archive_key]
+            pin, selected_row = \
+                self.bridge_module._source5_indexed_reservation_binding(
+                    index_row, pin_value, role, index_row["job"],
+                    initial_output_root=self.cases_by_host[descriptor["host_id"]][
+                        "generated_documents"]["header"]["initial_output_root"],
+                    campaign_id=self.views[descriptor["host_id"]].spec["campaign_id"],
+                    selected_host=descriptor["host_id"],
+                    old_rows=self.old_rows_by_host[descriptor["host_id"]],
+                    evidence_budget_module=self.views[
+                        descriptor["host_id"]].budget_module,
+                )
+            budget_module = self.views[descriptor["host_id"]].budget_module
+            budget_pin, budget_row = budget_module.source5_indexed_reservation_binding_v1(
+                index_row, pin_value, role, index_row["job"],
+                initial_output_root=self.cases_by_host[descriptor["host_id"]][
+                    "generated_documents"]["header"]["initial_output_root"],
+                campaign_id=self.views[descriptor["host_id"]].spec["campaign_id"],
+                selected_host=descriptor["host_id"],
+                old_rows=self.old_rows_by_host[descriptor["host_id"]],
+            )
+            self.assertEqual(descriptor["maximum_bytes"],
+                             selected_row["max_file_bytes"])
+            self.assertEqual(budget_pin, pin)
+            self.assertEqual(budget_row, selected_row)
+            old_paths_by_host[descriptor["host_id"]].add(budget_row["path"])
+            self.assertEqual(by_path.get(pin["path"]),
+                             [selected_row["max_file_bytes"]] * 2)
+            if role in {"source5_archive_ack", "source5_archive_signature"}:
+                self.assertNotIn(selected_row["path"], by_path)
+
+        for host in self.host_ids:
+            expected_rows = {
+                descriptor["origin_pin"]["path"]: {
+                    "raw_sha256": descriptor["origin_pin"]["raw_sha256"],
+                    "byte_count": descriptor["byte_count"],
+                    "role": descriptor["role"], "host_id": host,
+                    "phase": "exploration", "run_id": descriptor["run_id"],
+                    "catalogue_hosts": {host},
+                }
+                for descriptor in self.declaration["objects"]
+                if descriptor["host_id"] == host and
+                descriptor["phase"] == "exploration"
+            }
+            budget_module = self.views[host].budget_module
+            old_needed = budget_module._source5_prepared_lineage_indexed_rows_v4(
+                expected_rows, self.proofs[host]["index_rows"],
+                self.old_rows_by_host[host],
+                initial_output_root=self.cases_by_host[host][
+                    "generated_documents"]["header"]["initial_output_root"],
+                campaign_id=self.views[host].spec["campaign_id"],
+                selected_host=host,
+            )
+            self.assertEqual(set(old_needed), old_paths_by_host[host])
+            self.assertEqual(len(old_needed), 2160)
+            for path, expected in old_needed.items():
+                row = self.old_rows_by_host[host][path]
+                self.assertEqual(row["role"], expected["role"])
+                self.assertEqual(row["host_id"], host)
+                self.assertEqual(row["phase"], "exploration")
+                self.assertEqual(row["run_id"], expected["run_id"])
+                self.assertGreaterEqual(
+                    row["max_file_bytes"], expected["byte_count"],
+                )
+
+            request_descriptor = next(
+                descriptor for descriptor in self.declaration["objects"]
+                if descriptor["host_id"] == host and
+                descriptor["role"] == "source5_checkpoint_request" and
+                descriptor["phase"] == "exploration"
+            )
+            self.assertGreater(request_descriptor["byte_count"], 1)
+            request_index = self.proofs[host]["index_rows"][
+                request_descriptor["row_index"]]
+            request_reservation = budget_module.source5_indexed_reservation_binding_v1(
+                request_index, request_index["archive_pins"]["request_pin"],
+                "source5_checkpoint_request", request_index["job"],
+                initial_output_root=self.cases_by_host[host][
+                    "generated_documents"]["header"]["initial_output_root"],
+                campaign_id=self.views[host].spec["campaign_id"],
+                selected_host=host, old_rows=self.old_rows_by_host[host],
+            )[1]
+            low_cap_rows = dict(self.old_rows_by_host[host])
+            low_cap_row = copy.deepcopy(request_reservation)
+            low_cap_row["max_file_bytes"] = request_descriptor["byte_count"] - 1
+            low_cap_rows[request_reservation["path"]] = low_cap_row
+            with self.assertRaises(budget_module.BudgetPlanError):
+                budget_module._source5_prepared_lineage_indexed_rows_v4(
+                    expected_rows, self.proofs[host]["index_rows"], low_cap_rows,
+                    initial_output_root=self.cases_by_host[host][
+                        "generated_documents"]["header"]["initial_output_root"],
+                    campaign_id=self.views[host].spec["campaign_id"],
+                    selected_host=host,
+                )
+
+    def test_shared_cohort_mismatch_is_rejected(self) -> None:
+        cohort_inputs = [
+            {
+                "host_id": host,
+                "original_pins": self.proofs[host]["capture_context"][
+                    "preparatory_original_pins"],
+                "execution_manifest": self.proofs[host]["capture_context"][
+                    "execution_manifest"],
+                "header": self.proofs[host]["bridge_header"],
+            }
+            for host in self.host_ids
+        ]
+        budget_module = self.views[self.host_ids[0]].budget_module
+        shared = budget_module.source5_preparatory_shared_originals_v1(
+            cohort_inputs,
+        )
+        first_original = cohort_inputs[0]["original_pins"]
+        self.assertEqual(shared["preparation"], first_original["preparation"])
+        self.assertEqual(
+            shared["capacity_generation"]["provenance"],
+            first_original["capacity_generation"]["provenance"],
+        )
+
+        changed_peer_preparation = copy.deepcopy(cohort_inputs)
+        peer = changed_peer_preparation[1]
+        peer["original_pins"]["preparation"]["raw_sha256"] = "0" * 64
+        peer["original_pins"]["capacity_generation"]["provenance"][
+            "preparation_pin"]["raw_sha256"] = "0" * 64
+        peer["execution_manifest"]["preparatory_capacity_generation"][
+            "provenance"]["preparation_pin"]["raw_sha256"] = "0" * 64
+        with self.assertRaisesRegex(
+                budget_module.BudgetPlanError,
+                "shared SourceH preparation/generation pins differ across the cohort",
+        ):
+            budget_module.source5_preparatory_shared_originals_v1(
+                changed_peer_preparation,
+            )
+
+        changed_peer_plan = copy.deepcopy(cohort_inputs)
+        peer = changed_peer_plan[1]
+        peer["original_pins"]["capacity_generation"]["provenance"][
+            "initial_plan_pin"]["raw_sha256"] = "0" * 64
+        peer["execution_manifest"]["preparatory_capacity_generation"][
+            "provenance"]["initial_plan_pin"]["raw_sha256"] = "0" * 64
+        with self.assertRaisesRegex(
+                budget_module.BudgetPlanError,
+                "generation initial_plan_pin differs",
+        ):
+            budget_module.source5_preparatory_shared_originals_v1(
+                changed_peer_plan,
+            )
+
+        with self.assertRaises(self.bridge_module.PreparedBridgeBudgetError):
+            self.bridge_module.build_prepared_exploration_capture_declaration_v1(
+                list(reversed(self.host_ids)), self.proofs,
+                artifact_reader=self.raw_reader,
+                evidence_budget_module=self.views[self.host_ids[0]].budget_module,
+            )
+
+        changed = copy.deepcopy(self.proofs)
+        first_host = self.host_ids[0]
+        changed[first_host]["bridge_header"]["initial"][
+            "source_manifest_pins"][0]["raw_sha256"] = "0" * 64
+        with self.assertRaises(self.bridge_module.PreparedBridgeBudgetError):
+            self.bridge_module.build_prepared_exploration_capture_declaration_v1(
+                self.host_ids, changed, artifact_reader=self.raw_reader,
+                evidence_budget_module=self.views[first_host].budget_module,
+            )
+
+        changed_shared = copy.deepcopy(self.proofs)
+        peer_host = self.host_ids[1]
+        peer_context = changed_shared[peer_host]["capture_context"]
+        peer_budget = peer_context["budget"]
+        peer_original = peer_context["preparatory_original_pins"]
+        peer_original["preparation"]["raw_sha256"] = "0" * 64
+        peer_original["capacity_generation"]["provenance"][
+            "preparation_pin"]["raw_sha256"] = "0" * 64
+        peer_context["execution_manifest"]["preparatory_capacity_generation"][
+            "provenance"]["preparation_pin"]["raw_sha256"] = "0" * 64
+        peer_budget["original_pins"] = copy.deepcopy(peer_original)
+        peer_budget["budget_sha256"] = self.bridge_module._sha(
+            self.bridge_module._canonical({
+                key: value for key, value in peer_budget.items()
+                if key != "budget_sha256"
+            }),
+        )
+        with self.assertRaisesRegex(
+                self.bridge_module.PreparedBridgeBudgetError,
+                "shared SourceH preparation/generation pins differ across the cohort",
+        ):
+            self.bridge_module.build_prepared_exploration_capture_declaration_v1(
+                self.host_ids, changed_shared, artifact_reader=self.raw_reader,
+                evidence_budget_module=self.views[first_host].budget_module,
+            )
+
+    def test_production_capture_rejects_missing_or_tampered_indexed_object(self) -> None:
+        descriptor_by_pin = {
+            (row["origin_pin"]["path"], row["origin_pin"]["raw_sha256"]): row
+            for row in self.declaration["objects"]
+        }
+
+        def row_for(role: str) -> dict:
+            return next(
+                row for row in self.capture_manifest["objects"]
+                if descriptor_by_pin[(row["origin_pin"]["path"],
+                                     row["origin_pin"]["raw_sha256"])]["role"] == role
+                and descriptor_by_pin[(row["origin_pin"]["path"],
+                                       row["origin_pin"]["raw_sha256"])]["phase"] == "exploration"
+            )
+
+        def clone(name: str) -> Path:
+            target = self.root / name
+            shutil.copytree(self.capture_root, target, copy_function=shutil.copy2)
+            return target
+
+        ack_row = row_for("source5_archive_ack")
+        missing_root = clone("capture-missing-ack")
+        (missing_root / ack_row["local_relative_path"]).unlink()
+        with self.assertRaises(self.capture_module.PreparedExplorationLineageCaptureError):
+            self.capture_module.PreparedExplorationLineageCaptureReaderV1(
+                self.declaration, self.capture_manifest, str(missing_root),
+            )
+
+        signature_row = row_for("source5_archive_signature")
+        tampered_root = clone("capture-tampered-signature")
+        signature_path = tampered_root / signature_row["local_relative_path"]
+        signature_path.chmod(0o600)
+        signature_path.write_bytes(b"tampered structural signature\n")
+        signature_path.chmod(0o400)
+        with self.assertRaises(self.capture_module.PreparedExplorationLineageCaptureError):
+            self.capture_module.PreparedExplorationLineageCaptureReaderV1(
+                self.declaration, self.capture_manifest, str(tampered_root),
+            )
+
+        extra_root = clone("capture-extra-child")
+        extra_path = extra_root / "objects" / "unlisted.bin"
+        extra_path.write_bytes(b"unlisted\n")
+        extra_path.chmod(0o400)
+        with self.assertRaises(self.capture_module.PreparedExplorationLineageCaptureError):
+            self.capture_module.PreparedExplorationLineageCaptureReaderV1(
+                self.declaration, self.capture_manifest, str(extra_root),
+            )
 
 
 if __name__ == "__main__":

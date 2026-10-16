@@ -11,6 +11,7 @@ import importlib.util
 import inspect
 import json
 import os
+import shutil
 import stat
 import tempfile
 import types
@@ -1948,6 +1949,7 @@ class CapturedCapacityPilotExportTests(unittest.TestCase):
         return CaptureProvider()
 
     def _run_public_exporter(self, *, fault=None, compare=False, complete=False,
+                             original_metadata=False,
                              before_publication=None,
                              before_publication_state=None):
         method = Source5PreparationInputTests.test_public_exporter_derives_rate_matrix_after_each_original_job_replay
@@ -1957,7 +1959,9 @@ class CapturedCapacityPilotExportTests(unittest.TestCase):
             "outputs": [], "pilots": [], "provider": None, "exception": None,
             "preparation": None, "output_path": None,
             "before_publication": before_publication,
+            "source_verify_calls": [], "selected_host": None,
         }
+        source_campaign = method.__globals__["campaign"]
 
         def patched_loader(path, name):
             module = original_loader(path, name)
@@ -1970,8 +1974,18 @@ class CapturedCapacityPilotExportTests(unittest.TestCase):
             result["preparation"] = module
             result["fixed_owner"] = fixed_owner
             real_export = module.export_capacity_pilot
+            original_metadata_export = \
+                module.export_capacity_pilot_original_metadata_v1
+            if original_metadata:
+                # This fixture compares owner bytes only. The separate bad
+                # selected-ELF witness uses the actual captured Source loader.
+                module.read_preparation_intent_metadata_v1 = \
+                    lambda *args, **kwargs: module.read_preparation_intent(
+                        *args, **kwargs,
+                    )
 
             def export_wrapper(pins, records, selected_host):
+                result["selected_host"] = selected_host
                 if not compare:
                     output_path = Path(pins["input_root"]) / "must-not-publish-pilot.json"
                     pins["output"] = str(output_path)
@@ -2007,16 +2021,20 @@ class CapturedCapacityPilotExportTests(unittest.TestCase):
                         module, fixed_owner, real_export, pins, records,
                         selected_host, None, result,
                     )
+                    captured_export = (original_metadata_export
+                                       if original_metadata else real_export)
                     captured = self._export_once(
-                        module, fixed_owner, real_export, pins, records,
+                        module, fixed_owner, captured_export, pins, records,
                         selected_host, provider, result,
                         before_publication=before_publication,
                     )
                     result["outputs"] = [legacy, captured]
                     result["captured_result"] = captured
                     return captured
+                selected_export = (original_metadata_export
+                                   if original_metadata else real_export)
                 captured = self._export_once(
-                    module, fixed_owner, real_export, pins, records,
+                    module, fixed_owner, selected_export, pins, records,
                     selected_host, provider, result,
                     before_publication=before_publication,
                 )
@@ -2026,10 +2044,25 @@ class CapturedCapacityPilotExportTests(unittest.TestCase):
             module.export_capacity_pilot = export_wrapper
             return module
 
+        def record_source_verification(source, *, source_root, verify_artifacts):
+            result["source_verify_calls"].append(
+                (source, source_root, verify_artifacts),
+            )
+            provider = result["provider"]
+            if provider is not None:
+                self.assertEqual(provider.opened, [])
+            return None
+
         with patch.dict(namespace, {"load_script": patched_loader}):
             test_case = Source5PreparationInputTests(self._PUBLIC_METHOD)
             try:
-                getattr(test_case, self._PUBLIC_METHOD)()
+                if original_metadata:
+                    with patch.object(
+                            source_campaign, "verify_source_manifest",
+                            side_effect=record_source_verification):
+                        getattr(test_case, self._PUBLIC_METHOD)()
+                else:
+                    getattr(test_case, self._PUBLIC_METHOD)()
             except Exception as error:
                 result["exception"] = error
         return result
@@ -2231,6 +2264,27 @@ class CapturedCapacityPilotExportTests(unittest.TestCase):
         self.assertEqual(provider.active, 0)
         self.assertNotIn("capacity-pilot-capture-window",
                          result["preparation"]._canonical(captured).decode("ascii"))
+
+    def test_original_metadata_export_matches_bytes_and_checks_selected_source_before_views(self):
+        """Synthetic owner parity and route-order witness, not Source verification evidence."""
+        result = self._run_public_exporter(compare=True, original_metadata=True)
+        self.assertIsNone(result["exception"], str(result["exception"]))
+        ordinary, original_metadata = result["outputs"]
+        self.assertEqual(ordinary, original_metadata)
+        self.assertEqual(result["pilots"][0], result["pilots"][1])
+        self.assertEqual(len(result["source_verify_calls"]), 1)
+        selected_source, source_root, verify_artifacts = \
+            result["source_verify_calls"][0]
+        method = Source5PreparationInputTests.test_public_exporter_derives_rate_matrix_after_each_original_job_replay
+        self.assertEqual(source_root, method.__globals__["SCRIPT_DIR"].parent)
+        self.assertIs(verify_artifacts, True)
+        self.assertEqual(selected_source["manifest_sha256"], "1" * 64)
+        self.assertEqual(result["selected_host"], "host-1")
+        provider = result["provider"]
+        self.assertEqual(len(provider.opened), 360)
+        self.assertEqual(provider.opened, provider.closed)
+        self.assertEqual(provider.maximum_active, 1)
+        self.assertEqual(provider.active, 0)
 
     def test_captured_export_rejects_identity_receipt_and_object_faults(self):
         for fault in (
@@ -2853,12 +2907,26 @@ class RecordedHistoricalGlobalReaderTests(unittest.TestCase):
         ):
             with self.subTest(function=function.__name__):
                 self.assertNotIn("global_artifact_reader", inspect.signature(function).parameters)
+        original = inspect.signature(
+            module.export_capacity_pilot_original_metadata_v1,
+        )
+        self.assertEqual(tuple(original.parameters), (
+            "preparation_final_pins", "verified_fixed_records", "host_id",
+            "captured_read_provider", "before_publication",
+        ))
+        self.assertEqual(original.parameters["captured_read_provider"].kind,
+                         inspect.Parameter.KEYWORD_ONLY)
+        self.assertEqual(original.parameters["captured_read_provider"].default,
+                         inspect.Parameter.empty)
+        self.assertIsNone(original.parameters["before_publication"].default)
+        self.assertNotIn("global_artifact_reader", original.parameters)
         for name in (
             "read_preparation_intent_metadata_v1",
             "replay_prepared_capacity_inputs_bounded_metadata_v1",
             "build_prepared_capacity_generation_bounded_metadata_v1",
             "verify_prepared_capacity_generation_bounded_metadata_v1",
             "export_initial_spec_plan_metadata_v1",
+            "export_capacity_pilot_original_metadata_v1",
             "materialize_prepared_host_binding_metadata_v1",
             "verify_prepared_host_binding_metadata_v1",
         ):
@@ -3106,6 +3174,103 @@ class RecordedHistoricalGlobalReaderTests(unittest.TestCase):
             self.assertFalse((input_root / "initial-spec-v3.json").exists())
             self.assertFalse((input_root / "initial-plan-v3.json").exists())
 
+    def test_original_metadata_export_rejects_selected_bad_elf_before_opening_a_view(self):
+        """Peers use same-path metadata; the selected bad artifact still fails in Source."""
+        module = self.preparation
+        with tempfile.TemporaryDirectory(prefix="inputprep-original-selected-artifact-") as temporary:
+            fixture = self._metadata_intent_fixture(Path(temporary))
+            selected_host = fixture["host_ids"][0]
+            source_root = fixture["source_root"]
+            input_root = fixture["input_root"]
+            selected_source = fixture["sources"][selected_host]
+            artifact = selected_source["artifacts"]["allocatbelt"]
+            artifact_path = source_root / artifact["path"]
+            artifact_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            artifact_path.write_bytes(b"selected fixture ELF with the wrong raw hash\n")
+            artifact_path.chmod(0o700)
+            for peer_host in fixture["host_ids"][1:]:
+                peer = fixture["sources"][peer_host]["artifacts"]["allocatbelt"]
+                self.assertEqual(peer["path"], artifact["path"])
+                self.assertNotEqual(peer["sha256"], artifact["sha256"])
+
+            binding = module.materialize_prepared_host_binding_metadata_v1(
+                fixture["preparation_pin"], fixture["spec_pin"],
+                source_root, input_root, selected_host,
+            )
+            campaign_artifacts_root = input_root.parent / "campaign-artifacts"
+            campaign_artifacts_root.mkdir(mode=0o700)
+            pins = {
+                "preparation": fixture["preparation_pin"],
+                "spec": fixture["spec_pin"],
+                "plan": {"path": str(input_root / "unused-plan.json"),
+                         "sha256": "a" * 64},
+                "source_root": str(source_root),
+                "input_root": str(input_root),
+                "campaign_artifacts_root": str(campaign_artifacts_root),
+                "prepared_host_binding": binding["prepared_host_binding"],
+                "output": None,
+            }
+
+            class Provider:
+                def __init__(self):
+                    self.opened = []
+
+                def open_view(self, *args, **kwargs):
+                    self.opened.append((args, kwargs))
+                    raise AssertionError("selected Source verification must precede every owner view")
+
+            provider = Provider()
+            reader_calls = []
+            verify_calls = []
+            real_execute = module._execute_captured_module
+
+            def execute_and_track(raw, path, name):
+                captured = real_execute(raw, path, name)
+                if name == "campaign_controller":
+                    real_verify = captured.verify_source_manifest
+
+                    def verify_source(manifest, source_root=None,
+                                      verify_artifacts=True, timeout_seconds=120.0):
+                        verify_calls.append((manifest, source_root, verify_artifacts))
+                        return real_verify(
+                            manifest, source_root=source_root,
+                            verify_artifacts=verify_artifacts,
+                            timeout_seconds=timeout_seconds,
+                        )
+
+                    captured.verify_source_manifest = verify_source
+                return captured
+
+            real_metadata_reader = module.read_preparation_intent_metadata_v1
+
+            def read_metadata(*args, **kwargs):
+                reader_calls.append((args, kwargs))
+                return real_metadata_reader(*args, **kwargs)
+
+            try:
+                with patch.object(module, "_execute_captured_module",
+                                  side_effect=execute_and_track), \
+                     patch.object(module, "read_preparation_intent_metadata_v1",
+                                  side_effect=read_metadata):
+                    with self.assertRaisesRegex(
+                            module.PreparationError,
+                            "selected original SourceV5 full verification failed.*frozen artifact mismatch"):
+                        module.export_capacity_pilot_original_metadata_v1(
+                            pins, [], selected_host, captured_read_provider=provider,
+                        )
+                self.assertEqual(len(reader_calls), 1)
+                self.assertEqual(reader_calls[0][0], (
+                    fixture["preparation_pin"], source_root, input_root,
+                ))
+                self.assertEqual(len(verify_calls), len(fixture["host_ids"]) + 1)
+                self.assertTrue(all(row[2] is False for row in verify_calls[:-1]))
+                self.assertEqual(verify_calls[-1][0], selected_source)
+                self.assertEqual(verify_calls[-1][1], source_root)
+                self.assertIs(verify_calls[-1][2], True)
+                self.assertEqual(provider.opened, [])
+            finally:
+                shutil.rmtree(artifact_path.parent, ignore_errors=True)
+
     def test_recorded_pilot_none_reader_preserves_full_source_validation_route(self):
         """Only an explicit historical reader selects metadata-only Source checks."""
         module = self.preparation
@@ -3341,6 +3506,54 @@ class RecordedHistoricalGlobalReaderTests(unittest.TestCase):
             self.assertFalse(path.exists())
             self.assertNotEqual(observed_path.read_bytes(), original_observed)
 
+
+class OriginalMetadataCapacityPilotTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.preparation = load_script(
+            SCRIPT_DIR / "application-source5-input-preparation.py",
+            "original_metadata_capacity_pilot_target",
+        )
+        cls.fixture_type = RecordedHistoricalGlobalReaderTests
+        cls.fixture_type.setUpClass()
+        cls.fixture_builder = cls.fixture_type()
+
+    def test_original_entrypoint_is_narrow_and_selects_the_original_owner_route(self):
+        module = self.preparation
+        function = module.export_capacity_pilot_original_metadata_v1
+        signature = inspect.signature(function)
+        self.assertEqual(tuple(signature.parameters), (
+            "preparation_final_pins", "verified_fixed_records", "host_id",
+            "captured_read_provider", "before_publication",
+        ))
+        self.assertEqual(signature.parameters["captured_read_provider"].kind,
+                         inspect.Parameter.KEYWORD_ONLY)
+        self.assertIs(signature.parameters["captured_read_provider"].default,
+                      inspect.Parameter.empty)
+        self.assertIsNone(signature.parameters["before_publication"].default)
+        self.assertNotIn("global_artifact_reader", signature.parameters)
+
+        provider = type("Provider", (), {
+            "open_view": lambda self, *_args, **_kwargs: None,
+        })()
+        pins = {"route_fixture": True}
+        records = [{"route_fixture": "not replay evidence"}]
+        hook = lambda *_args: None
+        result = {"route": "original-metadata"}
+        with patch.object(module, "_export_capacity_pilot_impl",
+                          return_value=result) as implementation:
+            self.assertIs(
+                function(pins, records, "host-a",
+                         captured_read_provider=provider,
+                         before_publication=hook),
+                result,
+            )
+        implementation.assert_called_once_with(
+            pins, records, "host-a", captured_read_provider=provider,
+            before_publication=hook, recorded_host=False, original_metadata=True,
+        )
+        with self.assertRaisesRegex(module.PreparationError, "open_view provider"):
+            function(pins, records, "host-a", captured_read_provider=object())
 
 if __name__ == "__main__":
     unittest.main()

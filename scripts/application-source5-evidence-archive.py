@@ -15,6 +15,7 @@ import os
 import re
 import stat
 import subprocess
+import sys
 import types
 from pathlib import Path, PurePosixPath
 from typing import Any, Iterable
@@ -79,6 +80,23 @@ PREPARATORY_CAMPAIGN_SOURCE_PATH = "scripts/application-campaign.py"
 PREPARATORY_INPUT_PREPARATION_SOURCE_PATH = (
     "scripts/application-source5-input-preparation.py"
 )
+PREPARED_LINEAGE_SOURCE_PATH = "scripts/application-source5-prepared-lineage.py"
+PREPARED_BRIDGE_BUDGET_SOURCE_PATH = (
+    "scripts/application-source5-prepared-bridge-budget.py"
+)
+PREPARED_CAMPAIGN_SOURCE_PATH = "scripts/application-source5-campaign.py"
+PREPARED_INPUT_PREPARATION_SOURCE_PATH = (
+    "scripts/application-source5-input-preparation.py"
+)
+PREPARED_CAMPAIGN_INPUTS_SOURCE_PATH = "scripts/application-campaign-inputs.py"
+PREPARED_CHRONOLOGY_SOURCE_PATH = "scripts/application-campaign-chronology.py"
+PREPARED_CONTROLLER_SOURCE_PATH = "scripts/application-campaign.py"
+PREPARED_CAPTURE_SOURCE_PATH = "scripts/application-source5-lineage-capture.py"
+PREPARED_CAPTURE_MANIFEST_SCHEMA = (
+    "allocatbelt.application-source5-lineage-capture-manifest.v1"
+)
+PREPARED_CAPTURE_MANIFEST_MAX_BYTES = 32 * 1024 * 1024
+PREPARED_CAPTURE_BOOTSTRAP_MAX_BYTES = 256 * 1024 * 1024
 PREPARATORY_EXECUTION_FIELDS_V1 = {
     "schema", "campaign_id", "host_id", "hosts", "original_inputs",
     "execution_sources", "modules", "observed_hosts", "artifact_root",
@@ -1052,7 +1070,7 @@ def _read_source_budget_module(
 def _read_source_typed_module(
     source_manifest_raw: bytes, execution_manifest_raw: bytes,
     context: dict[str, Any], module_path: str, expected_execution_schema: str,
-    *, namespace_name: str,
+    *, namespace_name: str, register_module: bool = False,
 ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
     """Load one module only after its exact Source and execution pins close."""
     source_pin = _pin(context["source_manifest_pin"],
@@ -1197,6 +1215,29 @@ def _read_source_typed_module(
             os.close(parent_fd)
         os.close(root_fd)
     filename = str(source_root / module_path)
+    if register_module:
+        module_name = (
+            f"{namespace_name}_{module_sha[:16]}_"
+            f"{source_pin['raw_sha256'][:12]}_{execution_pin['raw_sha256'][:12]}"
+        )
+        module = types.ModuleType(module_name)
+        module.__file__ = filename
+        module.__package__ = None
+        previous = sys.modules.get(module_name)
+        sys.modules[module_name] = module
+        try:
+            code = compile(module_raw, filename, "exec")
+            exec(code, module.__dict__, module.__dict__)
+        except Exception as error:
+            if sys.modules.get(module_name) is module:
+                if previous is None:
+                    sys.modules.pop(module_name, None)
+                else:
+                    sys.modules[module_name] = previous
+            raise EvidenceArchiveError(
+                f"typed Source module cannot be loaded: {error}",
+            ) from error
+        return module.__dict__, source, execution
     namespace: dict[str, Any] = {
         "__name__": namespace_name, "__file__": filename,
         "__package__": None,
@@ -1303,6 +1344,1223 @@ def _source_budget_catalogue_reader(
         return raw
 
     return read_catalogue_chunk
+
+
+def _prepared_source_document(
+    raw: bytes, pin_value: object, label: str,
+) -> dict[str, Any]:
+    pin = _pin(pin_value, f"{label} Source manifest pin")
+    _require(type(raw) is bytes and _sha(raw) == pin["raw_sha256"],
+             f"{label} Source manifest differs from its raw pin")
+    source = _parse_canonical(
+        raw, f"{label} SourceV5 manifest",
+        maximum_bytes=MAX_SOURCE_MANIFEST_BYTES,
+    )
+    body = {key: value for key, value in source.items()
+            if key != "manifest_sha256"}
+    inventory = source.get("source")
+    _require(source.get("schema") == SOURCE_MANIFEST_SCHEMA_V5 and
+             source.get("manifest_sha256") == pin["semantic_sha256"] ==
+                 _sha(_canonical(body, maximum_bytes=MAX_SOURCE_MANIFEST_BYTES)) and
+             type(inventory) is dict and type(inventory.get("files")) is list,
+             f"{label} Source manifest schema or semantic pin differs")
+    inventory_body = {"schema": SOURCE_INVENTORY_SCHEMA_V1,
+                      "entries": inventory["files"]}
+    tree_sha = _sha(_canonical(inventory_body,
+                               maximum_bytes=MAX_SOURCE_MANIFEST_BYTES))
+    _require(inventory.get("source_tree_sha256") == tree_sha,
+             f"{label} Source typed inventory digest differs")
+    return source
+
+
+def _prepared_typed_module(
+    source_manifest_raw: bytes, execution_manifest_raw: bytes,
+    context: dict[str, Any], module_path: str,
+) -> dict[str, Any]:
+    namespace, source, execution = _read_source_typed_module(
+        source_manifest_raw, execution_manifest_raw, context, module_path,
+        PREPARED_EXPLORATION_EXECUTION_SCHEMA,
+        namespace_name="_allocatbelt_source5_prepared_" +
+            module_path.rsplit("/", 1)[-1].replace(".py", "").replace("-", "_"),
+        register_module=True,
+    )
+    module_name = namespace["__name__"]
+    module = sys.modules.get(module_name)
+    try:
+        rows = [row for row in source["source"]["files"]
+                if type(row) is dict and row.get("path") == module_path]
+        _require(len(rows) == 1,
+                 f"selected Source lacks one typed row for {module_path}")
+        row = _exact(rows[0], {"path", "kind", "mode", "sha256", "size"},
+                     f"selected Source module row {module_path}")
+        pin = _exact(execution["modules"][context["host_id"]].get(module_path),
+                     {"path", "sha256"},
+                     f"selected execution module pin {module_path}")
+        _require(row["kind"] == "file" and
+                 row["mode"] in {"100644", "100755"} and
+                 pin == {"path": module_path, "sha256": row["sha256"]},
+                 f"selected Source module identity differs for {module_path}")
+        namespace["__source5_typed_pin__"] = pin
+    except BaseException:
+        if module is not None and sys.modules.get(module_name) is module:
+            sys.modules.pop(module_name, None)
+        raise
+    return namespace
+
+
+class _PreparedBootstrapCaptureReader:
+    """Lazy custody-checked bootstrap for Source-requested captured bytes only."""
+
+    def __init__(
+        self, capture_module: dict[str, Any], manifest: dict[str, Any],
+        stage_root: str, maximum_read_bytes: int,
+    ):
+        self._capture_module = capture_module
+        self._stage_root = capture_module["_absolute_stage_root"](stage_root)
+        self._maximum_read_bytes = _uint(
+            maximum_read_bytes, "prepared bootstrap Source byte ceiling", positive=True,
+        )
+        _require(self._maximum_read_bytes <= PREPARED_CAPTURE_BOOTSTRAP_MAX_BYTES,
+                 "selected Source capture algorithms exceed the fixed bootstrap envelope")
+        self._closed = True
+        self._root_fd = -1
+        self._uid = os.geteuid()
+        self._root_device = -1
+        self._root_identity: tuple[int, int] | None = None
+        self._root_chain: tuple[tuple[int, int], ...] = ()
+        self._objects: dict[tuple[str, str], dict[str, Any]] = {}
+        self._file_identity: dict[str, tuple[int, int, int, int, int]] = {}
+        self._directory_identity: dict[str, tuple[int, int]] = {}
+        items = _exact(manifest, {"schema", "objects"},
+                       "prepared bootstrap capture manifest")
+        _require(items["schema"] == PREPARED_CAPTURE_MANIFEST_SCHEMA and
+                 type(items["objects"]) is list and
+                 0 < len(items["objects"]) <= MAX_ROWS,
+                 "prepared bootstrap manifest schema/cardinality differs")
+        local_paths: set[str] = set()
+        for index, item_value in enumerate(items["objects"]):
+            item = _exact(item_value, {
+                "origin_pin", "local_relative_path", "byte_count",
+            }, f"prepared bootstrap object[{index}]")
+            pin = _pin_raw(item["origin_pin"],
+                           f"prepared bootstrap origin[{index}]")
+            local = capture_module["_relative_local"](
+                item["local_relative_path"],
+            )
+            count = _uint(item["byte_count"],
+                          f"prepared bootstrap byte count[{index}]", positive=True)
+            _require(count <= self._maximum_read_bytes,
+                     "prepared capture object exceeds the Source bootstrap envelope")
+            key = (pin["path"], pin["raw_sha256"])
+            _require(key not in self._objects and local not in local_paths,
+                     "prepared capture manifest repeats a pin or local path")
+            local_paths.add(local)
+            self._objects[key] = {
+                "origin_pin": pin, "local_relative_path": local,
+                "byte_count": count,
+            }
+        open_directory = capture_module["_open_absolute_directory"]
+        self._root_fd, self._root_chain = open_directory(self._stage_root)
+        self._closed = False
+        try:
+            root_info = os.fstat(self._root_fd)
+            self._root_device = root_info.st_dev
+            self._require_private_directory(root_info, "capture root")
+            self._root_identity = (root_info.st_dev, root_info.st_ino)
+            self._scan_metadata()
+        except BaseException:
+            self.close()
+            raise
+
+    def _require_private_directory(self, info: os.stat_result, label: str) -> None:
+        _require(stat.S_ISDIR(info.st_mode) and stat.S_IMODE(info.st_mode) == 0o700 and
+                 info.st_uid == self._uid and info.st_dev == self._root_device,
+                 f"{label} is not a private same-device mode-0700 directory")
+
+    def _open_root_checked(self) -> int:
+        _require(not self._closed, "prepared bootstrap reader is closed")
+        fd, chain = self._capture_module["_open_absolute_directory"](
+            self._stage_root,
+        )
+        try:
+            info = os.fstat(fd)
+            self._require_private_directory(info, "capture root")
+            _require(chain == self._root_chain and
+                     (info.st_dev, info.st_ino) == self._root_identity,
+                     "prepared capture root or ancestor changed")
+            return fd
+        except BaseException:
+            os.close(fd)
+            raise
+
+    def _open_local_parent(self, root_fd: int, relative: str) -> tuple[int, str]:
+        parts = relative.split("/")
+        _require(parts and all(part not in ("", ".", "..") for part in parts),
+                 "prepared bootstrap path is not normalized")
+        current = os.dup(root_fd)
+        prefix: list[str] = []
+        try:
+            for component in parts[:-1]:
+                prefix.append(component)
+                child = os.open(
+                    component, os.O_RDONLY | _O_DIRECTORY | _O_CLOEXEC | _O_NOFOLLOW,
+                    dir_fd=current,
+                )
+                try:
+                    info = os.fstat(child)
+                    name = "/".join(prefix)
+                    self._require_private_directory(info, "capture subdirectory")
+                    _require(self._directory_identity.get(name) ==
+                             (info.st_dev, info.st_ino),
+                             "prepared capture directory changed after custody scan")
+                except BaseException:
+                    os.close(child)
+                    raise
+                os.close(current)
+                current = child
+            return current, parts[-1]
+        except BaseException:
+            os.close(current)
+            raise
+
+    def _scan_metadata(self) -> None:
+        expected_paths = {
+            row["local_relative_path"]: (key, row)
+            for key, row in self._objects.items()
+        }
+        expected_dirs = {
+            "/".join(parts[:index])
+            for relative in expected_paths
+            for parts in [relative.split("/")]
+            for index in range(1, len(parts))
+        }
+        expected_children: dict[str, set[str]] = {"": set()}
+        for relative in expected_dirs | set(expected_paths):
+            parent, _, leaf = relative.rpartition("/")
+            expected_children.setdefault(parent, set()).add(leaf)
+        root_fd = os.dup(self._root_fd)
+        pending = [""]
+        seen_files: set[str] = set()
+        seen_dirs: set[str] = set()
+        inode_ids = {self._root_identity}
+        try:
+            while pending:
+                prefix = pending.pop()
+                if prefix:
+                    directory_fd, _leaf = self._open_local_parent(
+                        root_fd, prefix + "/.bootstrap-sentinel",
+                    )
+                else:
+                    directory_fd = os.dup(root_fd)
+                try:
+                    allowed = expected_children.get(prefix, set())
+                    observed: set[str] = set()
+                    with os.scandir(directory_fd) as entries:
+                        for entry in entries:
+                            name = entry.name
+                            _require(name in allowed and name not in observed,
+                                     "capture tree contains an undeclared entry")
+                            observed.add(name)
+                            relative = name if not prefix else prefix + "/" + name
+                            info = os.stat(name, dir_fd=directory_fd,
+                                           follow_symlinks=False)
+                            identity = (info.st_dev, info.st_ino)
+                            _require(info.st_dev == self._root_device and
+                                     identity not in inode_ids,
+                                     "capture tree crosses a device or aliases an inode")
+                            inode_ids.add(identity)
+                            if relative in expected_dirs:
+                                self._require_private_directory(info,
+                                                                "capture subdirectory")
+                                self._directory_identity[relative] = identity
+                                child = os.open(
+                                    name,
+                                    os.O_RDONLY | _O_DIRECTORY | _O_CLOEXEC | _O_NOFOLLOW,
+                                    dir_fd=directory_fd,
+                                )
+                                try:
+                                    opened = os.fstat(child)
+                                    self._require_private_directory(
+                                        opened, "capture subdirectory",
+                                    )
+                                    _require((opened.st_dev, opened.st_ino) == identity,
+                                             "capture directory changed while opening")
+                                finally:
+                                    os.close(child)
+                                seen_dirs.add(relative)
+                                pending.append(relative)
+                            else:
+                                _require(relative in expected_paths and
+                                         stat.S_ISREG(info.st_mode) and
+                                         stat.S_IMODE(info.st_mode) == 0o400 and
+                                         info.st_uid == self._uid and info.st_nlink == 1,
+                                         "capture tree contains a non-private file or special object")
+                                _key, captured = expected_paths[relative]
+                                _require(info.st_size == captured["byte_count"] <=
+                                         self._maximum_read_bytes,
+                                         "captured metadata size exceeds its bounded declaration")
+                                self._file_identity[relative] = (
+                                    info.st_dev, info.st_ino, info.st_size,
+                                    info.st_mtime_ns, info.st_ctime_ns,
+                                )
+                                seen_files.add(relative)
+                    _require(observed == allowed,
+                             "capture directory omits a declared child")
+                finally:
+                    os.close(directory_fd)
+            _require(seen_files == set(expected_paths) and
+                     seen_dirs == expected_dirs and
+                     len(inode_ids) == 1 + len(seen_files) + len(seen_dirs),
+                     "capture metadata tree does not close over its exact manifest")
+            check_fd = self._open_root_checked()
+            os.close(check_fd)
+        finally:
+            os.close(root_fd)
+
+    def read(self, pin_value: object, maximum_bytes: int) -> bytes:
+        pin = _pin_raw(pin_value, "prepared bootstrap read pin")
+        key = (pin["path"], pin["raw_sha256"])
+        captured = self._objects.get(key)
+        _require(captured is not None,
+                 "prepared bootstrap reader refuses an uncaptured origin")
+        _require(type(maximum_bytes) is int and 0 < maximum_bytes <=
+                 self._maximum_read_bytes and
+                 captured["byte_count"] <= maximum_bytes,
+                 "prepared bootstrap read exceeds its Source-derived byte cap")
+        relative = captured["local_relative_path"]
+        root_fd = self._open_root_checked()
+        parent_fd = -1
+        descriptor = -1
+        try:
+            parent_fd, leaf = self._open_local_parent(root_fd, relative)
+            before_path = os.stat(leaf, dir_fd=parent_fd, follow_symlinks=False)
+            expected_identity = self._file_identity[relative]
+            before_identity = (before_path.st_dev, before_path.st_ino,
+                              before_path.st_size, before_path.st_mtime_ns,
+                              before_path.st_ctime_ns)
+            _require(before_identity == expected_identity and
+                     stat.S_ISREG(before_path.st_mode) and
+                     stat.S_IMODE(before_path.st_mode) == 0o400 and
+                     before_path.st_uid == self._uid and before_path.st_nlink == 1 and
+                     before_path.st_dev == self._root_device and
+                     before_path.st_size <= maximum_bytes,
+                     "prepared captured file changed or exceeds its requested cap")
+            descriptor = os.open(
+                leaf, os.O_RDONLY | _O_NOFOLLOW | _O_CLOEXEC | _O_NONBLOCK,
+                dir_fd=parent_fd,
+            )
+            before = os.fstat(descriptor)
+            _require((before.st_dev, before.st_ino, before.st_size,
+                      before.st_mtime_ns, before.st_ctime_ns) == expected_identity and
+                     stat.S_ISREG(before.st_mode) and
+                     stat.S_IMODE(before.st_mode) == 0o400 and
+                     before.st_uid == self._uid and before.st_nlink == 1,
+                     "prepared captured file changed while opening")
+            count = captured["byte_count"]
+            output = bytearray(count)
+            hasher = hashlib.sha256()
+            offset = 0
+            while offset < count:
+                block = os.read(descriptor, min(COPY_BLOCK_BYTES, count - offset))
+                _require(bool(block), "prepared captured file ended before its manifest size")
+                output[offset:offset + len(block)] = block
+                hasher.update(block)
+                offset += len(block)
+            _require(os.read(descriptor, 1) == b"" and
+                     hasher.hexdigest() == pin["raw_sha256"],
+                     "prepared captured bytes differ from their exact raw pin")
+            after = os.fstat(descriptor)
+            after_path = os.stat(leaf, dir_fd=parent_fd, follow_symlinks=False)
+            _require((after.st_dev, after.st_ino, after.st_size,
+                      after.st_mtime_ns, after.st_ctime_ns) == expected_identity and
+                     (after_path.st_dev, after_path.st_ino, after_path.st_size,
+                      after_path.st_mtime_ns, after_path.st_ctime_ns) == expected_identity and
+                     stat.S_IMODE(after.st_mode) == 0o400 and
+                     after.st_uid == self._uid and after.st_nlink == 1,
+                     "prepared captured file changed during its bounded read")
+            current_root = self._open_root_checked()
+            current_parent, current_leaf = self._open_local_parent(current_root, relative)
+            try:
+                current_info = os.fstat(current_parent)
+                held_info = os.fstat(parent_fd)
+                current_path = os.stat(current_leaf, dir_fd=current_parent,
+                                       follow_symlinks=False)
+                _require((current_info.st_dev, current_info.st_ino) ==
+                         (held_info.st_dev, held_info.st_ino) and
+                         (current_path.st_dev, current_path.st_ino) ==
+                         (after.st_dev, after.st_ino),
+                         "prepared captured file left its private tree during read")
+            finally:
+                os.close(current_parent)
+                os.close(current_root)
+            return bytes(output)
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+            if parent_fd >= 0:
+                os.close(parent_fd)
+            os.close(root_fd)
+
+    def __call__(self, pin_value: object, maximum_bytes: int) -> bytes:
+        return self.read(pin_value, maximum_bytes)
+
+    def close(self) -> None:
+        if not self._closed:
+            os.close(self._root_fd)
+            self._root_fd = -1
+            self._closed = True
+
+
+def _prepared_bootstrap_capture_reader(
+    capture_module: dict[str, Any], capture_manifest_raw: bytes,
+    stage_root: str, host_ids: list[str], maximum_read_bytes: int,
+) -> tuple[Any, dict[str, Any]]:
+    _require(type(capture_manifest_raw) is bytes and
+             len(capture_manifest_raw) <= PREPARED_CAPTURE_MANIFEST_MAX_BYTES,
+             "prepared lineage capture manifest exceeds its finite Source bound")
+    manifest = _parse_canonical(
+        capture_manifest_raw, "prepared lineage capture manifest",
+        maximum_bytes=PREPARED_CAPTURE_MANIFEST_MAX_BYTES,
+    )
+    _exact(manifest, {"schema", "objects"},
+           "prepared lineage capture manifest")
+    _require(manifest["schema"] == PREPARED_CAPTURE_MANIFEST_SCHEMA and
+             type(manifest["objects"]) is list and
+             0 < len(manifest["objects"]) <= MAX_ROWS,
+             "prepared lineage capture manifest schema/cardinality differs")
+    _require(manifest["schema"] == capture_module["CAPTURE_MANIFEST_SCHEMA"],
+             "prepared capture manifest schema differs from selected Source")
+    _require(type(host_ids) is list and len(host_ids) == 2 and
+             len(set(host_ids)) == 2,
+             "prepared bootstrap Source host order is malformed")
+    _uint(maximum_read_bytes, "prepared bootstrap selected Source read ceiling",
+          positive=True)
+    _require(maximum_read_bytes <= PREPARED_CAPTURE_BOOTSTRAP_MAX_BYTES,
+             "prepared Source role caps exceed the bootstrap envelope")
+    seen_origins: set[tuple[str, str]] = set()
+    for index, item_value in enumerate(manifest["objects"]):
+        item = _exact(item_value, {
+            "origin_pin", "local_relative_path", "byte_count",
+        }, f"prepared capture manifest object[{index}]")
+        pin = _pin_raw(item["origin_pin"],
+                       f"prepared capture manifest origin[{index}]")
+        key = (pin["path"], pin["raw_sha256"])
+        _require(key not in seen_origins,
+                 "prepared capture manifest repeats an origin pin")
+        seen_origins.add(key)
+        count = _uint(item["byte_count"],
+                      f"prepared capture manifest byte count[{index}]", positive=True)
+        _require(count <= maximum_read_bytes,
+                 "prepared capture metadata exceeds every selected Source role cap")
+        capture_module["_relative_local"](item["local_relative_path"])
+    try:
+        reader = _PreparedBootstrapCaptureReader(
+            capture_module, manifest, stage_root, maximum_read_bytes,
+        )
+    except Exception as error:
+        raise EvidenceArchiveError(
+            f"prepared capture stage failed its metadata-only private custody scan: {error}",
+        ) from error
+    return reader, manifest
+
+
+def _prepared_execution_manifest(
+    raw: bytes, pin_value: object, budget: dict[str, Any],
+    context: dict[str, Any], source_docs: dict[str, dict[str, Any]],
+    selected_source_doc: dict[str, Any],
+    source_pins: dict[str, dict[str, str]],
+    plan_raw: bytes, spec_raw: bytes,
+    journal_width_contract_raw: bytes,
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], dict[str, Any]]:
+    pin = _pin(pin_value, "prepared execution-manifest pin")
+    _require(type(raw) is bytes and len(raw) <= MAX_PLAN_BYTES and
+             _sha(raw) == pin["raw_sha256"],
+             "prepared execution-manifest bytes differ from their raw pin")
+    execution = _parse_canonical(
+        raw, "prepared Source5 execution manifest", maximum_bytes=MAX_PLAN_BYTES,
+    )
+    base = {
+        "schema", "campaign_id", "hosts", "original_inputs", "execution_sources",
+        "modules", "observed_hosts", "capacity_completions", "artifact_root",
+        "output_root", "phase_order", "protocol_sha256", "qualification_eligible",
+        "manifest_sha256",
+    }
+    _exact(execution, (base - {"capacity_completions"}) | {
+        "scope", "prepared_input_generation", "prepared_capacity_registration",
+        "archive_signer_contexts", "journal_width_contracts",
+    }, "prepared Source5 execution manifest V5")
+    hosts = execution["hosts"]
+    _require(type(hosts) is list and len(hosts) == 2 and
+             all(type(host) is str and bool(host) for host in hosts) and
+             len(set(hosts)) == 2 and set(hosts) == set(source_pins) and
+             context["host_id"] in hosts and
+             execution["schema"] == PREPARED_EXPLORATION_EXECUTION_SCHEMA and
+             execution["scope"] == PREPARED_EXPLORATION_SCOPE and
+             execution["campaign_id"] == context["campaign_id"] and
+             execution["qualification_eligible"] is False and
+             execution["manifest_sha256"] == pin["semantic_sha256"] ==
+                 _sha(_canonical({key: value for key, value in execution.items()
+                                  if key != "manifest_sha256"},
+                                 maximum_bytes=MAX_PLAN_BYTES)),
+             "prepared execution V5 identity, cohort, scope or semantic pin differs")
+    original = _exact(execution["original_inputs"], {
+        "spec", "plan", "source_manifests", "campaign_artifacts_root",
+    }, "prepared execution original inputs")
+    _absolute_path(original["campaign_artifacts_root"],
+                   "prepared original campaign-artifact root")
+    _absolute_path(execution["artifact_root"], "prepared execution artifact root")
+    _absolute_path(execution["output_root"], "prepared execution output root")
+    _digest(execution["protocol_sha256"], "prepared execution protocol digest")
+    spec_pin = _pin(budget["original_pins"]["spec"],
+                    "prepared final Spec pin")
+    plan_pin = _pin(budget["original_pins"]["plan"],
+                    "prepared final Plan pin")
+    spec = _parse_canonical(spec_raw, "prepared final SpecV3",
+                            maximum_bytes=PREPARATORY_MAX_SPEC_BYTES)
+    plan = _parse_canonical(plan_raw, "prepared final PlanV3",
+                            maximum_bytes=MAX_PLAN_BYTES)
+    _require(type(spec_raw) is bytes and _sha(spec_raw) == spec_pin["raw_sha256"] and
+             _sha(spec_raw) == spec_pin["semantic_sha256"] and
+             type(plan_raw) is bytes and _sha(plan_raw) == plan_pin["raw_sha256"] and
+             plan.get("plan_sha256") == plan_pin["semantic_sha256"] ==
+                 _sha(_canonical({key: value for key, value in plan.items()
+                                  if key != "plan_sha256"},
+                                 maximum_bytes=MAX_PLAN_BYTES)) and
+             spec.get("schema") == "allocatbelt.application-campaign-spec.v3" and
+             plan.get("schema") == "allocatbelt.application-campaign-plan.v3" and
+             spec.get("campaign_id") == plan.get("campaign_id") ==
+                 context["campaign_id"],
+             "prepared final Spec/Plan schema or raw/semantic pin differs")
+    _require(type(spec.get("protocol")) is dict and
+             execution["protocol_sha256"] == _sha(_canonical(spec["protocol"])),
+             "prepared execution protocol digest differs from the exact final Spec")
+    spec_hosts = spec.get("hosts")
+    _require(type(spec_hosts) is list and len(spec_hosts) == len(hosts) and
+             [row.get("host_id") for row in spec_hosts if type(row) is dict] == hosts,
+             "prepared execution host order differs from the immutable final Spec")
+    spec_host_by_id = {}
+    for host, row in zip(hosts, spec_hosts, strict=True):
+        _require(type(row) is dict and row.get("host_id") == host and
+                 type(row.get("controls")) is dict,
+                 f"prepared final Spec {host} host contract is malformed")
+        fingerprint = _digest(
+            row.get("host_fingerprint_sha256"),
+            f"prepared final Spec {host} host fingerprint",
+        )
+        _require(fingerprint == _sha(_canonical(row["controls"])),
+                 f"prepared final Spec {host} fingerprint differs from its controls")
+        spec_host_by_id[host] = row
+    spec_wrapper = _exact(original["spec"], {"artifact", "semantic_sha256"},
+                          "prepared execution Spec wrapper")
+    plan_wrapper = _exact(original["plan"], {"artifact", "semantic_sha256"},
+                          "prepared execution Plan wrapper")
+    _require(_pin({**_pin_raw(spec_wrapper["artifact"],
+                             "prepared execution Spec artifact"),
+                   "semantic_sha256": spec_wrapper["semantic_sha256"]},
+                  "prepared execution Spec pin") == spec_pin and
+             _pin({**_pin_raw(plan_wrapper["artifact"],
+                             "prepared execution Plan artifact"),
+                   "semantic_sha256": plan_wrapper["semantic_sha256"]},
+                  "prepared execution Plan pin") == plan_pin,
+             "prepared execution manifest changed its final Spec/Plan pins")
+    source_wrappers = _exact(original["source_manifests"], set(hosts),
+                             "prepared execution Source wrapper map")
+    for host in hosts:
+        wrapper = _exact(source_wrappers[host], {"artifact", "semantic_sha256"},
+                         f"prepared execution {host} Source wrapper")
+        wrapper_pin = _pin({**_pin_raw(wrapper["artifact"],
+                                      f"prepared execution {host} Source artifact"),
+                            "semantic_sha256": wrapper["semantic_sha256"]},
+                           f"prepared execution {host} Source pin")
+        _require(wrapper_pin == source_pins[host] and
+                 source_docs[host]["manifest_sha256"] == wrapper_pin["semantic_sha256"],
+                 f"prepared execution changed the {host} Source manifest pin")
+    prepared_generation = _exact(execution["prepared_input_generation"], {
+        "completion", "provenance",
+    }, "prepared execution input generation")
+    provenance = prepared_generation["provenance"]
+    _require(type(provenance) is dict and
+             provenance.get("schema") ==
+                 "allocatbelt.application-source5-prepared-inputs-provenance.v2" and
+             type(provenance.get("exploration_lineage")) is dict and
+             set(provenance["exploration_lineage"]) == set(hosts) and
+             provenance["exploration_lineage"] ==
+                 budget["original_pins"]["prepared_exploration"],
+             "prepared execution lineage provenance differs from the budget pins")
+    registration = _exact(execution["prepared_capacity_registration"], {
+        "completion", "host_completion", "host_verification", "ledger",
+        "capacity_schedule_sha256", "registration_head",
+    }, "prepared execution capacity registration")
+    _pin(registration["completion"], "prepared capacity-generation completion")
+    _digest(registration["capacity_schedule_sha256"],
+            "prepared capacity schedule digest")
+    _digest(registration["registration_head"],
+            "prepared capacity registration head")
+    signer_map = _exact(execution["archive_signer_contexts"], set(hosts),
+                        "prepared execution signer-context map")
+    width_map = _exact(execution["journal_width_contracts"], set(hosts),
+                       "prepared execution width-contract map")
+    observed_map = _exact(execution["observed_hosts"], set(hosts),
+                          "prepared execution observed-host map")
+    for host in hosts:
+        signer_wrapper = _exact(signer_map[host], {"artifact", "semantic_sha256"},
+                                f"prepared {host} signer-context wrapper")
+        _pin({**_pin_raw(signer_wrapper["artifact"],
+                         f"prepared {host} signer-context artifact"),
+              "semantic_sha256": signer_wrapper["semantic_sha256"]},
+             f"prepared {host} signer-context pin")
+        current_width_wrapper = _exact(width_map[host], {
+            "artifact", "semantic_sha256",
+        }, f"prepared {host} width-contract wrapper")
+        _pin({**_pin_raw(current_width_wrapper["artifact"],
+                         f"prepared {host} width-contract artifact"),
+              "semantic_sha256": current_width_wrapper["semantic_sha256"]},
+             f"prepared {host} width-contract pin")
+        observed_wrapper = _exact(observed_map[host], {
+            "artifact", "host_fingerprint_sha256", "controls_sha256",
+        }, f"prepared {host} observed-host wrapper")
+        _pin_raw(observed_wrapper["artifact"],
+                 f"prepared {host} observed-host artifact")
+        fingerprint = _digest(
+            observed_wrapper["host_fingerprint_sha256"],
+            f"prepared {host} observed-host fingerprint",
+        )
+        controls_sha = _digest(
+            observed_wrapper["controls_sha256"],
+            f"prepared {host} observed-host controls digest",
+        )
+        _require(fingerprint == spec_host_by_id[host]["host_fingerprint_sha256"],
+                 f"prepared {host} observed-host fingerprint differs from immutable final Spec")
+    width_pin = _pin(budget["journal_width_contract_pin"],
+                     "prepared current width-contract pin")
+    width_wrapper = _exact(
+        width_map[context["host_id"]],
+        {"artifact", "semantic_sha256"},
+        "prepared current width-contract wrapper",
+    )
+    _require(_pin({**_pin_raw(width_wrapper["artifact"],
+                             "prepared current width artifact"),
+                   "semantic_sha256": width_wrapper["semantic_sha256"]},
+                  "prepared current execution width pin") == width_pin and
+             type(journal_width_contract_raw) is bytes and
+             _sha(journal_width_contract_raw) == width_pin["raw_sha256"],
+             "prepared current width wrapper differs from its exact budget pin")
+    width = _parse_canonical(
+        journal_width_contract_raw, "prepared current width contract",
+        maximum_bytes=PREPARATORY_MAX_WIDTH_BYTES,
+    )
+    module_maps = _exact(execution["modules"], set(hosts),
+                         "prepared execution Source module maps")
+    for host in hosts:
+        modules = module_maps[host]
+        source_files = source_docs[host]["source"]["files"]
+        expected_paths = {
+            row["path"] for row in source_files
+            if type(row) is dict and row.get("kind") == "file" and
+            type(row.get("path")) is str and row["path"].startswith("scripts/") and
+            PurePosixPath(row["path"]).suffix in {".py", ".sh"}
+        }
+        _require(type(modules) is dict and set(modules) == expected_paths,
+                 f"prepared execution {host} module map differs from its pinned Source inventory")
+        file_rows = {row["path"]: row for row in source_files
+                     if type(row) is dict and type(row.get("path")) is str}
+        selected_paths = expected_paths
+        for module_path in selected_paths:
+            _require(type(module_path) is str and module_path.startswith("scripts/"),
+                     f"prepared execution {host} module path is malformed")
+            module_pin = _exact(modules[module_path], {"path", "sha256"},
+                                f"prepared execution {host} module pin")
+            _require(module_pin["path"] == module_path,
+                     f"prepared execution {host} module path differs at {module_path}")
+            _digest(module_pin["sha256"],
+                    f"prepared execution {host} module digest {module_path}")
+            row = file_rows[module_path]
+            _require(module_pin["sha256"] == row["sha256"],
+                     f"prepared execution {host} module map differs at {module_path}")
+    source_roots = _exact(execution["execution_sources"], set(hosts),
+                          "prepared execution source/build map")
+    for host in hosts:
+        root_row = _exact(source_roots[host], {
+            "source_root", "git_commit", "source_tree_sha256", "build_sha256",
+        }, f"prepared execution {host} source/build row")
+        _absolute_path(root_row["source_root"],
+                       f"prepared execution {host} Source root")
+        _digest(root_row["source_tree_sha256"],
+                f"prepared execution {host} source-tree digest")
+        _digest(root_row["build_sha256"],
+                f"prepared execution {host} build digest")
+        _require(type(root_row["git_commit"]) is str and
+                 bool(root_row["git_commit"]),
+                 f"prepared execution {host} Git identity is malformed")
+        source = source_docs[host]
+        build = source.get("build")
+        calibration = source.get("resource_domain_calibration")
+        _require(type(build) is dict and type(calibration) is dict,
+                 f"prepared {host} Source build calibration is malformed")
+        build_sha = _sha(_canonical(build,
+                                    maximum_bytes=MAX_SOURCE_MANIFEST_BYTES))
+        _require(root_row["git_commit"] == source["source"].get("git_commit") and
+                 root_row["source_tree_sha256"] ==
+                     source["source"]["source_tree_sha256"] and
+                 root_row["build_sha256"] == build_sha and
+                 calibration.get("build") == build and
+                 calibration.get("build_sha256") == build_sha,
+                 f"prepared execution {host} Source/build snapshot differs")
+    _require(selected_source_doc["source"]["source_tree_sha256"] ==
+             budget["original_pins"]["source_tree_sha256"],
+             "prepared budget Source-tree pin differs from the current selected Source")
+    source_root = Path(os.path.abspath(globals()["__file__"])).parent.parent
+    _require(source_roots[context["host_id"]]["source_root"] ==
+             str(source_root.resolve(strict=True)),
+             "prepared selected Source root differs from the resident Archive tree")
+    _require(type(execution["phase_order"]) is list and
+             execution["phase_order"] == [
+                 "exploration", "aa", "confirmation", "fixed_analysis",
+                 "pressure", "pressure_analysis", "soak", "final_analysis",
+             ],
+             "prepared execution phase order differs from Source5 V5")
+    return execution, spec, plan, width
+
+
+def _prepared_observed_host_dto(
+    execution: dict[str, Any], spec: dict[str, Any], host: str,
+    read_lineage: Any, maximum_bytes: int,
+) -> dict[str, Any]:
+    """Join one canonical captured observation to its exact Spec host contract."""
+    wrapper = _exact(execution["observed_hosts"][host], {
+        "artifact", "host_fingerprint_sha256", "controls_sha256",
+    }, f"prepared {host} observed-host wrapper")
+    pin = _pin_raw(wrapper["artifact"],
+                   f"prepared {host} observed-host artifact")
+    host_rows = [row for row in spec.get("hosts", [])
+                 if type(row) is dict and row.get("host_id") == host]
+    _require(len(host_rows) == 1,
+             f"prepared {host} immutable Spec host row is missing or repeated")
+    host_spec = host_rows[0]
+    fingerprint = _digest(
+        wrapper["host_fingerprint_sha256"],
+        f"prepared {host} observed-host fingerprint",
+    )
+    controls_sha = _digest(
+        wrapper["controls_sha256"],
+        f"prepared {host} observed-host controls digest",
+    )
+    _require(fingerprint == host_spec.get("host_fingerprint_sha256") and
+             type(host_spec.get("controls")) is dict and
+             fingerprint == _sha(_canonical(host_spec["controls"])),
+             f"prepared {host} observed-host fingerprint differs from immutable final Spec")
+    try:
+        observed_raw = read_lineage(pin, maximum_bytes)
+        value = _parse_canonical(
+            observed_raw, f"captured prepared {host} observed-host input",
+            maximum_bytes=maximum_bytes,
+        )
+    except Exception as error:
+        raise EvidenceArchiveError(
+            f"captured prepared {host} observed-host input failed Source checks: {error}",
+        ) from error
+    observed = _exact(value, {
+        "schema", "host_id", "boot_id_sha256", "controls_sha256", "controls",
+        "kernel_release", "cpu_model", "cpu_affinity", "network_namespace_inode",
+    }, f"captured prepared {host} observed-host DTO")
+    _require(_sha(observed_raw) == pin["raw_sha256"] and
+             observed["schema"] == "allocatbelt.application-capacity-host-context.v1" and
+             observed["host_id"] == host and
+             _digest(observed["boot_id_sha256"],
+                     f"prepared {host} observed boot ID") and
+             type(observed["controls"]) is dict and
+             observed["controls"] == host_spec["controls"] and
+             observed["controls_sha256"] == controls_sha ==
+                 _sha(_canonical(observed["controls"])) and
+             observed["kernel_release"] ==
+                 host_spec["controls"].get("kernel_release") and
+             observed["cpu_model"] == host_spec["controls"].get("cpu_model"),
+             f"current prepared {host} observed-host bytes differ from their raw/control pins")
+    return {
+        "pin": pin, "raw": observed_raw, "value": observed,
+        "dto": {
+            "path": pin["path"], "raw_sha256": pin["raw_sha256"],
+            "boot_id_sha256": observed["boot_id_sha256"],
+            "controls_sha256": observed["controls_sha256"],
+        },
+    }
+
+
+def _prepared_lineage_closure(
+    budget: dict[str, Any], context: dict[str, Any],
+    source_manifest_raw: bytes, execution_manifest_raw: bytes,
+    plan_raw: bytes, spec_raw: bytes, width_raw: bytes,
+    capture_manifest_raw: bytes, capture_stage_root: str,
+) -> tuple[Any, dict[str, Any], list[dict[str, Any]], dict[str, Any],
+           dict[str, Any], dict[str, Any]]:
+    primary_context, _pins = _prepared_exploration_primary_context(
+        budget, context["resource_budget_pin"],
+    )
+    _require(all(context[name] == primary_context[name] for name in (
+        "campaign_id", "host_id", "source_manifest_pin", "plan_pin",
+        "resource_budget_pin", "execution_manifest_pin",
+    )), "prepared V5 full request context differs from its selected six-pin projection")
+    source_pins = {
+        host: _pin(value, f"prepared {host} Source manifest pin")
+        for host, value in budget["original_pins"]["source_manifests"].items()
+    }
+    source_docs: dict[str, dict[str, Any]] = {}
+    modules = {
+        "evidence_budget": _prepared_typed_module(
+            source_manifest_raw, execution_manifest_raw, primary_context,
+            SOURCE5_BUDGET_VALIDATOR_PATH,
+        ),
+        "lineage": _prepared_typed_module(
+            source_manifest_raw, execution_manifest_raw, primary_context,
+            PREPARED_LINEAGE_SOURCE_PATH,
+        ),
+        "bridge": _prepared_typed_module(
+            source_manifest_raw, execution_manifest_raw, primary_context,
+            PREPARED_BRIDGE_BUDGET_SOURCE_PATH,
+        ),
+        "source5_campaign": _prepared_typed_module(
+            source_manifest_raw, execution_manifest_raw, primary_context,
+            PREPARED_CAMPAIGN_SOURCE_PATH,
+        ),
+        "input_preparation": _prepared_typed_module(
+            source_manifest_raw, execution_manifest_raw, primary_context,
+            PREPARED_INPUT_PREPARATION_SOURCE_PATH,
+        ),
+        "campaign_inputs": _prepared_typed_module(
+            source_manifest_raw, execution_manifest_raw, primary_context,
+            PREPARED_CAMPAIGN_INPUTS_SOURCE_PATH,
+        ),
+        "chronology": _prepared_typed_module(
+            source_manifest_raw, execution_manifest_raw, primary_context,
+            PREPARED_CHRONOLOGY_SOURCE_PATH,
+        ),
+        "controller": _prepared_typed_module(
+            source_manifest_raw, execution_manifest_raw, primary_context,
+            PREPARED_CONTROLLER_SOURCE_PATH,
+        ),
+        "preparatory_budget": _prepared_typed_module(
+            source_manifest_raw, execution_manifest_raw, primary_context,
+            PREPARATORY_BUDGET_VALIDATOR_PATH,
+        ),
+        "capture": _prepared_typed_module(
+            source_manifest_raw, execution_manifest_raw, primary_context,
+            PREPARED_CAPTURE_SOURCE_PATH,
+        ),
+    }
+    required_apis = {
+        "evidence_budget": (
+            "validate_host_evidence_budget_v4",
+            "required_archive_request_schema_v1",
+            "iter_path_catalogue_rows_with_reader",
+            "verify_prepared_source5_path_catalogue_chunks_with_reader",
+            "_catalogue_row",
+        ),
+        "lineage": ("verify_source5_prepared_exploration_lineage_v2",),
+        "bridge": (
+            "build_prepared_exploration_capture_storage_v1",
+            "validate_prepared_exploration_width_contract_v2",
+        ),
+        "source5_campaign": ("build_source5_original_pins_from_observed_v1",),
+        "chronology": ("_validate_chronology_original_pins",),
+        "controller": ("digest_object",),
+        "capture": ("PreparedExplorationLineageCaptureReaderV1",),
+    }
+    for module_name, api_names in required_apis.items():
+        _require(all(callable(modules[module_name].get(name))
+                     for name in api_names),
+                 f"typed Source {module_name} module lacks a required V5 API")
+    budget_module = modules["evidence_budget"]
+    _require(budget_module.get("HOST_BUDGET_SCHEMA_V4") == HOST_BUDGET_SCHEMA_V4 and
+             budget_module.get("SOURCE5_PREPARED_EXPLORATION_ADMISSION_PROFILE") ==
+                 PREPARED_EXPLORATION_ADMISSION_PROFILE and
+             budget_module.get("EXECUTION_SCHEMA_V5") ==
+                 PREPARED_EXPLORATION_EXECUTION_SCHEMA,
+             "typed Source budget module lacks the exact V4/V5 metadata profile")
+    maximums = (
+        modules["source5_campaign"].get("MAX_ARTIFACT_BYTES"),
+        modules["lineage"].get("MAX_PLAN_BYTES"),
+        modules["lineage"].get("MAX_SPEC_BYTES"),
+        modules["lineage"].get("MAX_RECORD_BYTES"),
+        modules["lineage"].get("MAX_CHECKPOINT_BYTES"),
+        modules["lineage"].get("MAX_METADATA_BYTES"),
+        modules["lineage"].get("MAX_SIGNATURE_BYTES"),
+        modules["chronology"].get("MAX_JOURNAL_BYTES"),
+        modules["chronology"].get("MAX_EVENT_BYTES"),
+    )
+    _require(all(type(value) is int and 0 < value <=
+                 PREPARED_CAPTURE_BOOTSTRAP_MAX_BYTES for value in maximums),
+             "selected Source historical artifact caps exceed the bootstrap envelope")
+    bootstrap_maximum = max(maximums)
+    capture_module = modules["capture"]
+    bootstrap, capture_manifest = _prepared_bootstrap_capture_reader(
+        capture_module, capture_manifest_raw, capture_stage_root,
+        list(source_pins), bootstrap_maximum,
+    )
+    final_reader = None
+    try:
+        selected_source_doc = _prepared_source_document(
+            source_manifest_raw, source_pins[context["host_id"]],
+            "selected current",
+        )
+        for host in source_pins:
+            try:
+                raw = bootstrap.read(
+                    {"path": source_pins[host]["path"],
+                     "raw_sha256": source_pins[host]["raw_sha256"]},
+                    MAX_SOURCE_MANIFEST_BYTES,
+                )
+            except Exception as error:
+                raise EvidenceArchiveError(
+                    f"historical Source manifest {host} is absent from its private capture",
+                ) from error
+            source_docs[host] = _prepared_source_document(
+                raw, source_pins[host], f"prepared {host}",
+            )
+        execution, spec, plan, width = _prepared_execution_manifest(
+            execution_manifest_raw,
+            budget["original_pins"]["execution_manifest"],
+            budget, context, source_docs, selected_source_doc, source_pins,
+            plan_raw, spec_raw, width_raw,
+        )
+
+        final_spec_pin = _pin(budget["original_pins"]["spec"],
+                              "prepared final Spec")
+        final_plan_pin = _pin(budget["original_pins"]["plan"],
+                              "prepared final Plan")
+        source_objects = {
+            name: sys.modules[namespace["__name__"]]
+            for name, namespace in modules.items()
+        }
+
+        def read_lineage(pin_value: dict[str, str], maximum: int) -> bytes:
+            pin = _pin_raw(pin_value, "prepared lineage read pin")
+            if pin == {"path": final_spec_pin["path"],
+                       "raw_sha256": final_spec_pin["raw_sha256"]}:
+                raw = spec_raw
+            elif pin == {"path": final_plan_pin["path"],
+                         "raw_sha256": final_plan_pin["raw_sha256"]}:
+                raw = plan_raw
+            else:
+                raw = bootstrap.read(pin, maximum)
+            _require(type(raw) is bytes and 0 < len(raw) <= maximum and
+                     _sha(raw) == pin["raw_sha256"],
+                     "prepared Source reader returned bytes outside the requested raw pin/cap")
+            return raw
+
+        source_rows = []
+        for host in execution["hosts"]:
+            source = source_docs[host]
+            pin = source_pins[host]
+            source_rows.append({
+                "host_id": host, "path": pin["path"],
+                "raw_sha256": pin["raw_sha256"],
+                "semantic_sha256": pin["semantic_sha256"],
+                "source_tree_sha256": source["source"]["source_tree_sha256"],
+            })
+        observed_by_host: dict[str, dict[str, Any]] = {}
+        original_pin_dtos: dict[str, dict[str, Any]] = {}
+        for host in execution["hosts"]:
+            joined_observed = _prepared_observed_host_dto(
+                execution, spec, host, read_lineage,
+                modules["source5_campaign"]["MAX_ARTIFACT_BYTES"],
+            )
+            pin = joined_observed["pin"]
+            observed_raw = joined_observed["raw"]
+            value = joined_observed["value"]
+            observed_by_host[host] = joined_observed["dto"]
+            observed_context = types.SimpleNamespace(
+                observed_host_pin=pin, manifest=execution, host_id=host,
+                chronology=source_objects["chronology"],
+                spec_pin=final_spec_pin,
+                spec_semantic_sha256=final_spec_pin["semantic_sha256"],
+                plan_pin=final_plan_pin,
+                plan_semantic_sha256=final_plan_pin["semantic_sha256"],
+                source_manifest_pins=source_pins, sources=source_docs,
+            )
+            try:
+                dto = source_objects[
+                    "source5_campaign"
+                ].build_source5_original_pins_from_observed_v1(
+                    observed_context, value, _sha(observed_raw),
+                )
+                source_objects["chronology"]._validate_chronology_original_pins(dto)
+            except Exception as error:
+                raise EvidenceArchiveError(
+                    f"typed Source chronology rejected captured {host} observation: {error}",
+                ) from error
+            original_pin_dtos[host] = dto
+        proofs: dict[str, dict[str, Any]] = {}
+        for host in execution["hosts"]:
+            final_prepared = {
+                "campaign_id": context["campaign_id"], "host_id": host,
+                "output_root": execution["output_root"],
+                "original_pins": {
+                    "spec": final_spec_pin, "plan": final_plan_pin,
+                    "source_manifests": source_rows,
+                    "observed_host": observed_by_host[host],
+                },
+            }
+            try:
+                proof = source_objects["lineage"].verify_source5_prepared_exploration_lineage_v2(
+                    final_prepared,
+                    budget["original_pins"]["prepared_exploration"][host],
+                    artifact_reader=read_lineage,
+                    campaign_module=source_objects["controller"],
+                    input_preparation_module=source_objects["input_preparation"],
+                    campaign_inputs_module=source_objects["campaign_inputs"],
+                    chronology_module=source_objects["chronology"],
+                    source5_campaign_module=source_objects["source5_campaign"],
+                    preparatory_budget_module=source_objects["preparatory_budget"],
+                )
+            except Exception as error:
+                raise EvidenceArchiveError(
+                    f"typed Source lineage verifier rejected {host}: {error}",
+                ) from error
+            _require(type(proof) is dict and
+                     proof.get("schema") ==
+                         "allocatbelt.application-source5-prepared-exploration-lineage-proof.v2" and
+                     proof.get("campaign_id") == context["campaign_id"] and
+                     proof.get("host_id") == host and
+                     proof.get("qualification_eligible") is False and
+                     proof.get("component_replay_required") is True and
+                     type(proof.get("index_rows")) is list and
+                     len(proof["index_rows"]) == 360,
+                     f"typed Source lineage proof for {host} is incomplete or authorizing")
+            proofs[host] = proof
+        expected_ancestors = {host: proofs[host]["ancestor"]
+                              for host in execution["hosts"]}
+        jobs_by_host = {
+            host: [job for job in plan["jobs"]["exploration"]
+                   if type(job) is dict and job.get("host_id") == host]
+            for host in execution["hosts"]
+        }
+        budget_module_object = source_objects["evidence_budget"]
+        try:
+            declaration, storage_rows = source_objects[
+                "bridge"
+            ].build_prepared_exploration_capture_storage_v1(
+                execution["hosts"], proofs,
+                expected_ancestors=expected_ancestors,
+                expected_exploration_jobs=jobs_by_host,
+                artifact_reader=read_lineage,
+                evidence_budget_module=budget_module_object,
+            )
+        except Exception as error:
+            raise EvidenceArchiveError(
+                f"typed Source capture-declaration builder rejected lineage closure: {error}",
+            ) from error
+        storage_rows = [budget_module["_catalogue_row"](
+            row, f"prepared captured lineage storage row[{index}]",
+        ) for index, row in enumerate(storage_rows)]
+        _require(declaration.get("cohort_host_ids") == execution["hosts"] and
+                 len(storage_rows) == len(declaration.get("objects", [])),
+                 "typed Source capture declaration does not close over its storage rows")
+        selected_host = context["host_id"]
+        try:
+            original_width_pins = original_pin_dtos[selected_host]
+            selected_jobs = {
+                phase: [job for job in plan["jobs"][phase]
+                        if type(job) is dict and job.get("host_id") == selected_host]
+                for phase in ("exploration", "aa", "confirmation", "pressure", "soak")
+            }
+            checked_width, width_events, max_line = source_objects[
+                "bridge"
+            ].validate_prepared_exploration_width_contract_v2(
+                width, jobs_by_phase=selected_jobs,
+                expected_campaign_id=context["campaign_id"],
+                expected_host_id=selected_host,
+                expected_original_pins_sha256=_sha(_canonical(original_width_pins)),
+                expected_plan_pin=_pin(budget["original_pins"]["plan"],
+                                        "prepared width Plan pin"),
+                expected_source_manifest_pin=source_pins[selected_host],
+                expected_ancestor=proofs[selected_host]["ancestor"],
+            )
+        except Exception as error:
+            raise EvidenceArchiveError(
+                f"typed Source width validator rejected the current V5 horizon: {error}",
+            ) from error
+        _require(checked_width == width and width_events == 97499 and max_line > 0,
+                 "typed Source width validator returned a changed current horizon")
+        _require(all(
+            _uint(row["maximum_bytes"],
+                  "derived prepared capture role cap", positive=True) <= bootstrap_maximum and
+            _uint(row["byte_count"],
+                  "derived prepared capture byte count", positive=True) <=
+                  row["maximum_bytes"]
+            for row in declaration["objects"]
+        ), "derived prepared capture exceeds the Source bootstrap role envelope")
+        captured_by_pin = {
+            (item["origin_pin"]["path"], item["origin_pin"]["raw_sha256"]): item
+            for item in capture_manifest["objects"]
+        }
+        expected_manifest_rows = []
+        for row in declaration["objects"]:
+            key = (row["origin_pin"]["path"], row["origin_pin"]["raw_sha256"])
+            captured = captured_by_pin.get(key)
+            _require(captured is not None,
+                     "derived prepared capture object is absent from its transport manifest")
+            expected_manifest_rows.append({
+                "origin_pin": row["origin_pin"],
+                "local_relative_path": captured["local_relative_path"],
+                "byte_count": row["byte_count"],
+            })
+        _require(expected_manifest_rows == capture_manifest["objects"] and
+                 len(expected_manifest_rows) == len(declaration["objects"]),
+                 "private capture manifest differs from the full freshly derived Source closure")
+    finally:
+        bootstrap.close()
+    try:
+        final_reader = capture_module["PreparedExplorationLineageCaptureReaderV1"](
+            declaration, capture_manifest, capture_stage_root,
+        )
+    except Exception as error:
+        raise EvidenceArchiveError(
+            f"derived prepared capture reader failed its exact physical closure: {error}",
+        ) from error
+    return (final_reader, declaration, storage_rows, execution, width,
+            source_objects["evidence_budget"])
+
+
+def _require_prepared_catalogue_storage_parity(
+    budget_module: object, budget: dict[str, Any], reader,
+    storage_rows: list[dict[str, Any]],
+) -> dict[str, Any]:
+    expected = {row["path"]: row for row in storage_rows}
+    _require(len(expected) == len(storage_rows),
+             "Source-derived captured storage rows repeat a current path")
+    observed: dict[str, dict[str, Any]] = {}
+    try:
+        for row in budget_module.iter_path_catalogue_rows_with_reader(
+                budget["path_catalogue"], reader):
+            expected_row = expected.get(row["path"])
+            if expected_row is not None:
+                _require(row["path"] not in observed and row == expected_row,
+                         f"current catalogue differs from Source capture storage at {row['path']}")
+                observed[row["path"]] = row
+    except Exception as error:
+        raise EvidenceArchiveError(
+            f"current Source catalogue failed complete captured-storage parity: {error}",
+        ) from error
+    _require(set(observed) == set(expected),
+             "current Source catalogue omits a Source-derived captured storage row")
+    return budget["path_catalogue"]
+
+
+def validate_prepared_exploration_budget_profile_v1(
+    budget_raw: bytes, context: dict[str, Any], *,
+    source_manifest_raw: bytes, execution_manifest_raw: bytes,
+    plan_raw: bytes, journal_width_contract_raw: bytes, spec_raw: bytes,
+    lineage_capture_manifest_raw: bytes, lineage_capture_stage_root: str,
+    catalogue_chunk_paths: dict[str, str] | None = None,
+    catalogue_cache_root: str | None = None, root_local: bool = False,
+) -> dict[str, Any]:
+    """Validate the read-only V4/V5 budget profile and closed old ancestry."""
+    checked_context = _validate_context(context)
+    _require(type(root_local) is bool,
+             "prepared profile Root/local access mode is malformed")
+    budget_pin = _pin(checked_context["resource_budget_pin"],
+                      "prepared V4 budget context pin")
+    _require(type(budget_raw) is bytes and
+             len(budget_raw) <= PREPARATORY_MAX_BUDGET_BYTES and
+             _sha(budget_raw) == budget_pin["raw_sha256"],
+             "prepared V4 budget bytes differ from their exact raw pin")
+    budget = _exact(_parse_canonical(
+        budget_raw, "prepared V4 host evidence budget",
+        maximum_bytes=PREPARATORY_MAX_BUDGET_BYTES,
+    ), HOST_BUDGET_FIELDS_V3, "prepared V4 host evidence budget")
+    _require(budget.get("schema") == HOST_BUDGET_SCHEMA_V4 and
+             budget.get("admission_profile") == PREPARED_EXPLORATION_ADMISSION_PROFILE and
+             budget.get("execution_manifest_schema") ==
+                 PREPARED_EXPLORATION_EXECUTION_SCHEMA and
+             budget.get("campaign_id") == checked_context["campaign_id"] and
+             budget.get("host_id") == checked_context["host_id"] and
+             budget.get("budget_sha256") == budget_pin["semantic_sha256"] ==
+                 _sha(_canonical({key: value for key, value in budget.items()
+                                  if key != "budget_sha256"},
+                                 maximum_bytes=PREPARATORY_MAX_BUDGET_BYTES)),
+             "prepared budget V4 schema/profile or semantic context pin differs")
+    _prepared_exploration_primary_context(budget, budget_pin)
+    original = budget["original_pins"]
+    source_pins = {host: _pin(value, f"prepared {host} Source pin")
+                   for host, value in original["source_manifests"].items()}
+    _require(checked_context["source_manifest_pin"] ==
+                 source_pins[checked_context["host_id"]] and
+             checked_context["plan_pin"] == _pin(original["plan"],
+                                                   "prepared budget Plan pin") and
+             checked_context["execution_manifest_pin"] == _pin(
+                 original["execution_manifest"],
+                 "prepared budget execution pin"),
+             "prepared request context does not match the budget's exact selected pins")
+    _require(type(source_manifest_raw) is bytes and
+             type(execution_manifest_raw) is bytes and
+             type(plan_raw) is bytes and
+             type(journal_width_contract_raw) is bytes and
+             type(spec_raw) is bytes,
+             "prepared V4 requires all six exact primary document bytes")
+    source_doc = _prepared_source_document(
+        source_manifest_raw, source_pins[checked_context["host_id"]],
+        "selected current",
+    )
+    _require(source_doc["source"]["source_tree_sha256"] ==
+             original["source_tree_sha256"],
+             "prepared budget Source-tree pin differs from the selected current Source")
+    try:
+        reader, declaration, storage_rows, execution, width, budget_module = \
+            _prepared_lineage_closure(
+                budget, checked_context, source_manifest_raw,
+                execution_manifest_raw, plan_raw, spec_raw,
+                journal_width_contract_raw, lineage_capture_manifest_raw,
+                lineage_capture_stage_root,
+            )
+    except EvidenceArchiveError:
+        raise
+    except Exception as error:
+        raise EvidenceArchiveError(
+            f"prepared V4 Source closure failed: {error}",
+        ) from error
+    try:
+        catalogue_reader = _source_budget_catalogue_reader(
+            budget, catalogue_chunk_paths, catalogue_cache_root,
+            root_local=root_local,
+        )
+        _require(callable(getattr(budget_module,
+                                  "validate_host_evidence_budget_v4", None)) and
+                 callable(getattr(budget_module,
+                                 "required_archive_request_schema_v1", None)),
+                 "selected Source budget module lacks its exact V4 profile APIs")
+        try:
+            validated = budget_module.validate_host_evidence_budget_v4(
+                budget, journal_width_contract_raw=journal_width_contract_raw,
+                final_spec_raw=spec_raw, lineage_artifact_reader=reader,
+                catalogue_row_reader=catalogue_reader,
+            )
+        except Exception as error:
+            raise EvidenceArchiveError(
+                f"selected Source V4 budget validator rejected its metadata: {error}",
+            ) from error
+        _require(validated == budget,
+                 "selected Source V4 validator returned a changed budget projection")
+        catalogue = _require_prepared_catalogue_storage_parity(
+            budget_module, validated, catalogue_reader, storage_rows,
+        )
+        try:
+            required_schema = budget_module.required_archive_request_schema_v1(
+                validated, execution, checked_context,
+            )
+        except Exception as error:
+            raise EvidenceArchiveError(
+                f"selected Source request-schema hook rejected the V4 profile: {error}",
+            ) from error
+        _require(required_schema is None or
+                 required_schema == REQUEST_SCHEMA_V3,
+                 "selected Source request-schema hook returned an unknown request profile")
+        return {
+            "budget": validated, "catalogue": catalogue,
+            "execution_manifest": execution,
+            "required_request_schema": required_schema,
+        }
+    finally:
+        reader.close()
 
 
 def _preparatory_original_pins(

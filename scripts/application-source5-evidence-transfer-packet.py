@@ -884,9 +884,9 @@ def _read_source_budget_module(
 
 def _read_source_archive_preparatory_validator(
     source_manifest_raw: bytes, execution_manifest_raw: bytes,
-    context: dict[str, Any],
+    context: dict[str, Any], *, prepared_exploration: bool = False,
 ) -> dict[str, Any]:
-    """Load the archive validator only from the exact prep-selected Source."""
+    """Load the archive validator only from its exact selected Source profile."""
     source_pin = _pin(context["source_manifest_pin"],
                       "preparatory Source manifest pin")
     execution_pin = _pin(context["execution_manifest_pin"],
@@ -935,37 +935,79 @@ def _read_source_archive_preparatory_validator(
     )
     body = {key: item for key, item in execution.items()
             if key != "manifest_sha256"}
-    _require(execution.get("schema") == PREPARATORY_EXECUTION_SCHEMA_V1 and
-             execution.get("campaign_id") == context["campaign_id"] and
-             execution.get("host_id") == context["host_id"] and
-             execution.get("manifest_sha256") == execution_pin["semantic_sha256"] ==
-                 _sha(_canonical(body, maximum_bytes=MAX_PLAN_BYTES)),
-             "selected prep execution manifest differs from its exact pin")
-    modules = execution.get("modules")
-    _require(type(modules) is dict and context["host_id"] in modules and
-             type(modules[context["host_id"]]) is dict,
-             "selected prep execution manifest omits its Source module map")
-    module_pin = _exact(
-        modules[context["host_id"]].get(PREPARATORY_ARCHIVE_VALIDATOR_PATH),
-        {"path", "sha256"}, "selected prep archive-validator module pin",
-    )
+    if prepared_exploration:
+        _exact(execution, {
+            "schema", "campaign_id", "hosts", "original_inputs", "execution_sources",
+            "modules", "observed_hosts", "artifact_root", "output_root",
+            "phase_order", "protocol_sha256", "qualification_eligible",
+            "manifest_sha256", "scope", "prepared_input_generation",
+            "prepared_capacity_registration", "archive_signer_contexts",
+            "journal_width_contracts",
+        }, "selected prepared-exploration execution manifest")
+        _require(execution.get("schema") == PREPARED_EXPLORATION_EXECUTION_SCHEMA and
+                 execution.get("scope") == PREPARED_EXPLORATION_SCOPE and
+                 type(execution.get("hosts")) is list and
+                 context["host_id"] in execution["hosts"] and
+                 execution.get("campaign_id") == context["campaign_id"] and
+                 execution.get("manifest_sha256") == execution_pin["semantic_sha256"] ==
+                     _sha(_canonical(body, maximum_bytes=MAX_PLAN_BYTES)),
+                 "selected prepared-exploration execution manifest differs from its exact pin")
+        modules = execution.get("modules")
+        _require(type(modules) is dict and context["host_id"] in modules and
+                 type(modules[context["host_id"]]) is dict,
+                 "selected prepared execution manifest omits its Source module map")
+        original = _exact(execution.get("original_inputs"), {
+            "spec", "plan", "source_manifests", "campaign_artifacts_root",
+        }, "selected prepared execution original inputs")
+        source_wrappers = original.get("source_manifests")
+        _require(type(source_wrappers) is dict and context["host_id"] in source_wrappers,
+                 "selected prepared execution omits its Source manifest wrapper")
+        wrapper = _exact(source_wrappers[context["host_id"]], {
+            "artifact", "semantic_sha256",
+        }, "selected prepared Source manifest wrapper")
+        artifact = _exact(wrapper["artifact"], {"path", "raw_sha256"},
+                          "selected prepared Source manifest artifact")
+        _require(artifact == {"path": source_pin["path"],
+                              "raw_sha256": source_pin["raw_sha256"]} and
+                 wrapper["semantic_sha256"] == source_pin["semantic_sha256"],
+                 "selected prepared Source manifest differs from its execution wrapper")
+        module_pin = _exact(
+            modules[context["host_id"]].get(PREPARATORY_ARCHIVE_VALIDATOR_PATH),
+            {"path", "sha256"}, "selected prepared archive-validator module pin",
+        )
+    else:
+        _require(execution.get("schema") == PREPARATORY_EXECUTION_SCHEMA_V1 and
+                 execution.get("campaign_id") == context["campaign_id"] and
+                 execution.get("host_id") == context["host_id"] and
+                 execution.get("manifest_sha256") == execution_pin["semantic_sha256"] ==
+                     _sha(_canonical(body, maximum_bytes=MAX_PLAN_BYTES)),
+                 "selected prep execution manifest differs from its exact pin")
+        modules = execution.get("modules")
+        _require(type(modules) is dict and context["host_id"] in modules and
+                 type(modules[context["host_id"]]) is dict,
+                 "selected prep execution manifest omits its Source module map")
+        module_pin = _exact(
+            modules[context["host_id"]].get(PREPARATORY_ARCHIVE_VALIDATOR_PATH),
+            {"path", "sha256"}, "selected prep archive-validator module pin",
+        )
     _require(module_pin == {"path": PREPARATORY_ARCHIVE_VALIDATOR_PATH,
                             "sha256": module_sha},
              "selected prep archive validator differs from its execution pin")
-    original = execution.get("original_inputs")
-    _require(type(original) is dict and
-             type(original.get("source_manifests")) is dict and
-             context["host_id"] in original["source_manifests"],
-             "selected prep execution manifest omits its Source input wrapper")
-    wrapper = _exact(original["source_manifests"][context["host_id"]], {
-        "artifact", "semantic_sha256",
-    }, "selected prep Source input wrapper")
-    artifact = _exact(wrapper["artifact"], {"path", "raw_sha256"},
-                       "selected prep Source input artifact")
-    _require(artifact == {"path": source_pin["path"],
-                          "raw_sha256": source_pin["raw_sha256"]} and
-             wrapper["semantic_sha256"] == source_pin["semantic_sha256"],
-             "selected prep Source manifest differs from its execution wrapper")
+    if not prepared_exploration:
+        original = execution.get("original_inputs")
+        _require(type(original) is dict and
+                 type(original.get("source_manifests")) is dict and
+                 context["host_id"] in original["source_manifests"],
+                 "selected prep execution manifest omits its Source input wrapper")
+        wrapper = _exact(original["source_manifests"][context["host_id"]], {
+            "artifact", "semantic_sha256",
+        }, "selected prep Source input wrapper")
+        artifact = _exact(wrapper["artifact"], {"path", "raw_sha256"},
+                           "selected prep Source input artifact")
+        _require(artifact == {"path": source_pin["path"],
+                              "raw_sha256": source_pin["raw_sha256"]} and
+                 wrapper["semantic_sha256"] == source_pin["semantic_sha256"],
+                 "selected prep Source manifest differs from its execution wrapper")
     module_filename = globals().get("__file__")
     _require(type(module_filename) is str and bool(module_filename),
              "transfer-packet module has no selected Source root identity")
@@ -1027,12 +1069,20 @@ def _read_source_archive_preparatory_validator(
         raise TransferPacketError(
             f"selected Source preparatory archive validator cannot load: {error}",
         ) from error
-    _require(callable(namespace.get("validate_preparatory_budget_profile_v1")) and
-             namespace.get("PREPARATORY_EXECUTION_SCHEMA_V1") ==
-                 PREPARATORY_EXECUTION_SCHEMA_V1 and
-             namespace.get("PREPARATORY_BUDGET_SCHEMA_V1") ==
-                 PREPARATORY_BUDGET_SCHEMA_V1,
-             "selected prep archive source lacks its exact profile validator")
+    if prepared_exploration:
+        _require(callable(namespace.get(
+                    "validate_prepared_exploration_budget_profile_v1")) and
+                 namespace.get("PREPARED_EXPLORATION_EXECUTION_SCHEMA") ==
+                    PREPARED_EXPLORATION_EXECUTION_SCHEMA and
+                 namespace.get("HOST_BUDGET_SCHEMA_V4") == HOST_BUDGET_SCHEMA_V4,
+                 "selected Archive source lacks its exact prepared-exploration profile")
+    else:
+        _require(callable(namespace.get("validate_preparatory_budget_profile_v1")) and
+                 namespace.get("PREPARATORY_EXECUTION_SCHEMA_V1") ==
+                     PREPARATORY_EXECUTION_SCHEMA_V1 and
+                 namespace.get("PREPARATORY_BUDGET_SCHEMA_V1") ==
+                     PREPARATORY_BUDGET_SCHEMA_V1,
+                 "selected prep archive source lacks its exact profile validator")
     return namespace
 
 
@@ -1232,6 +1282,128 @@ def _validate_preparatory_budget_profile_v1(
               max_window_inodes, list(roots), scratch_roots[0],
               max_ack, max_signature)
     return budget, profile, limits
+
+
+def _validate_prepared_exploration_budget_profile_v1(
+    budget_raw: bytes, budget_pin: object, context: dict[str, Any],
+    campaign_id: str, host_id: str, *,
+    source_manifest_raw: bytes | None,
+    execution_manifest_raw: bytes | None,
+    plan_raw: bytes | None,
+    journal_width_contract_raw: bytes | None,
+    spec_raw: bytes | None,
+    dependency_map_raw: bytes | None,
+    dependency_cache_root: str | os.PathLike[str] | None,
+    lineage_capture_manifest_raw: bytes | None,
+    lineage_capture_stage_root: str | None,
+    catalogue_chunk_paths: dict[str, str] | None,
+    catalogue_cache_root: str | None,
+    root_local: bool,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    pin = _pin(budget_pin, "prepared V4 host budget pin")
+    budget = _exact(_parse_canonical(
+        budget_raw, "prepared V4 host evidence budget",
+        maximum_bytes=PREPARATORY_MAX_BUDGET_BYTES,
+    ), HOST_BUDGET_FIELDS_V3, "prepared V4 host evidence budget")
+    _require(type(context) is dict and
+             context.get("campaign_id") == campaign_id and
+             context.get("host_id") == host_id and
+             _pin(context.get("resource_budget_pin"),
+                  "prepared request budget context pin") == pin and
+             budget.get("schema") == HOST_BUDGET_SCHEMA_V4 and
+             budget.get("admission_profile") == PREPARED_EXPLORATION_ADMISSION_PROFILE and
+             budget.get("execution_manifest_schema") ==
+                 PREPARED_EXPLORATION_EXECUTION_SCHEMA and
+             budget.get("campaign_id") == campaign_id and
+             budget.get("host_id") == host_id and
+             _sha(budget_raw) == pin["raw_sha256"] and
+             budget.get("budget_sha256") == pin["semantic_sha256"] ==
+                 _sha(_canonical({key: value for key, value in budget.items()
+                                  if key != "budget_sha256"},
+                                 maximum_bytes=PREPARATORY_MAX_BUDGET_BYTES)),
+             "prepared V4 budget/context raw or semantic identity differs")
+    derived_context, expected = _prepared_exploration_primary_context(budget, pin)
+    _require(all(context.get(name) == derived_context[name] for name in (
+        "campaign_id", "host_id", "source_manifest_pin", "plan_pin",
+        "resource_budget_pin", "execution_manifest_pin",
+    )), "prepared request context differs from the exact final budget pins")
+    _require(type(lineage_capture_manifest_raw) is bytes and
+             type(lineage_capture_stage_root) is str,
+             "prepared V4 profile requires its captured lineage manifest and private stage")
+    if root_local:
+        _require(type(dependency_map_raw) is bytes and
+                 dependency_cache_root is not None,
+                 "Root prepared V4 profile requires its exact six-copy dependency map")
+        primary_context, captured_source, captured_plan, captured_execution, \
+            captured_width, captured_spec = _read_root_prepared_exploration_dependencies(
+                budget, budget_raw, pin, derived_context,
+                dependency_map_raw, dependency_cache_root,
+            )
+        _require(primary_context == derived_context,
+                 "Root prepared V4 six-copy reader returned a changed context")
+        source_manifest_raw = captured_source
+        plan_raw = captured_plan
+        execution_manifest_raw = captured_execution
+        journal_width_contract_raw = captured_width
+        spec_raw = captured_spec
+    else:
+        _require(dependency_map_raw is None and dependency_cache_root is None and
+                 catalogue_chunk_paths is None and catalogue_cache_root is None,
+                 "host prepared V4 validation cannot substitute Root-local maps")
+        limits = (
+            MAX_SOURCE_MANIFEST_BYTES, MAX_PLAN_BYTES,
+            PREPARATORY_MAX_BUDGET_BYTES, MAX_PLAN_BYTES,
+            MAX_JOURNAL_WIDTH_CONTRACT_BYTES, PREPARATORY_MAX_SPEC_BYTES,
+        )
+        captured = []
+        for index, (origin_pin, maximum) in enumerate(zip(expected, limits, strict=True)):
+            local, digest, _info = _read_regular_absolute(
+                Path(origin_pin["path"]), maximum,
+                f"prepared host primary dependency[{index}]",
+            )
+            _require(digest == origin_pin["raw_sha256"],
+                     f"prepared host primary dependency[{index}] differs from its raw pin")
+            captured.append(local)
+        _require(captured[2] == budget_raw,
+                 "prepared host primary budget copy differs from supplied bytes")
+        source_manifest_raw, plan_raw, _budget_copy, execution_manifest_raw, \
+            journal_width_contract_raw, spec_raw = captured
+    _require(all(type(raw) is bytes for raw in (
+        source_manifest_raw, plan_raw, execution_manifest_raw,
+        journal_width_contract_raw, spec_raw,
+    )), "prepared V4 six-copy dependency reader did not return exact bytes")
+    archive_namespace = _read_source_archive_preparatory_validator(
+        source_manifest_raw, execution_manifest_raw, derived_context,
+        prepared_exploration=True,
+    )
+    try:
+        profile = archive_namespace[
+            "validate_prepared_exploration_budget_profile_v1"
+        ](
+            budget_raw, context,
+            source_manifest_raw=source_manifest_raw,
+            execution_manifest_raw=execution_manifest_raw,
+            plan_raw=plan_raw,
+            journal_width_contract_raw=journal_width_contract_raw,
+            spec_raw=spec_raw,
+            lineage_capture_manifest_raw=lineage_capture_manifest_raw,
+            lineage_capture_stage_root=lineage_capture_stage_root,
+            catalogue_chunk_paths=catalogue_chunk_paths,
+            catalogue_cache_root=catalogue_cache_root,
+            root_local=root_local,
+        )
+    except Exception as error:
+        raise TransferPacketError(
+            f"selected Source V4 budget/profile validator rejected its metadata: {error}",
+        ) from error
+    _require(type(profile) is dict and profile.get("budget") == budget and
+             type(profile.get("catalogue")) is dict and
+             type(profile.get("execution_manifest")) is dict and
+             (profile.get("required_request_schema") is None or
+              profile.get("required_request_schema") == REQUEST_SCHEMA_V3),
+             "selected Source prepared profile returned malformed metadata")
+    _profile_required_request_schema(profile)
+    return budget, profile
 
 
 def _source_budget_catalogue_reader(
@@ -2839,6 +3011,10 @@ def _budget_limits_with_archive_profile(
     catalogue_chunk_paths: dict[str, str] | None = None,
     catalogue_cache_root: str | None = None,
     root_local: bool = False,
+    prepared_dependency_map_raw: bytes | None = None,
+    prepared_dependency_cache_root: str | os.PathLike[str] | None = None,
+    lineage_capture_manifest_raw: bytes | None = None,
+    lineage_capture_stage_root: str | None = None,
 ) -> tuple[tuple[int, int, int, int, list[str], str, int, int],
            dict[str, Any] | None]:
     pin = _pin(budget_pin, "host evidence budget pin")
@@ -2863,6 +3039,61 @@ def _budget_limits_with_archive_profile(
             root_local=root_local,
         )
         return limits, profile
+    if budget_probe.get("schema") == HOST_BUDGET_SCHEMA_V4:
+        _require(budget_context is not None,
+                 "prepared V4 budget validation requires its exact archive context")
+        budget, profile = _validate_prepared_exploration_budget_profile_v1(
+            budget_raw, pin, budget_context, campaign_id, host_id,
+            source_manifest_raw=source_manifest_raw,
+            execution_manifest_raw=execution_manifest_raw,
+            plan_raw=plan_raw,
+            journal_width_contract_raw=journal_width_contract_raw,
+            spec_raw=spec_raw,
+            dependency_map_raw=prepared_dependency_map_raw,
+            dependency_cache_root=prepared_dependency_cache_root,
+            lineage_capture_manifest_raw=lineage_capture_manifest_raw,
+            lineage_capture_stage_root=lineage_capture_stage_root,
+            catalogue_chunk_paths=catalogue_chunk_paths,
+            catalogue_cache_root=catalogue_cache_root,
+            root_local=root_local,
+        )
+        catalogue = profile["catalogue"]
+        retention = catalogue.get("retention_policy")
+        _require(type(retention) is dict,
+                 "prepared V4 catalogue lacks its exact retention projection")
+        max_packet = _uint(retention.get("maximum_transfer_packet_bytes"),
+                           "prepared V4 transfer-packet byte cap", positive=True)
+        max_packet_inodes = _uint(
+            retention.get("maximum_transfer_packet_inodes"),
+            "prepared V4 transfer-packet inode cap", positive=True,
+        )
+        max_window_bytes = _uint(retention.get("maximum_window_total_bytes"),
+                                 "prepared V4 live-window byte cap", positive=True)
+        max_window_inodes = _uint(retention.get("maximum_window_total_inodes"),
+                                  "prepared V4 live-window inode cap", positive=True)
+        max_ack = _uint(retention.get("maximum_ack_bundle_bytes"),
+                        "prepared V4 ACK-bundle byte cap", positive=True)
+        max_signature = _uint(retention.get("maximum_signature_bytes"),
+                              "prepared V4 signature cap", positive=True)
+        transport = budget.get("transport")
+        _require(max_signature <= MAX_GPG_OUTPUT_BYTES and
+                 type(transport) is dict and
+                 transport.get("maximum_job_packet_bytes") == max_packet and
+                 transport.get("maximum_job_packet_inodes") == max_packet_inodes,
+                 "prepared V4 transport limits differ from the selected catalogue")
+        roots = catalogue.get("root_byte_bounds")
+        reservation = budget.get("storage_reservation")
+        reservation_roots = reservation.get("roots") if type(reservation) is dict else None
+        _require(type(roots) is dict and bool(roots) and
+                 type(reservation_roots) is dict,
+                 "prepared V4 budget lacks exact roots/reservation")
+        scratch_roots = [root for root, row in reservation_roots.items()
+                         if type(row) is dict and row.get("role") == "scratch"]
+        _require(len(scratch_roots) == 1,
+                 "prepared V4 budget lacks one exact scratch root")
+        return ((max_packet, max_packet_inodes, max_window_bytes,
+                 max_window_inodes, list(roots), scratch_roots[0],
+                 max_ack, max_signature), profile)
     _require(len(budget_raw) <= MAX_JSON_BYTES,
              "final host evidence budget exceeds its unchanged metadata ceiling")
     budget, is_width_bound = _exact_host_budget(
@@ -2964,6 +3195,10 @@ def _budget_limits(
     catalogue_chunk_paths: dict[str, str] | None = None,
     catalogue_cache_root: str | None = None,
     root_local: bool = False,
+    prepared_dependency_map_raw: bytes | None = None,
+    prepared_dependency_cache_root: str | os.PathLike[str] | None = None,
+    lineage_capture_manifest_raw: bytes | None = None,
+    lineage_capture_stage_root: str | None = None,
 ) -> tuple[int, int, int, int, list[str], str, int, int]:
     """Keep the legacy eight-value ABI for non-request-aware consumers."""
     limits, _profile = _budget_limits_with_archive_profile(
@@ -2977,6 +3212,10 @@ def _budget_limits(
         catalogue_chunk_paths=catalogue_chunk_paths,
         catalogue_cache_root=catalogue_cache_root,
         root_local=root_local,
+        prepared_dependency_map_raw=prepared_dependency_map_raw,
+        prepared_dependency_cache_root=prepared_dependency_cache_root,
+        lineage_capture_manifest_raw=lineage_capture_manifest_raw,
+        lineage_capture_stage_root=lineage_capture_stage_root,
     )
     return limits
 
