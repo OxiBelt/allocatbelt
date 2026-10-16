@@ -1197,6 +1197,7 @@ def _read_source_typed_module(
 def _source_budget_catalogue_reader(
     budget: dict[str, Any], catalogue_chunk_paths: dict[str, str] | None,
     catalogue_cache_root: str | None, *, root_local: bool,
+    captured_artifact_reader=None,
 ):
     """Build the sole v3 validator row reader from exact pinned chunk origins."""
     catalogue = budget.get("path_catalogue")
@@ -1224,7 +1225,12 @@ def _source_budget_catalogue_reader(
                  descriptor["semantic_sha256"] == descriptor["raw_sha256"],
                  "v3 budget catalogue chunk descriptor is duplicate or unpinned")
         descriptors[origin] = descriptor
-    if root_local:
+    if captured_artifact_reader is not None:
+        _require(callable(captured_artifact_reader) and root_local and
+                 catalogue_chunk_paths is None and catalogue_cache_root is None,
+                 "captured catalogue byte reads cannot mix with host or local-path reads")
+        cache_root = None
+    elif root_local:
         _require(type(catalogue_chunk_paths) is dict and
                  catalogue_cache_root is not None and
                  set(catalogue_chunk_paths) == set(descriptors),
@@ -1248,6 +1254,18 @@ def _source_budget_catalogue_reader(
                        "v3 validator catalogue chunk byte count", positive=True) ==
                      descriptor["byte_count"],
                  "v3 validator requested a chunk outside the exact source catalogue")
+        if captured_artifact_reader is not None:
+            pin = {"path": origin, "raw_sha256": descriptor["raw_sha256"]}
+            try:
+                raw = captured_artifact_reader(pin, descriptor["byte_count"])
+            except Exception as error:
+                raise EvidenceArchiveError(
+                    "captured source-pinned catalogue chunk is unavailable",
+                ) from error
+            _require(type(raw) is bytes and len(raw) == descriptor["byte_count"] and
+                     _sha(raw) == descriptor["raw_sha256"] == descriptor["semantic_sha256"],
+                     "captured catalogue chunk differs from its exact Source pin/size")
+            return raw
         if root_local:
             local = Path(_absolute_path(catalogue_chunk_paths[origin],
                                         "v3 captured catalogue chunk path"))
@@ -1322,7 +1340,7 @@ def _preparatory_original_pins(
     observed = _exact(manifest.get("observed_hosts"), set(hosts),
                       "preparatory observed-host map")
     observed_pins = {
-        host: _pin_raw(_exact(observed[host], {"artifact", "semantic_sha256"},
+        host: _pin_raw(_exact(observed[host], {"artifact"},
                               f"preparatory {host} observed-host wrapper")["artifact"],
                        f"preparatory {host} observed-host pin")
         for host in hosts
@@ -1493,8 +1511,17 @@ def _validate_preparatory_profile_v1(
     catalogue_chunk_paths: dict[str, str] | None,
     catalogue_cache_root: str | None,
     root_local: bool,
+    captured_preparatory_artifact_reader=None,
 ) -> dict[str, Any]:
     """Validate only the selected Source's separate 360-job prep profile."""
+    if captured_preparatory_artifact_reader is not None:
+        _require(callable(captured_preparatory_artifact_reader) and root_local and
+                 catalogue_chunk_paths is None and catalogue_cache_root is None and
+                 all(type(raw) is bytes for raw in (
+                     source_manifest_raw, execution_manifest_raw, plan_raw,
+                     journal_width_contract_raw,
+                 )),
+                 "captured preparatory byte validation requires exact dependency bytes and no path map")
     _require(context.get("phase") == "exploration" and
              _uint(context.get("job_index"),
                    "preparatory original exploration index") < 360,
@@ -1626,6 +1653,16 @@ def _validate_preparatory_profile_v1(
             prep_original_pins["initial_spec"],
             "preparatory initial SpecV3 pin",
         )
+        if spec_raw is None and captured_preparatory_artifact_reader is not None:
+            spec_origin = {key: initial_spec_pin[key] for key in ("path", "raw_sha256")}
+            try:
+                spec_raw = captured_preparatory_artifact_reader(
+                    spec_origin, PREPARATORY_MAX_SPEC_BYTES,
+                )
+            except Exception as error:
+                raise EvidenceArchiveError(
+                    "captured preparatory initial Spec is unavailable",
+                ) from error
         if spec_raw is None:
             _require(not root_local,
                      "Root preparatory validation requires the sixth captured Spec dependency")
@@ -1713,6 +1750,7 @@ def _validate_preparatory_profile_v1(
         catalogue_reader = _source_budget_catalogue_reader(
             budget, catalogue_chunk_paths, catalogue_cache_root,
             root_local=root_local,
+            captured_artifact_reader=captured_preparatory_artifact_reader,
         )
         budget_namespace, catalogue_module, owner_catalogue_module = \
             _load_preparatory_catalogue_modules(
@@ -1854,6 +1892,7 @@ def validate_preparatory_budget_profile_v1(
     catalogue_chunk_paths: dict[str, str] | None = None,
     catalogue_cache_root: str | None = None,
     root_local: bool = False,
+    captured_preparatory_artifact_reader=None,
 ) -> dict[str, Any]:
     """Public captured-dependency boundary for the separate prep budget."""
     checked_context = _validate_context(context)
@@ -1867,6 +1906,7 @@ def validate_preparatory_budget_profile_v1(
         catalogue_chunk_paths=catalogue_chunk_paths,
         catalogue_cache_root=catalogue_cache_root,
         root_local=root_local,
+        captured_preparatory_artifact_reader=captured_preparatory_artifact_reader,
     )
 
 
@@ -2475,6 +2515,7 @@ def _campaign_signature_limit(
     catalogue_cache_root: str | None = None,
     root_local: bool = False,
     require_v4_manifest: bool = False,
+    captured_preparatory_artifact_reader=None,
 ) -> int:
     pin = _pin(budget_pin, "campaign host evidence budget pin")
     _require(_sha(raw) == pin["raw_sha256"],
@@ -2494,6 +2535,7 @@ def _campaign_signature_limit(
             catalogue_chunk_paths=catalogue_chunk_paths,
             catalogue_cache_root=catalogue_cache_root,
             root_local=root_local,
+            captured_preparatory_artifact_reader=captured_preparatory_artifact_reader,
         )
         retention = profile["catalogue"].get("retention_policy")
         _require(type(retention) is dict,
@@ -2506,6 +2548,8 @@ def _campaign_signature_limit(
                  limit <= MAX_GPG_OUTPUT_BYTES,
                  "preparatory signature quota differs from its fixed pinned allowance")
         return limit
+    _require(captured_preparatory_artifact_reader is None,
+             "captured preparatory byte reads cannot select a different budget profile")
     budget, _is_r6 = _parse_host_budget_value(
         raw, "campaign host evidence budget v2",
     )
@@ -2687,6 +2731,7 @@ def _validate_archive_signer_context(
     catalogue_chunk_paths: dict[str, str] | None = None,
     catalogue_cache_root: str | None = None,
     root_local: bool = False,
+    captured_preparatory_artifact_reader=None,
 ) -> dict[str, Any]:
     context_pin = _pin(signer_context_pin, "archive signer-context pin")
     _require(type(raw) is bytes and _sha(raw) == context_pin["raw_sha256"],
@@ -2726,6 +2771,7 @@ def _validate_archive_signer_context(
         catalogue_cache_root=catalogue_cache_root,
         root_local=root_local,
         require_v4_manifest=width_bound,
+        captured_preparatory_artifact_reader=captured_preparatory_artifact_reader,
     )
     fingerprint = _fingerprint(
         value["authorized_primary_fingerprint"],
@@ -6598,6 +6644,7 @@ def _verify_signed_ack_metadata(
     budget_catalogue_map_raw: bytes | None = None,
     budget_catalogue_cache_root: str | None = None,
     captured_keyring_reader=None,
+    captured_preparatory_artifact_reader=None,
 ) -> dict[str, Any]:
     """Verify one persisted signed ACK and its complete metadata signature closure.
 
@@ -6612,6 +6659,14 @@ def _verify_signed_ack_metadata(
     _require(captured_keyring_reader is None or
              (purpose == "read" and callable(captured_keyring_reader)),
              "captured keyring bytes are reserved for read-only ACK verification")
+    _require(captured_preparatory_artifact_reader is None or
+             (purpose == "read" and callable(captured_preparatory_artifact_reader) and
+              callable(captured_keyring_reader) and
+              all(value is None for value in (
+                  budget_dependency_map_raw, budget_dependency_cache_root,
+                  budget_catalogue_map_raw, budget_catalogue_cache_root,
+              ))),
+             "captured preparatory bytes require a read-only closed keyring and no physical map")
     checked_checkpoint = _validate_checkpoint(checkpoint)
     context = checked_checkpoint["context"]
     check_pin = _pin(
@@ -6754,8 +6809,17 @@ def _verify_signed_ack_metadata(
     catalogue_cache_root = None
     root_local_budget = False
     spec_raw = None
+    _require(captured_preparatory_artifact_reader is None or
+             budget_value.get("schema") == PREPARATORY_BUDGET_SCHEMA_V1,
+             "captured preparatory bytes are not a legacy or final budget route")
     if budget_value.get("schema") == PREPARATORY_BUDGET_SCHEMA_V1:
-        if budget_dependency_map_raw is not None:
+        if captured_preparatory_artifact_reader is not None:
+            _require(type(source_manifest_raw) is bytes and
+                     type(execution_manifest_raw) is bytes and
+                     type(journal_width_contract_raw) is bytes,
+                     "captured preparatory ACK lacks its exact Source/execution/width bytes")
+            root_local_budget = True
+        elif budget_dependency_map_raw is not None:
             _require(budget_dependency_cache_root is not None and
                      budget_catalogue_map_raw is not None and
                      budget_catalogue_cache_root is not None,
@@ -6811,6 +6875,7 @@ def _verify_signed_ack_metadata(
         catalogue_chunk_paths=catalogue_chunk_paths,
         catalogue_cache_root=catalogue_cache_root,
         root_local=root_local_budget,
+        captured_preparatory_artifact_reader=captured_preparatory_artifact_reader,
     )
     fingerprint = signer["fingerprint"]
     signature_limit = signer["maximum_signature_bytes"]
@@ -7014,6 +7079,7 @@ def verify_signed_ack_for_read(
     budget_catalogue_map_raw: bytes | None = None,
     budget_catalogue_cache_root: str | None = None,
     captured_keyring_reader=None,
+    captured_preparatory_artifact_reader=None,
 ) -> dict[str, Any]:
     """Verify one arbitrary successful PlanV3 job for readback, never reclaim.
 
@@ -7023,6 +7089,8 @@ def verify_signed_ack_for_read(
     local payload paths and returns a distinct non-reclaim capability.
     An explicit captured keyring reader supplies only pinned public bytes;
     the current pinned gpgv executable is still opened and executed normally.
+    Preparatory metadata may use a closed byte reader instead of creating
+    dependency/catalogue cache copies; all Source-owned validators still run.
     """
     return _verify_signed_ack_metadata(
         checkpoint_pin, checkpoint, checkpoint_raw, request_raw,
@@ -7040,6 +7108,7 @@ def verify_signed_ack_for_read(
         budget_catalogue_map_raw=budget_catalogue_map_raw,
         budget_catalogue_cache_root=budget_catalogue_cache_root,
         captured_keyring_reader=captured_keyring_reader,
+        captured_preparatory_artifact_reader=captured_preparatory_artifact_reader,
     )
 
 

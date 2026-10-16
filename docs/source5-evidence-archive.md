@@ -338,3 +338,12 @@ raw pin and Source byte limit, then verifies the signature with the actual
 current pinned `gpgv` executable. The default route still opens the original
 keyring. This adds no reclaim authority; SourceA must still authenticate the
 complete journal, metadata and numeric-owner closure before issuing a gate.
+
+
+Preparatory read-only ACK verification can also receive an explicit
+`captured_preparatory_artifact_reader`. It reads the exact initial Spec and
+Source-pinned catalogue chunks as bounded bytes, without recreating dependency
+or catalogue files. It retains the complete Source-owned preparation, width,
+plan, catalogue and budget checks. This route requires captured keyring bytes,
+rejects mixed physical dependency maps, and does not extend reclaim authority.
+The original host and six-copy cache routes keep their existing behavior.
