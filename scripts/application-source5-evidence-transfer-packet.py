@@ -28,6 +28,10 @@ PROBE_TMPDIR_INVENTORY_SCHEMA_V1 = \
 PACKET_PIN_SCHEMA = "allocatbelt.application-source5-evidence-transfer-packet-pin.v1"
 HOST_BUDGET_SCHEMA = "allocatbelt.application-source5-host-evidence-budget.v2"
 HOST_BUDGET_SCHEMA_V3 = "allocatbelt.application-source5-host-evidence-budget.v3"
+HOST_BUDGET_SCHEMA_V4 = "allocatbelt.application-source5-host-evidence-budget.v4"
+PREPARED_EXPLORATION_ADMISSION_PROFILE = "source5_prepared_exploration_reuse_v1"
+PREPARED_EXPLORATION_EXECUTION_SCHEMA = "allocatbelt.application-source5-campaign-execution.v5"
+PREPARED_EXPLORATION_SCOPE = "final_prepared_exploration_reuse"
 HOST_BUDGET_V3_ADMISSION_PROFILE = "source5_width_v4_captured_replay_v1"
 SOURCE5_BUDGET_VALIDATOR_PATH = "scripts/application-source5-evidence-budget.py"
 PREPARATORY_EXECUTION_SCHEMA_V1 = (
@@ -2118,6 +2122,60 @@ def _parse_catalogue_local_map(
     return paths
 
 
+def _prepared_exploration_primary_context(
+    budget: dict[str, Any], budget_pin: object,
+) -> tuple[dict[str, Any], list[dict[str, str]]]:
+    """Project the V5 six-copy closure; this does not admit a host budget."""
+    _exact(budget, HOST_BUDGET_FIELDS_V3, "prepared-exploration host budget")
+    checked_budget_pin = _pin(budget_pin, "prepared-exploration budget pin")
+    _require(budget["schema"] == HOST_BUDGET_SCHEMA_V4 and
+             budget["admission_profile"] == PREPARED_EXPLORATION_ADMISSION_PROFILE and
+             budget["execution_manifest_schema"] == PREPARED_EXPLORATION_EXECUTION_SCHEMA,
+             "prepared-exploration budget schema/profile/execution version differs")
+    campaign_id = _token(budget["campaign_id"], "prepared-exploration campaign ID")
+    host_id = _token(budget["host_id"], "prepared-exploration host ID")
+    original = _exact(budget["original_pins"], {
+        "spec", "plan", "execution_manifest", "source_manifests",
+        "source_tree_sha256", "prepared_exploration",
+    }, "prepared-exploration final original pins")
+    sources = original["source_manifests"]
+    _require(type(sources) is dict and len(sources) in (2, 3) and host_id in sources,
+             "prepared-exploration source cohort is incomplete")
+    source_pins = {}
+    for source_host, value in sources.items():
+        _token(source_host, "prepared-exploration source host")
+        source_pins[source_host] = _pin(value, "prepared-exploration Source manifest pin")
+    lineage = _exact(original["prepared_exploration"], set(sources),
+                      "prepared-exploration ancestor host map")
+    lineage_paths = set()
+    for source_host, value in lineage.items():
+        pair = _exact(value, {"bridge_header", "record_index"},
+                       f"prepared-exploration {source_host} ancestor pins")
+        for kind in ("bridge_header", "record_index"):
+            pin = _pin_raw(pair[kind], f"prepared-exploration {source_host} {kind}")
+            _require(pin["path"] not in lineage_paths,
+                     "prepared-exploration ancestor metadata repeats an origin path")
+            lineage_paths.add(pin["path"])
+    tree = original["source_tree_sha256"]
+    _require(type(tree) is str and re.fullmatch(r"[0-9a-f]{64}", tree) is not None,
+             "prepared-exploration source-tree pin is malformed")
+    plan_pin = _pin(original["plan"], "prepared-exploration FINAL Plan pin")
+    execution_pin = _pin(original["execution_manifest"], "prepared-exploration FINAL execution pin")
+    width_pin = _pin(budget["journal_width_contract_pin"], "prepared-exploration FINAL width pin")
+    spec_pin = _pin(original["spec"], "prepared-exploration FINAL Spec pin")
+    pins = [source_pins[host_id], plan_pin, checked_budget_pin,
+            execution_pin, width_pin, spec_pin]
+    _require(len({pin["path"] for pin in pins}) == 6 and
+             not ({pin["path"] for pin in pins} & lineage_paths),
+             "prepared-exploration final primary pins alias another dependency or ancestor")
+    return ({
+        "campaign_id": campaign_id, "host_id": host_id,
+        "source_manifest_pin": source_pins[host_id], "plan_pin": plan_pin,
+        "resource_budget_pin": checked_budget_pin,
+        "execution_manifest_pin": execution_pin,
+    }, pins)
+
+
 def _budget_origin_context(
     budget: dict[str, Any], budget_pin: object,
 ) -> dict[str, Any]:
@@ -2331,6 +2389,132 @@ def _read_root_preparatory_dependencies(
              "sixth Root prep dependency does not match both original Spec pin sets")
     return (context, captured[0], captured[1], captured[3], captured[4],
             captured[5])
+
+
+def _read_root_prepared_exploration_dependencies(
+    budget: dict[str, Any], budget_raw: bytes, budget_pin: object,
+    context: dict[str, Any], dependency_map_raw: bytes,
+    dependency_cache_root: str | os.PathLike[str],
+) -> tuple[dict[str, Any], bytes, bytes, bytes, bytes, bytes]:
+    """Reopen the exact six FINAL V5 dependencies without opening old origins."""
+    derived_context, expected = _prepared_exploration_primary_context(budget, budget_pin)
+    _require(context == derived_context,
+             "Root V5 request context differs from its exact final budget pins")
+    checked_budget_pin = expected[2]
+    _require(type(budget_raw) is bytes and _sha(budget_raw) == checked_budget_pin["raw_sha256"] and
+             budget_raw == _canonical(budget, maximum_bytes=PREPARATORY_MAX_BUDGET_BYTES) and
+             budget["budget_sha256"] == checked_budget_pin["semantic_sha256"] ==
+                 _sha(_canonical({key: value for key, value in budget.items()
+                                  if key != "budget_sha256"},
+                                 maximum_bytes=PREPARATORY_MAX_BUDGET_BYTES)),
+             "Root V5 budget differs from its exact raw/semantic pin")
+    spec_pin = expected[5]
+    local_map = _exact(_parse_canonical(
+        dependency_map_raw, "Root-local prepared-exploration dependency map",
+    ), {"schema", "campaign_id", "host_id", "entries", "map_sha256"},
+                       "Root-local prepared-exploration dependency map")
+    map_body = {key: item for key, item in local_map.items()
+                if key != "map_sha256"}
+    _require(local_map["schema"] == DEPENDENCY_LOCAL_MAP_SCHEMA and
+             local_map["campaign_id"] == context["campaign_id"] and
+             local_map["host_id"] == context["host_id"] and
+             local_map["map_sha256"] == _sha(_canonical(map_body)) and
+             type(local_map["entries"]) is list and
+             len(local_map["entries"]) == 6,
+             "Root V5 dependency map identity/size/self digest differs")
+    dependency_paths: dict[str, str] = {}
+    local_paths = set()
+    for index, (entry_value, expected_pin) in enumerate(zip(
+            local_map["entries"], expected, strict=True)):
+        entry = _exact(entry_value, {"origin_pin", "local_path"},
+                       f"Root V5 dependency map row[{index}]")
+        origin_pin = _pin(entry["origin_pin"],
+                          f"Root V5 dependency origin pin[{index}]")
+        local_path = _path(entry["local_path"],
+                           f"Root V5 dependency local path[{index}]")
+        _require(origin_pin == expected_pin and
+                 origin_pin["path"] not in dependency_paths and
+                 local_path != origin_pin["path"] and
+                 local_path not in local_paths,
+                 "Root V5 dependency map is not the exact ordered six-pin closure")
+        dependency_paths[origin_pin["path"]] = local_path
+        local_paths.add(local_path)
+    cache_root = Path(_path(os.fspath(dependency_cache_root),
+                            "Root V5 dependency cache root"))
+    root_fd = _open_abs_dir(str(cache_root),
+                            "Root V5 dependency cache root",
+                            private_final=True)
+    root_identity = os.fstat(root_fd)
+    try:
+        limits = [
+            MAX_SOURCE_MANIFEST_BYTES, MAX_PLAN_BYTES,
+            PREPARATORY_MAX_BUDGET_BYTES, MAX_PLAN_BYTES,
+            PREPARATORY_MAX_WIDTH_BYTES, PREPARATORY_MAX_SPEC_BYTES,
+        ]
+        captured = []
+        for pin, maximum in zip(expected, limits, strict=True):
+            origin = pin["path"]
+            local_text = dependency_paths[origin]
+            local = Path(_path(local_text, "Root V5 mapped dependency"))
+            _require(origin == pin["path"] and local != cache_root and
+                     cache_root in local.parents and local != Path(origin) and
+                     local.resolve(strict=True) == local,
+                     "Root V5 dependency path aliases or escapes its exact private cache")
+            raw, actual, _info = _read_regular_absolute(
+                local, maximum, "Root-local captured prepared-exploration dependency",
+            )
+            _require(actual == pin["raw_sha256"],
+                     "Root V5 dependency bytes differ from their original raw pin")
+            captured.append(raw)
+        _require(captured[2] == budget_raw,
+                 "Root-local prepared-exploration budget copy differs from supplied bytes")
+        execution = _parse_canonical(
+            captured[3], "Root-local prepared-exploration execution manifest",
+            maximum_bytes=MAX_PLAN_BYTES,
+        )
+        _exact(execution, {
+            "schema", "campaign_id", "hosts", "original_inputs", "execution_sources",
+            "modules", "observed_hosts", "artifact_root", "output_root", "phase_order",
+            "protocol_sha256", "qualification_eligible", "manifest_sha256", "scope",
+            "prepared_input_generation", "prepared_capacity_registration",
+            "archive_signer_contexts", "journal_width_contracts",
+        }, "Root V5 execution manifest")
+        _require(execution["schema"] == PREPARED_EXPLORATION_EXECUTION_SCHEMA and
+                 execution["scope"] == PREPARED_EXPLORATION_SCOPE and
+                 execution["campaign_id"] == context["campaign_id"] and
+                 execution["qualification_eligible"] is False and
+                 execution["manifest_sha256"] == expected[3]["semantic_sha256"] ==
+                     _sha(_canonical({key: value for key, value in execution.items()
+                                      if key != "manifest_sha256"}, maximum_bytes=MAX_PLAN_BYTES)),
+                 "Root V5 execution identity, scope or semantic pin differs")
+        spec_wrapper = _exact(
+            _exact(execution.get("original_inputs"), {
+                "spec", "plan", "source_manifests", "campaign_artifacts_root",
+            }, "Root V5 execution original inputs")["spec"],
+            {"artifact", "semantic_sha256"},
+            "Root V5 execution final Spec wrapper",
+        )
+        execution_spec_pin = _pin({
+            **_pin_raw(spec_wrapper["artifact"],
+                       "Root V5 execution final Spec artifact"),
+            "semantic_sha256": spec_wrapper["semantic_sha256"],
+        }, "Root V5 execution final Spec pin")
+        _require(execution_spec_pin == spec_pin,
+                 "sixth Root V5 dependency does not match both original Spec pin sets")
+        final_root = os.stat(cache_root, follow_symlinks=False)
+        held_root = os.fstat(root_fd)
+        _require((final_root.st_dev, final_root.st_ino) ==
+                     (held_root.st_dev, held_root.st_ino) ==
+                     (root_identity.st_dev, root_identity.st_ino) and
+                 stat.S_ISDIR(final_root.st_mode) and
+                 final_root.st_uid == held_root.st_uid == os.getuid() and
+                 stat.S_IMODE(final_root.st_mode) == stat.S_IMODE(held_root.st_mode) == 0o700 and
+                 cache_root.resolve(strict=True) == cache_root,
+                 "Root V5 dependency cache custody changed during the six-copy read")
+        return (context, captured[0], captured[1], captured[3], captured[4],
+                captured[5])
+    finally:
+        os.close(root_fd)
 
 
 def _read_host_budget_dependencies(

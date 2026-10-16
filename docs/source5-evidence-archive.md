@@ -311,3 +311,23 @@ retain their original shape and do not acquire H15 roles. H15 readback requires
 the exact 15-field width-bound v4 budget; its budget remains non-ready and
 keeps the archive-ACK/reclaim blocker until the separate activation work is
 complete.
+
+
+## Captured prepared-exploration metadata
+
+The prepared-exploration transport reader reopens exactly six final dependency
+copies: Source, Plan, host budget, execution manifest, width contract and Spec.
+It checks the ordered origin pins, actual copied bytes and private cache custody.
+Legacy final and preparatory dependency readers keep their existing contracts.
+
+`application-source5-lineage-capture.py` reads historical metadata from a separate
+private capture tree. It consumes a Source-owned finite declaration and exact
+local manifest, refuses ambient origin reads, and checks file hashes, caps,
+ownership, permissions, link counts and directory custody. Unknown entries are
+rejected before traversal. Its content-byte count and per-inode allocated-byte
+count are separate; allocated bytes do not prove unique filesystem occupancy
+when extents can be shared. Storage admission must account for that limitation.
+
+These byte readers do not authenticate signatures, replay numeric owners, admit
+a final budget or authorize application launches. The Source-owned authority
+and storage validators must perform those checks before qualification starts.
