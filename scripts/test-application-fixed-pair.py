@@ -523,6 +523,216 @@ class FixedPairPureContractTests(unittest.TestCase):
             self.assertTrue(FIXED._tmpdir_exceeded(root, 16, 2))
             self.assertTrue(FIXED._tmpdir_exceeded(root, 100, 0))
 
+    def test_tmpdir_monitor_does_not_count_vanished_names_as_usage(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            names = [f"vanished-{index}" for index in range(12)]
+            for name in names:
+                (root / name).write_bytes(b"x")
+            original_scandir = FIXED.os.scandir
+            vanished: list[str] = []
+
+            class DeleteAfterYield:
+                def __init__(self, iterator: object, directory_fd: int) -> None:
+                    self.iterator = iterator
+                    self.directory_fd = directory_fd
+
+                def __enter__(self) -> DeleteAfterYield:
+                    return self
+
+                def __exit__(self, _type: object, _value: object, _traceback: object) -> None:
+                    self.iterator.close()
+
+                def __iter__(self) -> DeleteAfterYield:
+                    return self
+
+                def __next__(self) -> os.DirEntry[str]:
+                    child = next(self.iterator)
+                    if child.name in names:
+                        os.unlink(child.name, dir_fd=self.directory_fd)
+                        vanished.append(child.name)
+                    return child
+
+            def delete_after_scandir_yield(path: object) -> object:
+                iterator = original_scandir(path)
+                if isinstance(path, int):
+                    return DeleteAfterYield(iterator, path)
+                return iterator
+
+            with patch.object(FIXED.os, "scandir", side_effect=delete_after_scandir_yield):
+                self.assertFalse(FIXED._tmpdir_exceeded(root, 64, 8))
+            self.assertCountEqual(vanished, names)
+            self.assertEqual(list(root.iterdir()), [])
+
+            for name in names[:9]:
+                (root / name).write_bytes(b"x")
+            self.assertTrue(FIXED._tmpdir_exceeded(root, 64, 8))
+
+    def test_tmpdir_monitor_survives_sequential_unique_create_yield_delete(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            root_identity = (root.stat().st_dev, root.stat().st_ino)
+            original_scandir = FIXED.os.scandir
+            yielded = []
+            removed = []
+
+            class SequentialEntries:
+                def __init__(self) -> None:
+                    self.index = 0
+                    self.current = None
+
+                def __enter__(self):
+                    return self
+
+                def cleanup_current(self) -> None:
+                    if self.current is not None:
+                        (self.current / "payload").unlink()
+                        self.current.rmdir()
+                        removed.append(self.current.name)
+                        self.current = None
+
+                def __exit__(self, _type, _value, _traceback) -> None:
+                    self.cleanup_current()
+
+                def __iter__(self):
+                    return self
+
+                def __next__(self):
+                    self.cleanup_current()
+                    if self.index == 64:
+                        raise StopIteration
+                    self.current = root / f"unique-{self.index}"
+                    self.current.mkdir(mode=0o700)
+                    (self.current / "payload").write_bytes(b"live")
+                    with original_scandir(root) as actual_entries:
+                        entry = next(item for item in actual_entries
+                                     if item.name == self.current.name)
+                    yielded.append(entry.name)
+                    self.index += 1
+                    return entry
+
+            def sequential_root_stream(path):
+                if isinstance(path, int):
+                    info = FIXED.os.fstat(path)
+                    if (info.st_dev, info.st_ino) == root_identity:
+                        return SequentialEntries()
+                return original_scandir(path)
+
+            with patch.object(FIXED.os, "scandir", side_effect=sequential_root_stream):
+                self.assertFalse(FIXED._tmpdir_exceeded(root, 4096, 8))
+            self.assertEqual(len(yielded), 64)
+            self.assertEqual(removed, yielded)
+            self.assertEqual(list(root.iterdir()), [])
+
+    def _vanishing_file_scandir(self, consumed, closed):
+        original_scandir = FIXED.os.scandir
+
+        class VanishingFiles:
+            def __init__(self, descriptor):
+                self.descriptor = descriptor
+                self.iterator = original_scandir(descriptor)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, _type, _value, _traceback):
+                self.iterator.close()
+                closed.append(self.descriptor)
+
+            def __iter__(self):
+                return self
+
+            def __next__(self):
+                child = next(self.iterator)
+                consumed.append(child.name)
+                if child.name.startswith("ghost-"):
+                    os.unlink(child.name, dir_fd=self.descriptor)
+                return child
+
+        def wrapped(path):
+            return VanishingFiles(path) if isinstance(path, int) else original_scandir(path)
+
+        return wrapped
+
+    def test_tmpdir_enumeration_work_exhaustion_fails_closed_after_vanishing_names(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for index in range(4):
+                (root / f"ghost-{index}").write_bytes(b"x")
+            consumed, closed = [], []
+            with patch.object(FIXED, "TMPDIR_MONITOR_MAX_ENUMERATED_ENTRIES", 3), \
+                    patch.object(FIXED.os, "scandir", side_effect=self._vanishing_file_scandir(consumed, closed)):
+                with self.assertRaisesRegex(FIXED.FixedPairError, "enumeration-work bound"):
+                    FIXED._tmpdir_usage_snapshot(root, 64, 1, None, allow_descendant_enoent=True)
+            self.assertEqual(len(consumed), 4)
+            self.assertEqual(len(closed), 1)
+            self.assertEqual(list(root.iterdir()), [])
+
+    def test_tmpdir_enumeration_work_counter_spans_directories(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for name in ("first", "second"):
+                child = root / name
+                child.mkdir(mode=0o700)
+                (child / f"ghost-{name}").write_bytes(b"x")
+            consumed, closed = [], []
+            with patch.object(FIXED, "TMPDIR_MONITOR_MAX_ENUMERATED_ENTRIES", 3), \
+                    patch.object(FIXED.os, "scandir", side_effect=self._vanishing_file_scandir(consumed, closed)):
+                with self.assertRaisesRegex(FIXED.FixedPairError, "enumeration-work bound"):
+                    FIXED._tmpdir_usage_snapshot(root, 64, 2, None, allow_descendant_enoent=True)
+            self.assertEqual(len(consumed), 4)
+            self.assertEqual(len(closed), 3)
+            self.assertEqual(set(consumed), {"first", "second", "ghost-first", "ghost-second"})
+
+    def test_tmpdir_enumeration_preserves_larger_existing_output_inode_allowance(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for index in range(4):
+                (root / f"retained-{index}").write_bytes(b"x")
+            with patch.object(FIXED, "TMPDIR_MONITOR_MAX_ENUMERATED_ENTRIES", 3):
+                usage = FIXED._tmpdir_usage_snapshot(root, 64, 4, None, allow_descendant_enoent=True)
+            self.assertEqual(usage, {"bytes_used": 4, "inode_count": 4})
+
+    def test_tmpdir_live_stat_racing_unlink_keeps_real_observed_bytes(self) -> None:
+        for live, byte_limit in ((True, 4), (True, 3), (False, 4)):
+            with self.subTest(live=live, byte_limit=byte_limit), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                (root / "entry").write_bytes(b"live")
+                original_stat = FIXED.os.stat
+                original_open = FIXED.os.open
+                observed = []
+
+                def unlink_during_lookup(path, *args, **kwargs):
+                    if path == "entry" and kwargs.get("dir_fd") is not None and not observed:
+                        descriptor = original_open(path, os.O_RDONLY | os.O_NOFOLLOW,
+                                                   dir_fd=kwargs["dir_fd"])
+                        try:
+                            os.unlink(path, dir_fd=kwargs["dir_fd"])
+                            actual = os.fstat(descriptor)
+                            self.assertEqual(actual.st_nlink, 0)
+                            self.assertEqual(actual.st_size, 4)
+                            observed.append(actual)
+                            return actual
+                        finally:
+                            os.close(descriptor)
+                    return original_stat(path, *args, **kwargs)
+
+                with patch.object(FIXED.os, "stat", side_effect=unlink_during_lookup):
+                    if live and byte_limit == 4:
+                        usage = FIXED._tmpdir_usage_snapshot(root, 4, 1, None,
+                                                             allow_descendant_enoent=True)
+                        self.assertEqual(usage, {"bytes_used": 4, "inode_count": 1})
+                    elif live:
+                        with self.assertRaisesRegex(FIXED.FixedPairError, "byte bound"):
+                            FIXED._tmpdir_usage_snapshot(root, byte_limit, 1, None,
+                                                         allow_descendant_enoent=True)
+                    else:
+                        with self.assertRaisesRegex(FIXED.FixedPairError, "hard link or invalid regular file"):
+                            FIXED._tmpdir_usage_snapshot(root, 4, 1, None,
+                                                         allow_descendant_enoent=False)
+                self.assertEqual(len(observed), 1)
+                self.assertEqual(list(root.iterdir()), [])
+
     def test_tmpdir_monitor_survives_actual_directory_churn(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -769,7 +979,11 @@ class FixedPairPureContractTests(unittest.TestCase):
                 base = Path(temporary)
                 root = base / "root"
                 root.mkdir(mode=0o700)
-                (root / "child").mkdir(mode=0o700)
+                child = root / "child"
+                child.mkdir(mode=0o700)
+                original_child = child.lstat()
+                original_child_identity = (original_child.st_dev, original_child.st_ino)
+                moved = base / "moved-child"
                 outside = base / "outside"
                 outside.mkdir(mode=0o700)
                 original_open = FIXED.os.open
@@ -777,11 +991,22 @@ class FixedPairPureContractTests(unittest.TestCase):
 
                 def substitute_then_open(path: object, flags: int, *args: object, **kwargs: object) -> int:
                     if path == "child" and kwargs.get("dir_fd") is not None and not substituted[0]:
-                        os.rmdir(path, dir_fd=kwargs["dir_fd"])
+                        os.rename(path, moved, src_dir_fd=kwargs["dir_fd"])
+                        retained = moved.lstat()
+                        self.assertEqual(
+                            (retained.st_dev, retained.st_ino), original_child_identity,
+                        )
                         if replacement == "directory":
                             os.mkdir(path, 0o700, dir_fd=kwargs["dir_fd"])
                         else:
                             os.symlink(outside, path, dir_fd=kwargs["dir_fd"])
+                        replacement_info = os.stat(
+                            path, dir_fd=kwargs["dir_fd"], follow_symlinks=False,
+                        )
+                        self.assertNotEqual(
+                            (replacement_info.st_dev, replacement_info.st_ino),
+                            original_child_identity,
+                        )
                         substituted[0] = True
                     return original_open(path, flags, *args, **kwargs)
 

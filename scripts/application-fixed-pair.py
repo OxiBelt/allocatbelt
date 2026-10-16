@@ -69,6 +69,9 @@ MAX_PROC_ENTRIES = 262_144
 MAX_TMPDIR_BYTES = 1024 * 1024 * 1024
 MAX_TMPDIR_INODES = 4096
 TMPDIR_MONITOR_MAX_DEPTH = 32
+# Bound a snapshot's temporary name collection to one full supported TMPDIR inode budget.
+# This source-level work limit is independent of a caller's frozen inode allowance.
+TMPDIR_MONITOR_MAX_ENUMERATED_ENTRIES = MAX_TMPDIR_INODES
 TERM_GRACE_SECONDS = 3.0
 KILL_REAP_SECONDS = 1.0
 PROBE_TIMEOUT_SECONDS = 30.0
@@ -2074,124 +2077,132 @@ def _tmpdir_usage_snapshot(
         directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
         file_flags = (getattr(os, "O_PATH", os.O_RDONLY | os.O_NONBLOCK) |
                       os.O_NOFOLLOW | os.O_CLOEXEC)
+        enumeration_limit = max(TMPDIR_MONITOR_MAX_ENUMERATED_ENTRIES, inode_limit)
+        enumerated_entries = 0
 
-        # Recursion keeps one directory fd and one scandir stream per level;
-        # the depth cap bounds traversal to at most 67 live descriptors.
+        # Close each scandir stream after collecting names, before inspecting
+        # children or recursing; directory descriptors remain depth-bounded.
         def visit(directory_fd: int, depth: int) -> None:
-            nonlocal total_bytes, inode_count
+            nonlocal total_bytes, inode_count, enumerated_entries
+            names: list[str] = []
             with os.scandir(directory_fd) as children:
                 for child in children:
                     name = child.name
                     require(type(name) is str and name not in ("", ".", "..") and "/" not in name,
                             "member TMPDIR contains an invalid directory entry name")
-                    inode_count += 1
-                    require(inode_count <= inode_limit,
-                            "member TMPDIR exceeded its frozen inode bound")
+                    enumerated_entries += 1
+                    require(enumerated_entries <= enumeration_limit,
+                            "member TMPDIR exceeded its finite enumeration-work bound")
+                    names.append(name)
+            for name in names:
+                try:
+                    info = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+                except OSError as error:
+                    if allow_descendant_enoent and error.errno == errno.ENOENT:
+                        # A name that vanished before it was observed is not usage.
+                        continue
+                    raise
+                inode_count += 1
+                require(inode_count <= inode_limit,
+                        "member TMPDIR exceeded its frozen inode bound")
+                require(info.st_uid == os.getuid() and info.st_dev == root_before.st_dev and
+                        not stat.S_ISLNK(info.st_mode),
+                        "member TMPDIR contains an unowned, cross-device, or linked entry")
+                if stat.S_ISDIR(info.st_mode):
+                    _validate_tmpdir_directory(info, root_before.st_dev, "member TMPDIR child")
+                    require(depth < TMPDIR_MONITOR_MAX_DEPTH,
+                            "member TMPDIR exceeded its finite directory-depth bound")
                     try:
-                        info = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+                        child_fd = os.open(name, directory_flags, dir_fd=directory_fd)
                     except OSError as error:
                         if allow_descendant_enoent and error.errno == errno.ENOENT:
-                            # The live application removed this enumerated entry.
-                            # Keep its inode count for this scan's conservative bound.
                             continue
                         raise
-                    require(info.st_uid == os.getuid() and info.st_dev == root_before.st_dev and
-                            not stat.S_ISLNK(info.st_mode),
-                            "member TMPDIR contains an unowned, cross-device, or linked entry")
-                    if stat.S_ISDIR(info.st_mode):
-                        _validate_tmpdir_directory(info, root_before.st_dev, "member TMPDIR child")
-                        require(depth < TMPDIR_MONITOR_MAX_DEPTH,
-                                "member TMPDIR exceeded its finite directory-depth bound")
+                    try:
+                        opened = os.fstat(child_fd)
+                        require(_tmpdir_directory_signature(opened) ==
+                                _tmpdir_directory_signature(info),
+                                "member TMPDIR directory changed between stat and open")
                         try:
-                            child_fd = os.open(name, directory_flags, dir_fd=directory_fd)
+                            visit(child_fd, depth + 1)
+                        except OSError as error:
+                            if not (allow_descendant_enoent and error.errno == errno.ENOENT):
+                                raise
+                            # A held descendant may disappear while its
+                            # directory stream is being read; root errors
+                            # are never handled by this descendant path.
+                        after = os.fstat(child_fd)
+                        require(_tmpdir_directory_signature(after) ==
+                                _tmpdir_directory_signature(opened),
+                                "member TMPDIR directory identity or mode changed during accounting")
+                        try:
+                            named_after = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
                         except OSError as error:
                             if allow_descendant_enoent and error.errno == errno.ENOENT:
                                 continue
                             raise
+                        require(_tmpdir_directory_signature(named_after) ==
+                                _tmpdir_directory_signature(opened),
+                                "member TMPDIR directory name changed during accounting")
+                    finally:
+                        os.close(child_fd)
+                elif stat.S_ISREG(info.st_mode):
+                    require(info.st_nlink in ((0, 1) if allow_descendant_enoent else (1,)) and
+                            info.st_size >= 0,
+                            "member TMPDIR contains a hard link or invalid regular file")
+                    try:
+                        file_fd = os.open(name, file_flags, dir_fd=directory_fd)
+                    except OSError as error:
+                        if allow_descendant_enoent and error.errno == errno.ENOENT:
+                            total_bytes += info.st_size
+                            require(total_bytes <= byte_limit,
+                                    "member TMPDIR exceeded its frozen byte bound")
+                            continue
+                        raise
+                    try:
+                        opened = os.fstat(file_fd)
+                        require((opened.st_dev, opened.st_ino, opened.st_uid,
+                                 stat.S_IFMT(opened.st_mode)) ==
+                                (info.st_dev, info.st_ino, info.st_uid,
+                                 stat.S_IFMT(info.st_mode)) and
+                                stat.S_ISREG(opened.st_mode) and
+                                opened.st_nlink in ((0, 1) if allow_descendant_enoent else (1,)) and
+                                opened.st_size >= 0,
+                                "member TMPDIR file changed between stat and open or is hard-linked")
+                        after = os.fstat(file_fd)
+                        require((after.st_dev, after.st_ino, after.st_uid,
+                                 stat.S_IFMT(after.st_mode)) ==
+                                (opened.st_dev, opened.st_ino, opened.st_uid,
+                                 stat.S_IFMT(opened.st_mode)) and
+                                after.st_nlink in ((0, 1) if allow_descendant_enoent else (1,)) and
+                                after.st_size >= 0,
+                                "member TMPDIR file identity changed during accounting")
                         try:
-                            opened = os.fstat(child_fd)
-                            require(_tmpdir_directory_signature(opened) ==
-                                    _tmpdir_directory_signature(info),
-                                    "member TMPDIR directory changed between stat and open")
-                            try:
-                                visit(child_fd, depth + 1)
-                            except OSError as error:
-                                if not (allow_descendant_enoent and error.errno == errno.ENOENT):
-                                    raise
-                                # A held descendant may disappear while its
-                                # directory stream is being read; root errors
-                                # are never handled by this descendant path.
-                            after = os.fstat(child_fd)
-                            require(_tmpdir_directory_signature(after) ==
-                                    _tmpdir_directory_signature(opened),
-                                    "member TMPDIR directory identity or mode changed during accounting")
-                            try:
-                                named_after = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
-                            except OSError as error:
-                                if allow_descendant_enoent and error.errno == errno.ENOENT:
-                                    continue
-                                raise
-                            require(_tmpdir_directory_signature(named_after) ==
-                                    _tmpdir_directory_signature(opened),
-                                    "member TMPDIR directory name changed during accounting")
-                        finally:
-                            os.close(child_fd)
-                    elif stat.S_ISREG(info.st_mode):
-                        require(info.st_nlink == 1 and info.st_size >= 0,
-                                "member TMPDIR contains a hard link or invalid regular file")
-                        try:
-                            file_fd = os.open(name, file_flags, dir_fd=directory_fd)
+                            named_after = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
                         except OSError as error:
                             if allow_descendant_enoent and error.errno == errno.ENOENT:
-                                total_bytes += info.st_size
+                                total_bytes += max(info.st_size, opened.st_size, after.st_size)
                                 require(total_bytes <= byte_limit,
                                         "member TMPDIR exceeded its frozen byte bound")
                                 continue
                             raise
-                        try:
-                            opened = os.fstat(file_fd)
-                            require((opened.st_dev, opened.st_ino, opened.st_uid,
-                                     stat.S_IFMT(opened.st_mode)) ==
-                                    (info.st_dev, info.st_ino, info.st_uid,
-                                     stat.S_IFMT(info.st_mode)) and
-                                    stat.S_ISREG(opened.st_mode) and
-                                    opened.st_nlink in ((0, 1) if allow_descendant_enoent else (1,)) and
-                                    opened.st_size >= 0,
-                                    "member TMPDIR file changed between stat and open or is hard-linked")
-                            after = os.fstat(file_fd)
-                            require((after.st_dev, after.st_ino, after.st_uid,
-                                     stat.S_IFMT(after.st_mode)) ==
-                                    (opened.st_dev, opened.st_ino, opened.st_uid,
-                                     stat.S_IFMT(opened.st_mode)) and
-                                    after.st_nlink in ((0, 1) if allow_descendant_enoent else (1,)) and
-                                    after.st_size >= 0,
-                                    "member TMPDIR file identity changed during accounting")
-                            try:
-                                named_after = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
-                            except OSError as error:
-                                if allow_descendant_enoent and error.errno == errno.ENOENT:
-                                    total_bytes += max(info.st_size, opened.st_size, after.st_size)
-                                    require(total_bytes <= byte_limit,
-                                            "member TMPDIR exceeded its frozen byte bound")
-                                    continue
-                                raise
-                            require((named_after.st_dev, named_after.st_ino, named_after.st_uid,
-                                     stat.S_IFMT(named_after.st_mode)) ==
-                                    (opened.st_dev, opened.st_ino, opened.st_uid,
-                                     stat.S_IFMT(opened.st_mode)) and
-                                    stat.S_ISREG(named_after.st_mode) and
-                                    named_after.st_nlink in ((0, 1) if allow_descendant_enoent else (1,)) and
-                                    named_after.st_size >= 0,
-                                    "member TMPDIR file name changed during accounting")
-                            total_bytes += max(
-                                info.st_size, opened.st_size, after.st_size, named_after.st_size,
-                            )
-                        finally:
-                            os.close(file_fd)
-                        require(total_bytes <= byte_limit,
-                                "member TMPDIR exceeded its frozen byte bound")
-                    else:
-                        raise FixedPairError("member TMPDIR contains a special file")
+                        require((named_after.st_dev, named_after.st_ino, named_after.st_uid,
+                                 stat.S_IFMT(named_after.st_mode)) ==
+                                (opened.st_dev, opened.st_ino, opened.st_uid,
+                                 stat.S_IFMT(opened.st_mode)) and
+                                stat.S_ISREG(named_after.st_mode) and
+                                named_after.st_nlink in ((0, 1) if allow_descendant_enoent else (1,)) and
+                                named_after.st_size >= 0,
+                                "member TMPDIR file name changed during accounting")
+                        total_bytes += max(
+                            info.st_size, opened.st_size, after.st_size, named_after.st_size,
+                        )
+                    finally:
+                        os.close(file_fd)
+                    require(total_bytes <= byte_limit,
+                            "member TMPDIR exceeded its frozen byte bound")
+                else:
+                    raise FixedPairError("member TMPDIR contains a special file")
 
         visit(root_fd, 0)
         root_after = os.fstat(root_fd)
