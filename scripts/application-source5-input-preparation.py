@@ -3026,6 +3026,106 @@ def _validate_initial_pressure_binding_matrix(
     return host_ids, expected_keys, condition_map, pressure_order
 
 
+def _pressure_scope_verifier(
+    pressure_reader: Any, *, closed_recorded: bool, label: str,
+) -> Callable[..., Any]:
+    name = ("verify_calibration_scope_v2_closed_recorded_v1"
+            if closed_recorded else "verify_calibration_scope_v2_offline")
+    verifier = getattr(pressure_reader, name, None)
+    _require(callable(verifier),
+             f"{label} lacks the explicitly selected scope-v2 replay API {name}")
+    return verifier
+
+
+def _closed_recorded_pressure_probe_capture_members(
+    pressure_reader: Any, capture_row_value: object, index: int,
+    host_id: str, condition: dict[str, Any], context_policy_pin: dict[str, str],
+    *, label: str,
+) -> list[dict[str, Any]]:
+    capture_index_row = _exact(capture_row_value, {
+        "host_id", "condition_id", "capacity_key", "context_policy_pin",
+        "members",
+    }, f"{label} capture-index row[{index}]")
+    indexed_context_pin = _exact(capture_index_row["context_policy_pin"], {
+        "path", "raw_sha256",
+    }, f"{label} capture-index row[{index}] context-policy pin")
+    _require(capture_index_row["host_id"] == host_id and
+             capture_index_row["condition_id"] == condition["condition_id"] and
+             capture_index_row["capacity_key"] == condition["capacity_key"] and
+             indexed_context_pin == context_policy_pin,
+             f"{label} capture-index row[{index}] crosses its condition/context binding")
+    bundle_value, _bundle_raw, bundle_sha = _read_pinned_json(
+        {"path": context_policy_pin["path"],
+         "sha256": context_policy_pin["raw_sha256"]},
+        f"{label} context-policy bundle[{index}]",
+        MAX_REQUEST_BYTES,
+    )
+    bundle_value = _exact(bundle_value, {"schema", "artifact", "members"},
+                          f"{label} context-policy bundle[{index}]")
+    _require(bundle_sha == context_policy_pin["raw_sha256"] and
+             bundle_value["schema"] == pressure_reader.CONTEXT_POLICY_BUNDLE_SCHEMA_V2 and
+             type(bundle_value["members"]) is list and
+             len(bundle_value["members"]) == 2,
+             f"{label} context-policy bundle[{index}] is not the pinned two-member SourceV5 bundle")
+    indexed_members = capture_index_row["members"]
+    _require(type(indexed_members) is list and len(indexed_members) == 2,
+             f"{label} capture-index row[{index}] omits a context member")
+    closed_members: list[dict[str, Any]] = []
+    for member_index, (bundle_member_value, indexed_member_value) in enumerate(
+            zip(bundle_value["members"], indexed_members)):
+        bundle_member = _exact(bundle_member_value, {
+            "descriptor", "request", "construction_probe", "resolved_policy",
+            "composition_receipt",
+        }, f"{label} context bundle[{index}] member[{member_index}]")
+        indexed_member = _exact(indexed_member_value, {
+            "descriptor", "request_pin", "probe_capture_pin",
+        }, f"{label} capture index[{index}] member[{member_index}]")
+        descriptor = _exact(bundle_member["descriptor"], {
+            "pair", "executor", "allocator",
+        }, f"{label} context bundle[{index}] descriptor[{member_index}]")
+        indexed_descriptor = _exact(indexed_member["descriptor"], {
+            "pair", "executor", "allocator",
+        }, f"{label} capture-index descriptor[{index}] member[{member_index}]")
+        request_pin = _exact(indexed_member["request_pin"], {
+            "path", "raw_sha256",
+        }, f"{label} capture-index request[{index}] member[{member_index}]")
+        bundle_request_pin = _exact(bundle_member["request"], {
+            "path", "raw_sha256",
+        }, f"{label} context bundle request[{index}] member[{member_index}]")
+        _require(indexed_descriptor == descriptor and
+                 request_pin == bundle_request_pin,
+                 f"{label} capture-index member[{index}:{member_index}] differs from the actual context bundle order")
+        capture_pin = _exact(indexed_member["probe_capture_pin"], {
+            "path", "raw_sha256", "receipt_sha256",
+        }, f"{label} capture-index capture[{index}] member[{member_index}]")
+        closed_members.append({
+            "descriptor": descriptor,
+            "request_pin": request_pin,
+            "probe_capture_pin": capture_pin,
+        })
+    return closed_members
+
+
+def _call_pressure_scope_verifier(
+    verifier: Callable[..., Any], calibration_pin: dict[str, Any],
+    context_policy_pin: dict[str, str], capacity_bundle_pin: dict[str, Any],
+    observed_host_pin: dict[str, str], *, source_root: str,
+    evidence_path_map: dict[str, Any], host_verification_pin: dict[str, Any],
+    probe_capture_pins: list[dict[str, Any]] | None = None,
+) -> Any:
+    kwargs: dict[str, Any] = {
+        "source_root": source_root,
+        "evidence_path_map": evidence_path_map,
+        "host_verification_pin": host_verification_pin,
+    }
+    if probe_capture_pins is not None:
+        kwargs["probe_capture_pins"] = probe_capture_pins
+    return verifier(
+        calibration_pin, context_policy_pin, capacity_bundle_pin,
+        observed_host_pin, **kwargs,
+    )
+
+
 def _replay_initial_pressure_bindings(
     preparation: dict[str, Any], sources: dict[str, dict[str, Any]],
     inputs: Any, source_root: Path, input_root: Path,
@@ -3058,15 +3158,10 @@ def _replay_initial_pressure_bindings(
     pressure_reader = _execute_captured_module(
         reader_raw, reader_path, "initial_pressure_readback",
     )
-    if probe_capture_rows is None:
-        verify_scope = getattr(pressure_reader, "verify_calibration_scope_v2_offline", None)
-    else:
-        verify_scope = getattr(
-            pressure_reader,
-            "verify_calibration_scope_v2_closed_recorded_v1", None,
-        )
-    _require(callable(verify_scope),
-             "typed SourceV5 pressure reader lacks the explicitly selected scope-v2 replay API")
+    verify_scope = _pressure_scope_verifier(
+        pressure_reader, closed_recorded=probe_capture_rows is not None,
+        label="typed SourceV5 pressure reader",
+    )
 
     projected: list[dict[str, Any]] = []
     for index, (binding_value, expected_key) in enumerate(
@@ -3138,83 +3233,19 @@ def _replay_initial_pressure_bindings(
                  f"initial pressure binding[{index}] scope digest is malformed")
         closed_members = None
         if probe_capture_rows is not None:
-            capture_index_row = _exact(probe_capture_rows[index], {
-                "host_id", "condition_id", "capacity_key", "context_policy_pin",
-                "members",
-            }, f"initial pressure capture-index row[{index}]")
-            indexed_context_pin = _exact(capture_index_row["context_policy_pin"], {
-                "path", "raw_sha256",
-            }, f"initial pressure capture-index row[{index}] context-policy pin")
-            _require(capture_index_row["host_id"] == host_id and
-                     capture_index_row["condition_id"] == condition["condition_id"] and
-                     capture_index_row["capacity_key"] == condition["capacity_key"] and
-                     indexed_context_pin == context_policy_pin,
-                     f"initial pressure capture-index row[{index}] crosses its condition/context binding")
-            bundle_value, _bundle_raw, bundle_sha = _read_pinned_json(
-                {"path": context_policy_pin["path"],
-                 "sha256": context_policy_pin["raw_sha256"]},
-                f"initial pressure context-policy bundle[{index}]",
-                MAX_REQUEST_BYTES,
+            closed_members = _closed_recorded_pressure_probe_capture_members(
+                pressure_reader, probe_capture_rows[index], index, host_id,
+                condition, context_policy_pin, label="initial pressure",
             )
-            bundle_value = _exact(bundle_value, {"schema", "artifact", "members"},
-                                  f"initial pressure context-policy bundle[{index}]")
-            _require(bundle_sha == context_policy_pin["raw_sha256"] and
-                     bundle_value["schema"] == pressure_reader.CONTEXT_POLICY_BUNDLE_SCHEMA_V2 and
-                     type(bundle_value["members"]) is list and
-                     len(bundle_value["members"]) == 2,
-                     f"initial pressure context-policy bundle[{index}] is not the pinned two-member SourceV5 bundle")
-            indexed_members = capture_index_row["members"]
-            _require(type(indexed_members) is list and len(indexed_members) == 2,
-                     f"initial pressure capture-index row[{index}] omits a context member")
-            closed_members = []
-            for member_index, (bundle_member_value, indexed_member_value) in enumerate(
-                    zip(bundle_value["members"], indexed_members)):
-                bundle_member = _exact(bundle_member_value, {
-                    "descriptor", "request", "construction_probe", "resolved_policy",
-                    "composition_receipt",
-                }, f"initial pressure context bundle[{index}] member[{member_index}]")
-                indexed_member = _exact(indexed_member_value, {
-                    "descriptor", "request_pin", "probe_capture_pin",
-                }, f"initial pressure capture index[{index}] member[{member_index}]")
-                descriptor = _exact(bundle_member["descriptor"], {
-                    "pair", "executor", "allocator",
-                }, f"initial pressure context bundle[{index}] descriptor[{member_index}]")
-                indexed_descriptor = _exact(indexed_member["descriptor"], {
-                    "pair", "executor", "allocator",
-                }, f"initial pressure capture-index descriptor[{index}] member[{member_index}]")
-                request_pin = _exact(indexed_member["request_pin"], {
-                    "path", "raw_sha256",
-                }, f"initial pressure capture-index request[{index}] member[{member_index}]")
-                bundle_request_pin = _exact(bundle_member["request"], {
-                    "path", "raw_sha256",
-                }, f"initial pressure context bundle request[{index}] member[{member_index}]")
-                _require(indexed_descriptor == descriptor and
-                         request_pin == bundle_request_pin,
-                         f"initial pressure capture-index member[{index}:{member_index}] differs from the actual context bundle order")
-                capture_pin = _exact(indexed_member["probe_capture_pin"], {
-                    "path", "raw_sha256", "receipt_sha256",
-                }, f"initial pressure capture-index capture[{index}] member[{member_index}]")
-                closed_members.append({
-                    "descriptor": descriptor,
-                    "request_pin": request_pin,
-                    "probe_capture_pin": capture_pin,
-                })
         try:
-            if closed_members is None:
-                receipt = verify_scope(
-                    calibration_pin, context_policy_pin, expected_capacity_bundle,
-                    observed_pin, source_root=str(source_root),
-                    evidence_path_map=binding["evidence_path_map"],
-                    host_verification_pin=receipt_pin,
-                )
-            else:
-                receipt = verify_scope(
-                    calibration_pin, context_policy_pin, expected_capacity_bundle,
-                    observed_pin, source_root=str(source_root),
-                    evidence_path_map=binding["evidence_path_map"],
-                    host_verification_pin=receipt_pin,
-                    probe_capture_pins=closed_members,
-                )
+            receipt = _call_pressure_scope_verifier(
+                verify_scope, calibration_pin, context_policy_pin,
+                expected_capacity_bundle, observed_pin,
+                source_root=str(source_root),
+                evidence_path_map=binding["evidence_path_map"],
+                host_verification_pin=receipt_pin,
+                probe_capture_pins=closed_members,
+            )
         except Exception as error:
             raise PreparationError(
                 f"initial pressure calibration[{index}] failed complete offline SourceV5 replay: {error}",
@@ -3569,6 +3600,7 @@ def _complete_prepared_inputs_impl(
     global_artifact_reader: Callable[[dict[str, str], int], bytes] | None = None,
     input_root: Path | None = None,
     closed_recorded: bool = False,
+    probe_capture_index_pin: object = None,
 ) -> dict[str, Any]:
     """Bridge independently replayed preparation evidence into final frozen inputs."""
     _require(type(recorded_host) is bool and
@@ -3582,6 +3614,8 @@ def _complete_prepared_inputs_impl(
                captured_pilot_read_providers is not None and
                write_completion is False)),
              "closed recorded completion is restricted to the read-only Source-owned route")
+    _require(probe_capture_index_pin is None or closed_recorded,
+             "closed pressure capture index requires the named closed-recorded completion route")
     _require(input_root is None or recorded_host,
              "explicit nested input-root replay is reserved for the recorded completion route")
     (
@@ -3612,6 +3646,12 @@ def _complete_prepared_inputs_impl(
     )
     _require(not closed_recorded or len(host_ids) == 2,
              "closed recorded completion requires the exact two-host SourceA cohort")
+    probe_capture_rows = (
+        None if probe_capture_index_pin is None else
+        _read_initial_pressure_probe_capture_index(
+            probe_capture_index_pin, input_root,
+        )
+    )
 
     final_spec, final_spec_raw, final_spec_raw_sha = _read_pinned_json(final_spec_pin, "final completed SpecV3")
     final_plan, final_plan_raw, final_plan_raw_sha = _read_pinned_json(final_plan_pin, "final completed PlanV3", MAX_PLAN_BYTES)
@@ -3709,8 +3749,10 @@ def _complete_prepared_inputs_impl(
     _require(all(value["modules"]["pressure_readback"]["sha256"] == pressure_reader_sha for value in preparation["source_pins"].values()),
              "active pressure reader differs from the full SourceV5 module pins")
     pressure_reader = _execute_captured_module(pressure_reader_raw, pressure_reader_path, "pressure_readback")
-    verify_scope = getattr(pressure_reader, "verify_calibration_scope_v2_offline", None)
-    _require(callable(verify_scope), "SourceV5 pressure reader has no mapped offline context-scope v2 replay")
+    verify_scope = _pressure_scope_verifier(
+        pressure_reader, closed_recorded=probe_capture_rows is not None,
+        label="SourceV5 pressure reader",
+    )
     condition_map = {
         (item["host_id"], item["workload"], item["profile"]): item
         for item in preparation["condition_intensities"]
@@ -3779,11 +3821,19 @@ def _complete_prepared_inputs_impl(
         }, f"{key} exact prepared capacity bundle pin")
         _require(bundle_pin == expected_bundle_pin,
                  f"{key} pressure calibration did not consume the exact earlier prepared TSV bundle")
+        closed_members = None
+        if probe_capture_rows is not None:
+            closed_members = _closed_recorded_pressure_probe_capture_members(
+                pressure_reader, probe_capture_rows[index], index, key[0],
+                condition, context_policy_pin, label="context pressure",
+            )
         try:
-            scope_receipt = verify_scope(
-                calibration_pin, context_policy_pin, bundle_pin, observed_pin,
-                source_root=str(source_root), evidence_path_map=record["evidence_path_map"],
+            scope_receipt = _call_pressure_scope_verifier(
+                verify_scope, calibration_pin, context_policy_pin, bundle_pin,
+                observed_pin, source_root=str(source_root),
+                evidence_path_map=record["evidence_path_map"],
                 host_verification_pin=calibration_receipt_pin,
+                probe_capture_pins=closed_members,
             )
         except Exception as error:
             raise PreparationError(f"{key} context pressure calibration failed independent v2 replay: {error}") from error
@@ -4421,6 +4471,7 @@ def _verify_prepared_inputs_completion_impl(
     recorded_host: bool = False,
     global_artifact_reader: Callable[[dict[str, str], int], bytes] | None = None,
     closed_recorded: bool = False,
+    probe_capture_index_pin: object = None,
 ) -> dict[str, Any]:
     """Read-only replay of a frozen preparation-completion receipt.
 
@@ -4440,6 +4491,8 @@ def _verify_prepared_inputs_completion_impl(
               (recorded_host and callable(global_artifact_reader) and
                captured_pilot_read_providers is not None)),
              "closed recorded completion requires the named Source-owned inputs")
+    _require(probe_capture_index_pin is None or closed_recorded,
+             "closed pressure capture index requires the named closed-recorded completion route")
     completion_ref = _exact(completion_pin, {
         "path", "raw_sha256", "semantic_sha256",
     }, "prepared-input completion pin")
@@ -4475,6 +4528,13 @@ def _verify_prepared_inputs_completion_impl(
     final_plan_pin = _exact(provenance["final_plan_pin"], {"path", "raw_sha256"}, "final PlanV3 raw pin")
     source_root_checked = _safe_root(source_root, "prepared-input replay SourceV5 root")
     input_root_checked = _safe_root(input_root, "prepared-input replay input root")
+    if probe_capture_index_pin is not None:
+        probe_capture_index_pin = _validate_initial_pressure_probe_capture_index_pin(
+            probe_capture_index_pin,
+        )
+        _read_initial_pressure_probe_capture_index(
+            probe_capture_index_pin, input_root_checked,
+        )
     preparation_path = Path(preparation_pin["path"])
     _require(source_root_checked == _safe_root(SOURCE_ROOT, "active SourceV5 root") and
              preparation_path.is_absolute(),
@@ -4509,6 +4569,8 @@ def _verify_prepared_inputs_completion_impl(
             replay_kwargs["input_root"] = input_root_checked
             if global_artifact_reader is not None:
                 replay_kwargs["global_artifact_reader"] = global_artifact_reader
+        if probe_capture_index_pin is not None:
+            replay_kwargs["probe_capture_index_pin"] = probe_capture_index_pin
         replay_arguments_values = (
             {"path": preparation_pin["path"], "sha256": preparation_pin["raw_sha256"]},
             replay_arguments["capacity_completion_pins"],
@@ -4590,6 +4652,37 @@ def verify_prepared_inputs_completion_closed_recorded_v1(
         captured_pilot_read_providers=captured_pilot_read_providers,
         recorded_host=True, global_artifact_reader=global_artifact_reader,
         closed_recorded=True,
+    )
+
+
+def verify_prepared_inputs_completion_closed_recorded_v2(
+    completion_pin: dict[str, Any], provenance_v1: dict[str, Any],
+    source_root: Path, input_root: Path, *,
+    captured_pilot_read_providers: dict[str, Any],
+    global_artifact_reader: Callable[[dict[str, str], int], bytes],
+    probe_capture_index_pin: object,
+) -> dict[str, Any]:
+    """Replay completion through closed Fixed and all 30 closed pressure scopes.
+
+    This explicit SourceA route retains the V1 provenance shape while requiring
+    the pinned ProbeV2 sidecar used by the typed closed pressure owner.
+    """
+    _require(type(captured_pilot_read_providers) is dict and
+             callable(global_artifact_reader),
+             "closed recorded completion requires its exact SourceA providers and raw2 reader")
+    capture_index_pin = _validate_initial_pressure_probe_capture_index_pin(
+        probe_capture_index_pin,
+    )
+    checked_input_root = _safe_root(Path(input_root),
+                                    "closed-recorded completion input root")
+    _read_initial_pressure_probe_capture_index(
+        capture_index_pin, checked_input_root,
+    )
+    return _verify_prepared_inputs_completion_impl(
+        completion_pin, provenance_v1, source_root, checked_input_root,
+        captured_pilot_read_providers=captured_pilot_read_providers,
+        recorded_host=True, global_artifact_reader=global_artifact_reader,
+        closed_recorded=True, probe_capture_index_pin=capture_index_pin,
     )
 
 

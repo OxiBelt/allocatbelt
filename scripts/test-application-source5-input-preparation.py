@@ -3792,6 +3792,224 @@ class ClosedRecordedOwnerSelectorTests(unittest.TestCase):
              "captured_pilot_read_providers", "global_artifact_reader"),
         )
 
+    def test_v2_completion_requires_and_forwards_the_capture_index_pin(self):
+        module = self.module
+        function = module.verify_prepared_inputs_completion_closed_recorded_v2
+        signature = inspect.signature(function)
+        self.assertEqual(tuple(signature.parameters), (
+            "completion_pin", "provenance_v1", "source_root", "input_root",
+            "captured_pilot_read_providers", "global_artifact_reader",
+            "probe_capture_index_pin",
+        ))
+        self.assertIs(signature.parameters["probe_capture_index_pin"].default,
+                      inspect.Parameter.empty)
+
+        completion = {"path": "/inputs/completion.json", "raw_sha256": "a" * 64,
+                      "semantic_sha256": "b" * 64}
+        provenance_v1 = {
+            "schema": "allocatbelt.application-source5-prepared-inputs-provenance.v1",
+        }
+        providers = {"host-a": object(), "host-b": object()}
+        reader = lambda _pin, _maximum: b"raw2 bytes"
+        with tempfile.TemporaryDirectory(prefix="source5-closed-completion-v2-") as temporary:
+            input_root = Path(temporary).resolve()
+            pin = {"path": str(input_root / "capture-index.json"),
+                   "raw_sha256": "c" * 64}
+            result_value = {"completion": "replayed"}
+            with patch.object(module, "_read_initial_pressure_probe_capture_index",
+                              return_value=[]) as capture_reader, \
+                    patch.object(module, "_verify_prepared_inputs_completion_impl",
+                                 return_value=result_value) as replay:
+                result = function(
+                    completion, provenance_v1, Path("/source"), input_root,
+                    captured_pilot_read_providers=providers,
+                    global_artifact_reader=reader,
+                    probe_capture_index_pin=pin,
+                )
+        self.assertIs(result, result_value)
+        capture_reader.assert_called_once_with(pin, input_root)
+        replay.assert_called_once_with(
+            completion, provenance_v1, Path("/source"), input_root,
+            captured_pilot_read_providers=providers, recorded_host=True,
+            global_artifact_reader=reader, closed_recorded=True,
+            probe_capture_index_pin=pin,
+        )
+
+    def test_v2_completion_rejects_missing_or_malformed_capture_index_before_replay(self):
+        module = self.module
+        function = module.verify_prepared_inputs_completion_closed_recorded_v2
+        providers = {"host-a": object(), "host-b": object()}
+        reader = lambda _pin, _maximum: b"raw2 bytes"
+        arguments = (
+            {"path": "/inputs/completion.json", "raw_sha256": "a" * 64,
+             "semantic_sha256": "b" * 64},
+            {"schema": "allocatbelt.application-source5-prepared-inputs-provenance.v1"},
+            Path("/source"), Path("/unread/input"),
+        )
+        with patch.object(module, "_verify_prepared_inputs_completion_impl",
+                          side_effect=AssertionError("completion replay ran")) as replay:
+            with self.assertRaises(TypeError):
+                function(*arguments, captured_pilot_read_providers=providers,
+                         global_artifact_reader=reader)
+            with self.assertRaisesRegex(module.PreparationError, "requires a raw-pinned"):
+                function(*arguments, captured_pilot_read_providers=providers,
+                         global_artifact_reader=reader,
+                         probe_capture_index_pin=None)
+        replay.assert_not_called()
+
+        with tempfile.TemporaryDirectory(prefix="source5-closed-completion-bad-index-") as temporary:
+            input_root = Path(temporary).resolve()
+            index_path = input_root / "capture-index.json"
+            raw = module._canonical({"schema": "wrong-schema", "entries": []})
+            index_path.write_bytes(raw)
+            bad_pin = {"path": str(index_path), "raw_sha256": module._sha256(raw)}
+            with patch.object(module, "_verify_prepared_inputs_completion_impl",
+                              side_effect=AssertionError("completion replay ran")) as replay:
+                with self.assertRaisesRegex(module.PreparationError,
+                                            "exact 30-row v1 matrix"):
+                    function(
+                        *arguments[:3], input_root,
+                        captured_pilot_read_providers=providers,
+                        global_artifact_reader=reader,
+                        probe_capture_index_pin=bad_pin,
+                    )
+            replay.assert_not_called()
+
+    def test_closed_pressure_scope_selector_requires_the_named_api_without_fallback(self):
+        module = self.module
+        ordinary = mock.Mock(side_effect=AssertionError("ordinary pressure API selected"))
+        closed = mock.Mock()
+        reader = types.SimpleNamespace(
+            verify_calibration_scope_v2_offline=ordinary,
+            verify_calibration_scope_v2_closed_recorded_v1=closed,
+        )
+        self.assertIs(module._pressure_scope_verifier(
+            reader, closed_recorded=True, label="typed pressure reader",
+        ), closed)
+        ordinary.assert_not_called()
+        closed.assert_not_called()
+
+        reader_without_closed = types.SimpleNamespace(
+            verify_calibration_scope_v2_offline=ordinary,
+        )
+        with self.assertRaisesRegex(module.PreparationError,
+                                    "explicitly selected scope-v2 replay API"):
+            module._pressure_scope_verifier(
+                reader_without_closed, closed_recorded=True,
+                label="typed pressure reader",
+            )
+        ordinary.assert_not_called()
+
+        calibration = {"path": "/inputs/calibration.json", "raw_sha256": "a" * 64}
+        context = {"path": "/inputs/context.json", "raw_sha256": "b" * 64}
+        bundle = {"schema": "capacity-bundle"}
+        observed = {"path": "/inputs/host.json", "raw_sha256": "c" * 64}
+        evidence = {"capacity": "/inputs/capacity.tsv"}
+        receipt = {"path": "/inputs/receipt.json", "raw_sha256": "d" * 64}
+        captures = [{"descriptor": {"pair": "bounded"}}]
+        sentinel = {"closed_scope": True}
+        closed.return_value = sentinel
+        result = module._call_pressure_scope_verifier(
+            closed, calibration, context, bundle, observed,
+            source_root="/source", evidence_path_map=evidence,
+            host_verification_pin=receipt, probe_capture_pins=captures,
+        )
+        self.assertIs(result, sentinel)
+        closed.assert_called_once_with(
+            calibration, context, bundle, observed, source_root="/source",
+            evidence_path_map=evidence, host_verification_pin=receipt,
+            probe_capture_pins=captures,
+        )
+
+        ordinary.reset_mock()
+        ordinary.side_effect = None
+        module._call_pressure_scope_verifier(
+            ordinary, calibration, context, bundle, observed,
+            source_root="/source", evidence_path_map=evidence,
+            host_verification_pin=receipt,
+        )
+        ordinary.assert_called_once_with(
+            calibration, context, bundle, observed, source_root="/source",
+            evidence_path_map=evidence, host_verification_pin=receipt,
+        )
+
+    def test_closed_pressure_capture_row_matches_original_bundle_and_condition(self):
+        module = self.module
+        with tempfile.TemporaryDirectory(prefix="source5-closed-pressure-member-") as temporary:
+            root = Path(temporary).resolve()
+            bundle_path = root / "context-bundle.json"
+            descriptors = [
+                {"pair": "bounded", "executor": "bounded", "allocator": "allocatbelt"},
+                {"pair": "tokio", "executor": "tokio", "allocator": "allocatbelt"},
+            ]
+            requests = [
+                {"path": str(root / f"request-{index}.json"),
+                 "raw_sha256": f"{index + 1:064x}"}
+                for index in range(2)
+            ]
+            bundle = {
+                "schema": "test-context-policy-bundle-v2",
+                "artifact": {},
+                "members": [
+                    {"descriptor": descriptors[index], "request": requests[index],
+                     "construction_probe": {}, "resolved_policy": {},
+                     "composition_receipt": {}}
+                    for index in range(2)
+                ],
+            }
+            raw = module._canonical(bundle)
+            bundle_path.write_bytes(raw)
+            context_pin = {"path": str(bundle_path),
+                           "raw_sha256": module._sha256(raw)}
+            capacity_key = {
+                "host_id": "host-a", "workload": "cpu", "profile": "mixed",
+                "calibration_id": "capacity-a",
+            }
+            condition = {"condition_id": "condition-a",
+                         "capacity_key": capacity_key}
+            capture_members = [
+                {"descriptor": descriptors[index], "request_pin": requests[index],
+                 "probe_capture_pin": {
+                     "path": str(root / f"capture-{index}.json"),
+                     "raw_sha256": f"{index + 11:064x}",
+                     "receipt_sha256": f"{index + 21:064x}",
+                 }}
+                for index in range(2)
+            ]
+            capture_row = {
+                "host_id": "host-a", "condition_id": "condition-a",
+                "capacity_key": capacity_key,
+                "context_policy_pin": context_pin,
+                "members": capture_members,
+            }
+            pressure_reader = types.SimpleNamespace(
+                CONTEXT_POLICY_BUNDLE_SCHEMA_V2="test-context-policy-bundle-v2",
+            )
+            checked = module._closed_recorded_pressure_probe_capture_members(
+                pressure_reader, capture_row, 0, "host-a", condition,
+                context_pin, label="context pressure",
+            )
+            self.assertEqual(checked, [
+                {"descriptor": descriptors[index], "request_pin": requests[index],
+                 "probe_capture_pin": capture_members[index]["probe_capture_pin"]}
+                for index in range(2)
+            ])
+            mismatched = dict(capture_row, condition_id="condition-b")
+            with self.assertRaisesRegex(module.PreparationError,
+                                        "crosses its condition/context binding"):
+                module._closed_recorded_pressure_probe_capture_members(
+                    pressure_reader, mismatched, 0, "host-a", condition,
+                    context_pin, label="context pressure",
+                )
+            mismatched_member = copy.deepcopy(capture_row)
+            mismatched_member["members"][0]["request_pin"]["path"] += ".changed"
+            with self.assertRaisesRegex(module.PreparationError,
+                                        "differs from the actual context bundle order"):
+                module._closed_recorded_pressure_probe_capture_members(
+                    pressure_reader, mismatched_member, 0, "host-a", condition,
+                    context_pin, label="context pressure",
+                )
+
     def test_capacity_export_selects_only_the_named_closed_fixed_owner(self):
         module = self.module
         checkpoint_raw = b"source-authenticated checkpoint bytes"
