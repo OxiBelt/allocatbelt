@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import hashlib
 import importlib.util
+import inspect
+import io
 import json
 import os
 import signal
@@ -192,6 +194,159 @@ class CompositionContractTests(unittest.TestCase):
         }
         self.assertEqual(composition._absolute_paths(capture), expected)
         self.assertEqual(reader._absolute_json_paths(capture), expected)
+
+    def test_closed_recorded_composer_has_no_public_bypass_selector(self) -> None:
+        function = composition.compose_calibrated_policy_v5_closed_recorded_v1
+        parameters = inspect.signature(function).parameters
+        self.assertEqual(list(parameters), [
+            "request", "request_raw_sha256", "replay_context",
+        ])
+        self.assertEqual(parameters["replay_context"].default,
+                         inspect.Parameter.empty)
+
+    def test_recorded_artifact_mode_skips_only_artifacts_and_keeps_source_files(self) -> None:
+        source_file = self.root / "scripts" / "validator.py"
+        source_file.parent.mkdir()
+        source_file.write_bytes(b"pinned Source module\n")
+        artifact = self.root / "target" / "release" / "application"
+        context = {
+            "mapped_paths": frozenset({str(source_file), str(artifact)}),
+            "mapped_files": frozenset({str(source_file)}),
+            "mapped_symlinks": frozenset(),
+        }
+        inventory = [{"path": "scripts/validator.py", "kind": "file"}]
+        artifact_paths = {str(artifact)}
+        composition._source5_offline_inventory_closure(
+            self.root, inventory, artifact_paths, context, "test SourceV5",
+            recorded_artifacts=True,
+        )
+        with self.assertRaisesRegex(composition.CompositionError,
+                                    "regular inventory/artifact member"):
+            composition._source5_offline_inventory_closure(
+                self.root, inventory, artifact_paths, context, "test SourceV5",
+            )
+        source_omitted = dict(context)
+        source_omitted["mapped_files"] = frozenset()
+        with self.assertRaisesRegex(composition.CompositionError,
+                                    "regular inventory/artifact member"):
+            composition._source5_offline_inventory_closure(
+                self.root, inventory, artifact_paths, source_omitted,
+                "test SourceV5", recorded_artifacts=True,
+            )
+
+    def test_closed_composer_rejects_selected_and_unused_elf_map_entries_before_io(self) -> None:
+        identity = {
+            "host_id": "closed-map-host", "workload": "mixed",
+            "profile": "mixed", "binary_sha256": "a" * 64,
+        }
+        source = feedback_fixtures._source_v5_manifest(identity)
+        source_path = self.root / "source-manifest.json"
+        source_raw = composition.canonical(source)
+        _write(source_path, source_raw)
+        source_pin = {"path": str(source_path), "raw_sha256": _sha(source_raw)}
+        capacity_bundle = {
+            "request": {"path": str(self.root / "capacity-request.json"), "raw_sha256": "c" * 64},
+            "artifact": {"path": str(self.root / "capacity.tsv"), "raw_sha256": "d" * 64},
+            "receipt": {"path": str(self.root / "capacity-receipt.json"), "raw_sha256": "e" * 64},
+        }
+        request = {
+            "schema": composition.REQUEST_SCHEMA,
+            "source_root": str(SOURCE_ROOT), "source_manifest": source_pin,
+            "context": {
+                "host_id": identity["host_id"], "workload": identity["workload"],
+                "profile": identity["profile"], "calibration_id": "capacity-1",
+            },
+            "construction_probe": {
+                "path": str(self.root / "probe.json"), "raw_sha256": "b" * 64,
+                "allocator": "allocatbelt", "binary_sha256": identity["binary_sha256"],
+            },
+            "capacity_bundle": capacity_bundle,
+        }
+        request_raw_sha = _sha(composition.canonical(request))
+        artifact_records = {
+            name: source["artifacts"][name]
+            for name in ("allocatbelt", "mimalloc-secure", "mimalloc-standard", "system")
+        }
+        artifact_records.update({
+            "soak-allocatbelt": source["soak_artifacts"]["allocatbelt"],
+            "analyzer": source["analysis_artifact"],
+            "resource-domain-calibration": source["resource_domain_calibration"]["binary"],
+        })
+        artifact_paths = {
+            str(SOURCE_ROOT / record["path"])
+            for record in artifact_records.values()
+        }
+        replay_context = {
+            "schema": composition.FEEDBACK_OFFLINE_CONTEXT_SCHEMA,
+            "evidence_path_map": {
+                "schema": reader.EVIDENCE_PATH_MAP_SCHEMA,
+                "entries": [],
+            },
+            "probe_capture_pin": {
+                "path": str(self.root / "probe-capture.json"),
+                "raw_sha256": "f" * 64, "receipt_sha256": "1" * 64,
+            },
+            "capacity_bundle": capacity_bundle,
+        }
+        original = {
+            "lstat": Path.lstat, "stat": Path.stat,
+            "resolve": Path.resolve, "open": Path.open,
+        }
+
+        def path_call(name: str):
+            method = original[name]
+
+            def guarded(path_value: Path, *args: Any, **kwargs: Any):
+                if str(path_value) in artifact_paths:
+                    raise AssertionError(f"closed composer touched Source ELF with {name}")
+                return method(path_value, *args, **kwargs)
+            return guarded
+
+        real_os_open, real_os_stat, real_os_lstat = os.open, os.stat, os.lstat
+        real_builtin_open, real_io_open = open, io.open
+
+        def guard_os(method, label: str):
+            def guarded(path_value: object, *args: Any, **kwargs: Any):
+                try:
+                    rendered = os.fsdecode(os.fspath(path_value))
+                except (TypeError, ValueError):
+                    rendered = ""
+                if rendered in artifact_paths:
+                    raise AssertionError(f"closed composer touched Source ELF with {label}")
+                return method(path_value, *args, **kwargs)
+            return guarded
+
+        def guard_open(method, label: str):
+            def guarded(path_value: object, *args: Any, **kwargs: Any):
+                try:
+                    rendered = os.fsdecode(os.fspath(path_value))
+                except (TypeError, ValueError):
+                    rendered = ""
+                if rendered in artifact_paths:
+                    raise AssertionError(f"closed composer touched Source ELF with {label}")
+                return method(path_value, *args, **kwargs)
+            return guarded
+
+        for artifact_name, artifact in artifact_records.items():
+            artifact_path = str(SOURCE_ROOT / artifact["path"])
+            replay_context["evidence_path_map"]["entries"] = [
+                {"origin": artifact_path, "local": artifact_path},
+            ]
+            with self.subTest(artifact=artifact_name):
+                with mock.patch.object(Path, "lstat", new=path_call("lstat")), \
+                        mock.patch.object(Path, "stat", new=path_call("stat")), \
+                        mock.patch.object(Path, "resolve", new=path_call("resolve")), \
+                        mock.patch.object(Path, "open", new=path_call("open")), \
+                        mock.patch.object(os, "open", new=guard_os(real_os_open, "open")), \
+                        mock.patch.object(os, "stat", new=guard_os(real_os_stat, "stat")), \
+                        mock.patch.object(os, "lstat", new=guard_os(real_os_lstat, "lstat")), \
+                        mock.patch("builtins.open", new=guard_open(real_builtin_open, "open")), \
+                        mock.patch.object(io, "open", new=guard_open(real_io_open, "open")):
+                    with self.assertRaisesRegex(composition.CompositionError,
+                                                "executable artifact"):
+                        composition.compose_calibrated_policy_v5_closed_recorded_v1(
+                            request, request_raw_sha, replay_context=replay_context,
+                        )
 
     def test_source_policy_context_does_not_mutate_pinned_source(self) -> None:
         for schema in (

@@ -52,6 +52,9 @@ CAPACITY_FLOOR_POLICY_ID = "application_capacity_relative_tenth_v1"
 CALIBRATION_BINDING_SCHEMA_V2 = "allocatbelt.application-pressure-calibration-binding.v2"
 SOURCE5_PRESSURE_CONDITION_SCHEMA = "allocatbelt.application-source5-pressure-condition.v1"
 SOURCE5_MANIFEST_SCHEMA = "allocatbelt.application-source-manifest.v5"
+SOURCE5_APPLICATION_ALLOCATOR_LABELS = (
+    "allocatbelt", "mimalloc-secure", "mimalloc-standard", "system",
+)
 SOURCE5_PRESSURE_POLICY_SCHEMA = "allocatbelt.application-pressure-pair-policy.v1"
 SOURCE5_COMPOSED_POLICY_SCHEMA = "allocatbelt.application-feedback-resolved-policy.v1"
 SOURCE5_CAPACITY_BUNDLE_SCHEMA = "allocatbelt.application-byte-capacity-request.v1"
@@ -1257,33 +1260,289 @@ def _load_source_module(source_root: Path, source: dict[str, Any], relative: str
 def _capture_offline_typed_inventory(
     source_root: Path, records: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
-    """Hash declared SourceV5 members without Git, /proc, or child processes."""
+    """Hash exact offline Source files and read each tracked link literally."""
+    return _capture_closed_recorded_typed_inventory_v1(source_root, records)
+
+
+def _capture_closed_recorded_typed_inventory_v1(
+    source_root: Path, records: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Recheck exact Source files and literal tracked symlinks for closed replay."""
     actual: list[dict[str, Any]] = []
-    for index, entry_value in enumerate(records):
-        entry = exact(entry_value, {"path", "kind", "mode", "sha256", "size"},
-                      f"offline SourceV5 inventory[{index}]")
-        relative = PurePosixPath(text(entry["path"], "offline SourceV5 inventory path", 4096))
-        require(not relative.is_absolute() and ".." not in relative.parts and
-                relative.as_posix() == entry["path"] and entry["kind"] == "file" and
-                entry["mode"] in ("100644", "100755"),
-                "offline SourceV5 inventory contains an unsafe or non-regular path")
+    for index, value in enumerate(records):
+        require(type(value) is dict and type(value.get("kind")) is str,
+                f"closed SourceV5 inventory[{index}] is malformed")
+        kind = value["kind"]
+        if kind == "file":
+            entry = exact(value, {"path", "kind", "mode", "sha256", "size"},
+                          f"closed SourceV5 regular file[{index}]")
+        elif kind == "symlink":
+            entry = exact(value, {"path", "kind", "mode", "target", "sha256", "size"},
+                          f"closed SourceV5 symlink[{index}]")
+        else:
+            require(False, f"closed SourceV5 inventory[{index}] has an unsupported kind")
+        relative = PurePosixPath(text(entry["path"], "closed SourceV5 inventory path", 4096))
+        require(not relative.is_absolute() and relative.parts and
+                ".." not in relative.parts and relative.as_posix() == entry["path"] and
+                "\\" not in entry["path"],
+                "closed SourceV5 inventory path is not portable")
         path = source_root.joinpath(*relative.parts)
         try:
-            require(path.resolve(strict=True) == path,
-                    "offline SourceV5 inventory member traverses an alias")
+            require(path.parent.resolve(strict=True) == path.parent,
+                    "closed SourceV5 inventory parent traverses an alias")
             info = path.lstat()
-            actual_mode = stat.S_IFMT(info.st_mode) | stat.S_IMODE(info.st_mode)
-            require(stat.S_ISREG(info.st_mode) and not stat.S_ISLNK(info.st_mode) and
-                    actual_mode == int(entry["mode"], 8),
-                    "offline SourceV5 inventory member mode/type differs")
-        except OSError as error:
-            raise ReadbackError(f"offline SourceV5 inventory member is unavailable: {error}") from error
-        raw, actual_sha = read_stable(path, "offline SourceV5 inventory member",
-                                      MAX_SOURCE_MODULE_BYTES)
-        require(len(raw) == entry["size"] and actual_sha == entry["sha256"],
-                "offline SourceV5 inventory member bytes differ from the original typed pin")
+            if kind == "file":
+                require(entry["mode"] in ("100644", "100755") and
+                        stat.S_ISREG(info.st_mode) and
+                        stat.S_IFMT(info.st_mode) | stat.S_IMODE(info.st_mode) ==
+                        int(entry["mode"], 8),
+                        "closed SourceV5 regular file mode/type differs")
+                raw, actual_sha = read_stable(
+                    path, "closed SourceV5 typed inventory member",
+                    MAX_SOURCE_MODULE_BYTES,
+                )
+                require(len(raw) == entry["size"] and actual_sha == entry["sha256"],
+                        "closed SourceV5 regular file differs from its complete typed inventory")
+            else:
+                require(entry["mode"] == "120000" and stat.S_ISLNK(info.st_mode),
+                        "closed SourceV5 symlink mode/type differs")
+                target = os.readlink(path)
+                target_raw = target.encode("utf-8", "strict")
+                require(target == entry["target"] and len(target_raw) == entry["size"] and
+                        sha256_bytes(target_raw) == entry["sha256"],
+                        "closed SourceV5 symlink literal differs from its complete typed inventory")
+        except (OSError, UnicodeError) as error:
+            raise ReadbackError(
+                f"closed SourceV5 inventory member is unavailable or invalid: {error}",
+            ) from error
         actual.append(dict(entry))
     return actual
+
+
+def _closed_probe_capture_mountpoints_v1(capture: dict[str, Any]) -> set[str]:
+    output_mount = exact(capture.get("output_mount"), {
+        "mount_id", "major_minor", "mount_root", "mount_point",
+        "filesystem_type", "mount_source", "device", "available_bytes",
+        "available_inodes",
+    }, "closed-recorded ProbeV2 output mount")
+    static_keys = {
+        "mount_id", "major_minor", "mount_root", "mount_point",
+        "filesystem_type", "mount_source", "device",
+    }
+    initial = exact(capture.get("tmpdir_initial"), {
+        "path", "device", "inode", "mode", "mount", "available_bytes",
+        "available_inodes", "bytes_limit", "inode_limit",
+    }, "closed-recorded ProbeV2 initial TMPDIR")
+    final = exact(capture.get("tmpdir_final"), {
+        "path", "device", "inode", "mode", "mount", "bytes_used",
+        "file_count", "directory_count", "bytes_limit", "inode_limit",
+        "available_bytes", "available_inodes",
+    }, "closed-recorded ProbeV2 final TMPDIR")
+    initial_mount = exact(initial["mount"], static_keys,
+                          "closed-recorded ProbeV2 initial TMPDIR mount")
+    final_mount = exact(final["mount"], static_keys,
+                        "closed-recorded ProbeV2 final TMPDIR mount")
+    output_mount_static = {key: output_mount[key] for key in static_keys}
+    mount_point = str(absolute_path(output_mount["mount_point"],
+                                    "closed-recorded ProbeV2 output mountpoint"))
+    tmp_mount_point = str(absolute_path(initial_mount["mount_point"],
+                                        "closed-recorded ProbeV2 TMPDIR mountpoint"))
+    stdout_pin = exact(capture.get("stdout"), {"path", "raw_sha256"},
+                       "closed-recorded ProbeV2 stdout pin")
+    output_root = absolute_path(str(Path(stdout_pin["path"]).parent),
+                                "closed-recorded ProbeV2 output root")
+    require(initial_mount == final_mount and initial_mount == output_mount_static and
+            mount_point == tmp_mount_point and
+            (str(output_root) == mount_point or
+             str(output_root).startswith(mount_point.rstrip("/") + "/")),
+            "closed-recorded ProbeV2 output/TMPDIR mountpoints differ from their captured roots")
+    return {mount_point}
+
+
+def _closed_recorded_feedback_context_v1(
+    source_stack: dict[str, Any], evidence_path_map: object,
+    source_root: Path, documents: list[object], evidence_files: set[str],
+    probe_capture_pin: dict[str, str], capacity_bundle: dict[str, Any],
+    selected_binary_path: str, additional_directories: set[str],
+) -> dict[str, Any]:
+    """Adapt admitted pressure roots into the exact finite feedback identity map."""
+    checked_map = exact(evidence_path_map, {"schema", "entries"},
+                        "closed-recorded pressure evidence path map")
+    require(checked_map["schema"] == EVIDENCE_PATH_MAP_SCHEMA_V1 and
+            type(checked_map["entries"]) is list,
+            "closed-recorded pressure evidence map schema differs")
+    context = _EVIDENCE_PATH_MAP_CONTEXT.get()
+    require(context is not None, "closed-recorded feedback adaptation has no admitted pressure map")
+    pressure_mapping, pressure_directories = context
+    source_root = absolute_path(str(source_root), "closed-recorded SourceV5 root")
+    source_text = str(source_root)
+
+    def under(path_value: str, root_value: str) -> bool:
+        return path_value == root_value or path_value.startswith(root_value.rstrip("/") + "/")
+
+    require(source_text in pressure_mapping and source_text in pressure_directories,
+            "closed-recorded pressure map omits the exact SourceV5 root directory")
+    external_origins = [origin for origin in pressure_mapping
+                        if not under(origin, source_text)]
+    input_candidates = [directory for directory in pressure_directories
+                        if directory != "/" and not under(directory, source_text) and
+                        not under(source_text, directory) and
+                        all(under(origin, directory) for origin in external_origins)]
+    require(external_origins and input_candidates,
+            "closed-recorded pressure map has no unique separate private input root")
+    input_root_text = max(input_candidates, key=lambda value: len(Path(value).parts))
+    require(input_root_text in pressure_mapping and
+            input_root_text in pressure_directories and input_root_text != source_text and
+            not under(input_root_text, source_text) and
+            not under(source_text, input_root_text) and
+            all(under(origin, input_root_text) for origin in external_origins),
+            "closed-recorded pressure input root is ambiguous or overlaps SourceV5")
+    require(all(under(origin, source_text) or under(origin, input_root_text)
+                for origin in pressure_mapping),
+            "closed-recorded pressure map contains evidence outside its two admitted roots")
+
+    source = source_stack["source"]
+    source_identity = exact(source.get("source"), {
+        "git_commit", "source_tree_sha256", "cargo_lock_sha256", "files",
+    }, "closed-recorded SourceV5 inventory")
+    inventory = source_identity["files"]
+    require(type(inventory) is list and len(inventory) <= 16_384,
+            "closed-recorded SourceV5 inventory exceeds its finite bound")
+    typed: dict[str, dict[str, Any]] = {}
+    for index, value in enumerate(inventory):
+        require(type(value) is dict and type(value.get("path")) is str,
+                f"closed-recorded SourceV5 inventory[{index}] is malformed")
+        relative = PurePosixPath(value["path"])
+        require(not relative.is_absolute() and relative.parts and
+                ".." not in relative.parts and relative.as_posix() == value["path"] and
+                "\\" not in value["path"],
+                "closed-recorded SourceV5 inventory path is not portable")
+        absolute = str(source_root.joinpath(*relative.parts))
+        require(absolute not in typed, "closed-recorded SourceV5 inventory repeats a path")
+        typed[absolute] = value
+
+    artifacts = source.get("artifacts")
+    require(type(artifacts) is dict and bool(artifacts),
+            "closed-recorded SourceV5 artifact table is malformed")
+    artifact_paths: set[str] = set()
+    for name, value in artifacts.items():
+        artifact = exact(value, {"path", "sha256"},
+                         f"closed-recorded SourceV5 artifact {name}")
+        relative = PurePosixPath(text(artifact["path"],
+                                      f"closed-recorded SourceV5 artifact {name} path",
+                                      4096))
+        require(not relative.is_absolute() and relative.parts and
+                ".." not in relative.parts and relative.as_posix() == artifact["path"] and
+                "\\" not in artifact["path"],
+                "closed-recorded SourceV5 artifact path is not portable")
+        artifact_sha = sha256(artifact["sha256"],
+                              f"closed-recorded SourceV5 artifact {name} SHA-256")
+        artifact_path = str(source_root.joinpath(*relative.parts))
+        require(artifact_path not in typed,
+                "closed-recorded SourceV5 artifact aliases its typed source inventory")
+        artifact_paths.add(artifact_path)
+        require(len(artifact_sha) == 64,
+                "closed-recorded SourceV5 artifact digest is malformed")
+
+    selected_path = str(absolute_path(selected_binary_path,
+                                      "closed-recorded selected SourceV5 binary"))
+    require(selected_path in artifact_paths,
+            "closed-recorded selected binary is not a lexical SourceV5 artifact path")
+    require(not any(origin == selected_path for origin in pressure_mapping),
+            "closed-recorded pressure map must not stage or inspect a SourceV5 ELF")
+
+    composer = source_stack["composer"]
+    feedback_reader = source_stack["feedback_reader"]
+    entries: dict[str, str] = {}
+
+    def add(path_value: str, expected_kind: str | None = None) -> None:
+        path = absolute_path(path_value, "closed-recorded feedback evidence path")
+        rendered = str(path)
+        if rendered in artifact_paths:
+            return
+        external_mount = rendered in additional_directories
+        require(under(rendered, source_text) or under(rendered, input_root_text) or
+                external_mount,
+                "closed-recorded feedback evidence escapes SourceV5 and the private input root")
+        if not external_mount:
+            _require_evidence_path_mapped(path)
+        if rendered == source_text:
+            kind = "directory"
+        elif rendered == input_root_text:
+            kind = "directory"
+        elif rendered in typed:
+            kind = typed[rendered]["kind"]
+            if kind == "symlink":
+                composer._verify_source5_symlink_literal(
+                    source_root, PurePosixPath(typed[rendered]["path"]),
+                    typed[rendered], "closed-recorded SourceV5",
+                )
+        else:
+            source_directory_reference = under(rendered, source_text)
+            require(under(rendered, input_root_text) or external_mount or
+                    source_directory_reference,
+                    "closed-recorded feedback path escapes its typed roots")
+            try:
+                require(path.parent.resolve(strict=True) == path.parent,
+                        "closed-recorded evidence parent traverses an alias")
+                info = path.lstat()
+                require(path.resolve(strict=True) == path and
+                        not stat.S_ISLNK(info.st_mode),
+                        "closed-recorded non-Source evidence is a symlink or alias")
+            except OSError as error:
+                raise ReadbackError(
+                    f"closed-recorded evidence path is unavailable: {error}",
+                ) from error
+            if stat.S_ISDIR(info.st_mode):
+                kind = "directory"
+            elif stat.S_ISREG(info.st_mode):
+                require(not source_directory_reference,
+                        "closed-recorded regular SourceV5 evidence is absent from its typed inventory")
+                kind = "file"
+            else:
+                require(False, "closed-recorded evidence is not a regular file or directory")
+        if expected_kind is not None:
+            require(kind == expected_kind,
+                    "closed-recorded feedback evidence type differs from its Source pin")
+        entries[rendered] = rendered
+
+    add(source_text, "directory")
+    add(input_root_text, "directory")
+    for directory in additional_directories:
+        add(directory, "directory")
+    for path_value, entry in typed.items():
+        add(path_value, entry["kind"])
+    for path_value in evidence_files:
+        add(path_value, "file")
+    for document in documents:
+        require(type(document) in (dict, list),
+                "closed-recorded feedback closure document is malformed")
+        for path_value in composer._absolute_paths(document):
+            require(type(path_value) is str,
+                    "closed-recorded feedback document path is malformed")
+            add(path_value)
+        if type(document) is dict and document.get("schema") == \
+                "allocatbelt.application-byte-capacity-request.v1":
+            trace_root = absolute_path(document.get("trace_directory"),
+                                      "closed-recorded capacity trace directory")
+            for name in feedback_reader.CAPACITY_TRACE_FILES:
+                add(str(trace_root / name), "file")
+    require(len(entries) <= feedback_reader.MAX_OFFLINE_PATH_MAP_ENTRIES,
+            "closed-recorded feedback identity map exceeds its finite bound")
+    return {
+        "schema": composer.FEEDBACK_OFFLINE_CONTEXT_SCHEMA,
+        "evidence_path_map": {
+            "schema": feedback_reader.EVIDENCE_PATH_MAP_SCHEMA,
+            "entries": [
+                {"origin": path, "local": entries[path]}
+                for path in sorted(entries)
+            ],
+        },
+        "probe_capture_pin": dict(probe_capture_pin),
+        "capacity_bundle": {
+            name: dict(capacity_bundle[name]) for name in ("request", "artifact", "receipt")
+        },
+    }
 
 
 def _source5_stack(
@@ -1377,6 +1636,217 @@ def _source5_stack(
         "feedback_reader_sha256": feedback_reader_sha, "composer": composer,
         "composer_sha256": composer_sha,
     }
+
+
+def _source5_application_artifact_paths_v1(
+    source_root: Path, source_manifest: dict[str, Any],
+) -> set[str]:
+    """Derive every SourceV5 application ELF path from canonical raw-pinned metadata."""
+    require(source_manifest.get("schema") == SOURCE5_MANIFEST_SCHEMA,
+            "closed-recorded replay requires the exact SourceV5 manifest schema")
+    semantic = sha256(source_manifest.get("manifest_sha256"),
+                      "closed-recorded SourceV5 semantic manifest SHA-256")
+    body = {key: value for key, value in source_manifest.items()
+            if key != "manifest_sha256"}
+    require(semantic == digest_object(body),
+            "closed-recorded SourceV5 semantic manifest digest is invalid")
+    artifacts = source_manifest.get("artifacts")
+    require(type(artifacts) is dict and
+            set(artifacts) == set(SOURCE5_APPLICATION_ALLOCATOR_LABELS),
+            "closed-recorded SourceV5 application artifact table is incomplete")
+    result: set[str] = set()
+
+    def add_artifact(value: object, label: str) -> None:
+        artifact = exact(value, {"path", "sha256"},
+                         f"closed-recorded SourceV5 executable artifact {label}")
+        relative = PurePosixPath(text(
+            artifact["path"], f"closed-recorded SourceV5 artifact {label} path", 4096,
+        ))
+        require(not relative.is_absolute() and relative.parts and
+                ".." not in relative.parts and relative.as_posix() == artifact["path"] and
+                "\\" not in artifact["path"],
+                f"closed-recorded SourceV5 artifact {label} path is not portable")
+        sha256(artifact["sha256"],
+               f"closed-recorded SourceV5 executable artifact {label} SHA-256")
+        result.add(str(source_root.joinpath(*relative.parts)))
+    for label in SOURCE5_APPLICATION_ALLOCATOR_LABELS:
+        add_artifact(artifacts[label], label)
+    soak_artifacts = source_manifest.get("soak_artifacts")
+    require(type(soak_artifacts) is dict and set(soak_artifacts) == {"allocatbelt"},
+            "closed-recorded SourceV5 soak artifact table is malformed")
+    add_artifact(soak_artifacts["allocatbelt"], "soak-allocatbelt")
+    add_artifact(source_manifest.get("analysis_artifact"), "analysis")
+    calibration = exact(source_manifest.get("resource_domain_calibration"), {
+        "binary", "output", "record", "source", "build", "build_sha256",
+    }, "closed-recorded SourceV5 resource-domain calibration")
+    add_artifact(calibration["binary"], "resource-domain calibration")
+    require(len(result) == len(SOURCE5_APPLICATION_ALLOCATOR_LABELS) + 3,
+            "closed-recorded SourceV5 executable artifact paths alias")
+    return result
+
+
+def _reject_closed_recorded_artifact_paths_in_map_v1(
+    evidence_path_map: object, forbidden_paths: set[str], label: str,
+) -> None:
+    """Reject Source ELF paths using only identity-map strings, before any stat."""
+    value = exact(evidence_path_map, {"schema", "entries"}, label)
+    require(value["schema"] == EVIDENCE_PATH_MAP_SCHEMA_V1 and
+            type(value["entries"]) is list and
+            1 <= len(value["entries"]) <= 4096,
+            f"{label} schema or entry count is invalid")
+    previous = ""
+    seen_local: set[str] = set()
+    for index, entry_value in enumerate(value["entries"]):
+        entry = exact(entry_value, {"origin", "local"}, f"{label}[{index}]")
+        origin = str(absolute_path(entry["origin"], f"{label} origin[{index}]"))
+        local = str(absolute_path(entry["local"], f"{label} local[{index}]"))
+        require(origin == local,
+                "non-identity evidence paths are unsupported because SourceV5 pins absolute paths")
+        require(origin > previous and local not in seen_local,
+                f"{label} entries are not sorted unique identity paths")
+        previous = origin
+        seen_local.add(local)
+        require(origin not in forbidden_paths and local not in forbidden_paths,
+                f"{label} maps a SourceV5 application ELF path")
+
+
+def _closed_recorded_pressure_source_preflight_v1(
+    source_root: Path, capacity_bundle_value: object,
+    calibration_pin_value: object, context_policy_pin_value: object,
+    observed_host_pin_value: object, host_receipt_pin_value: object,
+    evidence_path_map: object, probe_capture_pins: object,
+) -> dict[str, Any]:
+    """Check pinned Source metadata and reject mapped ELFs before map classification."""
+    bundle = exact(capacity_bundle_value, {
+        "schema", "capacity_key", "source_manifest", "request", "artifact", "receipt",
+    }, "closed-recorded pressure capacity bundle")
+    require(bundle["schema"] == CAPACITY_BUNDLE_PIN_SCHEMA_V2,
+            "closed-recorded pressure capacity bundle schema differs")
+    capacity_key = _capacity_key_v2(bundle["capacity_key"])
+    source_pin = _raw_pin(bundle["source_manifest"],
+                          "closed-recorded pressure SourceV5 manifest")
+    root_text = str(source_root)
+    require(not (source_pin["path"] == root_text or
+                 source_pin["path"].startswith(root_text.rstrip("/") + "/")),
+            "closed-recorded SourceV5 manifest pin must be outside SourceRoot")
+    source_manifest, _, source_raw_sha = read_canonical(
+        Path(source_pin["path"]), "closed-recorded pinned SourceV5 manifest",
+        MAX_SOURCE_BYTES,
+    )
+    require(source_raw_sha == source_pin["raw_sha256"],
+            "closed-recorded SourceV5 manifest raw pin differs")
+    forbidden = _source5_application_artifact_paths_v1(
+        source_root, source_manifest,
+    )
+    source_identity = exact(source_manifest.get("source"), {
+        "git_commit", "source_tree_sha256", "cargo_lock_sha256", "files",
+    }, "closed-recorded SourceV5 identity")
+    require(type(source_identity["files"]) is list and
+            len(source_identity["files"]) <= 16_384,
+            "closed-recorded SourceV5 inventory exceeds its finite bound")
+    for index, entry in enumerate(source_identity["files"]):
+        require(type(entry) is dict and type(entry.get("path")) is str,
+                f"closed-recorded SourceV5 inventory[{index}] is malformed")
+        relative = PurePosixPath(entry["path"])
+        require(not relative.is_absolute() and relative.parts and
+                ".." not in relative.parts and relative.as_posix() == entry["path"] and
+                "\\" not in entry["path"],
+                "closed-recorded SourceV5 inventory path is not portable")
+        require(str(source_root.joinpath(*relative.parts)) not in forbidden,
+                "closed-recorded SourceV5 inventory aliases an application ELF")
+    source_stack = _source5_stack(
+        source_pin, str(source_root), verify_git_commit=False,
+    )
+    require(source_stack["source_raw_sha256"] == source_raw_sha and
+            source_stack["source"] == source_manifest,
+            "closed-recorded SourceV5 stack differs from its preflighted raw manifest")
+    capture_rows = probe_capture_pins
+    require(type(capture_rows) is list and len(capture_rows) == 2,
+            "closed-recorded pressure replay requires exactly two capture rows")
+    first_row = exact(capture_rows[0], {
+        "descriptor", "request_pin", "probe_capture_pin",
+    }, "closed-recorded pressure first capture row")
+    first_descriptor = exact(first_row["descriptor"], {
+        "pair", "executor", "allocator",
+    }, "closed-recorded pressure first member descriptor")
+    allocator = text(first_descriptor["allocator"],
+                     "closed-recorded pressure selected allocator", 64)
+    require(allocator in SOURCE5_APPLICATION_ALLOCATOR_LABELS,
+            "closed-recorded pressure selected allocator is unsupported")
+    artifact = source_stack["source"]["artifacts"][allocator]
+    early_identity = {
+        "host_id": capacity_key["host_id"],
+        "workload": capacity_key["workload"],
+        "profile": capacity_key["profile"],
+        "allocator": allocator,
+        "source_sha256": source_stack["source_tree_sha256"],
+        "binary_sha256": artifact["sha256"],
+    }
+    try:
+        source_stack["feedback_reader"]._verify_source_manifest_v5(
+            source_stack["source"], {
+                "schema": source_stack["feedback_reader"].EXPECTATION_SCHEMA_V5,
+                "mode": "pressure_validation", "identity": early_identity,
+            },
+        )
+    except Exception as error:
+        raise ReadbackError(
+            f"closed-recorded SourceV5 metadata verifier rejected its manifest: {error}",
+        ) from error
+
+    calibration_pin = _raw_pin(calibration_pin_value,
+                               "closed-recorded pressure calibration")
+    context_policy_pin = _raw_pin(context_policy_pin_value,
+                                  "closed-recorded context-policy bundle")
+    observed_pin = _raw_pin(observed_host_pin_value,
+                            "closed-recorded observed-host pin")
+    receipt_pin = _scope_receipt_pin_v2(
+        host_receipt_pin_value, "closed-recorded strict scope receipt",
+    )
+    role_pins = [
+        source_pin, calibration_pin, context_policy_pin, observed_pin,
+        receipt_pin, *(_raw_pin(bundle[name], f"closed-recorded capacity {name}")
+                       for name in ("request", "artifact", "receipt")),
+    ]
+    for index, row_value in enumerate(capture_rows):
+        row = exact(row_value, {"descriptor", "request_pin", "probe_capture_pin"},
+                    f"closed-recorded pressure capture row[{index}]")
+        request_pin = _raw_pin(row["request_pin"],
+                               f"closed-recorded pressure request[{index}]")
+        capture_pin = exact(row["probe_capture_pin"], {
+            "path", "raw_sha256", "receipt_sha256",
+        }, f"closed-recorded pressure capture pin[{index}]")
+        role_pins.extend((request_pin, {
+            "path": str(absolute_path(capture_pin["path"],
+                                      f"closed-recorded capture path[{index}]")),
+            "raw_sha256": sha256(capture_pin["raw_sha256"],
+                                 f"closed-recorded capture raw SHA[{index}]"),
+        }))
+        sha256(capture_pin["receipt_sha256"],
+               f"closed-recorded capture receipt SHA[{index}]")
+    for pin in role_pins:
+        require(pin["path"] not in forbidden,
+                "closed-recorded pressure pin aliases a SourceV5 application ELF")
+
+    calibration_value, _, calibration_raw_sha = read_canonical(
+        Path(calibration_pin["path"]), "closed-recorded pressure calibration",
+        64 * 1024 * 1024,
+    )
+    require(calibration_raw_sha == calibration_pin["raw_sha256"],
+            "closed-recorded pressure calibration raw pin differs")
+    scope = calibration_value.get("scope")
+    require(type(scope) is dict,
+            "closed-recorded pressure calibration has no scope metadata")
+    scope_source_pin = _raw_pin(scope.get("source_manifest"),
+                                "closed-recorded calibration SourceV5 pin")
+    require(scope_source_pin == source_pin and
+            scope.get("source_root") == root_text,
+            "closed-recorded calibration SourceV5 identity differs from its pinned capacity bundle")
+    _reject_closed_recorded_artifact_paths_in_map_v1(
+        evidence_path_map, forbidden,
+        "closed-recorded pressure evidence path map",
+    )
+    return source_stack
 
 
 def _capacity_key_v2(value: object, label: str = "pressure capacity key") -> dict[str, str]:
@@ -1649,6 +2119,8 @@ def _source5_capacity_floor_policy_id(source_stack: dict[str, Any]) -> str | Non
 def _verify_context_policy_bundle_v2(
     source_stack: dict[str, Any], context_policy_pin_value: object,
     capacity: dict[str, Any], expected_source_pin: dict[str, Any],
+    *, closed_recorded: bool = False, probe_capture_pins: object = None,
+    evidence_path_map: object = None,
 ) -> dict[str, Any]:
     context_pin, context_bundle, context_bundle_raw, context_bundle_sha = _read_raw_pin(
         context_policy_pin_value, "context-policy bundle", MAX_CONTEXT_POLICY_BUNDLE_BYTES,
@@ -1690,6 +2162,13 @@ def _verify_context_policy_bundle_v2(
     text(policy["resolution_rule_version"], "SourceV5 capacity resolution rule version", 128)
     members = context_bundle["members"]
     require(type(members) is list and len(members) == 2, "context-policy bundle must pin exactly two original pressure members")
+    if closed_recorded:
+        require(type(probe_capture_pins) is list and len(probe_capture_pins) == 2 and
+                evidence_path_map is not None,
+                "closed-recorded context-policy replay requires exactly two pinned captures")
+    else:
+        require(probe_capture_pins is None,
+                "ordinary context-policy replay cannot accept closed-recorded captures")
     replayed_members = []
     for index, item in enumerate(members):
         member = exact(item, {"descriptor", "request", "construction_probe", "resolved_policy", "composition_receipt"}, f"context-policy member[{index}]")
@@ -1700,6 +2179,39 @@ def _verify_context_policy_bundle_v2(
         require(executor in ("bounded", "tokio") and allocator in ("allocatbelt", "mimalloc-secure", "mimalloc-standard", "system"), f"context-policy member[{index}] role is unsupported")
         request_pin, request, request_raw, request_sha = _read_raw_pin(member["request"], f"context-policy member[{index}] composer request", 1 * 1024 * 1024)
         _require_absolute_evidence_paths_mapped(request)
+        closed_capture_pin = None
+        if closed_recorded:
+            capture_row = exact(probe_capture_pins[index], {
+                "descriptor", "request_pin", "probe_capture_pin",
+            }, f"closed-recorded context-policy member[{index}] capture index")
+            indexed_descriptor = exact(capture_row["descriptor"], {
+                "pair", "executor", "allocator",
+            }, f"closed-recorded context-policy member[{index}] descriptor")
+            indexed_request = _raw_pin(
+                capture_row["request_pin"],
+                f"closed-recorded context-policy member[{index}] request pin",
+            )
+            require(indexed_descriptor == descriptor and
+                    indexed_request == request_pin,
+                    f"closed-recorded capture index member[{index}] differs from the actual context bundle")
+            closed_capture_pin = exact(capture_row["probe_capture_pin"], {
+                "path", "raw_sha256", "receipt_sha256",
+            }, f"closed-recorded context-policy member[{index}] capture pin")
+            closed_capture_pin = {
+                "path": str(absolute_path(
+                    closed_capture_pin["path"],
+                    f"closed-recorded context-policy member[{index}] capture path",
+                )),
+                "raw_sha256": sha256(
+                    closed_capture_pin["raw_sha256"],
+                    f"closed-recorded context-policy member[{index}] capture raw SHA-256",
+                ),
+                "receipt_sha256": sha256(
+                    closed_capture_pin["receipt_sha256"],
+                    f"closed-recorded context-policy member[{index}] capture receipt digest",
+                ),
+            }
+            _require_evidence_path_mapped(closed_capture_pin["path"])
         probe_pin = exact(member["construction_probe"], {"path", "raw_sha256", "allocator", "binary_sha256"}, f"context-policy member[{index}] construction probe")
         probe_pin = {
             "path": str(absolute_path(probe_pin["path"], f"context-policy member[{index}] construction probe path")),
@@ -1744,7 +2256,114 @@ def _verify_context_policy_bundle_v2(
         request_capacity = exact(request.get("capacity_bundle"), {"request", "artifact", "receipt"}, f"context-policy member[{index}] composer capacity bundle")
         require(request_capacity == expected_capacity, f"context-policy member[{index}] composer request uses different prepared capacity bytes")
         try:
-            resolved_replayed, receipt_replayed = source_stack["composer"].compose_calibrated_policy_v5(request, request_sha)
+            if closed_recorded:
+                require(closed_capture_pin is not None,
+                        "closed-recorded composer capture pin is unavailable")
+                selected_artifact = exact(
+                    source_stack["source"]["artifacts"].get(allocator),
+                    {"path", "sha256"},
+                    f"closed-recorded member[{index}] selected SourceV5 artifact",
+                )
+                relative_artifact = PurePosixPath(text(
+                    selected_artifact["path"],
+                    f"closed-recorded member[{index}] selected artifact path", 4096,
+                ))
+                require(not relative_artifact.is_absolute() and relative_artifact.parts and
+                        ".." not in relative_artifact.parts and
+                        relative_artifact.as_posix() == selected_artifact["path"] and
+                        "\\" not in selected_artifact["path"],
+                        "closed-recorded selected SourceV5 artifact path is not portable")
+                selected_binary_path = str(
+                    source_stack["source_root"].joinpath(*relative_artifact.parts)
+                )
+                require(probe_pin["binary_sha256"] == sha256(
+                            selected_artifact["sha256"],
+                            f"closed-recorded member[{index}] artifact SHA-256",
+                        ),
+                        "closed-recorded construction probe differs from its SourceV5 artifact SHA")
+                capture_raw, capture_raw_sha = read_stable(
+                    Path(closed_capture_pin["path"]),
+                    f"closed-recorded member[{index}] strict ProbeV2 capture",
+                    source_stack["feedback_reader"].MAX_PROBE_CAPTURE_RECEIPT_BYTES,
+                )
+                require(capture_raw_sha == closed_capture_pin["raw_sha256"],
+                        "closed-recorded ProbeV2 capture raw digest differs")
+                capture = source_stack["feedback_reader"].validate_probe_capture_receipt_envelope(
+                    capture_raw, closed_capture_pin["raw_sha256"],
+                    closed_capture_pin["receipt_sha256"],
+                )
+                expected_binary = {
+                    "path": selected_binary_path,
+                    "raw_sha256": selected_artifact["sha256"],
+                }
+                require(capture["probe_pin"] == probe_pin and
+                        capture["binary"] == expected_binary and
+                        capture["probe_argv"][0] == selected_binary_path,
+                        "closed-recorded capture differs from its SourceV5 probe/artifact identity")
+                owner_pin = exact(capture["owner_result_pin"], {
+                    "path", "raw_sha256", "owner_result_sha256",
+                }, f"closed-recorded member[{index}] owner-result pin")
+                owner_result, _owner_raw, _owner_sha = read_canonical(
+                    Path(owner_pin["path"]),
+                    f"closed-recorded member[{index}] direct owner result",
+                    source_stack["feedback_reader"].MAX_PROBE_OWNER_RESULT_BYTES,
+                )
+                direct = exact(owner_result.get("direct"),
+                               source_stack["feedback_reader"].DIRECT_CAPTURE_FIELDS,
+                               f"closed-recorded member[{index}] direct launch facts")
+                binary_size = uint(
+                    direct["binary_size"],
+                    f"closed-recorded member[{index}] executable byte size",
+                    positive=True,
+                    maximum=source_stack["feedback_reader"].MAX_APP_BINARY_BYTES,
+                )
+                require(direct["binary_path"] == selected_binary_path and
+                        direct["binary_sha256"] == selected_artifact["sha256"] and
+                        direct["requested_argv"] == capture["probe_argv"] and
+                        binary_size > 0,
+                        "closed-recorded owner facts differ from the exact SourceV5 artifact/argv")
+                inventory_pin = exact(capture["tmpdir_inventory_pin"], {
+                    "path", "raw_sha256", "inventory_sha256",
+                }, f"closed-recorded member[{index}] TMPDIR inventory pin")
+                owner_result_pin = exact(capture["owner_result_pin"], {
+                    "path", "raw_sha256", "owner_result_sha256",
+                }, f"closed-recorded member[{index}] owner-result pin")
+                stdout_pin = exact(capture["stdout"], {"path", "raw_sha256"},
+                                   f"closed-recorded member[{index}] stdout pin")
+                stderr_pin = exact(capture["stderr"], {"path", "raw_sha256"},
+                                   f"closed-recorded member[{index}] stderr pin")
+                inventory_value, _inventory_raw, _inventory_sha = read_canonical(
+                    Path(inventory_pin["path"]),
+                    f"closed-recorded member[{index}] TMPDIR inventory",
+                    source_stack["feedback_reader"].MAX_PROBE_TMPDIR_INVENTORY_BYTES,
+                )
+                capture_mountpoints = _closed_probe_capture_mountpoints_v1(capture)
+                capture_mountpoints.add(str(Path(closed_capture_pin["path"]).parent))
+                replay_context = _closed_recorded_feedback_context_v1(
+                    source_stack, evidence_path_map, source_stack["source_root"],
+                    [source_stack["source"], capacity["request"], capacity["context"],
+                     capacity["capacity_receipt"], context_bundle, policy, request,
+                     construction_probe, resolved_policy, composition_receipt,
+                     capture, owner_result, inventory_value],
+                    {
+                        source_stack["source_pin"]["path"],
+                        *(pin["path"] for pin in capacity["pins"].values()),
+                        context_pin["path"], policy_pin["path"], request_pin["path"],
+                        probe_pin["path"], resolved_pin["path"], composition_pin["path"],
+                        closed_capture_pin["path"], owner_result_pin["path"],
+                        inventory_pin["path"], stdout_pin["path"], stderr_pin["path"],
+                    },
+                    closed_capture_pin,
+                    {name: dict(capacity["pins"][name])
+                     for name in ("request", "artifact", "receipt")},
+                    selected_binary_path,
+                    capture_mountpoints,
+                )
+                resolved_replayed, receipt_replayed = source_stack["composer"].compose_calibrated_policy_v5_closed_recorded_v1(
+                    request, request_sha, replay_context=replay_context,
+                )
+            else:
+                resolved_replayed, receipt_replayed = source_stack["composer"].compose_calibrated_policy_v5(request, request_sha)
         except Exception as error:
             raise ReadbackError(f"pinned SourceV5 composer replay failed for member[{index}]: {type(error).__name__}: {error}") from error
         require(canonical_bytes(resolved_replayed) == resolved_raw and canonical_bytes(receipt_replayed) == composition_raw, f"context-policy member[{index}] resolved policy/receipt differs from full SourceV5 composer replay")
@@ -1801,7 +2420,7 @@ def build_context_policy_bundle_v2(
     source_root = absolute_path(source_root_value,
                                 "initial context-policy SourceV5 root")
     source_stack = _source5_stack(
-        source_pin, source_root, verify_git_commit=False,
+        source_pin, str(source_root), verify_git_commit=False,
     )
     observed_pin, observed = _verify_observed_host_pin_v2(
         observed_host_pin_value,
@@ -2412,6 +3031,9 @@ def _replay_calibration_scope_v2(
     calibration_pin: object, context_policy_pin: object,
     capacity_bundle_pins: object, observed_host_pin: object, *, require_local_host: bool,
     expected_source_root: Path | None = None,
+    closed_recorded: bool = False, probe_capture_pins: object = None,
+    evidence_path_map: object = None,
+    preloaded_source_stack: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Replay one v2 calibration; strict mode additionally checks its live host."""
     calibration_file_pin = _raw_pin(calibration_pin, "context calibration artifact")
@@ -2425,15 +3047,25 @@ def _replay_calibration_scope_v2(
         expected_source_root is None or scope["source_root"] == str(expected_source_root),
         "offline SourceV5 source root differs from the original calibration bytes",
     )
+    require((not closed_recorded and probe_capture_pins is None) or
+            (closed_recorded and type(probe_capture_pins) is list and
+             len(probe_capture_pins) == 2 and evidence_path_map is not None),
+            "closed-recorded pressure replay selector is incomplete or unexpected")
     capacity_pins = exact(capacity_bundle_pins, {
         "schema", "capacity_key", "source_manifest", "request", "artifact", "receipt",
     }, "context calibration capacity bundle input")
     require(capacity_pins == scope["capacity_bundle_pins"], "context calibration capacity bundle differs from its independently supplied pin")
     _preflight_scope_replay_paths_v2(scope, context_policy_pin, capacity_pins, observed_host_pin)
-    source_stack = _source5_stack(
-        scope["source_manifest"], scope["source_root"],
-        verify_git_commit=require_local_host,
-    )
+    if preloaded_source_stack is None:
+        source_stack = _source5_stack(
+            scope["source_manifest"], scope["source_root"],
+            verify_git_commit=require_local_host,
+        )
+    else:
+        source_stack = preloaded_source_stack
+        require(source_stack["source_pin"] == scope["source_manifest"] and
+                str(source_stack["source_root"]) == scope["source_root"],
+                "preflighted closed-recorded SourceV5 identity differs from calibration scope")
     require(
         source_stack["source_raw_sha256"] == scope["source_manifest"]["raw_sha256"]
         and source_stack["source_semantic_sha256"] == scope["source_manifest_semantic_sha256"]
@@ -2449,6 +3081,9 @@ def _replay_calibration_scope_v2(
     require(capacity["capacity_tsv_raw_sha256"] == calibration["raw_inputs"]["application_capacity_calibration_sha256"], "prepared capacity TSV differs from the exact calibration input bytes")
     calibration_policy = _verify_context_policy_bundle_v2(
         source_stack, scope["context_policy_bundle"], capacity, scope["source_manifest"],
+        closed_recorded=closed_recorded,
+        probe_capture_pins=probe_capture_pins,
+        evidence_path_map=evidence_path_map,
     )
     require(
         calibration_policy["numeric_context_policy_sha256"] == scope["context_policy_sha256"]
@@ -2456,7 +3091,12 @@ def _replay_calibration_scope_v2(
         and calibration_policy["policy_raw_sha256"] == calibration["raw_inputs"]["policy_artifact_raw_sha256"],
         "calibration context-policy bundle differs from its independently pinned raw inputs",
     )
-    policy_replay = _verify_context_policy_bundle_v2(source_stack, context_policy_pin, capacity, scope["source_manifest"])
+    policy_replay = _verify_context_policy_bundle_v2(
+        source_stack, context_policy_pin, capacity, scope["source_manifest"],
+        closed_recorded=closed_recorded,
+        probe_capture_pins=probe_capture_pins,
+        evidence_path_map=evidence_path_map,
+    )
     require(
         policy_replay["numeric_context_policy_sha256"] == calibration_policy["numeric_context_policy_sha256"],
         "current per-job context-policy projection differs from the calibrated numeric policy",
@@ -2531,13 +3171,65 @@ def verify_calibration_scope_v2_offline(
     path. Non-identity translations are rejected instead of changing a
     producer/composer input or normalizing a changed canonical receipt.
     """
+    return _verify_calibration_scope_v2_offline_impl(
+        calibration_pin, context_policy_pin, capacity_bundle_pins, observed_host_pin,
+        source_root=source_root, evidence_path_map=evidence_path_map,
+        host_verification_pin=host_verification_pin,
+        closed_recorded=False, probe_capture_pins=None,
+    )
+
+
+def verify_calibration_scope_v2_closed_recorded_v1(
+    calibration_pin: object, context_policy_pin: object,
+    capacity_bundle_pins: object, observed_host_pin: object, *,
+    source_root: object, evidence_path_map: object, host_verification_pin: object,
+    probe_capture_pins: object,
+) -> dict[str, Any]:
+    """Replay a strict scope receipt using the exact two captured ProbeV2 owners."""
+    require(type(probe_capture_pins) is list and len(probe_capture_pins) == 2,
+            "closed-recorded pressure replay requires exactly two capture-index members")
+    for index, value in enumerate(probe_capture_pins):
+        row = exact(value, {"descriptor", "request_pin", "probe_capture_pin"},
+                    f"closed-recorded pressure capture index[{index}]")
+        exact(row["descriptor"], {"pair", "executor", "allocator"},
+              f"closed-recorded pressure capture descriptor[{index}]")
+        exact(row["request_pin"], {"path", "raw_sha256"},
+              f"closed-recorded pressure request pin[{index}]")
+        exact(row["probe_capture_pin"], {
+            "path", "raw_sha256", "receipt_sha256",
+        }, f"closed-recorded pressure capture pin[{index}]")
+    return _verify_calibration_scope_v2_offline_impl(
+        calibration_pin, context_policy_pin, capacity_bundle_pins, observed_host_pin,
+        source_root=source_root, evidence_path_map=evidence_path_map,
+        host_verification_pin=host_verification_pin,
+        closed_recorded=True, probe_capture_pins=probe_capture_pins,
+    )
+
+
+def _verify_calibration_scope_v2_offline_impl(
+    calibration_pin: object, context_policy_pin: object,
+    capacity_bundle_pins: object, observed_host_pin: object, *,
+    source_root: object, evidence_path_map: object, host_verification_pin: object,
+    closed_recorded: bool, probe_capture_pins: object,
+) -> dict[str, Any]:
     source_root_path = absolute_path(source_root, "offline SourceV5 source root")
+    preloaded_source_stack = None
+    if closed_recorded:
+        preloaded_source_stack = _closed_recorded_pressure_source_preflight_v1(
+            source_root_path, capacity_bundle_pins, calibration_pin,
+            context_policy_pin, observed_host_pin, host_verification_pin,
+            evidence_path_map, probe_capture_pins,
+        )
     mapping, directories = _normalize_evidence_path_map(evidence_path_map, str(source_root_path))
     token = _EVIDENCE_PATH_MAP_CONTEXT.set((mapping, directories))
     try:
         result = _replay_calibration_scope_v2(
             calibration_pin, context_policy_pin, capacity_bundle_pins, observed_host_pin,
             require_local_host=False, expected_source_root=source_root_path,
+            closed_recorded=closed_recorded,
+            probe_capture_pins=probe_capture_pins,
+            evidence_path_map=evidence_path_map,
+            preloaded_source_stack=preloaded_source_stack,
         )
         stored_pin = _scope_receipt_pin_v2(host_verification_pin, "strict host verification receipt")
         require(stored_pin["scope_sha256"] == result["scope_sha256"], "host verification receipt pin names a different calibration scope")

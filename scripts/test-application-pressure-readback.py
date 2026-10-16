@@ -10,8 +10,10 @@ import builtins
 import contextlib
 import json
 import io
+import os
 import stat
 import sys
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -41,6 +43,8 @@ feedback_reader = _load_module("pressure_feedback_readback_floor_test_target", F
 SCOPE_FIXTURE_SCHEMA = "allocatbelt.application-pressure-calibration-v2-native-fixture.v1"
 PRESSURE_OFFLINE_FIXTURE_SCHEMA = "allocatbelt.application-pressure-offline-fixture.v1"
 SOAK_PRESSURE_OFFLINE_FIXTURE_SCHEMA = "allocatbelt.application-source5-soak-pressure-offline-fixture.v1"
+CLOSED_RECORDED_SCOPE_FIXTURE_SCHEMA = \
+    "allocatbelt.application-pressure-closed-recorded-scope-fixture.v1"
 SCOPE_FIXTURE_EXPECTED_KEYS = {
     "host_id", "condition_id", "pressure_calibration_id", "capacity_key",
     "calibration_raw_sha256", "calibration_sha256", "scope_sha256",
@@ -478,7 +482,552 @@ def run_genuine_scope_fixture(path: Path) -> dict[str, Any]:
     return result
 
 
+def run_genuine_closed_recorded_scope_fixture(
+    path: Path, expected_request_raw_sha256: str,
+) -> dict[str, Any]:
+    """Replay actual capture.v2 output while forbidding peer-ELF access and Popen."""
+    fixture, _, fixture_sha = readback.read_canonical(
+        path, "closed-recorded pressure fixture", 4 * 1024 * 1024,
+    )
+    if fixture_sha != expected_request_raw_sha256:
+        raise readback.ReadbackError("closed-recorded pressure fixture raw pin differs")
+    fixture = readback.exact(fixture, {
+        "schema", "source_root", "evidence_path_map", "calibration_pin",
+        "context_policy_pin", "capacity_bundle_pins", "observed_host_pin",
+        "host_verification_pin", "probe_capture_pins", "expected",
+    }, "closed-recorded pressure fixture")
+    if fixture["schema"] != CLOSED_RECORDED_SCOPE_FIXTURE_SCHEMA:
+        raise readback.ReadbackError("unsupported closed-recorded pressure fixture schema")
+    expected = readback.exact(fixture["expected"], {
+        "host_id", "condition_id", "pressure_calibration_id", "capacity_key",
+        "calibration_raw_sha256", "scope_sha256", "receipt_sha256",
+        "context_policy_bundle_raw_sha256", "context_policy_artifact_raw_sha256",
+        "context_policy_sha256", "capacity_bundle_pins_sha256",
+        "capacity_tsv_raw_sha256", "sample_count", "members",
+    }, "closed-recorded pressure expected replay")
+    source_root = readback.absolute_path(fixture["source_root"],
+                                         "closed-recorded fixture SourceV5 root")
+    calibration_pin = readback._raw_pin(fixture["calibration_pin"],
+                                         "closed-recorded fixture calibration")
+    context_policy_pin = readback._raw_pin(fixture["context_policy_pin"],
+                                            "closed-recorded fixture context bundle")
+    observed_host_pin = readback._raw_pin(fixture["observed_host_pin"],
+                                           "closed-recorded fixture observed host")
+    capacity_bundle = readback.exact(fixture["capacity_bundle_pins"], {
+        "schema", "capacity_key", "source_manifest", "request", "artifact", "receipt",
+    }, "closed-recorded fixture capacity bundle")
+    source_pin = readback._raw_pin(capacity_bundle["source_manifest"],
+                                    "closed-recorded fixture SourceV5 pin")
+    source_manifest, _, source_sha = readback.read_canonical(
+        Path(source_pin["path"]), "closed-recorded fixture SourceV5 manifest",
+        readback.MAX_SOURCE_BYTES,
+    )
+    if source_sha != source_pin["raw_sha256"]:
+        raise readback.ReadbackError("closed-recorded fixture SourceV5 manifest pin differs")
+    capture_rows = fixture["probe_capture_pins"]
+    if type(capture_rows) is not list or len(capture_rows) != 2:
+        raise readback.ReadbackError("closed-recorded fixture omits its exact two capture rows")
+
+    artifact_paths: set[str] = set()
+    artifact_sha_by_path: dict[str, str] = {}
+    for index, value in enumerate(capture_rows):
+        row = readback.exact(value, {
+            "descriptor", "request_pin", "probe_capture_pin",
+        }, f"closed-recorded fixture member[{index}]")
+        descriptor = readback.exact(row["descriptor"], {
+            "pair", "executor", "allocator",
+        }, f"closed-recorded fixture descriptor[{index}]")
+        artifact = readback.exact(
+            source_manifest.get("artifacts", {}).get(descriptor["allocator"]),
+            {"path", "sha256"},
+            f"closed-recorded fixture SourceV5 artifact[{index}]",
+        )
+        relative = Path(artifact["path"])
+        if relative.is_absolute() or ".." in relative.parts or relative.as_posix() != artifact["path"]:
+            raise readback.ReadbackError("closed-recorded fixture SourceV5 artifact path is not portable")
+        artifact_path = str(source_root.joinpath(*relative.parts))
+        artifact_paths.add(artifact_path)
+        artifact_sha_by_path[artifact_path] = artifact["sha256"]
+    mapped_origins = {
+        entry["origin"]
+        for entry in readback.exact(fixture["evidence_path_map"], {
+            "schema", "entries",
+        }, "closed-recorded fixture evidence map")["entries"]
+        if type(entry) is dict and type(entry.get("origin")) is str
+    }
+    if mapped_origins.intersection(artifact_paths):
+        raise readback.ReadbackError("closed-recorded fixture path map includes a peer SourceV5 ELF")
+
+    peer_elf_state: dict[str, str] = {}
+    for artifact_path in sorted(artifact_paths):
+        candidate = Path(artifact_path)
+        try:
+            info = candidate.lstat()
+        except FileNotFoundError:
+            peer_elf_state[artifact_path] = "absent"
+            continue
+        if not stat.S_ISREG(info.st_mode):
+            raise readback.ReadbackError("closed-recorded fixture peer artifact is neither absent nor a regular decoy")
+        actual_sha, _size, _mode = feedback_reader._stable_file_sha256(
+            candidate, "closed-recorded fixture peer artifact precondition",
+            feedback_reader.MAX_APP_BINARY_BYTES,
+        )
+        if actual_sha == artifact_sha_by_path[artifact_path]:
+            raise readback.ReadbackError("closed-recorded fixture still contains the original peer ELF")
+        peer_elf_state[artifact_path] = "decoy"
+
+    receipt_pin = readback._scope_receipt_pin_v2(
+        fixture["host_verification_pin"],
+        "closed-recorded fixture strict scope receipt",
+    )
+    context_bundle, _, bundle_sha = readback.read_canonical(
+        Path(context_policy_pin["path"]),
+        "closed-recorded fixture context-policy bundle", 8 * 1024 * 1024,
+    )
+    if bundle_sha != context_policy_pin["raw_sha256"]:
+        raise readback.ReadbackError("closed-recorded fixture context bundle pin differs")
+    members = readback.exact(context_bundle, {
+        "schema", "artifact", "members",
+    }, "closed-recorded fixture context bundle")["members"]
+    if type(members) is not list or len(members) != 2:
+        raise readback.ReadbackError("closed-recorded fixture context bundle is not two-member")
+    member_expected = []
+    for index, (bundle_member_value, capture_row_value) in enumerate(zip(members, capture_rows)):
+        member = readback.exact(bundle_member_value, {
+            "descriptor", "request", "construction_probe", "resolved_policy",
+            "composition_receipt",
+        }, f"closed-recorded fixture bundle member[{index}]")
+        capture_row = readback.exact(capture_row_value, {
+            "descriptor", "request_pin", "probe_capture_pin",
+        }, f"closed-recorded fixture capture row[{index}]")
+        request_pin = readback._raw_pin(member["request"],
+                                         f"closed-recorded fixture request[{index}]")
+        indexed_request = readback._raw_pin(capture_row["request_pin"],
+                                             f"closed-recorded fixture indexed request[{index}]")
+        if member["descriptor"] != capture_row["descriptor"] or request_pin != indexed_request:
+            raise readback.ReadbackError("closed-recorded fixture capture row differs from its context bundle order")
+        resolved_pin = readback._raw_pin(member["resolved_policy"],
+                                          f"closed-recorded fixture resolved policy[{index}]")
+        composition_pin = readback._raw_pin(member["composition_receipt"],
+                                              f"closed-recorded fixture composition receipt[{index}]")
+        resolved_raw, resolved_sha = readback.read_stable(
+            Path(resolved_pin["path"]), "closed-recorded fixture resolved policy",
+            readback.MAX_POLICY_BYTES,
+        )
+        composition_raw, composition_sha = readback.read_stable(
+            Path(composition_pin["path"]), "closed-recorded fixture composition receipt",
+            readback.MAX_CONTEXT_POLICY_BUNDLE_BYTES,
+        )
+        if resolved_sha != resolved_pin["raw_sha256"] or composition_sha != composition_pin["raw_sha256"]:
+            raise readback.ReadbackError("closed-recorded fixture policy outputs differ from their pins")
+        member_expected.append({
+            "descriptor": member["descriptor"],
+            "resolved_policy_raw_sha256": resolved_sha,
+            "composition_receipt_raw_sha256": composition_sha,
+        })
+    if expected["members"] != member_expected:
+        raise readback.ReadbackError("closed-recorded fixture member outputs differ from the origin pins")
+
+    real_path_methods = {
+        "stat": Path.stat,
+        "lstat": Path.lstat,
+        "resolve": Path.resolve,
+        "open": Path.open,
+    }
+
+    def deny_elf_path(
+        value: object, label: str, dir_fd: int | None = None,
+    ) -> None:
+        try:
+            rendered = os.fsdecode(os.fspath(value))
+        except (TypeError, ValueError):
+            return
+        candidates = {rendered}
+        if dir_fd is not None and not os.path.isabs(rendered):
+            try:
+                base = os.fsdecode(os.readlink(f"/proc/self/fd/{dir_fd}"))
+            except OSError:
+                base = ""
+            if base:
+                candidates.add(os.path.normpath(os.path.join(base, rendered)))
+        if candidates.intersection(artifact_paths):
+            raise AssertionError(f"closed-recorded replay attempted peer ELF {label}")
+
+    def guarded_path_method(label: str):
+        original = real_path_methods[label]
+
+        def guarded(path_value: Path, *args: Any, **kwargs: Any) -> Any:
+            deny_elf_path(path_value, label)
+            return original(path_value, *args, **kwargs)
+        return guarded
+
+    real_builtins_open = builtins.open
+    real_io_open = io.open
+    real_os_open = os.open
+    real_os_stat = os.stat
+    real_os_lstat = os.lstat
+    real_os_readlink = os.readlink
+
+    def guarded_open(file: object, *args: Any, **kwargs: Any) -> Any:
+        deny_elf_path(file, "open")
+        return real_builtins_open(file, *args, **kwargs)
+
+    def guarded_io_open(file: object, *args: Any, **kwargs: Any) -> Any:
+        deny_elf_path(file, "open")
+        return real_io_open(file, *args, **kwargs)
+
+    def guarded_os_open(file: object, *args: Any, **kwargs: Any) -> Any:
+        deny_elf_path(file, "open", kwargs.get("dir_fd"))
+        return real_os_open(file, *args, **kwargs)
+
+    def guarded_os_stat(file: object, *args: Any, **kwargs: Any) -> Any:
+        deny_elf_path(file, "stat", kwargs.get("dir_fd"))
+        return real_os_stat(file, *args, **kwargs)
+
+    def guarded_os_lstat(file: object, *args: Any, **kwargs: Any) -> Any:
+        deny_elf_path(file, "lstat", kwargs.get("dir_fd"))
+        return real_os_lstat(file, *args, **kwargs)
+
+    def guarded_os_readlink(file: object, *args: Any, **kwargs: Any) -> Any:
+        deny_elf_path(file, "readlink", kwargs.get("dir_fd"))
+        return real_os_readlink(file, *args, **kwargs)
+
+    with patch.object(Path, "stat", new=guarded_path_method("stat")), \
+            patch.object(Path, "lstat", new=guarded_path_method("lstat")), \
+            patch.object(Path, "resolve", new=guarded_path_method("resolve")), \
+            patch.object(Path, "open", new=guarded_path_method("open")), \
+            patch.object(builtins, "open", new=guarded_open), \
+            patch.object(io, "open", new=guarded_io_open), \
+            patch.object(os, "open", new=guarded_os_open), \
+            patch.object(os, "stat", new=guarded_os_stat), \
+            patch.object(os, "lstat", new=guarded_os_lstat), \
+            patch.object(os, "readlink", new=guarded_os_readlink), \
+            patch.object(subprocess, "Popen",
+                         side_effect=AssertionError("closed-recorded replay attempted Popen")):
+        result = readback.verify_calibration_scope_v2_closed_recorded_v1(
+            calibration_pin, context_policy_pin, capacity_bundle, observed_host_pin,
+            source_root=str(source_root), evidence_path_map=fixture["evidence_path_map"],
+            host_verification_pin=receipt_pin,
+            probe_capture_pins=capture_rows,
+        )
+
+    projection = {
+        "host_id": result["capacity_key"]["host_id"],
+        "condition_id": result["condition_id"],
+        "pressure_calibration_id": result["pressure_calibration_id"],
+        "capacity_key": result["capacity_key"],
+        "calibration_raw_sha256": result["calibration_raw_sha256"],
+        "scope_sha256": result["scope_sha256"],
+        "receipt_sha256": result["receipt_sha256"],
+        "context_policy_bundle_raw_sha256": result["context_policy_bundle_raw_sha256"],
+        "context_policy_artifact_raw_sha256": result["context_policy_artifact_raw_sha256"],
+        "context_policy_sha256": result["context_policy_sha256"],
+        "capacity_bundle_pins_sha256": result["capacity_bundle_pins_sha256"],
+        "capacity_tsv_raw_sha256": result["capacity_tsv_raw_sha256"],
+        "sample_count": result["sample_count"],
+        "members": member_expected,
+    }
+    if projection != expected:
+        raise readback.ReadbackError("closed-recorded pressure replay differs from its pinned origin outputs")
+
+    try:
+        readback.verify_calibration_scope_v2_offline(
+            calibration_pin, context_policy_pin, capacity_bundle, observed_host_pin,
+            source_root=str(source_root), evidence_path_map=fixture["evidence_path_map"],
+            host_verification_pin=receipt_pin,
+        )
+    except readback.ReadbackError:
+        pass
+    else:
+        raise AssertionError("ordinary pressure replay accepted peer evidence without its historical ELF")
+    return {
+        "request_raw_sha256": fixture_sha,
+        "scope_sha256": result["scope_sha256"],
+        "receipt_sha256": result["receipt_sha256"],
+        "peer_elf_state": peer_elf_state,
+        "qualification_eligible": result["qualification_eligible"],
+    }
+
+
 class PressureReadbackV2Tests(unittest.TestCase):
+    def test_closed_recorded_pressure_api_requires_two_capture_members(self) -> None:
+        parameters = inspect.signature(
+            readback.verify_calibration_scope_v2_closed_recorded_v1,
+        ).parameters
+        self.assertEqual(tuple(parameters), (
+            "calibration_pin", "context_policy_pin", "capacity_bundle_pins",
+            "observed_host_pin", "source_root", "evidence_path_map",
+            "host_verification_pin", "probe_capture_pins",
+        ))
+        self.assertIs(parameters["probe_capture_pins"].default,
+                      inspect.Parameter.empty)
+
+    def test_closed_recorded_source_inventory_checks_literal_symlink_bytes(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="pressure-closed-symlink-") as temporary:
+            root = Path(temporary).resolve()
+            target = root / "LICENSE-MIT"
+            target.write_bytes(b"license bytes\n")
+            target.chmod(0o644)
+            link = root / "LICENSE"
+            link.symlink_to("LICENSE-MIT")
+            link_bytes = b"LICENSE-MIT"
+            records = [
+                {
+                    "path": "LICENSE", "kind": "symlink", "mode": "120000",
+                    "target": "LICENSE-MIT",
+                    "sha256": readback.sha256_bytes(link_bytes),
+                    "size": len(link_bytes),
+                },
+                {
+                    "path": "LICENSE-MIT", "kind": "file", "mode": "100644",
+                    "sha256": readback.sha256_bytes(b"license bytes\n"),
+                    "size": len(b"license bytes\n"),
+                },
+            ]
+            self.assertEqual(
+                readback._capture_closed_recorded_typed_inventory_v1(root, records),
+                records,
+            )
+            link.unlink()
+            link.symlink_to("changed-target")
+            with self.assertRaisesRegex(readback.ReadbackError, "symlink literal"):
+                readback._capture_closed_recorded_typed_inventory_v1(root, records)
+
+    def test_ordinary_offline_inventory_accepts_full_source_tree_and_rejects_link_mutations(self) -> None:
+        inventory_module = _load_module(
+            "pressure_ordinary_full_source_inventory_target",
+            SCRIPT_DIR / "application-source-inventory.py",
+        )
+        source_root = SCRIPT_DIR.parent.resolve()
+        complete = inventory_module.inventory(source_root, timeout_seconds=120.0)
+        records = complete["entries"]
+        license_link = next((
+            item for item in records
+            if item.get("path") == "crates/allocatbelt/LICENSE"
+        ))
+        self.assertEqual(license_link["kind"], "symlink")
+        self.assertEqual(license_link["target"], "../../LICENSE")
+        self.assertEqual(readback._capture_offline_typed_inventory(source_root, records),
+                         records)
+
+        wrong_literal = json.loads(json.dumps(records))
+        wrong = next(item for item in wrong_literal
+                     if item.get("path") == "crates/allocatbelt/LICENSE")
+        wrong["target"] = "../../../LICENSE"
+        with self.assertRaisesRegex(readback.ReadbackError, "symlink literal"):
+            readback._capture_offline_typed_inventory(source_root, wrong_literal)
+
+        escaping = json.loads(json.dumps(records))
+        escape = next(item for item in escaping
+                      if item.get("path") == "crates/allocatbelt/LICENSE")
+        escape_target = "../../../escape"
+        escape_raw = escape_target.encode("utf-8")
+        escape["target"] = escape_target
+        escape["size"] = len(escape_raw)
+        escape["sha256"] = readback.sha256_bytes(escape_raw)
+        with self.assertRaises(inventory_module.InventoryError):
+            inventory_module.validate_records({
+                "schema": readback.SOURCE5_INVENTORY_SCHEMA,
+                "entries": escaping,
+            })
+
+        wrong_mode = json.loads(json.dumps(records))
+        mode_link = next(item for item in wrong_mode
+                         if item.get("path") == "crates/allocatbelt/LICENSE")
+        mode_link["mode"] = "100644"
+        with self.assertRaisesRegex(readback.ReadbackError, "symlink mode/type"):
+            readback._capture_offline_typed_inventory(source_root, wrong_mode)
+
+        wrong_hash = json.loads(json.dumps(records))
+        hash_link = next(item for item in wrong_hash
+                         if item.get("path") == "crates/allocatbelt/LICENSE")
+        hash_link["sha256"] = "0" * 64
+        with self.assertRaisesRegex(readback.ReadbackError, "symlink literal"):
+            readback._capture_offline_typed_inventory(source_root, wrong_hash)
+
+    def test_closed_pressure_api_rejects_selected_and_unused_elf_map_entries_before_io(self) -> None:
+        fixture_builder = _load_module(
+            "pressure_closed_elf_map_source_fixture",
+            SCRIPT_DIR / "test-application-feedback-readback.py",
+        )
+        source_root = SCRIPT_DIR.parent.resolve()
+        with tempfile.TemporaryDirectory(prefix="pressure-closed-map-") as temporary:
+            input_root = Path(temporary).resolve()
+            identity = {
+                "host_id": "closed-map-host", "workload": "mixed",
+                "profile": "mixed", "binary_sha256": "a" * 64,
+            }
+            source_manifest = fixture_builder._source_v5_manifest(identity)
+            source_manifest["source"]["git_commit"] = "a" * 40
+            composer_relative = "scripts/application-feedback-composition.py"
+            composer_path = source_root / composer_relative
+            composer_raw = composer_path.read_bytes()
+            composer_info = composer_path.stat(follow_symlinks=False)
+            composer_record = {
+                "path": composer_relative,
+                "kind": "file",
+                "mode": "100755" if composer_info.st_mode & 0o111 else "100644",
+                "sha256": readback.sha256_bytes(composer_raw),
+                "size": len(composer_raw),
+            }
+            source_files = source_manifest["source"]["files"]
+            source_files.append(composer_record)
+            source_files.sort(key=lambda item: item["path"].encode("utf-8"))
+            campaign = fixture_builder.campaign
+            inventory_module = campaign.source_inventory_module()
+            source_tree_sha256 = inventory_module.digest_records(source_files)
+            source_manifest["source"]["source_tree_sha256"] = source_tree_sha256
+            identity["source_sha256"] = source_tree_sha256
+            calibration = source_manifest["resource_domain_calibration"]
+            calibration["source"] = {
+                key: source_manifest["source"][key]
+                for key in ("git_commit", "source_tree_sha256", "cargo_lock_sha256")
+            }
+            inputs = campaign.campaign_inputs_module()
+            source_manifest["feedback_policy"] = inputs.build_feedback_policy_artifact(
+                source_root, source_files, source_manifest["qualification_harness"],
+            )
+            source_manifest["manifest_sha256"] = readback.digest_object({
+                key: value for key, value in source_manifest.items()
+                if key != "manifest_sha256"
+            })
+            source_raw = readback.canonical_bytes(source_manifest)
+            source_path = input_root / "source-manifest.json"
+            source_path.write_bytes(source_raw)
+            source_pin = {"path": str(source_path),
+                          "raw_sha256": readback.sha256_bytes(source_raw)}
+            capacity_key = {
+                "host_id": identity["host_id"], "workload": identity["workload"],
+                "profile": identity["profile"], "calibration_id": "capacity-1",
+            }
+            capacity_bundle = {
+                "schema": readback.CAPACITY_BUNDLE_PIN_SCHEMA_V2,
+                "capacity_key": capacity_key,
+                "source_manifest": source_pin,
+                "request": {"path": str(input_root / "capacity-request.json"),
+                            "raw_sha256": "b" * 64},
+                "artifact": {"path": str(input_root / "capacity.tsv"),
+                             "raw_sha256": "c" * 64},
+                "receipt": {"path": str(input_root / "capacity-receipt.json"),
+                            "raw_sha256": "d" * 64},
+            }
+            calibration_value = {
+                "scope": {"source_root": str(source_root),
+                          "source_manifest": source_pin},
+            }
+            calibration_raw = readback.canonical_bytes(calibration_value)
+            calibration_path = input_root / "calibration.json"
+            calibration_path.write_bytes(calibration_raw)
+            calibration_pin = {
+                "path": str(calibration_path),
+                "raw_sha256": readback.sha256_bytes(calibration_raw),
+            }
+            context_policy_pin = {
+                "path": str(input_root / "context-policy.json"),
+                "raw_sha256": "e" * 64,
+            }
+            observed_host_pin = {
+                "path": str(input_root / "observed-host.json"),
+                "raw_sha256": "f" * 64,
+            }
+            host_receipt_pin = {
+                "path": str(input_root / "scope-receipt.json"),
+                "raw_sha256": "1" * 64, "scope_sha256": "2" * 64,
+            }
+            capture_rows = [
+                {
+                    "descriptor": {"pair": "bounded", "executor": "bounded",
+                                   "allocator": "allocatbelt"},
+                    "request_pin": {"path": str(input_root / "member-0-request.json"),
+                                    "raw_sha256": "3" * 64},
+                    "probe_capture_pin": {
+                        "path": str(input_root / "member-0-capture.json"),
+                        "raw_sha256": "4" * 64, "receipt_sha256": "5" * 64,
+                    },
+                },
+                {
+                    "descriptor": {"pair": "tokio", "executor": "tokio",
+                                   "allocator": "allocatbelt"},
+                    "request_pin": {"path": str(input_root / "member-1-request.json"),
+                                    "raw_sha256": "6" * 64},
+                    "probe_capture_pin": {
+                        "path": str(input_root / "member-1-capture.json"),
+                        "raw_sha256": "7" * 64, "receipt_sha256": "8" * 64,
+                    },
+                },
+            ]
+            original_methods = {
+                "lstat": Path.lstat, "stat": Path.stat,
+                "resolve": Path.resolve, "open": Path.open,
+            }
+
+            def path_method(name: str, forbidden: set[str]):
+                original = original_methods[name]
+
+                def guarded(path_value: Path, *args: Any, **kwargs: Any):
+                    if str(path_value) in forbidden:
+                        raise AssertionError(f"closed pressure API touched an ELF with {name}")
+                    return original(path_value, *args, **kwargs)
+                return guarded
+
+            def deny_os(path_value: object, label: str) -> None:
+                try:
+                    rendered = os.fsdecode(os.fspath(path_value))
+                except (TypeError, ValueError):
+                    return
+                if rendered in forbidden:
+                    raise AssertionError(f"closed pressure API touched an ELF with {label}")
+
+            real_os_open, real_os_stat, real_os_lstat = os.open, os.stat, os.lstat
+            real_builtin_open, real_io_open = builtins.open, io.open
+
+            def guarded_os(method, label: str):
+                def guarded(path_value: object, *args: Any, **kwargs: Any):
+                    deny_os(path_value, label)
+                    return method(path_value, *args, **kwargs)
+                return guarded
+
+            artifact_records = {
+                label: source_manifest["artifacts"][label]
+                for label in ("allocatbelt", "mimalloc-secure", "mimalloc-standard", "system")
+            }
+            artifact_records.update({
+                "soak-allocatbelt": source_manifest["soak_artifacts"]["allocatbelt"],
+                "analyzer": source_manifest["analysis_artifact"],
+                "resource-domain-calibration": source_manifest["resource_domain_calibration"]["binary"],
+            })
+            forbidden = {
+                str(source_root / artifact["path"])
+                for artifact in artifact_records.values()
+            }
+            for artifact_name, artifact in artifact_records.items():
+                artifact_path = str(source_root / artifact["path"])
+                path_map = {
+                    "schema": readback.EVIDENCE_PATH_MAP_SCHEMA_V1,
+                    "entries": [{"origin": artifact_path, "local": artifact_path}],
+                }
+                with self.subTest(artifact=artifact_name):
+                    with patch.object(Path, "lstat", new=path_method("lstat", forbidden)), \
+                            patch.object(Path, "stat", new=path_method("stat", forbidden)), \
+                            patch.object(Path, "resolve", new=path_method("resolve", forbidden)), \
+                            patch.object(Path, "open", new=path_method("open", forbidden)), \
+                            patch.object(os, "open", new=guarded_os(real_os_open, "open")), \
+                            patch.object(os, "stat", new=guarded_os(real_os_stat, "stat")), \
+                            patch.object(os, "lstat", new=guarded_os(real_os_lstat, "lstat")), \
+                            patch("builtins.open", new=guarded_os(real_builtin_open, "open")), \
+                            patch.object(io, "open", new=guarded_os(real_io_open, "open")), \
+                            patch.object(subprocess, "Popen",
+                                         side_effect=AssertionError("closed pressure preflight attempted Popen")):
+                        with self.assertRaisesRegex(
+                                readback.ReadbackError, "application ELF path"):
+                            readback.verify_calibration_scope_v2_closed_recorded_v1(
+                                calibration_pin, context_policy_pin, capacity_bundle,
+                                observed_host_pin, source_root=str(source_root),
+                                evidence_path_map=path_map,
+                                host_verification_pin=host_receipt_pin,
+                                probe_capture_pins=capture_rows,
+                            )
+
     def test_selected_floor_policy_is_bound_through_exact_shared_and_member_contexts(self) -> None:
         tree = ast.parse(READER_PATH.read_bytes(), filename=str(READER_PATH))
         matches = [node for node in tree.body
@@ -1568,6 +2117,9 @@ def main(argv: list[str] | None = None) -> int:
         "--scope-fixture", type=Path,
         help="run full replay and mutation checks against a raw-pinned genuine SourceV5 fixture",
     )
+    parser.add_argument("--closed-recorded-scope-fixture", type=Path,
+                        help="replay genuine capture.v2 pressure evidence with peer-ELF reads denied")
+    parser.add_argument("--expected-closed-recorded-scope-fixture-sha256")
     parser.add_argument("--pressure-offline-fixture", type=Path,
                         help="replay pressure output using a genuine strict host receipt")
     parser.add_argument("--expected-pressure-fixture-sha256")
@@ -1575,6 +2127,26 @@ def main(argv: list[str] | None = None) -> int:
                         help="replay pressure output using a genuine strict single-APP Soak receipt")
     parser.add_argument("--expected-source5-soak-pressure-fixture-sha256")
     args = parser.parse_args(argv)
+    if args.closed_recorded_scope_fixture is not None:
+        if args.expected_closed_recorded_scope_fixture_sha256 is None:
+            parser.error(
+                "--closed-recorded-scope-fixture requires "
+                "--expected-closed-recorded-scope-fixture-sha256",
+            )
+        result = run_genuine_closed_recorded_scope_fixture(
+            args.closed_recorded_scope_fixture,
+            args.expected_closed_recorded_scope_fixture_sha256,
+        )
+        sys.stdout.buffer.write(readback.canonical_bytes({
+            "schema": CLOSED_RECORDED_SCOPE_FIXTURE_SCHEMA,
+            "status": "closed_recorded_scope_replay_passed",
+            "request_raw_sha256": result["request_raw_sha256"],
+            "scope_sha256": result["scope_sha256"],
+            "receipt_sha256": result["receipt_sha256"],
+            "peer_elf_state": result["peer_elf_state"],
+            "qualification_eligible": False,
+        }))
+        return 0
     if args.source5_soak_pressure_offline_fixture is not None:
         if args.expected_source5_soak_pressure_fixture_sha256 is None:
             parser.error(

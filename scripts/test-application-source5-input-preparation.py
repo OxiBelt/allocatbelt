@@ -151,6 +151,125 @@ def preparation_fixture() -> tuple[dict, dict]:
 
 
 class Source5PreparationInputTests(unittest.TestCase):
+    def test_closed_initial_export_rejects_none_capture_index_before_source_calls(self) -> None:
+        preparation = load_script(
+            SCRIPT_DIR / "application-source5-input-preparation.py",
+            "source5_closed_initial_none_index_test_target",
+        )
+        function = preparation.export_initial_spec_plan_closed_metadata_v1
+        with patch.object(
+                preparation, "_export_initial_spec_plan_impl",
+                side_effect=AssertionError("closed export entered Source replay")) as implementation:
+            with self.assertRaisesRegex(preparation.PreparationError,
+                                        "requires a raw-pinned"):
+                function({}, {}, {}, Path("/unread/source"), Path("/unread/input"),
+                         probe_capture_index_pin=None)
+        implementation.assert_not_called()
+
+    def test_closed_initial_export_rejects_malformed_index_before_intent_generation_or_publish(self) -> None:
+        preparation = load_script(
+            SCRIPT_DIR / "application-source5-input-preparation.py",
+            "source5_closed_initial_bad_index_test_target",
+        )
+        function = preparation.export_initial_spec_plan_closed_metadata_v1
+        with tempfile.TemporaryDirectory(prefix="source5-closed-index-order-") as temporary:
+            input_root = Path(temporary).resolve()
+            index_path = input_root / "capture-index.json"
+            raw = preparation._canonical({"schema": "wrong-schema", "entries": []})
+            index_path.write_bytes(raw)
+            pin = {"path": str(index_path), "raw_sha256": preparation._sha256(raw)}
+            with patch.object(
+                    preparation, "read_preparation_intent_metadata_v1",
+                    side_effect=AssertionError("preparation intent was read")) as intent, \
+                    patch.object(
+                        preparation, "verify_prepared_capacity_generation_bounded_metadata_v1",
+                        side_effect=AssertionError("capacity generation was read")) as generation, \
+                    patch.object(
+                        preparation, "_publish_initial_spec_plan_new",
+                        side_effect=AssertionError("initial output was published")) as publish:
+                with self.assertRaisesRegex(preparation.PreparationError,
+                                            "exact 30-row v1 matrix"):
+                    function({}, {}, {}, input_root / "missing-source-root", input_root,
+                             probe_capture_index_pin=pin)
+            intent.assert_not_called()
+            generation.assert_not_called()
+            publish.assert_not_called()
+
+            malformed_raw_pin = {"path": str(index_path), "raw_sha256": "not-a-sha256"}
+            with patch.object(
+                    preparation, "_export_initial_spec_plan_impl",
+                    side_effect=AssertionError("malformed raw pin entered Source replay")) as implementation:
+                with self.assertRaisesRegex(preparation.PreparationError,
+                                            "raw pin is malformed"):
+                    function({}, {}, {}, input_root / "missing-source-root", input_root,
+                             probe_capture_index_pin=malformed_raw_pin)
+            implementation.assert_not_called()
+
+    def test_initial_pressure_capture_index_requires_exact_thirty_two_member_rows(self) -> None:
+        preparation = load_script(
+            SCRIPT_DIR / "application-source5-input-preparation.py",
+            "source5_initial_pressure_capture_index_test_target",
+        )
+        with tempfile.TemporaryDirectory(prefix="source5-pressure-capture-index-") as temporary:
+            root = Path(temporary).resolve()
+            rows = []
+            for row_index in range(30):
+                members = []
+                for member_index in range(2):
+                    base = root / f"context-{row_index:02d}-member-{member_index}"
+                    members.append({
+                        "descriptor": {
+                            "pair": "bounded" if member_index == 0 else "tokio",
+                            "executor": "bounded" if member_index == 0 else "tokio",
+                            "allocator": "allocatbelt",
+                        },
+                        "request_pin": {
+                            "path": str(base / "request.json"),
+                            "raw_sha256": f"{row_index + member_index + 1:064x}",
+                        },
+                        "probe_capture_pin": {
+                            "path": str(base / "capture.json"),
+                            "raw_sha256": f"{row_index + member_index + 101:064x}",
+                            "receipt_sha256": f"{row_index + member_index + 201:064x}",
+                        },
+                    })
+                rows.append({
+                    "host_id": "host-a" if row_index < 15 else "host-b",
+                    "condition_id": f"condition-{row_index:02d}",
+                    "capacity_key": {
+                        "host_id": "host-a" if row_index < 15 else "host-b",
+                        "workload": f"workload-{row_index:02d}",
+                        "profile": "mixed",
+                        "calibration_id": f"capacity-{row_index:02d}",
+                    },
+                    "context_policy_pin": {
+                        "path": str(root / f"context-{row_index:02d}.json"),
+                        "raw_sha256": f"{row_index + 301:064x}",
+                    },
+                    "members": members,
+                })
+            document = {
+                "schema": preparation.INITIAL_PRESSURE_PROBE_CAPTURES_SCHEMA,
+                "entries": rows,
+            }
+            index_path = root / "capture-index.json"
+            raw = preparation._canonical(document)
+            index_path.write_bytes(raw)
+            pin = {"path": str(index_path), "raw_sha256": preparation._sha256(raw)}
+            checked = preparation._read_initial_pressure_probe_capture_index(pin, root)
+            self.assertEqual(checked, rows)
+
+            malformed = copy.deepcopy(document)
+            malformed["entries"][0]["members"].pop()
+            malformed_raw = preparation._canonical(malformed)
+            index_path.write_bytes(malformed_raw)
+            with self.assertRaisesRegex(preparation.PreparationError, "exact 30-row|two members"):
+                preparation._read_initial_pressure_probe_capture_index(
+                    {"path": str(index_path),
+                     "raw_sha256": preparation._sha256(malformed_raw)},
+                    root,
+                )
+
     def test_build_pins_full_pre_spec_matrix_and_keeps_all_eligibility_false(self) -> None:
         fixture, _spec = preparation_fixture()
         with tempfile.TemporaryDirectory(prefix="source5-preparation-inputs-") as temporary:

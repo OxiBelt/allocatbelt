@@ -2623,6 +2623,8 @@ PREPARED_CAPACITY_GENERATION_SCHEMA = \
     "allocatbelt.application-source5-prepared-capacity-generation.v1"
 INITIAL_PRESSURE_BINDINGS_SCHEMA = \
     "allocatbelt.application-source5-initial-pressure-bindings.v1"
+INITIAL_PRESSURE_PROBE_CAPTURES_SCHEMA = \
+    "allocatbelt.application-source5-initial-pressure-probe-captures.v1"
 INITIAL_SPEC_EXPORT_SCHEMA = \
     "allocatbelt.application-source5-initial-spec-plan-export.v1"
 def _is_initial_two_kvm_host_order(host_ids: object) -> bool:
@@ -2869,6 +2871,109 @@ def _read_initial_pressure_bindings(
     return value["entries"]
 
 
+def _validate_initial_pressure_probe_capture_index_pin(
+    capture_index_pin_value: object,
+) -> dict[str, str]:
+    _require(capture_index_pin_value is not None,
+             "closed-recorded initial export requires a raw-pinned ProbeV2 capture index")
+    pin = _exact(capture_index_pin_value, {"path", "raw_sha256"},
+                 "initial pressure ProbeV2 capture index raw pin")
+    path = Path(pin["path"])
+    _require(path.is_absolute() and path.as_posix() == pin["path"] and
+             ".." not in path.parts and _is_sha(pin["raw_sha256"]),
+             "initial pressure capture index raw pin is malformed")
+    return {"path": str(path), "raw_sha256": pin["raw_sha256"]}
+
+
+def _read_initial_pressure_probe_capture_index(
+    capture_index_pin_value: object, input_root: Path,
+) -> list[dict[str, Any]]:
+    pin = _validate_initial_pressure_probe_capture_index_pin(
+        capture_index_pin_value,
+    )
+    path = Path(pin["path"])
+    _require(path.is_absolute() and path.as_posix() == pin["path"] and
+             ".." not in path.parts and _within(input_root, path),
+             "initial pressure capture index must be inside the frozen private input root")
+    value, _raw, actual = _read_pinned_json(
+        {"path": str(path), "sha256": pin["raw_sha256"]},
+        "initial pressure ProbeV2 capture index", MAX_REQUEST_BYTES,
+    )
+    _require(actual == pin["raw_sha256"],
+             "initial pressure capture index raw digest changed")
+    index = _exact(value, {"schema", "entries"},
+                   "initial pressure ProbeV2 capture index")
+    _require(index["schema"] == INITIAL_PRESSURE_PROBE_CAPTURES_SCHEMA and
+             type(index["entries"]) is list and len(index["entries"]) == 30,
+             "initial pressure capture index must contain the exact 30-row v1 matrix")
+    request_paths: set[str] = set()
+    capture_paths: set[str] = set()
+    context_paths: set[str] = set()
+    for row_index, row_value in enumerate(index["entries"]):
+        row = _exact(row_value, {
+            "host_id", "condition_id", "capacity_key", "context_policy_pin",
+            "members",
+        }, f"initial pressure capture-index row[{row_index}]")
+        _require(type(row["host_id"]) is str and bool(row["host_id"]) and
+                 type(row["condition_id"]) is str and bool(row["condition_id"]),
+                 f"initial pressure capture-index row[{row_index}] identity is malformed")
+        _exact(row["capacity_key"], {
+            "host_id", "workload", "profile", "calibration_id",
+        }, f"initial pressure capture-index row[{row_index}] capacity key")
+        context_pin = _exact(row["context_policy_pin"], {
+            "path", "raw_sha256",
+        }, f"initial pressure capture-index row[{row_index}] context-policy pin")
+        context_path = Path(context_pin["path"])
+        _require(context_path.is_absolute() and
+                 context_path.as_posix() == context_pin["path"] and
+                 ".." not in context_path.parts and
+                 _within(input_root, context_path) and
+                 _is_sha(context_pin["raw_sha256"]),
+                 f"initial pressure capture-index row[{row_index}] context-policy pin is malformed")
+        _require(context_pin["path"] not in context_paths,
+                 "initial pressure capture index repeats a context-policy bundle path")
+        context_paths.add(context_pin["path"])
+        _require(type(row["members"]) is list and len(row["members"]) == 2,
+                 f"initial pressure capture-index row[{row_index}] must contain two members")
+        for member_index, member_value in enumerate(row["members"]):
+            member = _exact(member_value, {
+                "descriptor", "request_pin", "probe_capture_pin",
+            }, f"initial pressure capture-index row[{row_index}] member[{member_index}]")
+            descriptor = _exact(member["descriptor"], {
+                "pair", "executor", "allocator",
+            }, f"initial pressure capture-index row[{row_index}] member[{member_index}] descriptor")
+            _require(all(type(descriptor[key]) is str and bool(descriptor[key])
+                         for key in descriptor),
+                     f"initial pressure capture-index row[{row_index}] member[{member_index}] descriptor is malformed")
+            request_pin = _exact(member["request_pin"], {
+                "path", "raw_sha256",
+            }, f"initial pressure capture-index row[{row_index}] member[{member_index}] request pin")
+            capture_pin = _exact(member["probe_capture_pin"], {
+                "path", "raw_sha256", "receipt_sha256",
+            }, f"initial pressure capture-index row[{row_index}] member[{member_index}] capture pin")
+            for label, evidence_pin in (("request", request_pin),
+                                        ("capture", capture_pin)):
+                evidence_path = Path(evidence_pin["path"])
+                _require(evidence_path.is_absolute() and
+                         evidence_path.as_posix() == evidence_pin["path"] and
+                         ".." not in evidence_path.parts and
+                         _within(input_root, evidence_path) and
+                         _is_sha(evidence_pin["raw_sha256"]),
+                         f"initial pressure capture-index row[{row_index}] member[{member_index}] {label} pin is malformed")
+                target_paths = request_paths if label == "request" else capture_paths
+                _require(evidence_pin["path"] not in target_paths,
+                         f"initial pressure capture index repeats a {label} path")
+                target_paths.add(evidence_pin["path"])
+            _require(_is_sha(capture_pin["receipt_sha256"]),
+                     f"initial pressure capture-index row[{row_index}] member[{member_index}] capture receipt digest is malformed")
+    _require(not request_paths.intersection(capture_paths),
+             "initial pressure capture index aliases a composer request and capture receipt")
+    _require(not context_paths.intersection(request_paths | capture_paths) and
+             pin["path"] not in context_paths | request_paths | capture_paths,
+             "initial pressure capture index aliases a bundle, request, or capture receipt")
+    return index["entries"]
+
+
 def _validate_initial_pressure_binding_matrix(
     preparation: dict[str, Any], pressure_binding_rows: object,
 ) -> tuple[list[str], set[tuple[str, str, str]], dict[tuple[str, str, str], dict[str, Any]], list[tuple[str, str, str]]]:
@@ -2926,6 +3031,7 @@ def _replay_initial_pressure_bindings(
     inputs: Any, source_root: Path, input_root: Path,
     pressure_binding_rows: list[dict[str, Any]],
     capacity_entries: dict[tuple[str, str, str], dict[str, Any]],
+    *, probe_capture_rows: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     """Replay actual scope receipts and project the immutable Spec rows."""
     host_ids, expected_keys, condition_map, pressure_order = \
@@ -2952,9 +3058,15 @@ def _replay_initial_pressure_bindings(
     pressure_reader = _execute_captured_module(
         reader_raw, reader_path, "initial_pressure_readback",
     )
-    verify_scope = getattr(pressure_reader, "verify_calibration_scope_v2_offline", None)
+    if probe_capture_rows is None:
+        verify_scope = getattr(pressure_reader, "verify_calibration_scope_v2_offline", None)
+    else:
+        verify_scope = getattr(
+            pressure_reader,
+            "verify_calibration_scope_v2_closed_recorded_v1", None,
+        )
     _require(callable(verify_scope),
-             "typed SourceV5 pressure reader lacks offline scope-v2 replay")
+             "typed SourceV5 pressure reader lacks the explicitly selected scope-v2 replay API")
 
     projected: list[dict[str, Any]] = []
     for index, (binding_value, expected_key) in enumerate(
@@ -3024,13 +3136,85 @@ def _replay_initial_pressure_bindings(
                      f"initial pressure binding[{index}] {label} pin is malformed")
         _require(_is_sha(receipt_pin["scope_sha256"]),
                  f"initial pressure binding[{index}] scope digest is malformed")
-        try:
-            receipt = verify_scope(
-                calibration_pin, context_policy_pin, expected_capacity_bundle,
-                observed_pin, source_root=str(source_root),
-                evidence_path_map=binding["evidence_path_map"],
-                host_verification_pin=receipt_pin,
+        closed_members = None
+        if probe_capture_rows is not None:
+            capture_index_row = _exact(probe_capture_rows[index], {
+                "host_id", "condition_id", "capacity_key", "context_policy_pin",
+                "members",
+            }, f"initial pressure capture-index row[{index}]")
+            indexed_context_pin = _exact(capture_index_row["context_policy_pin"], {
+                "path", "raw_sha256",
+            }, f"initial pressure capture-index row[{index}] context-policy pin")
+            _require(capture_index_row["host_id"] == host_id and
+                     capture_index_row["condition_id"] == condition["condition_id"] and
+                     capture_index_row["capacity_key"] == condition["capacity_key"] and
+                     indexed_context_pin == context_policy_pin,
+                     f"initial pressure capture-index row[{index}] crosses its condition/context binding")
+            bundle_value, _bundle_raw, bundle_sha = _read_pinned_json(
+                {"path": context_policy_pin["path"],
+                 "sha256": context_policy_pin["raw_sha256"]},
+                f"initial pressure context-policy bundle[{index}]",
+                MAX_REQUEST_BYTES,
             )
+            bundle_value = _exact(bundle_value, {"schema", "artifact", "members"},
+                                  f"initial pressure context-policy bundle[{index}]")
+            _require(bundle_sha == context_policy_pin["raw_sha256"] and
+                     bundle_value["schema"] == pressure_reader.CONTEXT_POLICY_BUNDLE_SCHEMA_V2 and
+                     type(bundle_value["members"]) is list and
+                     len(bundle_value["members"]) == 2,
+                     f"initial pressure context-policy bundle[{index}] is not the pinned two-member SourceV5 bundle")
+            indexed_members = capture_index_row["members"]
+            _require(type(indexed_members) is list and len(indexed_members) == 2,
+                     f"initial pressure capture-index row[{index}] omits a context member")
+            closed_members = []
+            for member_index, (bundle_member_value, indexed_member_value) in enumerate(
+                    zip(bundle_value["members"], indexed_members)):
+                bundle_member = _exact(bundle_member_value, {
+                    "descriptor", "request", "construction_probe", "resolved_policy",
+                    "composition_receipt",
+                }, f"initial pressure context bundle[{index}] member[{member_index}]")
+                indexed_member = _exact(indexed_member_value, {
+                    "descriptor", "request_pin", "probe_capture_pin",
+                }, f"initial pressure capture index[{index}] member[{member_index}]")
+                descriptor = _exact(bundle_member["descriptor"], {
+                    "pair", "executor", "allocator",
+                }, f"initial pressure context bundle[{index}] descriptor[{member_index}]")
+                indexed_descriptor = _exact(indexed_member["descriptor"], {
+                    "pair", "executor", "allocator",
+                }, f"initial pressure capture-index descriptor[{index}] member[{member_index}]")
+                request_pin = _exact(indexed_member["request_pin"], {
+                    "path", "raw_sha256",
+                }, f"initial pressure capture-index request[{index}] member[{member_index}]")
+                bundle_request_pin = _exact(bundle_member["request"], {
+                    "path", "raw_sha256",
+                }, f"initial pressure context bundle request[{index}] member[{member_index}]")
+                _require(indexed_descriptor == descriptor and
+                         request_pin == bundle_request_pin,
+                         f"initial pressure capture-index member[{index}:{member_index}] differs from the actual context bundle order")
+                capture_pin = _exact(indexed_member["probe_capture_pin"], {
+                    "path", "raw_sha256", "receipt_sha256",
+                }, f"initial pressure capture-index capture[{index}] member[{member_index}]")
+                closed_members.append({
+                    "descriptor": descriptor,
+                    "request_pin": request_pin,
+                    "probe_capture_pin": capture_pin,
+                })
+        try:
+            if closed_members is None:
+                receipt = verify_scope(
+                    calibration_pin, context_policy_pin, expected_capacity_bundle,
+                    observed_pin, source_root=str(source_root),
+                    evidence_path_map=binding["evidence_path_map"],
+                    host_verification_pin=receipt_pin,
+                )
+            else:
+                receipt = verify_scope(
+                    calibration_pin, context_policy_pin, expected_capacity_bundle,
+                    observed_pin, source_root=str(source_root),
+                    evidence_path_map=binding["evidence_path_map"],
+                    host_verification_pin=receipt_pin,
+                    probe_capture_pins=closed_members,
+                )
         except Exception as error:
             raise PreparationError(
                 f"initial pressure calibration[{index}] failed complete offline SourceV5 replay: {error}",
@@ -3174,6 +3358,7 @@ def _export_initial_spec_plan_impl(
     preparation_pin: dict[str, Any], capacity_generation_pin: dict[str, Any],
     pressure_bindings_pin: dict[str, Any], source_root: Path, input_root: Path,
     *, metadata_only: bool,
+    probe_capture_index_pin: object = None,
 ) -> dict[str, Any]:
     """Export a prospective initial SpecV3/PlanV3 from complete real inputs.
 
@@ -3181,12 +3366,20 @@ def _export_initial_spec_plan_impl(
     Capacity evidence remains ``None`` in the initial generation; the returned
     plan is prospective and cannot authorize application launches.
     """
-    source_root = _safe_root(Path(source_root), "initial SpecV3 SourceV5 root")
     input_root = _safe_root(Path(input_root), "initial SpecV3 input root")
-    _require(source_root != input_root,
-             "initial SpecV3 SourceV5 and private input roots must be separate")
     _require(type(metadata_only) is bool,
              "initial SpecV3 metadata-only selector is malformed")
+    _require(probe_capture_index_pin is None or metadata_only,
+             "closed-recorded pressure capture index requires metadata Source replay")
+    probe_capture_rows = (
+        None if probe_capture_index_pin is None else
+        _read_initial_pressure_probe_capture_index(
+            probe_capture_index_pin, input_root,
+        )
+    )
+    source_root = _safe_root(Path(source_root), "initial SpecV3 SourceV5 root")
+    _require(source_root != input_root,
+             "initial SpecV3 SourceV5 and private input roots must be separate")
     intent_reader = (read_preparation_intent_metadata_v1 if metadata_only else
                      read_preparation_intent)
     preparation, sources, campaign, inputs = intent_reader(
@@ -3242,6 +3435,7 @@ def _export_initial_spec_plan_impl(
     pressure_conditions = _replay_initial_pressure_bindings(
         preparation, sources, inputs, source_root, input_root,
         pressure_bindings, capacity_entries,
+        probe_capture_rows=probe_capture_rows,
     )
     spec = _initial_spec_value(
         preparation, sources, campaign, inputs, pressure_conditions,
@@ -3330,6 +3524,22 @@ def export_initial_spec_plan_metadata_v1(
     return _export_initial_spec_plan_impl(
         preparation_pin, capacity_generation_pin, pressure_bindings_pin,
         source_root, input_root, metadata_only=True,
+    )
+
+
+def export_initial_spec_plan_closed_metadata_v1(
+    preparation_pin: dict[str, Any], capacity_generation_pin: dict[str, Any],
+    pressure_bindings_pin: dict[str, Any], source_root: Path, input_root: Path,
+    *, probe_capture_index_pin: object,
+) -> dict[str, Any]:
+    """Export the prospective initial plan through strict closed capture replay."""
+    capture_index_pin = _validate_initial_pressure_probe_capture_index_pin(
+        probe_capture_index_pin,
+    )
+    return _export_initial_spec_plan_impl(
+        preparation_pin, capacity_generation_pin, pressure_bindings_pin,
+        source_root, input_root, metadata_only=True,
+        probe_capture_index_pin=capture_index_pin,
     )
 
 

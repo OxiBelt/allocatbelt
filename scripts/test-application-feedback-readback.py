@@ -9,11 +9,13 @@ from __future__ import annotations
 import hashlib
 import contextlib
 import importlib.util
+import inspect
 import io
 import json
 import os
 import shutil
 import stat
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -2839,8 +2841,149 @@ class HelperTests(unittest.TestCase):
         with self.assertRaises(reader.ValidationError):
             reader.uint(True, "bool-as-integer")
 
+    def test_closed_recorded_probe_api_is_named_and_requires_capture_context(self) -> None:
+        function = reader.validate_calibrated_construction_probe_v2_closed_recorded_v1
+        parameters = inspect.signature(function).parameters
+        self.assertEqual(list(parameters), [
+            "probe_pin", "source_manifest_pin", "capacity_artifact_pin", "identity",
+            "replay_context", "expected_policy", "capacity_floor_policy_id",
+        ])
+        self.assertEqual(parameters["replay_context"].default,
+                         inspect.Parameter.empty)
+        self.assertNotIn("closed_recorded", parameters)
+
 
 class OfflineProbeReplayContextTests(unittest.TestCase):
+    def test_closed_recorded_probe_rejects_selected_and_other_elf_map_entries_before_io(self) -> None:
+        identity = {
+            "host_id": "closed-map-host", "workload": "mixed",
+            "profile": "mixed", "binary_sha256": "a" * 64,
+        }
+        source_manifest = _source_v5_manifest(identity)
+        source_root = SCRIPT_DIR.parent.resolve()
+        source_path = Path(tempfile.mkdtemp(prefix="feedback-closed-source-pin-")) / "source.json"
+        self.addCleanup(shutil.rmtree, source_path.parent, ignore_errors=True)
+        source_path.parent.mkdir(parents=True, exist_ok=True)
+        source_raw = reader.canonical_bytes(source_manifest)
+        source_path.write_bytes(source_raw)
+        source_pin = {"path": str(source_path), "raw_sha256": _sha(source_raw)}
+        temp_root = source_path.parent
+        probe_pin = {
+            "path": str(temp_root / "probe.json"), "raw_sha256": "b" * 64,
+            "allocator": "allocatbelt", "binary_sha256": "a" * 64,
+        }
+        capacity_pin = {"path": str(temp_root / "capacity.tsv"),
+                        "raw_sha256": "c" * 64}
+        capacity_bundle = {
+            "request": {"path": str(temp_root / "request.json"), "raw_sha256": "d" * 64},
+            "artifact": capacity_pin,
+            "receipt": {"path": str(temp_root / "capacity-receipt.json"), "raw_sha256": "e" * 64},
+        }
+        identity["source_sha256"] = source_manifest["source"]["source_tree_sha256"]
+        replay_context = {
+            "schema": reader.FEEDBACK_OFFLINE_CONTEXT_SCHEMA,
+            "evidence_path_map": {
+                "schema": reader.EVIDENCE_PATH_MAP_SCHEMA,
+                "entries": [],
+            },
+            "probe_capture_pin": {
+                "path": str(temp_root / "capture.json"),
+                "raw_sha256": "f" * 64, "receipt_sha256": "1" * 64,
+            },
+            "capacity_bundle": capacity_bundle,
+        }
+        original_methods = {
+            "lstat": Path.lstat, "stat": Path.stat,
+            "resolve": Path.resolve, "open": Path.open,
+        }
+
+        def denied(path_value: object, label: str) -> None:
+            try:
+                rendered = os.fsdecode(os.fspath(path_value))
+            except (TypeError, ValueError):
+                return
+            if rendered in forbidden:
+                raise AssertionError(f"closed probe API touched Source ELF with {label}")
+
+        def path_method(name: str):
+            original = original_methods[name]
+
+            def guarded(path_value: Path, *args: Any, **kwargs: Any):
+                denied(path_value, name)
+                return original(path_value, *args, **kwargs)
+            return guarded
+
+        def denied_os(path_value: object, label: str) -> None:
+            try:
+                rendered = os.fsdecode(os.fspath(path_value))
+            except (TypeError, ValueError):
+                return
+            if rendered in forbidden:
+                raise AssertionError(f"closed probe API touched Source ELF with {label}")
+
+        real_os_open, real_os_stat, real_os_lstat = os.open, os.stat, os.lstat
+        real_builtin_open, real_io_open = open, io.open
+
+        def os_method(method, label: str):
+            def guarded(path_value: object, *args: Any, **kwargs: Any):
+                denied_os(path_value, label)
+                return method(path_value, *args, **kwargs)
+            return guarded
+
+        def guarded_open(path_value: object, *args: Any, **kwargs: Any):
+            return os_method(real_os_open, "open")(path_value, *args, **kwargs)
+
+        def guarded_stat(path_value: object, *args: Any, **kwargs: Any):
+            return os_method(real_os_stat, "stat")(path_value, *args, **kwargs)
+
+        def guarded_lstat(path_value: object, *args: Any, **kwargs: Any):
+            return os_method(real_os_lstat, "lstat")(path_value, *args, **kwargs)
+
+        def guarded_builtin_open(path_value: object, *args: Any, **kwargs: Any):
+            denied(path_value, "open")
+            return real_builtin_open(path_value, *args, **kwargs)
+
+        def guarded_io_open(path_value: object, *args: Any, **kwargs: Any):
+            denied(path_value, "open")
+            return real_io_open(path_value, *args, **kwargs)
+
+        artifact_records = {
+            label: source_manifest["artifacts"][label]
+            for label in ("allocatbelt", "mimalloc-secure", "mimalloc-standard", "system")
+        }
+        artifact_records.update({
+            "soak-allocatbelt": source_manifest["soak_artifacts"]["allocatbelt"],
+            "analyzer": source_manifest["analysis_artifact"],
+            "resource-domain-calibration": source_manifest["resource_domain_calibration"]["binary"],
+        })
+        forbidden = {
+            str(source_root / artifact["path"])
+            for artifact in artifact_records.values()
+        }
+        for label, artifact in artifact_records.items():
+            artifact_path = str(source_root / artifact["path"])
+            replay_context["evidence_path_map"]["entries"] = [
+                {"origin": artifact_path, "local": artifact_path},
+            ]
+            with self.subTest(allocator=label):
+                with patch.object(Path, "lstat", new=path_method("lstat")), \
+                        patch.object(Path, "stat", new=path_method("stat")), \
+                        patch.object(Path, "resolve", new=path_method("resolve")), \
+                        patch.object(Path, "open", new=path_method("open")), \
+                        patch.object(os, "open", new=guarded_open), \
+                        patch.object(os, "stat", new=guarded_stat), \
+                        patch.object(os, "lstat", new=guarded_lstat), \
+                        patch("builtins.open", new=guarded_builtin_open), \
+                        patch.object(io, "open", new=guarded_io_open), \
+                        patch.object(subprocess, "Popen",
+                                     side_effect=AssertionError("closed probe API attempted Popen")):
+                    with self.assertRaisesRegex(
+                            reader.ValidationError, "executable artifact"):
+                        reader.validate_calibrated_construction_probe_v2_closed_recorded_v1(
+                            probe_pin, source_pin, capacity_pin, identity,
+                            replay_context=replay_context,
+                        )
+
     def test_offline_context_uses_closed_sorted_identity_mapping(self) -> None:
         with tempfile.TemporaryDirectory(prefix="feedback-offline-map-", dir="/var/tmp") as directory:
             root = Path(directory).resolve(strict=True)

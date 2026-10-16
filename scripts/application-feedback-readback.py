@@ -1637,6 +1637,7 @@ def _check_calibrated_construction_probe_v2_inputs(
     probe_pin: object, source_manifest: dict[str, Any], capacity_artifact_pin: object,
     identity: dict[str, Any], expected_policy: dict[str, Any] | None = None,
     capacity_floor_policy_id: str | None = None, *, artifact_view: Any = None,
+    closed_recorded: bool = False,
 ) -> tuple[str, dict[str, Any], Path, Path, str, Path]:
     """Check every static V2 source/policy input without launching an APP."""
     require(source_manifest.get("schema") == SOURCE_MANIFEST_SCHEMA_V5, "calibrated construction probe requires SourceV5")
@@ -1664,10 +1665,21 @@ def _check_calibrated_construction_probe_v2_inputs(
     require(digest(artifact["sha256"], "calibrated SourceV5 APP artifact SHA-256") == pin["binary_sha256"], "calibrated probe binary differs from SourceV5 APP artifact")
     source_root = Path(__file__).resolve().parent.parent
     relative = PurePosixPath(text(artifact["path"], "SourceV5 APP artifact relative path", 4096))
-    require(not relative.is_absolute() and ".." not in relative.parts and relative.as_posix() == artifact["path"], "SourceV5 APP artifact path is not portable")
+    require(not relative.is_absolute() and ".." not in relative.parts and
+            relative.as_posix() == artifact["path"] and "\\" not in artifact["path"],
+            "SourceV5 APP artifact path is not portable")
     binary = source_root.joinpath(*relative.parts)
-    binary_sha, _size, binary_mode = _stable_file_sha256(binary, "SourceV5 APP artifact", MAX_APP_BINARY_BYTES)
-    require(stat.S_IMODE(binary_mode) & 0o111 and binary_sha == artifact["sha256"], "SourceV5 APP artifact bytes or executable mode differ from the manifest")
+    if closed_recorded:
+        require(digest(artifact["sha256"], "SourceV5 APP artifact SHA-256") ==
+                pin["binary_sha256"],
+                "closed-recorded probe binary differs from the exact SourceV5 artifact identity")
+    else:
+        binary_sha, _size, binary_mode = _stable_file_sha256(
+            binary, "SourceV5 APP artifact", MAX_APP_BINARY_BYTES,
+        )
+        require(stat.S_IMODE(binary_mode) & 0o111 and
+                binary_sha == artifact["sha256"],
+                "SourceV5 APP artifact bytes or executable mode differ from the manifest")
     _fields, capacity_sha = _read_capacity_artifact_v5(capacity_artifact_pin)
     _validate_calibrated_construction_evidence(source_manifest, probe, identity)
     capacity_path = absolute_path(exact(capacity_artifact_pin, {"path", "raw_sha256"}, "V5 capacity artifact pin")["path"], "V5 capacity artifact path")
@@ -2461,7 +2473,7 @@ def _verify_source5_symlink_literal(
 
 def _source5_offline_inventory_closure(
     source_root: Path, inventory: object, artifact_paths: set[str],
-    context: dict[str, Any], label: str,
+    context: dict[str, Any], label: str, *, recorded_artifacts: bool = False,
 ) -> None:
     """Close typed SourceV5 regular/link paths before the captured verifier runs."""
     require(type(inventory) is list and
@@ -2500,7 +2512,8 @@ def _source5_offline_inventory_closure(
     require(set(context["mapped_symlinks"]) == source_symlinks,
             f"{label} path map symlinks differ from the typed inventory")
     _require_offline_paths(context, source_symlinks, f"{label} symlink member")
-    _require_offline_files(context, source_files | checked_artifacts,
+    required_files = source_files if recorded_artifacts else source_files | checked_artifacts
+    _require_offline_files(context, required_files,
                            f"{label} regular inventory/artifact member")
     for relative, record in symlink_records:
         _verify_source5_symlink_literal(source_root, relative, record, label)
@@ -2508,7 +2521,8 @@ def _source5_offline_inventory_closure(
 
 def _preflight_offline_probe_evidence(
     source_manifest: dict[str, Any], source_pin: dict[str, Any], probe_pin: dict[str, Any],
-    capacity_pin: dict[str, Any], context: dict[str, Any],
+    capacity_pin: dict[str, Any], context: dict[str, Any], *,
+    recorded_artifacts: bool = False,
 ) -> None:
     source_root = Path(__file__).resolve().parent.parent
     paths = {
@@ -2535,10 +2549,13 @@ def _preflight_offline_probe_evidence(
         artifact = exact(artifact_value, {"path", "sha256"}, "offline SourceV5 artifact")
         relative = PurePosixPath(text(artifact["path"], "offline SourceV5 artifact path", 4096))
         require(not relative.is_absolute() and ".." not in relative.parts and
-                relative.as_posix() == artifact["path"], "offline SourceV5 artifact path is not portable")
+                relative.as_posix() == artifact["path"] and "\\" not in artifact["path"],
+                "offline SourceV5 artifact path is not portable")
+        digest(artifact["sha256"], "offline SourceV5 artifact SHA-256")
         artifact_paths.add(str(source_root.joinpath(*relative.parts)))
     _source5_offline_inventory_closure(
         source_root, source["files"], artifact_paths, context, "offline SourceV5",
+        recorded_artifacts=recorded_artifacts,
     )
     owner_paths = {
         str(source_root / "scripts/application-fixed-pair.py"),
@@ -2572,7 +2589,10 @@ def _preflight_offline_probe_evidence(
     capture = validate_probe_capture_receipt_envelope(
         capture_raw, capture_pin["raw_sha256"], capture_pin["receipt_sha256"],
     )
-    _require_offline_paths(context, _absolute_json_paths(capture),
+    capture_paths = _absolute_json_paths(capture)
+    if recorded_artifacts:
+        capture_paths.difference_update(artifact_paths)
+    _require_offline_paths(context, capture_paths,
                            "nested ProbeV2 capture evidence")
     _preflight_probe_capture_tree(capture, context, capture_path)
     probe, _probe_raw_sha = read_canonical(
@@ -2668,15 +2688,161 @@ def validate_calibrated_construction_probe_v2_offline(
     capacity_floor_policy_id: str | None = None,
 ) -> str:
     """Replay the original SourceV5 ProbeV2 using captured origin-host bytes only."""
-    context = _validate_feedback_offline_context(replay_context)
-    try:
-        pin_snapshot = json.loads(canonical_bytes(probe_pin).decode("ascii"))
-        source_pin_snapshot = json.loads(canonical_bytes(source_manifest_pin).decode("ascii"))
-        capacity_snapshot = json.loads(canonical_bytes(capacity_artifact_pin).decode("ascii"))
-        identity_snapshot = json.loads(canonical_bytes(identity).decode("ascii"))
-        policy_snapshot = None if expected_policy is None else json.loads(canonical_bytes(expected_policy).decode("ascii"))
-    except (TypeError, ValueError, UnicodeError) as error:
-        raise ValidationError(f"offline calibrated probe inputs are not closed JSON: {error}") from error
+    return _validate_calibrated_construction_probe_v2_offline_impl(
+        probe_pin, source_manifest_pin, capacity_artifact_pin, identity,
+        replay_context=replay_context, expected_policy=expected_policy,
+        capacity_floor_policy_id=capacity_floor_policy_id,
+        closed_recorded=False,
+    )
+
+
+def validate_calibrated_construction_probe_v2_closed_recorded_v1(
+    probe_pin: object, source_manifest_pin: object, capacity_artifact_pin: object,
+    identity: dict[str, Any], *, replay_context: object,
+    expected_policy: dict[str, Any] | None = None,
+    capacity_floor_policy_id: str | None = None,
+) -> str:
+    """Replay strict capture.v2 owner facts without reopening a historical ELF."""
+    return _validate_calibrated_construction_probe_v2_offline_impl(
+        probe_pin, source_manifest_pin, capacity_artifact_pin, identity,
+        replay_context=replay_context, expected_policy=expected_policy,
+        capacity_floor_policy_id=capacity_floor_policy_id,
+        closed_recorded=True,
+    )
+
+
+def _closed_recorded_source_executable_paths_v1(
+    source_root: Path, source_manifest: dict[str, Any],
+) -> set[str]:
+    """Derive SourceV5 executable artifacts from an exact canonical manifest."""
+    require(source_manifest.get("schema") == SOURCE_MANIFEST_SCHEMA_V5,
+            "closed-recorded probe requires SourceV5 metadata")
+    semantic = digest(source_manifest.get("manifest_sha256"),
+                      "closed-recorded SourceV5 semantic manifest SHA-256")
+    body = {key: value for key, value in source_manifest.items()
+            if key != "manifest_sha256"}
+    require(semantic == digest_object(body),
+            "closed-recorded SourceV5 semantic manifest digest is invalid")
+    artifacts = source_manifest.get("artifacts")
+    require(type(artifacts) is dict and
+            set(artifacts) == set(APPLICATION_ALLOCATOR_LABELS),
+            "closed-recorded SourceV5 application artifact table is incomplete")
+    result: set[str] = set()
+
+    def add(value: object, label: str) -> None:
+        artifact = exact(value, {"path", "sha256"},
+                         f"closed-recorded SourceV5 executable artifact {label}")
+        relative_text = text(artifact["path"], f"{label} artifact path", 4096)
+        relative = PurePosixPath(relative_text)
+        require(not relative.is_absolute() and relative.parts and
+                ".." not in relative.parts and relative.as_posix() == relative_text and
+                "\\" not in relative_text,
+                f"closed-recorded SourceV5 artifact {label} path is not portable")
+        digest(artifact["sha256"], f"closed-recorded SourceV5 artifact {label} SHA-256")
+        result.add(str(source_root.joinpath(*relative.parts)))
+
+    for label in APPLICATION_ALLOCATOR_LABELS:
+        add(artifacts[label], label)
+    soak_artifacts = source_manifest.get("soak_artifacts")
+    require(type(soak_artifacts) is dict and set(soak_artifacts) == {"allocatbelt"},
+            "closed-recorded SourceV5 soak artifact table is malformed")
+    add(soak_artifacts["allocatbelt"], "soak-allocatbelt")
+    add(source_manifest.get("analysis_artifact"), "analysis")
+    calibration = exact(source_manifest.get("resource_domain_calibration"), {
+        "binary", "output", "record", "source", "build", "build_sha256",
+    }, "closed-recorded SourceV5 resource-domain calibration")
+    add(calibration["binary"], "resource-domain calibration")
+    require(len(result) == len(APPLICATION_ALLOCATOR_LABELS) + 3,
+            "closed-recorded SourceV5 executable artifacts alias one another")
+    return result
+
+
+def _reject_closed_recorded_artifact_map_v1(
+    replay_context: object, role_pins: list[dict[str, Any]],
+    source_root: Path, source_manifest: dict[str, Any],
+) -> None:
+    forbidden = _closed_recorded_source_executable_paths_v1(
+        source_root, source_manifest,
+    )
+    for index, pin in enumerate(role_pins):
+        path = str(absolute_path(pin["path"],
+                                 f"closed-recorded feedback role path[{index}]"))
+        require(path not in forbidden,
+                "closed-recorded feedback input pin aliases a SourceV5 executable artifact")
+    require(type(replay_context) is dict,
+            "closed-recorded feedback context must be a closed identity-map object")
+    context = exact(replay_context, {
+        "schema", "evidence_path_map", "probe_capture_pin", "capacity_bundle",
+    }, "closed-recorded feedback replay context")
+    require(context["schema"] == FEEDBACK_OFFLINE_CONTEXT_SCHEMA,
+            "closed-recorded feedback replay context schema differs")
+    capture = exact(context["probe_capture_pin"], {
+        "path", "raw_sha256", "receipt_sha256",
+    }, "closed-recorded ProbeV2 capture pin")
+    require(str(absolute_path(capture["path"],
+                              "closed-recorded ProbeV2 capture path")) not in forbidden,
+            "closed-recorded capture pin aliases a SourceV5 executable artifact")
+    capacity = exact(context["capacity_bundle"], {"request", "artifact", "receipt"},
+                     "closed-recorded feedback capacity bundle")
+    for name in capacity:
+        pin = exact(capacity[name], {"path", "raw_sha256"},
+                    f"closed-recorded feedback capacity {name} pin")
+        require(str(absolute_path(pin["path"],
+                                  f"closed-recorded capacity {name} path")) not in forbidden,
+                "closed-recorded capacity pin aliases a SourceV5 executable artifact")
+
+    mapping = exact(context["evidence_path_map"], {"schema", "entries"},
+                    "closed-recorded feedback evidence path map")
+    require(mapping["schema"] == EVIDENCE_PATH_MAP_SCHEMA and
+            type(mapping["entries"]) is list and
+            1 <= len(mapping["entries"]) <= MAX_OFFLINE_PATH_MAP_ENTRIES,
+            "closed-recorded feedback evidence map schema or entry count differs")
+    previous = ""
+    local_paths: set[str] = set()
+    for index, entry_value in enumerate(mapping["entries"]):
+        entry = exact(entry_value, {"origin", "local"},
+                      f"closed-recorded feedback evidence map[{index}]")
+        origin = str(absolute_path(entry["origin"],
+                                   f"closed-recorded evidence origin[{index}]"))
+        local = str(absolute_path(entry["local"],
+                                  f"closed-recorded evidence local[{index}]"))
+        require(origin == local and origin > previous and local not in local_paths,
+                "closed-recorded feedback map must be sorted unique identity paths")
+        previous = origin
+        local_paths.add(local)
+        require(origin not in forbidden and local not in forbidden,
+                "closed-recorded feedback map names a SourceV5 executable artifact")
+
+
+def _validate_calibrated_construction_probe_v2_offline_impl(
+    probe_pin: object, source_manifest_pin: object, capacity_artifact_pin: object,
+    identity: dict[str, Any], *, replay_context: object,
+    expected_policy: dict[str, Any] | None = None,
+    capacity_floor_policy_id: str | None = None,
+    closed_recorded: bool,
+) -> str:
+    def snapshot_inputs() -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], dict[str, Any], dict[str, Any] | None]:
+        try:
+            pin_value = json.loads(canonical_bytes(probe_pin).decode("ascii"))
+            source_value = json.loads(canonical_bytes(source_manifest_pin).decode("ascii"))
+            capacity_value = json.loads(canonical_bytes(capacity_artifact_pin).decode("ascii"))
+            identity_value = json.loads(canonical_bytes(identity).decode("ascii"))
+            policy_value = (None if expected_policy is None else
+                            json.loads(canonical_bytes(expected_policy).decode("ascii")))
+        except (TypeError, ValueError, UnicodeError) as error:
+            raise ValidationError(
+                f"offline calibrated probe inputs are not closed JSON: {error}",
+            ) from error
+        return pin_value, source_value, capacity_value, identity_value, policy_value
+
+    context = None
+    source_manifest_preloaded = None
+    source_root = Path(__file__).resolve().parent.parent
+    if closed_recorded:
+        pin_snapshot, source_pin_snapshot, capacity_snapshot, identity_snapshot, policy_snapshot = snapshot_inputs()
+    else:
+        context = _validate_feedback_offline_context(replay_context)
+        pin_snapshot, source_pin_snapshot, capacity_snapshot, identity_snapshot, policy_snapshot = snapshot_inputs()
     identity = identity_snapshot
     expected_policy = policy_snapshot
     pin = exact(pin_snapshot, {"path", "raw_sha256", "allocator", "binary_sha256"},
@@ -2685,23 +2851,53 @@ def validate_calibrated_construction_probe_v2_offline(
                          "offline V5 capacity artifact pin")
     source_pin = exact(source_pin_snapshot, {"path", "raw_sha256"},
                        "offline SourceV5 manifest pin")
-    source_root = Path(__file__).resolve().parent.parent
+    if closed_recorded:
+        require(source_pin["path"] != str(source_root) and
+                not source_pin["path"].startswith(str(source_root).rstrip("/") + "/"),
+                "closed-recorded SourceV5 manifest must be outside SourceRoot")
+        source_manifest_preloaded, source_raw_sha = read_canonical(
+            Path(source_pin["path"]), "closed-recorded SourceV5 manifest",
+            MAX_SOURCE_MANIFEST_BYTES,
+            digest(source_pin["raw_sha256"], "closed-recorded SourceV5 raw SHA-256"),
+        )
+        require(source_raw_sha == source_pin["raw_sha256"],
+                "closed-recorded SourceV5 manifest raw digest differs")
+        source_recipe = {
+            "schema": EXPECTATION_SCHEMA_V5, "mode": "pressure_validation",
+            "identity": identity,
+        }
+        _verify_source_manifest_v5(source_manifest_preloaded, source_recipe)
+        _reject_closed_recorded_artifact_map_v1(
+            replay_context, [source_pin, pin, capacity_pin], source_root,
+            source_manifest_preloaded,
+        )
+        context = _validate_feedback_offline_context(replay_context)
+    require(context is not None,
+            "feedback offline replay context was not validated")
     _require_offline_directories(context, {str(source_root)}, "SourceV5 source root")
     _require_offline_files(context, {source_pin["path"]}, "SourceV5 manifest")
-    source_manifest, _source_raw_sha = read_canonical(
-        Path(source_pin["path"]), "offline SourceV5 manifest", MAX_SOURCE_MANIFEST_BYTES,
-        digest(source_pin["raw_sha256"], "offline SourceV5 raw SHA-256"),
+    if source_manifest_preloaded is None:
+        source_manifest, _source_raw_sha = read_canonical(
+            Path(source_pin["path"]), "offline SourceV5 manifest", MAX_SOURCE_MANIFEST_BYTES,
+            digest(source_pin["raw_sha256"], "offline SourceV5 raw SHA-256"),
+        )
+    else:
+        source_manifest = source_manifest_preloaded
+    _preflight_offline_probe_evidence(
+        source_manifest, source_pin, pin, capacity_pin, context,
+        recorded_artifacts=closed_recorded,
     )
-    _preflight_offline_probe_evidence(source_manifest, source_pin, pin, capacity_pin, context)
     # The captured SourceV5 campaign verifier checks SourceInventory records only after map closure.
     source_recipe = {
         "schema": EXPECTATION_SCHEMA_V5, "mode": "pressure_validation", "identity": identity,
     }
-    _verify_source_manifest_v5(source_manifest, source_recipe)
+    if not closed_recorded:
+        _verify_source_manifest_v5(source_manifest, source_recipe)
     probe_sha, probe, binary, source_root, _capacity_sha, capacity_path = _check_calibrated_construction_probe_v2_inputs(
         pin, source_manifest, capacity_pin, identity, expected_policy,
         capacity_floor_policy_id,
         artifact_view=_captured_view_for_path(context, pin["path"]),
+        closed_recorded=closed_recorded,
     )
     _verify_capacity_bundle_v5_offline(source_manifest, source_pin, identity, capacity_pin, context)
     receipt_pin = context["probe_capture_pin"]
@@ -2915,7 +3111,14 @@ def validate_calibrated_construction_probe_v2_offline(
         "elapsed_ns", "exit_code", "child_return_code", "timed_out",
         "artifact_budget_exceeded", "cleanup_status",
     }, "owned calibrated probe timing")
-    binary_info = binary.stat(follow_symlinks=False)
+    if closed_recorded:
+        binary_size = uint(direct["binary_size"],
+                           "captured ProbeV2 executable byte size", positive=True,
+                           maximum=MAX_APP_BINARY_BYTES)
+        binary_info_size = binary_size
+    else:
+        binary_info = binary.stat(follow_symlinks=False)
+        binary_info_size = binary_info.st_size
     capture_timeout_ns = uint(receipt["capture_timeout_ns"],
                               "captured ProbeV2 timeout nanoseconds", positive=True,
                               maximum=30_000_000_000)
@@ -2927,7 +3130,13 @@ def validate_calibrated_construction_probe_v2_offline(
             direct["environment_sha256"] == digest_object(receipt["environment"]) and
             direct["binary_path"] == binary_pin["path"] and
             direct["binary_sha256"] == binary_pin["raw_sha256"] and
-            direct["binary_size"] == binary_info.st_size and
+            direct["binary_size"] == binary_info_size and
+            (not closed_recorded or (
+                uint(direct["binary_device"],
+                     "captured ProbeV2 executable device", positive=True) > 0 and
+                uint(direct["binary_inode"],
+                     "captured ProbeV2 executable inode", positive=True) > 0
+            )) and
             direct["cpu_affinity"] == receipt["affinity"] and
             direct["network_namespace_inode"] == receipt["netns"] and
             timing["schema"] == "allocatbelt.application-fixed-pair-direct-launch-time.v1" and
