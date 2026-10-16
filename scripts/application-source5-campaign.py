@@ -12048,15 +12048,23 @@ def build_source5_archive_read_response(
 def _source5_hash_archive_read_bundle(
     path: Path, maximum_bytes: int, label: str,
     cancel_event: threading.Event | None = None,
+    deadline_ns: int | None = None,
+    allocation_block_bytes: int | None = None,
 ) -> tuple[str, int]:
     require(path.is_absolute() and path.resolve(strict=True) == path,
             f"{label} path is not canonical")
     before_path = path.lstat()
+    space = os.statvfs(path.parent)
+    block_bytes = space.f_frsize or space.f_bsize
     require(stat.S_ISREG(before_path.st_mode) and
             before_path.st_uid == os.getuid() and
             stat.S_IMODE(before_path.st_mode) == 0o600 and
             before_path.st_nlink == 1 and
-            0 < before_path.st_size <= maximum_bytes,
+            0 < before_path.st_size <= maximum_bytes and block_bytes > 0 and
+            (allocation_block_bytes is None or
+             block_bytes == allocation_block_bytes) and
+            before_path.st_blocks * 512 <=
+                ((maximum_bytes + block_bytes - 1) // block_bytes) * block_bytes,
             f"{label} is not one bounded private regular file")
     descriptor = os.open(
         path, os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) |
@@ -12068,7 +12076,7 @@ def _source5_hash_archive_read_bundle(
                 f"{label} changed identity before open")
         digest = _source5_hash_open_file(
             descriptor, before.st_size, maximum_bytes, label,
-            cancel_event=cancel_event,
+            cancel_event=cancel_event, deadline_ns=deadline_ns,
         )
         after = os.fstat(descriptor)
         after_path = path.lstat()
@@ -12104,12 +12112,27 @@ def _source5_publish_readback_file(
     directory_fd: int, incoming_name: str, final_name: str,
     expected_sha256: str, expected_bytes: int, maximum_bytes: int,
     label: str, rename_noreplace=None,
+    cancel_event: threading.Event | None = None,
+    deadline_ns: int | None = None,
+    allocation_block_bytes: int | None = None,
 ) -> dict[str, str | int]:
+    def require_window_open(where: str) -> None:
+        require(cancel_event is None or not cancel_event.is_set(),
+                f"{label} publication was cancelled {where}")
+        require(deadline_ns is None or time.monotonic_ns() < deadline_ns,
+                f"{label} publication exceeded its bounded window {where}")
+
     def check(name: str) -> os.stat_result:
+        require_window_open("before file inspection")
         info = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
         require(stat.S_ISREG(info.st_mode) and info.st_uid == os.getuid() and
                 stat.S_IMODE(info.st_mode) == 0o600 and info.st_nlink == 1 and
-                info.st_size == expected_bytes <= maximum_bytes,
+                info.st_size == expected_bytes <= maximum_bytes and
+                (allocation_block_bytes is None or
+                 allocation_block_bytes > 0 and
+                 info.st_blocks * 512 <=
+                    ((maximum_bytes + allocation_block_bytes - 1) //
+                     allocation_block_bytes) * allocation_block_bytes),
                 f"{label} is not its exact bounded regular file")
         descriptor = os.open(
             name, os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) |
@@ -12123,6 +12146,7 @@ def _source5_publish_readback_file(
             digest = hashlib.sha256()
             total = 0
             while total < expected_bytes:
+                require_window_open("while hashing")
                 block = os.read(descriptor, min(
                     SOURCE5_ARCHIVE_READ_COPY_BYTES,
                     expected_bytes - total,
@@ -12144,9 +12168,11 @@ def _source5_publish_readback_file(
         return info
 
     try:
+        require_window_open("before publication")
         final_info = check(final_name)
     except FileNotFoundError:
         check(incoming_name)
+        require_window_open("before atomic rename")
         renamer = (_source5_rename_noreplace if rename_noreplace is None
                    else rename_noreplace)
         renamer(directory_fd, incoming_name, final_name)
@@ -12160,6 +12186,7 @@ def _source5_publish_readback_file(
         if incoming_info is not None:
             os.unlink(incoming_name, dir_fd=directory_fd)
             os.fsync(directory_fd)
+    require_window_open("after publication")
     return {"raw_sha256": expected_sha256,
             "byte_count": final_info.st_size}
 
@@ -12270,6 +12297,16 @@ def _source5_same_file_identity(left: os.stat_result,
             right.st_mtime_ns, right.st_ctime_ns, right.st_nlink, right.st_uid)
 
 
+def _source5_same_directory_identity(left: os.stat_result,
+                                      right: os.stat_result) -> bool:
+    """Keep directory identity stable while owned children change metadata."""
+    return (stat.S_ISDIR(left.st_mode) and stat.S_ISDIR(right.st_mode) and
+            (left.st_dev, left.st_ino, stat.S_IMODE(left.st_mode),
+             left.st_uid, left.st_gid) ==
+            (right.st_dev, right.st_ino, stat.S_IMODE(right.st_mode),
+             right.st_uid, right.st_gid))
+
+
 def _source5_same_mutable_file_object(left: os.stat_result,
                                       right: os.stat_result) -> bool:
     """Compare identity/ownership while an append changes size and timestamps."""
@@ -12283,7 +12320,8 @@ def _source5_same_mutable_file_object(left: os.stat_result,
 
 def _source5_hash_open_file(fd: int, expected_size: int,
                             maximum: int, label: str,
-                            cancel_event: threading.Event | None = None) -> str:
+                            cancel_event: threading.Event | None = None,
+                            deadline_ns: int | None = None) -> str:
     before = os.fstat(fd)
     require(stat.S_ISREG(before.st_mode) and before.st_uid == os.getuid() and
             stat.S_IMODE(before.st_mode) == 0o600 and before.st_nlink == 1 and
@@ -12295,6 +12333,8 @@ def _source5_hash_open_file(fd: int, expected_size: int,
     while total < expected_size:
         require(cancel_event is None or not cancel_event.is_set(),
                 f"{label} verification was cancelled")
+        require(deadline_ns is None or time.monotonic_ns() < deadline_ns,
+                f"{label} verification exceeded its bounded window")
         block = os.read(fd, min(SOURCE5_ARCHIVE_READ_COPY_BYTES,
                                 expected_size - total))
         require(bool(block), f"{label} shortened during bounded hash")
@@ -12311,6 +12351,8 @@ def validate_source5_archive_read_response(
     stage_root: Path, maximum_response_bytes: int,
     signed_manifest: dict[str, Any], *,
     cancel_event: threading.Event | None = None,
+    deadline_ns: int | None = None,
+    allocation_block_bytes: int | None = None,
 ) -> dict[str, Any]:
     """Verify a Root response and stream exact signed objects into a private slot."""
     request = validate_source5_archive_read_request(request_raw)
@@ -12319,6 +12361,10 @@ def validate_source5_archive_read_response(
             type(response_raw) is bytes and
             0 < len(response_raw) <= MAX_SOURCE5_ARCHIVE_READ_METADATA_BYTES,
             "Source5 archive read response document exceeds its pinned bound")
+    _source5_recorded_read_deadline_check(
+        cancel_event, deadline_ns if deadline_ns is not None else
+        (1 << 63) - 1, "Source5 archive read response validation",
+    )
     try:
         response_value = json.loads(response_raw.decode("ascii"))
     except (UnicodeError, json.JSONDecodeError, RecursionError) as error:
@@ -12414,6 +12460,8 @@ def validate_source5_archive_read_response(
             not any(stage_root.iterdir()),
             "Source5 archive read stage is not one empty private directory")
     bundle_before_path = bundle_path.lstat()
+    bundle_space = os.statvfs(bundle_path.parent)
+    bundle_block_bytes = bundle_space.f_frsize or bundle_space.f_bsize
     require(stat.S_ISREG(bundle_before_path.st_mode) and
             bundle_before_path.st_uid == os.getuid() and
             stat.S_IMODE(bundle_before_path.st_mode) == 0o600 and
@@ -12421,6 +12469,14 @@ def validate_source5_archive_read_response(
             bundle_before_path.st_size == bundle_pin["byte_count"] <=
                 maximum_response_bytes,
             "Source5 archive read tar is not the exact bounded private regular file")
+    require(bundle_block_bytes > 0 and
+            (allocation_block_bytes is None or
+             bundle_block_bytes == allocation_block_bytes) and
+            (allocation_block_bytes is None or
+             bundle_before_path.st_blocks * 512 <=
+                ((maximum_response_bytes + allocation_block_bytes - 1) //
+                 allocation_block_bytes) * allocation_block_bytes),
+            "Source5 archive read tar exceeds its block-rounded reservation")
     bundle_fd = os.open(
         bundle_path, os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) |
         getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0),
@@ -12433,7 +12489,7 @@ def validate_source5_archive_read_response(
         bundle_digest = _source5_hash_open_file(
             bundle_fd, bundle_before.st_size, maximum_response_bytes,
             "Source5 archive read response tar",
-            cancel_event=cancel_event,
+            cancel_event=cancel_event, deadline_ns=deadline_ns,
         )
         require(bundle_digest == bundle_pin["raw_sha256"],
                 "Source5 archive read tar raw digest differs from its response pin")
@@ -12447,6 +12503,9 @@ def validate_source5_archive_read_response(
                 for position, pair in enumerate(members):
                     require(cancel_event is None or not cancel_event.is_set(),
                             "Source5 archive readback was cancelled during staging")
+                    require(deadline_ns is None or
+                            time.monotonic_ns() < deadline_ns,
+                            "Source5 archive readback exceeded its bounded staging window")
                     obj, signed = pair
                     try:
                         member = archive.next()
@@ -12479,6 +12538,9 @@ def validate_source5_archive_read_response(
                             require(cancel_event is None or
                                     not cancel_event.is_set(),
                                     "Source5 archive readback was cancelled during object copy")
+                            require(deadline_ns is None or
+                                    time.monotonic_ns() < deadline_ns,
+                                    "Source5 archive readback exceeded its object-copy window")
                             block = input_stream.read(min(
                                 SOURCE5_ARCHIVE_READ_COPY_BYTES,
                                 member.size - total,
@@ -12494,6 +12556,9 @@ def validate_source5_archive_read_response(
                                 require(cancel_event is None or
                                         not cancel_event.is_set(),
                                         "Source5 archive readback was cancelled during staged write")
+                                require(deadline_ns is None or
+                                        time.monotonic_ns() < deadline_ns,
+                                        "Source5 archive readback exceeded its staged-write window")
                                 written = os.write(descriptor, view)
                                 require(written > 0,
                                         "Source5 archive read stage writer made no progress")
@@ -12514,7 +12579,11 @@ def validate_source5_archive_read_response(
                             staged_info.st_uid == os.getuid() and
                             stat.S_IMODE(staged_info.st_mode) == 0o400 and
                             staged_info.st_nlink == 1 and
-                            staged_info.st_size == obj["byte_count"],
+                            staged_info.st_size == obj["byte_count"] and
+                            (allocation_block_bytes is None or
+                             staged_info.st_blocks * 512 <=
+                                ((obj["byte_count"] + allocation_block_bytes - 1) //
+                                 allocation_block_bytes) * allocation_block_bytes),
                             f"Source5 archive read object[{position}] stage is not exact")
                     refs[obj["origin_path"]] = {
                         "origin_path": obj["origin_path"],
@@ -12534,6 +12603,8 @@ def validate_source5_archive_read_response(
                     ) from error
                 require(extra is None,
                         "Source5 archive read tar has an extra or duplicate member")
+            require(deadline_ns is None or time.monotonic_ns() < deadline_ns,
+                    "Source5 archive readback exceeded its final verification window")
         finally:
             duplicate.close()
         bundle_after = os.fstat(bundle_fd)
@@ -12553,6 +12624,1656 @@ def validate_source5_archive_read_response(
                        "byte_count": bundle_pin["byte_count"]},
         "refs": refs,
     }
+
+
+SOURCE5_RECORDED_READ_PLAN_PATH = (
+    "scripts/application-source5-recorded-preparation-read.py"
+)
+SOURCE5_RECORDED_READ_BASIS_SCHEMA = (
+    "allocatbelt.application-source5-recorded-preparation-replay-basis.v1"
+)
+
+
+def _source5_recorded_read_plan_module(
+    basis_value: object, source_manifest_raw: bytes,
+) -> types.ModuleType:
+    """Load the pure replay-plan API from this selected Source inventory only."""
+    require(type(basis_value) is dict and
+            basis_value.get("schema") == SOURCE5_RECORDED_READ_BASIS_SCHEMA,
+            "recorded-read basis schema differs")
+    consumer = basis_value.get("consumer_host_id")
+    source_pins = basis_value.get("source_manifest_pins")
+    module_maps = basis_value.get("source_module_pins")
+    roots = basis_value.get("current_roots")
+    require(type(consumer) is str and type(source_pins) is dict and
+            type(module_maps) is dict and type(roots) is dict and
+            consumer in source_pins and consumer in module_maps and
+            type(source_manifest_raw) is bytes,
+            "recorded-read selected Source identity is incomplete")
+    source_pin = exact(source_pins[consumer], {
+        "path", "raw_sha256", "semantic_sha256",
+    }, "recorded-read selected Source manifest pin")
+    require(sha256(source_manifest_raw) == source_pin["raw_sha256"],
+            "recorded-read selected Source manifest differs from its basis raw pin")
+    try:
+        source = json.loads(source_manifest_raw.decode("ascii"))
+    except (UnicodeError, json.JSONDecodeError, RecursionError) as error:
+        raise Source5CampaignError(
+            "recorded-read selected Source manifest is malformed",
+        ) from error
+    require(type(source) is dict and
+            source_manifest_raw == canonical_bytes(source) and
+            source.get("schema") == "allocatbelt.application-source-manifest.v5" and
+            source.get("manifest_sha256") == source_pin["semantic_sha256"] ==
+                sha256(canonical_bytes({
+                    key: value for key, value in source.items()
+                    if key != "manifest_sha256"
+                })),
+            "recorded-read selected Source manifest raw/semantic identity differs")
+    inventory = source.get("source")
+    require(type(inventory) is dict and type(inventory.get("files")) is list and
+            inventory.get("source_tree_sha256") == sha256(canonical_bytes({
+                "schema": "allocatbelt.application-source-inventory.v1",
+                "entries": inventory["files"],
+            })),
+            "recorded-read selected Source inventory self digest differs")
+    path = SOURCE5_RECORDED_READ_PLAN_PATH
+    selected_modules = module_maps[consumer]
+    require(type(selected_modules) is dict and path in selected_modules,
+            "recorded-read basis omits its selected typed plan module")
+    declared = exact(selected_modules[path], {"path", "sha256"},
+                     "recorded-read typed plan-module pin")
+    matches = [row for row in inventory["files"]
+               if type(row) is dict and row.get("path") == path]
+    require(len(matches) == 1,
+            "recorded-read selected Source inventory lacks one plan module")
+    row = exact(matches[0], {"path", "kind", "mode", "sha256", "size"},
+                 "recorded-read selected Source plan-module row")
+    require(declared == {"path": path, "sha256": row["sha256"]} and
+            row["kind"] == "file" and row["mode"] in {"100644", "100755"} and
+            type(row["size"]) is int and 0 < row["size"] <= MAX_SCRIPT_BYTES and
+            is_sha(row["sha256"]),
+            "recorded-read plan module differs from the selected typed inventory")
+    source_root = Path(os.path.abspath(__file__)).parent.parent
+    source_root = source_root.resolve(strict=True)
+    require(roots.get("source_root") == str(source_root),
+            "recorded-read selected Source root differs from this resident Source")
+    module_path = _safe_child(source_root, path,
+                              "recorded-read selected plan module")
+    raw, actual, info = read_stable(
+        module_path, "recorded-read selected typed plan module", MAX_SCRIPT_BYTES,
+    )
+    mode = f"{stat.S_IFMT(info.st_mode) | stat.S_IMODE(info.st_mode):06o}"
+    require(actual == row["sha256"] and len(raw) == row["size"] and
+            mode == row["mode"],
+            "recorded-read plan module bytes/mode differ from the selected Source pin")
+    module = _load_module(raw, module_path, "recorded_preparation_read_plan")
+    required_apis = (
+        "_validate_basis", "_validate_plan_self", "_validated_plan_context",
+        "recorded_preparation_read_plan_pin_v2",
+        "validate_recorded_preparation_read_window_v2",
+        "build_recorded_preparation_read_request_v2",
+        "validate_recorded_preparation_read_request_v2",
+        "validate_recorded_preparation_read_response_v2",
+        "build_recorded_preparation_read_control_event_v2",
+        "build_recorded_preparation_read_session_descriptor_v2",
+        "project_recorded_preparation_payload_view_v2",
+        "validate_recorded_preparation_payload_view_v2",
+    )
+    require(all(callable(getattr(module, name, None)) for name in required_apis) and
+            getattr(module, "REQUEST_SCHEMA_V2", None) ==
+                "allocatbelt.application-source5-recorded-preparation-read-request.v2" and
+            getattr(module, "RESPONSE_SCHEMA_V2", None) ==
+                "allocatbelt.application-source5-recorded-preparation-read-response.v2",
+            "selected recorded-read plan module exposes a different frozen API")
+    module.__source5_typed_pin__ = dict(declared)
+    return module
+
+
+def _source5_recorded_read_deadline_check(
+    cancel_event: threading.Event | None, deadline_ns: int, label: str,
+) -> None:
+    require(cancel_event is None or not cancel_event.is_set(),
+            f"{label} was cancelled")
+    require(type(deadline_ns) is int and time.monotonic_ns() < deadline_ns,
+            f"{label} exceeded its finite I/O window")
+
+
+_SOURCE5_RECORDED_READ_MANIFEST_SUMMARY_FIELDS = {
+    "schema", "campaign_id", "host_id", "phase", "job_index",
+    "job_ordinal", "job_sha256", "run_id", "job_record_raw_sha256",
+    "predecessor_ack_pin", "object_count", "payload_bytes",
+    "manifest_sha256",
+}
+_SOURCE5_RECORDED_READ_MANIFEST_FIELDS = (
+    _SOURCE5_RECORDED_READ_MANIFEST_SUMMARY_FIELDS | {"objects"}
+)
+_SOURCE5_RECORDED_READ_MANIFEST_OBJECT_FIELDS = {
+    "origin_path", "role", "object_id", "byte_count", "raw_sha256",
+    "semantic_sha256", "object_pin",
+}
+
+
+def _source5_recorded_read_manifest_projection(
+    plan_module: types.ModuleType, plan: dict[str, Any], row: object,
+) -> dict[str, Any]:
+    """Rebuild SourceH's exact legacy importer manifest from the typed row."""
+    checked_row = plan_module._validate_plan_row(
+        plan, row, plan_module._uint(
+            row["read_ordinal"], "recorded-read manifest row ordinal",
+            maximum=plan_module.READ_WINDOW_COUNT - 1,
+        ),
+    )
+    summary = exact(
+        checked_row["manifest_summary"],
+        _SOURCE5_RECORDED_READ_MANIFEST_SUMMARY_FIELDS,
+        "recorded-read Source manifest summary",
+    )
+    pins = exact(checked_row["original_pins"], {
+        "job_record", "request", "checkpoint", "object_manifest", "ack",
+        "signature", "host_receipt",
+    }, "recorded-read Source original pins")
+    manifest_pin = exact(pins["object_manifest"], {
+        "path", "raw_sha256", "semantic_sha256",
+    }, "recorded-read Source manifest pin")
+    require(Path(manifest_pin["path"]).is_absolute() and
+            is_sha(manifest_pin["raw_sha256"]) and
+            is_sha(manifest_pin["semantic_sha256"]),
+            "recorded-read Source manifest pin is malformed")
+    objects = checked_row["objects"]
+    require(type(objects) is list,
+            "recorded-read Source manifest object projection is not a list")
+    projected_objects = []
+    seen_origins = set()
+    payload_bytes = 0
+    for index, value in enumerate(objects):
+        obj = exact(value, _SOURCE5_RECORDED_READ_MANIFEST_OBJECT_FIELDS,
+                    f"recorded-read Source manifest object[{index}]")
+        pin = exact(obj["object_pin"], {
+            "path", "raw_sha256", "semantic_sha256", "byte_count",
+        }, f"recorded-read Source manifest object pin[{index}]")
+        require(type(obj["origin_path"]) is str and
+                Path(obj["origin_path"]).is_absolute() and
+                type(obj["role"]) is str and
+                type(obj["object_id"]) is str and
+                type(obj["byte_count"]) is int and obj["byte_count"] >= 0 and
+                is_sha(obj["raw_sha256"]) and
+                (obj["semantic_sha256"] is None or
+                 is_sha(obj["semantic_sha256"])) and
+                pin["path"] == checked_row["archive_source5_root"] +
+                    "/objects/" + obj["object_id"] and
+                pin["raw_sha256"] == obj["raw_sha256"] and
+                pin["semantic_sha256"] == obj["raw_sha256"] and
+                pin["byte_count"] == obj["byte_count"] and
+                obj["origin_path"] not in seen_origins,
+                f"recorded-read Source manifest object[{index}] differs")
+        seen_origins.add(obj["origin_path"])
+        projected_objects.append({
+            "origin_path": obj["origin_path"], "role": obj["role"],
+            "object_id": obj["object_id"], "byte_count": obj["byte_count"],
+            "raw_sha256": obj["raw_sha256"],
+            "semantic_sha256": obj["semantic_sha256"],
+            "object_pin": pin,
+        })
+        payload_bytes += obj["byte_count"]
+    manifest = {**summary, "objects": projected_objects}
+    exact(manifest, _SOURCE5_RECORDED_READ_MANIFEST_FIELDS,
+          "recorded-read reconstructed Source manifest")
+    body = {key: value for key, value in manifest.items()
+            if key != "manifest_sha256"}
+    require(manifest["schema"] ==
+                "allocatbelt.application-source5-evidence-object-manifest.v1" and
+            manifest["host_id"] == checked_row["owner_host_id"] and
+            manifest["phase"] == checked_row["job"]["phase"] and
+            manifest["job_index"] == checked_row["job_index"] and
+            manifest["job_sha256"] == checked_row["job_sha256"] and
+            manifest["job_ordinal"] == checked_row["job"]["ordinal"] and
+            manifest["run_id"] == checked_row["job"]["run_id"] and
+            manifest["predecessor_ack_pin"] is None and
+            manifest["object_count"] == len(projected_objects) and
+            manifest["payload_bytes"] == payload_bytes and
+            manifest["manifest_sha256"] ==
+                sha256(canonical_bytes(body)) == manifest_pin["semantic_sha256"],
+            "recorded-read reconstructed Source manifest differs from its row/pin")
+    _source5_recorded_read_manifest_raw_pin_join(manifest, manifest_pin)
+    return manifest
+
+
+def _source5_recorded_read_manifest_raw_pin_join(
+    manifest: dict[str, Any], original_manifest_pin: object,
+) -> bytes:
+    """Bind the canonical seven-field projection to its original raw pin."""
+    pin = exact(original_manifest_pin, {
+        "path", "raw_sha256", "semantic_sha256",
+    }, "recorded-read original Source manifest pin")
+    require(type(pin["path"]) is str and Path(pin["path"]).is_absolute() and
+            is_sha(pin["raw_sha256"]) and is_sha(pin["semantic_sha256"]),
+            "recorded-read original Source manifest pin is malformed")
+    raw = canonical_bytes(manifest)
+    require(sha256(raw) == pin["raw_sha256"],
+            "recorded-read reconstructed Source manifest differs from its original raw pin")
+    return raw
+
+
+def _source5_recorded_read_private_file(
+    path: Path, maximum_bytes: int, label: str, *,
+    expected_raw_sha256: str | None = None,
+    expected_bytes: int | None = None,
+    allocation_block_bytes: int | None = None,
+    cancel_event: threading.Event | None = None,
+    deadline_ns: int | None = None,
+) -> tuple[bytes, str, os.stat_result]:
+    _source5_recorded_read_deadline_check(
+        cancel_event, deadline_ns if deadline_ns is not None else
+        (1 << 63) - 1, label,
+    )
+    path = Path(os.path.abspath(path))
+    parent = path.parent
+    require(path.is_absolute() and parent.resolve(strict=True) == parent,
+            f"{label} path or parent is not canonical")
+    parent_path_info = parent.lstat()
+    require(stat.S_ISDIR(parent_path_info.st_mode) and
+            not stat.S_ISLNK(parent_path_info.st_mode) and
+            parent_path_info.st_uid == os.getuid() and
+            stat.S_IMODE(parent_path_info.st_mode) == 0o700,
+            f"{label} parent is not one owned private directory")
+    parent_fd = os.open(
+        parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) |
+        getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+    )
+    try:
+        parent_info = os.fstat(parent_fd)
+        parent_space = os.fstatvfs(parent_fd)
+        actual_block_bytes = parent_space.f_frsize or parent_space.f_bsize
+        require(_source5_same_file_identity(parent_path_info, parent_info),
+                f"{label} parent changed before its bounded read")
+        require(actual_block_bytes > 0 and
+                (allocation_block_bytes is None or
+                 actual_block_bytes == allocation_block_bytes),
+                f"{label} parent allocation block differs from its session")
+        before_path = os.stat(path.name, dir_fd=parent_fd,
+                              follow_symlinks=False)
+        allocation_limit_bytes = (
+            before_path.st_size if expected_bytes is None else expected_bytes
+        )
+        require(stat.S_ISREG(before_path.st_mode) and
+                before_path.st_uid == os.getuid() and
+                stat.S_IMODE(before_path.st_mode) == 0o600 and
+                before_path.st_nlink == 1 and
+                before_path.st_size <= maximum_bytes and
+                before_path.st_blocks * 512 <=
+                    ((allocation_limit_bytes + actual_block_bytes - 1) //
+                     actual_block_bytes) * actual_block_bytes and
+                (expected_bytes is None or
+                 before_path.st_size == expected_bytes),
+                f"{label} is not its exact private mode-0600 single-link file")
+        descriptor = os.open(
+            path.name, os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) |
+            getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0),
+            dir_fd=parent_fd,
+        )
+        try:
+            before = os.fstat(descriptor)
+            require(_source5_same_file_identity(before_path, before),
+                    f"{label} changed identity before its bounded read")
+            hasher = hashlib.sha256()
+            chunks = []
+            total = 0
+            while total < before.st_size:
+                _source5_recorded_read_deadline_check(
+                    cancel_event, deadline_ns if deadline_ns is not None else
+                    (1 << 63) - 1, label,
+                )
+                block = os.read(descriptor, min(
+                    SOURCE5_ARCHIVE_READ_COPY_BYTES,
+                    before.st_size - total,
+                ))
+                require(bool(block), f"{label} ended before its pinned size")
+                total += len(block)
+                require(total <= maximum_bytes and total <= before.st_size,
+                        f"{label} exceeded its exact byte ceiling")
+                hasher.update(block)
+                chunks.append(block)
+            require(os.read(descriptor, 1) == b"" and total == before.st_size,
+                    f"{label} has trailing or changed bytes")
+            after = os.fstat(descriptor)
+            after_path = os.stat(path.name, dir_fd=parent_fd,
+                                 follow_symlinks=False)
+            digest = hasher.hexdigest()
+            require(_source5_same_file_identity(before, after) and
+                    _source5_same_file_identity(before, after_path) and
+                    (expected_raw_sha256 is None or
+                     digest == expected_raw_sha256),
+                    f"{label} changed during its stable read or differs from its pin")
+            _source5_recorded_read_deadline_check(
+                cancel_event, deadline_ns if deadline_ns is not None else
+                (1 << 63) - 1, label,
+            )
+            return b"".join(chunks), digest, after
+        finally:
+            os.close(descriptor)
+    finally:
+        os.close(parent_fd)
+
+
+def _source5_recorded_read_window_chunk(
+    plan: dict[str, Any], plan_pin: dict[str, Any],
+    plan_module: types.ModuleType, read_ordinal: int, *,
+    cancel_event: threading.Event | None = None,
+    deadline_ns: int | None = None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    ordinal = plan_module._uint(
+        read_ordinal, "recorded-read chunk ordinal",
+        maximum=plan_module.READ_WINDOW_COUNT - 1,
+    )
+    index = plan["window_index"][ordinal]
+    ref = plan["window_chunks"][index["chunk_ordinal"]]
+    expected_path = (
+        Path(plan["session_paths"]["window_metadata_root"]) /
+        f"chunk-{ref['chunk_ordinal']:06d}.json"
+    )
+    require(ref["pin"]["path"] == expected_path.as_posix(),
+            "recorded-read chunk path differs from the nonce-bound plan")
+    raw, digest, _info = _source5_recorded_read_private_file(
+        Path(ref["pin"]["path"]), MAX_SOURCE5_ARCHIVE_READ_METADATA_BYTES,
+        "recorded-read current window metadata chunk",
+        expected_raw_sha256=ref["pin"]["raw_sha256"],
+        expected_bytes=ref["byte_count"],
+        allocation_block_bytes=plan["scratch_declaration"][
+            "allocation_block_bytes"],
+        cancel_event=cancel_event, deadline_ns=deadline_ns,
+    )
+    require(digest == ref["pin"]["raw_sha256"],
+            "recorded-read current chunk raw digest differs")
+    try:
+        chunk = json.loads(raw.decode("ascii"))
+    except (UnicodeError, json.JSONDecodeError, RecursionError) as error:
+        raise Source5CampaignError(
+            "recorded-read current window metadata chunk is malformed",
+        ) from error
+    require(raw == canonical_bytes(chunk),
+            "recorded-read current window metadata chunk is not canonical")
+    row = plan_module.validate_recorded_preparation_read_window_v2(
+        plan, plan_pin, chunk, ordinal,
+    )
+    return chunk, row
+
+
+def _source5_wait_for_recorded_read_publication(
+    slot_root: Path, request_name: str, response_incoming_name: str,
+    response_name: str, bundle_incoming_name: str, bundle_name: str, *,
+    stage_name: str,
+    request_maximum_bytes: int, response_maximum_bytes: int,
+    bundle_maximum_bytes: int, device_id: int,
+    allocation_block_bytes: int, deadline_ns: int,
+    cancel_event: threading.Event | None = None,
+) -> None:
+    """Wait for exact final response/tar slots across bounded rename windows."""
+    require(slot_root.is_absolute() and slot_root.resolve(strict=True) == slot_root,
+            "recorded-read publication slot root is not canonical")
+    directory_info = slot_root.lstat()
+    require(stat.S_ISDIR(directory_info.st_mode) and
+            not stat.S_ISLNK(directory_info.st_mode) and
+            directory_info.st_uid == os.getuid() and
+            stat.S_IMODE(directory_info.st_mode) == 0o700 and
+            directory_info.st_dev == device_id,
+            "recorded-read publication slot root is not its private declared device")
+    directory_fd = os.open(
+        slot_root, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) |
+        getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+    )
+    try:
+        opened_directory = os.fstat(directory_fd)
+        require(_source5_same_directory_identity(directory_info, opened_directory) and
+                slot_root.resolve(strict=True) == slot_root,
+                "recorded-read publication slot root changed before wait")
+        space = os.fstatvfs(directory_fd)
+        current_block = space.f_frsize or space.f_bsize
+        require(current_block == allocation_block_bytes,
+                "recorded-read publication slot allocation block differs")
+        file_names = {
+            request_name, response_incoming_name, response_name,
+            bundle_incoming_name, bundle_name,
+        }
+        require(type(stage_name) is str and stage_name not in file_names and
+                stage_name not in {"", ".", ".."} and
+                Path(stage_name).name == stage_name and
+                "/" not in stage_name and "\\" not in stage_name and
+                "\x00" not in stage_name,
+                "recorded-read planned stage directory name is malformed")
+        expected_names = file_names | {stage_name}
+        caps = {
+            request_name: request_maximum_bytes,
+            response_incoming_name: response_maximum_bytes,
+            response_name: response_maximum_bytes,
+            bundle_incoming_name: bundle_maximum_bytes,
+            bundle_name: bundle_maximum_bytes,
+        }
+        stage_identity = None
+        while True:
+            _source5_recorded_read_deadline_check(
+                cancel_event, deadline_ns,
+                "recorded-read response/bundle publication wait",
+            )
+            names = set(os.listdir(directory_fd))
+            require(names <= expected_names and stage_name in names,
+                    "recorded-read publication slot contains an undeclared path")
+            try:
+                stage_path_info = os.stat(
+                    stage_name, dir_fd=directory_fd,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError as error:
+                raise Source5CampaignError(
+                    "recorded-read planned stage directory disappeared during publication",
+                ) from error
+            require(stat.S_ISDIR(stage_path_info.st_mode) and
+                    stage_path_info.st_uid == os.getuid() and
+                    stat.S_IMODE(stage_path_info.st_mode) == 0o700 and
+                    stage_path_info.st_dev == device_id,
+                    "recorded-read planned stage is not a private same-device directory")
+            stage_fd = os.open(
+                stage_name, os.O_RDONLY |
+                getattr(os, "O_DIRECTORY", 0) |
+                getattr(os, "O_CLOEXEC", 0) |
+                getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=directory_fd,
+            )
+            try:
+                opened_stage = os.fstat(stage_fd)
+                require(_source5_same_file_identity(
+                            stage_path_info, opened_stage,
+                        ) and not os.listdir(stage_fd),
+                        "recorded-read planned stage changed or became nonempty during publication")
+                if stage_identity is None:
+                    stage_identity = opened_stage
+                else:
+                    require(_source5_same_file_identity(
+                                stage_identity, opened_stage,
+                            ),
+                            "recorded-read planned stage identity changed during publication")
+            finally:
+                os.close(stage_fd)
+            entries = {}
+            for name in file_names:
+                try:
+                    info = os.stat(name, dir_fd=directory_fd,
+                                   follow_symlinks=False)
+                except FileNotFoundError:
+                    continue
+                maximum = caps[name]
+                require(stat.S_ISREG(info.st_mode) and
+                        info.st_uid == os.getuid() and
+                        stat.S_IMODE(info.st_mode) == 0o600 and
+                        info.st_nlink == 1 and info.st_size <= maximum and
+                        info.st_blocks * 512 <=
+                            ((maximum + allocation_block_bytes - 1) //
+                             allocation_block_bytes) * allocation_block_bytes,
+                        f"recorded-read publication member {name} is not a bounded private file")
+                entries[name] = info
+            require(request_name in entries,
+                    "recorded-read publication wait lost its exact current request")
+            response_incoming = response_incoming_name in entries
+            response_final = response_name in entries
+            bundle_incoming = bundle_incoming_name in entries
+            bundle_final = bundle_name in entries
+            require(not (response_incoming and response_final) and
+                    not (bundle_incoming and bundle_final),
+                    "recorded-read publisher left an incoming/final duplicate")
+            if response_final and bundle_final:
+                require(not response_incoming and not bundle_incoming,
+                        "recorded-read complete final pair retains incoming duplicates")
+                _source5_recorded_read_deadline_check(
+                    cancel_event, deadline_ns,
+                    "recorded-read after final publication pair",
+                )
+                return
+            time.sleep(0.05)
+    finally:
+        os.close(directory_fd)
+
+
+def _source5_recorded_read_chunk_file(
+    path: Path, raw: bytes, label: str, *,
+    allocation_block_bytes: int,
+    cancel_event: threading.Event | None = None,
+    deadline_ns: int | None = None, sync_parent: bool = False,
+) -> str:
+    _source5_recorded_read_deadline_check(
+        cancel_event, deadline_ns if deadline_ns is not None else
+        (1 << 63) - 1, label,
+    )
+    require(path.is_absolute() and path.parent.is_dir() and
+            path.parent.resolve(strict=True) == path.parent,
+            f"refusing to replace {label} at {path}")
+    parent_info = path.parent.lstat()
+    require(stat.S_ISDIR(parent_info.st_mode) and
+            parent_info.st_uid == os.getuid() and
+            stat.S_IMODE(parent_info.st_mode) == 0o700,
+            f"{label} parent is not one exact private directory")
+    parent_fd = os.open(
+        path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) |
+        getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+    )
+    descriptor = -1
+    created = False
+    try:
+        opened_parent = os.fstat(parent_fd)
+        require(_source5_same_file_identity(parent_info, opened_parent) and
+                not path.exists() and not path.is_symlink(),
+                f"{label} destination or parent changed before creation")
+        descriptor = os.open(
+            path.name, os.O_WRONLY | os.O_CREAT | os.O_EXCL |
+            getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+            0o600, dir_fd=parent_fd,
+        )
+        created = True
+        os.fchmod(descriptor, 0o600)
+        view = memoryview(raw)
+        while view:
+            _source5_recorded_read_deadline_check(
+                cancel_event, deadline_ns if deadline_ns is not None else
+                (1 << 63) - 1, label,
+            )
+            written = os.write(descriptor, view)
+            require(written > 0, f"{label} writer made no progress")
+            view = view[written:]
+        os.fsync(descriptor)
+        info = os.fstat(descriptor)
+        path_info = os.stat(path.name, dir_fd=parent_fd,
+                            follow_symlinks=False)
+        require(type(allocation_block_bytes) is int and
+                allocation_block_bytes > 0,
+                f"{label} allocation block is invalid")
+        require(stat.S_ISREG(info.st_mode) and info.st_uid == os.getuid() and
+                stat.S_IMODE(info.st_mode) == 0o600 and info.st_nlink == 1 and
+                info.st_size == len(raw) and
+                info.st_blocks * 512 <=
+                    ((len(raw) + allocation_block_bytes - 1) //
+                     allocation_block_bytes) * allocation_block_bytes and
+                _source5_same_file_identity(info, path_info),
+                f"{label} writer did not create the exact private file")
+        _source5_recorded_read_deadline_check(
+            cancel_event, deadline_ns if deadline_ns is not None else
+            (1 << 63) - 1, label,
+        )
+        if sync_parent:
+            os.fsync(parent_fd)
+    except BaseException:
+        if descriptor >= 0:
+            os.close(descriptor)
+        if created:
+            try:
+                os.unlink(path.name, dir_fd=parent_fd)
+            except FileNotFoundError:
+                pass
+        os.close(parent_fd)
+        raise
+    os.close(descriptor)
+    os.close(parent_fd)
+    return sha256(raw)
+
+
+def _source5_recorded_read_check_scratch(plan: dict[str, Any]) -> None:
+    root = Path(plan["scratch_declaration"]["root"])
+    info = root.lstat()
+    require(stat.S_ISDIR(info.st_mode) and
+            not stat.S_ISLNK(info.st_mode) and
+            info.st_uid == os.getuid() and
+            stat.S_IMODE(info.st_mode) == 0o700 and
+            info.st_dev == plan["scratch_declaration"]["device_id"] and
+            root.resolve(strict=True) == root,
+            "recorded-read current scratch root changed identity or mode")
+    fs_info = os.statvfs(root)
+    block_bytes = fs_info.f_frsize or fs_info.f_bsize
+    projection = plan["resource_projection"]
+    require(block_bytes == plan["scratch_declaration"]["allocation_block_bytes"] and
+            fs_info.f_bavail * block_bytes >=
+                projection["window_physical_bytes"] and
+            fs_info.f_favail >= projection["window_inodes"],
+            "recorded-read current scratch device lacks one exact payload window")
+    _source5_recorded_read_check_directory_metadata(plan)
+
+
+def _source5_recorded_read_check_directory_metadata(
+    plan: dict[str, Any],
+) -> int:
+    paths = plan["session_paths"]["directories"]
+    require(type(paths) is list and len(paths) == 8 and len(set(paths)) == 8,
+            "recorded-read directory metadata set differs from its exact layout")
+    total_allocated = 0
+    for index, path_text in enumerate(paths):
+        path = Path(path_text)
+        info = path.lstat()
+        require(stat.S_ISDIR(info.st_mode) and
+                not stat.S_ISLNK(info.st_mode) and
+                info.st_uid == os.getuid() and
+                stat.S_IMODE(info.st_mode) == 0o700 and
+                info.st_dev == plan["scratch_declaration"]["device_id"] and
+                path.resolve(strict=True) == path,
+                f"recorded-read directory[{index}] changed identity or mode")
+        total_allocated += info.st_blocks * 512
+    require(total_allocated <=
+                plan["scratch_declaration"]["directory_metadata_reserve_bytes"] and
+            total_allocated <=
+                plan["resource_projection"]["directory_metadata_reserve_bytes"],
+            "recorded-read session directories exceed their aggregate physical reserve")
+    return total_allocated
+
+
+def _source5_recorded_read_session_documents(
+    basis_value: object, basis_pin_value: object,
+    plan_value: object, plan_pin_value: object,
+    plan_module: types.ModuleType, *, create_missing: bool,
+    window_chunk_values: object = None,
+    cancel_event: threading.Event | None = None,
+    deadline_ns: int | None = None,
+) -> tuple[dict[str, Any], dict[str, str], dict[str, Any], dict[str, str],
+           dict[str, Any]]:
+    basis, basis_pin, plan, plan_pin = plan_module._validated_plan_context(
+        basis_value, basis_pin_value, plan_value, plan_pin_value,
+    )
+    _source5_recorded_read_deadline_check(
+        cancel_event, deadline_ns if deadline_ns is not None else
+        (1 << 63) - 1, "recorded-read session documents",
+    )
+    root = Path(plan["scratch_declaration"]["root"])
+    root_info = root.lstat()
+    require(stat.S_ISDIR(root_info.st_mode) and
+            not stat.S_ISLNK(root_info.st_mode) and
+            root_info.st_uid == os.getuid() and
+            stat.S_IMODE(root_info.st_mode) == 0o700 and
+            root_info.st_dev == plan["scratch_declaration"]["device_id"] and
+            root.resolve(strict=True) == root,
+            "recorded-read Source scratch root differs from its exact device/mode declaration")
+    fs_info = os.statvfs(root)
+    projection = plan["resource_projection"]
+    allocation_block_bytes = fs_info.f_frsize or fs_info.f_bsize
+    require(allocation_block_bytes ==
+                plan["scratch_declaration"]["allocation_block_bytes"] and
+            fs_info.f_bavail * allocation_block_bytes >=
+                (projection["required_bytes"] if create_missing else
+                 projection["window_physical_bytes"]) and
+            fs_info.f_favail >=
+                (projection["required_inodes"] if create_missing else
+                 projection["window_inodes"]),
+            "recorded-read current scratch device/free-space declaration differs")
+    basis_raw = canonical_bytes(basis)
+    plan_raw = canonical_bytes(plan)
+    session, session_raw, session_pin = \
+        plan_module.build_recorded_preparation_read_session_descriptor_v2(
+            plan, plan_pin,
+        )
+    directories = plan["session_paths"]["directories"]
+    require(type(directories) is list and len(directories) == 8,
+            "recorded-read session directory set differs from its exact layout")
+    chunk_root = Path(plan["session_paths"]["window_metadata_root"])
+    chunk_root_preexisting = chunk_root.exists() or chunk_root.is_symlink()
+    for directory in directories:
+        _source5_recorded_read_deadline_check(
+            cancel_event, deadline_ns if deadline_ns is not None else
+            (1 << 63) - 1, "recorded-read session directory setup",
+        )
+        path = Path(directory)
+        if create_missing:
+            _private_directory(path)
+        else:
+            info = path.lstat()
+            require(stat.S_ISDIR(info.st_mode) and
+                    not stat.S_ISLNK(info.st_mode) and
+                    info.st_uid == os.getuid() and
+                    stat.S_IMODE(info.st_mode) == 0o700 and
+                    info.st_dev == plan["scratch_declaration"]["device_id"] and
+                    path.resolve(strict=True) == path,
+                    "recorded-read persisted session directory changed identity or mode")
+    if create_missing and chunk_root_preexisting:
+        parent_fd = os.open(
+            chunk_root.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) |
+            getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+        )
+        try:
+            os.fsync(parent_fd)
+        finally:
+            os.close(parent_fd)
+    expected = (
+        (Path(basis_pin["path"]), basis_raw,
+         basis_pin["raw_sha256"], "recorded-read basis"),
+        (Path(plan_pin["path"]), plan_raw,
+         plan_pin["raw_sha256"], "recorded-read plan"),
+        (Path(session_pin["path"]), session_raw,
+         session_pin["raw_sha256"], "recorded-read session descriptor"),
+    )
+    for path, raw, digest, label in expected:
+        _source5_recorded_read_deadline_check(
+            cancel_event, deadline_ns if deadline_ns is not None else
+            (1 << 63) - 1, label,
+        )
+        if not path.exists() and not path.is_symlink():
+            require(create_missing,
+                    f"{label} is absent from the current private session")
+            _source5_recorded_read_chunk_file(
+                path, raw, label, cancel_event=cancel_event,
+                allocation_block_bytes=plan["scratch_declaration"][
+                    "allocation_block_bytes"],
+                deadline_ns=deadline_ns, sync_parent=True,
+            )
+        existing, actual, info = _source5_recorded_read_private_file(
+            path, MAX_SOURCE5_ARCHIVE_READ_METADATA_BYTES, label,
+            expected_raw_sha256=digest, expected_bytes=len(raw),
+            allocation_block_bytes=plan["scratch_declaration"][
+                "allocation_block_bytes"],
+            cancel_event=cancel_event, deadline_ns=deadline_ns,
+        )
+        require(existing == raw and actual == digest,
+                f"persisted {label} bytes differ from their exact current plan")
+
+    chunk_refs = plan["window_chunks"]
+    require(type(chunk_refs) is list and chunk_refs and
+            (window_chunk_values is None or
+             type(window_chunk_values) is list and
+             len(window_chunk_values) == len(chunk_refs)) and
+            (not create_missing or window_chunk_values is not None),
+            "recorded-read chunk documents do not match the exact plan index")
+    expected_names = {
+        f"chunk-{ref['chunk_ordinal']:06d}.json" for ref in chunk_refs
+    }
+    present_names = set(os.listdir(chunk_root))
+    require(present_names <= expected_names,
+            "recorded-read metadata directory contains an unplanned entry")
+    missing_refs = [
+        ref for ref in chunk_refs
+        if f"chunk-{ref['chunk_ordinal']:06d}.json" not in present_names
+    ]
+    chunk_block = projection["window_metadata_allocation_block_bytes"]
+    missing_allocated_bytes = sum(
+        ((ref["byte_count"] + chunk_block - 1) // chunk_block) * chunk_block
+        for ref in missing_refs
+    )
+    current_root_info = root.lstat()
+    current_fs_info = os.statvfs(root)
+    current_block = current_fs_info.f_frsize or current_fs_info.f_bsize
+    require(_source5_same_directory_identity(root_info, current_root_info) and
+            root.resolve(strict=True) == root and
+            current_root_info.st_dev == plan["scratch_declaration"]["device_id"] and
+            current_block == plan["scratch_declaration"]["allocation_block_bytes"] and
+            current_fs_info.f_bavail * current_block >= missing_allocated_bytes and
+            current_fs_info.f_favail >= len(missing_refs),
+            "recorded-read scratch device/block/resources changed before chunk publication")
+    for chunk_index, ref in enumerate(chunk_refs):
+        _source5_recorded_read_deadline_check(
+            cancel_event, deadline_ns if deadline_ns is not None else
+            (1 << 63) - 1, f"recorded-read chunk[{chunk_index}]",
+        )
+        path = Path(ref["pin"]["path"])
+        require(path.parent == chunk_root and
+                path.name == f"chunk-{chunk_index:06d}.json",
+                "recorded-read chunk pin escaped its exact metadata directory")
+        if window_chunk_values is None:
+            raw, digest, _chunk_info = _source5_recorded_read_private_file(
+                path, MAX_SOURCE5_ARCHIVE_READ_METADATA_BYTES,
+                f"recorded-read persisted window chunk[{chunk_index}]",
+                expected_raw_sha256=ref["pin"]["raw_sha256"],
+                expected_bytes=ref["byte_count"],
+                allocation_block_bytes=plan["scratch_declaration"][
+                    "allocation_block_bytes"],
+                cancel_event=cancel_event, deadline_ns=deadline_ns,
+            )
+            require(digest == ref["pin"]["raw_sha256"],
+                    f"recorded-read persisted chunk[{chunk_index}] raw digest differs")
+            try:
+                chunk = json.loads(raw.decode("ascii"))
+            except (UnicodeError, json.JSONDecodeError, RecursionError) as error:
+                raise Source5CampaignError(
+                    f"recorded-read persisted chunk[{chunk_index}] is malformed",
+                ) from error
+            require(raw == canonical_bytes(chunk),
+                    f"recorded-read persisted chunk[{chunk_index}] is not canonical")
+        else:
+            chunk = window_chunk_values[chunk_index]
+            raw = canonical_bytes(chunk)
+            require(len(raw) == ref["byte_count"] and
+                    sha256(raw) == ref["pin"]["raw_sha256"],
+                    f"recorded-read supplied chunk[{chunk_index}] raw pin differs")
+        plan_module.validate_recorded_preparation_read_window_v2(
+            plan, plan_pin, chunk, ref["first_read_ordinal"],
+        )
+        if not path.exists() and not path.is_symlink():
+            require(create_missing and window_chunk_values is not None,
+                    f"recorded-read persisted chunk[{chunk_index}] is absent")
+            _source5_recorded_read_chunk_file(
+                path, raw, f"recorded-read chunk[{chunk_index}]",
+                allocation_block_bytes=plan["scratch_declaration"][
+                    "allocation_block_bytes"],
+                cancel_event=cancel_event, deadline_ns=deadline_ns,
+            )
+        else:
+            existing, actual, _chunk_info = _source5_recorded_read_private_file(
+                path, MAX_SOURCE5_ARCHIVE_READ_METADATA_BYTES,
+                f"recorded-read persisted chunk[{chunk_index}]",
+                expected_raw_sha256=ref["pin"]["raw_sha256"],
+                expected_bytes=ref["byte_count"],
+                allocation_block_bytes=plan["scratch_declaration"][
+                    "allocation_block_bytes"],
+                cancel_event=cancel_event, deadline_ns=deadline_ns,
+            )
+            require(existing == raw and actual == ref["pin"]["raw_sha256"],
+                    f"recorded-read persisted chunk[{chunk_index}] differs from its plan")
+    require(set(os.listdir(chunk_root)) == expected_names,
+            "recorded-read metadata directory does not contain the exact planned chunks")
+    if create_missing:
+        _source5_recorded_read_deadline_check(
+            cancel_event, deadline_ns if deadline_ns is not None else
+            (1 << 63) - 1, "recorded-read metadata directory fsync",
+        )
+        chunk_dir_fd = os.open(
+            chunk_root, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) |
+            getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+        )
+        try:
+            os.fsync(chunk_dir_fd)
+        finally:
+            os.close(chunk_dir_fd)
+    _source5_recorded_read_check_directory_metadata(plan)
+    current_fs_info = os.statvfs(root)
+    current_allocation_block_bytes = (
+        current_fs_info.f_frsize or current_fs_info.f_bsize
+    )
+    require(current_allocation_block_bytes ==
+                plan["scratch_declaration"]["allocation_block_bytes"] and
+            current_fs_info.f_bavail * current_allocation_block_bytes >=
+                projection["window_physical_bytes"] and
+            current_fs_info.f_favail >= projection["window_inodes"],
+            "recorded-read current scratch root lacks one exact payload window")
+    return basis, basis_pin, plan, plan_pin, session
+
+
+def _source5_recorded_read_control_event(
+    plan_module: types.ModuleType, plan: dict[str, Any],
+    plan_pin: dict[str, str], read_ordinal: int,
+    window_chunk: dict[str, Any], action: str,
+    request_pin: dict[str, Any], response_pin=None, bundle_pin=None,
+) -> dict[str, Any]:
+    return plan_module.build_recorded_preparation_read_control_event_v2(
+        plan, plan_pin, read_ordinal, window_chunk, action,
+        request_pin=request_pin, response_pin=response_pin,
+        bundle_pin=bundle_pin,
+    )
+
+
+def _source5_recorded_read_ledger_fd(
+    plan: dict[str, Any], plan_module: types.ModuleType,
+) -> int:
+    path = Path(plan["session_paths"]["control_ledger"])
+    maximum = plan["resource_projection"]["control_ledger_bytes"]
+    if not path.exists() and not path.is_symlink():
+        _source5_recorded_read_chunk_file(
+            path, b"", "recorded-read current control ledger",
+            allocation_block_bytes=plan["scratch_declaration"][
+                "allocation_block_bytes"],
+            sync_parent=True,
+        )
+    info = path.lstat()
+    require(stat.S_ISREG(info.st_mode) and info.st_uid == os.getuid() and
+            stat.S_IMODE(info.st_mode) == 0o600 and info.st_nlink == 1 and
+            0 <= info.st_size <= maximum and
+            info.st_blocks * 512 <=
+                plan["resource_projection"]["control_ledger_allocated_bytes"],
+            "recorded-read current control ledger is not one bounded private file")
+    descriptor = os.open(
+        path, os.O_RDWR | getattr(os, "O_CLOEXEC", 0) |
+        getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0),
+    )
+    try:
+        opened = os.fstat(descriptor)
+        require(_source5_same_file_identity(info, opened),
+                "recorded-read current control ledger changed before open")
+        try:
+            import fcntl
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except (ImportError, OSError) as error:
+            raise Source5CampaignError(
+                "recorded-read current control ledger is already leased",
+            ) from error
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _source5_recorded_read_ledger_state(
+    descriptor: int, basis: dict[str, Any], basis_pin: dict[str, Any],
+    plan: dict[str, Any], plan_pin: dict[str, str],
+    plan_module: types.ModuleType,
+    *, cancel_event: threading.Event | None = None,
+    deadline_ns: int | None = None,
+) -> tuple[int, dict[str, Any] | None, str]:
+    info = os.fstat(descriptor)
+    maximum = plan["resource_projection"]["control_ledger_bytes"]
+    maximum_line = plan["resource_projection"][
+        "control_ledger_maximum_line_bytes"]
+    require(stat.S_ISREG(info.st_mode) and info.st_uid == os.getuid() and
+            stat.S_IMODE(info.st_mode) == 0o600 and info.st_nlink == 1 and
+            info.st_blocks * 512 <=
+                plan["resource_projection"]["control_ledger_allocated_bytes"] and
+            0 <= info.st_size <= maximum,
+            "recorded-read current control ledger exceeded its exact allocation")
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    data = bytearray()
+    while len(data) < info.st_size:
+        _source5_recorded_read_deadline_check(
+            cancel_event, deadline_ns if deadline_ns is not None else
+            (1 << 63) - 1, "recorded-read current control-ledger read",
+        )
+        block = os.read(descriptor, min(
+            SOURCE5_ARCHIVE_READ_COPY_BYTES, info.st_size - len(data),
+        ))
+        require(bool(block),
+                "recorded-read current control ledger shortened during replay")
+        data.extend(block)
+        require(len(data) <= maximum,
+                "recorded-read current control ledger exceeded its byte ceiling")
+    require(os.read(descriptor, 1) == b"" and
+            _source5_same_file_identity(info, os.fstat(descriptor)),
+            "recorded-read current control ledger changed while reading")
+    raw = bytes(data)
+    previous = "0" * 64
+    count = 0
+    cached_chunk_ordinal = None
+    cached_window_chunk = None
+    lines = raw.splitlines(keepends=True)
+    require(b"".join(lines) == raw and
+            all(line.endswith(b"\n") and len(line) <= maximum_line
+                for line in lines),
+            "recorded-read current control ledger has an incomplete or oversized line")
+    for line_index, line in enumerate(lines):
+        _source5_recorded_read_deadline_check(
+            cancel_event, deadline_ns if deadline_ns is not None else
+            (1 << 63) - 1, "recorded-read control-ledger replay",
+        )
+        try:
+            envelope = json.loads(line.decode("ascii"))
+        except (UnicodeError, json.JSONDecodeError, RecursionError) as error:
+            raise Source5CampaignError(
+                "recorded-read current control ledger line is malformed",
+            ) from error
+        envelope = exact(envelope, {
+            "previous_sha256", "record", "record_sha256",
+        }, f"recorded-read current control event[{line_index}]")
+        event = envelope["record"]
+        require(line == canonical_bytes(envelope) and
+                envelope["previous_sha256"] == previous and
+                envelope["record_sha256"] == sha256(canonical_bytes({
+                    "previous_sha256": previous, "record": event,
+                })),
+                "recorded-read current control ledger chain digest differs")
+        ordinal = count // 2
+        require(ordinal < plan_module.READ_WINDOW_COUNT,
+                "recorded-read current control ledger exceeds its exact schedule")
+        current_chunk_ordinal = plan["window_index"][ordinal]["chunk_ordinal"]
+        if current_chunk_ordinal != cached_chunk_ordinal:
+            cached_window_chunk, _row = _source5_recorded_read_window_chunk(
+                plan, plan_pin, plan_module, ordinal,
+                cancel_event=cancel_event, deadline_ns=deadline_ns,
+            )
+            cached_chunk_ordinal = current_chunk_ordinal
+        window_chunk = cached_window_chunk
+        request, request_raw, request_pin = \
+            plan_module.build_recorded_preparation_read_request_v2(
+                basis, basis_pin, plan, plan_pin, ordinal, window_chunk,
+            )
+        expected_request_pin = {
+            "path": request_pin["path"],
+            "raw_sha256": request_pin["raw_sha256"],
+            "semantic_sha256": request_pin["semantic_sha256"],
+        }
+        if count % 2 == 0:
+            expected_event = _source5_recorded_read_control_event(
+                plan_module, plan, plan_pin, ordinal, window_chunk,
+                "request_published",
+                expected_request_pin,
+            )
+        else:
+            response_pin = exact(event.get("response_pin"), {
+                "path", "raw_sha256", "semantic_sha256",
+            }, "recorded-read control outer response pin")
+            bundle_pin = exact(event.get("bundle_pin"), {
+                "path", "raw_sha256", "byte_count",
+            }, "recorded-read control bundle pin")
+            expected_event = _source5_recorded_read_control_event(
+                plan_module, plan, plan_pin, ordinal, window_chunk,
+                "view_released",
+                expected_request_pin, response_pin, bundle_pin,
+            )
+        require(event == expected_event and
+                event["sequence"] == count + 1,
+                "recorded-read current control event differs from its exact plan row")
+        previous = envelope["record_sha256"]
+        count += 1
+    require(count <= plan["resource_projection"]["control_event_count"],
+            "recorded-read current control ledger exceeds its reserved schedule")
+    pending = None
+    if count % 2:
+        ordinal = count // 2
+        current_chunk_ordinal = plan["window_index"][ordinal]["chunk_ordinal"]
+        if current_chunk_ordinal != cached_chunk_ordinal:
+            cached_window_chunk, _row = _source5_recorded_read_window_chunk(
+                plan, plan_pin, plan_module, ordinal,
+                cancel_event=cancel_event, deadline_ns=deadline_ns,
+            )
+        window_chunk = cached_window_chunk
+        _request, _raw, pin = \
+            plan_module.build_recorded_preparation_read_request_v2(
+                basis, basis_pin, plan, plan_pin, ordinal, window_chunk,
+            )
+        pending = {key: pin[key] for key in (
+            "path", "raw_sha256", "semantic_sha256",
+        )}
+    return count // 2, pending, previous
+
+
+def _source5_append_recorded_read_control_event(
+    descriptor: int, plan: dict[str, Any], event: dict[str, Any],
+    previous: str, plan_module: types.ModuleType,
+    *, cancel_event: threading.Event | None = None,
+    deadline_ns: int | None = None,
+) -> str:
+    line = canonical_bytes({
+        "previous_sha256": previous,
+        "record": event,
+        "record_sha256": sha256(canonical_bytes({
+            "previous_sha256": previous, "record": event,
+        })),
+    })
+    maximum = plan["resource_projection"]["control_ledger_bytes"]
+    maximum_line = plan["resource_projection"][
+        "control_ledger_maximum_line_bytes"]
+    before = os.fstat(descriptor)
+    require(len(line) <= maximum_line and before.st_size + len(line) <= maximum,
+            "recorded-read current control event exceeds its exact byte reservation")
+    os.lseek(descriptor, 0, os.SEEK_END)
+    view = memoryview(line)
+    while view:
+        _source5_recorded_read_deadline_check(
+            cancel_event, deadline_ns if deadline_ns is not None else
+            (1 << 63) - 1, "recorded-read current control-ledger append",
+        )
+        written = os.write(descriptor, view)
+        require(written > 0,
+                "recorded-read current control ledger writer made no progress")
+        view = view[written:]
+    os.fsync(descriptor)
+    info = os.fstat(descriptor)
+    require(info.st_size == before.st_size + len(line) and
+            info.st_blocks * 512 <=
+                plan["resource_projection"]["control_ledger_allocated_bytes"] and
+            stat.S_ISREG(info.st_mode) and info.st_uid == os.getuid() and
+            stat.S_IMODE(info.st_mode) == 0o600 and info.st_nlink == 1 and
+            _source5_same_mutable_file_object(before, info),
+            "recorded-read current control event failed stable append verification")
+    parent_fd = os.open(
+        Path(plan["session_paths"]["control_ledger"]).parent,
+        os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) |
+        getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+    )
+    try:
+        os.fsync(parent_fd)
+    finally:
+        os.close(parent_fd)
+    return json.loads(line.decode("ascii"))["record_sha256"]
+
+
+def publish_recorded_preparation_readback_v1(
+    basis_value: object, basis_pin_value: object,
+    read_plan_value: object, read_plan_pin_value: object,
+    read_ordinal: object, source_manifest_raw: bytes, *,
+    cancel_event: threading.Event | None = None,
+    deadline_ns: int | None = None, rename_noreplace=None,
+) -> dict[str, Any]:
+    """Publish one validated outer response and tar into this exact nonce slot."""
+    module = _source5_recorded_read_plan_module(
+        basis_value, source_manifest_raw,
+    )
+    plan_hint = module._validate_plan_self(read_plan_value)
+    started_ns = time.monotonic_ns()
+    deadline = ((1 << 63) - 1 if deadline_ns is None else deadline_ns)
+    if deadline_ns is None:
+        deadline = started_ns + plan_hint["timeout_declaration"][
+            "maximum_io_window_seconds"] * 1_000_000_000
+    require(deadline < (1 << 63),
+            "recorded-read publication deadline exceeds monotonic arithmetic")
+    basis, basis_pin, plan, plan_pin, _session = \
+        _source5_recorded_read_session_documents(
+            basis_value, basis_pin_value, read_plan_value,
+            read_plan_pin_value, module, create_missing=False,
+            cancel_event=cancel_event, deadline_ns=deadline,
+        )
+    ordinal = module._uint(read_ordinal, "recorded-read publication ordinal",
+                           maximum=module.READ_WINDOW_COUNT - 1)
+    _source5_recorded_read_deadline_check(
+        cancel_event, deadline, "recorded-read publication",
+    )
+    window_chunk, row = _source5_recorded_read_window_chunk(
+        plan, plan_pin, module, ordinal,
+        cancel_event=cancel_event, deadline_ns=deadline,
+    )
+    request_path = Path(row["session_paths"]["request"])
+    response_incoming = Path(row["session_paths"]["response_incoming"])
+    bundle_incoming = Path(row["session_paths"]["bundle_incoming"])
+    request_raw, request_sha, request_info = _source5_recorded_read_private_file(
+        request_path, row["resource_bounds"]["outer_request_bytes"],
+        "recorded-read persisted request",
+            allocation_block_bytes=plan["scratch_declaration"][
+                "allocation_block_bytes"],
+        cancel_event=cancel_event, deadline_ns=deadline,
+    )
+    request = module.validate_recorded_preparation_read_request_v2(
+        request_raw, basis, basis_pin, plan, plan_pin, window_chunk,
+    )
+    require(request_info.st_size <= row["resource_bounds"]["outer_request_bytes"] and
+            request_sha == sha256(request_raw),
+            "recorded-read persisted outer request exceeds its planned slot")
+    response_raw, response_sha, response_info = \
+        _source5_recorded_read_private_file(
+            response_incoming,
+            row["resource_bounds"]["outer_response_bytes"],
+            "recorded-read incoming outer response",
+            allocation_block_bytes=plan["scratch_declaration"][
+                "allocation_block_bytes"],
+            cancel_event=cancel_event, deadline_ns=deadline,
+        )
+    response = module.validate_recorded_preparation_read_response_v2(
+        response_raw, request_raw, basis, basis_pin, plan, plan_pin,
+        window_chunk,
+    )
+    bundle_sha, bundle_bytes = _source5_hash_archive_read_bundle(
+        bundle_incoming, row["resource_bounds"]["tar_bytes"],
+        "recorded-read incoming SourceH tar",
+        cancel_event=cancel_event, deadline_ns=deadline,
+            allocation_block_bytes=plan["scratch_declaration"][
+                "allocation_block_bytes"],
+    )
+    inner_tar = response["legacy_response"]["body_tar_pin"]
+    require(response_info.st_uid == os.getuid() and
+            stat.S_IMODE(response_info.st_mode) == 0o600 and
+            response_info.st_nlink == 1 and
+            inner_tar == {"raw_sha256": bundle_sha,
+                          "byte_count": bundle_bytes} and
+            bundle_bytes == row["resource_bounds"]["tar_bytes"],
+            "recorded-read incoming tar differs from the exact outer/inner response")
+    slot_fd = os.open(
+        request_path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) |
+        getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+    )
+    try:
+        response_final = _source5_publish_readback_file(
+            slot_fd, response_incoming.name,
+            Path(row["session_paths"]["response"]).name,
+            response_sha, len(response_raw),
+            row["resource_bounds"]["outer_response_bytes"],
+            "recorded-read outer response", rename_noreplace,
+            cancel_event, deadline,
+            allocation_block_bytes=plan["scratch_declaration"][
+                "allocation_block_bytes"],
+        )
+        bundle_final = _source5_publish_readback_file(
+            slot_fd, bundle_incoming.name,
+            Path(row["session_paths"]["bundle"]).name,
+            bundle_sha, bundle_bytes, row["resource_bounds"]["tar_bytes"],
+            "recorded-read SourceH tar", rename_noreplace,
+            cancel_event, deadline,
+            allocation_block_bytes=plan["scratch_declaration"][
+                "allocation_block_bytes"],
+        )
+    finally:
+        os.close(slot_fd)
+    final_response_pin = {
+        "path": row["session_paths"]["response"],
+        "raw_sha256": response_final["raw_sha256"],
+        "semantic_sha256": response["response_sha256"],
+    }
+    final_bundle_pin = {
+        "path": row["session_paths"]["bundle"],
+        "raw_sha256": bundle_final["raw_sha256"],
+        "byte_count": bundle_final["byte_count"],
+    }
+    return {
+        "schema": "allocatbelt.application-source5-recorded-preparation-read-publication.v1",
+        "request_pin": {
+            "path": request_path.as_posix(),
+            "raw_sha256": request_sha,
+            "semantic_sha256": request["request_sha256"],
+        },
+        "response_pin": final_response_pin,
+        "bundle_pin": final_bundle_pin,
+    }
+
+
+def _source5_recorded_read_failure_receipt(
+    plan_module: types.ModuleType, basis_pin: dict[str, Any],
+    plan: dict[str, Any], plan_pin: dict[str, Any], read_ordinal: int,
+    failure_kind: str, retained_bytes: int, retained_inodes: int,
+) -> bytes:
+    row_index = plan["window_index"][read_ordinal]
+    body = {
+        "schema": plan_module.FAILURE_RECEIPT_SCHEMA_V2,
+        "basis_pin": basis_pin,
+        "read_plan_pin": plan_pin,
+        "session_nonce": plan["session_nonce"],
+        "consumer_host_id": plan["consumer_host_id"],
+        "operation_kind": plan["operation_kind"],
+        "read_ordinal": read_ordinal,
+        "job_index": row_index["job_index"],
+        "failure_kind": failure_kind,
+        "retained_window_bytes": retained_bytes,
+        "retained_window_inodes": retained_inodes,
+        "failure_sha256": "",
+    }
+    failure = plan_module._seal(body, "failure_sha256")
+    raw = canonical_bytes(failure)
+    require(len(raw) <= plan["resource_projection"]["failure_receipt_bytes"],
+            "recorded-read failure receipt exceeds its bounded reserved slot")
+    return raw
+
+
+@contextmanager
+def _source5_recorded_read_provider_lease(
+    lock: Any, cancel_event: threading.Event | None, deadline_ns: int,
+):
+    """Acquire one non-reentrant payload window without blocking past deadline."""
+    _source5_recorded_read_deadline_check(
+        cancel_event, deadline_ns, "recorded-read provider lease acquisition",
+    )
+    require(callable(getattr(lock, "acquire", None)) and
+            callable(getattr(lock, "release", None)) and
+            lock.acquire(blocking=False),
+            "recorded-read client already has an active view")
+    try:
+        _source5_recorded_read_deadline_check(
+            cancel_event, deadline_ns, "recorded-read provider lease entry",
+        )
+        yield
+    finally:
+        lock.release()
+
+
+class _Source5RecordedPreparationReadClient:
+    """Finite non-reentrant H importer for one SourceA-owned replay session."""
+
+    def __init__(
+        self, basis_value: object, basis_pin_value: object,
+        read_plan_value: object, read_plan_pin_value: object,
+        source_manifest_raw: bytes, *,
+        window_chunk_values: object,
+        cancel_event: threading.Event | None = None,
+    ) -> None:
+        require(cancel_event is None or
+                callable(getattr(cancel_event, "is_set", None)),
+                "recorded-read client cancellation token is malformed")
+        self._operation_started_ns = time.monotonic_ns()
+        self.plan_module = _source5_recorded_read_plan_module(
+            basis_value, source_manifest_raw,
+        )
+        plan_hint = self.plan_module._validate_plan_self(read_plan_value)
+        self._operation_deadline_ns = (
+            self._operation_started_ns +
+            plan_hint["timeout_declaration"]["maximum_operation_seconds"] *
+            1_000_000_000
+        )
+        require(self._operation_deadline_ns < (1 << 63),
+                "recorded-read client operation deadline exceeds monotonic arithmetic")
+        (self.basis, self.basis_pin, self.plan, self.plan_pin,
+         self.session) = _source5_recorded_read_session_documents(
+            basis_value, basis_pin_value, read_plan_value,
+            read_plan_pin_value, self.plan_module, create_missing=True,
+            window_chunk_values=window_chunk_values,
+            cancel_event=cancel_event,
+            deadline_ns=self._operation_deadline_ns,
+        )
+        self.cancel_event = cancel_event
+        self._provider_lock = threading.Lock()
+        failure_path = Path(self.plan["session_paths"]["failure_receipt"])
+        require(not failure_path.exists() and not failure_path.is_symlink(),
+                "recorded-read session is blocked by its retained failure receipt")
+
+    def _window_deadline(self) -> int:
+        now = time.monotonic_ns()
+        return min(
+            self._operation_deadline_ns,
+            now + self.plan["timeout_declaration"][
+                "maximum_io_window_seconds"] * 1_000_000_000,
+        )
+
+    def _append_event(
+        self, fd: int, previous: str, ordinal: int, action: str,
+        window_chunk: dict[str, Any], request_pin: dict[str, Any],
+        response_pin=None, bundle_pin=None,
+        *, deadline_ns: int,
+    ) -> str:
+        event = _source5_recorded_read_control_event(
+            self.plan_module, self.plan, self.plan_pin, ordinal,
+            window_chunk, action, request_pin, response_pin, bundle_pin,
+        )
+        return _source5_append_recorded_read_control_event(
+            fd, self.plan, event, previous, self.plan_module,
+            cancel_event=self.cancel_event, deadline_ns=deadline_ns,
+        )
+
+    def _write_failure_receipt(
+        self, ordinal: int, *, retain_window: bool,
+    ) -> None:
+        path = Path(self.plan["session_paths"]["failure_receipt"])
+        raw = _source5_recorded_read_failure_receipt(
+            self.plan_module, self.basis_pin, self.plan, self.plan_pin,
+            ordinal, "window_failed",
+            (self.plan["resource_projection"]["failure_window_bytes"]
+             if retain_window else 0),
+            (self.plan["resource_projection"]["failure_window_inodes"]
+             if retain_window else 0),
+        )
+        require(not path.exists() and not path.is_symlink(),
+                "recorded-read failure receipt already exists")
+        _source5_recorded_read_chunk_file(
+            path, raw, "recorded-read retained failure receipt",
+            allocation_block_bytes=self.plan["scratch_declaration"][
+                "allocation_block_bytes"],
+            sync_parent=True,
+        )
+
+    @contextmanager
+    def open_view(self, read_ordinal: int):
+        with _source5_recorded_read_provider_lease(
+            self._provider_lock, self.cancel_event, self._window_deadline(),
+        ):
+            deadline = self._window_deadline()
+            _source5_recorded_read_check_scratch(self.plan)
+            _source5_recorded_read_deadline_check(
+                self.cancel_event, deadline, "recorded-read client window",
+            )
+            ordinal = self.plan_module._uint(
+                read_ordinal, "recorded-read client ordinal",
+                maximum=self.plan_module.READ_WINDOW_COUNT - 1,
+            )
+            ledger_fd = _source5_recorded_read_ledger_fd(
+                self.plan, self.plan_module,
+            )
+            stage_root = None
+            refs: dict[str, dict[str, Any]] = {}
+            retained_window = False
+            try:
+                cursor, pending, previous = \
+                    _source5_recorded_read_ledger_state(
+                        ledger_fd, self.basis, self.basis_pin,
+                        self.plan, self.plan_pin, self.plan_module,
+                        cancel_event=self.cancel_event, deadline_ns=deadline,
+                    )
+                require(ordinal == cursor and
+                        ordinal < self.plan_module.READ_WINDOW_COUNT,
+                        "recorded-read client ordinal differs from the exact next ledger row")
+                window_chunk, row = _source5_recorded_read_window_chunk(
+                    self.plan, self.plan_pin, self.plan_module, ordinal,
+                    cancel_event=self.cancel_event, deadline_ns=deadline,
+                )
+                request, request_raw, request_pin = \
+                    self.plan_module.build_recorded_preparation_read_request_v2(
+                        self.basis, self.basis_pin, self.plan,
+                        self.plan_pin, ordinal, window_chunk,
+                    )
+                request_sha = request_pin["raw_sha256"]
+                request_path = Path(row["session_paths"]["request"])
+                request_pin3 = {
+                    "path": request_pin["path"],
+                    "raw_sha256": request_pin["raw_sha256"],
+                    "semantic_sha256": request_pin["semantic_sha256"],
+                }
+                if pending is not None:
+                    require(pending == request_pin3,
+                            "recorded-read pending request differs from this exact plan row")
+                if request_path.exists() or request_path.is_symlink():
+                    existing, actual, info = _source5_recorded_read_private_file(
+                        request_path,
+                        row["resource_bounds"]["outer_request_bytes"],
+                        "recorded-read current outer request",
+                        expected_raw_sha256=request_pin["raw_sha256"],
+                        expected_bytes=len(request_raw),
+                        allocation_block_bytes=self.plan[
+                            "scratch_declaration"]["allocation_block_bytes"],
+                        cancel_event=self.cancel_event,
+                        deadline_ns=deadline,
+                    )
+                    require(existing == request_raw and
+                            info.st_uid == os.getuid() and
+                            actual == request_pin["raw_sha256"],
+                            "recorded-read current request slot differs from its exact bytes")
+                else:
+                    _source5_recorded_read_chunk_file(
+                        request_path, request_raw,
+                        "recorded-read current outer request",
+                        allocation_block_bytes=self.plan[
+                            "scratch_declaration"]["allocation_block_bytes"],
+                        cancel_event=self.cancel_event,
+                        deadline_ns=deadline, sync_parent=True,
+                    )
+                if pending is None:
+                    previous = self._append_event(
+                        ledger_fd, previous, ordinal, "request_published",
+                        window_chunk, request_pin3, deadline_ns=deadline,
+                    )
+
+                response_path = Path(row["session_paths"]["response"])
+                bundle_path = Path(row["session_paths"]["bundle"])
+                stage_path = Path(row["session_paths"]["stage"])
+                response_incoming = Path(
+                    row["session_paths"]["response_incoming"],
+                )
+                bundle_incoming = Path(row["session_paths"]["bundle_incoming"])
+                require(stage_path.parent == request_path.parent and
+                        stage_path.name not in {
+                            request_path.name, response_incoming.name,
+                            response_path.name, bundle_incoming.name,
+                            bundle_path.name,
+                        },
+                        "recorded-read planned stage is not the exact empty slot child")
+                _source5_wait_for_recorded_read_publication(
+                    request_path.parent, request_path.name,
+                    response_incoming.name, response_path.name,
+                    bundle_incoming.name, bundle_path.name,
+                    stage_name=stage_path.name,
+                    request_maximum_bytes=row["resource_bounds"][
+                        "outer_request_bytes"],
+                    response_maximum_bytes=row["resource_bounds"][
+                        "outer_response_bytes"],
+                    bundle_maximum_bytes=row["resource_bounds"]["tar_bytes"],
+                    device_id=self.plan["scratch_declaration"]["device_id"],
+                    allocation_block_bytes=self.plan["scratch_declaration"][
+                        "allocation_block_bytes"],
+                    deadline_ns=deadline, cancel_event=self.cancel_event,
+                )
+
+                response_raw, response_sha, response_info = \
+                    _source5_recorded_read_private_file(
+                        response_path,
+                        row["resource_bounds"]["outer_response_bytes"],
+                        "recorded-read current outer response",
+                        allocation_block_bytes=self.plan[
+                            "scratch_declaration"]["allocation_block_bytes"],
+                        cancel_event=self.cancel_event,
+                        deadline_ns=deadline,
+                    )
+                response = self.plan_module.validate_recorded_preparation_read_response_v2(
+                    response_raw, request_raw, self.basis, self.basis_pin,
+                    self.plan, self.plan_pin, window_chunk,
+                )
+                bundle_sha, bundle_bytes = _source5_hash_archive_read_bundle(
+                    bundle_path, row["resource_bounds"]["tar_bytes"],
+                    "recorded-read current SourceH bundle",
+                    cancel_event=self.cancel_event, deadline_ns=deadline,
+                    allocation_block_bytes=self.plan[
+                        "scratch_declaration"]["allocation_block_bytes"],
+                )
+                inner_tar_pin = response["legacy_response"]["body_tar_pin"]
+                require(response_info.st_uid == os.getuid() and
+                        stat.S_IMODE(response_info.st_mode) == 0o600 and
+                        response_info.st_nlink == 1 and
+                        inner_tar_pin == {
+                            "raw_sha256": bundle_sha,
+                            "byte_count": bundle_bytes,
+                        } and bundle_bytes == row["resource_bounds"]["tar_bytes"],
+                        "recorded-read outer response/tar join differs")
+                request_legacy_raw = canonical_bytes(request["legacy_request"])
+                response_legacy_raw = canonical_bytes(response["legacy_response"])
+                _source5_prepare_archive_read_stage(
+                    Path(row["session_paths"]["stage"]),
+                    request["legacy_request"]["objects"],
+                    cancel_event=self.cancel_event,
+                    deadline_ns=deadline,
+                )
+                stage_root = Path(row["session_paths"]["stage"])
+                checked = validate_source5_archive_read_response(
+                    request_legacy_raw, response_legacy_raw, bundle_path,
+                    stage_root,
+                    request["legacy_request"]["maximum_response_bytes"],
+                    _source5_recorded_read_manifest_projection(
+                        self.plan_module, self.plan, row,
+                    ), cancel_event=self.cancel_event,
+                    deadline_ns=deadline,
+                    allocation_block_bytes=self.plan[
+                        "scratch_declaration"]["allocation_block_bytes"],
+                )
+                refs = checked["refs"]
+                _source5_recorded_read_check_directory_metadata(self.plan)
+                request_pin3 = {
+                    "path": request_path.as_posix(),
+                    "raw_sha256": request_sha,
+                    "semantic_sha256": request["request_sha256"],
+                }
+                response_pin3 = {
+                    "path": response_path.as_posix(),
+                    "raw_sha256": response_sha,
+                    "semantic_sha256": response["response_sha256"],
+                }
+                bundle_pin = {
+                    "path": bundle_path.as_posix(),
+                    "raw_sha256": bundle_sha,
+                    "byte_count": bundle_bytes,
+                }
+                payload_view = \
+                    self.plan_module.project_recorded_preparation_payload_view_v2(
+                        self.plan, self.plan_pin, ordinal, window_chunk,
+                        outer_request_pin=request_pin3,
+                        outer_response_pin=response_pin3,
+                        bundle_pin=bundle_pin,
+                        stage_root=stage_root.as_posix(),
+                        refs_by_origin=refs,
+                    )
+                payload_view = \
+                    self.plan_module.validate_recorded_preparation_payload_view_v2(
+                        payload_view, self.plan, self.plan_pin, window_chunk,
+                    )
+                _source5_recorded_read_deadline_check(
+                    self.cancel_event, deadline,
+                    "recorded-read before yielding the payload view",
+                )
+                yield {"payload_view": payload_view,
+                       "objects_by_origin": refs,
+                       "stage_root": stage_root.as_posix()}
+                _source5_recorded_read_deadline_check(
+                    self.cancel_event, deadline,
+                    "recorded-read after consuming the payload view",
+                )
+                _source5_prepare_archive_read_stage(
+                    stage_root, request["legacy_request"]["objects"],
+                    cancel_event=self.cancel_event,
+                    deadline_ns=deadline,
+                )
+                _source5_unlink_exact_private_file(
+                    request_path, request_pin["raw_sha256"],
+                    row["resource_bounds"]["outer_request_bytes"],
+                    "recorded-read current request slot",
+                    cancel_event=self.cancel_event, deadline_ns=deadline,
+                )
+                _source5_unlink_exact_private_file(
+                    response_path, response_sha,
+                    row["resource_bounds"]["outer_response_bytes"],
+                    "recorded-read current response slot",
+                    cancel_event=self.cancel_event, deadline_ns=deadline,
+                )
+                _source5_unlink_exact_private_file(
+                    bundle_path, bundle_sha, row["resource_bounds"]["tar_bytes"],
+                    "recorded-read current bundle slot",
+                    cancel_event=self.cancel_event, deadline_ns=deadline,
+                )
+                require(not response_incoming.exists() and
+                        not bundle_incoming.exists(),
+                        "recorded-read cleanup found a Root incoming duplicate")
+                previous = self._append_event(
+                    ledger_fd, previous, ordinal, "view_released",
+                    window_chunk, request_pin3, response_pin3, bundle_pin,
+                    deadline_ns=deadline,
+                )
+                refs = {}
+                stage_root = None
+            except BaseException:
+                try:
+                    row_paths = self.plan["session_paths"]
+                    if stage_root is not None and stage_root.exists():
+                        if "window_chunk" not in locals():
+                            window_chunk, _row = \
+                                _source5_recorded_read_window_chunk(
+                                    self.plan, self.plan_pin, self.plan_module,
+                                    ordinal, deadline_ns=self._operation_deadline_ns,
+                                )
+                        _source5_prepare_archive_read_stage(
+                            stage_root,
+                            self.plan_module.build_recorded_preparation_read_request_v2(
+                                self.basis, self.basis_pin, self.plan,
+                                self.plan_pin, ordinal, window_chunk,
+                            )[0]["legacy_request"]["objects"],
+                            cancel_event=None,
+                            deadline_ns=self._operation_deadline_ns,
+                        )
+                    retained_window = any(
+                        Path(value).exists() or Path(value).is_symlink()
+                        for value in (
+                            row_paths["request"],
+                            row_paths["response"],
+                            row_paths["bundle"],
+                            row_paths["response_incoming"],
+                            row_paths["bundle_incoming"],
+                        )
+                    )
+                    if not retained_window:
+                        retained_window = (stage_root is not None and
+                                            stage_root.exists() and
+                                            bool(list(stage_root.iterdir())))
+                except BaseException:
+                    retained_window = True
+                try:
+                    self._write_failure_receipt(
+                        ordinal, retain_window=retained_window,
+                    )
+                except BaseException as receipt_error:
+                    raise Source5CampaignError(
+                        f"recorded-read failed and its bounded failure receipt could not be stored: {receipt_error}",
+                    ) from receipt_error
+                raise
+            finally:
+                os.close(ledger_fd)
+
+
+def source5_recorded_preparation_read_client_v1(
+    basis_value: object, basis_pin_value: object,
+    read_plan_value: object, read_plan_pin_value: object,
+    source_manifest_raw: bytes, *,
+    window_chunk_values: object,
+    cancel_event: threading.Event | None = None,
+) -> _Source5RecordedPreparationReadClient:
+    """Create the non-authorizing H byte client for a live SourceA session."""
+    return _Source5RecordedPreparationReadClient(
+        basis_value, basis_pin_value, read_plan_value,
+        read_plan_pin_value, source_manifest_raw,
+        window_chunk_values=window_chunk_values,
+        cancel_event=cancel_event,
+    )
 
 
 def _source5_verify_persisted_archive_read_closure(
@@ -12983,6 +14704,7 @@ def _source5_remove_archive_read_stage(
 def _source5_prepare_archive_read_stage(
     stage_root: Path, objects: list[dict[str, Any]], *,
     cancel_event: threading.Event | None = None,
+    deadline_ns: int | None = None,
 ) -> None:
     """Create an empty stage or discard only exact interrupted-import slots."""
     require(cancel_event is None or
@@ -12990,6 +14712,8 @@ def _source5_prepare_archive_read_stage(
             "Source5 readback stage cancellation token is malformed")
     require(cancel_event is None or not cancel_event.is_set(),
             "Source5 readback stage preparation was cancelled")
+    require(deadline_ns is None or time.monotonic_ns() < deadline_ns,
+            "Source5 readback stage preparation exceeded its bounded window")
     expected = {
         _source5_archive_read_tar_member_name(row).removeprefix(
             "objects/",
@@ -13014,6 +14738,8 @@ def _source5_prepare_archive_read_stage(
         for name in os.listdir(directory_fd):
             require(cancel_event is None or not cancel_event.is_set(),
                     "Source5 interrupted readback stage inspection was cancelled")
+            require(deadline_ns is None or time.monotonic_ns() < deadline_ns,
+                    "Source5 interrupted stage inspection exceeded its bounded window")
             row = expected.get(name)
             require(type(row) is dict,
                     "Source5 interrupted readback stage has an undeclared child")
@@ -13039,6 +14765,8 @@ def _source5_prepare_archive_read_stage(
                 while total < before.st_size:
                     require(cancel_event is None or not cancel_event.is_set(),
                             "Source5 interrupted readback child inspection was cancelled")
+                    require(deadline_ns is None or time.monotonic_ns() < deadline_ns,
+                            "Source5 interrupted child inspection exceeded its bounded window")
                     block = os.read(descriptor, min(
                         SOURCE5_ARCHIVE_READ_COPY_BYTES,
                         before.st_size - total,
@@ -14416,7 +16144,8 @@ def _source5_wait_for_ack_bundle(
 
 def _source5_unlink_exact_private_file(
     path_value: str | Path, expected_sha256: str, maximum_bytes: int,
-    label: str,
+    label: str, *, cancel_event: threading.Event | None = None,
+    deadline_ns: int | None = None,
 ) -> None:
     path = Path(path_value)
     require(path.is_absolute() and path.resolve(strict=True) == path and
@@ -14453,6 +16182,10 @@ def _source5_unlink_exact_private_file(
             digest = hashlib.sha256()
             total = 0
             while total < before.st_size:
+                require(cancel_event is None or not cancel_event.is_set(),
+                        f"Source5 {label} cleanup was cancelled")
+                require(deadline_ns is None or time.monotonic_ns() < deadline_ns,
+                        f"Source5 {label} cleanup exceeded its bounded window")
                 block = os.read(descriptor, min(1024 * 1024,
                                                 before.st_size - total))
                 require(bool(block), f"Source5 {label} shortened before reclaim")

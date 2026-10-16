@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import hashlib
+import fcntl
+import copy
 import importlib.util
 import json
 import os
@@ -11,6 +13,8 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from contextlib import ExitStack
 from pathlib import Path
@@ -1511,7 +1515,779 @@ class GpgIdentityTests(unittest.TestCase):
                 with self.assertRaises(OSError):
                     archive._verify_detached_signature(ack, signature, signer)
 
+                # A recorded read uses both captured signer tools. The old
+                # executable origin is absent; verification executes only an
+                # exact byte copy in the explicitly reserved private window.
+                captured_gpgv_path = captured.parent / "gpgv-executable.bin"
+                captured_gpgv_path.write_bytes(gpgv_raw)
+                os.chmod(captured_gpgv_path, 0o400)
+                historical_gpgv_path = root / "historical-gpgv-executable"
+                shutil.copyfile(gpgv_path, historical_gpgv_path)
+                historical_gpgv_path.chmod(stat_mode(gpgv_path))
+                gpgv_origin_pin = {
+                    "path": str(historical_gpgv_path),
+                    "raw_sha256": sha(gpgv_raw),
+                }
+                historical_gpgv_path.unlink()
 
+                def captured_gpgv_reader(pin, maximum):
+                    self.assertEqual(pin, gpgv_origin_pin)
+                    raw = captured_gpgv_path.read_bytes()
+                    self.assertLessEqual(len(raw), maximum)
+                    return raw
+
+                gpg_auxiliary_root = private(root / "recorded-gpg-auxiliary")
+                gpg_aux_space = os.statvfs(gpg_auxiliary_root)
+                allocation_block = gpg_aux_space.f_frsize or gpg_aux_space.f_bsize
+                file_maxima = (
+                    len(gpgv_raw), len(exported.stdout), len(ack),
+                    len(signature), 64 * 1024, 64 * 1024,
+                )
+                required_allocated = allocation_block + sum(
+                    ((maximum + allocation_block - 1) // allocation_block) *
+                    allocation_block for maximum in file_maxima
+                )
+                resource_body = {
+                    "schema": archive.RECORDED_READ_GPG_RESOURCE_SCHEMA_V2,
+                    "scratch_root": str(gpg_auxiliary_root),
+                    "device": gpg_auxiliary_root.stat().st_dev,
+                    "reserved_bytes": required_allocated,
+                    "allocation_block_bytes": allocation_block,
+                    "window_directory_allocated_bytes": allocation_block,
+                    "required_file_bytes": sum(file_maxima),
+                    "required_allocated_bytes": required_allocated,
+                    "reserved_inodes": 7,
+                    "maximum_gpgv_bytes": len(gpgv_raw),
+                    "maximum_keyring_bytes": len(exported.stdout),
+                    "maximum_ack_bytes": len(ack),
+                    "maximum_signature_bytes": len(signature),
+                    "maximum_stdout_bytes": 64 * 1024,
+                    "maximum_stderr_bytes": 64 * 1024,
+                    "maximum_window_seconds": 30,
+                }
+                recorded_resource = {
+                    **resource_body,
+                    "resource_sha256": sha(canonical(resource_body)),
+                }
+
+                sentinel = gpg_auxiliary_root / "retained-prior-window"
+                sentinel.write_bytes(b"must be removed by the test operator")
+                sentinel.chmod(0o600)
+                descriptor_count = len(os.listdir("/proc/self/fd"))
+                for attempt in range(2):
+                    failed_start = time.monotonic_ns()
+                    with self.assertRaises(archive.EvidenceArchiveError):
+                        archive._verify_detached_signature_recorded(
+                            ack, signature,
+                            {"fingerprint": fingerprint,
+                             "keyring_pin": old_keyring_pin,
+                             "gpgv_pin": gpgv_origin_pin},
+                            captured_keyring_reader=captured_reader,
+                            captured_gpgv_reader=captured_gpgv_reader,
+                            root_auxiliary_resource_declaration=recorded_resource,
+                            operation_started_ns=failed_start,
+                            window_deadline_ns=failed_start + 30_000_000_000,
+                        )
+                    self.assertEqual(len(os.listdir("/proc/self/fd")),
+                                     descriptor_count)
+                    self.assertEqual(list(gpg_auxiliary_root.iterdir()),
+                                     [sentinel])
+                sentinel.unlink()
+
+                original_popen = archive.subprocess.Popen
+                observed_modes = []
+
+                def inspect_executable_mode(command, *args, **kwargs):
+                    executable_info = Path(command[0]).stat()
+                    modes = []
+                    for descriptor_text in os.listdir("/proc/self/fd"):
+                        descriptor = int(descriptor_text)
+                        try:
+                            info = os.fstat(descriptor)
+                            if (info.st_dev, info.st_ino) == (
+                                    executable_info.st_dev,
+                                    executable_info.st_ino):
+                                modes.append(
+                                    fcntl.fcntl(descriptor, fcntl.F_GETFL) &
+                                    os.O_ACCMODE,
+                                )
+                        except OSError:
+                            continue
+                    observed_modes.extend(modes)
+                    self.assertTrue(modes)
+                    self.assertEqual(set(modes), {os.O_RDONLY})
+                    return original_popen(command, *args, **kwargs)
+
+                started_ns = time.monotonic_ns()
+                with mock.patch.object(
+                        archive.subprocess, "Popen",
+                        side_effect=inspect_executable_mode):
+                    self.assertEqual(
+                        archive._verify_detached_signature_recorded(
+                            ack, signature,
+                            {"fingerprint": fingerprint,
+                             "keyring_pin": old_keyring_pin,
+                             "gpgv_pin": gpgv_origin_pin},
+                            captured_keyring_reader=captured_reader,
+                            captured_gpgv_reader=captured_gpgv_reader,
+                            root_auxiliary_resource_declaration=recorded_resource,
+                            operation_started_ns=started_ns,
+                            window_deadline_ns=started_ns + 30_000_000_000,
+                        ),
+                        fingerprint,
+                    )
+                self.assertEqual(observed_modes, [os.O_RDONLY])
+                self.assertFalse(historical_gpgv_path.exists())
+                self.assertEqual(list(gpg_auxiliary_root.iterdir()), [])
+
+                unequal_body = dict(resource_body)
+                unequal_body["maximum_stdout_bytes"] = 32 * 1024
+                unequal_file_maxima = (
+                    len(gpgv_raw), len(exported.stdout), len(ack),
+                    len(signature), 32 * 1024, 64 * 1024,
+                )
+                unequal_required = allocation_block + sum(
+                    ((maximum + allocation_block - 1) // allocation_block) *
+                    allocation_block for maximum in unequal_file_maxima
+                )
+                unequal_body["reserved_bytes"] = unequal_required
+                unequal_body["required_file_bytes"] = sum(unequal_file_maxima)
+                unequal_body["required_allocated_bytes"] = unequal_required
+                unequal_resource = {
+                    **unequal_body,
+                    "resource_sha256": sha(canonical(unequal_body)),
+                }
+                unequal_started = time.monotonic_ns()
+                with self.assertRaises(archive.EvidenceArchiveError):
+                    archive._verify_detached_signature_recorded(
+                        ack, signature,
+                        {"fingerprint": fingerprint,
+                         "keyring_pin": old_keyring_pin,
+                         "gpgv_pin": gpgv_origin_pin},
+                        captured_keyring_reader=captured_reader,
+                        captured_gpgv_reader=captured_gpgv_reader,
+                        root_auxiliary_resource_declaration=unequal_resource,
+                        operation_started_ns=unequal_started,
+                        window_deadline_ns=unequal_started + 30_000_000_000,
+                    )
+                self.assertEqual(list(gpg_auxiliary_root.iterdir()), [])
+                failed_started_ns = time.monotonic_ns()
+                with self.assertRaises(archive.EvidenceArchiveError):
+                    archive._verify_detached_signature_recorded(
+                        ack + b"changed", signature,
+                        {"fingerprint": fingerprint,
+                         "keyring_pin": old_keyring_pin,
+                         "gpgv_pin": gpgv_origin_pin},
+                        captured_keyring_reader=captured_reader,
+                        captured_gpgv_reader=captured_gpgv_reader,
+                        root_auxiliary_resource_declaration=recorded_resource,
+                        operation_started_ns=failed_started_ns,
+                        window_deadline_ns=failed_started_ns + 30_000_000_000,
+                    )
+                self.assertEqual(list(gpg_auxiliary_root.iterdir()), [])
+
+
+class RecordedReadPlanProjectionJoinTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        plan_test_path = SCRIPT_DIR / "test-application-source5-recorded-preparation-read.py"
+        spec = importlib.util.spec_from_file_location(
+            "recorded_read_projection_actual_h6_fixture", plan_test_path,
+        )
+        if spec is None or spec.loader is None:
+            raise AssertionError("cannot load the actual H6 read-plan fixture")
+        cls.plan_tests_module = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = cls.plan_tests_module
+        spec.loader.exec_module(cls.plan_tests_module)
+        cls.plan_test_class = cls.plan_tests_module.ActualH6RecordedReadPlanTests
+        cls.plan_test_class.setUpClass()
+        cls.plan_test_instance = cls.plan_test_class(
+            "test_actual_h5_schedule_joins_recomputed_caps_and_builds_720_windows",
+        )
+
+        source_h_path = SCRIPT_DIR / "application-source5-campaign.py"
+        source_h_spec = importlib.util.spec_from_file_location(
+            "recorded_read_projection_source_h", source_h_path,
+        )
+        if source_h_spec is None or source_h_spec.loader is None:
+            raise AssertionError("cannot load the SourceH recorded-read projection")
+        cls.source_h = importlib.util.module_from_spec(source_h_spec)
+        sys.modules[source_h_spec.name] = cls.source_h
+        source_h_spec.loader.exec_module(cls.source_h)
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls.plan_test_class.tearDownClass()
+
+    def _append_synthetic_released_prefix(
+        self, fixture, plan_module, context, ledger_fd, target_ordinal: int,
+        deadline_ns: int,
+    ) -> str:
+        """Create only a test-scoped already-released plan-bound ledger prefix."""
+        previous = "0" * 64
+        lines = []
+
+        def append(event) -> None:
+            nonlocal previous
+            body = {"previous_sha256": previous, "record": event}
+            record_sha = sha(canonical(body))
+            line = canonical({**body, "record_sha256": record_sha})
+            self.assertLessEqual(
+                len(line), context["maximum_control_line_bytes"],
+            )
+            lines.append(line)
+            previous = record_sha
+
+        basis, basis_pin = fixture.basis, fixture.basis_pin
+        plan, plan_pin = fixture.plan, fixture.plan_pin
+        for ordinal in range(target_ordinal):
+            self.assertLess(time.monotonic_ns(), deadline_ns)
+            chunk = fixture.window_chunk_for(ordinal)
+            row = fixture.window_row_for(ordinal)
+            request, request_raw, request_pin = \
+                plan_module.build_recorded_preparation_read_request_v2(
+                    basis, basis_pin, plan, plan_pin, ordinal, chunk,
+                )
+            request_pin3 = {key: request_pin[key] for key in (
+                "path", "raw_sha256", "semantic_sha256",
+            )}
+            accepted = archive._recorded_root_control_event(
+                basis, basis_pin, plan, plan_pin, row, 2 * ordinal + 1,
+                "request_accepted", request_pin3, context["paths"],
+            )
+            append(accepted)
+            # Earlier outputs are represented only as released fixture history.
+            # These deterministic pins are never used as Root/H authority.
+            prefix_tar_sha = sha(canonical({
+                "schema": "recorded-read-test-released-prefix.v1",
+                "read_ordinal": ordinal,
+                "planned_tar_bytes": row["resource_bounds"]["tar_bytes"],
+            }))
+            legacy_response = plan_module._legacy_response(
+                request["legacy_request"], prefix_tar_sha,
+                row["resource_bounds"]["tar_bytes"],
+            )
+            legacy_response_raw = canonical(legacy_response)
+            response, response_raw, _source_response_pin = \
+                plan_module.build_recorded_preparation_read_response_v2(
+                    request_raw, legacy_response, legacy_response_raw,
+                    basis, basis_pin, plan, plan_pin, chunk,
+                )
+            response_pin = {
+                "path": context["paths"]["response"],
+                "raw_sha256": sha(response_raw),
+                "semantic_sha256": response["response_sha256"],
+            }
+            bundle_pin = {
+                "path": context["paths"]["bundle"],
+                "raw_sha256": prefix_tar_sha,
+                "byte_count": row["resource_bounds"]["tar_bytes"],
+            }
+            published = archive._recorded_root_control_event(
+                basis, basis_pin, plan, plan_pin, row, 2 * ordinal + 2,
+                "response_published", request_pin3, context["paths"],
+                response_pin, bundle_pin,
+            )
+            append(published)
+        prefix_raw = b"".join(lines)
+        self.assertLessEqual(
+            len(prefix_raw), context["maximum_control_ledger_bytes"],
+        )
+        if prefix_raw:
+            self.assertLess(time.monotonic_ns(), deadline_ns)
+            os.lseek(ledger_fd, 0, os.SEEK_SET)
+            view = memoryview(prefix_raw)
+            while view:
+                written = os.write(ledger_fd, view)
+                self.assertGreater(written, 0)
+                view = view[written:]
+            os.fsync(ledger_fd)
+        cursor, pending, checked_previous = archive._recorded_root_control_state(
+            ledger_fd, context, basis, basis_pin, plan, plan_pin, plan_module,
+            deadline_ns=deadline_ns,
+        )
+        self.assertEqual(cursor, target_ordinal)
+        self.assertIsNone(pending)
+        self.assertEqual(checked_previous, previous)
+        return previous
+
+    def test_actual_h6_manifest_and_typed_cap_projection_joins(self) -> None:
+        fixture = self.plan_test_instance
+        plan_module = self.plan_tests_module.read_plan
+        for ordinal in (0, plan_module.READ_JOB_COUNT_PER_HOST):
+            with self.subTest(ordinal=ordinal):
+                row = fixture.window_row_for(ordinal)
+                owner = row["owner_host_id"]
+                run_id = row["job"]["run_id"]
+                typed_caps = fixture.readback_caps[owner][run_id]
+                projected_caps = archive._recorded_read_source_cap_projection(
+                    typed_caps,
+                )
+                self.assertEqual(projected_caps,
+                                 row["recomputed_source_caps"])
+                self.assertEqual(
+                    archive._recorded_read_manifest_projection(row),
+                    self.source_h._source5_recorded_read_manifest_projection(
+                        plan_module, fixture.plan, row,
+                    ),
+                )
+                manifest = archive._recorded_read_manifest_projection(row)
+                self.assertEqual(manifest["objects"], row["objects"])
+                self.assertEqual(
+                    manifest["manifest_sha256"],
+                    row["original_pins"]["object_manifest"]["semantic_sha256"],
+                )
+                cap_fields = {
+                    "maximum_request_bytes": "request_bytes",
+                    "maximum_response_bytes": "response_bytes",
+                    "bundle_bytes": "bundle_bytes",
+                    "stage_bytes": "stage_bytes",
+                    "stage_inodes": "stage_inodes",
+                    "object_count": "object_count",
+                    "maximum_object_bytes": "maximum_object_bytes",
+                    "live_window_bytes": "live_window_bytes",
+                    "live_window_inodes": "live_window_inodes",
+                }
+                for plan_name, source_name in cap_fields.items():
+                    changed = dict(typed_caps)
+                    changed[source_name] += 1
+                    changed_projection = archive._recorded_read_source_cap_projection(
+                        changed,
+                    )
+                    self.assertNotEqual(changed_projection[plan_name],
+                                        row["recomputed_source_caps"][plan_name])
+
+                changed_row = copy.deepcopy(row)
+                changed_row["manifest_summary"]["payload_bytes"] += 1
+                with self.assertRaises(archive.EvidenceArchiveError):
+                    archive._recorded_read_manifest_projection(changed_row)
+                changed_row = copy.deepcopy(row)
+                changed_row["objects"][0]["object_pin"]["raw_sha256"] = "f" * 64
+                with self.assertRaises(archive.EvidenceArchiveError):
+                    archive._recorded_read_manifest_projection(changed_row)
+
+                source_manifest_pin = row["original_pins"]["object_manifest"]
+                source_h_manifest = self.source_h._source5_recorded_read_manifest_projection(
+                    plan_module, fixture.plan, row,
+                )
+                source_manifest_raw = \
+                    self.source_h._source5_recorded_read_manifest_raw_pin_join(
+                        source_h_manifest, source_manifest_pin,
+                    )
+                self.assertEqual(source_manifest_raw, canonical(source_h_manifest))
+                crossed_source_manifest_pin = dict(source_manifest_pin)
+                crossed_source_manifest_pin["raw_sha256"] = "0" * 64
+                with self.assertRaises(self.source_h.Source5CampaignError):
+                    self.source_h._source5_recorded_read_manifest_raw_pin_join(
+                        source_h_manifest, crossed_source_manifest_pin,
+                    )
+
+        # Exercise the same wait helper after SourceH's real session creator
+        # has made the eight planned directories, including slot/stage.
+        basis, basis_pin = fixture.basis, fixture.basis_pin
+        plan, plan_pin = fixture.plan, fixture.plan_pin
+        scratch_root = Path(plan["scratch_declaration"]["root"])
+        if not scratch_root.exists():
+            private(scratch_root)
+        started = time.monotonic_ns()
+        setup_deadline = started + 120_000_000_000
+        session = self.source_h._source5_recorded_read_session_documents(
+            basis, basis_pin, plan, plan_pin, plan_module,
+            create_missing=True, window_chunk_values=fixture.window_chunks,
+            deadline_ns=setup_deadline,
+        )
+        session_stage = Path(plan["session_paths"]["stage"])
+        self.assertTrue(session_stage.is_dir())
+        self.assertEqual(list(session_stage.iterdir()), [])
+        session_chunk = fixture.window_chunk_for(0)
+        session_row = fixture.window_row_for(0)
+        session_request, session_request_raw, session_request_pin = \
+            plan_module.build_recorded_preparation_read_request_v2(
+                basis, basis_pin, plan, plan_pin, 0, session_chunk,
+            )
+        self.source_h._source5_recorded_read_chunk_file(
+            Path(session_request_pin["path"]), session_request_raw,
+            "recorded-read actual-session wait request",
+            allocation_block_bytes=plan["scratch_declaration"][
+                "allocation_block_bytes"],
+            deadline_ns=setup_deadline, sync_parent=True,
+        )
+        slot_root = Path(plan["session_paths"]["slot"])
+        request_path = Path(session_request_pin["path"])
+        response_incoming = Path(plan["session_paths"]["response_incoming"])
+        response_path = Path(plan["session_paths"]["response"])
+        bundle_incoming = Path(plan["session_paths"]["bundle_incoming"])
+        bundle_path = Path(plan["session_paths"]["bundle"])
+        for first, second in (("response", "bundle"), ("bundle", "response")):
+            first_incoming = (response_incoming if first == "response"
+                              else bundle_incoming)
+            first_final = response_path if first == "response" else bundle_path
+            second_incoming = (response_incoming if second == "response"
+                               else bundle_incoming)
+            second_final = response_path if second == "response" else bundle_path
+            first_incoming.write_bytes((first + "-incoming").encode())
+            first_incoming.chmod(0o600)
+            waiter_errors = []
+            waiter_done = threading.Event()
+
+            def wait_for_actual_session_pair() -> None:
+                try:
+                    self.source_h._source5_wait_for_recorded_read_publication(
+                        slot_root, request_path.name,
+                        response_incoming.name, response_path.name,
+                        bundle_incoming.name, bundle_path.name,
+                        stage_name=session_stage.name,
+                        request_maximum_bytes=session_row["resource_bounds"][
+                            "outer_request_bytes"],
+                        response_maximum_bytes=session_row["resource_bounds"][
+                            "outer_response_bytes"],
+                        bundle_maximum_bytes=session_row["resource_bounds"][
+                            "tar_bytes"],
+                        device_id=plan["scratch_declaration"]["device_id"],
+                        allocation_block_bytes=plan["scratch_declaration"][
+                            "allocation_block_bytes"],
+                        deadline_ns=time.monotonic_ns() + 5_000_000_000,
+                    )
+                except BaseException as error:
+                    waiter_errors.append(error)
+                finally:
+                    waiter_done.set()
+
+            waiter = threading.Thread(target=wait_for_actual_session_pair)
+            waiter.start()
+            time.sleep(0.06)
+            self.assertFalse(waiter_done.is_set())
+            first_incoming.rename(first_final)
+            time.sleep(0.06)
+            self.assertFalse(waiter_done.is_set())
+            second_incoming.write_bytes((second + "-incoming").encode())
+            second_incoming.chmod(0o600)
+            time.sleep(0.06)
+            self.assertFalse(waiter_done.is_set())
+            second_incoming.rename(second_final)
+            waiter.join(timeout=2)
+            self.assertFalse(waiter.is_alive())
+            self.assertEqual(waiter_errors, [])
+            self.assertTrue(waiter_done.is_set())
+            first_final.unlink()
+            second_final.unlink()
+            slot_fd = os.open(slot_root, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+            try:
+                os.fsync(slot_fd)
+            finally:
+                os.close(slot_fd)
+        request_path.unlink()
+        request_parent_fd = os.open(
+            request_path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+        )
+        try:
+            os.fsync(request_parent_fd)
+        finally:
+            os.close(request_parent_fd)
+
+    def test_root_output_release_rejects_foreign_pin_and_unlinks_exact_pair(self) -> None:
+        fixture = self.plan_test_instance
+        plan_module = self.plan_tests_module.read_plan
+        basis, basis_pin = fixture.basis, fixture.basis_pin
+        plan, plan_pin = fixture.plan, fixture.plan_pin
+        minimum_tar_row = min(
+            (row for chunk_value in fixture.window_chunks
+             for row in chunk_value["rows"]),
+            key=lambda value: (value["resource_bounds"]["tar_bytes"],
+                               value["read_ordinal"]),
+        )
+        ordinal = minimum_tar_row["read_ordinal"]
+        chunk = fixture.window_chunk_for(ordinal)
+        row = fixture.window_row_for(ordinal)
+        source_root = Path(plan["scratch_declaration"]["root"])
+        if not source_root.exists():
+            private(source_root)
+        started = time.monotonic_ns()
+        deadline = started + plan["timeout_declaration"][
+            "maximum_io_window_seconds"] * 1_000_000_000
+        self.source_h._source5_recorded_read_session_documents(
+            basis, basis_pin, plan, plan_pin, plan_module,
+            create_missing=True, window_chunk_values=fixture.window_chunks,
+            deadline_ns=deadline,
+        )
+        request, request_raw, request_pin = \
+            plan_module.build_recorded_preparation_read_request_v2(
+                basis, basis_pin, plan, plan_pin, ordinal, chunk,
+            )
+        self.source_h._source5_recorded_read_chunk_file(
+            Path(request_pin["path"]), request_raw,
+            "recorded-read root-release test request",
+            allocation_block_bytes=plan["scratch_declaration"][
+                "allocation_block_bytes"],
+            sync_parent=True,
+        )
+
+        with tempfile.TemporaryDirectory(
+                prefix="source5-recorded-root-release-") as temporary:
+            root = private(Path(temporary) / "root-output")
+            space = os.statvfs(root)
+            block = space.f_frsize or space.f_bsize
+            self.assertEqual(block,
+                             plan["scratch_declaration"]["allocation_block_bytes"])
+            response_cap = row["resource_bounds"]["outer_response_bytes"]
+            bundle_cap = row["resource_bounds"]["tar_bytes"]
+            failure_cap = 64 * 1024
+            line_cap = (plan["resource_projection"][
+                "control_ledger_maximum_line_bytes"] + 4096)
+            ledger_cap = 2 * plan_module.READ_WINDOW_COUNT * line_cap
+            file_caps = (response_cap, bundle_cap, ledger_cap, failure_cap)
+            file_bytes = sum(file_caps)
+            file_allocated = sum(
+                ((cap + block - 1) // block) * block for cap in file_caps
+            )
+            directory_count = 6
+            directory_allocated = directory_count * block
+            resource_body = {
+                "schema": archive.RECORDED_READ_ROOT_OUTPUT_SCHEMA_V2,
+                "root": str(root), "device": root.stat().st_dev,
+                "reserved_bytes": directory_allocated + file_allocated,
+                "reserved_inodes": 10,
+                "allocation_block_bytes": block,
+                "directory_metadata_bytes": block,
+                "directory_allocated_bytes": directory_allocated,
+                "required_file_bytes": file_bytes,
+                "required_file_allocated_bytes": file_allocated,
+                "required_allocated_bytes": directory_allocated + file_allocated,
+                "maximum_response_bytes": response_cap,
+                "maximum_bundle_bytes": bundle_cap,
+                "maximum_control_ledger_bytes": ledger_cap,
+                "maximum_control_line_bytes": line_cap,
+                "failure_receipt_bytes": failure_cap,
+                "maximum_window_seconds": plan["timeout_declaration"][
+                    "maximum_io_window_seconds"],
+            }
+            resource = {
+                **resource_body,
+                "resource_sha256": sha(canonical(resource_body)),
+            }
+            context = archive._recorded_read_root_output_context(
+                resource, basis, basis_pin, plan, plan_pin,
+                ordinal, chunk, plan_module,
+            )
+            archive._prepare_recorded_read_root_output_dirs(context)
+            same_device_aux = private(
+                Path(temporary) / "gpg-aux-same-device",
+            )
+            aux_space = os.statvfs(same_device_aux)
+            aux_block = aux_space.f_frsize or aux_space.f_bsize
+            same_device_gpg_resource = {
+                "scratch_root": str(same_device_aux),
+                "device": same_device_aux.stat().st_dev,
+                "allocation_block_bytes": aux_block,
+                "reserved_bytes": aux_block,
+                "reserved_inodes": 1,
+            }
+            self.assertEqual(same_device_gpg_resource["device"],
+                             context["device"])
+            archive._check_recorded_read_root_resource_pair(
+                context, same_device_gpg_resource, deadline_ns=deadline,
+            )
+            original_open_dir_path = archive._open_dir_path
+            acquired_gpg_fds = []
+
+            def reject_output_root_after_gpg_open(
+                    path_value, label, *, private_final):
+                if label == "Root recorded-read output root":
+                    raise archive.EvidenceArchiveError(
+                        "injected Root output-root acquisition failure",
+                    )
+                descriptor = original_open_dir_path(
+                    path_value, label, private_final=private_final,
+                )
+                if label == "Root recorded-read GPG auxiliary root":
+                    acquired_gpg_fds.append(descriptor)
+                return descriptor
+
+            descriptor_count = len(os.listdir("/proc/self/fd"))
+            for attempt in range(2):
+                with mock.patch.object(
+                        archive, "_open_dir_path",
+                        side_effect=reject_output_root_after_gpg_open):
+                    with self.assertRaises(archive.EvidenceArchiveError):
+                        archive._check_recorded_read_root_resource_pair(
+                            context, same_device_gpg_resource,
+                            deadline_ns=deadline,
+                        )
+                self.assertEqual(len(acquired_gpg_fds), attempt + 1)
+                self.assertEqual(len(os.listdir("/proc/self/fd")),
+                                 descriptor_count)
+                with self.assertRaises(OSError):
+                    os.fstat(acquired_gpg_fds[-1])
+
+            overcommitted_gpg_resource = dict(same_device_gpg_resource)
+            overcommitted_gpg_resource["reserved_bytes"] = (
+                aux_space.f_bavail * aux_block
+            )
+            with self.assertRaises(archive.EvidenceArchiveError):
+                archive._check_recorded_read_root_resource_pair(
+                    context, overcommitted_gpg_resource,
+                    deadline_ns=deadline,
+                )
+            shared_memory_root = Path("/dev/shm")
+            if shared_memory_root.is_dir():
+                with tempfile.TemporaryDirectory(
+                        prefix="source5-root-output-separate-device-",
+                        dir=shared_memory_root) as separate_temp:
+                    separate_aux = private(Path(separate_temp) / "gpg-aux")
+                    separate_space = os.statvfs(separate_aux)
+                    separate_block = (separate_space.f_frsize or
+                                      separate_space.f_bsize)
+                    if separate_aux.stat().st_dev != context["device"]:
+                        archive._check_recorded_read_root_resource_pair(
+                            context,
+                            {"scratch_root": str(separate_aux),
+                             "device": separate_aux.stat().st_dev,
+                             "allocation_block_bytes": separate_block,
+                             "reserved_bytes": separate_block,
+                             "reserved_inodes": 1},
+                            deadline_ns=deadline,
+                        )
+            root_ledger_fd = archive._open_recorded_read_root_ledger(context)
+            try:
+                previous = self._append_synthetic_released_prefix(
+                    fixture, plan_module, context, root_ledger_fd, ordinal,
+                    deadline,
+                )
+                request_pin3 = {key: request_pin[key] for key in (
+                    "path", "raw_sha256", "semantic_sha256",
+                )}
+                first_event = archive._recorded_root_control_event(
+                    basis, basis_pin, plan, plan_pin, row, 2 * ordinal + 1,
+                    "request_accepted", request_pin3, context["paths"],
+                )
+                previous = archive._append_recorded_root_control_event(
+                    root_ledger_fd, first_event, previous, context,
+                    deadline_ns=deadline,
+                )
+
+                zero_block = bytes(1024 * 1024)
+                tar_hasher = hashlib.sha256()
+                tar_remaining = bundle_cap
+                while tar_remaining:
+                    amount = min(len(zero_block), tar_remaining)
+                    tar_hasher.update(zero_block[:amount])
+                    tar_remaining -= amount
+                tar_sha256 = tar_hasher.hexdigest()
+                legacy_response = plan_module._legacy_response(
+                    request["legacy_request"], tar_sha256, bundle_cap,
+                )
+                legacy_response_raw = canonical(legacy_response)
+                response, response_raw, _response_slot_pin = \
+                    plan_module.build_recorded_preparation_read_response_v2(
+                        request_raw, legacy_response, legacy_response_raw,
+                        basis, basis_pin, plan, plan_pin, chunk,
+                    )
+                output_fd = archive._open_dir_path(
+                    context["paths"]["slot"],
+                    "Root output release test slot", private_final=True,
+                )
+                try:
+                    response_slot = archive._write_recorded_read_output_bytes(
+                        output_fd, Path(context["paths"]["response"]).name,
+                        response_raw, response_cap,
+                        "Root output release test response",
+                        allocation_block_bytes=block, deadline_ns=deadline,
+                    )
+                    bundle_fd = os.open(
+                        Path(context["paths"]["bundle"]).name,
+                        os.O_WRONLY | os.O_CREAT | os.O_EXCL |
+                        getattr(os, "O_NOFOLLOW", 0),
+                        0o600, dir_fd=output_fd,
+                    )
+                    try:
+                        os.fchmod(bundle_fd, 0o600)
+                        os.ftruncate(bundle_fd, bundle_cap)
+                        os.fsync(bundle_fd)
+                        bundle_info = os.fstat(bundle_fd)
+                        self.assertEqual(bundle_info.st_size, bundle_cap)
+                        self.assertLessEqual(
+                            bundle_info.st_blocks * 512,
+                            ((bundle_cap + block - 1) // block) * block,
+                        )
+                        os.fsync(output_fd)
+                        bundle_slot = {
+                            "raw_sha256": tar_sha256,
+                            "byte_count": bundle_cap,
+                        }
+                    finally:
+                        os.close(bundle_fd)
+                finally:
+                    os.close(output_fd)
+                response_pin = {
+                    "path": context["paths"]["response"],
+                    "raw_sha256": response_slot["raw_sha256"],
+                    "semantic_sha256": response["response_sha256"],
+                }
+                bundle_pin = {
+                    "path": context["paths"]["bundle"],
+                    "raw_sha256": bundle_slot["raw_sha256"],
+                    "byte_count": bundle_slot["byte_count"],
+                }
+                second_event = archive._recorded_root_control_event(
+                    basis, basis_pin, plan, plan_pin, row, 2 * ordinal + 2,
+                    "response_published", request_pin3, context["paths"],
+                    response_pin, bundle_pin,
+                )
+                archive._append_recorded_root_control_event(
+                    root_ledger_fd, second_event, previous, context,
+                    deadline_ns=deadline,
+                )
+            finally:
+                os.close(root_ledger_fd)
+            archive._verify_recorded_read_root_output_directory_growth(context)
+
+            source_manifest_pin = basis["source_manifest_pins"][
+                basis["consumer_host_id"]
+            ]
+            selected_source_raw = fixture.source_fixture_class.raw_reader(
+                {key: source_manifest_pin[key] for key in (
+                    "path", "raw_sha256",
+                )},
+                archive.MAX_SOURCE_MANIFEST_BYTES,
+            )
+            source_root_text = basis["current_roots"]["source_root"]
+            foreign_response_pin = dict(response_pin)
+            foreign_response_pin["raw_sha256"] = "0" * 64
+            with self.assertRaises(archive.EvidenceArchiveError):
+                archive.release_recorded_preparation_read_root_output_v1(
+                    canonical(basis), canonical(plan), canonical(
+                        plan_module.build_recorded_preparation_read_session_descriptor_v2(
+                            plan, plan_pin,
+                        )[0],
+                    ), source_root_text, selected_source_raw, resource,
+                    ordinal, foreign_response_pin, bundle_pin,
+                )
+            self.assertTrue(Path(response_pin["path"]).is_file())
+            self.assertTrue(Path(bundle_pin["path"]).is_file())
+
+            descriptor, descriptor_raw, _descriptor_pin = \
+                plan_module.build_recorded_preparation_read_session_descriptor_v2(
+                    plan, plan_pin,
+                )
+            released = archive.release_recorded_preparation_read_root_output_v1(
+                canonical(basis), canonical(plan), descriptor_raw,
+                source_root_text, selected_source_raw, resource,
+                ordinal, response_pin, bundle_pin,
+            )
+            self.assertEqual(released["response_pin"], response_pin)
+            self.assertEqual(released["bundle_pin"], bundle_pin)
+            self.assertFalse(Path(response_pin["path"]).exists())
+            self.assertFalse(Path(bundle_pin["path"]).exists())
+            request_path = Path(request_pin["path"])
+            request_path.unlink()
+            request_parent_fd = os.open(
+                request_path.parent,
+                os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+            )
+            try:
+                os.fsync(request_parent_fd)
+            finally:
+                os.close(request_parent_fd)
 class HostBudgetR6SchemaTests(unittest.TestCase):
     def _fixture(self, *, width_bound: bool):
         campaign = "campaign-a"

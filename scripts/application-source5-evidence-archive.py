@@ -16,6 +16,8 @@ import re
 import stat
 import subprocess
 import sys
+import tarfile
+import time
 import types
 from pathlib import Path, PurePosixPath
 from typing import Any, Iterable
@@ -143,6 +145,7 @@ MAX_JSON_BYTES = 32 * 1024 * 1024
 MAX_ARCHIVE_REQUEST_CHECKPOINT_BYTES = 128 * 1024 * 1024
 MAX_PLAN_BYTES = 256 * 1024 * 1024
 MAX_SOURCE_MANIFEST_BYTES = 256 * 1024 * 1024
+MAX_SOURCE_MODULES_PER_HOST = 4096
 MAX_PROBE_TMPDIR_INVENTORY_BYTES = 16 * 1024 * 1024
 MAX_PATH_BYTES = 4096
 MAX_ROWS = 1_000_000
@@ -153,6 +156,41 @@ MAX_TOTAL_BYTES = 1 << 48
 MAX_ARCHIVE_READ_METADATA_BYTES = 16 * 1024 * 1024
 MAX_ARCHIVE_READ_OBJECTS = 262_144
 MIN_ARCHIVE_READ_BUNDLE_BYTES = 10 * 1024
+MAX_ARCHIVE_SIGNER_CONTEXT_BYTES = 64 * 1024
+SOURCE5_RECORDED_READ_PLAN_PATH = (
+    "scripts/application-source5-recorded-preparation-read.py"
+)
+MAX_ARCHIVE_GPGV_BYTES = 64 * 1024 * 1024
+RECORDED_READ_GPG_RESOURCE_SCHEMA_V2 = (
+    "allocatbelt.application-source5-recorded-read-gpg-resource.v2"
+)
+RECORDED_READ_GPG_RESOURCE_FIELDS_V2 = {
+    "schema", "scratch_root", "device", "reserved_bytes",
+    "allocation_block_bytes", "window_directory_allocated_bytes",
+    "required_file_bytes", "required_allocated_bytes",
+    "reserved_inodes", "maximum_gpgv_bytes", "maximum_keyring_bytes",
+    "maximum_ack_bytes", "maximum_signature_bytes",
+    "maximum_stdout_bytes", "maximum_stderr_bytes",
+    "maximum_window_seconds", "resource_sha256",
+}
+RECORDED_READ_ROOT_OUTPUT_SCHEMA_V2 = (
+    "allocatbelt.application-source5-recorded-read-root-output-resource.v2"
+)
+RECORDED_READ_ROOT_OUTPUT_FIELDS_V2 = {
+    "schema", "root", "device", "reserved_bytes", "reserved_inodes",
+    "allocation_block_bytes", "directory_metadata_bytes",
+    "directory_allocated_bytes", "required_file_bytes",
+    "required_file_allocated_bytes", "required_allocated_bytes",
+    "maximum_response_bytes", "maximum_bundle_bytes",
+    "maximum_control_ledger_bytes", "maximum_control_line_bytes",
+    "failure_receipt_bytes", "maximum_window_seconds", "resource_sha256",
+}
+RECORDED_READ_ROOT_CONTROL_SCHEMA_V1 = (
+    "allocatbelt.application-source5-recorded-read-root-control-event.v1"
+)
+RECORDED_READ_ROOT_FAILURE_SCHEMA_V1 = (
+    "allocatbelt.application-source5-recorded-read-root-failure.v1"
+)
 MAX_GPG_OUTPUT_BYTES = 1 << 20
 COPY_BLOCK_BYTES = 1024 * 1024
 MAX_U64 = (1 << 64) - 1
@@ -362,8 +400,12 @@ def _fingerprint(value: object, label: str) -> str:
     return value
 
 
-def _uint(value: object, label: str, *, positive: bool = False) -> int:
-    _require(type(value) is int and 0 <= value <= MAX_U64 and
+def _uint(
+    value: object, label: str, *, positive: bool = False,
+    maximum: int = MAX_U64,
+) -> int:
+    _require(type(maximum) is int and 0 <= maximum <= MAX_U64 and
+             type(value) is int and 0 <= value <= maximum and
              (not positive or value > 0), f"{label} is outside its finite integer bound")
     return value
 
@@ -529,7 +571,8 @@ def _open_parent(root_fd: int, relative_file: str, *, create: bool,
 
 def _read_at(fd: int, name: str, maximum: int, label: str,
              *, expected_bytes: int | None = None,
-             collect: bool = True) -> tuple[bytes | None, str, os.stat_result]:
+             collect: bool = True, deadline_ns: int | None = None,
+             cancel_event=None) -> tuple[bytes | None, str, os.stat_result]:
     try:
         before_path = os.stat(name, dir_fd=fd, follow_symlinks=False)
         _require(stat.S_ISREG(before_path.st_mode) and before_path.st_uid == os.getuid() and
@@ -551,6 +594,10 @@ def _read_at(fd: int, name: str, maximum: int, label: str,
         blocks: list[bytes] | None = [] if collect else None
         total = 0
         while total < before.st_size:
+            _require(deadline_ns is None or time.monotonic_ns() < deadline_ns,
+                     f"{label} exceeded its finite read deadline")
+            _require(cancel_event is None or not cancel_event.is_set(),
+                     f"{label} read was cancelled")
             block = os.read(descriptor, min(COPY_BLOCK_BYTES, before.st_size - total))
             _require(bool(block), f"{label} ended before its pinned size")
             total += len(block)
@@ -1408,18 +1455,161 @@ def _prepared_typed_module(
     return namespace
 
 
+def _recorded_pre_manifest_typed_module(
+    source_manifest_raw: bytes, source_manifest_pin_value: object,
+    source_module_pins_value: object, module_path: str,
+    source_root_value: object, expected_source_root_value: object, *,
+    namespace_name: str,
+) -> dict[str, Any]:
+    """Load one current selected-host Source module before any final manifest.
+
+    This is deliberately narrower than ``_prepared_typed_module``: a
+    registration replay has no sealed final execution manifest to consult.
+    The current selected Source manifest and the SourceA-issued basis module
+    map provide the exact identities instead. Peer Source manifests remain
+    metadata and are never opened through this helper.
+    """
+    source_pin = _pin(source_manifest_pin_value,
+                      "recorded-read selected Source manifest pin")
+    _require(type(source_manifest_raw) is bytes and
+             _sha(source_manifest_raw) == source_pin["raw_sha256"],
+             "recorded-read selected Source bytes differ from their basis pin")
+    source = _prepared_source_document(
+        source_manifest_raw, source_pin, "recorded-read selected current",
+    )
+    _require(type(source_module_pins_value) is dict and
+             0 < len(source_module_pins_value) <= MAX_SOURCE_MODULES_PER_HOST,
+             "recorded-read selected Source module map is malformed")
+    module_pins = source_module_pins_value
+    _require(type(module_path) is str and module_path in module_pins,
+             "recorded-read basis omits the selected Source module pin")
+    module_pin = _exact(module_pins[module_path], {"path", "sha256"},
+                        "recorded-read selected Source module pin")
+    _require(module_pin["path"] == module_path and
+             module_path.startswith("scripts/") and
+             PurePosixPath(module_path).as_posix() == module_path and
+             len(PurePosixPath(module_path).parts) == 2 and
+             ".." not in PurePosixPath(module_path).parts,
+             "recorded-read selected Source module path is not a scripts child")
+    module_sha = _digest(module_pin["sha256"],
+                         "recorded-read selected Source module digest")
+    source_rows = [row for row in source["source"]["files"]
+                   if type(row) is dict and row.get("path") == module_path]
+    _require(len(source_rows) == 1,
+             "recorded-read current Source lacks one selected typed module row")
+    module_row = _exact(source_rows[0], {
+        "path", "kind", "mode", "sha256", "size",
+    }, "recorded-read current Source module inventory row")
+    module_size = _uint(module_row["size"],
+                        "recorded-read selected Source module size",
+                        positive=True, maximum=PREPARATORY_MAX_MODULE_BYTES)
+    _require(module_row["kind"] == "file" and
+             module_row["mode"] in {"100644", "100755"} and
+             module_row["sha256"] == module_sha,
+             "recorded-read module differs from the current Source inventory")
+    source_root = Path(_absolute_path(
+        source_root_value, "recorded-read current selected Source root",
+    ))
+    expected_source_root = Path(_absolute_path(
+        expected_source_root_value,
+        "recorded-read basis selected Source root",
+    ))
+    _require(source_root == expected_source_root and
+             source_root.resolve(strict=True) == source_root,
+             "recorded-read Source root differs from the selected current basis root")
+    root_fd = _open_dir_path(str(source_root),
+                             "recorded-read current Source root",
+                             private_final=False)
+    parent_fd = -1
+    descriptor = -1
+    try:
+        parent_fd = os.open(
+            "scripts", os.O_RDONLY | _O_DIRECTORY | _O_CLOEXEC | _O_NOFOLLOW,
+            dir_fd=root_fd,
+        )
+        leaf = PurePosixPath(module_path).parts[1]
+        before_path = os.stat(leaf, dir_fd=parent_fd,
+                              follow_symlinks=False)
+        actual_mode = f"{stat.S_IFMT(before_path.st_mode) | stat.S_IMODE(before_path.st_mode):06o}"
+        _require(stat.S_ISREG(before_path.st_mode) and
+                 before_path.st_size == module_size and
+                 actual_mode == module_row["mode"],
+                 "recorded-read selected module mode/size differs from its typed inventory")
+        descriptor = os.open(
+            leaf, os.O_RDONLY | _O_CLOEXEC | _O_NOFOLLOW | _O_NONBLOCK,
+            dir_fd=parent_fd,
+        )
+        before = os.fstat(descriptor)
+        _require(_info_key(before) == _info_key(before_path),
+                 "recorded-read selected Source module changed before its pinned read")
+        pieces = []
+        hasher = hashlib.sha256()
+        total = 0
+        while total < module_size:
+            block = os.read(descriptor,
+                            min(COPY_BLOCK_BYTES, module_size - total))
+            _require(bool(block),
+                     "recorded-read selected Source module ended before its typed size")
+            total += len(block)
+            hasher.update(block)
+            pieces.append(block)
+        after = os.fstat(descriptor)
+        after_path = os.stat(leaf, dir_fd=parent_fd, follow_symlinks=False)
+        _require(os.read(descriptor, 1) == b"" and total == module_size and
+                 _info_key(before) == _info_key(after) ==
+                     _info_key(after_path) and hasher.hexdigest() == module_sha,
+                 "recorded-read selected Source module bytes differ from its typed pin")
+        module_raw = b"".join(pieces)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        if parent_fd >= 0:
+            os.close(parent_fd)
+        os.close(root_fd)
+    filename = str(source_root / module_path)
+    module_name = f"{namespace_name}_{module_sha[:16]}_{source_pin['raw_sha256'][:12]}"
+    module = types.ModuleType(module_name)
+    module.__file__ = filename
+    module.__package__ = None
+    previous = sys.modules.get(module_name)
+    sys.modules[module_name] = module
+    try:
+        code = compile(module_raw, filename, "exec")
+        exec(code, module.__dict__, module.__dict__)
+    except Exception as error:
+        if sys.modules.get(module_name) is module:
+            if previous is None:
+                sys.modules.pop(module_name, None)
+            else:
+                sys.modules[module_name] = previous
+        raise EvidenceArchiveError(
+            f"typed pre-manifest selected Source module cannot be loaded: {error}",
+        ) from error
+    module.__source5_typed_pin__ = dict(module_pin)
+    return module.__dict__
+
+
 class _PreparedBootstrapCaptureReader:
     """Lazy custody-checked bootstrap for Source-requested captured bytes only."""
 
     def __init__(
         self, capture_module: dict[str, Any], manifest: dict[str, Any],
-        stage_root: str, maximum_read_bytes: int,
+        stage_root: str, maximum_read_bytes: int, *,
+        deadline_ns: int | None = None, cancel_event=None,
     ):
         self._capture_module = capture_module
         self._stage_root = capture_module["_absolute_stage_root"](stage_root)
         self._maximum_read_bytes = _uint(
             maximum_read_bytes, "prepared bootstrap Source byte ceiling", positive=True,
         )
+        self._deadline_ns = deadline_ns
+        self._cancel_event = cancel_event
+        _require(deadline_ns is None or
+                 (type(deadline_ns) is int and deadline_ns > 0),
+                 "prepared bootstrap deadline is malformed")
+        _require(cancel_event is None or
+                 callable(getattr(cancel_event, "is_set", None)),
+                 "prepared bootstrap cancellation token is malformed")
         _require(self._maximum_read_bytes <= PREPARED_CAPTURE_BOOTSTRAP_MAX_BYTES,
                  "selected Source capture algorithms exceed the fixed bootstrap envelope")
         self._closed = True
@@ -1439,6 +1629,7 @@ class _PreparedBootstrapCaptureReader:
                  "prepared bootstrap manifest schema/cardinality differs")
         local_paths: set[str] = set()
         for index, item_value in enumerate(items["objects"]):
+            self._check_window("while validating capture-manifest rows")
             item = _exact(item_value, {
                 "origin_pin", "local_relative_path", "byte_count",
             }, f"prepared bootstrap object[{index}]")
@@ -1477,7 +1668,16 @@ class _PreparedBootstrapCaptureReader:
                  info.st_uid == self._uid and info.st_dev == self._root_device,
                  f"{label} is not a private same-device mode-0700 directory")
 
+    def _check_window(self, label: str) -> None:
+        _require(self._cancel_event is None or
+                 not self._cancel_event.is_set(),
+                 f"prepared capture was cancelled {label}")
+        _require(self._deadline_ns is None or
+                 time.monotonic_ns() < self._deadline_ns,
+                 f"prepared capture exceeded its finite window {label}")
+
     def _open_root_checked(self) -> int:
+        self._check_window("while reopening the capture root")
         _require(not self._closed, "prepared bootstrap reader is closed")
         fd, chain = self._capture_module["_open_absolute_directory"](
             self._stage_root,
@@ -1545,6 +1745,7 @@ class _PreparedBootstrapCaptureReader:
         inode_ids = {self._root_identity}
         try:
             while pending:
+                self._check_window("while scanning its closed tree")
                 prefix = pending.pop()
                 if prefix:
                     directory_fd, _leaf = self._open_local_parent(
@@ -1557,6 +1758,7 @@ class _PreparedBootstrapCaptureReader:
                     observed: set[str] = set()
                     with os.scandir(directory_fd) as entries:
                         for entry in entries:
+                            self._check_window("while scanning directory entries")
                             name = entry.name
                             _require(name in allowed and name not in observed,
                                      "capture tree contains an undeclared entry")
@@ -1618,6 +1820,7 @@ class _PreparedBootstrapCaptureReader:
             os.close(root_fd)
 
     def read(self, pin_value: object, maximum_bytes: int) -> bytes:
+        self._check_window("before a captured read")
         pin = _pin_raw(pin_value, "prepared bootstrap read pin")
         key = (pin["path"], pin["raw_sha256"])
         captured = self._objects.get(key)
@@ -1661,6 +1864,7 @@ class _PreparedBootstrapCaptureReader:
             hasher = hashlib.sha256()
             offset = 0
             while offset < count:
+                self._check_window("while reading a captured object")
                 block = os.read(descriptor, min(COPY_BLOCK_BYTES, count - offset))
                 _require(bool(block), "prepared captured file ended before its manifest size")
                 output[offset:offset + len(block)] = block
@@ -1713,7 +1917,8 @@ class _PreparedBootstrapCaptureReader:
 
 def _prepared_bootstrap_capture_reader(
     capture_module: dict[str, Any], capture_manifest_raw: bytes,
-    stage_root: str, host_ids: list[str], maximum_read_bytes: int,
+    stage_root: str, host_ids: list[str], maximum_read_bytes: int, *,
+    deadline_ns: int | None = None, cancel_event=None,
 ) -> tuple[Any, dict[str, Any]]:
     _require(type(capture_manifest_raw) is bytes and
              len(capture_manifest_raw) <= PREPARED_CAPTURE_MANIFEST_MAX_BYTES,
@@ -1756,6 +1961,7 @@ def _prepared_bootstrap_capture_reader(
     try:
         reader = _PreparedBootstrapCaptureReader(
             capture_module, manifest, stage_root, maximum_read_bytes,
+            deadline_ns=deadline_ns, cancel_event=cancel_event,
         )
     except Exception as error:
         raise EvidenceArchiveError(
@@ -2419,6 +2625,2364 @@ def _prepared_lineage_closure(
         ) from error
     return (final_reader, declaration, storage_rows, execution, width,
             source_objects["evidence_budget"])
+
+
+def _recorded_pre_manifest_source_closure(
+    basis: dict[str, Any], basis_pin: dict[str, Any],
+    selected_source_manifest_raw: bytes,
+    capture_manifest_raw: bytes, capture_stage_root: str,
+    source_root_value: str, final_plan_module: object, *,
+    deadline_ns: int | None = None, cancel_event=None,
+) -> dict[str, Any]:
+    """Rebuild the actual SourceV2/Bridge capture graph before one read.
+
+    The final execution manifest is intentionally absent. The selected current
+    Source inventory in the cyclic-free basis pins each resident module. Peer
+    Source manifests and bridge/index data are read from the closed capture;
+    this helper never opens a peer Source tree or ELF.
+    """
+    basis_hosts = basis["cohort_hosts"]
+    consumer = basis["consumer_host_id"]
+    source_pins = {
+        host: _pin(basis["source_manifest_pins"][host],
+                   f"recorded-read {host} Source manifest pin")
+        for host in basis_hosts
+    }
+    selected_pin = source_pins[consumer]
+    source_root = Path(_absolute_path(
+        source_root_value, "recorded-read selected Source root",
+    ))
+    _require(source_root == Path(basis["current_roots"]["source_root"]) and
+             source_root.resolve(strict=True) == source_root,
+             "recorded-read source root differs from the current selected basis root")
+    archive_code_root = Path(os.path.abspath(globals()["__file__"]))
+    archive_code_root = archive_code_root.parent.parent.resolve(strict=True)
+    _require(archive_code_root == source_root,
+             "Root recorded-read verifier is not executing from the selected Source root")
+    module_pins = basis["source_module_pins"][consumer]
+    namespaces: dict[str, dict[str, Any]] = {}
+    for name, path in (
+        ("evidence_budget", SOURCE5_BUDGET_VALIDATOR_PATH),
+        ("lineage", PREPARED_LINEAGE_SOURCE_PATH),
+        ("bridge", PREPARED_BRIDGE_BUDGET_SOURCE_PATH),
+        ("source5_campaign", PREPARED_CAMPAIGN_SOURCE_PATH),
+        ("input_preparation", PREPARED_INPUT_PREPARATION_SOURCE_PATH),
+        ("campaign_inputs", PREPARED_CAMPAIGN_INPUTS_SOURCE_PATH),
+        ("chronology", PREPARED_CHRONOLOGY_SOURCE_PATH),
+        ("controller", PREPARED_CONTROLLER_SOURCE_PATH),
+        ("preparatory_budget", PREPARATORY_BUDGET_VALIDATOR_PATH),
+        ("capture", PREPARED_CAPTURE_SOURCE_PATH),
+    ):
+        namespaces[name] = _recorded_pre_manifest_typed_module(
+            selected_source_manifest_raw, selected_pin, module_pins,
+            path, source_root, source_root,
+            namespace_name="_allocatbelt_recorded_pre_manifest_" + name,
+        )
+    objects = {
+        name: sys.modules[namespace["__name__"]]
+        for name, namespace in namespaces.items()
+    }
+    required_apis = {
+        "evidence_budget": (
+            "_catalogue_row", "iter_path_catalogue_rows_with_reader",
+            "source5_indexed_reservation_binding_v1",
+            "project_fixed_pair_archive_readback_caps",
+        ),
+        "lineage": ("verify_source5_prepared_exploration_lineage_v2",),
+        "bridge": (
+            "build_prepared_exploration_capture_storage_v1",
+            "validate_prepared_exploration_width_contract_v2",
+        ),
+        "source5_campaign": ("build_source5_original_pins_from_observed_v1",),
+        "chronology": ("_validate_chronology_original_pins",),
+        "controller": ("digest_object",),
+        "capture": ("PreparedExplorationLineageCaptureReaderV1",),
+    }
+    _require(all(callable(getattr(objects[module], api, None))
+                 for module, apis in required_apis.items()
+                 for api in apis),
+             "selected Source lacks a required current prepared-input validator")
+    _require(type(capture_manifest_raw) is bytes and
+             _sha(capture_manifest_raw) ==
+                 basis["metadata_capture_manifest_pin"]["raw_sha256"],
+             "recorded-read capture manifest differs from its exact raw basis pin")
+    bootstrap, capture_manifest = _prepared_bootstrap_capture_reader(
+        namespaces["capture"], capture_manifest_raw, capture_stage_root,
+        basis_hosts, PREPARED_CAPTURE_BOOTSTRAP_MAX_BYTES,
+        deadline_ns=deadline_ns, cancel_event=cancel_event,
+    )
+    final_reader = None
+    try:
+        source_docs: dict[str, dict[str, Any]] = {}
+        for host in basis_hosts:
+            pin = source_pins[host]
+            if host == consumer:
+                raw = selected_source_manifest_raw
+            else:
+                raw = bootstrap.read({
+                    "path": pin["path"], "raw_sha256": pin["raw_sha256"],
+                }, MAX_SOURCE_MANIFEST_BYTES)
+            source_docs[host] = _prepared_source_document(
+                raw, pin, f"recorded-read {host}",
+            )
+        spec_pin = _pin(basis["spec_pin"],
+                        "recorded-read final Spec pin")
+        plan_pin = _pin(basis["plan_pin"],
+                        "recorded-read final Plan pin")
+        spec_raw = bootstrap.read({
+            "path": spec_pin["path"], "raw_sha256": spec_pin["raw_sha256"],
+        }, PREPARATORY_MAX_SPEC_BYTES)
+        plan_raw = bootstrap.read({
+            "path": plan_pin["path"], "raw_sha256": plan_pin["raw_sha256"],
+        }, MAX_PLAN_BYTES)
+        spec = _parse_canonical(spec_raw, "recorded-read final Spec",
+                                maximum_bytes=PREPARATORY_MAX_SPEC_BYTES)
+        source_plan = _parse_canonical(plan_raw, "recorded-read final Plan",
+                                       maximum_bytes=MAX_PLAN_BYTES)
+        _require(spec.get("campaign_id") == basis["campaign_id"] and
+                 _sha(spec_raw) == spec_pin["raw_sha256"] and
+                 objects["controller"].digest_object(spec) ==
+                     spec_pin["semantic_sha256"] and
+                 _sha(plan_raw) == plan_pin["raw_sha256"] and
+                 source_plan.get("plan_sha256") == plan_pin["semantic_sha256"] ==
+                     _sha(_canonical({key: value for key, value in
+                                      source_plan.items()
+                                      if key != "plan_sha256"},
+                                     maximum_bytes=MAX_PLAN_BYTES)),
+                 "recorded-read final Spec/Plan differs from its exact basis pins")
+        source_rows = []
+        for host in basis_hosts:
+            doc = source_docs[host]
+            pin = source_pins[host]
+            source_rows.append({
+                "host_id": host, "path": pin["path"],
+                "raw_sha256": pin["raw_sha256"],
+                "semantic_sha256": pin["semantic_sha256"],
+                "source_tree_sha256": doc["source"]["source_tree_sha256"],
+            })
+
+        def bootstrap_reader(pin_value: dict[str, str], maximum: int) -> bytes:
+            _require(cancel_event is None or not cancel_event.is_set(),
+                     "recorded-read Source graph replay was cancelled")
+            _require(deadline_ns is None or
+                     time.monotonic_ns() < deadline_ns,
+                     "recorded-read Source graph replay exceeded its window")
+            pin = _pin_raw(pin_value, "recorded-read closed metadata request")
+            if pin == {"path": spec_pin["path"],
+                      "raw_sha256": spec_pin["raw_sha256"]}:
+                raw = spec_raw
+            elif pin == {"path": plan_pin["path"],
+                        "raw_sha256": plan_pin["raw_sha256"]}:
+                raw = plan_raw
+            elif pin == {"path": selected_pin["path"],
+                        "raw_sha256": selected_pin["raw_sha256"]}:
+                raw = selected_source_manifest_raw
+            else:
+                raw = bootstrap.read(pin, maximum)
+            _require(type(raw) is bytes and 0 < len(raw) <= maximum and
+                     _sha(raw) == pin["raw_sha256"],
+                     "recorded-read closed reader returned bytes outside the exact pin/cap")
+            _require(cancel_event is None or not cancel_event.is_set(),
+                     "recorded-read Source graph replay was cancelled after a read")
+            _require(deadline_ns is None or
+                     time.monotonic_ns() < deadline_ns,
+                     "recorded-read Source graph replay exceeded its window")
+            return raw
+
+        original_pin_dtos: dict[str, dict[str, Any]] = {}
+        for host in basis_hosts:
+            header_pin = _pin_raw(basis["ancestor_pins"][host]["bridge_header"],
+                                  f"recorded-read {host} bridge header pin")
+            header_raw = bootstrap_reader(header_pin, 256 * 1024)
+            header = _parse_canonical(header_raw,
+                                      f"recorded-read {host} bridge header",
+                                      maximum_bytes=256 * 1024)
+            initial = _exact(header.get("initial"), {
+                "execution_manifest_pin", "spec_pin", "plan_pin",
+                "source_manifest_pins", "observed_host_pin",
+                "capacity_generation_sha256", "capacity_registration_head",
+                "host_budget_pin", "journal_width_pin",
+                "fixed_spec_host_pin", "prepared_host_binding_sha256",
+                "signer_context_pin", "signer_fingerprint",
+                "maximum_signature_bytes",
+            }, f"recorded-read {host} initial bridge context")
+            observed_pin = _pin_raw(initial["observed_host_pin"],
+                                    f"recorded-read {host} observed-host pin")
+            observed_raw = bootstrap_reader(
+                observed_pin, objects["source5_campaign"].MAX_ARTIFACT_BYTES,
+            )
+            observed = _parse_canonical(
+                observed_raw, f"recorded-read {host} observed-host document",
+                maximum_bytes=objects["source5_campaign"].MAX_ARTIFACT_BYTES,
+            )
+            observed_context = types.SimpleNamespace(
+                observed_host_pin=observed_pin,
+                manifest={"hosts": basis_hosts,
+                          "modules": basis["source_module_pins"]},
+                host_id=host, chronology=objects["chronology"],
+                spec_pin=spec_pin,
+                spec_semantic_sha256=spec_pin["semantic_sha256"],
+                plan_pin=plan_pin,
+                plan_semantic_sha256=plan_pin["semantic_sha256"],
+                source_manifest_pins=source_pins,
+                sources=source_docs,
+            )
+            try:
+                original = objects[
+                    "source5_campaign"
+                ].build_source5_original_pins_from_observed_v1(
+                    observed_context, observed, _sha(observed_raw),
+                )
+                objects["chronology"]._validate_chronology_original_pins(original)
+            except Exception as error:
+                raise EvidenceArchiveError(
+                    f"typed Source chronology rejected recorded-read {host}: {error}",
+                ) from error
+            original_pin_dtos[host] = original
+
+        proofs: dict[str, dict[str, Any]] = {}
+        for host in basis_hosts:
+            final_prepared = {
+                "campaign_id": basis["campaign_id"], "host_id": host,
+                "output_root": basis["current_roots"]["output_root"],
+                "original_pins": original_pin_dtos[host],
+            }
+            try:
+                proof = objects["lineage"].verify_source5_prepared_exploration_lineage_v2(
+                    final_prepared, basis["ancestor_pins"][host],
+                    artifact_reader=bootstrap_reader,
+                    campaign_module=objects["controller"],
+                    input_preparation_module=objects["input_preparation"],
+                    campaign_inputs_module=objects["campaign_inputs"],
+                    chronology_module=objects["chronology"],
+                    source5_campaign_module=objects["source5_campaign"],
+                    preparatory_budget_module=objects["preparatory_budget"],
+                )
+            except Exception as error:
+                raise EvidenceArchiveError(
+                    f"typed Source lineage verifier rejected recorded-read {host}: {error}",
+                ) from error
+            _require(type(proof) is dict and proof.get("host_id") == host and
+                     proof.get("campaign_id") == basis["campaign_id"] and
+                     proof.get("qualification_eligible") is False and
+                     proof.get("component_replay_required") is True and
+                     type(proof.get("index_rows")) is list and
+                     len(proof["index_rows"]) == 360,
+                     f"recorded-read {host} rich lineage proof is incomplete or authorizing")
+            proofs[host] = proof
+        expected_ancestors = {
+            host: proofs[host]["ancestor"] for host in basis_hosts
+        }
+        jobs_by_host = {
+            host: [job for job in source_plan["jobs"]["exploration"]
+                   if type(job) is dict and job.get("host_id") == host]
+            for host in basis_hosts
+        }
+        try:
+            declaration, storage_rows = objects[
+                "bridge"
+            ].build_prepared_exploration_capture_storage_v1(
+                basis_hosts, proofs,
+                expected_ancestors=expected_ancestors,
+                expected_exploration_jobs=jobs_by_host,
+                artifact_reader=bootstrap_reader,
+                evidence_budget_module=objects["evidence_budget"],
+            )
+        except Exception as error:
+            raise EvidenceArchiveError(
+                f"typed Source capture closure builder rejected recorded replay: {error}",
+            ) from error
+        storage_rows = [objects["evidence_budget"]._catalogue_row(
+            row, f"recorded-read captured storage row[{index}]",
+        ) for index, row in enumerate(storage_rows)]
+        _require(declaration.get("cohort_host_ids") == basis_hosts and
+                 len(storage_rows) == len(declaration.get("objects", [])),
+                 "recorded-read Source capture declaration is not a complete cohort")
+        width_pin = _pin(basis["width_contract_pin"],
+                         "recorded-read current width contract pin")
+        width_raw = bootstrap_reader(
+            {"path": width_pin["path"],
+             "raw_sha256": width_pin["raw_sha256"]},
+            PREPARATORY_MAX_WIDTH_BYTES,
+        )
+        width = _parse_canonical(
+            width_raw, "recorded-read current width contract",
+            maximum_bytes=PREPARATORY_MAX_WIDTH_BYTES,
+        )
+        selected_jobs = {
+            phase: [job for job in source_plan["jobs"][phase]
+                    if type(job) is dict and job.get("host_id") == consumer]
+            for phase in ("exploration", "aa", "confirmation", "pressure", "soak")
+        }
+        try:
+            checked_width, width_events, max_line = objects[
+                "bridge"
+            ].validate_prepared_exploration_width_contract_v2(
+                width, jobs_by_phase=selected_jobs,
+                expected_campaign_id=basis["campaign_id"],
+                expected_host_id=consumer,
+                expected_original_pins_sha256=_sha(_canonical(
+                    original_pin_dtos[consumer],
+                )), expected_plan_pin=plan_pin,
+                expected_source_manifest_pin=selected_pin,
+                expected_ancestor=proofs[consumer]["ancestor"],
+            )
+        except Exception as error:
+            raise EvidenceArchiveError(
+                f"typed Source width validator rejected recorded-read basis: {error}",
+            ) from error
+        _require(checked_width == width and width_events == 97499 and
+                 max_line > 0 and _sha(width_raw) == width_pin["raw_sha256"] and
+                 _sha(_canonical({key: value for key, value in width.items()
+                                  if key != "contract_sha256"})) ==
+                     width_pin["semantic_sha256"],
+                 "recorded-read current width contract differs from its exact basis pin")
+        captured_by_pin = {
+            (item["origin_pin"]["path"],
+             item["origin_pin"]["raw_sha256"]): item
+            for item in capture_manifest["objects"]
+        }
+        expected_capture_rows = []
+        for row in declaration["objects"]:
+            key = (row["origin_pin"]["path"],
+                   row["origin_pin"]["raw_sha256"])
+            captured = captured_by_pin.get(key)
+            _require(captured is not None,
+                     "recorded-read derived Source object is absent from closed capture")
+            expected_capture_rows.append({
+                "origin_pin": row["origin_pin"],
+                "local_relative_path": captured["local_relative_path"],
+                "byte_count": row["byte_count"],
+            })
+        _require(expected_capture_rows == capture_manifest["objects"] and
+                 len(expected_capture_rows) == len(declaration["objects"]),
+                 "recorded-read closed capture manifest differs from the full Source-derived declaration")
+        return {
+        "reader": bootstrap, "declaration": declaration,
+        "storage_rows": storage_rows, "proofs": proofs,
+        "source_docs": source_docs, "source_modules": objects,
+        "source_plan": source_plan, "spec": spec, "width": width,
+        "source_pins": source_pins, "selected_source_pin": selected_pin,
+        }
+    except BaseException:
+        bootstrap.close()
+        raise
+
+
+def _recorded_read_root_output_context(
+    resource_value: object, basis: dict[str, Any],
+    basis_pin: dict[str, Any], plan: dict[str, Any],
+    plan_pin: dict[str, Any], read_ordinal: int,
+    window_chunk: dict[str, Any], plan_module: object,
+) -> dict[str, Any]:
+    resource = _exact(resource_value, RECORDED_READ_ROOT_OUTPUT_FIELDS_V2,
+                      "Root recorded-read output reservation")
+    body = {key: value for key, value in resource.items()
+            if key != "resource_sha256"}
+    _require(resource["schema"] == RECORDED_READ_ROOT_OUTPUT_SCHEMA_V2 and
+             resource["resource_sha256"] == _sha(_canonical(body)),
+             "Root recorded-read output reservation self digest differs")
+    root = Path(_absolute_path(resource["root"],
+                               "Root recorded-read output root"))
+    root_device = _uint(resource["device"],
+                        "Root recorded-read output device")
+    reserved_bytes = _uint(resource["reserved_bytes"],
+                           "Root recorded-read output bytes", positive=True)
+    reserved_inodes = _uint(resource["reserved_inodes"],
+                            "Root recorded-read output inodes", positive=True)
+    allocation_block = _uint(
+        resource["allocation_block_bytes"],
+        "Root recorded-read output allocation block", positive=True,
+        maximum=1 << 20,
+    )
+    directory_metadata = _uint(
+        resource["directory_metadata_bytes"],
+        "Root recorded-read output per-directory metadata reserve", positive=True,
+    )
+    directory_allocated = _uint(
+        resource["directory_allocated_bytes"],
+        "Root recorded-read output directory allocation projection", positive=True,
+    )
+    projected_file_bytes = _uint(
+        resource["required_file_bytes"],
+        "Root recorded-read output raw file projection", positive=True,
+    )
+    projected_file_allocated = _uint(
+        resource["required_file_allocated_bytes"],
+        "Root recorded-read output rounded file projection", positive=True,
+    )
+    projected_allocated = _uint(
+        resource["required_allocated_bytes"],
+        "Root recorded-read output physical projection", positive=True,
+    )
+    maximum_response = _uint(
+        resource["maximum_response_bytes"],
+        "Root recorded-read output response cap", positive=True,
+        maximum=MAX_ARCHIVE_READ_METADATA_BYTES,
+    )
+    maximum_bundle = _uint(
+        resource["maximum_bundle_bytes"],
+        "Root recorded-read output bundle cap", positive=True,
+        maximum=MAX_TOTAL_BYTES,
+    )
+    maximum_ledger = _uint(
+        resource["maximum_control_ledger_bytes"],
+        "Root recorded-read control-ledger cap", positive=True,
+        maximum=MAX_TOTAL_BYTES,
+    )
+    maximum_line = _uint(
+        resource["maximum_control_line_bytes"],
+        "Root recorded-read control-line cap", positive=True,
+        maximum=MAX_ARCHIVE_READ_METADATA_BYTES,
+    )
+    failure_bytes = _uint(
+        resource["failure_receipt_bytes"],
+        "Root recorded-read failure-receipt cap", positive=True,
+        maximum=MAX_ARCHIVE_READ_METADATA_BYTES,
+    )
+    maximum_window = _uint(
+        resource["maximum_window_seconds"],
+        "Root recorded-read output timeout", positive=True, maximum=300,
+    )
+    row = plan_module.validate_recorded_preparation_read_window_v2(
+        plan, plan_pin, window_chunk, read_ordinal,
+    )
+    _require(maximum_window ==
+             plan["timeout_declaration"]["maximum_io_window_seconds"] and
+             maximum_response >= row["resource_bounds"]["outer_response_bytes"] and
+             maximum_bundle >= row["resource_bounds"]["tar_bytes"],
+             "Root output caps/deadline do not cover this exact Source window")
+    required_directories = [
+        str(root / basis["campaign_id"]),
+        str(root / basis["campaign_id"] / "source5"),
+        str(root / basis["campaign_id"] / "source5" /
+            basis["consumer_host_id"]),
+        str(root / basis["campaign_id"] / "source5" /
+            basis["consumer_host_id"] / "recorded-preparation"),
+        str(root / basis["campaign_id"] / "source5" /
+            basis["consumer_host_id"] / "recorded-preparation" /
+            plan["session_nonce"]),
+        str(root / basis["campaign_id"] / "source5" /
+            basis["consumer_host_id"] / "recorded-preparation" /
+            plan["session_nonce"] / "slot"),
+    ]
+    session = Path(required_directories[-2])
+    slot = Path(required_directories[-1])
+    paths = {
+        "session": str(session),
+        "slot": str(slot),
+        "response": str(slot / "response.json.incoming"),
+        "bundle": str(slot / "response.tar.incoming"),
+        "control_ledger": str(session / "control-ledger.jsonl"),
+        "failure_receipt": str(session / "failure-receipt.json"),
+        "directories": required_directories,
+    }
+    protected_roots = list(basis["current_roots"].values()) + [
+        plan["scratch_declaration"]["root"], row["archive_source5_root"],
+    ]
+    for protected in protected_roots:
+        _require(not plan_module._paths_overlap(str(root), protected),
+                 "Root response scratch overlaps a Source/current/archive root")
+    file_caps = (maximum_response, maximum_bundle,
+                 maximum_ledger, failure_bytes)
+    required_file_bytes = sum(file_caps)
+    required_file_allocated = sum(
+        ((cap + allocation_block - 1) // allocation_block) *
+        allocation_block for cap in file_caps
+    )
+    required_directories_count = len(required_directories)
+    required_directory_bytes = required_directories_count * directory_metadata
+    required_allocated = required_directory_bytes + required_file_allocated
+    required_inodes = 2 + 1 + 1 + len(required_directories)
+    _require(directory_metadata == allocation_block and
+             directory_allocated == required_directory_bytes and
+             projected_file_bytes == required_file_bytes and
+             projected_file_allocated == required_file_allocated and
+             projected_allocated == required_allocated and
+             reserved_bytes >= required_allocated and
+             reserved_inodes >= required_inodes and
+             maximum_ledger >= (2 * plan_module.READ_WINDOW_COUNT * maximum_line),
+             "Root recorded-read output reservation is below its complete bounded session")
+    return {
+        "resource": resource, "root": root, "device": root_device,
+        "maximum_response_bytes": maximum_response,
+        "maximum_bundle_bytes": maximum_bundle,
+        "maximum_control_ledger_bytes": maximum_ledger,
+        "maximum_control_line_bytes": maximum_line,
+        "failure_receipt_bytes": failure_bytes,
+        "maximum_window_seconds": maximum_window,
+        "allocation_block_bytes": allocation_block,
+        "directory_metadata_bytes": directory_metadata,
+        "directory_allocated_bytes": directory_allocated,
+        "required_file_bytes": projected_file_bytes,
+        "required_file_allocated_bytes": projected_file_allocated,
+        "required_allocated_bytes": projected_allocated,
+        "maximum_response_allocated_bytes": (
+            (maximum_response + allocation_block - 1) // allocation_block *
+            allocation_block
+        ),
+        "maximum_bundle_allocated_bytes": (
+            (maximum_bundle + allocation_block - 1) // allocation_block *
+            allocation_block
+        ),
+        "maximum_control_ledger_allocated_bytes": (
+            (maximum_ledger + allocation_block - 1) // allocation_block *
+            allocation_block
+        ),
+        "failure_receipt_allocated_bytes": (
+            (failure_bytes + allocation_block - 1) // allocation_block *
+            allocation_block
+        ),
+        "reserved_bytes": reserved_bytes,
+        "reserved_inodes": reserved_inodes,
+        "paths": paths,
+    }
+
+
+def _recorded_read_root_output_directory_baseline(
+    context: dict[str, Any],
+) -> dict[str, int]:
+    baseline = {}
+    for path_text in context["paths"]["directories"]:
+        directory_fd = _open_dir_path(
+            path_text, "Root recorded-read output directory baseline",
+            private_final=True,
+        )
+        try:
+            info = os.fstat(directory_fd)
+            _require(info.st_dev == context["device"] and
+                     stat.S_ISDIR(info.st_mode) and
+                     info.st_uid == os.getuid() and
+                     stat.S_IMODE(info.st_mode) == 0o700,
+                     "Root output directory baseline identity differs")
+            baseline[path_text] = info.st_blocks * 512
+        finally:
+            os.close(directory_fd)
+    return baseline
+
+
+def _recorded_read_root_output_missing_directory_count(
+    root_fd: int, context: dict[str, Any],
+) -> int:
+    current_fd = os.dup(root_fd)
+    try:
+        directories = context["paths"]["directories"]
+        for index, path_text in enumerate(directories):
+            leaf = Path(path_text).name
+            try:
+                path_info = os.stat(leaf, dir_fd=current_fd,
+                                    follow_symlinks=False)
+            except FileNotFoundError:
+                return len(directories) - index
+            _require(stat.S_ISDIR(path_info.st_mode) and
+                     path_info.st_uid == os.getuid() and
+                     stat.S_IMODE(path_info.st_mode) == 0o700 and
+                     path_info.st_dev == context["device"],
+                     "Root output existing directory is not private same-device storage")
+            child_fd = os.open(
+                leaf, os.O_RDONLY | _O_DIRECTORY | _O_CLOEXEC | _O_NOFOLLOW,
+                dir_fd=current_fd,
+            )
+            try:
+                _require(_info_key(path_info) == _info_key(os.fstat(child_fd)),
+                         "Root output directory changed during preflight")
+            except BaseException:
+                os.close(child_fd)
+                raise
+            os.close(current_fd)
+            current_fd = child_fd
+        return 0
+    finally:
+        os.close(current_fd)
+
+
+def _prepare_recorded_read_root_output_dirs(context: dict[str, Any]) -> None:
+    root_fd = _open_dir_path(context["root"],
+                             "Root recorded-read output root",
+                             private_final=True)
+    try:
+        root_info = os.fstat(root_fd)
+        initial_space = os.fstatvfs(root_fd)
+        initial_block = initial_space.f_frsize or initial_space.f_bsize
+        _require(root_info.st_dev == context["device"] and
+                 initial_block == context["allocation_block_bytes"],
+                 "Root recorded-read output root device/allocation block differs")
+        missing_directories = _recorded_read_root_output_missing_directory_count(
+            root_fd, context,
+        )
+        try:
+            session_fd = _open_dir_path(
+                context["paths"]["session"],
+                "Root recorded-read session inode preflight",
+                private_final=True,
+            )
+        except FileNotFoundError:
+            ledger_inode_remaining = 1
+        else:
+            try:
+                try:
+                    ledger_info = os.stat(
+                        Path(context["paths"]["control_ledger"]).name,
+                        dir_fd=session_fd, follow_symlinks=False,
+                    )
+                except FileNotFoundError:
+                    ledger_inode_remaining = 1
+                else:
+                    _require(stat.S_ISREG(ledger_info.st_mode) and
+                             ledger_info.st_uid == os.getuid() and
+                             stat.S_IMODE(ledger_info.st_mode) == 0o600 and
+                             ledger_info.st_nlink == 1,
+                             "Root output inode preflight found a foreign ledger")
+                    ledger_inode_remaining = 0
+            finally:
+                os.close(session_fd)
+        initial_space = os.fstatvfs(root_fd)
+        _require(initial_space.f_favail >=
+                     missing_directories + 3 + ledger_inode_remaining,
+                 "Root output root lacks directory and current file inodes")
+        _require(os.fstat(root_fd).st_dev == context["device"],
+                 "Root recorded-read output root is on the wrong device")
+        current_fd = os.dup(root_fd)
+        try:
+            for path_text in context["paths"]["directories"]:
+                leaf = Path(path_text).name
+                try:
+                    before_child = os.stat(
+                        leaf, dir_fd=current_fd, follow_symlinks=False,
+                    )
+                except FileNotFoundError:
+                    before_child = None
+                child_fd = _ensure_private_child(
+                    current_fd, leaf, "Root recorded-read output directory",
+                )
+                child_info = os.fstat(child_fd)
+                _require(child_info.st_dev == context["device"] and
+                         stat.S_ISDIR(child_info.st_mode) and
+                         child_info.st_uid == os.getuid() and
+                         stat.S_IMODE(child_info.st_mode) == 0o700,
+                         "Root output directory crossed device/mode or its explicit metadata reserve")
+                if before_child is None:
+                    allocated_delta = child_info.st_blocks * 512
+                else:
+                    _require(_info_key(before_child) == _info_key(child_info),
+                             "Root output directory changed during identity check")
+                    allocated_delta = max(
+                        0, child_info.st_blocks - before_child.st_blocks,
+                    ) * 512
+                _require(allocated_delta <=
+                         context["directory_metadata_bytes"],
+                         "Root output directory growth exceeded its explicit metadata reserve")
+                os.close(current_fd)
+                current_fd = child_fd
+        finally:
+            os.close(current_fd)
+        context["directory_allocation_baseline"] = \
+            _recorded_read_root_output_directory_baseline(context)
+        remaining_bytes, remaining_inodes = \
+            _recorded_read_root_output_remaining_capacity(context)
+        space = os.fstatvfs(root_fd)
+        block_bytes = space.f_frsize or space.f_bsize
+        _require(block_bytes == context["allocation_block_bytes"] and
+                 space.f_bavail * block_bytes >= remaining_bytes and
+                 space.f_favail >= remaining_inodes,
+                 "Root recorded-read output root lacks its remaining reserved window")
+        session_fd = _open_dir_path(
+            context["paths"]["session"],
+            "Root recorded-read current session directory",
+            private_final=True,
+        )
+        try:
+            _require(set(os.listdir(session_fd)) <= {
+                         "slot", "control-ledger.jsonl",
+                     } and "slot" in os.listdir(session_fd),
+                     "Root recorded-read session contains an undeclared entry")
+        finally:
+            os.close(session_fd)
+        slot_fd = _open_dir_path(
+            context["paths"]["slot"],
+            "Root recorded-read current slot directory",
+            private_final=True,
+        )
+        try:
+            _require(not os.listdir(slot_fd),
+                     "Root recorded-read current Root slot still holds an output")
+        finally:
+            os.close(slot_fd)
+        os.fsync(root_fd)
+    finally:
+        os.close(root_fd)
+
+
+def _verify_recorded_read_root_output_directory_growth(
+    context: dict[str, Any],
+) -> None:
+    baseline = context.get("directory_allocation_baseline")
+    _require(type(baseline) is dict and
+             set(baseline) == set(context["paths"]["directories"]),
+             "Root output directory allocation baseline is absent")
+    total_growth = 0
+    for path_text in context["paths"]["directories"]:
+        directory_fd = _open_dir_path(
+            path_text, "Root recorded-read output directory growth",
+            private_final=True,
+        )
+        try:
+            info = os.fstat(directory_fd)
+            _require(info.st_dev == context["device"] and
+                     stat.S_ISDIR(info.st_mode) and
+                     info.st_uid == os.getuid() and
+                     stat.S_IMODE(info.st_mode) == 0o700,
+                     "Root output directory changed identity or mode")
+            allocated = info.st_blocks * 512
+            growth = max(0, allocated - baseline[path_text])
+            _require(growth <= context["directory_metadata_bytes"],
+                     "Root output directory exceeded its per-directory metadata reserve")
+            total_growth += growth
+        finally:
+            os.close(directory_fd)
+    _require(total_growth <= context["directory_allocated_bytes"],
+             "Root output directories exceeded their aggregate metadata reserve")
+
+
+def _recorded_read_root_output_remaining_capacity(
+    context: dict[str, Any],
+) -> tuple[int, int]:
+    ledger_path = Path(context["paths"]["control_ledger"])
+    try:
+        ledger_info = ledger_path.lstat()
+        _require(stat.S_ISREG(ledger_info.st_mode) and
+                 ledger_info.st_uid == os.getuid() and
+                 stat.S_IMODE(ledger_info.st_mode) == 0o600 and
+                 ledger_info.st_nlink == 1 and
+                 ledger_info.st_size <= context["maximum_control_ledger_bytes"] and
+                 ledger_info.st_blocks * 512 <=
+                    context["maximum_control_ledger_allocated_bytes"],
+                 "Root output control ledger exceeds its remaining physical reservation")
+        ledger_allocated = ledger_info.st_blocks * 512
+        ledger_inode_remaining = 0
+    except FileNotFoundError:
+        ledger_allocated = 0
+        ledger_inode_remaining = 1
+    for key in ("response", "bundle", "failure_receipt"):
+        path = Path(context["paths"][key])
+        _require(not path.exists() and not path.is_symlink(),
+                 "Root output reservation has a retained prior window")
+    remaining_bytes = (
+        context["maximum_response_allocated_bytes"] +
+        context["maximum_bundle_allocated_bytes"] +
+        context["failure_receipt_allocated_bytes"] +
+        max(0, context["maximum_control_ledger_allocated_bytes"] -
+            ledger_allocated)
+    )
+    remaining_inodes = 3 + ledger_inode_remaining
+    return remaining_bytes, remaining_inodes
+
+
+def _check_recorded_read_root_resource_pair(
+    output_context: dict[str, Any], gpg_resource: dict[str, Any], *,
+    deadline_ns: int, cancel_event=None,
+) -> None:
+    _require(time.monotonic_ns() < deadline_ns and
+             (cancel_event is None or not cancel_event.is_set()),
+             "Root recorded-read combined resource check was cancelled or expired")
+    gpg_root = Path(_absolute_path(
+        gpg_resource["scratch_root"], "Root GPG auxiliary scratch root",
+    ))
+    output_fd: int | None = None
+    gpg_fd = _open_dir_path(
+        gpg_root, "Root recorded-read GPG auxiliary root",
+        private_final=True,
+    )
+    try:
+        output_fd = _open_dir_path(
+            output_context["root"], "Root recorded-read output root",
+            private_final=True,
+        )
+        gpg_info = os.fstat(gpg_fd)
+        output_info = os.fstat(output_fd)
+        gpg_space = os.fstatvfs(gpg_fd)
+        output_space = os.fstatvfs(output_fd)
+        gpg_block = gpg_space.f_frsize or gpg_space.f_bsize
+        output_block = output_space.f_frsize or output_space.f_bsize
+        gpg_bytes = _uint(
+            gpg_resource["reserved_bytes"],
+            "Root GPG reserved physical bytes", positive=True,
+        )
+        gpg_inodes = _uint(
+            gpg_resource["reserved_inodes"],
+            "Root GPG reserved inodes", positive=True,
+        )
+        _require(gpg_info.st_dev == gpg_resource["device"] and
+                 gpg_block == gpg_resource["allocation_block_bytes"] and
+                 output_info.st_dev == output_context["device"] and
+                 output_block == output_context["allocation_block_bytes"],
+                 "Root GPG/output root device or allocation-block identity differs")
+        output_bytes, output_inodes = \
+            _recorded_read_root_output_remaining_capacity(output_context)
+        if gpg_info.st_dev == output_info.st_dev:
+            _require(gpg_space.f_bavail * gpg_block >=
+                         gpg_bytes + output_bytes and
+                     gpg_space.f_favail >= gpg_inodes + output_inodes,
+                     "Root GPG plus output windows exceed the shared device reservation")
+        else:
+            _require(gpg_space.f_bavail * gpg_block >= gpg_bytes and
+                     gpg_space.f_favail >= gpg_inodes and
+                     output_space.f_bavail * output_block >= output_bytes and
+                     output_space.f_favail >= output_inodes,
+                     "Root GPG or output window lacks its separate device reservation")
+    finally:
+        try:
+            if output_fd is not None:
+                os.close(output_fd)
+        finally:
+            os.close(gpg_fd)
+
+
+def _recorded_root_control_event(
+    basis: dict[str, Any], basis_pin: dict[str, Any],
+    plan: dict[str, Any], plan_pin: dict[str, Any],
+    row: dict[str, Any], sequence: int, action: str,
+    request_pin: dict[str, Any], root_paths: dict[str, Any],
+    response_pin=None, bundle_pin=None,
+) -> dict[str, Any]:
+    _require(action in {"request_accepted", "response_published"} and
+             type(sequence) is int and 0 < sequence < (1 << 64),
+             "Root recorded-read event action/sequence differs")
+    request = _exact(request_pin, {
+        "path", "raw_sha256", "semantic_sha256",
+    }, "Root recorded-read event request pin")
+    _require(request["path"] == row["session_paths"]["request"],
+             "Root recorded-read event request path differs from its Source row")
+    _digest(request["raw_sha256"], "Root recorded-read event request raw digest")
+    _digest(request["semantic_sha256"],
+            "Root recorded-read event request semantic digest")
+    if action == "request_accepted":
+        _require(response_pin is None and bundle_pin is None,
+                 "Root request-accepted event cannot carry an output pin")
+    else:
+        response_pin = _exact(response_pin, {
+            "path", "raw_sha256", "semantic_sha256",
+        }, "Root recorded-read event response pin")
+        bundle_pin = _exact(bundle_pin, {
+            "path", "raw_sha256", "byte_count",
+        }, "Root recorded-read event bundle pin")
+        _require(response_pin["path"] == root_paths["response"] and
+                 bundle_pin["path"] == root_paths["bundle"],
+                 "Root recorded-read event output path differs from its current Root slots")
+        _digest(response_pin["raw_sha256"],
+                "Root recorded-read event response raw digest")
+        _digest(response_pin["semantic_sha256"],
+                "Root recorded-read event response semantic digest")
+        _digest(bundle_pin["raw_sha256"],
+                "Root recorded-read event bundle raw digest")
+        _require(_uint(bundle_pin["byte_count"],
+                       "Root recorded-read event bundle byte count",
+                       positive=True) == row["resource_bounds"]["tar_bytes"],
+                 "Root recorded-read event bundle size differs from its exact row")
+    body = {
+        "schema": RECORDED_READ_ROOT_CONTROL_SCHEMA_V1,
+        "sequence": sequence,
+        "basis_pin": basis_pin,
+        "read_plan_pin": plan_pin,
+        "session_nonce": plan["session_nonce"],
+        "consumer_host_id": plan["consumer_host_id"],
+        "owner_host_id": row["owner_host_id"],
+        "operation_kind": plan["operation_kind"],
+        "read_ordinal": row["read_ordinal"],
+        "job_index": row["job_index"],
+        "job_sha256": row["job_sha256"],
+        "action": action,
+        "request_pin": request_pin,
+        "response_path": root_paths["response"],
+        "bundle_path": root_paths["bundle"],
+        "response_pin": response_pin,
+        "bundle_pin": bundle_pin,
+        "qualification_eligible": False,
+        "event_sha256": "",
+    }
+    return {**body, "event_sha256": _sha(_canonical({
+        key: value for key, value in body.items()
+        if key != "event_sha256"
+    }))}
+
+
+def _open_recorded_read_root_ledger(context: dict[str, Any]) -> int:
+    path = Path(context["paths"]["control_ledger"])
+    if not path.exists() and not path.is_symlink():
+        parent_fd = _open_dir_path(
+            path.parent, "Root recorded-read control-ledger parent",
+            private_final=True,
+        )
+        try:
+            _require(os.fstat(parent_fd).st_dev == context["device"],
+                     "Root recorded-read control-ledger parent device differs")
+            _write_at(parent_fd, path.name, b"",
+                      "Root recorded-read current control ledger")
+        finally:
+            os.close(parent_fd)
+    parent_fd = _open_dir_path(
+        path.parent, "Root recorded-read current ledger parent",
+        private_final=True,
+    )
+    try:
+        _require(os.fstat(parent_fd).st_dev == context["device"],
+                 "Root recorded-read current ledger parent device differs")
+        info = os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
+        _require(stat.S_ISREG(info.st_mode) and info.st_uid == os.getuid() and
+                 stat.S_IMODE(info.st_mode) == 0o600 and info.st_nlink == 1 and
+                 0 <= info.st_size <= context["maximum_control_ledger_bytes"] and
+                 info.st_blocks * 512 <=
+                    context["maximum_control_ledger_allocated_bytes"],
+                 "Root recorded-read current ledger is outside its exact private bounds")
+        descriptor = os.open(
+            path.name,
+            os.O_RDWR | _O_CLOEXEC | _O_NOFOLLOW | _O_NONBLOCK,
+            dir_fd=parent_fd,
+        )
+        try:
+            _require(_info_key(info) == _info_key(os.fstat(descriptor)),
+                 "Root recorded-read control ledger changed before open")
+            import fcntl
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return descriptor
+        except BaseException:
+            os.close(descriptor)
+            raise
+    except (ImportError, OSError) as error:
+        raise EvidenceArchiveError(
+            "Root recorded-read control ledger is already leased or unavailable",
+        ) from error
+    finally:
+        os.close(parent_fd)
+
+
+def _recorded_root_control_state(
+    descriptor: int, context: dict[str, Any], basis: dict[str, Any],
+    basis_pin: dict[str, Any], plan: dict[str, Any],
+    plan_pin: dict[str, Any], plan_module: object, *,
+    deadline_ns: int | None = None, cancel_event=None,
+) -> tuple[int, dict[str, Any] | None, str]:
+    info = os.fstat(descriptor)
+    _require(info.st_size <= context["maximum_control_ledger_bytes"] and
+             info.st_blocks * 512 <=
+                context["maximum_control_ledger_allocated_bytes"] and
+             stat.S_ISREG(info.st_mode) and info.st_uid == os.getuid() and
+             stat.S_IMODE(info.st_mode) == 0o600 and info.st_nlink == 1,
+             "Root recorded-read current ledger exceeded its exact limit")
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    raw = bytearray()
+    while len(raw) < info.st_size:
+        _require(deadline_ns is None or time.monotonic_ns() < deadline_ns,
+                 "Root recorded-read ledger read exceeded its window")
+        _require(cancel_event is None or not cancel_event.is_set(),
+                 "Root recorded-read ledger read was cancelled")
+        block = os.read(descriptor, min(COPY_BLOCK_BYTES,
+                                        info.st_size - len(raw)))
+        _require(bool(block),
+                 "Root recorded-read ledger shortened during bounded replay")
+        raw.extend(block)
+        _require(len(raw) <= context["maximum_control_ledger_bytes"],
+                 "Root recorded-read ledger exceeds its bounded session")
+    _require(os.read(descriptor, 1) == b"" and
+             _info_key(info) == _info_key(os.fstat(descriptor)),
+             "Root recorded-read ledger changed during replay")
+    previous = "0" * 64
+    count = 0
+    lines = bytes(raw).splitlines(keepends=True)
+    _require(b"".join(lines) == bytes(raw) and
+             all(line.endswith(b"\n") and
+                 len(line) <= context["maximum_control_line_bytes"]
+                 for line in lines),
+             "Root recorded-read ledger has a partial or oversized line")
+    pending_request = None
+    cached_chunk_ordinal = None
+    cached_window_chunk = None
+    for index, line in enumerate(lines):
+        _require(deadline_ns is None or time.monotonic_ns() < deadline_ns,
+                 "Root recorded-read ledger replay exceeded its window")
+        _require(cancel_event is None or not cancel_event.is_set(),
+                 "Root recorded-read ledger replay was cancelled")
+        try:
+            envelope = json.loads(line.decode("ascii"))
+        except (UnicodeError, json.JSONDecodeError, RecursionError) as error:
+            raise EvidenceArchiveError(
+                "Root recorded-read ledger line is malformed",
+            ) from error
+        envelope = _exact(envelope, {
+            "previous_sha256", "record", "record_sha256",
+        }, f"Root recorded-read ledger line[{index}]")
+        event = _exact(envelope["record"], {
+            "schema", "sequence", "basis_pin", "read_plan_pin",
+            "session_nonce", "consumer_host_id", "owner_host_id",
+            "operation_kind", "read_ordinal", "job_index", "job_sha256",
+            "action", "request_pin", "response_path", "bundle_path",
+            "response_pin", "bundle_pin", "qualification_eligible",
+            "event_sha256",
+        }, f"Root recorded-read event[{index}]")
+        ordinal = count // 2
+        _require(ordinal < plan_module.READ_WINDOW_COUNT and
+                 event["read_ordinal"] == ordinal,
+                 "Root recorded-read ledger order differs from its exact schedule")
+        current_chunk_ordinal = plan["window_index"][ordinal]["chunk_ordinal"]
+        if current_chunk_ordinal != cached_chunk_ordinal:
+            cached_window_chunk, _row = _recorded_read_window_chunk(
+                plan, plan_pin, plan_module, ordinal,
+                deadline_ns=deadline_ns, cancel_event=cancel_event,
+            )
+            cached_chunk_ordinal = current_chunk_ordinal
+        window_chunk = cached_window_chunk
+        row = plan_module.validate_recorded_preparation_read_window_v2(
+            plan, plan_pin, window_chunk, ordinal,
+        )
+        request, request_raw, request_pin = \
+            plan_module.build_recorded_preparation_read_request_v2(
+                basis, basis_pin, plan, plan_pin, ordinal, window_chunk,
+            )
+        request_pin = {key: request_pin[key] for key in (
+            "path", "raw_sha256", "semantic_sha256",
+        )}
+        if count % 2 == 0:
+            expected = _recorded_root_control_event(
+                basis, basis_pin, plan, plan_pin, row, count + 1,
+                "request_accepted", request_pin, context["paths"],
+            )
+            pending_request = request_pin
+        else:
+            response_pin = event["response_pin"]
+            bundle_pin = event["bundle_pin"]
+            expected = _recorded_root_control_event(
+                basis, basis_pin, plan, plan_pin, row, count + 1,
+                "response_published", request_pin, context["paths"],
+                response_pin, bundle_pin,
+            )
+            pending_request = None
+        record_digest = _sha(_canonical({
+            "previous_sha256": previous, "record": event,
+        }))
+        _require(line == _canonical(envelope) and
+                 envelope["previous_sha256"] == previous and
+                 envelope["record_sha256"] == record_digest and
+                 event == expected and
+                 event["event_sha256"] == _sha(_canonical({
+                     key: value for key, value in event.items()
+                     if key != "event_sha256"
+                 })),
+                 "Root recorded-read ledger chain/event differs from the current Source plan")
+        previous = record_digest
+        count += 1
+    _require(count <= 2 * plan_module.READ_WINDOW_COUNT,
+             "Root recorded-read ledger exceeds its exact 720-window schedule")
+    return count // 2, pending_request, previous
+
+
+def _append_recorded_root_control_event(
+    descriptor: int, event: dict[str, Any], previous: str,
+    context: dict[str, Any], *, deadline_ns: int | None = None,
+    cancel_event=None,
+) -> str:
+    line = _canonical({
+        "previous_sha256": previous, "record": event,
+        "record_sha256": _sha(_canonical({
+            "previous_sha256": previous, "record": event,
+        })),
+    })
+    before = os.fstat(descriptor)
+    _require(len(line) <= context["maximum_control_line_bytes"] and
+             before.st_size + len(line) <=
+                 context["maximum_control_ledger_bytes"],
+             "Root recorded-read ledger append exceeds its exact reservation")
+    os.lseek(descriptor, 0, os.SEEK_END)
+    view = memoryview(line)
+    while view:
+        _require(deadline_ns is None or time.monotonic_ns() < deadline_ns,
+                 "Root recorded-read ledger append exceeded its window")
+        _require(cancel_event is None or not cancel_event.is_set(),
+                 "Root recorded-read ledger append was cancelled")
+        written = os.write(descriptor, view)
+        _require(written > 0,
+                 "Root recorded-read ledger writer made no progress")
+        view = view[written:]
+    os.fsync(descriptor)
+    after = os.fstat(descriptor)
+    _require(after.st_size == before.st_size + len(line) and
+             after.st_blocks * 512 <=
+                context["maximum_control_ledger_allocated_bytes"] and
+             (before.st_dev, before.st_ino, stat.S_IFMT(before.st_mode),
+              stat.S_IMODE(before.st_mode), before.st_nlink, before.st_uid,
+              before.st_gid) ==
+             (after.st_dev, after.st_ino, stat.S_IFMT(after.st_mode),
+              stat.S_IMODE(after.st_mode), after.st_nlink, after.st_uid,
+              after.st_gid),
+             "Root recorded-read ledger event failed its stable append check")
+    parent_fd = _open_dir_path(
+        context["paths"]["session"],
+        "Root recorded-read ledger session parent", private_final=True,
+    )
+    try:
+        os.fsync(parent_fd)
+    finally:
+        os.close(parent_fd)
+    return json.loads(line.decode("ascii"))["record_sha256"]
+
+
+def _write_recorded_root_failure_receipt(
+    context: dict[str, Any], basis: dict[str, Any], basis_pin: dict[str, Any],
+    plan: dict[str, Any], plan_pin: dict[str, Any], read_ordinal: int,
+    row: dict[str, Any], *, retained_window: bool,
+    deadline_ns: int, cancel_event=None,
+) -> None:
+    body = {
+        "schema": RECORDED_READ_ROOT_FAILURE_SCHEMA_V1,
+        "basis_pin": basis_pin, "read_plan_pin": plan_pin,
+        "session_nonce": plan["session_nonce"],
+        "consumer_host_id": plan["consumer_host_id"],
+        "owner_host_id": row["owner_host_id"],
+        "operation_kind": plan["operation_kind"],
+        "read_ordinal": read_ordinal,
+        "job_index": row["job_index"],
+        "failure_kind": "root_io_failed",
+        "retained_window_bytes": (
+            row["resource_bounds"]["outer_response_bytes"] +
+            row["resource_bounds"]["tar_bytes"] if retained_window else 0
+        ),
+        "retained_window_inodes": 2 if retained_window else 0,
+        "failure_sha256": "",
+    }
+    receipt = {**body, "failure_sha256": _sha(_canonical(body))}
+    raw = _canonical(receipt)
+    _require(len(raw) <= context["failure_receipt_bytes"],
+             "Root recorded-read failure receipt exceeds its reserved slot")
+    path = Path(context["paths"]["failure_receipt"])
+    parent_fd = _open_dir_path(path.parent,
+                               "Root recorded-read failure parent",
+                               private_final=True)
+    try:
+        _write_recorded_read_output_bytes(
+            parent_fd, path.name, raw, context["failure_receipt_bytes"],
+            "Root recorded-read current failure receipt",
+            allocation_block_bytes=context["allocation_block_bytes"],
+            deadline_ns=deadline_ns, cancel_event=cancel_event,
+        )
+        info = os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
+        _require(stat.S_ISREG(info.st_mode) and
+                 info.st_uid == os.getuid() and info.st_nlink == 1 and
+                 stat.S_IMODE(info.st_mode) == 0o600 and
+                 info.st_size == len(raw) and
+                 info.st_blocks * 512 <=
+                     context["failure_receipt_allocated_bytes"],
+                 "Root recorded-read failure receipt exceeded its physical reservation")
+        _verify_recorded_read_root_output_directory_growth(context)
+    finally:
+        os.close(parent_fd)
+
+
+def _write_recorded_read_output_bytes(
+    parent_fd: int, name: str, raw: bytes, maximum_bytes: int,
+    label: str, *, allocation_block_bytes: int,
+    deadline_ns: int, cancel_event=None,
+) -> dict[str, Any]:
+    _require(type(raw) is bytes and 0 < len(raw) <= maximum_bytes,
+             f"{label} exceeds its exact bounded output slot")
+    _require(name not in ("", ".", "..") and "/" not in name and "\x00" not in name,
+             f"{label} has an unsafe output leaf")
+    descriptor = -1
+    identity = None
+    try:
+        descriptor = os.open(
+            name, os.O_WRONLY | os.O_CREAT | os.O_EXCL |
+            _O_CLOEXEC | _O_NOFOLLOW, 0o600, dir_fd=parent_fd,
+        )
+        os.fchmod(descriptor, 0o600)
+        before = os.fstat(descriptor)
+        identity = (before.st_dev, before.st_ino, before.st_mode, before.st_uid)
+        view = memoryview(raw)
+        while view:
+            _require(time.monotonic_ns() < deadline_ns and
+                     (cancel_event is None or not cancel_event.is_set()),
+                     f"{label} write exceeded or cancelled its bounded window")
+            written = os.write(descriptor, view)
+            _require(written > 0, f"{label} writer made no progress")
+            view = view[written:]
+        os.fsync(descriptor)
+        after = os.fstat(descriptor)
+        current = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        _require(identity == (after.st_dev, after.st_ino, after.st_mode,
+                              after.st_uid) and
+                 _info_key(after) == _info_key(current) and
+                 stat.S_ISREG(after.st_mode) and after.st_uid == os.getuid() and
+                 stat.S_IMODE(after.st_mode) == 0o600 and
+                 after.st_nlink == 1 and after.st_size == len(raw) and
+                 after.st_blocks * 512 <=
+                    ((maximum_bytes + allocation_block_bytes - 1) //
+                     allocation_block_bytes) * allocation_block_bytes,
+                 f"{label} writer did not create one exact private output")
+        os.fsync(parent_fd)
+        return {"raw_sha256": _sha(raw), "byte_count": len(raw)}
+    except BaseException:
+        try:
+            current = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            current = None
+        if (identity is not None and current is not None and
+                (current.st_dev, current.st_ino, current.st_mode,
+                 current.st_uid) == identity and
+                stat.S_ISREG(current.st_mode) and current.st_nlink == 1):
+            os.unlink(name, dir_fd=parent_fd)
+            os.fsync(parent_fd)
+        raise
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+_RECORDED_READ_MANIFEST_SUMMARY_FIELDS_V1 = {
+    "schema", "campaign_id", "host_id", "phase", "job_index",
+    "job_ordinal", "job_sha256", "run_id", "job_record_raw_sha256",
+    "predecessor_ack_pin", "object_count", "payload_bytes",
+    "manifest_sha256",
+}
+_RECORDED_READ_MANIFEST_FIELDS_V1 = (
+    _RECORDED_READ_MANIFEST_SUMMARY_FIELDS_V1 | {"objects"}
+)
+_RECORDED_READ_MANIFEST_OBJECT_FIELDS_V1 = {
+    "origin_path", "role", "object_id", "byte_count", "raw_sha256",
+    "semantic_sha256", "object_pin",
+}
+_RECORDED_READ_SOURCE_CAP_FIELDS_V1 = {
+    "request_bytes", "response_bytes", "bundle_bytes", "stage_bytes",
+    "stage_inodes", "object_count", "maximum_object_bytes",
+    "live_window_bytes", "live_window_inodes", "maximum_request_bytes",
+    "maximum_response_bytes", "maximum_bundle_bytes",
+    "maximum_stage_bytes", "maximum_stage_inodes",
+    "maximum_object_count", "maximum_live_window_bytes",
+    "maximum_live_window_inodes",
+}
+
+
+def _recorded_read_source_cap_projection(value: object) -> dict[str, int]:
+    """Project only the nine names used by the v2 plan from typed Source caps."""
+    caps = _exact(value, _RECORDED_READ_SOURCE_CAP_FIELDS_V1,
+                  "recorded-read typed Source readback caps")
+    for name, cap in caps.items():
+        _uint(cap, f"recorded-read typed Source cap {name}")
+    return {
+        "maximum_request_bytes": caps["request_bytes"],
+        "maximum_response_bytes": caps["response_bytes"],
+        "bundle_bytes": caps["bundle_bytes"],
+        "stage_bytes": caps["stage_bytes"],
+        "stage_inodes": caps["stage_inodes"],
+        "object_count": caps["object_count"],
+        "maximum_object_bytes": caps["maximum_object_bytes"],
+        "live_window_bytes": caps["live_window_bytes"],
+        "live_window_inodes": caps["live_window_inodes"],
+    }
+
+
+def _recorded_read_manifest_projection(plan_row: object) -> dict[str, Any]:
+    """Rebuild the exact full Archive manifest from a typed plan row."""
+    row = _exact(plan_row, {
+        "read_ordinal", "consumer_host_id", "owner_host_id", "operation_kind",
+        "job_index", "job", "job_sha256", "original_pins",
+        "indexed_reservation_bindings", "archive_source5_root",
+        "manifest_summary", "objects", "source_budget_schedule_caps",
+        "recomputed_source_caps", "legacy_request_sha256", "resource_bounds",
+        "session_stage_root", "session_paths",
+    }, "recorded-read manifest source row")
+    summary = _exact(
+        row["manifest_summary"], _RECORDED_READ_MANIFEST_SUMMARY_FIELDS_V1,
+        "recorded-read projected manifest summary",
+    )
+    original_pins = _exact(row["original_pins"], {
+        "job_record", "request", "checkpoint", "object_manifest", "ack",
+        "signature", "host_receipt",
+    }, "recorded-read projected original pins")
+    manifest_pin = _pin(original_pins["object_manifest"],
+                         "recorded-read projected object-manifest pin")
+    objects = row["objects"]
+    _require(type(objects) is list,
+             "recorded-read projected manifest objects are not a list")
+    projected_objects = []
+    seen_origins = set()
+    payload_bytes = 0
+    for index, value in enumerate(objects):
+        obj = _exact(value, _RECORDED_READ_MANIFEST_OBJECT_FIELDS_V1,
+                     f"recorded-read projected manifest object[{index}]")
+        origin = _absolute_path(
+            obj["origin_path"],
+            f"recorded-read projected manifest object[{index}] origin",
+        )
+        role = _token(
+            obj["role"],
+            f"recorded-read projected manifest object[{index}] role",
+        )
+        raw_sha = _digest(
+            obj["raw_sha256"],
+            f"recorded-read projected manifest object[{index}] raw digest",
+        )
+        semantic_sha = obj["semantic_sha256"]
+        if semantic_sha is not None:
+            _digest(semantic_sha,
+                    f"recorded-read projected manifest object[{index}] semantic digest")
+        byte_count = _uint(
+            obj["byte_count"],
+            f"recorded-read projected manifest object[{index}] byte count",
+        )
+        object_id = _object_identity(origin, raw_sha)
+        object_pin = _exact(obj["object_pin"], {
+            "path", "raw_sha256", "semantic_sha256", "byte_count",
+        }, f"recorded-read projected manifest object[{index}] pin")
+        checked_pin = {
+            "path": _absolute_path(
+                object_pin["path"],
+                f"recorded-read projected manifest object[{index}] pin path",
+            ),
+            "raw_sha256": _digest(
+                object_pin["raw_sha256"],
+                f"recorded-read projected manifest object[{index}] pin raw digest",
+            ),
+            "semantic_sha256": _digest(
+                object_pin["semantic_sha256"],
+                f"recorded-read projected manifest object[{index}] pin semantic digest",
+            ),
+            "byte_count": _uint(
+                object_pin["byte_count"],
+                f"recorded-read projected manifest object[{index}] pin byte count",
+            ),
+        }
+        _require(obj["object_id"] == object_id and
+                 checked_pin["raw_sha256"] == raw_sha and
+                 checked_pin["semantic_sha256"] == raw_sha and
+                 checked_pin["byte_count"] == byte_count and
+                 origin not in seen_origins,
+                 f"recorded-read projected manifest object[{index}] identity differs")
+        seen_origins.add(origin)
+        projected_objects.append({
+            "origin_path": origin, "role": role, "object_id": object_id,
+            "byte_count": byte_count, "raw_sha256": raw_sha,
+            "semantic_sha256": semantic_sha, "object_pin": checked_pin,
+        })
+        payload_bytes += byte_count
+    manifest = {**summary, "objects": projected_objects}
+    _exact(manifest, _RECORDED_READ_MANIFEST_FIELDS_V1,
+           "recorded-read reconstructed Archive manifest")
+    body = {key: value for key, value in manifest.items()
+            if key != "manifest_sha256"}
+    _require(manifest["schema"] == OBJECT_MANIFEST_SCHEMA_V1 and
+             manifest["host_id"] == row["owner_host_id"] and
+             manifest["job_index"] == row["job_index"] and
+             manifest["job_sha256"] == row["job_sha256"] and
+             manifest["predecessor_ack_pin"] is None and
+             manifest["object_count"] == len(projected_objects) and
+             manifest["payload_bytes"] == payload_bytes and
+             manifest["manifest_sha256"] == _sha(_canonical(body)) ==
+                 manifest_pin["semantic_sha256"],
+             "recorded-read reconstructed manifest differs from its Source pin summary")
+    return manifest
+
+
+def _recorded_read_archive_manifest(
+    manifest_raw: bytes, manifest_pin: dict[str, Any],
+    plan_row: dict[str, Any], source5_root: Path,
+) -> dict[str, Any]:
+    expected_manifest = _recorded_read_manifest_projection(plan_row)
+    expected_manifest_pin = _pin(
+        plan_row["original_pins"]["object_manifest"],
+        "recorded-read plan original object-manifest pin",
+    )
+    _require(manifest_pin == expected_manifest_pin,
+             "recorded-read captured manifest full pin differs from its Source row")
+    _require(type(manifest_raw) is bytes and
+             _sha(manifest_raw) == manifest_pin["raw_sha256"],
+             "recorded-read captured signed manifest differs from its exact raw pin")
+    manifest = _parse_canonical(
+        manifest_raw, "recorded-read captured signed object manifest",
+    )
+    _require(manifest == expected_manifest and
+             manifest_raw == _canonical(expected_manifest) and
+             manifest.get("manifest_sha256") ==
+                 manifest_pin["semantic_sha256"] ==
+                 _sha(_canonical({key: value for key, value in
+                                  manifest.items()
+                                  if key != "manifest_sha256"})) and
+             manifest.get("host_id") == plan_row["owner_host_id"] and
+             manifest.get("job_sha256") == plan_row["job_sha256"] and
+             manifest.get("job_index") == plan_row["job_index"] and
+             manifest.get("phase") == "exploration" and
+             manifest.get("predecessor_ack_pin") is None and
+             type(manifest.get("objects")) is list and
+             len(manifest["objects"]) == manifest.get("object_count") and
+             0 < len(manifest["objects"]) <= MAX_ARCHIVE_READ_OBJECTS,
+             "recorded-read plan manifest is not the exact captured signed document")
+    _require(source5_root.name == "source5" and
+             source5_root == Path(plan_row["archive_source5_root"]) and
+             source5_root.resolve(strict=True) == source5_root,
+             "recorded-read archive root differs from its exact planned Source5 root")
+    _validate_archive_path_bindings(
+        str(source5_root), plan_row["original_pins"]["checkpoint"],
+        manifest_pin, plan_row["original_pins"]["ack"],
+        plan_row["original_pins"]["signature"], manifest,
+        {
+            "campaign_id": manifest["campaign_id"],
+            "host_id": manifest["host_id"], "phase": "exploration",
+        },
+        {"job_ordinal": manifest["job_ordinal"],
+         "job_sha256": manifest["job_sha256"],
+         "run_id": manifest["run_id"]},
+    )
+    for position, obj_value in enumerate(manifest["objects"]):
+        obj = _exact(obj_value, {
+            "origin_path", "role", "object_id", "byte_count", "raw_sha256",
+            "semantic_sha256", "object_pin",
+        }, f"recorded-read signed manifest object[{position}]")
+        object_pin = _exact(obj["object_pin"], {
+            "path", "raw_sha256", "semantic_sha256", "byte_count",
+        }, f"recorded-read signed object pin[{position}]")
+        object_id = _object_identity(obj["origin_path"], obj["raw_sha256"])
+        _require(obj["object_id"] == object_id and
+                 object_pin == {
+                     "path": str(source5_root / "objects" / object_id),
+                     "raw_sha256": obj["raw_sha256"],
+                     "semantic_sha256": obj["raw_sha256"],
+                     "byte_count": obj["byte_count"],
+                 },
+                 f"recorded-read signed object[{position}] is outside its Root object-store identity")
+    return manifest
+
+
+def _serve_recorded_preparation_read_window_core_v1(
+    request_raw: bytes, *, basis_raw: bytes, read_plan_raw: bytes,
+    session_descriptor_raw: bytes, source_root: str,
+    selected_source_manifest_raw: bytes,
+    lineage_capture_manifest_raw: bytes,
+    lineage_capture_stage_root: str, archive_source5_root: str,
+    response_output_path: str, bundle_output_path: str,
+    root_resource_declaration: object,
+    root_output_context: dict[str, Any],
+    window_deadline_ns: int, cancel_event=None,
+) -> dict[str, Any]:
+    """Materialize one actual Source-verified recorded window into its exact slots.
+
+    This seam rederives the actual SourceV2/Bridge graph and selected old H6
+    row, performs the pinned Source ACK verifier, streams the signed manifest
+    objects from the Root object store, and writes the two transport envelopes.
+    It is deliberately a one-window Root I/O operation; the SourceA-owned
+    720-row plan/cap reconstruction and admission session remain separate.
+    """
+    _require(type(request_raw) is bytes and
+             type(basis_raw) is bytes and type(read_plan_raw) is bytes and
+             type(session_descriptor_raw) is bytes and
+             (cancel_event is None or
+              callable(getattr(cancel_event, "is_set", None))),
+             "recorded-read Root operation inputs or cancellation token are malformed")
+    try:
+        basis = _parse_canonical(basis_raw,
+                                 "recorded-read replay basis",
+                                 maximum_bytes=MAX_ARCHIVE_READ_METADATA_BYTES)
+        plan = _parse_canonical(read_plan_raw,
+                                "recorded-read source plan",
+                                maximum_bytes=MAX_ARCHIVE_READ_METADATA_BYTES)
+        session = _parse_canonical(
+            session_descriptor_raw, "recorded-read session descriptor",
+            maximum_bytes=MAX_ARCHIVE_READ_METADATA_BYTES,
+        )
+    except EvidenceArchiveError:
+        raise
+    except Exception as error:
+        raise EvidenceArchiveError(
+            f"recorded-read Root session documents are malformed: {error}",
+        ) from error
+    source_pin_value = basis.get("source_manifest_pins", {}).get(
+        basis.get("consumer_host_id"),
+    )
+    _require(type(source_pin_value) is dict and
+             type(selected_source_manifest_raw) is bytes and
+             _sha(selected_source_manifest_raw) ==
+                 source_pin_value.get("raw_sha256"),
+             "recorded-read selected current Source bytes differ from the basis")
+    namespaces = _recorded_pre_manifest_typed_module(
+        selected_source_manifest_raw, source_pin_value,
+        basis["source_module_pins"][basis["consumer_host_id"]],
+        SOURCE5_RECORDED_READ_PLAN_PATH, source_root, source_root,
+        namespace_name="_allocatbelt_recorded_read_plan_api",
+    )
+    plan_module = sys.modules[namespaces["__name__"]]
+    basis_pin = _exact(session, {
+        "schema", "basis_pin", "read_plan_pin", "session_nonce",
+        "consumer_host_id", "operation_kind", "current_journal_frontier",
+        "session_sha256",
+    }, "recorded-read session descriptor")
+    session_body = {key: value for key, value in session.items()
+                    if key != "session_sha256"}
+    _require(session["schema"] == plan_module.SESSION_DESCRIPTOR_SCHEMA_V2 and
+             session["session_sha256"] == _sha(_canonical(session_body)),
+             "recorded-read session descriptor self digest differs")
+    basis_pin_value = _pin(session["basis_pin"],
+                           "recorded-read session basis pin")
+    checked_plan_pin = plan_module.recorded_preparation_read_plan_pin_v2(plan)
+    plan_pin = _pin(session["read_plan_pin"],
+                     "recorded-read session plan pin")
+    _require(plan_pin == checked_plan_pin and
+             plan["basis_pin"] == basis_pin_value and
+             session["session_nonce"] == plan["session_nonce"] and
+             session["consumer_host_id"] == basis["consumer_host_id"] and
+             session["operation_kind"] == basis["operation_kind"] and
+             session["current_journal_frontier"] ==
+                 basis["current_journal_frontier"],
+             "recorded-read session descriptor differs from its exact basis/plan")
+    checked_basis, checked_basis_pin, _hosts = plan_module._validate_basis(
+        basis, basis_pin_value,
+    )
+    _require(checked_basis == basis and checked_basis_pin == basis_pin_value,
+             "recorded-read basis raw/semantic pin differs")
+    source_module_pin = basis["source_module_pins"][basis["consumer_host_id"]][
+        SOURCE5_RECORDED_READ_PLAN_PATH
+    ]
+    _require(getattr(plan_module, "__source5_typed_pin__", None) ==
+             source_module_pin,
+             "recorded-read plan APIs are not the selected typed Source bytes")
+    request_header = _parse_canonical(
+        request_raw, "recorded-read outer request header",
+        maximum_bytes=MAX_ARCHIVE_READ_METADATA_BYTES,
+    )
+    ordinal = plan_module._uint(
+        request_header.get("read_ordinal"),
+        "recorded-read request ordinal",
+        maximum=plan_module.READ_WINDOW_COUNT - 1,
+    )
+    window_chunk, row = _recorded_read_window_chunk(
+        plan, plan_pin, plan_module, ordinal,
+        deadline_ns=window_deadline_ns, cancel_event=cancel_event,
+    )
+    outer_request = plan_module.validate_recorded_preparation_read_request_v2(
+        request_raw, basis, basis_pin_value, plan, plan_pin, window_chunk,
+    )
+    _require(_absolute_path(archive_source5_root,
+                            "recorded-read Source5 archive root") ==
+             row["archive_source5_root"] and
+             _absolute_path(lineage_capture_stage_root,
+                            "recorded-read metadata capture root") ==
+                 basis["current_roots"]["metadata_capture_root"] and
+             _absolute_path(source_root,
+                            "recorded-read selected Source root") ==
+                 basis["current_roots"]["source_root"],
+             "recorded-read caller roots differ from its selected basis/plan")
+    root_resource = _exact(
+        root_resource_declaration, RECORDED_READ_GPG_RESOURCE_FIELDS_V2,
+        "Root recorded-read GPG auxiliary reservation",
+    )
+    resource_body = {key: value for key, value in root_resource.items()
+                     if key != "resource_sha256"}
+    _require(root_resource["maximum_window_seconds"] ==
+             plan["timeout_declaration"]["maximum_io_window_seconds"] and
+             root_resource["schema"] == RECORDED_READ_GPG_RESOURCE_SCHEMA_V2 and
+             root_resource["resource_sha256"] ==
+                 _sha(_canonical(resource_body)),
+             "recorded-read Root GPG window differs from its finite Source plan")
+    source_scratch = plan["scratch_declaration"]["root"]
+    protected_roots = list(basis["current_roots"].values()) + [
+        source_scratch, row["archive_source5_root"],
+    ]
+    root_aux_path = _absolute_path(
+        root_resource["scratch_root"], "Root recorded-read auxiliary scratch root",
+    )
+    protected_roots.append(str(root_output_context["root"]))
+    for protected in protected_roots:
+        _require(not plan_module._paths_overlap(root_aux_path, protected),
+                 "Root recorded-read GPG scratch overlaps a Source/current/archive root")
+    _require(type(window_deadline_ns) is int and
+             time.monotonic_ns() < window_deadline_ns and
+             window_deadline_ns < (1 << 63),
+             "recorded-read Root window deadline is absent or expired")
+
+    def check_window(label: str) -> None:
+        _require(time.monotonic_ns() < window_deadline_ns and
+                 (cancel_event is None or not cancel_event.is_set()),
+                 f"recorded-read Root operation exceeded or cancelled {label}")
+
+    auxiliary_root_fd = _open_dir_path(
+        root_aux_path, "Root recorded-read auxiliary scratch root",
+        private_final=True,
+    )
+    try:
+        auxiliary_info = os.fstat(auxiliary_root_fd)
+        auxiliary_space = os.fstatvfs(auxiliary_root_fd)
+        _require(auxiliary_info.st_dev == root_resource["device"] and
+                 auxiliary_space.f_bavail * auxiliary_space.f_frsize >=
+                     root_resource["reserved_bytes"] and
+                 auxiliary_space.f_favail >= root_resource["reserved_inodes"],
+                 "Root recorded-read GPG auxiliary root lacks its exact declared resources")
+    finally:
+        os.close(auxiliary_root_fd)
+
+    _require(row["owner_host_id"] == row["job"]["host_id"] and
+             row["job"] == {
+                 key: value for key, value in row["job"].items()
+             } and row["job"]["phase"] == "exploration" and
+             row["job_index"] == ordinal % plan_module.READ_JOB_COUNT_PER_HOST and
+             row["owner_host_id"] == plan["cohort_hosts"][
+                 ordinal // plan_module.READ_JOB_COUNT_PER_HOST
+             ],
+             "recorded-read requested window is outside its ordered Source cohort row")
+    _require(request_raw == _canonical(outer_request) and
+             request_raw == _read_absolute_private_file(
+                 Path(row["session_paths"]["request"]),
+                 row["resource_bounds"]["outer_request_bytes"],
+                 "recorded-read current persisted request",
+                 deadline_ns=window_deadline_ns,
+                 cancel_event=cancel_event,
+             )[0],
+             "recorded-read request bytes differ from the exact persisted current slot")
+    source_graph = _recorded_pre_manifest_source_closure(
+        basis, basis_pin_value, selected_source_manifest_raw,
+        lineage_capture_manifest_raw, lineage_capture_stage_root,
+        source_root, plan_module, deadline_ns=window_deadline_ns,
+        cancel_event=cancel_event,
+    )
+    reader = source_graph["reader"]
+    try:
+        check_window("Source metadata closure")
+        source_graph["source_modules"]["source5_campaign"]._source5_recorded_read_session_documents(
+            basis, basis_pin_value, plan, plan_pin, plan_module,
+            create_missing=False, cancel_event=cancel_event,
+            deadline_ns=window_deadline_ns,
+        )
+        owner = row["owner_host_id"]
+        job_index = row["job_index"]
+        proof = source_graph["proofs"][owner]
+        _require(type(proof["index_rows"]) is list and
+                 len(proof["index_rows"]) == plan_module.READ_JOB_COUNT_PER_HOST,
+                 "recorded-read Source rich proof lost its exact owner schedule")
+        index_row = proof["index_rows"][job_index]
+        _require(index_row["row_index"] == job_index and
+                 index_row["job"] == row["job"] and
+                 index_row["job_sha256"] == row["job_sha256"],
+                 "recorded-read plan row differs from its exact Source lineage index")
+        durable_pins = row["original_pins"]
+        raw_pin_names = {
+            "job_record": index_row["job_record_pin"],
+            "request": index_row["archive_pins"]["request_pin"],
+            "checkpoint": index_row["archive_pins"]["checkpoint_pin"],
+            "object_manifest": index_row["archive_pins"]["object_manifest_pin"],
+            "ack": index_row["archive_pins"]["ack_pin"],
+            "signature": index_row["archive_pins"]["signature_pin"],
+        }
+        for name, indexed_pin in raw_pin_names.items():
+            indexed_raw = _pin_raw(indexed_pin,
+                                   f"recorded-read Source index {name} pin")
+            planned_pin = durable_pins[name]
+            _require(planned_pin["path"] == indexed_raw["path"] and
+                     planned_pin["raw_sha256"] == indexed_raw["raw_sha256"],
+                     f"recorded-read plan {name} origin differs from its Source index")
+            if name in {"request", "checkpoint", "object_manifest", "ack"}:
+                _require(planned_pin["semantic_sha256"] ==
+                         indexed_pin["semantic_sha256"],
+                         f"recorded-read plan {name} semantic pin differs from its Source index")
+        header_raw = reader.read(
+            basis["ancestor_pins"][owner]["bridge_header"], 256 * 1024,
+        )
+        header = _parse_canonical(header_raw,
+                                  "recorded-read owner bridge header",
+                                  maximum_bytes=256 * 1024)
+        initial = header["initial"]
+        old_source_pin = source_graph["source_pins"][owner]
+        old_source_raw = reader.read({
+            "path": old_source_pin["path"],
+            "raw_sha256": old_source_pin["raw_sha256"],
+        }, MAX_SOURCE_MANIFEST_BYTES)
+        old_execution_pin = _pin(
+            initial["execution_manifest_pin"],
+            "recorded-read original preparatory execution pin",
+        )
+        old_plan_pin = _pin(initial["plan_pin"],
+                            "recorded-read original preparatory Plan pin")
+        old_spec_pin = _pin(initial["spec_pin"],
+                            "recorded-read original preparatory Spec pin")
+        old_width_pin = _pin(initial["journal_width_pin"],
+                             "recorded-read original preparatory width pin")
+        old_budget_pin = _pin(initial["host_budget_pin"],
+                              "recorded-read original H6 budget pin")
+        old_execution_raw = reader.read({
+            "path": old_execution_pin["path"],
+            "raw_sha256": old_execution_pin["raw_sha256"],
+        }, MAX_PLAN_BYTES)
+        old_plan_raw = reader.read({
+            "path": old_plan_pin["path"],
+            "raw_sha256": old_plan_pin["raw_sha256"],
+        }, MAX_PLAN_BYTES)
+        old_spec_raw = reader.read({
+            "path": old_spec_pin["path"],
+            "raw_sha256": old_spec_pin["raw_sha256"],
+        }, PREPARATORY_MAX_SPEC_BYTES)
+        old_width_raw = reader.read({
+            "path": old_width_pin["path"],
+            "raw_sha256": old_width_pin["raw_sha256"],
+        }, PREPARATORY_MAX_WIDTH_BYTES)
+        old_budget_raw = reader.read({
+            "path": old_budget_pin["path"],
+            "raw_sha256": old_budget_pin["raw_sha256"],
+        }, PREPARATORY_MAX_BUDGET_BYTES)
+        original_context = _validate_context({
+            "schema": CONTEXT_SCHEMA_V1,
+            "campaign_id": basis["campaign_id"], "host_id": owner,
+            "phase": "exploration", "job_index": job_index,
+            "source_manifest_pin": source_graph["source_pins"][owner],
+            "execution_manifest_pin": old_execution_pin,
+            "plan_pin": old_plan_pin,
+            "resource_budget_pin": old_budget_pin,
+            "predecessor_ack_pin": None,
+            "authorized_signer_fingerprint": initial["signer_fingerprint"],
+        })
+        # This validates all 360 old H6 rows, the typed catalogue and the
+        # Source-derived per-job transport envelope for the selected row.
+        prepared_profile = validate_preparatory_budget_profile_v1(
+            old_budget_raw, original_context,
+            source_manifest_raw=old_source_raw,
+            execution_manifest_raw=old_execution_raw,
+            plan_raw=old_plan_raw,
+            journal_width_contract_raw=old_width_raw,
+            spec_raw=old_spec_raw,
+            captured_preparatory_artifact_reader=reader.read,
+        )
+        old_budget = prepared_profile["budget"]
+        catalogue_module = prepared_profile["catalogue_module"]
+        iterator_name = prepared_profile["catalogue_iterator_name"]
+        old_rows = list(catalogue_module[iterator_name](
+            old_budget["path_catalogue"], prepared_profile["catalogue_reader"],
+        ))
+        old_rows_by_path = {item["path"]: item for item in old_rows}
+        _require(len(old_rows_by_path) == len(old_rows),
+                 "recorded-read validated H6 catalogue repeats an exact row path")
+        read_schedule = old_budget["read_schedule"]
+        _require(len(read_schedule) == plan_module.READ_JOB_COUNT_PER_HOST and
+                 read_schedule[job_index]["job"] == row["job"] and
+                 read_schedule[job_index]["job_index"] == job_index,
+                 "recorded-read plan row differs from the actual validated H6 budget schedule")
+        projected_caps = catalogue_module[
+            "project_fixed_pair_archive_readback_caps"
+        ](catalogue_module[iterator_name](
+            old_budget["path_catalogue"], prepared_profile["catalogue_reader"],
+        ))
+        cap_key = ("exploration", row["job"]["run_id"])
+        _require(cap_key in projected_caps and
+                 row["recomputed_source_caps"] ==
+                     _recorded_read_source_cap_projection(
+                         projected_caps[cap_key],
+                     ) and
+                 row["source_budget_schedule_caps"] ==
+                     read_schedule[job_index]["caps"],
+                 "recorded-read planned old cap differs from the typed Source H6 projections")
+        initial_output_root = _absolute_path(
+            header["initial_output_root"],
+            "recorded-read owner initial H6 output root",
+        )
+        role_pin_names = {
+            "source5_job_record": index_row["job_record_pin"],
+            "source5_checkpoint_request": index_row["archive_pins"]["request_pin"],
+            "source5_checkpoint": index_row["archive_pins"]["checkpoint_pin"],
+            "source5_object_manifest": index_row["archive_pins"]["object_manifest_pin"],
+            "source5_archive_ack": index_row["archive_pins"]["ack_pin"],
+            "source5_archive_signature": index_row["archive_pins"]["signature_pin"],
+        }
+        for role, indexed_pin in role_pin_names.items():
+            actual_pin, reservation_row = catalogue_module[
+                "source5_indexed_reservation_binding_v1"
+            ](
+                index_row, indexed_pin, role, row["job"],
+                initial_output_root=initial_output_root,
+                campaign_id=basis["campaign_id"], selected_host=owner,
+                old_rows=old_rows_by_path,
+            )
+            plan_binding = row["indexed_reservation_bindings"][role]
+            _require(reservation_row == plan_binding and
+                     actual_pin["path"] == indexed_pin["path"] and
+                     actual_pin["raw_sha256"] == indexed_pin["raw_sha256"],
+                     f"recorded-read {role} binding differs from the actual typed Source helper")
+        manifest_pin = durable_pins["object_manifest"]
+        manifest_raw = reader.read({
+            "path": manifest_pin["path"],
+            "raw_sha256": manifest_pin["raw_sha256"],
+        }, MAX_JSON_BYTES)
+        manifest = _recorded_read_archive_manifest(
+            manifest_raw, manifest_pin, row,
+            Path(row["archive_source5_root"]),
+        )
+        host_receipts = [obj for obj in manifest["objects"]
+                         if obj["role"] == "fixed_pair_host_receipt"]
+        _require(len(host_receipts) == 1 and
+                 row["host_receipt_pin"] == {
+                     "path": host_receipts[0]["origin_path"],
+                     "raw_sha256": host_receipts[0]["raw_sha256"],
+                     "host_verification_sha256":
+                         host_receipts[0]["semantic_sha256"],
+                 }, "recorded-read fixed host-receipt pin differs from its signed manifest")
+        owner_source = source_graph["source_docs"][owner]
+        selected_source = source_graph["source_docs"][basis["consumer_host_id"]]
+        selected_files = {
+            item["path"]: item for item in selected_source["source"]["files"]
+            if type(item) is dict and type(item.get("path")) is str
+        }
+        owner_files = {
+            item["path"]: item for item in owner_source["source"]["files"]
+            if type(item) is dict and type(item.get("path")) is str
+        }
+        for path in (
+            SOURCE5_BUDGET_VALIDATOR_PATH,
+            PREPARATORY_OWNER_CATALOGUE_PATH,
+            PREPARATORY_BUDGET_VALIDATOR_PATH,
+            PREPARATORY_CAMPAIGN_SOURCE_PATH,
+            PREPARATORY_INPUT_PREPARATION_SOURCE_PATH,
+        ):
+            _require(path in selected_files and path in owner_files and
+                     selected_files[path].get("sha256") ==
+                         owner_files[path].get("sha256"),
+                     "recorded-read owner Source has a different validator ELF; peer binary loading is refused")
+        def read_capture(pin_value: object, maximum_bytes: int) -> bytes:
+            pin = _pin_raw(pin_value, "recorded-read exact capture request")
+            return reader.read(pin, maximum_bytes)
+
+        raw_artifacts = {
+            name: reader.read({
+                              "path": durable_pins[name]["path"],
+                              "raw_sha256": durable_pins[name]["raw_sha256"],
+                          },
+                              (MAX_PLAN_BYTES if name in {"job_record", "checkpoint"}
+                               else MAX_JSON_BYTES))
+            for name in ("job_record", "request", "checkpoint", "object_manifest",
+                         "ack", "signature")
+        }
+        def parse_captured(name: str) -> dict[str, Any]:
+            raw = raw_artifacts[name]
+            value = _parse_canonical(raw, f"recorded-read captured {name}")
+            return value
+        checkpoint = parse_captured("checkpoint")
+        job_record = parse_captured("job_record")
+        object_manifest = parse_captured("object_manifest")
+        ack = parse_captured("ack")
+        signer_context_pin = _pin(
+            initial["signer_context_pin"],
+            "recorded-read original signer-context pin",
+        )
+        signer_context_raw = reader.read({
+            "path": signer_context_pin["path"],
+            "raw_sha256": signer_context_pin["raw_sha256"],
+        }, MAX_ARCHIVE_SIGNER_CONTEXT_BYTES)
+        signature_pin = durable_pins["signature"]
+        signature_raw = raw_artifacts["signature"]
+        keyring_reader = lambda pin, maximum: read_capture(pin, maximum)
+        gpgv_reader = lambda pin, maximum: read_capture(pin, maximum)
+        remaining_window_seconds = (
+            window_deadline_ns - time.monotonic_ns()
+        ) // 1_000_000_000
+        _require(remaining_window_seconds > 0,
+                 "recorded-read Root source verification has no window time remaining")
+        _check_recorded_read_root_resource_pair(
+            root_output_context, root_resource,
+            deadline_ns=window_deadline_ns, cancel_event=cancel_event,
+        )
+        check_window("before captured GPG verification")
+        try:
+            verify_signed_ack_for_recorded_read_v1(
+                durable_pins["checkpoint"], checkpoint,
+                raw_artifacts["checkpoint"], raw_artifacts["request"],
+                old_budget_raw, durable_pins["job_record"],
+                raw_artifacts["job_record"], old_plan_raw,
+                durable_pins["object_manifest"], object_manifest,
+                raw_artifacts["object_manifest"],
+                durable_pins["ack"], ack, raw_artifacts["ack"],
+                signature_pin, signature_raw,
+                signer_context_pin, signer_context_raw,
+                old_execution_pin, old_execution_raw,
+                expected_ack_pin=durable_pins["ack"],
+                expected_run_id=row["job"]["run_id"],
+                journal_width_contract_raw=old_width_raw,
+                source_manifest_raw=old_source_raw,
+                captured_keyring_reader=keyring_reader,
+                captured_gpgv_reader=gpgv_reader,
+                captured_preparatory_artifact_reader=read_capture,
+                root_auxiliary_resource_declaration=root_resource,
+                maximum_io_window_seconds=min(
+                    remaining_window_seconds,
+                    root_resource["maximum_window_seconds"],
+                ),
+                recorded_deadline_ns=window_deadline_ns,
+                cancel_event=cancel_event,
+            )
+        except Exception as error:
+            raise EvidenceArchiveError(
+                f"actual Source signed ACK verifier rejected recorded-read row {ordinal}: {error}",
+            ) from error
+        legacy_request = outer_request["legacy_request"]
+        legacy_request_raw = _canonical(
+            legacy_request,
+            maximum_bytes=MAX_ARCHIVE_READ_METADATA_BYTES,
+        )
+        tar_path = Path(_absolute_path(
+            bundle_output_path, "recorded-read Root bundle output slot",
+        ))
+        response_path = Path(_absolute_path(
+            response_output_path, "recorded-read Root response output slot",
+        ))
+        _require(tar_path == Path(root_output_context["paths"]["bundle"]) and
+                 response_path == Path(root_output_context["paths"]["response"]) and
+                 tar_path.name == "response.tar.incoming" and
+                 response_path.name == "response.json.incoming" and
+                 not response_path.exists() and not response_path.is_symlink(),
+                 "recorded-read Root output path differs from its exact incoming slots")
+        check_window("before signed object materialization")
+        tar_pin = _write_recorded_preparation_read_tar_v1(
+            legacy_request, manifest, source_graph["source_modules"][
+                "source5_campaign"], row["archive_source5_root"], tar_path,
+            row["resource_bounds"]["tar_bytes"],
+            allocation_block_bytes=root_output_context[
+                "allocation_block_bytes"],
+            deadline_ns=window_deadline_ns,
+            cancel_event=cancel_event,
+        )
+        legacy_response, legacy_response_raw, _legacy_response_pin = \
+            source_graph["source_modules"]["source5_campaign"].build_source5_archive_read_response(
+                legacy_request_raw, tar_pin["raw_sha256"],
+                tar_pin["byte_count"],
+            )
+        _outer, response_raw, _outer_pin = \
+            plan_module.build_recorded_preparation_read_response_v2(
+                request_raw, legacy_response, legacy_response_raw,
+                basis, basis_pin_value, plan, plan_pin, window_chunk,
+            )
+        check_window("before outer response write")
+        response_parent_fd = _open_dir_path(
+            response_path.parent,
+            "recorded-read Root response incoming parent",
+            private_final=True,
+        )
+        try:
+            output_pin = _write_recorded_read_output_bytes(
+                response_parent_fd, response_path.name, response_raw,
+                row["resource_bounds"]["outer_response_bytes"],
+                "recorded-read Root outer response",
+                allocation_block_bytes=root_output_context[
+                    "allocation_block_bytes"],
+                deadline_ns=window_deadline_ns,
+                cancel_event=cancel_event,
+            )
+            reopened, reopened_sha, _ = _read_at(
+                response_parent_fd, response_path.name,
+                row["resource_bounds"]["outer_response_bytes"],
+                "recorded-read Root outer response", expected_bytes=len(response_raw),
+            )
+            _require(reopened == response_raw and
+                     reopened_sha == output_pin["raw_sha256"],
+                     "recorded-read Root response failed independent reopen")
+        finally:
+            os.close(response_parent_fd)
+        _verify_recorded_read_root_output_directory_growth(root_output_context)
+        return {
+            "schema": "allocatbelt.application-source5-recorded-preparation-read-window-output.v1",
+            "response_pin": {
+                "path": str(response_path),
+                "raw_sha256": output_pin["raw_sha256"],
+                "semantic_sha256": _outer["response_sha256"],
+            },
+            "bundle_pin": {
+                "path": str(tar_path), "raw_sha256": tar_pin["raw_sha256"],
+                "byte_count": tar_pin["byte_count"],
+            },
+        }
+    finally:
+        reader.close()
+
+
+def serve_recorded_preparation_read_window_v1(
+    request_raw: bytes, *, basis_raw: bytes, read_plan_raw: bytes,
+    session_descriptor_raw: bytes, source_root: str,
+    selected_source_manifest_raw: bytes,
+    lineage_capture_manifest_raw: bytes,
+    lineage_capture_stage_root: str, archive_source5_root: str,
+    response_output_path: str, bundle_output_path: str,
+    root_resource_declaration: object,
+    root_output_resource_declaration: object,
+    cancel_event=None,
+) -> dict[str, Any]:
+    """Serve one real Source-verified read into bounded current Root slots.
+
+    This is the one-window Root materializer. It rebuilds the SourceV2 and
+    Bridge closure, validates the selected actual old H6 row/cap, and freshly
+    verifies its captured GPG signature. The SourceA 720-window plan rebuild
+    and any admission authority remain separate.
+    """
+    _require(type(request_raw) is bytes and type(basis_raw) is bytes and
+             type(read_plan_raw) is bytes and
+             type(session_descriptor_raw) is bytes and
+             (cancel_event is None or
+              callable(getattr(cancel_event, "is_set", None))),
+             "recorded-read Root inputs or cancellation token are malformed")
+    basis = _parse_canonical(basis_raw, "recorded-read basis",
+                             maximum_bytes=MAX_ARCHIVE_READ_METADATA_BYTES)
+    plan = _parse_canonical(read_plan_raw, "recorded-read plan",
+                            maximum_bytes=MAX_ARCHIVE_READ_METADATA_BYTES)
+    session = _parse_canonical(session_descriptor_raw,
+                               "recorded-read session descriptor",
+                               maximum_bytes=MAX_ARCHIVE_READ_METADATA_BYTES)
+    consumer = basis.get("consumer_host_id")
+    source_pin = basis.get("source_manifest_pins", {}).get(consumer)
+    _require(type(source_pin) is dict and
+             type(selected_source_manifest_raw) is bytes and
+             _sha(selected_source_manifest_raw) == source_pin.get("raw_sha256"),
+             "recorded-read selected Source bytes differ from the basis")
+    namespace = _recorded_pre_manifest_typed_module(
+        selected_source_manifest_raw, source_pin,
+        basis["source_module_pins"][consumer],
+        SOURCE5_RECORDED_READ_PLAN_PATH, source_root, source_root,
+        namespace_name="_allocatbelt_recorded_read_plan_api",
+    )
+    plan_module = sys.modules[namespace["__name__"]]
+    session = _exact(session, {
+        "schema", "basis_pin", "read_plan_pin", "session_nonce",
+        "consumer_host_id", "operation_kind", "current_journal_frontier",
+        "session_sha256",
+    }, "recorded-read session descriptor")
+    session_body = {key: value for key, value in session.items()
+                    if key != "session_sha256"}
+    _require(session["schema"] == plan_module.SESSION_DESCRIPTOR_SCHEMA_V2 and
+             session["session_sha256"] == _sha(_canonical(session_body)),
+             "recorded-read session descriptor digest differs")
+    basis_pin = _pin(session["basis_pin"], "recorded-read basis pin")
+    plan_pin = _pin(session["read_plan_pin"], "recorded-read plan pin")
+    checked_basis, checked_basis_pin, _hosts = plan_module._validate_basis(
+        basis, basis_pin,
+    )
+    _require(checked_basis == basis and checked_basis_pin == basis_pin and
+             plan_module.recorded_preparation_read_plan_pin_v2(plan) == plan_pin and
+             plan["basis_pin"] == basis_pin and
+             session["session_nonce"] == plan["session_nonce"] and
+             session["consumer_host_id"] == consumer and
+             session["operation_kind"] == basis["operation_kind"] and
+             session["current_journal_frontier"] ==
+                 basis["current_journal_frontier"],
+             "recorded-read session, basis and plan do not close")
+    descriptor, descriptor_raw, descriptor_pin = \
+        plan_module.build_recorded_preparation_read_session_descriptor_v2(
+            plan, plan_pin,
+        )
+    _require(descriptor_raw == session_descriptor_raw,
+             "recorded-read session descriptor differs from its plan")
+    for pin, raw, label in (
+        (basis_pin, basis_raw, "basis"), (plan_pin, read_plan_raw, "plan"),
+        (descriptor_pin, session_descriptor_raw, "session descriptor"),
+    ):
+        persisted, digest, _info = _read_absolute_private_file(
+            Path(pin["path"]), MAX_ARCHIVE_READ_METADATA_BYTES,
+            f"recorded-read persisted {label}",
+        )
+        _require(persisted == raw and digest == pin["raw_sha256"],
+                 f"recorded-read persisted {label} raw pin differs")
+    request_header = _parse_canonical(
+        request_raw, "recorded-read outer request header",
+        maximum_bytes=MAX_ARCHIVE_READ_METADATA_BYTES,
+    )
+    ordinal = plan_module._uint(
+        request_header.get("read_ordinal"),
+        "recorded-read request ordinal",
+        maximum=plan_module.READ_WINDOW_COUNT - 1,
+    )
+    start_ns = time.monotonic_ns()
+    deadline_ns = start_ns + plan["timeout_declaration"][
+        "maximum_io_window_seconds"] * 1_000_000_000
+    _require(deadline_ns < (1 << 63),
+             "Root recorded-read deadline exceeds monotonic arithmetic")
+    window_chunk, row = _recorded_read_window_chunk(
+        plan, plan_pin, plan_module, ordinal,
+        deadline_ns=deadline_ns, cancel_event=cancel_event,
+    )
+    outer_request = plan_module.validate_recorded_preparation_read_request_v2(
+        request_raw, basis, basis_pin, plan, plan_pin, window_chunk,
+    )
+    _request, expected_request_raw, expected_request_pin = \
+        plan_module.build_recorded_preparation_read_request_v2(
+            basis, basis_pin, plan, plan_pin, ordinal, window_chunk,
+        )
+    _require(expected_request_raw == request_raw,
+             "recorded-read request is not the deterministic Source request")
+    persisted_request, request_sha, _info = _read_absolute_private_file(
+        Path(row["session_paths"]["request"]),
+        row["resource_bounds"]["outer_request_bytes"],
+        "recorded-read current request",
+        deadline_ns=deadline_ns, cancel_event=cancel_event,
+    )
+    _require(persisted_request == request_raw and
+             request_sha == expected_request_pin["raw_sha256"],
+             "recorded-read current request slot differs")
+    root_output = _recorded_read_root_output_context(
+        root_output_resource_declaration, basis, basis_pin, plan, plan_pin,
+        ordinal, window_chunk, plan_module,
+    )
+    _require(_absolute_path(response_output_path,
+                            "Root response output path") ==
+                 root_output["paths"]["response"] and
+             _absolute_path(bundle_output_path,
+                            "Root bundle output path") ==
+                 root_output["paths"]["bundle"],
+             "Root output arguments differ from their separately reserved Root slots")
+    _prepare_recorded_read_root_output_dirs(root_output)
+    failure_path = Path(root_output["paths"]["failure_receipt"])
+    _require(not failure_path.exists() and not failure_path.is_symlink(),
+             "Root recorded-read nonce has a retained failure receipt")
+    root_ledger_fd = _open_recorded_read_root_ledger(root_output)
+    request_pin = {key: expected_request_pin[key] for key in (
+        "path", "raw_sha256", "semantic_sha256",
+    )}
+    reader = None
+    try:
+        cursor, pending, previous = _recorded_root_control_state(
+            root_ledger_fd, root_output, basis, basis_pin, plan, plan_pin,
+            plan_module, deadline_ns=deadline_ns,
+            cancel_event=cancel_event,
+        )
+        _require(ordinal == cursor and
+                 (pending is None or pending == request_pin),
+                 "Root recorded-read request is not the next current event")
+        if pending is None:
+            accepted = _recorded_root_control_event(
+                basis, basis_pin, plan, plan_pin, row, 2 * ordinal + 1,
+                "request_accepted", request_pin, root_output["paths"],
+            )
+            previous = _append_recorded_root_control_event(
+                root_ledger_fd, accepted, previous, root_output,
+                deadline_ns=deadline_ns, cancel_event=cancel_event,
+            )
+        result = _serve_recorded_preparation_read_window_core_v1(
+            request_raw, basis_raw=basis_raw,
+            read_plan_raw=read_plan_raw,
+            session_descriptor_raw=session_descriptor_raw,
+            source_root=source_root,
+            selected_source_manifest_raw=selected_source_manifest_raw,
+            lineage_capture_manifest_raw=lineage_capture_manifest_raw,
+            lineage_capture_stage_root=lineage_capture_stage_root,
+            archive_source5_root=archive_source5_root,
+            response_output_path=root_output["paths"]["response"],
+            bundle_output_path=root_output["paths"]["bundle"],
+            root_resource_declaration=root_resource_declaration,
+            root_output_context=root_output,
+            window_deadline_ns=deadline_ns,
+            cancel_event=cancel_event,
+        )
+        completed = _recorded_root_control_event(
+            basis, basis_pin, plan, plan_pin, row, 2 * ordinal + 2,
+            "response_published", request_pin, root_output["paths"],
+            result["response_pin"], result["bundle_pin"],
+        )
+        _append_recorded_root_control_event(
+            root_ledger_fd, completed, previous, root_output,
+            deadline_ns=deadline_ns, cancel_event=cancel_event,
+        )
+        return result
+    except BaseException as error:
+        retained = any(
+            Path(path).exists() or Path(path).is_symlink()
+            for path in (root_output["paths"]["response"],
+                         root_output["paths"]["bundle"])
+        )
+        try:
+            _write_recorded_root_failure_receipt(
+                root_output, basis, basis_pin, plan, plan_pin, ordinal, row,
+                retained_window=retained, deadline_ns=deadline_ns,
+                cancel_event=cancel_event,
+            )
+        except BaseException as receipt_error:
+            raise EvidenceArchiveError(
+                f"Root recorded-read failure receipt could not be stored: {receipt_error}",
+            ) from error
+        raise
+    finally:
+        if reader is not None:
+            reader.close()
+        os.close(root_ledger_fd)
+
+
+def release_recorded_preparation_read_root_output_v1(
+    basis_raw: bytes, read_plan_raw: bytes, session_descriptor_raw: bytes,
+    source_root: str, selected_source_manifest_raw: bytes,
+    root_output_resource_declaration: object, read_ordinal: object,
+    response_pin_value: object, bundle_pin_value: object,
+) -> dict[str, Any]:
+    """Free one exact Root spool only after the caller transferred its pins."""
+    basis = _parse_canonical(basis_raw, "recorded-read release basis",
+                             maximum_bytes=MAX_ARCHIVE_READ_METADATA_BYTES)
+    plan = _parse_canonical(read_plan_raw, "recorded-read release plan",
+                            maximum_bytes=MAX_ARCHIVE_READ_METADATA_BYTES)
+    session = _parse_canonical(session_descriptor_raw,
+                               "recorded-read release session",
+                               maximum_bytes=MAX_ARCHIVE_READ_METADATA_BYTES)
+    consumer = basis.get("consumer_host_id")
+    source_pin = basis.get("source_manifest_pins", {}).get(consumer)
+    _require(type(source_pin) is dict and
+             _sha(selected_source_manifest_raw) == source_pin.get("raw_sha256"),
+             "recorded-read Root release selected Source pin differs")
+    namespace = _recorded_pre_manifest_typed_module(
+        selected_source_manifest_raw, source_pin,
+        basis["source_module_pins"][consumer],
+        SOURCE5_RECORDED_READ_PLAN_PATH, source_root, source_root,
+        namespace_name="_allocatbelt_recorded_read_root_release_plan",
+    )
+    module = sys.modules[namespace["__name__"]]
+    basis_pin = _pin(session["basis_pin"], "Root release basis pin")
+    plan_pin = _pin(session["read_plan_pin"], "Root release plan pin")
+    _require(module._validate_basis(basis, basis_pin)[0] == basis and
+             module.recorded_preparation_read_plan_pin_v2(plan) == plan_pin and
+             plan["basis_pin"] == basis_pin,
+             "recorded-read Root release basis/plan pins differ")
+    _require(session_descriptor_raw ==
+             module.build_recorded_preparation_read_session_descriptor_v2(
+                 plan, plan_pin,
+             )[1],
+             "recorded-read Root release session descriptor differs")
+    ordinal = module._uint(read_ordinal, "Root output release ordinal",
+                           maximum=module.READ_WINDOW_COUNT - 1)
+    deadline_ns = time.monotonic_ns() + plan["timeout_declaration"][
+        "maximum_io_window_seconds"] * 1_000_000_000
+    _require(deadline_ns < (1 << 63),
+             "Root output release deadline exceeds monotonic arithmetic")
+    window_chunk, row = _recorded_read_window_chunk(
+        plan, plan_pin, module, ordinal, deadline_ns=deadline_ns,
+    )
+    context = _recorded_read_root_output_context(
+        root_output_resource_declaration, basis, basis_pin, plan, plan_pin,
+        ordinal, window_chunk, module,
+    )
+    response_pin = _pin(response_pin_value,
+                        "Root output release response pin")
+    bundle_pin = _exact(bundle_pin_value, {
+        "path", "raw_sha256", "byte_count",
+    }, "Root output release bundle pin")
+    _require(response_pin["path"] == context["paths"]["response"] and
+             bundle_pin["path"] == context["paths"]["bundle"],
+             "Root output release paths differ from its nonce-bound slots")
+    request, request_raw, request_pin = \
+        module.build_recorded_preparation_read_request_v2(
+            basis, basis_pin, plan, plan_pin, ordinal, window_chunk,
+        )
+    request_pin3 = {key: request_pin[key] for key in (
+        "path", "raw_sha256", "semantic_sha256",
+    )}
+    request_saved, request_sha, _info = _read_absolute_private_file(
+        Path(request_pin["path"]), row["resource_bounds"]["outer_request_bytes"],
+        "Root output release current Source request",
+        deadline_ns=deadline_ns,
+    )
+    _require(request_saved == request_raw and request_sha == request_pin["raw_sha256"],
+             "Root output release Source request differs from its exact plan")
+    ledger_fd = _open_recorded_read_root_ledger(context)
+    try:
+        cursor, pending, _previous = _recorded_root_control_state(
+            ledger_fd, context, basis, basis_pin, plan, plan_pin, module,
+            deadline_ns=deadline_ns,
+        )
+        _require(cursor > ordinal and pending is None,
+                 "Root output release row is not a completed Root control pair")
+        os.lseek(ledger_fd, 0, os.SEEK_SET)
+        ledger_info = os.fstat(ledger_fd)
+        ledger_raw = bytearray()
+        while len(ledger_raw) < ledger_info.st_size:
+            _require(time.monotonic_ns() < deadline_ns,
+                     "Root output release ledger read exceeded its window")
+            block = os.read(ledger_fd, min(
+                COPY_BLOCK_BYTES, ledger_info.st_size - len(ledger_raw),
+            ))
+            _require(bool(block), "Root output release ledger shortened")
+            ledger_raw.extend(block)
+        lines = bytes(ledger_raw).splitlines()
+        _require(len(lines) >= 2 * ordinal + 2,
+                 "Root output release ledger omits its completed response")
+        response_event = json.loads(lines[2 * ordinal + 1].decode("ascii"))["record"]
+        event_response_pin = response_event["response_pin"]
+        event_bundle_pin = response_event["bundle_pin"]
+        _require(event_response_pin == response_pin and
+                 event_bundle_pin == bundle_pin and
+                 response_event["request_pin"] == request_pin3,
+                 "Root output release pins differ from its append-only current ledger")
+    finally:
+        os.close(ledger_fd)
+    response_raw, response_sha, _response_info = _read_absolute_private_file(
+        Path(response_pin["path"]), row["resource_bounds"]["outer_response_bytes"],
+        "Root output release response",
+        deadline_ns=deadline_ns,
+    )
+    response = module.validate_recorded_preparation_read_response_v2(
+        response_raw, request_raw, basis, basis_pin, plan, plan_pin,
+        window_chunk,
+    )
+    _require(response_sha == response_pin["raw_sha256"] and
+             response["response_sha256"] == response_pin["semantic_sha256"],
+             "Root output release response raw/semantic pins differ")
+    bundle_parent = _open_dir_path(
+        Path(bundle_pin["path"]).parent,
+        "Root output release bundle parent", private_final=True,
+    )
+    cleanup_started = False
+    try:
+        bundle_name = Path(bundle_pin["path"]).name
+        _raw, bundle_sha, bundle_info = _read_at(
+            bundle_parent, bundle_name,
+            row["resource_bounds"]["tar_bytes"],
+            "Root output release bundle", expected_bytes=bundle_pin["byte_count"],
+            collect=False, deadline_ns=deadline_ns,
+        )
+        _require(bundle_sha == bundle_pin["raw_sha256"] and
+                 bundle_info.st_uid == os.getuid() and
+                 stat.S_IMODE(bundle_info.st_mode) == 0o600 and
+                 bundle_info.st_nlink == 1 and
+                 bundle_info.st_size == row["resource_bounds"]["tar_bytes"],
+                 "Root output release bundle differs from its exact Root pin")
+        cleanup_started = True
+        current_bundle = os.stat(bundle_name, dir_fd=bundle_parent,
+                                 follow_symlinks=False)
+        _require(_info_key(current_bundle) == _info_key(bundle_info),
+                 "Root output release bundle changed before exact unlink")
+        os.unlink(bundle_name, dir_fd=bundle_parent)
+        response_parent = _open_dir_path(
+            Path(response_pin["path"]).parent,
+            "Root output release response parent", private_final=True,
+        )
+        try:
+            response_name = Path(response_pin["path"]).name
+            _raw, response_raw_sha, response_info = _read_at(
+                response_parent, response_name,
+                row["resource_bounds"]["outer_response_bytes"],
+                "Root output release response unlink check",
+                expected_bytes=len(response_raw), collect=False,
+                deadline_ns=deadline_ns,
+            )
+            current_response = os.stat(response_name, dir_fd=response_parent,
+                                       follow_symlinks=False)
+            _require(response_raw_sha == response_pin["raw_sha256"] and
+                     _info_key(current_response) == _info_key(response_info),
+                     "Root output release response changed before exact unlink")
+            os.unlink(response_name, dir_fd=response_parent)
+            os.fsync(response_parent)
+        finally:
+            os.close(response_parent)
+        os.fsync(bundle_parent)
+    except BaseException:
+        if cleanup_started:
+            retained = any(
+                Path(value).exists() or Path(value).is_symlink()
+                for value in (context["paths"]["response"],
+                              context["paths"]["bundle"])
+            )
+            context["directory_allocation_baseline"] = \
+                _recorded_read_root_output_directory_baseline(context)
+            _write_recorded_root_failure_receipt(
+                context, basis, basis_pin, plan, plan_pin, ordinal, row,
+                retained_window=retained, deadline_ns=deadline_ns,
+            )
+        raise
+    finally:
+        os.close(bundle_parent)
+    return {
+        "schema": "allocatbelt.application-source5-recorded-preparation-root-output-release.v1",
+        "read_ordinal": ordinal,
+        "response_pin": response_pin,
+        "bundle_pin": bundle_pin,
+    }
 
 
 def _require_prepared_catalogue_storage_parity(
@@ -6626,8 +9190,519 @@ def _verify_detached_signature(
     return primary_fingerprint
 
 
+def _verify_detached_signature_recorded(
+    ack_raw: bytes, signature_raw: bytes, signer_pin: object, *,
+    captured_keyring_reader, captured_gpgv_reader,
+    root_auxiliary_resource_declaration: object,
+    operation_started_ns: int, window_deadline_ns: int,
+    cancel_event=None,
+) -> str:
+    """Freshly run the exact captured GPGV pin in one charged Root window."""
+    signer = _exact(signer_pin, {
+        "fingerprint", "keyring_pin", "gpgv_pin",
+    }, "recorded-read archive verification signer pin")
+    fingerprint = _fingerprint(signer["fingerprint"],
+                               "recorded-read authorized fingerprint")
+    keyring_pin = _pin_raw(signer["keyring_pin"],
+                           "recorded-read public keyring pin")
+    gpgv_pin = _pin_raw(signer["gpgv_pin"],
+                        "recorded-read captured GPGV pin")
+    resource = _exact(root_auxiliary_resource_declaration,
+                      RECORDED_READ_GPG_RESOURCE_FIELDS_V2,
+                      "Root recorded-read GPG auxiliary reservation")
+    resource_body = {key: value for key, value in resource.items()
+                     if key != "resource_sha256"}
+    _require(resource["schema"] == RECORDED_READ_GPG_RESOURCE_SCHEMA_V2 and
+             resource["resource_sha256"] == _sha(_canonical(resource_body)),
+             "Root recorded-read GPG resource self digest differs")
+    scratch_root = Path(_absolute_path(
+        resource["scratch_root"], "Root recorded-read GPG scratch root",
+    ))
+    device = _uint(resource["device"], "Root GPG scratch device")
+    reserved_bytes = _uint(resource["reserved_bytes"],
+                           "Root GPG auxiliary reserved bytes", positive=True)
+    allocation_block = _uint(
+        resource["allocation_block_bytes"],
+        "Root GPG scratch allocation block", positive=True, maximum=1 << 20,
+    )
+    directory_allocated = _uint(
+        resource["window_directory_allocated_bytes"],
+        "Root GPG private-window directory allocation", positive=True,
+    )
+    projected_allocated = _uint(
+        resource["required_allocated_bytes"],
+        "Root GPG block-rounded resource projection", positive=True,
+    )
+    projected_file_bytes = _uint(
+        resource["required_file_bytes"],
+        "Root GPG raw file-cap projection", positive=True,
+    )
+    reserved_inodes = _uint(resource["reserved_inodes"],
+                            "Root GPG auxiliary reserved inodes", positive=True)
+    gpgv_maximum = _uint(
+        resource["maximum_gpgv_bytes"], "Root GPGV executable cap",
+        positive=True, maximum=MAX_ARCHIVE_GPGV_BYTES,
+    )
+    keyring_maximum = _uint(
+        resource["maximum_keyring_bytes"], "Root GPG keyring cap",
+        positive=True, maximum=MAX_GPG_OUTPUT_BYTES * 16,
+    )
+    ack_maximum = _uint(
+        resource["maximum_ack_bytes"], "Root GPG ACK input cap",
+        positive=True, maximum=MAX_JSON_BYTES,
+    )
+    signature_maximum = _uint(
+        resource["maximum_signature_bytes"], "Root GPG signature cap",
+        positive=True, maximum=MAX_GPG_OUTPUT_BYTES,
+    )
+    stdout_maximum = _uint(
+        resource["maximum_stdout_bytes"], "Root GPG status cap",
+        positive=True, maximum=MAX_GPG_OUTPUT_BYTES,
+    )
+    stderr_maximum = _uint(
+        resource["maximum_stderr_bytes"], "Root GPG diagnostic cap",
+        positive=True, maximum=MAX_GPG_OUTPUT_BYTES,
+    )
+    maximum_window_seconds = _uint(
+        resource["maximum_window_seconds"], "Root GPG window timeout",
+        positive=True, maximum=300,
+    )
+    _require(stdout_maximum == stderr_maximum,
+             "Root GPG stdout/stderr caps must share one enforced file-size limit")
+    _require(type(ack_raw) is bytes and 0 < len(ack_raw) <= ack_maximum and
+             type(signature_raw) is bytes and
+             0 < len(signature_raw) <= signature_maximum and
+             callable(captured_keyring_reader) and
+             callable(captured_gpgv_reader) and
+             type(operation_started_ns) is int and operation_started_ns >= 0 and
+             type(window_deadline_ns) is int and
+             operation_started_ns < window_deadline_ns <=
+                 operation_started_ns + maximum_window_seconds * 1_000_000_000 and
+             (cancel_event is None or
+              callable(getattr(cancel_event, "is_set", None))),
+             "Root recorded-read GPG inputs, clock window or cancellation token differ")
+
+    def require_window_open(label: str) -> None:
+        _require(time.monotonic_ns() < window_deadline_ns and
+                 (cancel_event is None or not cancel_event.is_set()),
+                 f"Root recorded-read GPG window expired or cancelled {label}")
+
+    file_maxima = (gpgv_maximum, keyring_maximum, ack_maximum,
+                   signature_maximum, stdout_maximum, stderr_maximum)
+    required_bytes = directory_allocated + sum(
+        ((maximum + allocation_block - 1) // allocation_block) *
+        allocation_block for maximum in file_maxima
+    )
+    required_file_bytes = sum(file_maxima)
+    required_inodes = 7  # One private window directory and its six exact files.
+    _require(directory_allocated == allocation_block and
+             projected_file_bytes == required_file_bytes and
+             projected_allocated == required_bytes and
+             reserved_bytes >= required_bytes and
+             reserved_inodes >= required_inodes,
+             "Root recorded-read GPG auxiliary reservation is below its exact physical projection")
+    root_fd = _open_dir_path(scratch_root, "Root recorded-read GPG scratch root",
+                             private_final=True)
+    try:
+        import fcntl
+        fcntl.flock(root_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except (ImportError, OSError) as error:
+        os.close(root_fd)
+        raise EvidenceArchiveError(
+            "Root recorded-read GPG scratch window is already leased",
+        ) from error
+    root_identity = None
+    window_name = None
+    window_fd = -1
+    created_window = False
+    window_identity: tuple[int, int, int, int] | None = None
+    file_fds: dict[str, int] = {}
+    process = None
+    try:
+        root_info = os.fstat(root_fd)
+        root_identity = (root_info.st_dev, root_info.st_ino,
+                         root_info.st_mode, root_info.st_uid)
+        _require(not os.listdir(root_fd),
+                 "Root GPG auxiliary scratch retains a prior failed window")
+        window_name = os.urandom(16).hex()
+        require_window_open("before scratch allocation")
+        root_info = os.fstat(root_fd)
+        _require(root_info.st_dev == device,
+                 "Root GPG scratch device differs from its declared identity")
+        available = os.fstatvfs(root_fd)
+        available_block = available.f_frsize or available.f_bsize
+        _require(available_block == allocation_block and
+                 available.f_bavail * available_block >= reserved_bytes and
+                 available.f_favail >= reserved_inodes,
+                 "Root GPG scratch root lacks its reserved current byte/inode window")
+        _require(cancel_event is None or not cancel_event.is_set(),
+                 "Root recorded-read GPG window was cancelled before allocation")
+        try:
+            os.mkdir(window_name, 0o700, dir_fd=root_fd)
+        except FileExistsError as error:
+            raise EvidenceArchiveError(
+                "Root recorded-read GPG window name unexpectedly exists",
+            ) from error
+        created_window = True
+        created_info = os.stat(window_name, dir_fd=root_fd,
+                               follow_symlinks=False)
+        window_identity = (created_info.st_dev, created_info.st_ino,
+                           created_info.st_mode, created_info.st_uid)
+        os.fsync(root_fd)
+        window_fd = os.open(
+            window_name, os.O_RDONLY | _O_DIRECTORY | _O_CLOEXEC | _O_NOFOLLOW,
+            dir_fd=root_fd,
+        )
+        window_info = os.fstat(window_fd)
+        _require(stat.S_ISDIR(window_info.st_mode) and
+                 window_info.st_uid == os.getuid() and
+                 stat.S_IMODE(window_info.st_mode) == 0o700 and
+                 window_info.st_dev == device and
+                 _info_key(window_info) == _info_key(created_info) and
+                 (window_info.st_dev, window_info.st_ino,
+                  window_info.st_mode, window_info.st_uid) == window_identity,
+                 "Root recorded-read GPG window is not an owned same-device 0700 directory")
+
+        def write_file(name: str, raw: bytes, maximum: int,
+                       mode: int) -> int:
+            _require(type(raw) is bytes and 0 <= len(raw) <= maximum,
+                     f"Root GPG auxiliary {name} exceeds its declared file cap")
+            fd = os.open(
+                name, os.O_RDWR | os.O_CREAT | os.O_EXCL | _O_CLOEXEC |
+                _O_NOFOLLOW, mode, dir_fd=window_fd,
+            )
+            try:
+                os.fchmod(fd, mode)
+                view = memoryview(raw)
+                while view:
+                    require_window_open(f"while writing {name}")
+                    written = os.write(fd, view)
+                    _require(written > 0,
+                             f"Root GPG auxiliary {name} writer made no progress")
+                    view = view[written:]
+                os.fsync(fd)
+                info = os.fstat(fd)
+                _require(stat.S_ISREG(info.st_mode) and
+                         info.st_uid == os.getuid() and
+                         stat.S_IMODE(info.st_mode) == mode and
+                         info.st_nlink == 1 and info.st_size == len(raw) and
+                         info.st_blocks * 512 <=
+                            ((maximum + allocation_block - 1) //
+                             allocation_block) * allocation_block,
+                         f"Root GPG auxiliary {name} changed during creation")
+                file_fds[name] = fd
+                return fd
+            except BaseException:
+                os.close(fd)
+                raise
+
+        try:
+            keyring_raw = captured_keyring_reader(
+                dict(keyring_pin), keyring_maximum,
+            )
+            gpgv_raw = captured_gpgv_reader(dict(gpgv_pin), gpgv_maximum)
+        except Exception as error:
+            raise EvidenceArchiveError(
+                "closed capture lacks the exact recorded-read signer tool bytes",
+            ) from error
+        _require(type(keyring_raw) is bytes and
+                 0 < len(keyring_raw) <= keyring_maximum and
+                 _sha(keyring_raw) == keyring_pin["raw_sha256"] and
+                 type(gpgv_raw) is bytes and 0 < len(gpgv_raw) <= gpgv_maximum and
+                 _sha(gpgv_raw) == gpgv_pin["raw_sha256"],
+                 "captured GPG signer tools differ from their exact old raw pins")
+        require_window_open("after reading captured signer tools")
+        write_file("gpgv", gpgv_raw, gpgv_maximum, 0o700)
+        write_file("trusted-keyring.gpg", keyring_raw, keyring_maximum, 0o600)
+        write_file("ack.json", ack_raw, ack_maximum, 0o600)
+        write_file("ack.sig", signature_raw, signature_maximum, 0o600)
+        stdout_fd = write_file("status.stdout", b"", stdout_maximum, 0o600)
+        stderr_fd = write_file("status.stderr", b"", stderr_maximum, 0o600)
+        os.fsync(window_fd)
+        window_info = os.fstat(window_fd)
+        _require(window_info.st_blocks * 512 <= directory_allocated,
+                 "Root GPG private-window directory exceeded its metadata reserve")
+
+        # Linux refuses execve of a file while any process holds it writable.
+        gpgv_write_fd = file_fds.pop("gpgv")
+        gpgv_written_info = os.fstat(gpgv_write_fd)
+        os.close(gpgv_write_fd)
+        gpgv_read_fd = os.open(
+            "gpgv", os.O_RDONLY | _O_CLOEXEC | _O_NOFOLLOW | _O_NONBLOCK,
+            dir_fd=window_fd,
+        )
+        try:
+            gpgv_read_info = os.fstat(gpgv_read_fd)
+            gpgv_path_info = os.stat("gpgv", dir_fd=window_fd,
+                                     follow_symlinks=False)
+            _require(_info_key(gpgv_written_info) ==
+                        _info_key(gpgv_read_info) == _info_key(gpgv_path_info) and
+                     stat.S_ISREG(gpgv_read_info.st_mode) and
+                     gpgv_read_info.st_uid == os.getuid() and
+                     stat.S_IMODE(gpgv_read_info.st_mode) == 0o700 and
+                     gpgv_read_info.st_nlink == 1 and
+                     _hash_fd_exact(gpgv_read_fd, len(gpgv_raw),
+                                    gpgv_maximum,
+                                    "Root captured GPGV read-only reopen",
+                                    deadline_ns=window_deadline_ns,
+                                    cancel_event=cancel_event) ==
+                        gpgv_pin["raw_sha256"],
+                     "Root captured GPGV changed or lost read-only custody")
+        except BaseException:
+            os.close(gpgv_read_fd)
+            raise
+        file_fds["gpgv"] = gpgv_read_fd
+
+        def cap_child_file_size() -> None:
+            import resource
+            maximum_file_size = stdout_maximum
+            resource.setrlimit(
+                resource.RLIMIT_FSIZE,
+                (maximum_file_size, maximum_file_size),
+            )
+
+        gpgv_path = scratch_root / window_name / "gpgv"
+        command = [
+            str(gpgv_path), "--status-fd", "1", "--keyring",
+            str(scratch_root / window_name / "trusted-keyring.gpg"),
+            str(scratch_root / window_name / "ack.sig"),
+            str(scratch_root / window_name / "ack.json"),
+        ]
+        require_window_open("before execution")
+        try:
+            process = subprocess.Popen(
+                command, stdin=subprocess.DEVNULL,
+                stdout=stdout_fd, stderr=stderr_fd,
+                close_fds=True,
+                cwd=str(scratch_root / window_name),
+                env={"LC_ALL": "C", "LANG": "C",
+                     "HOME": str(scratch_root / window_name),
+                     "GNUPGHOME": str(scratch_root / window_name),
+                     "TMPDIR": str(scratch_root / window_name)},
+                preexec_fn=cap_child_file_size,
+            )
+        except (OSError, ValueError) as error:
+            raise EvidenceArchiveError(
+                f"captured recorded-read GPGV could not start: {error}",
+            ) from error
+        while process.poll() is None:
+            if cancel_event is not None and cancel_event.is_set():
+                process.kill()
+                process.wait()
+                raise EvidenceArchiveError(
+                    "Root recorded-read GPG verification was cancelled",
+                )
+            if time.monotonic_ns() >= window_deadline_ns:
+                process.kill()
+                process.wait()
+                raise EvidenceArchiveError(
+                    "Root recorded-read GPG verification exceeded its bounded window",
+                )
+            time.sleep(0.01)
+        return_code = process.returncode
+        require_window_open("after execution")
+
+        def read_log(name: str, fd: int, maximum: int) -> bytes:
+            before = os.fstat(fd)
+            current = os.stat(name, dir_fd=window_fd, follow_symlinks=False)
+            _require(stat.S_ISREG(before.st_mode) and
+                     before.st_uid == os.getuid() and
+                     stat.S_IMODE(before.st_mode) == 0o600 and
+                     before.st_nlink == 1 and before.st_size <= maximum and
+                     before.st_blocks * 512 <=
+                         ((maximum + allocation_block - 1) //
+                          allocation_block) * allocation_block and
+                     _info_key(before) == _info_key(current),
+                     f"Root GPG receipt {name} exceeds its exact bounded file")
+            os.lseek(fd, 0, os.SEEK_SET)
+            chunks = []
+            total = 0
+            while total < before.st_size:
+                block = os.read(fd, min(COPY_BLOCK_BYTES,
+                                        before.st_size - total))
+                _require(bool(block),
+                         f"Root GPG receipt {name} shortened before readback")
+                total += len(block)
+                _require(total <= maximum,
+                         f"Root GPG receipt {name} exceeded its cap")
+                chunks.append(block)
+            after = os.fstat(fd)
+            path_after = os.stat(name, dir_fd=window_fd,
+                                 follow_symlinks=False)
+            _require(os.read(fd, 1) == b"" and
+                     _info_key(before) == _info_key(after) ==
+                         _info_key(path_after),
+                     f"Root GPG receipt {name} changed during bounded readback")
+            return b"".join(chunks)
+
+        stdout_raw = read_log("status.stdout", stdout_fd, stdout_maximum)
+        stderr_raw = read_log("status.stderr", stderr_fd, stderr_maximum)
+        _require(os.fstat(window_fd).st_blocks * 512 <= directory_allocated,
+                 "Root GPG window directory exceeded its metadata reserve after execution")
+        _require(return_code == 0,
+                 "captured Source GPGV rejected the durable ACK")
+        try:
+            lines = stdout_raw.decode("ascii", "strict").splitlines()
+        except UnicodeError as error:
+            raise EvidenceArchiveError(
+                "captured Source GPGV status output is not ASCII",
+            ) from error
+        valid = [line.split() for line in lines
+                 if line.startswith("[GNUPG:] VALIDSIG ")]
+        rejected = [line for line in lines if line.startswith((
+            "[GNUPG:] BADSIG ", "[GNUPG:] ERRSIG ",
+            "[GNUPG:] NO_PUBKEY ", "[GNUPG:] REVKEYSIG ",
+            "[GNUPG:] EXPKEYSIG ", "[GNUPG:] EXPSIG ",
+        ))]
+        _require(len(valid) == 1 and not rejected and len(valid[0]) >= 4,
+                 "captured Source GPGV status lacks one unambiguous valid signature")
+        status = valid[0]
+        signing_fingerprint = _fingerprint(
+            status[2].upper(), "captured GPGV signing fingerprint",
+        )
+        primary_raw = status[-1] if len(status) >= 12 else status[2]
+        primary_fingerprint = _fingerprint(
+            primary_raw.upper(), "captured GPGV primary fingerprint",
+        )
+        _require(primary_fingerprint == fingerprint and
+                 signing_fingerprint == fingerprint and
+                 type(stderr_raw) is bytes,
+                 "captured GPGV signer or primary fingerprint differs from its pin")
+        for name, raw, maximum in (
+            ("gpgv", gpgv_raw, gpgv_maximum),
+            ("trusted-keyring.gpg", keyring_raw, keyring_maximum),
+            ("ack.json", ack_raw, ack_maximum),
+            ("ack.sig", signature_raw, signature_maximum),
+        ):
+            fd = file_fds[name]
+            before = os.fstat(fd)
+            _require(stat.S_ISREG(before.st_mode) and
+                     before.st_uid == os.getuid() and before.st_nlink == 1 and
+                     before.st_size == len(raw) <= maximum and
+                     _hash_fd_exact(fd, before.st_size, maximum, name) ==
+                         _sha(raw) and
+                     _info_key(before) == _info_key(os.stat(
+                         name, dir_fd=window_fd, follow_symlinks=False,
+                     )),
+                     f"Root GPG input {name} changed during verification")
+        return primary_fingerprint
+    except subprocess.TimeoutExpired as error:
+        if process is not None and process.poll() is None:
+            process.kill()
+            process.wait()
+        raise EvidenceArchiveError(
+            "Root recorded-read GPG verification exceeded its bounded window",
+        ) from error
+    finally:
+        try:
+            if process is not None and process.poll() is None:
+                process.kill()
+                process.wait()
+            for descriptor in file_fds.values():
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+            if created_window and window_fd < 0:
+                try:
+                    window_fd = os.open(
+                        window_name, os.O_RDONLY | _O_DIRECTORY |
+                        _O_CLOEXEC | _O_NOFOLLOW, dir_fd=root_fd,
+                    )
+                except FileNotFoundError:
+                    window_fd = -1
+            if created_window and window_fd >= 0:
+                cleanup_info = os.fstat(window_fd)
+                _require(stat.S_ISDIR(cleanup_info.st_mode) and
+                         cleanup_info.st_uid == os.getuid() and
+                         stat.S_IMODE(cleanup_info.st_mode) == 0o700 and
+                         cleanup_info.st_dev == device and
+                         window_identity == (
+                             cleanup_info.st_dev, cleanup_info.st_ino,
+                             cleanup_info.st_mode, cleanup_info.st_uid,
+                         ),
+                         "Root recorded-read GPG partial window changed before cleanup")
+                expected_names = {
+                    "gpgv", "trusted-keyring.gpg", "ack.json", "ack.sig",
+                    "status.stdout", "status.stderr",
+                }
+                present = set(os.listdir(window_fd))
+                _require(present <= expected_names,
+                         "Root recorded-read GPG window contains an undeclared file")
+                for name in sorted(present):
+                    info = os.stat(name, dir_fd=window_fd,
+                                   follow_symlinks=False)
+                    _require(stat.S_ISREG(info.st_mode) and
+                             info.st_uid == os.getuid() and
+                             info.st_nlink == 1 and
+                             stat.S_IMODE(info.st_mode) in {0o600, 0o700},
+                             "Root recorded-read GPG cleanup found a foreign file")
+                    os.unlink(name, dir_fd=window_fd)
+                os.fsync(window_fd)
+                _require(not os.listdir(window_fd),
+                         "Root recorded-read GPG window did not clean its exact files")
+                os.close(window_fd)
+                window_fd = -1
+                current = os.stat(window_name, dir_fd=root_fd,
+                                  follow_symlinks=False)
+                _require((current.st_dev, current.st_ino,
+                          current.st_mode, current.st_uid) == window_identity,
+                         "Root recorded-read GPG temp directory changed before removal")
+                os.rmdir(window_name, dir_fd=root_fd)
+                os.fsync(root_fd)
+            if root_identity is not None:
+                reopened_root_fd = _open_dir_path(
+                    scratch_root, "Root recorded-read GPG scratch root after window",
+                    private_final=True,
+                )
+                try:
+                    reopened_root = os.fstat(reopened_root_fd)
+                    _require((reopened_root.st_dev, reopened_root.st_ino,
+                              reopened_root.st_mode, reopened_root.st_uid) ==
+                             root_identity,
+                             "Root GPG scratch root changed during recorded verification")
+                finally:
+                    os.close(reopened_root_fd)
+        finally:
+            if window_fd >= 0:
+                try:
+                    os.close(window_fd)
+                except OSError:
+                    pass
+            os.close(root_fd)
+
+
+def _hash_fd_exact(fd: int, expected_bytes: int, maximum: int,
+                   label: str, *, deadline_ns: int | None = None,
+                   cancel_event=None) -> str:
+    before = os.fstat(fd)
+    _require(stat.S_ISREG(before.st_mode) and before.st_uid == os.getuid() and
+             before.st_nlink == 1 and before.st_size == expected_bytes <= maximum,
+             f"{label} is not one exact bounded recorded-read GPG file")
+    os.lseek(fd, 0, os.SEEK_SET)
+    hasher = hashlib.sha256()
+    total = 0
+    while total < expected_bytes:
+        _require(deadline_ns is None or time.monotonic_ns() < deadline_ns,
+                 f"{label} exceeded its finite recorded-read window")
+        _require(cancel_event is None or not cancel_event.is_set(),
+                 f"{label} was cancelled")
+        block = os.read(fd, min(COPY_BLOCK_BYTES, expected_bytes - total))
+        _require(bool(block), f"{label} shortened during its bounded hash")
+        total += len(block)
+        _require(total <= maximum,
+                 f"{label} exceeded its recorded-read GPG byte bound")
+        hasher.update(block)
+    after = os.fstat(fd)
+    _require(os.read(fd, 1) == b"" and total == expected_bytes and
+             _info_key(before) == _info_key(after),
+             f"{label} changed while hashing its recorded-read GPG bytes")
+    return hasher.hexdigest()
+
+
 def _read_absolute_private_file(
-    path: Path, maximum: int, label: str,
+    path: Path, maximum: int, label: str, *, deadline_ns: int | None = None,
+    cancel_event=None,
 ) -> tuple[bytes, str, os.stat_result]:
     path_text = _absolute_path(str(path), f"{label} path")
     require_path = Path(path_text)
@@ -6636,10 +9711,53 @@ def _read_absolute_private_file(
     parent_fd = _open_dir_path(str(require_path.parent), f"{label} parent",
                                private_final=False)
     try:
-        raw, digest, info = _read_at(parent_fd, require_path.name, maximum, label)
+        raw, digest, info = _read_at(
+            parent_fd, require_path.name, maximum, label,
+            deadline_ns=deadline_ns, cancel_event=cancel_event,
+        )
         return raw, digest, info
     finally:
         os.close(parent_fd)
+
+
+def _recorded_read_window_chunk(
+    plan: dict[str, Any], plan_pin: dict[str, Any], plan_module: object,
+    read_ordinal: int, *, deadline_ns: int | None = None,
+    cancel_event=None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    ordinal = plan_module._uint(
+        read_ordinal, "Root recorded-read chunk ordinal",
+        maximum=plan_module.READ_WINDOW_COUNT - 1,
+    )
+    index = plan["window_index"][ordinal]
+    ref = plan["window_chunks"][index["chunk_ordinal"]]
+    path = Path(ref["pin"]["path"])
+    expected = (Path(plan["session_paths"]["window_metadata_root"]) /
+                f"chunk-{ref['chunk_ordinal']:06d}.json")
+    _require(path == expected and path.is_absolute(),
+             "Root recorded-read chunk path differs from its nonce-bound plan")
+    raw, digest, info = _read_absolute_private_file(
+        path, MAX_ARCHIVE_READ_METADATA_BYTES,
+        "Root recorded-read current window metadata chunk",
+        deadline_ns=deadline_ns, cancel_event=cancel_event,
+    )
+    _require(digest == ref["pin"]["raw_sha256"] and
+             len(raw) == ref["byte_count"] and
+             info.st_dev == plan["scratch_declaration"]["device_id"],
+             "Root recorded-read chunk raw pin or byte count differs")
+    chunk_space = os.statvfs(path.parent)
+    chunk_block = chunk_space.f_frsize or chunk_space.f_bsize
+    _require(chunk_block ==
+             plan["scratch_declaration"]["allocation_block_bytes"],
+             "Root recorded-read chunk filesystem block differs from the plan")
+    chunk = _parse_canonical(
+        raw, "Root recorded-read current window metadata chunk",
+        maximum_bytes=MAX_ARCHIVE_READ_METADATA_BYTES,
+    )
+    row = plan_module.validate_recorded_preparation_read_window_v2(
+        plan, plan_pin, chunk, ordinal,
+    )
+    return chunk, row
 
 
 def _hash_absolute_private_file(
@@ -7197,6 +10315,161 @@ class _private_temp_pair:
                 pass
 
 
+class _private_temp_executable:
+    """Execute exact captured tool bytes without reopening their old path."""
+
+    def __init__(self, raw: bytes, expected_sha256: str):
+        _require(type(raw) is bytes and 0 < len(raw) <= MAX_ARCHIVE_GPGV_BYTES and
+                 _sha(raw) == _digest(expected_sha256,
+                                      "captured GPGV executable digest"),
+                 "captured GPGV bytes differ from their exact bounded pin")
+        self.raw = raw
+        self.digest = expected_sha256
+        self.directory: Path | None = None
+        self.path: Path | None = None
+        self.directory_identity: tuple[int, int] | None = None
+        self.file_identity: tuple[int, ...] | None = None
+
+    def __enter__(self) -> Path:
+        import tempfile
+        directory = Path(tempfile.mkdtemp(
+            prefix="source5-recorded-gpgv-", dir="/tmp",
+        ))
+        self.directory = directory
+        path = directory / "gpgv"
+        self.path = path
+        try:
+            directory_info = directory.lstat()
+            _require(directory.parent == Path("/tmp") and
+                     stat.S_ISDIR(directory_info.st_mode) and
+                     directory_info.st_uid == os.getuid() and
+                     stat.S_IMODE(directory_info.st_mode) == 0o700,
+                     "captured GPGV temp root is not one owned private directory")
+            self.directory_identity = (directory_info.st_dev, directory_info.st_ino)
+            fd = os.open(
+                path, os.O_WRONLY | os.O_CREAT | os.O_EXCL |
+                _O_CLOEXEC | _O_NOFOLLOW, 0o700,
+            )
+            try:
+                os.fchmod(fd, 0o700)
+                view = memoryview(self.raw)
+                while view:
+                    count = os.write(fd, view)
+                    _require(count > 0,
+                             "captured GPGV temp writer made no progress")
+                    view = view[count:]
+                os.fsync(fd)
+                info = os.fstat(fd)
+                _require(stat.S_ISREG(info.st_mode) and
+                         info.st_uid == os.getuid() and
+                         stat.S_IMODE(info.st_mode) == 0o700 and
+                         info.st_nlink == 1 and info.st_size == len(self.raw),
+                         "captured GPGV temp executable has wrong identity or mode")
+                self.file_identity = _info_key(info)
+            finally:
+                os.close(fd)
+            directory_fd = os.open(
+                directory, os.O_RDONLY | _O_DIRECTORY | _O_CLOEXEC | _O_NOFOLLOW,
+            )
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+            _raw, digest, _info = _read_absolute_executable(
+                path, MAX_ARCHIVE_GPGV_BYTES,
+                "captured GPGV temp executable before verification",
+            )
+            _require(digest == self.digest,
+                     "captured GPGV temp executable changed before verification")
+            return path
+        except BaseException:
+            self._cleanup_partial()
+            raise
+
+    def _cleanup_partial(self) -> None:
+        if self.directory is None:
+            return
+        try:
+            if self.path is not None:
+                try:
+                    info = self.path.lstat()
+                except FileNotFoundError:
+                    info = None
+                if info is not None:
+                    _require(stat.S_ISREG(info.st_mode) and
+                             info.st_uid == os.getuid() and
+                             stat.S_IMODE(info.st_mode) == 0o700 and
+                             info.st_nlink == 1,
+                             "captured GPGV temp path changed during failed setup")
+                    self.path.unlink()
+            try:
+                self.directory.rmdir()
+            except FileNotFoundError:
+                pass
+            parent_fd = os.open(
+                "/tmp", os.O_RDONLY | _O_DIRECTORY | _O_CLOEXEC | _O_NOFOLLOW,
+            )
+            try:
+                os.fsync(parent_fd)
+            finally:
+                os.close(parent_fd)
+        finally:
+            self.path = None
+            self.directory = None
+
+    def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
+        if self.path is None or self.directory is None:
+            return
+        try:
+            before_path = self.path.lstat()
+            _require(self.file_identity == _info_key(before_path) and
+                     stat.S_ISREG(before_path.st_mode) and
+                     before_path.st_uid == os.getuid() and
+                     stat.S_IMODE(before_path.st_mode) == 0o700 and
+                     before_path.st_nlink == 1 and
+                     before_path.st_size == len(self.raw),
+                     "captured GPGV temp executable changed before cleanup")
+            _raw, digest, after = _read_absolute_executable(
+                self.path, MAX_ARCHIVE_GPGV_BYTES,
+                "captured GPGV temp executable after verification",
+            )
+            _require(digest == self.digest and
+                     self.file_identity == _info_key(after),
+                     "captured GPGV temp executable bytes changed during verification")
+            parent_fd = os.open(
+                self.directory, os.O_RDONLY | _O_DIRECTORY |
+                _O_CLOEXEC | _O_NOFOLLOW,
+            )
+            try:
+                current = os.stat("gpgv", dir_fd=parent_fd,
+                                  follow_symlinks=False)
+                _require(self.file_identity == _info_key(current),
+                         "captured GPGV temp path changed before cleanup")
+                os.unlink("gpgv", dir_fd=parent_fd)
+                os.fsync(parent_fd)
+            finally:
+                os.close(parent_fd)
+            directory_info = self.directory.lstat()
+            _require(self.directory_identity ==
+                     (directory_info.st_dev, directory_info.st_ino) and
+                     stat.S_ISDIR(directory_info.st_mode) and
+                     stat.S_IMODE(directory_info.st_mode) == 0o700 and
+                     directory_info.st_uid == os.getuid() and
+                     not any(self.directory.iterdir()),
+                     "captured GPGV temp directory changed before cleanup")
+            self.directory.rmdir()
+            tmp_fd = os.open(
+                "/tmp", os.O_RDONLY | _O_DIRECTORY | _O_CLOEXEC | _O_NOFOLLOW,
+            )
+            try:
+                os.fsync(tmp_fd)
+            finally:
+                os.close(tmp_fd)
+        finally:
+            self.path = None
+            self.directory = None
+
+
 def archive_job_checkpoint(
     request_pin: object, request_bytes: bytes,
     context: object, job_record_pin: object, job_record_bytes: bytes,
@@ -7736,6 +11009,355 @@ def _read_object_pin(pin: object, byte_count: int) -> tuple[None, dict[str, Any]
     return None, object_pin
 
 
+class _RecordedReadTarOutput:
+    def __init__(self, fd: int, maximum: int, deadline_ns: int,
+                 cancel_event: Any):
+        self.fd = fd
+        self.maximum = maximum
+        self.deadline_ns = deadline_ns
+        self.cancel_event = cancel_event
+        self.total = 0
+        self.digest = hashlib.sha256()
+
+    def _check(self) -> None:
+        _require(time.monotonic_ns() < self.deadline_ns and
+                 (self.cancel_event is None or
+                  not self.cancel_event.is_set()),
+                 "Root recorded-read tar write exceeded or cancelled its bounded window")
+
+    def write(self, value: bytes) -> int:
+        _require(type(value) is bytes,
+                 "Root recorded-read tar writer received a non-byte block")
+        self._check()
+        _require(self.total + len(value) <= self.maximum,
+                 "Root recorded-read tar exceeds its exact Source bundle ceiling")
+        view = memoryview(value)
+        while view:
+            self._check()
+            written = os.write(self.fd, view)
+            _require(written > 0,
+                     "Root recorded-read tar writer made no progress")
+            piece = view[:written]
+            self.digest.update(piece)
+            self.total += written
+            view = view[written:]
+        return len(value)
+
+    def tell(self) -> int:
+        return self.total
+
+    def flush(self) -> None:
+        self._check()
+
+
+class _RecordedReadTarObject:
+    def __init__(self, fd: int, expected_bytes: int, maximum: int,
+                 expected_sha256: str, deadline_ns: int,
+                 cancel_event: Any, label: str):
+        self.fd = fd
+        self.expected_bytes = expected_bytes
+        self.maximum = maximum
+        self.expected_sha256 = expected_sha256
+        self.deadline_ns = deadline_ns
+        self.cancel_event = cancel_event
+        self.label = label
+        self.total = 0
+        self.digest = hashlib.sha256()
+
+    def _check(self) -> None:
+        _require(time.monotonic_ns() < self.deadline_ns and
+                 (self.cancel_event is None or
+                  not self.cancel_event.is_set()),
+                 f"{self.label} Root tar copy exceeded or cancelled its window")
+
+    def read(self, size: int = -1) -> bytes:
+        self._check()
+        remaining = self.expected_bytes - self.total
+        if size < 0 or size > COPY_BLOCK_BYTES:
+            size = min(COPY_BLOCK_BYTES, remaining)
+        else:
+            size = min(size, remaining)
+        if size == 0:
+            return b""
+        output = bytearray()
+        while len(output) < size:
+            self._check()
+            block = os.read(self.fd, size - len(output))
+            _require(bool(block), f"{self.label} shortened during Root tar copy")
+            output.extend(block)
+        raw = bytes(output)
+        self.total += len(raw)
+        _require(self.total <= self.expected_bytes <= self.maximum,
+                 f"{self.label} exceeded its exact Source object bound")
+        self.digest.update(raw)
+        return raw
+
+    def verify_complete(self, before: os.stat_result,
+                        parent_fd: int, name: str) -> None:
+        _require(self.total == self.expected_bytes and
+                 self.digest.hexdigest() == self.expected_sha256 and
+                 os.read(self.fd, 1) == b"" and
+                 _info_key(before) == _info_key(os.fstat(self.fd)) ==
+                     _info_key(os.stat(name, dir_fd=parent_fd,
+                                       follow_symlinks=False)),
+                 f"{self.label} raw bytes or identity changed during Root tar copy")
+
+
+def _write_recorded_preparation_read_tar_v1(
+    legacy_request: object, signed_manifest: object,
+    source5_campaign_module: object, archive_source5_root: object,
+    output_path: object, maximum_response_bytes: int, *,
+    allocation_block_bytes: int,
+    deadline_ns: int, cancel_event=None,
+) -> dict[str, Any]:
+    """Stream only the exact signed objects into the unchanged H USTAR format."""
+    request = _exact(legacy_request, {
+        "schema", "campaign_id", "host_id", "analysis_phase",
+        "request_ordinal", "objects", "maximum_response_bytes",
+        "request_sha256",
+    }, "recorded-read legacy SourceH request")
+    manifest = _exact(signed_manifest, {
+        "schema", "campaign_id", "host_id", "phase", "job_index",
+        "job_ordinal", "job_sha256", "run_id", "job_record_raw_sha256",
+        "predecessor_ack_pin", "objects", "object_count", "payload_bytes",
+        "manifest_sha256",
+    }, "recorded-read freshly verified object manifest")
+    archive_root = Path(_absolute_path(
+        archive_source5_root, "recorded-read signed Source5 root",
+    ))
+    target = Path(_absolute_path(output_path,
+                                 "Root recorded-read bundle output path"))
+    member_name = getattr(source5_campaign_module,
+                          "_source5_archive_read_tar_member_name", None)
+    _require(callable(member_name) and
+             type(maximum_response_bytes) is int and
+             0 < maximum_response_bytes <= request["maximum_response_bytes"] and
+             request["schema"] == REQUEST_SCHEMA_V1 and
+             request["analysis_phase"] == "exploration" and
+             request["campaign_id"] == manifest["campaign_id"] and
+             request["host_id"] == manifest["host_id"] ==
+                 manifest["host_id"] and
+             type(request["request_ordinal"]) is int and
+             0 <= request["request_ordinal"] < (1 << 64) and
+             type(request["objects"]) is list and
+             request["objects"] == sorted(
+                 request["objects"], key=lambda row: row["origin_path"],
+             ) and
+             archive_root.name == "source5" and
+             target.parent.resolve(strict=True) == target.parent and
+             target.resolve(strict=False) == target and
+             target.name == "response.tar.incoming",
+             "Root recorded-read request, Source root, cap or output slot differs")
+    body = {key: value for key, value in manifest.items()
+            if key != "manifest_sha256"}
+    _require(manifest["schema"] == OBJECT_MANIFEST_SCHEMA_V1 and
+             type(manifest["objects"]) is list and
+             type(manifest["object_count"]) is int and
+             manifest["object_count"] == len(manifest["objects"]) and
+             manifest["manifest_sha256"] == _sha(_canonical(body)) and
+             request["request_sha256"] == _sha(_canonical({
+                 key: value for key, value in request.items()
+                 if key != "request_sha256"
+             })) and
+             request["objects"] == [{
+                 "owner_job_sha256": manifest["job_sha256"],
+                 "origin_path": row["origin_path"],
+                 "raw_sha256": row["raw_sha256"],
+                 "byte_count": row["byte_count"],
+             } for row in manifest["objects"]],
+             "Root read request is not the exact ordered signed-manifest object set")
+    expected_tar_bytes = ((sum(
+        512 + ((row["byte_count"] + 511) // 512) * 512
+        for row in request["objects"]
+    ) + 1024 + MIN_ARCHIVE_READ_BUNDLE_BYTES - 1) //
+        MIN_ARCHIVE_READ_BUNDLE_BYTES) * MIN_ARCHIVE_READ_BUNDLE_BYTES
+    _require(0 < expected_tar_bytes <= maximum_response_bytes,
+             "Root deterministic USTAR exceeds its exact per-window cap")
+    parent_fd = _open_dir_path(target.parent,
+                               "Root recorded-read incoming parent",
+                               private_final=True)
+    output_fd = -1
+    created_identity = None
+    input_fds: list[tuple[int, int, str, str, _RecordedReadTarObject]] = []
+    try:
+        try:
+            output_fd = os.open(
+                target.name, os.O_WRONLY | os.O_CREAT | os.O_EXCL |
+                _O_CLOEXEC | _O_NOFOLLOW, 0o600, dir_fd=parent_fd,
+            )
+        except FileExistsError as error:
+            raise EvidenceArchiveError(
+                "Root recorded-read incoming bundle slot already exists",
+            ) from error
+        os.fchmod(output_fd, 0o600)
+        output_before = os.fstat(output_fd)
+        created_identity = (output_before.st_dev, output_before.st_ino,
+                            output_before.st_mode, output_before.st_uid)
+        writer = _RecordedReadTarOutput(
+            output_fd, maximum_response_bytes, deadline_ns, cancel_event,
+        )
+        manifest_rows = manifest["objects"]
+        _require(type(manifest_rows) is list and
+                 len(manifest_rows) == manifest["object_count"] and
+                 type(request["objects"]) is list and
+                 0 < len(manifest_rows) <= MAX_ARCHIVE_READ_OBJECTS,
+                 "Root signed manifest object count differs from the request")
+        with tarfile.open(fileobj=writer, mode="w|",
+                          format=tarfile.USTAR_FORMAT) as archive:
+            for position, (request_row, manifest_row) in enumerate(zip(
+                    request["objects"], manifest_rows, strict=True)):
+                _require(cancel_event is None or not cancel_event.is_set(),
+                         "Root recorded-read tar materialization was cancelled")
+                obj = _exact(manifest_row, {
+                    "origin_path", "role", "object_id", "byte_count",
+                    "raw_sha256", "semantic_sha256", "object_pin",
+                }, f"Root signed manifest object[{position}]")
+                origin = _absolute_path(obj["origin_path"],
+                                        f"Root signed origin[{position}]")
+                raw_sha = _digest(obj["raw_sha256"],
+                                  f"Root signed raw digest[{position}]")
+                object_count = _uint(obj["byte_count"],
+                                     f"Root signed byte count[{position}]")
+                object_id = _object_identity(origin, raw_sha)
+                object_pin = _exact(obj["object_pin"], {
+                    "path", "raw_sha256", "semantic_sha256", "byte_count",
+                }, f"Root signed store pin[{position}]")
+                expected_path = archive_root / "objects" / object_id
+                _require(obj["object_id"] == object_id and
+                         object_pin == {
+                             "path": str(expected_path),
+                             "raw_sha256": raw_sha,
+                             "semantic_sha256": raw_sha,
+                             "byte_count": object_count,
+                         } and request_row == {
+                             "owner_job_sha256": manifest["job_sha256"],
+                             "origin_path": origin, "raw_sha256": raw_sha,
+                             "byte_count": object_count,
+                         },
+                         f"Root object[{position}] escaped its signed path/hash/count")
+                _read_object_pin(object_pin, object_count)
+                object_path = Path(object_pin["path"])
+                object_parent_fd = _open_dir_path(
+                    object_path.parent,
+                    f"Root object store parent[{position}]",
+                    private_final=True,
+                )
+                object_fd = -1
+                try:
+                    before_path = os.stat(object_path.name,
+                                          dir_fd=object_parent_fd,
+                                          follow_symlinks=False)
+                    _require(stat.S_ISREG(before_path.st_mode) and
+                             before_path.st_uid == os.getuid() and
+                             stat.S_IMODE(before_path.st_mode) == 0o600 and
+                             before_path.st_nlink == 1 and
+                             before_path.st_size == object_count <= MAX_OBJECT_BYTES,
+                             f"Root object[{position}] is not its exact private object file")
+                    object_fd = os.open(
+                        object_path.name, os.O_RDONLY | _O_CLOEXEC |
+                        _O_NOFOLLOW | _O_NONBLOCK, dir_fd=object_parent_fd,
+                    )
+                    before = os.fstat(object_fd)
+                    _require(_info_key(before) == _info_key(before_path),
+                             f"Root object[{position}] changed identity before tar copy")
+                    stream = _RecordedReadTarObject(
+                        object_fd, object_count, MAX_OBJECT_BYTES, raw_sha,
+                        deadline_ns, cancel_event,
+                        f"Root signed object[{position}]",
+                    )
+                    name = member_name(request_row)
+                    _require(type(name) is str and name.startswith("objects/") and
+                             len(name.encode("ascii", "strict")) <= 255 and
+                             ".." not in PurePosixPath(name).parts and
+                             "\\" not in name,
+                             f"Root tar object[{position}] name exceeds exact USTAR path")
+                    info = tarfile.TarInfo(name)
+                    info.size = object_count
+                    info.mode = 0o600
+                    info.uid = 0
+                    info.gid = 0
+                    info.uname = ""
+                    info.gname = ""
+                    info.mtime = 0
+                    info.type = tarfile.REGTYPE
+                    info.linkname = ""
+                    info.pax_headers = {}
+                    archive.addfile(info, stream)
+                    stream.verify_complete(before, object_parent_fd,
+                                           object_path.name)
+                    input_fds.append((object_fd, object_parent_fd,
+                                      object_path.name, raw_sha, stream))
+                    object_fd = -1
+                    object_parent_fd = -1
+                finally:
+                    if object_fd >= 0:
+                        os.close(object_fd)
+                    if object_parent_fd >= 0:
+                        os.close(object_parent_fd)
+        writer.flush()
+        os.fsync(output_fd)
+        output_after = os.fstat(output_fd)
+        output_path_info = os.stat(target.name, dir_fd=parent_fd,
+                                   follow_symlinks=False)
+        _require(created_identity == (output_after.st_dev, output_after.st_ino,
+                                      output_after.st_mode, output_after.st_uid) and
+                 _info_key(output_after) == _info_key(output_path_info) and
+                 stat.S_ISREG(output_after.st_mode) and
+                 output_after.st_uid == os.getuid() and
+                 stat.S_IMODE(output_after.st_mode) == 0o600 and
+                 output_after.st_nlink == 1 and
+                 output_after.st_size == writer.total == expected_tar_bytes and
+                 writer.total <= maximum_response_bytes and
+                 output_after.st_blocks * 512 <=
+                    ((maximum_response_bytes + allocation_block_bytes - 1) //
+                     allocation_block_bytes) * allocation_block_bytes,
+                 "Root recorded-read USTAR output changed or exceeds its exact bound")
+        os.fsync(parent_fd)
+        return {"path": str(target), "raw_sha256": writer.digest.hexdigest(),
+                "byte_count": writer.total}
+    except BaseException:
+        if output_fd >= 0:
+            try:
+                current = os.stat(target.name, dir_fd=parent_fd,
+                                  follow_symlinks=False)
+                if (created_identity is not None and
+                        (current.st_dev, current.st_ino, current.st_mode,
+                         current.st_uid) == created_identity and
+                        stat.S_ISREG(current.st_mode) and current.st_nlink == 1):
+                    os.unlink(target.name, dir_fd=parent_fd)
+                    os.fsync(parent_fd)
+            except FileNotFoundError:
+                pass
+        raise
+    finally:
+        if output_fd >= 0:
+            os.close(output_fd)
+        try:
+            for object_fd, object_parent_fd, object_name, expected_sha, stream in input_fds:
+                try:
+                    current = os.stat(object_name, dir_fd=object_parent_fd,
+                                      follow_symlinks=False)
+                    _require(stat.S_ISREG(current.st_mode) and
+                             current.st_nlink == 1 and
+                             _hash_fd_exact(
+                                 object_fd, stream.expected_bytes,
+                                 stream.maximum,
+                                 "Root tar source object after copy",
+                                 deadline_ns=deadline_ns,
+                                 cancel_event=cancel_event,
+                             ) == expected_sha and
+                             _info_key(current) == _info_key(os.stat(
+                                 object_name, dir_fd=object_parent_fd,
+                                 follow_symlinks=False,
+                             )),
+                             "Root source object changed after tar materialization")
+                finally:
+                    os.close(object_fd)
+                    os.close(object_parent_fd)
+        finally:
+            os.close(parent_fd)
+
+
 def _validate_stage_map(value: object, checkpoint: dict[str, Any],
                         manifest: dict[str, Any]) -> dict[str, Any]:
     stage_map = _exact(value, {
@@ -8085,6 +11707,11 @@ def _verify_signed_ack_metadata(
     budget_catalogue_cache_root: str | None = None,
     captured_keyring_reader=None,
     captured_preparatory_artifact_reader=None,
+    captured_gpgv_reader=None,
+    root_auxiliary_resource_declaration: object | None = None,
+    maximum_io_window_seconds: int | None = None,
+    recorded_deadline_ns: int | None = None,
+    cancel_event=None,
 ) -> dict[str, Any]:
     """Verify one persisted signed ACK and its complete metadata signature closure.
 
@@ -8107,6 +11734,27 @@ def _verify_signed_ack_metadata(
                   budget_catalogue_map_raw, budget_catalogue_cache_root,
               ))),
              "captured preparatory bytes require a read-only closed keyring and no physical map")
+    _require(captured_gpgv_reader is None or
+             (purpose == "read" and callable(captured_gpgv_reader) and
+              callable(captured_keyring_reader) and
+              callable(captured_preparatory_artifact_reader) and
+              type(root_auxiliary_resource_declaration) is dict and
+              type(maximum_io_window_seconds) is int and
+              maximum_io_window_seconds > 0),
+             "captured GPGV bytes require the named bounded recorded-read route")
+    _require((root_auxiliary_resource_declaration is None) ==
+             (captured_gpgv_reader is None) and
+             (maximum_io_window_seconds is None) ==
+             (captured_gpgv_reader is None) and
+             (recorded_deadline_ns is None or
+              captured_gpgv_reader is not None and
+              type(recorded_deadline_ns) is int and
+              recorded_deadline_ns > 0) and
+             (cancel_event is None or callable(getattr(cancel_event, "is_set", None))),
+             "recorded-read GPG resource arguments are incomplete or malformed")
+    recorded_operation_started_ns = (
+        time.monotonic_ns() if captured_gpgv_reader is not None else None
+    )
     checked_checkpoint = _validate_checkpoint(checkpoint)
     context = checked_checkpoint["context"]
     check_pin = _pin(
@@ -8404,7 +12052,23 @@ def _verify_signed_ack_metadata(
         "keyring_pin": signer["keyring_pin"],
         "gpgv_pin": signer["gpgv_pin"],
     }
-    if captured_keyring_reader is None:
+    if captured_gpgv_reader is not None:
+        _require(type(recorded_operation_started_ns) is int,
+                 "recorded-read GPG monotonic start is absent")
+        primary = _verify_detached_signature_recorded(
+            ack_raw, signature_raw, verification_signer,
+            captured_keyring_reader=captured_keyring_reader,
+            captured_gpgv_reader=captured_gpgv_reader,
+            root_auxiliary_resource_declaration=
+                root_auxiliary_resource_declaration,
+            operation_started_ns=recorded_operation_started_ns,
+            window_deadline_ns=(recorded_deadline_ns
+                                if recorded_deadline_ns is not None else
+                                recorded_operation_started_ns +
+                                maximum_io_window_seconds * 1_000_000_000),
+            cancel_event=cancel_event,
+        )
+    elif captured_keyring_reader is None:
         primary = _verify_detached_signature(ack_raw, signature_raw, verification_signer)
     else:
         primary = _verify_detached_signature(
@@ -8555,6 +12219,69 @@ def verify_signed_ack_for_read(
         budget_catalogue_cache_root=budget_catalogue_cache_root,
         captured_keyring_reader=captured_keyring_reader,
         captured_preparatory_artifact_reader=captured_preparatory_artifact_reader,
+    )
+
+
+def verify_signed_ack_for_recorded_read_v1(
+    checkpoint_pin: object, checkpoint: object, checkpoint_raw: bytes,
+    request_raw: bytes, host_budget_raw: bytes,
+    job_record_pin: object, job_record_bytes: bytes, plan_bytes: bytes,
+    object_manifest_pin: object, object_manifest: object, manifest_raw: bytes,
+    ack_pin: object, ack: object, ack_raw: bytes,
+    signature_pin: object, signature_raw: bytes,
+    signer_context_pin: object, signer_context_raw: bytes,
+    execution_manifest_pin: object, execution_manifest_raw: bytes,
+    *, expected_ack_pin: object, expected_run_id: str,
+    journal_width_contract_raw: bytes,
+    source_manifest_raw: bytes,
+    captured_keyring_reader,
+    captured_gpgv_reader,
+    captured_preparatory_artifact_reader,
+    root_auxiliary_resource_declaration: object,
+    maximum_io_window_seconds: int,
+    recorded_deadline_ns: int | None = None,
+    cancel_event=None,
+) -> dict[str, Any]:
+    """Freshly verify one recorded-window ACK with exact captured Source tools.
+
+    This named read-only sibling leaves the legacy v1 disk verifier unchanged.
+    Its closed readers are byte sources created inside the Root service from
+    the exact metadata-capture declaration. The captured GPGV bytes are copied
+    into a private, explicitly reserved per-window tool directory and executed
+    there; no historical executable path fallback is permitted.
+    """
+    _require(type(journal_width_contract_raw) is bytes and
+             type(source_manifest_raw) is bytes and
+             callable(captured_keyring_reader) and
+             callable(captured_gpgv_reader) and
+             callable(captured_preparatory_artifact_reader) and
+             type(maximum_io_window_seconds) is int and
+             0 < maximum_io_window_seconds <= 300 and
+             (recorded_deadline_ns is None or
+              type(recorded_deadline_ns) is int and
+              time.monotonic_ns() < recorded_deadline_ns) and
+             type(root_auxiliary_resource_declaration) is dict,
+             "recorded-read signed ACK verification lacks exact closed inputs or finite Root GPG resources")
+    return _verify_signed_ack_metadata(
+        checkpoint_pin, checkpoint, checkpoint_raw, request_raw,
+        host_budget_raw, job_record_pin, job_record_bytes, plan_bytes,
+        object_manifest_pin, object_manifest, manifest_raw,
+        ack_pin, ack, ack_raw, signature_pin, signature_raw,
+        signer_context_pin, signer_context_raw,
+        execution_manifest_pin, execution_manifest_raw,
+        expected_ack_pin=expected_ack_pin, expected_run_id=expected_run_id,
+        successor_run_id=None, purpose="read",
+        journal_width_contract_raw=journal_width_contract_raw,
+        source_manifest_raw=source_manifest_raw,
+        captured_keyring_reader=captured_keyring_reader,
+        captured_preparatory_artifact_reader=
+            captured_preparatory_artifact_reader,
+        captured_gpgv_reader=captured_gpgv_reader,
+        root_auxiliary_resource_declaration=
+            root_auxiliary_resource_declaration,
+        maximum_io_window_seconds=maximum_io_window_seconds,
+        recorded_deadline_ns=recorded_deadline_ns,
+        cancel_event=cancel_event,
     )
 
 

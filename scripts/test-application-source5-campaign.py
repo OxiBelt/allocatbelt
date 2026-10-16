@@ -3589,6 +3589,65 @@ class Source5ArchiveReadApiTests(unittest.TestCase):
         return (request, request_raw, request_pin, response, response_raw,
                 response_pin, bundle_path, stage_root, manifest, objects)
 
+    def test_mutable_directory_identity_keeps_inode_type_mode_and_owner(self) -> None:
+        controller = self.controller
+        with tempfile.TemporaryDirectory(prefix="source5-recorded-directory-") as temp:
+            root = Path(temp) / "scratch"
+            root.mkdir(mode=0o700)
+            before = root.lstat()
+            (root / "child").mkdir(mode=0o700)
+            os.utime(root, ns=(before.st_atime_ns, before.st_mtime_ns + 1_000_000_000))
+            after = root.lstat()
+            self.assertFalse(controller._source5_same_file_identity(before, after))
+            self.assertTrue(controller._source5_same_directory_identity(before, after))
+            root.chmod(0o755)
+            self.assertFalse(controller._source5_same_directory_identity(before, root.lstat()))
+            root.chmod(0o700)
+            retained = root.with_name("retained")
+            root.rename(retained)
+            root.mkdir(mode=0o700)
+            self.assertFalse(controller._source5_same_directory_identity(before, root.lstat()))
+            root.rmdir()
+            root.symlink_to(retained, target_is_directory=True)
+            self.assertFalse(controller._source5_same_directory_identity(before, root.lstat()))
+            root.unlink()
+
+    def test_recorded_wait_accepts_owned_publication_between_stat_and_open(self) -> None:
+        controller = self.controller
+        with tempfile.TemporaryDirectory(prefix="source5-recorded-open-race-") as temp:
+            root = Path(temp)
+            root.chmod(0o700)
+            (root / "stage").mkdir(mode=0o700)
+            (root / "request.json").write_bytes(b"request")
+            (root / "request.json").chmod(0o600)
+            space = os.statvfs(root)
+            block = space.f_frsize or space.f_bsize
+            original_open = controller.os.open
+            published = []
+
+            def publish_before_directory_open(path, flags, *args, **kwargs):
+                if path == root and flags & os.O_DIRECTORY:
+                    self.assertEqual(published, [])
+                    previous = root.lstat()
+                    for name in ("response.json", "response.tar"):
+                        (root / name).write_bytes(b"published")
+                        (root / name).chmod(0o600)
+                    os.utime(root, ns=(previous.st_atime_ns,
+                                       previous.st_mtime_ns + 1_000_000_000))
+                    published.append(True)
+                return original_open(path, flags, *args, **kwargs)
+
+            with patch.object(controller.os, "open", side_effect=publish_before_directory_open):
+                controller._source5_wait_for_recorded_read_publication(
+                    root, "request.json", "response.json.incoming",
+                    "response.json", "response.tar.incoming", "response.tar",
+                    stage_name="stage", request_maximum_bytes=64,
+                    response_maximum_bytes=64, bundle_maximum_bytes=64,
+                    device_id=root.stat().st_dev, allocation_block_bytes=block,
+                    deadline_ns=time.monotonic_ns() + 3_000_000_000,
+                )
+            self.assertEqual(published, [True])
+
     def test_read_schedule_adds_one_trace_window_per_original_open_loop_job(self) -> None:
         controller = self.controller
         phases = {
@@ -3723,6 +3782,125 @@ class Source5ArchiveReadApiTests(unittest.TestCase):
                 )
             self.assertFalse((root / "response.json").exists())
             self.assertFalse((root / "response.tar").exists())
+
+    def test_recorded_read_wait_tolerates_both_incoming_orders_and_paused_renames(self) -> None:
+        controller = self.controller
+        for first, second in (("response", "bundle"), ("bundle", "response")):
+            with self.subTest(first=first), tempfile.TemporaryDirectory(
+                    prefix="source5-recorded-read-publish-order-") as temp:
+                root = Path(temp)
+                os.chmod(root, 0o700)
+                names = {
+                    "request": "request.json",
+                    "response_incoming": "response.json.incoming",
+                    "response": "response.json",
+                    "bundle_incoming": "response.tar.incoming",
+                    "bundle": "response.tar",
+                }
+                stage = root / "stage"
+                stage.mkdir(mode=0o700)
+                (root / names["request"]).write_bytes(b"exact request")
+                (root / names["request"]).chmod(0o600)
+                space = os.statvfs(root)
+                block = space.f_frsize or space.f_bsize
+                deadline = time.monotonic_ns() + 3_000_000_000
+                completed = threading.Event()
+                errors = []
+
+                def wait_for_pair() -> None:
+                    try:
+                        controller._source5_wait_for_recorded_read_publication(
+                            root, names["request"],
+                            names["response_incoming"], names["response"],
+                            names["bundle_incoming"], names["bundle"],
+                            stage_name=stage.name,
+                            request_maximum_bytes=64,
+                            response_maximum_bytes=64,
+                            bundle_maximum_bytes=64,
+                            device_id=root.stat().st_dev,
+                            allocation_block_bytes=block,
+                            deadline_ns=deadline,
+                        )
+                        completed.set()
+                    except BaseException as error:
+                        errors.append(error)
+                        completed.set()
+
+                waiter = threading.Thread(target=wait_for_pair)
+                waiter.start()
+                first_incoming = names[f"{first}_incoming"]
+                first_final = names[first]
+                (root / first_incoming).write_bytes((first + " bytes").encode())
+                (root / first_incoming).chmod(0o600)
+                time.sleep(0.04)
+                self.assertFalse(completed.is_set())
+                (root / first_incoming).rename(root / first_final)
+                time.sleep(0.04)
+                self.assertFalse(completed.is_set())
+                second_incoming = names[f"{second}_incoming"]
+                second_final = names[second]
+                (root / second_incoming).write_bytes((second + " bytes").encode())
+                (root / second_incoming).chmod(0o600)
+                time.sleep(0.04)
+                self.assertFalse(completed.is_set())
+                (root / second_incoming).rename(root / second_final)
+                waiter.join(timeout=2)
+                self.assertFalse(waiter.is_alive())
+                self.assertEqual(errors, [])
+                self.assertTrue(completed.is_set())
+                self.assertTrue((root / names["response"]).is_file())
+                self.assertTrue((root / names["bundle"]).is_file())
+
+    def test_recorded_read_wait_rejects_symlink_oversize_cancel_and_deadline(self) -> None:
+        controller = self.controller
+        for failure in ("symlink", "oversize", "cancelled", "deadline",
+                        "stage_symlink", "stage_nonempty", "stage_mode"):
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory(
+                    prefix="source5-recorded-read-publish-reject-") as temp:
+                root = Path(temp)
+                os.chmod(root, 0o700)
+                request = root / "request.json"
+                request.write_bytes(b"request")
+                request.chmod(0o600)
+                response_incoming = root / "response.json.incoming"
+                stage = root / "stage"
+                if failure == "stage_symlink":
+                    external_stage = Path(temp) / "external-stage"
+                    external_stage.mkdir(mode=0o700)
+                    stage.symlink_to(external_stage, target_is_directory=True)
+                else:
+                    stage.mkdir(mode=0o700)
+                    if failure == "stage_nonempty":
+                        (stage / "unexpected").write_bytes(b"unexpected")
+                    elif failure == "stage_mode":
+                        stage.chmod(0o755)
+                cancelled = threading.Event()
+                deadline = time.monotonic_ns() + 1_000_000_000
+                if failure == "symlink":
+                    external = Path(temp) / "external.bin"
+                    external.write_bytes(b"response")
+                    external.chmod(0o600)
+                    response_incoming.symlink_to(external)
+                elif failure == "oversize":
+                    response_incoming.write_bytes(b"x" * 65)
+                    response_incoming.chmod(0o600)
+                elif failure == "cancelled":
+                    cancelled.set()
+                else:
+                    deadline = time.monotonic_ns() - 1
+                space = os.statvfs(root)
+                block = space.f_frsize or space.f_bsize
+                with self.assertRaises(controller.Source5CampaignError):
+                    controller._source5_wait_for_recorded_read_publication(
+                        root, request.name, response_incoming.name,
+                        "response.json", "response.tar.incoming",
+                        "response.tar", request_maximum_bytes=64,
+                        stage_name=stage.name,
+                        response_maximum_bytes=64, bundle_maximum_bytes=64,
+                        device_id=root.stat().st_dev,
+                        allocation_block_bytes=block, deadline_ns=deadline,
+                        cancel_event=cancelled,
+                    )
 
     def test_read_control_schedule_and_append_only_chain_replay_exact_plan_row(self) -> None:
         controller = self.controller
@@ -4088,6 +4266,41 @@ class Source5ArchiveReadApiTests(unittest.TestCase):
             self.assertEqual(maximum_active, 1)
             self.assertEqual(active, 0)
             self.assertEqual(ledger.read_bytes(), ledger_before)
+
+    def test_recorded_read_provider_lease_rejects_nested_and_competing_opens(self) -> None:
+        controller = self.controller
+        lock = threading.Lock()
+        deadline = time.monotonic_ns() + 1_000_000_000
+        competitor_done = threading.Event()
+        competitor_errors = []
+        started = time.monotonic()
+        with controller._source5_recorded_read_provider_lease(
+                lock, None, deadline):
+            with self.assertRaises(controller.Source5CampaignError):
+                with controller._source5_recorded_read_provider_lease(
+                        lock, None, deadline):
+                    self.fail("nested recorded-read lease unexpectedly entered")
+
+            def competing_open() -> None:
+                try:
+                    with controller._source5_recorded_read_provider_lease(
+                            lock, None, deadline):
+                        competitor_errors.append(
+                            "competing recorded-read lease unexpectedly entered",
+                        )
+                except controller.Source5CampaignError:
+                    pass
+                finally:
+                    competitor_done.set()
+
+            worker = threading.Thread(target=competing_open)
+            worker.start()
+            self.assertTrue(competitor_done.wait(timeout=0.5))
+            worker.join(timeout=0.5)
+            self.assertFalse(worker.is_alive())
+        self.assertEqual(competitor_errors, [])
+        self.assertLess(time.monotonic() - started, 0.5)
+        self.assertFalse(lock.locked())
 
     def test_completed_read_view_revalidates_without_appending_a_new_ordinal(self) -> None:
         tree = ast.parse(CONTROLLER_PATH.read_bytes(), filename=str(CONTROLLER_PATH))
