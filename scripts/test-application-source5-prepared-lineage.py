@@ -1023,6 +1023,47 @@ def producer_shaped_initial_context_case():
     }
 
 
+class CapturedReaderPinContractTests(unittest.TestCase):
+    def test_semantic_document_pin_reaches_exact_raw_reader(self) -> None:
+        raw = lineage.canonical_bytes({"schema": "captured-document-component"})
+        pin = {
+            "path": "/absent-origin/initial-spec.json",
+            "raw_sha256": lineage.sha256_bytes(raw),
+            "semantic_sha256": "e" * 64,
+        }
+        original_pin = dict(pin)
+        reads = []
+
+        def closed_reader(raw_pin, maximum):
+            self.assertEqual(set(raw_pin), {"path", "raw_sha256"})
+            self.assertEqual(raw_pin["path"], pin["path"])
+            self.assertEqual(raw_pin["raw_sha256"], lineage.sha256_bytes(raw))
+            reads.append((dict(raw_pin), maximum))
+            return raw
+
+        self.assertEqual(
+            lineage._reader_bytes(closed_reader, pin, len(raw), "captured Spec"),
+            raw,
+        )
+        self.assertEqual(pin, original_pin)
+        self.assertEqual(len(reads), 1)
+
+    def test_raw_projection_preserves_digest_and_byte_bounds(self) -> None:
+        raw = b"captured bytes\n"
+        pin = {
+            "path": "/absent-origin/metadata.json",
+            "raw_sha256": lineage.sha256_bytes(raw),
+            "semantic_sha256": "e" * 64,
+        }
+        for changed_raw, maximum in ((raw + b"changed", 128), (raw, len(raw) - 1)):
+            with self.subTest(raw=changed_raw, maximum=maximum):
+                with self.assertRaises(lineage.PreparedExplorationLineageError):
+                    lineage._reader_bytes(
+                        lambda _pin, _maximum: changed_raw,
+                        pin, maximum, "captured metadata",
+                    )
+
+
 class PreparedLineageProjectionTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:

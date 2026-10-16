@@ -660,7 +660,12 @@ def _reader_bytes(
     maximum: int, label: str,
 ) -> bytes:
     require(callable(artifact_reader), "lineage artifact reader is not callable")
-    raw = artifact_reader(dict(pin), maximum)
+    # Semantic pins belong to the document verifier. The captured-byte reader
+    # accepts only the exact origin path and raw digest, even when its caller
+    # also carries a separately checked semantic digest.
+    raw = artifact_reader({
+        "path": pin["path"], "raw_sha256": pin["raw_sha256"],
+    }, maximum)
     require(type(raw) is bytes and 0 < len(raw) <= maximum and
             sha256_bytes(raw) == pin["raw_sha256"],
             f"{label} reader bytes differ from their exact bounded raw pin")
