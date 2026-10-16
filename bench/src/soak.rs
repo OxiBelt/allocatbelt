@@ -412,6 +412,22 @@ fn mark_finalizer_phase(
 }
 
 #[cfg(feature = "resource-feedback")]
+fn feedback_owner_release_instant(
+  finalizer: Option<&SoakTraceFinalizer>,
+) -> Result<Option<Instant>, String> {
+  finalizer
+    .map(|finalizer| finalizer.owner_release_instant_after_anchor())
+    .transpose()
+}
+
+#[cfg(not(feature = "resource-feedback"))]
+fn feedback_owner_release_instant(
+  _finalizer: Option<&SoakTraceFinalizer>,
+) -> Result<Option<Instant>, String> {
+  Ok(None)
+}
+
+#[cfg(feature = "resource-feedback")]
 fn finish_feedback_finalizer(
   finalizer: Option<SoakTraceFinalizer>,
   at: Option<Instant>,
@@ -2146,7 +2162,11 @@ fn run_soak(args: SoakArgs, identity: SoakIdentity) -> Result<(), String> {
       Some(rss_after_shutdown),
     )?;
   }
-  let postprocess_at = args.comparison_mode.feedback_enabled().then(Instant::now);
+  let postprocess_at = if args.comparison_mode.feedback_enabled() {
+    feedback_owner_release_instant(session.feedback_finalizer.as_ref())?
+  } else {
+    None
+  };
   if let Some(bounds) =
     finish_feedback_finalizer(session.feedback_finalizer.take(), postprocess_at)?
   {

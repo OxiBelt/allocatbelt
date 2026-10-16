@@ -634,12 +634,62 @@ impl FeedbackTraceFinalizer {
     self.finish_inner(None).map(|_| ())
   }
 
+  /// Captures a caller-owned owner-release Instant only after it is ordered
+  /// beyond the post-shutdown RSS bracket. Call this before taking an
+  /// explicit release timestamp for `finish_at`.
+  pub(crate) fn owner_release_instant_after_anchor(&self) -> Result<Instant, String> {
+    self
+      .release_instant_after_anchor()
+      .map_err(TraceFailure::description)
+  }
+
+  fn release_instant_after_anchor(&self) -> Result<Instant, TraceFailure> {
+    let owner = self.owner.as_ref().ok_or(TraceFailure::Phase)?;
+    let output = self.output.as_ref().ok_or(TraceFailure::Phase)?;
+    let rss_after_shutdown = owner
+      .state
+      .phases
+      .lock()
+      .unwrap_or_else(PoisonError::into_inner)[FeedbackTracePhase::RssAfterShutdown as usize]
+      .ok_or(TraceFailure::Phase)?;
+    let now = Instant::now();
+    if now.checked_duration_since(rss_after_shutdown.at).is_none() {
+      return Err(TraceFailure::Phase);
+    }
+    let anchor_width_ns = output
+      .clock
+      .upper_ns
+      .checked_sub(output.clock.lower_ns)
+      .ok_or(TraceFailure::Clock)?;
+    let anchor_width_ns = u64::try_from(anchor_width_ns).map_err(|_| TraceFailure::Clock)?;
+    let release_not_before = rss_after_shutdown
+      .at
+      .checked_add(Duration::from_nanos(anchor_width_ns))
+      .ok_or(TraceFailure::Clock)?;
+
+    // TraceClock bounds its anchor width to 50 ms. The RSS marker is already
+    // in the past, so this sleep is finite and no longer than that width.
+    loop {
+      let remaining = release_not_before.saturating_duration_since(Instant::now());
+      if remaining.is_zero() {
+        break;
+      }
+      thread::sleep(remaining);
+    }
+    Ok(Instant::now())
+  }
+
   fn finish_inner(mut self, release_at: Option<Instant>) -> Result<Option<(u128, u128)>, String> {
     let owner = self
       .owner
       .as_ref()
       .ok_or_else(|| "feedback trace owner is missing".to_owned())?;
-    let at = release_at.unwrap_or_else(Instant::now);
+    let at = match release_at {
+      Some(at) => at,
+      None => self
+        .release_instant_after_anchor()
+        .map_err(TraceFailure::description)?,
+    };
     let bounds = release_at.map(|_| self.monotonic_bounds(at)).transpose()?;
     mark_phase_owner(
       owner,
@@ -1477,6 +1527,50 @@ mod tests {
     .expect("feedback trace collector")
   }
 
+  fn finalizer_after_shutdown(
+    runtime: &mut TestRuntime,
+    collector: FeedbackTraceCollector,
+  ) -> FeedbackTraceFinalizer {
+    let rss_before_at = Instant::now();
+    collector
+      .mark_phase(
+        FeedbackTracePhase::RssBefore,
+        rss_before_at,
+        Some(rss_marker()),
+      )
+      .unwrap();
+    collector
+      .mark_phase(FeedbackTracePhase::ProductionStart, Instant::now(), None)
+      .unwrap();
+    runtime.wait_for_samples(3);
+    collector
+      .mark_phase(FeedbackTracePhase::ProductionEnd, Instant::now(), None)
+      .unwrap();
+    collector
+      .mark_phase(FeedbackTracePhase::DrainEnd, Instant::now(), None)
+      .unwrap();
+    collector
+      .mark_phase(
+        FeedbackTracePhase::RssAfterDrain,
+        Instant::now(),
+        Some(rss_marker()),
+      )
+      .unwrap();
+    runtime.stop();
+    collector
+      .mark_phase(FeedbackTracePhase::ShutdownEnd, Instant::now(), None)
+      .unwrap();
+    collector.stop_for_finalization().unwrap()
+  }
+
+  fn widen_test_anchor(finalizer: &mut FeedbackTraceFinalizer, width: Duration) {
+    let clock = &mut finalizer.output.as_mut().expect("finalizer output").clock;
+    clock.upper_ns = clock
+      .lower_ns
+      .checked_add(width.as_nanos())
+      .expect("wide test anchor fits the monotonic clock range");
+  }
+
   fn manifest_artifact_hash<'a>(manifest: &'a str, file: &str) -> &'a str {
     manifest
       .lines()
@@ -1738,6 +1832,85 @@ mod tests {
     assert_ne!(
       manifest_artifact_hash(&manifest, "feedback-events.jsonl").as_bytes(),
       &sha256(&tampered_bytes)
+    );
+  }
+
+  #[test]
+  fn finish_waits_out_wide_anchor_before_emitting_owner_release() {
+    let mut runtime = TestRuntime::new(TRACE_HISTORY_CAPACITY);
+    let fixture = TraceFixture::new();
+    let collector = trace_collector(&fixture, &runtime);
+    let mut finalizer = finalizer_after_shutdown(&mut runtime, collector);
+    widen_test_anchor(&mut finalizer, Duration::from_millis(25));
+
+    let rss_after_shutdown = rss_marker();
+    let rss_after_shutdown_at = Instant::now();
+    let expected_rss_bounds = finalizer.monotonic_bounds(rss_after_shutdown_at).unwrap();
+    finalizer
+      .mark_phase(
+        FeedbackTracePhase::RssAfterShutdown,
+        rss_after_shutdown_at,
+        Some(rss_after_shutdown),
+      )
+      .unwrap();
+    finalizer.finish().unwrap();
+
+    let manifest = fs::read_to_string(fixture.0.join("feedback-trace-manifest.tsv"))
+      .expect("completed manifest");
+    let rss_bounds = manifest_phase_bounds(&manifest, "rss_after_shutdown");
+    let owner_release_bounds = manifest_phase_bounds(&manifest, "owner_release");
+    assert_eq!(rss_bounds, expected_rss_bounds);
+    assert!(rss_bounds.1 <= owner_release_bounds.0);
+    let phase_rows: Vec<_> = manifest
+      .lines()
+      .filter(|line| line.starts_with("phase\t"))
+      .collect();
+    let rss_row = phase_rows
+      .iter()
+      .position(|line| line.starts_with("phase\trss_after_shutdown\t"))
+      .expect("RSS-after-shutdown phase row");
+    let release_row = phase_rows
+      .iter()
+      .position(|line| line.starts_with("phase\towner_release\t"))
+      .expect("owner-release phase row");
+    assert!(rss_row < release_row);
+  }
+
+  #[test]
+  fn caller_release_capture_waits_before_preserving_explicit_finish_at() {
+    let mut runtime = TestRuntime::new(TRACE_HISTORY_CAPACITY);
+    let fixture = TraceFixture::new();
+    let collector = trace_collector(&fixture, &runtime);
+    let mut finalizer = finalizer_after_shutdown(&mut runtime, collector);
+    widen_test_anchor(&mut finalizer, Duration::from_millis(25));
+
+    let rss_after_shutdown = rss_marker();
+    let rss_after_shutdown_at = Instant::now();
+    let expected_rss_bounds = finalizer.monotonic_bounds(rss_after_shutdown_at).unwrap();
+    finalizer
+      .mark_phase(
+        FeedbackTracePhase::RssAfterShutdown,
+        rss_after_shutdown_at,
+        Some(rss_after_shutdown),
+      )
+      .unwrap();
+    let owner_release_at = finalizer.owner_release_instant_after_anchor().unwrap();
+    let expected_release_bounds = finalizer.monotonic_bounds(owner_release_at).unwrap();
+    assert!(expected_rss_bounds.1 <= expected_release_bounds.0);
+    assert_eq!(
+      finalizer.finish_at(owner_release_at).unwrap(),
+      expected_release_bounds,
+    );
+
+    let manifest = fs::read_to_string(fixture.0.join("feedback-trace-manifest.tsv"))
+      .expect("completed manifest");
+    assert_eq!(
+      manifest_phase_bounds(&manifest, "rss_after_shutdown"),
+      expected_rss_bounds,
+    );
+    assert_eq!(
+      manifest_phase_bounds(&manifest, "owner_release"),
+      expected_release_bounds,
     );
   }
 
