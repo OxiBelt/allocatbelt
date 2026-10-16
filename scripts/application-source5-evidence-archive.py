@@ -1218,9 +1218,10 @@ def _preparatory_original_pins(
 ) -> dict[str, Any]:
     """Reconstruct the non-cyclic prep input pins from the exact manifest."""
     hosts = manifest.get("hosts")
-    _require(type(hosts) is list and len(hosts) == 3 and
-             len(set(hosts)) == 3 and all(type(item) is str and item for item in hosts),
-             "preparatory manifest does not preserve the original three-host order")
+    _require(type(hosts) is list and len(hosts) in (2, 3) and
+             all(type(item) is str and item for item in hosts) and
+             len(set(hosts)) == len(hosts),
+             "preparatory manifest does not preserve a complete supported host order")
     original = _exact(manifest.get("original_inputs"), {
         "spec", "plan", "source_manifests", "campaign_artifacts_root",
     }, "preparatory original input map")
@@ -1269,7 +1270,7 @@ def _preparatory_original_pins(
         for host in hosts
     }
     modules_by_host = _exact(manifest.get("modules"), set(hosts),
-                             "preparatory original three-host module map")
+                             "preparatory original host module map")
     _require(type(modules_by_host[manifest["host_id"]]) is dict,
              "preparatory selected-host typed module map is malformed")
     typed_modules = {}
@@ -2538,8 +2539,9 @@ def _validate_execution_manifest_signer_context(
         hosts = manifest["hosts"]
         _require(manifest["campaign_id"] == context["campaign_id"] and
                  manifest["host_id"] == context["host_id"] and
-                 type(hosts) is list and len(hosts) == 3 and
-                 len(set(hosts)) == 3 and context["host_id"] in hosts and
+                 type(hosts) is list and len(hosts) in (2, 3) and
+                 all(type(host) is str and host for host in hosts) and
+                 len(set(hosts)) == len(hosts) and context["host_id"] in hosts and
                  manifest["scope"] == "preparatory_exploration" and
                  manifest["phase_order"] == ["exploration"] and
                  manifest["qualification_eligible"] is False and
@@ -2585,7 +2587,7 @@ def _validate_execution_manifest_signer_context(
     _require(manifest["schema"] ==
              "allocatbelt.application-source5-campaign-execution.v4" and
              manifest["campaign_id"] == context["campaign_id"] and
-             type(hosts) is list and bool(hosts) and
+             type(hosts) is list and len(hosts) in (2, 3) and
              all(type(host) is str and host for host in hosts) and
              len(hosts) == len(set(hosts)) and context["host_id"] in hosts and
              manifest["scope"] == "final_prepared_bounded" and

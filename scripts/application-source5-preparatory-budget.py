@@ -201,8 +201,9 @@ def execution_basis_projection(value: object) -> dict[str, Any]:
              manifest["phase_order"] == [PREPARATORY_PHASE] and
              manifest["qualification_eligible"] is False and
              type(manifest["host_id"]) is str and manifest["host_id"] and
-             type(manifest["hosts"]) is list and len(manifest["hosts"]) == 3 and
-             len(set(manifest["hosts"])) == 3 and
+             type(manifest["hosts"]) is list and len(manifest["hosts"]) in (2, 3) and
+             all(type(host_id) is str and host_id for host_id in manifest["hosts"]) and
+             len(set(manifest["hosts"])) == len(manifest["hosts"]) and
              manifest["host_id"] in manifest["hosts"],
              "preparatory execution identity/scope differs")
     host_id = manifest["host_id"]
@@ -635,6 +636,21 @@ def _capacity_pilot_expected_row(
              spec.get("schema") == "allocatbelt.application-campaign-spec.v3" and
              spec.get("rates") == [] and spec.get("oracles") == [],
              "capacity-pilot Spec bytes differ from the original empty-rate Spec pin")
+    host_count = campaign_module.qualification_host_count(spec)
+    hosts = spec.get("hosts")
+    _require(type(hosts) is list and len(hosts) == host_count and
+             all(type(item) is dict for item in hosts),
+             "capacity-pilot Spec host rows differ from its validated qualification profile")
+    spec_host_ids = [item.get("host_id") for item in hosts]
+    venues = [item.get("venue") for item in hosts]
+    _require(all(type(item) is str and item for item in spec_host_ids) and
+             len(set(spec_host_ids)) == host_count and
+             ((host_count == 2 and venues == ["kvm_guest", "kvm_guest"]) or
+              (host_count == 3 and venues.count("bare_metal") == 1 and
+               venues.count("kvm_guest") == 2)) and
+             host_id in spec_host_ids and
+             set(original["source_manifests"]) == set(spec_host_ids),
+             "capacity-pilot Spec profile/venues and exact original host pins differ")
     source = _canonical_object(source_manifest_raw,
                                "selected capacity-pilot SourceV5 bytes")
     source_pin = _exact(original["source_manifests"].get(host_id), {
@@ -771,7 +787,7 @@ def _validate_preparatory_raw_bindings(
     host = budget["host_id"]
     hosts = manifest["hosts"]
     _require(host == manifest["host_id"] and
-             type(hosts) is list and len(hosts) == 3 and
+             type(hosts) is list and len(hosts) in (2, 3) and
              type(source.get("manifest_sha256")) is str and
              _is_sha(source["manifest_sha256"]) and
              type(source.get("source")) is dict and

@@ -1,5 +1,10 @@
 # Source5 offline component replay
 
+The exact source cohort follows the frozen SpecV3 qualification profile:
+`two_kvm_hosts_v1` requires two KVM hosts, while an absent selector retains
+the legacy three-host matrix. Replay must verify every selected host; it
+cannot drop a host from an already frozen generation.
+
 The Source5 offline dispatcher accepts one closed host-journal request, its
 captured identity-mapped evidence store, and an exact original job-record pin.
 Before loading the captured chronology or component modules, it checks the

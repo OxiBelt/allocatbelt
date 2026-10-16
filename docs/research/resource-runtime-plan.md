@@ -119,12 +119,13 @@ rejections and late arrivals separately; failed admission is not completed
 work. Allocation-churn latency includes payload access and freeing, and is
 distinct from raw allocation/free latency and application response latency.
 
-Run the native campaign on two KVM guests and an available bare-metal venue,
-using native instruction execution on each machine. Prefer bare metal for new
-benchmark work while preserving the guest campaigns. Analyze each machine
-separately, do not pool measurements, and draw explicit conclusions for each
-venue. Docker and QEMU instruction emulation establish correctness, not
-performance.
+Run the current campaign on two KVM guests using native instruction execution
+and the explicit SpecV3 `qualification_profile: "two_kvm_hosts_v1"`. Analyze
+each guest separately, do not pool measurements, and limit conclusions to the
+measured KVM venues. Bare-metal qualification is outside the current campaign.
+Specs without this selector retain the historical contract of one bare-metal
+host and two KVM guests; their existing evidence is not retagged. Docker and
+QEMU instruction emulation establish correctness, not performance.
 Keep raw measurements, profiles, security findings and Miri logs in the private
 resources checkout. Public reports contain sanitized conclusions and
 reproducible configuration.
@@ -276,7 +277,7 @@ contiguous 1,000-arrival blocks, 50,000 draws and a frozen seed. Preserve failed
 and interrupted processes without replacement. Source or environment changes
 require new controls and a fresh confirmation campaign.
 
-The final mixed-load soak is **three hours on each of the three hosts**,
+The final mixed-load soak is **three hours on each of the two KVM hosts**,
 superseding the earlier 24-hour requirement. Require valid outputs, bounded
 usage, no unexplained process failures, zero final managed charges and no
 sustained RSS growth; final-hour median RSS must remain within 5% of the first

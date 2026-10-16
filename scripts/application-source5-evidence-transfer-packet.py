@@ -1910,8 +1910,9 @@ def _validate_archive_signer_context(
         hosts = execution["hosts"]
         _require(execution["campaign_id"] == context["campaign_id"] and
                  execution["host_id"] == context["host_id"] and
-                 type(hosts) is list and len(hosts) == 3 and
-                 len(set(hosts)) == 3 and context["host_id"] in hosts and
+                 type(hosts) is list and len(hosts) in (2, 3) and
+                 all(type(host) is str and host for host in hosts) and
+                 len(set(hosts)) == len(hosts) and context["host_id"] in hosts and
                  execution["scope"] == "preparatory_exploration" and
                  execution["phase_order"] == ["exploration"] and
                  execution["qualification_eligible"] is False and
@@ -1958,7 +1959,7 @@ def _validate_archive_signer_context(
     _require(execution["schema"] ==
              "allocatbelt.application-source5-campaign-execution.v4" and
              execution["campaign_id"] == context["campaign_id"] and
-             type(hosts) is list and bool(hosts) and
+             type(hosts) is list and len(hosts) in (2, 3) and
              all(type(host) is str and bool(host) for host in hosts) and
              len(hosts) == len(set(hosts)) and context["host_id"] in hosts and
              execution["scope"] == "final_prepared_bounded" and

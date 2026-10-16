@@ -473,13 +473,16 @@ def _verify_local_source_symlink_snapshots(
 def _validate_full_source_index_closure(
     request: dict[str, Any], index_rows: dict[str, dict[str, Any]],
     rows: dict[str, dict[str, Any]], selected_modules: dict[str, Any],
+    expected_host_ids: set[str],
 ) -> dict[str, tuple[int, ...]]:
     """Close every original Source.files/artifact row before compiling a module."""
     source_manifest_rows = [row for row in index_rows.values()
                             if row["role"] == "source_manifest"]
-    _require(len(source_manifest_rows) == 3 and
-             len({row["host_id"] for row in source_manifest_rows}) == 3,
-             "complete SourceV5 replay requires three unique indexed host manifests")
+    _require(type(expected_host_ids) is set and len(expected_host_ids) in (2, 3) and
+             all(type(host_id) is str and host_id for host_id in expected_host_ids) and
+             len(source_manifest_rows) == len(expected_host_ids) and
+             {row["host_id"] for row in source_manifest_rows} == expected_host_ids,
+             "complete SourceV5 replay requires the exact execution-manifest host set")
     manifests: dict[str, dict[str, Any]] = {}
     inventories: dict[str, dict[str, dict[str, Any]]] = {}
     normalized_inventory: list[dict[str, Any]] | None = None
@@ -726,13 +729,19 @@ def _index_and_manifest_preflight(
                  if key != "manifest_sha256"
              })),
              "Source5 execution manifest semantic digest differs from its exact pin")
+    manifest_hosts = manifest.get("hosts")
+    _require(type(manifest_hosts) is list and len(manifest_hosts) in (2, 3) and
+             all(type(host_id) is str and host_id for host_id in manifest_hosts) and
+             len(set(manifest_hosts)) == len(manifest_hosts) and
+             req["host_id"] in manifest_hosts,
+             "Source5 execution manifest host set is malformed")
     module_map = manifest.get("modules")
     _require(type(module_map) is dict and req["host_id"] in module_map and
              type(module_map[req["host_id"]]) is dict,
              "Source5 execution manifest has no selected-host module map")
     selected_modules = module_map[req["host_id"]]
     source_symlink_snapshots = _validate_full_source_index_closure(
-        req, index_rows, rows, selected_modules,
+        req, index_rows, rows, selected_modules, set(manifest_hosts),
     )
     return req, index, rows, source_symlink_snapshots
 
@@ -1179,8 +1188,10 @@ def _pressure_component_path_map(
         component_paths |= _direct_paths(document, pressure)
     source_manifests = [row for row in host["indexed_direct_refs"]
                         if row["role"] == "source_manifest"]
-    _require(len(source_manifests) == 3,
-             "pressure replay requires all three original indexed SourceV5 manifests")
+    indexed_source_host_ids = {row["host_id"] for row in source_manifests}
+    _require(len(indexed_source_host_ids) in (2, 3) and
+             len(source_manifests) == len(indexed_source_host_ids),
+             "pressure replay requires a complete supported original SourceV5 host set")
     for row in source_manifests:
         component_paths.add(row["path"])
         component_paths |= _source_manifest_file_paths(
@@ -1188,19 +1199,37 @@ def _pressure_component_path_map(
         )
     original_inputs = host["original_pins"].get("original_inputs",
                                                 host["original_pins"])
+    original_documents: dict[str, dict[str, Any]] = {}
     for name in ("spec", "plan"):
         pin = original_inputs[name]["artifact"]
         path = _absolute(pin["path"], f"original Source5 {name} path")
         component_paths.add(path)
         document, _raw = _json_entry(rows, path, f"original Source5 {name}",
                                      MAX_JSON_BYTES)
+        original_documents[name] = document
         component_paths |= _direct_paths(document, pressure)
+    spec = original_documents["spec"]
+    spec_hosts = spec.get("hosts")
+    spec_host_ids = [item.get("host_id") for item in spec_hosts
+                     if type(item) is dict] if type(spec_hosts) is list else []
+    spec_refs = spec.get("source_manifests")
+    spec_ref_host_ids = [item.get("host_id") for item in spec_refs
+                         if type(item) is dict] if type(spec_refs) is list else []
+    _require(len(spec_host_ids) in (2, 3) and
+             len(spec_host_ids) == len(spec_hosts) and
+             all(type(host_id) is str and host_id for host_id in spec_host_ids) and
+             len(set(spec_host_ids)) == len(spec_host_ids) and
+             len(spec_ref_host_ids) == len(spec_refs) and
+             set(spec_ref_host_ids) == set(spec_host_ids) == indexed_source_host_ids,
+             "pressure replay source-index host set differs from the original SpecV3 refs")
     root = _absolute(record["pair_directory"],
                      "Source5 pressure job output root")
     execution_manifest, _manifest_raw = _json_entry(
         rows, request["execution_manifest"]["path"],
         "Source5 execution manifest", MAX_JSON_BYTES,
     )
+    _require(execution_manifest.get("hosts") == spec_host_ids,
+             "pressure replay execution manifest differs from the exact SpecV3 host order")
     _require(Path(root).is_relative_to(Path(request["output_root"])) or
              Path(root).is_relative_to(Path(execution_manifest["artifact_root"])),
              "Source5 pressure job output root is outside its original host roots")

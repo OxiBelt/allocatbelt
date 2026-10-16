@@ -82,7 +82,9 @@ SOURCE5_FEEDBACK_POLICY_ARTIFACT_SCHEMA_V2 = "allocatbelt.application-feedback-p
 SOURCE5_PREPARATION_SCHEMA_V1 = "allocatbelt.application-source5-preparation.v1"
 SOURCE5_PREPARATION_CORE_SCHEMA_V1 = "allocatbelt.application-source5-preparation-core.v1"
 SOURCE5_PREPARATION_CORE_SCHEMA_V2 = "allocatbelt.application-source5-preparation-core.v2"
+SOURCE5_PREPARATION_CORE_SCHEMA_V3 = "allocatbelt.application-source5-preparation-core.v3"
 CAPACITY_FLOOR_POLICY_ID = "application_capacity_relative_tenth_v1"
+TWO_KVM_QUALIFICATION_PROFILE = "two_kvm_hosts_v1"
 CHRONOLOGY_SOURCE_PATH = "scripts/application-campaign-chronology.py"
 CAPACITY_STAGE_SOURCE_PATH = "scripts/application-capacity-stage.py"
 CONTROLLER_SOURCE_PATH = "scripts/application-campaign.py"
@@ -2186,8 +2188,15 @@ def _prepare_inputs(
             "active chronology module is not executing from the supplied SourceV5 root")
 
     refs = spec.get("source_manifests")
-    require(type(refs) is list and len(refs) == 3,
-            "SourceV5 spec must pin all three host source manifests")
+    spec_hosts = spec.get("hosts")
+    require(type(spec_hosts) is list and len(spec_hosts) in (2, 3) and
+            all(type(item) is dict and type(item.get("host_id")) is str
+                for item in spec_hosts) and
+            len({item["host_id"] for item in spec_hosts}) == len(spec_hosts),
+            "SourceV5 SpecV3 host matrix is malformed")
+    expected_host_ids = {item["host_id"] for item in spec_hosts}
+    require(type(refs) is list and len(refs) == len(expected_host_ids),
+            "SourceV5 spec must pin one source manifest per SpecV3 host")
     raw_refs: dict[str, dict[str, Any]] = {}
     sources: dict[str, dict[str, Any]] = {}
     for index, value in enumerate(refs):
@@ -2214,6 +2223,8 @@ def _prepare_inputs(
             "source_tree_sha256": manifest["source"]["source_tree_sha256"],
         }
         sources[ref_host] = manifest
+    require(set(raw_refs) == expected_host_ids,
+            "SourceV5 source manifests do not cover the exact SpecV3 host set")
     require(host_id in sources, "selected host has no SourceV5 source manifest")
     selected_source = sources[host_id]
 
@@ -3021,7 +3032,7 @@ def _verify_source5_prepared_input_generation(
                 }, f"prepared-input completion changed {host_id} SourceV5 raw/semantic/tree pins")
     capacity_rows = verified.get("capacity_preparations")
     require(type(capacity_rows) is list and len(capacity_rows) == len(host_ids),
-            "prepared-input completion does not cover all three host capacity preparations")
+            "prepared-input completion does not cover every host capacity preparation")
     resource_budgets = None
     if bounded_completion:
         resource_budgets = _exact(verified.get("resource_budgets"), set(host_ids),
@@ -3100,8 +3111,8 @@ def _verify_source5_prepared_input_generation(
                         "prepared-capacity registration event head"),
                 "selected prepared-capacity registration differs from its full cohort bridge/ledger")
     pressure_rows = verified.get("pressure_calibrations")
-    require(type(pressure_rows) is list and len(pressure_rows) == 45,
-            "prepared-input completion does not contain the closed 45-entry V2 pressure scope matrix")
+    require(type(pressure_rows) is list and len(pressure_rows) == len(host_ids) * 15,
+            "prepared-input completion does not contain every host's closed 15-entry V2 pressure scope matrix")
     return verified
 
 
@@ -7987,8 +7998,8 @@ def _validate_chronology_original_pins(value: object) -> dict[str, Any]:
         _digest(pin["raw_sha256"], f"original {role} raw SHA-256")
         _digest(pin["semantic_sha256"], f"original {role} semantic SHA-256")
     source_rows = pins["source_manifests"]
-    require(type(source_rows) is list and len(source_rows) == 3,
-            "original source-manifest projection must retain exactly three hosts")
+    require(type(source_rows) is list and len(source_rows) in (2, 3),
+            "original source-manifest projection must retain a complete supported host set")
     source_hosts: list[str] = []
     for index, item in enumerate(source_rows):
         row = _exact(item, {
@@ -7999,7 +8010,7 @@ def _validate_chronology_original_pins(value: object) -> dict[str, Any]:
         _journal_absolute_path(row["path"], "source-manifest path")
         for name in ("raw_sha256", "semantic_sha256", "source_tree_sha256"):
             _digest(row[name], f"source-manifest {name}")
-    require(len(set(source_hosts)) == 3 and pins["host_id"] in source_hosts,
+    require(len(set(source_hosts)) == len(source_rows) and pins["host_id"] in source_hosts,
             "original source-manifest projection repeats or omits a host")
     observed = _exact(pins["observed_host"], {
         "path", "raw_sha256", "boot_id_sha256", "controls_sha256", "controls",
@@ -9965,12 +9976,25 @@ def _source5_preparation_core_projection(
         "campaign_id", "runner_sha256", "hosts", "cells", "protocol",
         "runtime_binding", "phase_adapters", "aa_controls", "soak", "deadlines",
     }
-    schema = (SOURCE5_PREPARATION_CORE_SCHEMA_V2
-              if selected_policy_id is not None else
-              SOURCE5_PREPARATION_CORE_SCHEMA_V1)
     require(selected_policy_id is None or
             selected_policy_id == CAPACITY_FLOOR_POLICY_ID,
             "SpecV3 selects an unknown capacity-floor policy ID")
+    if "qualification_profile" in spec:
+        require(spec.get("schema") == SPEC_SCHEMA and
+                type(spec["qualification_profile"]) is str and
+                spec["qualification_profile"] == TWO_KVM_QUALIFICATION_PROFILE,
+                "SpecV3 qualification profile is unknown or incompatible")
+        result = {
+            "schema": SOURCE5_PREPARATION_CORE_SCHEMA_V3,
+            **{key: spec[key] for key in sorted(keys)},
+            "qualification_profile": spec["qualification_profile"],
+        }
+        if "capacity_floor_policy_id" in spec:
+            result["capacity_floor_policy_id"] = selected_policy_id
+        return result
+    schema = (SOURCE5_PREPARATION_CORE_SCHEMA_V2
+              if selected_policy_id is not None else
+              SOURCE5_PREPARATION_CORE_SCHEMA_V1)
     result = {"schema": schema, **{key: spec[key] for key in sorted(keys)}}
     if selected_policy_id is not None:
         result["capacity_floor_policy_id"] = selected_policy_id
@@ -9979,20 +10003,22 @@ def _source5_preparation_core_projection(
 
 def _source5_validate_selected_plan_templates(
     plan: dict[str, Any], source_documents: dict[str, dict[str, Any]],
-    selected_policy_id: str, floor_descriptor: dict[str, Any],
+    selected_policy_id: str | None, floor_descriptor: dict[str, Any] | None,
 ) -> None:
     templates = plan.get("feedback_process_templates")
     host_ids = plan.get("host_ids")
-    require(type(host_ids) is list and len(host_ids) == 3 and
-            set(host_ids) == set(source_documents) and len(set(host_ids)) == 3,
-            "selected PlanV3 host matrix differs from the three SourceV5 manifests")
-    require(type(templates) is list and len(templates) == 720 and
+    require(type(host_ids) is list and len(host_ids) in (2, 3) and
+            all(type(host_id) is str and host_id for host_id in host_ids) and
+            len(set(host_ids)) == len(host_ids) and
+            set(host_ids) == set(source_documents),
+            "selected PlanV3 host matrix differs from the exact SourceV5 manifests")
+    require(type(templates) is list and len(templates) == len(host_ids) * 240 and
             plan.get("feedback_process_templates_sha256") ==
                 sha256_bytes(canonical_bytes(templates)),
             "selected SourceV5 PlanV3 feedback-template digest or matrix differs")
     capacity_templates = plan.get("capacity_process_templates")
-    require(type(capacity_templates) is list and len(capacity_templates) == 45,
-            "selected PlanV3 omits the original 45-entry capacity context matrix")
+    require(type(capacity_templates) is list and len(capacity_templates) == len(host_ids) * 15,
+            "selected PlanV3 omits a host's original 15-entry capacity context matrix")
     capacity_bindings: dict[tuple[str, str, str], tuple[str, str]] = {}
     for index, value in enumerate(capacity_templates):
         key = _exact(value.get("capacity_key") if type(value) is dict else None, {
@@ -10064,7 +10090,9 @@ def _source5_validate_selected_plan_templates(
         policy_keys = {
             "version", "reader_contract", "algorithm", "context", "source_pins",
         }
-        is_selected_pressure = family == "external_pressure"
+        is_selected_pressure = (
+            family == "external_pressure" and selected_policy_id is not None
+        )
         if is_selected_pressure:
             policy_keys.update({"capacity_floor_policy", "capacity_floor_policy_id"})
         policy = _exact(item["policy"], policy_keys,
@@ -10170,7 +10198,8 @@ def _source5_validate_source_provenance(
         "phase_adapters", "aa_controls", "soak", "deadlines",
         "qualification_inputs",
     } | ({"capacity_floor_policy_id"}
-         if "capacity_floor_policy_id" in spec else set()),
+         if "capacity_floor_policy_id" in spec else set()) |
+        ({"qualification_profile"} if "qualification_profile" in spec else set()),
        "captured original SpecV3")
     require(selected_floor_policy_id is None or
             selected_floor_policy_id == CAPACITY_FLOOR_POLICY_ID,
@@ -10200,12 +10229,12 @@ def _source5_validate_source_provenance(
             Path(plan_artifact["path"]).parent == Path(request["input_root"]),
             "Source5 request input root differs from the original SpecV3/PlanV3 generation")
     host_rows = spec.get("hosts")
-    require(type(host_rows) is list and len(host_rows) == 3,
-            "captured SpecV3 does not preserve the original three host order")
+    require(type(host_rows) is list and len(host_rows) in (2, 3),
+            "captured SpecV3 does not preserve a complete supported host order")
     host_ids = [item.get("host_id") for item in host_rows
                 if type(item) is dict]
-    require(len(host_ids) == 3 and all(type(item) is str for item in host_ids) and
-            len(set(host_ids)) == 3 and host_ids == plan.get("host_ids") and
+    require(len(host_ids) == len(host_rows) and all(type(item) is str for item in host_ids) and
+            len(set(host_ids)) == len(host_ids) and host_ids == plan.get("host_ids") and
             host_ids == manifest.get("hosts") and request["host_id"] in host_ids,
             "captured SpecV3/PlanV3/manifest host order or selected host differs")
     require(manifest["phase_order"] == [
@@ -10231,8 +10260,8 @@ def _source5_validate_source_provenance(
             "Source5 request changes the selected host's original source-root identity")
 
     refs = spec.get("source_manifests")
-    require(type(refs) is list and len(refs) == 3,
-            "captured SpecV3 does not contain exactly three source-manifest pins")
+    require(type(refs) is list and len(refs) == len(host_ids),
+            "captured SpecV3 does not contain one source-manifest pin per host")
     manifest_sources = _exact(original["source_manifests"], set(host_ids),
                               "Source5 original source-manifest map")
     source_documents: dict[str, dict[str, Any]] = {}
@@ -10308,7 +10337,7 @@ def _source5_validate_source_provenance(
             runtime_binding["resource_policy_sha256"] ==
                 next(iter(fixed_policy_hashes)),
             "SpecV3 runtime policy hashes do not bind the three SourceV5 policy artifacts")
-    if selected_floor_policy_id is not None:
+    if selected_floor_policy_id is not None or "qualification_profile" in spec:
         _source5_validate_selected_plan_templates(
             plan, source_documents, selected_floor_policy_id, floor_descriptor,
         )
@@ -10488,6 +10517,16 @@ def _source5_validate_source_provenance(
     _campaign_raw, _campaign_sha = _source5_evidence_bytes(
         campaign_entry, "captured campaign controller module", MAX_SCRIPT_BYTES,
     )
+    selected_controller = _load_module(
+        _campaign_raw, campaign_path, "captured_source5_profile_controller",
+    )
+    host_count = selected_controller.qualification_host_count(spec)
+    venues = [host.get("venue") for host in host_rows if type(host) is dict]
+    require(len(host_ids) == host_count and
+            ((host_count == 2 and venues == ["kvm_guest", "kvm_guest"]) or
+             (host_count == 3 and venues.count("bare_metal") == 1 and
+              venues.count("kvm_guest") == 2)),
+            "captured SpecV3 profile, host venues, and exact SourceV5 host set differ")
     require(type(plan.get("jobs")) is dict,
             "original PlanV3 job schedule is malformed")
 
@@ -13051,9 +13090,9 @@ def verify_source5_host_journal_offline(
             request["source_root"] == manifest["execution_sources"][request["host_id"]]["source_root"],
             "Source5 replay roots differ from the exact original input/source roots")
     host_ids = [host["host_id"] for host in spec["hosts"]]
-    require(host_ids == manifest["hosts"] and len(host_ids) == 3 and
-            len(set(host_ids)) == 3 and host_ids == plan["host_ids"],
-            "Source5 original three-host order differs across SpecV3/PlanV3/manifest")
+    require(host_ids == manifest["hosts"] and len(host_ids) in (2, 3) and
+            len(set(host_ids)) == len(host_ids) and host_ids == plan["host_ids"],
+            "Source5 original host order differs across SpecV3/PlanV3/manifest")
     require(all(manifest["execution_sources"][host]["source_tree_sha256"] ==
                 source_refs[host]["source_tree_sha256"] and
                 manifest["execution_sources"][host]["git_commit"] ==
@@ -17411,7 +17450,7 @@ def _source5_preparatory_immutable_inputs_held(
             core["hosts"] == [item["host_id"] for item in prepared["spec"]["hosts"]] ==
                 prepared["plan"]["host_ids"] and
             prepared["spec"].get("rates") == [] and prepared["spec"].get("oracles") == [],
-            "Source5 preparatory core requires its unchanged initial three-host Spec and Plan")
+            "Source5 preparatory core requires its unchanged profile-bound initial Spec and Plan")
     _source5_validate_manifest_source_bindings(core, prepared, verify_selected_files=True)
     generation = _verify_source5_preparatory_input_generation(
         prepared, core["preparatory_capacity_generation"],
@@ -17422,7 +17461,7 @@ def _source5_preparatory_immutable_inputs_held(
     require(cohort == expected and len(jobs) == 360 and
             all(job.get("phase") == "exploration" and job.get("mode") == "capacity" and
                 job.get("comparison_kind") == "capacity_pilot" for job in jobs),
-            "Source5 preparatory core changed an original exploration job")
+            "Source5 preparatory core changed its selected host's original exploration jobs")
     _source5_preparatory_signer_context(core, host)
     fixed_host = _source5_preparatory_fixed_host_inputs(
         prepared, core["preparatory_capacity_generation"],

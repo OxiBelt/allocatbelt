@@ -39,6 +39,7 @@ from typing import Any
 
 SPEC_SCHEMA = "allocatbelt.application-campaign-spec.v2"
 SPEC_SCHEMA_V3 = "allocatbelt.application-campaign-spec.v3"
+TWO_KVM_QUALIFICATION_PROFILE = "two_kvm_hosts_v1"
 SOURCE_SCHEMA = "allocatbelt.application-source-manifest.v4"
 SOURCE_SCHEMA_V5 = "allocatbelt.application-source-manifest.v5"
 CAPACITY_FLOOR_POLICY_ID = "application_capacity_relative_tenth_v1"
@@ -420,7 +421,7 @@ def campaign_inputs_module(expected_sha256: str | None = None) -> Any:
 
 
 def campaign_inputs_source_sha256(sources: dict[str, dict[str, Any]]) -> str:
-    require(type(sources) is dict and len(sources) == 3, "SourceV5 campaign inputs require exactly three verified host manifests")
+    require(type(sources) is dict and len(sources) in {2, 3}, "SourceV5 campaign inputs require a supported complete host cohort")
     pins: set[str] = set()
     for host_id, source in sources.items():
         require(source.get("schema") == SOURCE_SCHEMA_V5, f"campaign inputs module pin requires SourceV5 for {host_id}")
@@ -976,6 +977,18 @@ def preregistration_digest(spec: dict[str, Any]) -> str:
     return digest_object(core)
 
 
+def qualification_host_count(spec: dict[str, Any]) -> int:
+    """Select the explicit matrix without changing legacy Spec semantics."""
+    require(type(spec) is dict, "qualification profile requires a Spec object")
+    if "qualification_profile" not in spec:
+        return 3
+    require(spec.get("schema") == SPEC_SCHEMA_V3 and
+            type(spec["qualification_profile"]) is str and
+            spec["qualification_profile"] == TWO_KVM_QUALIFICATION_PROFILE,
+            "campaign qualification profile is unknown or incompatible with its Spec schema")
+    return 2
+
+
 def validate_spec(
     spec: dict[str, Any], sources: dict[str, dict[str, Any]], input_root: Path | None = None,
 ) -> dict[str, Any]:
@@ -984,7 +997,8 @@ def validate_spec(
     spec_v3 = schema == SPEC_SCHEMA_V3
     if spec_v3:
         optional_floor_key = {"capacity_floor_policy_id"} if "capacity_floor_policy_id" in spec else set()
-        exact_keys(spec, expected | {"qualification_inputs"} | optional_floor_key, "campaign spec v3")
+        optional_profile_key = {"qualification_profile"} if "qualification_profile" in spec else set()
+        exact_keys(spec, expected | {"qualification_inputs"} | optional_floor_key | optional_profile_key, "campaign spec v3")
         floor_policy_id = spec.get("capacity_floor_policy_id")
         require(floor_policy_id is None or floor_policy_id == CAPACITY_FLOOR_POLICY_ID,
                 "campaign spec capacity floor policy ID is unknown")
@@ -995,7 +1009,10 @@ def validate_spec(
     campaign_id = token(spec["campaign_id"], "campaign_id")
     require(is_sha256(spec["runner_sha256"]), "pair runner implementation is not pinned")
     hosts = spec["hosts"]
-    require(isinstance(hosts, list) and len(hosts) == 3, "campaign requires exactly three pinned hosts")
+    host_count = qualification_host_count(spec)
+    require(isinstance(hosts, list) and len(hosts) == host_count,
+            "campaign requires exactly three pinned hosts" if host_count == 3 else
+            "two-KVM qualification profile requires exactly two pinned hosts")
     seen_hosts: set[str] = set()
     venues: list[str] = []
     for index, host in enumerate(hosts):
@@ -1014,7 +1031,7 @@ def validate_spec(
             require(isinstance(controls[field], str) and controls[field], f"host {host_id} has unknown control {field}")
         require(hashlib.sha256(canonical_bytes(controls)).hexdigest() == host["host_fingerprint_sha256"], f"host {host_id} fingerprint does not match its controls")
     source_refs = spec["source_manifests"]
-    require(isinstance(source_refs, list) and len(source_refs) == 3, "one source/build manifest per host is required")
+    require(isinstance(source_refs, list) and len(source_refs) == host_count, "one source/build manifest per host is required")
     refs_by_host: dict[str, dict[str, Any]] = {}
     for index, ref in enumerate(source_refs):
         exact_keys(ref, {"host_id", "relative_path", "sha256"}, f"source manifest reference[{index}]")
@@ -1032,7 +1049,12 @@ def validate_spec(
         for source in sources.values()
     }
     require(len(identities) == 1, "host builds do not share the frozen source/toolchain/amd64-v3 contract")
-    require(venues.count("bare_metal") == 1 and venues.count("kvm_guest") == 2, "host matrix must contain one bare-metal host and two KVM guests")
+    if host_count == 2:
+        require(venues == ["kvm_guest", "kvm_guest"],
+                "two-KVM qualification profile requires exactly two KVM guests")
+    else:
+        require(venues.count("bare_metal") == 1 and venues.count("kvm_guest") == 2,
+                "host matrix must contain one bare-metal host and two KVM guests")
 
     binding = exact_keys(spec["runtime_binding"], {"resource_domain", "resource_policy_sha256", "feedback_policy_sha256", "feedback_match", "source_state"}, "runtime binding")
     require(binding["source_state"] in ("pending", "complete"), "unknown runtime-source state")

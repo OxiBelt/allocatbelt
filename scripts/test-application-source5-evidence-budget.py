@@ -136,7 +136,10 @@ def fixture() -> dict[str, Any]:
     spec = {
         "schema": budget.SPEC_SCHEMA,
         "campaign_id": "campaign-a",
-        "hosts": [{"host_id": host} for host in host_ids],
+        "hosts": [
+            {"host_id": host, "venue": "bare_metal" if index == 0 else "kvm_guest"}
+            for index, host in enumerate(host_ids)
+        ],
         "cells": cells(),
         "protocol": {"exploration_pairs": 6, "confirmation_pairs": 36},
         "aa_controls": [

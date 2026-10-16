@@ -25,6 +25,8 @@ CAPACITY_FLOOR_POLICY_ID = "application_capacity_relative_tenth_v1"
 SOURCE5_PREPARATION_SCHEMA = "allocatbelt.application-source5-preparation.v1"
 SOURCE5_PREPARATION_CORE_SCHEMA = "allocatbelt.application-source5-preparation-core.v1"
 SOURCE5_PREPARATION_CORE_SCHEMA_V2 = "allocatbelt.application-source5-preparation-core.v2"
+SOURCE5_PREPARATION_CORE_SCHEMA_V3 = "allocatbelt.application-source5-preparation-core.v3"
+TWO_KVM_QUALIFICATION_PROFILE = "two_kvm_hosts_v1"
 SOURCE5_PREPARATION_RESOURCE_BUDGET_SCHEMA = "allocatbelt.application-source5-preparation-resource-budget.v1"
 SOURCE5_PRESSURE_CONDITION_SCHEMA = "allocatbelt.application-source5-pressure-condition.v1"
 SOURCE5_PRESSURE_READINESS_RULE = "allocatbelt.application-source5-pressure-readiness-threshold-rule.v1"
@@ -523,9 +525,25 @@ def preparation_core_from_spec(spec: dict[str, Any]) -> dict[str, Any]:
         "runtime_binding", "phase_adapters", "aa_controls", "soak", "deadlines",
     }
     optional = {"capacity_floor_policy_id"} if "capacity_floor_policy_id" in spec else set()
+    if "qualification_profile" in spec:
+        optional.add("qualification_profile")
     _exact(spec, keys | {"schema", "source_manifests", "rates", "oracles", "qualification_inputs"} | optional, "final SpecV3 for preparation bridge")
     _require(spec["schema"] == SPEC_V3_SCHEMA, "preparation can only bridge to SpecV3")
     policy_id = spec.get("capacity_floor_policy_id")
+    if "qualification_profile" in spec:
+        _require(type(spec["qualification_profile"]) is str and
+                 spec["qualification_profile"] == TWO_KVM_QUALIFICATION_PROFILE,
+                 "SpecV3 qualification profile is unknown")
+        _require(policy_id is None or policy_id == CAPACITY_FLOOR_POLICY_ID,
+                 "SpecV3 capacity floor policy ID is unknown")
+        result = {
+            "schema": SOURCE5_PREPARATION_CORE_SCHEMA_V3,
+            **{key: spec[key] for key in sorted(keys)},
+            "qualification_profile": spec["qualification_profile"],
+        }
+        if "capacity_floor_policy_id" in spec:
+            result["capacity_floor_policy_id"] = policy_id
+        return result
     if policy_id is None:
         return {"schema": SOURCE5_PREPARATION_CORE_SCHEMA, **{key: spec[key] for key in sorted(keys)}}
     _require(policy_id == CAPACITY_FLOOR_POLICY_ID,
@@ -538,7 +556,22 @@ def preparation_core_from_spec(spec: dict[str, Any]) -> dict[str, Any]:
 
 
 def _validate_preparation_core(value: Any) -> dict[str, Any]:
-    if type(value) is dict and value.get("schema") == SOURCE5_PREPARATION_CORE_SCHEMA:
+    if type(value) is dict and value.get("schema") == SOURCE5_PREPARATION_CORE_SCHEMA_V3:
+        fields = {
+            "schema", "campaign_id", "runner_sha256", "hosts", "cells", "protocol",
+            "runtime_binding", "phase_adapters", "aa_controls", "soak", "deadlines",
+            "qualification_profile",
+        }
+        if "capacity_floor_policy_id" in value:
+            fields.add("capacity_floor_policy_id")
+        core = _exact(value, fields, "preparation core v3")
+        _require(type(core["qualification_profile"]) is str and
+                 core["qualification_profile"] == TWO_KVM_QUALIFICATION_PROFILE,
+                 "preparation core qualification profile is unknown")
+        _require(core.get("capacity_floor_policy_id") is None or
+                 core["capacity_floor_policy_id"] == CAPACITY_FLOOR_POLICY_ID,
+                 "preparation core capacity floor policy ID is unknown")
+    elif type(value) is dict and value.get("schema") == SOURCE5_PREPARATION_CORE_SCHEMA:
         core = _exact(value, {
             "schema", "campaign_id", "runner_sha256", "hosts", "cells", "protocol",
             "runtime_binding", "phase_adapters", "aa_controls", "soak", "deadlines",
@@ -566,7 +599,10 @@ def _validate_preparation_core(value: Any) -> dict[str, Any]:
         "x86_64_v3_capability_sha256", "target_triple", "target_cpu",
     }
     hosts = core["hosts"]
-    _require(type(hosts) is list and len(hosts) == 3, "preparation core must pin three genuine hosts")
+    host_count = 2 if core["schema"] == SOURCE5_PREPARATION_CORE_SCHEMA_V3 else 3
+    _require(type(hosts) is list and len(hosts) == host_count,
+             "preparation core must pin three genuine hosts" if host_count == 3 else
+             "preparation core two-KVM profile must pin two genuine hosts")
     host_ids: list[str] = []
     venues: list[str] = []
     for index, host_value in enumerate(hosts):
@@ -586,8 +622,12 @@ def _validate_preparation_core(value: Any) -> dict[str, Any]:
         _require(_is_sha(host["host_fingerprint_sha256"]) and
                  _sha256(_canonical(controls)) == host["host_fingerprint_sha256"],
                  f"preparation host {host_id} fingerprint differs from its controls")
-    _require(venues.count("bare_metal") == 1 and venues.count("kvm_guest") == 2,
-             "preparation core must contain one bare-metal host and two KVM guests")
+    if host_count == 2:
+        _require(venues == ["kvm_guest", "kvm_guest"],
+                 "preparation core two-KVM profile requires two KVM guests")
+    else:
+        _require(venues.count("bare_metal") == 1 and venues.count("kvm_guest") == 2,
+                 "preparation core must contain one bare-metal host and two KVM guests")
 
     expected_contexts = {
         (workload, profile)
@@ -1255,7 +1295,9 @@ def build_preparation_intent(
 ) -> dict[str, Any]:
     """Create an immutable prospective intent; no evidence or rates are implied."""
     if "schema" not in core:
-        core_schema = (SOURCE5_PREPARATION_CORE_SCHEMA_V2
+        core_schema = (SOURCE5_PREPARATION_CORE_SCHEMA_V3
+                       if "qualification_profile" in core else
+                       SOURCE5_PREPARATION_CORE_SCHEMA_V2
                        if core.get("capacity_floor_policy_id") is not None
                        else SOURCE5_PREPARATION_CORE_SCHEMA)
         core_value = {"schema": core_schema, **core}
@@ -1601,7 +1643,27 @@ def validate_qualification_plan_maps(value: dict[str, Any]) -> None:
     _require(type(capacity) is list and type(feedback) is list, "campaign plan qualification process maps must be lists")
     _require(_is_sha(value["capacity_process_templates_sha256"]) and _sha256(_canonical(capacity)) == value["capacity_process_templates_sha256"], "campaign plan capacity process-template digest mismatch")
     _require(_is_sha(value["feedback_process_templates_sha256"]) and _sha256(_canonical(feedback)) == value["feedback_process_templates_sha256"], "campaign plan feedback process-template digest mismatch")
-    _require(len(capacity) == 45 and len(feedback) == 720, "campaign plan prospective process maps do not cover three hosts, 15 contexts, and both comparison families")
+    host_ids = value.get("host_ids")
+    _require(type(host_ids) is list and len(host_ids) in {2, 3} and
+             all(type(host) is str and bool(host) for host in host_ids) and
+             len(set(host_ids)) == len(host_ids) and
+             type(value.get("source_manifests")) is dict and
+             set(value["source_manifests"]) == set(host_ids),
+             "campaign plan templates lack exact unique host/source membership")
+    contexts = {
+        (workload, profile)
+        for workload, profiles in (("cpu", STANDALONE_PROFILES),
+                                   ("memory", STANDALONE_PROFILES),
+                                   ("http", STANDALONE_PROFILES),
+                                   ("disk", STANDALONE_PROFILES),
+                                   ("mixed", MIXED_PROFILES))
+        for profile in profiles
+    }
+    expected_capacity_keys = {(host, workload, profile) for host in host_ids
+                              for workload, profile in contexts}
+    _require(len(capacity) == len(expected_capacity_keys) and
+             len(feedback) == len(expected_capacity_keys) * 2 * len(ALLOCATORS) * len(EXECUTORS),
+             "campaign plan prospective process maps do not cover its exact hosts, contexts, and comparison families")
     nonces: set[str] = set()
     capacity_bindings: dict[tuple[str, str, str], tuple[str, str]] = {}
     for index, item_value in enumerate(capacity):
@@ -1642,7 +1704,8 @@ def validate_qualification_plan_maps(value: dict[str, Any]) -> None:
         _require(item["required_proofs"] == ["capacity_artifact", "capacity_receipt", "pre_confirmation_stage_receipt"], f"capacity process template[{index}] proof requirements changed")
         body = {name: item[name] for name in item if name != "template_sha256"}
         _require(item["template_sha256"] == _sha256(_canonical(body)), f"capacity process template[{index}] digest mismatch")
-    _require(len({key[0] for key in capacity_bindings}) == 3 and len(capacity_bindings) == 45, "capacity process templates do not cover exactly three hosts and all workload/profile contexts")
+    _require(set(capacity_bindings) == expected_capacity_keys,
+             "capacity process templates do not cover the exact host/context matrix")
     feedback_nonces: set[str] = set()
     feedback_matrix: set[tuple[str, str, str, str, str, str]] = set()
     for index, item_value in enumerate(feedback):

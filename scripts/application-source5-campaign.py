@@ -579,9 +579,12 @@ def load_context(
                  if key != "manifest_sha256"
              })))),
             "Source5 execution manifest schema, phase order, eligibility, or digest is invalid")
-    require(host_id in manifest["hosts"] and type(manifest["hosts"]) is list and
-            len(manifest["hosts"]) == 3 and len(set(manifest["hosts"])) == 3,
-            "Source5 selected host is absent from the original three-host order")
+    require(type(manifest["hosts"]) is list and len(manifest["hosts"]) in (2, 3) and
+            all(type(host_id) is str and host_id for host_id in manifest["hosts"]) and
+            len(set(manifest["hosts"])) == len(manifest["hosts"]),
+            "Source5 manifest does not preserve a complete supported host order")
+    require(host_id in manifest["hosts"],
+            "Source5 selected host is absent from the original host order")
     original = exact(manifest["original_inputs"], {
         "spec", "plan", "source_manifests", "campaign_artifacts_root",
     }, "Source5 original inputs")
@@ -13983,21 +13986,22 @@ def run_host(context: CampaignContext, phase: str,
 
 
 def verify_source5_final_cohort(manifest_paths: object) -> dict[str, Any]:
-    """Replay three independent host journals and fail closed on missing offline pressure replay."""
-    require(type(manifest_paths) is dict and len(manifest_paths) == 3 and
+    """Replay every independently pinned host journal and fail closed on missing offline pressure replay."""
+    require(type(manifest_paths) is dict and len(manifest_paths) in (2, 3) and
             all(type(key) is str and
                 (type(value) is str or isinstance(value, Path))
                 for key, value in manifest_paths.items()),
-            "Source5 final cohort requires exactly three host-to-manifest paths")
+            "Source5 final cohort requires a complete supported host-to-manifest map")
     first_host = next(iter(manifest_paths))
     first_path = Path(manifest_paths[first_host]).resolve(strict=True)
     first_manifest, _first_raw, _first_sha = read_json(
         first_path, "Source5 first cohort execution manifest", MAX_MANIFEST_BYTES,
     )
     host_order = first_manifest.get("hosts")
-    require(type(host_order) is list and len(host_order) == 3 and
-            len(set(host_order)) == 3 and set(manifest_paths) == set(host_order),
-            "Source5 final cohort manifests do not cover the exact original three-host order")
+    require(type(host_order) is list and len(host_order) in (2, 3) and
+            all(type(host_id) is str and host_id for host_id in host_order) and
+            len(set(host_order)) == len(host_order) and set(manifest_paths) == set(host_order),
+            "Source5 final cohort manifests do not cover the exact original host order")
     common_projection = {
         key: first_manifest[key] for key in (
             "campaign_id", "hosts", "original_inputs", "execution_sources",
@@ -14074,7 +14078,7 @@ def verify_source5_final_cohort(manifest_paths: object) -> dict[str, Any]:
                 "numeric_gates_passed": numeric,
             })
     blockers.append("accepted_pressure_offline_full_replay_api_unavailable")
-    all_host_numeric = len(decisions) == 3 and all(
+    all_host_numeric = len(decisions) == len(host_order) and all(
         item["numeric_gates_passed"] is True for item in decisions
     )
     return {
@@ -14121,12 +14125,12 @@ def _parser() -> argparse.ArgumentParser:
     index_soak.add_argument("--output", required=True, type=Path)
     cohort = commands.add_parser(
         "verify-final-cohort",
-        help="freshly replay three independent host analyses and report aggregate blockers",
+        help="freshly replay the selected independent host analyses and report aggregate blockers",
     )
     cohort.add_argument(
         "--host-manifest", action="append", required=True,
         metavar="HOST=PATH",
-        help="one original host ID and its independent Source5 execution manifest; repeat three times",
+        help="one selected host ID and its independent Source5 execution manifest; repeat for every host",
     )
     export_pilot = commands.add_parser(
         "export-preparatory-capacity-pilot",

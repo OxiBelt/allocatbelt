@@ -619,9 +619,13 @@ def _source5_preflight_capture_context(
 
     source_rows = [row for row in index_rows.values()
                    if row["role"] == "source_manifest"]
-    require(len(source_rows) == 3 and
-            len({row["host_id"] for row in source_rows}) == 3,
-            "Source5 pressure replay requires three unique indexed host manifests")
+    execution_hosts = execution.get("hosts")
+    require(type(execution_hosts) is list and len(execution_hosts) in (2, 3) and
+            all(type(host_id) is str and host_id for host_id in execution_hosts) and
+            len(set(execution_hosts)) == len(execution_hosts) and
+            len(source_rows) == len(execution_hosts) and
+            {row["host_id"] for row in source_rows} == set(execution_hosts),
+            "Source5 pressure replay requires the exact indexed execution-manifest host set")
     source_docs: dict[str, dict[str, Any]] = {}
     source_inventories: dict[str, dict[str, dict[str, Any]]] = {}
     common_records: list[dict[str, Any]] | None = None
@@ -1423,7 +1427,8 @@ def _load_campaign_inputs(
     _validate_source_tree(source_root, source, inventory)
 
     refs = spec.get("source_manifests")
-    require(type(refs) is list and len(refs) == 3, "SourceV5 spec must retain its complete three-host source-manifest set")
+    require(type(refs) is list and len(refs) in (2, 3),
+            "SourceV5 spec must retain a complete supported source-manifest set")
     sources: dict[str, dict[str, Any]] = {}
     for index, ref_value in enumerate(refs):
         ref = exact(ref_value, {"host_id", "relative_path", "sha256"}, f"SourceV5 source reference[{index}]")
@@ -6519,8 +6524,9 @@ def validate_pressure_pair_artifacts_offline(
         for raw_path in _pair_absolute_paths(document):
             require(raw_path in mapped,
                     f"offline pressure evidence map omits exact original spec/plan dependency: {raw_path}")
-    require(type(spec.get("source_manifests")) is list and len(spec["source_manifests"]) == 3,
-            "offline pressure replay requires all three original SourceV5 host manifests")
+    require(type(spec.get("source_manifests")) is list and
+            len(spec["source_manifests"]) in (2, 3),
+            "offline pressure replay requires every original SourceV5 host manifest")
     for index, source_ref_value in enumerate(spec["source_manifests"]):
         source_ref = exact(source_ref_value, {"host_id", "relative_path", "sha256"},
                            f"offline original SourceV5 peer manifest[{index}]")

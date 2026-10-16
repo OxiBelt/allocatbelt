@@ -56,7 +56,7 @@ PREPARATION_BOUNDED_VERIFICATION_SCHEMA = "allocatbelt.application-capacity-prep
 PREPARATION_RESOURCE_BUDGET_SCHEMA = "allocatbelt.application-source5-preparation-resource-budget.v1"
 PREPARATION_RESOURCE_MONITOR_SCHEMA = "allocatbelt.application-capacity-preparation-resource-monitor.v1"
 DIRECT_OWNER_RETURN_FAILURE_SCHEMA = "allocatbelt.application-capacity-direct-owner-return-failure.v1"
-PREPARATION_FIXED_PAIR_R4_WALKER_SHA256 = "f17285a050d125c57aaa88ff60f75c18024894c0fca22d33397eb4c44c6b7eba"
+PREPARATION_FIXED_PAIR_R4_WALKER_SHA256 = "c1b02059b3602a1be4e819563b46eae1b9f8b6e502fd48751b552e69e5b3c578"
 OWNED_PROCESS_CAPTURE_SCHEMA = "allocatbelt.application-capacity-stage-owned-process-capture.v1"
 OWNED_POLICY_PROBE_START_SCHEMA = "allocatbelt.application-capacity-stage-owned-policy-probe-start.v1"
 OWNED_POLICY_PROBE_CAPTURE_SCHEMA = "allocatbelt.application-capacity-stage-owned-policy-probe-capture.v1"
@@ -535,7 +535,8 @@ def _capture_source_stack(
 
 def _source_manifest_refs(spec: dict[str, Any], spec_path: Path) -> dict[str, tuple[Path, dict[str, Any], bytes, str]]:
     refs = spec.get("source_manifests")
-    require(type(refs) is list and len(refs) == 3, "SourceV5 spec must bind all three host manifests")
+    require(type(refs) is list and len(refs) in (2, 3),
+            "SourceV5 spec must bind a complete supported host manifest set")
     result: dict[str, tuple[Path, dict[str, Any], bytes, str]] = {}
     parent = spec_path.parent
     for index, ref_value in enumerate(refs):
@@ -752,9 +753,15 @@ def derive_capacity_jobs(plan: dict[str, Any], host_id: str) -> list[dict[str, A
     require(type(plan) is dict and plan.get("schema") == PLAN_SCHEMA,
             "capacity scheduling requires plan V3")
     host_id = token(host_id, "host ID")
+    host_ids = plan.get("host_ids")
+    require(type(host_ids) is list and len(host_ids) in (2, 3) and
+            all(type(item) is str and item for item in host_ids) and
+            len(set(host_ids)) == len(host_ids) and host_id in host_ids,
+            "capacity plan does not bind the selected host to a complete supported cohort")
     templates = plan.get("capacity_process_templates")
-    require(type(templates) is list and len(templates) == 45,
-            "plan does not contain the frozen 45 capacity process templates")
+    expected_template_count = len(host_ids) * 15
+    require(type(templates) is list and len(templates) == expected_template_count,
+            "plan does not contain every host's frozen 15 capacity process templates")
     templates_sha = digest(plan.get("capacity_process_templates_sha256"), "capacity template schedule SHA-256")
     require(sha256_bytes(canonical_bytes(templates)) == templates_sha,
             "capacity template schedule digest differs from the plan")
@@ -2045,9 +2052,19 @@ def derive_capacity_preparation_jobs(intent: dict[str, Any], host_id: str) -> li
     require(type(intent) is dict and intent.get("schema") == PREPARATION_INTENT_SCHEMA,
             "capacity preparation scheduling requires the separate Source5 intent")
     host_id = token(host_id, "preparation host ID")
+    core = intent.get("core")
+    hosts = core.get("hosts") if type(core) is dict else None
+    require(type(hosts) is list and len(hosts) in (2, 3) and
+            all(type(item) is dict for item in hosts),
+            "preparation intent does not preserve a complete supported host core")
+    host_ids = [item.get("host_id") for item in hosts]
+    require(all(type(item) is str and item for item in host_ids) and
+            len(set(host_ids)) == len(host_ids) and host_id in host_ids,
+            "preparation intent does not bind the selected host to a complete supported cohort")
     templates = intent.get("capacity_templates")
-    require(type(templates) is list and len(templates) == 45,
-            "preparation intent does not contain the complete 45-template host/context matrix")
+    expected_template_count = len(host_ids) * 15
+    require(type(templates) is list and len(templates) == expected_template_count,
+            "preparation intent does not contain each host's complete 15-context matrix")
     selected: list[dict[str, Any]] = []
     seen: set[tuple[str, str]] = set()
     for index, template_value in enumerate(templates):

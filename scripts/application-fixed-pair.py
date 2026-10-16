@@ -571,7 +571,8 @@ def _load_source_inputs(
     )
     input_root = spec_path.parent
     refs = spec.get("source_manifests")
-    require(type(refs) is list and len(refs) == 3, "SpecV3 must retain all three original host source manifest pins")
+    require(type(refs) is list and len(refs) in (2, 3),
+            "SpecV3 must retain a complete supported host source manifest set")
     source_pins = exact(original["source_manifests"], {item.get("host_id") for item in refs if type(item) is dict}, "original source-manifest pins")
     sources: dict[str, dict[str, Any]] = {}
     source_manifest_records: dict[str, dict[str, Any]] = {}

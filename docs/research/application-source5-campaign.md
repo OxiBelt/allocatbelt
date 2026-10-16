@@ -1,5 +1,13 @@
 # SourceV5 campaign controller candidate
 
+The current campaign selects SpecV3
+`qualification_profile: "two_kvm_hosts_v1"` for two KVM guests. Host-indexed
+closure follows that exact matrix; the numerical gates, 360 pilot jobs,
+16,609 original jobs, 99,659 callback events and three-hour Soak remain per
+host. Results cover those KVM venues. Specs without the selector retain the
+legacy three-host contract discussed below. Existing source, spec, plan and
+journal generations cannot be retagged when changing profiles.
+
 `scripts/application-source5-campaign.py` now has separate execution-manifest
 v1 and v2 paths. V1 retains the original capacity-stage registration
 contract. V2 accepts only the closed `final_prepared` scope: it replays the
@@ -162,7 +170,7 @@ python3 -B scripts/application-campaign-chronology.py register-prepared-capacity
 ```
 
 This writes the distinct `source5_prepared_capacity_registered` event. It
-replays the entire three-host completion, then binds the selected host's
+replays the entire selected-host completion, then binds the selected host's
 original standalone `application-capacity-preparation-completion.v1`, its
 ordered 15-entry ledger, terminal head, frozen schedule digest, host
 verification receipt and completion provenance. The event head in
@@ -172,7 +180,7 @@ stage-v1 schema.
 
 Create one execution manifest v2 per host-local chronology and output root.
 Keep the existing common `campaign_id`, host order, original SpecV3/PlanV3 and
-three source-manifest pins, execution-source records, observed-host records,
+all selected source-manifest pins, execution-source records, observed-host records,
 regular-script inventory, roots, phase order, protocol digest and false
 eligibility field. V2 replaces the v1 `capacity_completions` map with these
 closed fields:

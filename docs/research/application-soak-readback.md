@@ -111,7 +111,7 @@ independent results before applying any full qualification gate.
 SourceV5 spec references use each manifest's internal semantic digest. The
 selected parent recipe separately pins the exact raw manifest file SHA; the
 reader checks both roles and runs the selected inventory-pinned controller's
-full manifest verifier over all three host manifests before plan validation.
+full manifest verifier over the complete frozen host matrix before plan validation.
 The v2 composite remains exactly 15 fields. The postflight artifact is checked
 as a separate input-stability record and its digest is not appended to that
 composite.

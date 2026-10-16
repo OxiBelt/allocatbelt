@@ -31,6 +31,7 @@ EXECUTION_SCHEMAS = {
     "allocatbelt.application-source5-campaign-execution.v3",
     "allocatbelt.application-source5-campaign-execution.v4",
 }
+TWO_KVM_QUALIFICATION_PROFILE = "two_kvm_hosts_v1"
 PHASES = ("exploration", "aa", "confirmation", "pressure", "soak")
 ALLOCATORS = ("allocatbelt", "mimalloc-secure", "mimalloc-standard", "system")
 LOADS = (70, 90)
@@ -287,6 +288,31 @@ def _token(value: Any, label: str) -> str:
     return value
 
 
+def _validated_spec_host_ids(spec: dict[str, Any]) -> list[str]:
+    """Bind the explicit profile and venue matrix before deriving host maps."""
+    _require(type(spec) is dict and spec.get("schema") == SPEC_SCHEMA,
+             "host matrix requires the original SpecV3")
+    if "qualification_profile" in spec:
+        _require(type(spec["qualification_profile"]) is str and
+                 spec["qualification_profile"] == TWO_KVM_QUALIFICATION_PROFILE,
+                 "SpecV3 qualification profile is unknown")
+        expected_count = 2
+    else:
+        expected_count = 3
+    hosts = spec.get("hosts")
+    _require(type(hosts) is list and len(hosts) == expected_count and
+             all(type(host) is dict for host in hosts),
+             "SpecV3 host rows do not match the selected qualification profile")
+    host_ids = [_token(host.get("host_id"), "SpecV3 host ID") for host in hosts]
+    venues = [host.get("venue") for host in hosts]
+    _require(len(set(host_ids)) == expected_count and
+             ((expected_count == 2 and venues == ["kvm_guest", "kvm_guest"]) or
+              (expected_count == 3 and venues.count("bare_metal") == 1 and
+               venues.count("kvm_guest") == 2)),
+             "SpecV3 host IDs or profile venue matrix differs")
+    return host_ids
+
+
 def _run_id(value: Any, label: str) -> str:
     _require(type(value) is str and 0 < len(value.encode("utf-8", "strict")) <= 4096 and
              not any(ord(char) < 32 or ord(char) == 127 for char in value),
@@ -512,13 +538,10 @@ def build_host_evidence_budget_plan(
              execution_manifest.get("schema") in EXECUTION_SCHEMAS,
              "budget planning requires a prepared Source5 execution manifest")
     host_id = _token(host_id_value, "budget planning host ID")
-    hosts = spec.get("hosts")
-    _require(type(hosts) is list and len(hosts) == 3 and
-             all(type(item) is dict for item in hosts),
-             "budget planning requires the original three-host SpecV3")
-    host_ids = [_token(item.get("host_id"), "SpecV3 host ID") for item in hosts]
-    _require(len(set(host_ids)) == 3 and host_id in host_ids and
+    host_ids = _validated_spec_host_ids(spec)
+    _require(host_id in host_ids and
              plan.get("host_ids") == host_ids and
+             execution_manifest.get("hosts") == host_ids and
              plan.get("campaign_id") == spec.get("campaign_id"),
              "PlanV3 host order/campaign differs from the original SpecV3")
     _token(spec.get("campaign_id"), "SpecV3 campaign ID")
@@ -3949,11 +3972,17 @@ def _build_host_evidence_budget_projection(
                      for phase in PHASES],
                  "Source5 ready v3 requires the exact original 16,609-job/99,659-callback horizon")
         all_counts = schedule.get("all_host_job_counts")
-        _require(type(all_counts) is dict and len(all_counts) == 3 and
+        audit_pins = audit.get("original_pins")
+        original_source_pins = (
+            audit_pins.get("source_manifests") if type(audit_pins) is dict else None
+        )
+        expected_host_ids = set(original_source_pins) if type(original_source_pins) is dict else set()
+        _require(len(expected_host_ids) in (2, 3) and
+                 type(all_counts) is dict and set(all_counts) == expected_host_ids and
                  all(type(row) is dict and
                      {phase: row.get(phase) for phase in PHASES} == expected_counts
                      for row in all_counts.values()),
-                 "Source5 ready v3 requires all three hosts' complete original Plan schedule")
+                 "Source5 ready v3 requires the exact host map of complete original Plan schedules")
     budget_bytes = 0
     result: dict[str, Any] = {}
     for _ in range(32):
@@ -4111,6 +4140,10 @@ def _validate_host_evidence_budget_common(
     _require(type(budget["original_pins"]) is dict and
              type(budget["schedule"]) is dict,
              "Source5 v2 provenance or schedule is malformed")
+    original_source_pins = budget["original_pins"].get("source_manifests")
+    expected_host_ids = set(original_source_pins) if type(original_source_pins) is dict else set()
+    _require(len(expected_host_ids) in (2, 3) and budget["host_id"] in expected_host_ids,
+             "Source5 budget original pins do not bind a complete supported host map")
     catalogue = validate_path_catalogue_manifest(budget["path_catalogue"])
     if width_is_bound:
         if catalogue_row_reader is None:
@@ -4166,11 +4199,11 @@ def _validate_host_evidence_budget_common(
                       for row in width_contract["phase_totals"]] ==
                         [(phase, *expected_phase_events[phase])
                          for phase in PHASES] and
-                     type(all_counts) is dict and len(all_counts) == 3 and
+                     type(all_counts) is dict and set(all_counts) == expected_host_ids and
                      all(type(row) is dict and
                          {phase: row.get(phase) for phase in PHASES} == expected_counts
                          for row in all_counts.values()),
-                     "Source5 v3 does not preserve all three complete original Plan schedules")
+                     "Source5 v3 does not preserve the exact complete original host schedule map")
         width_row = None
         width_row_count = 0
         rows = (iter_path_catalogue_rows(catalogue)

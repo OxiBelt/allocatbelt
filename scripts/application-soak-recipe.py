@@ -861,7 +861,8 @@ def _v5_manifest_context(
     paths: dict[str, Path] = {}
     raw_shas: dict[str, str] = {}
     references = spec.get("source_manifests")
-    require(type(references) is list and len(references) == 3, "SourceV5 spec must name exactly three source manifests")
+    require(type(references) is list and len(references) in (2, 3),
+            "SourceV5 spec must name a complete supported source-manifest set")
     for index, ref_value in enumerate(references):
         ref = exact_object(ref_value, {"host_id", "relative_path", "sha256"}, f"SourceV5 source ref[{index}]")
         host = token(ref["host_id"], f"SourceV5 source ref[{index}] host")
@@ -880,6 +881,20 @@ def _v5_manifest_context(
         paths[host] = path
         raw_shas[host] = raw_sha
     require(controller is not None, "SourceV5 full controller was not loaded")
+    host_count = controller.qualification_host_count(spec)
+    hosts = spec.get("hosts")
+    require(type(hosts) is list and len(hosts) == host_count and
+            all(type(item) is dict for item in hosts),
+            "SourceV5 SpecV3 host rows differ from its qualification profile")
+    host_ids = [item.get("host_id") for item in hosts]
+    venues = [item.get("venue") for item in hosts]
+    require(all(type(item) is str and item for item in host_ids) and
+            len(set(host_ids)) == host_count and set(sources) == set(host_ids) and
+            set(plan.get("host_ids", [])) == set(host_ids) and
+            ((host_count == 2 and venues == ["kvm_guest", "kvm_guest"]) or
+             (host_count == 3 and venues.count("bare_metal") == 1 and
+              venues.count("kvm_guest") == 2)),
+            "SourceV5 source, plan, and venue maps differ from the exact SpecV3 host profile")
     return {"root": source_base, "input_root": input_root}, sources, paths, raw_shas, controller, {"spec": spec, "plan": plan}
 
 

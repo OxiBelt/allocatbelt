@@ -412,10 +412,17 @@ class Source5PreparationInputTests(unittest.TestCase):
             "entries": [{"origin": "/private/source", "local": "/private/source"}],
         }
         completion = {
+            "source_manifests": {},
             "capacity_preparations": [], "pressure_calibrations": [], "pilots": [], "oracles": [],
         }
         for index in range(3):
             host = f"host-{index + 1}"
+            completion["source_manifests"][host] = {
+                "path": f"/private/{host}/source.json",
+                "raw_sha256": str(index + 1) * 64,
+                "semantic_sha256": str(index + 2) * 64,
+                "source_tree_sha256": str(index + 3) * 64,
+            }
             completion["capacity_preparations"].append({
                 "host_id": host,
                 "completion": {"path": f"/private/{host}/capacity.json", "raw_sha256": str(index + 1) * 64},
@@ -526,7 +533,7 @@ class Source5PreparationInputTests(unittest.TestCase):
                 "final_spec": {"path": str(spec_path), "raw_sha256": spec_sha,
                                "semantic_sha256": "b" * 64, "preregistration_sha256": "c" * 64},
                 "final_plan": {"path": str(plan_path), "raw_sha256": plan_sha, "semantic_sha256": "d" * 64},
-                "source_manifests": {},
+                "source_manifests": completion["source_manifests"],
                 "capacity_preparations": completion["capacity_preparations"],
                 "pressure_calibrations": completion["pressure_calibrations"],
                 "pilots": completion["pilots"], "oracles": completion["oracles"],
@@ -686,7 +693,10 @@ class Source5PreparationInputTests(unittest.TestCase):
             {"host_id": host_id, "relative_path": f"sources/{host_id}.json", "sha256": str(index + 1) * 64}
             for index, host_id in enumerate(host_ids)
         ]
-        core = {"campaign_id": spec["campaign_id"]}
+        core = {
+            "campaign_id": spec["campaign_id"],
+            "hosts": [dict(host) for host in spec["hosts"]],
+        }
 
         with tempfile.TemporaryDirectory(prefix="source5-public-pilot-export-") as temporary:
             root = Path(temporary)

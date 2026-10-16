@@ -46,7 +46,7 @@ with campaign_host_lock(output_root, campaign_id, host_id) as lock:
 keeps its 15-context run under the campaign/host lock. Registration calls the
 captured `verify_capacity_completion` API, which replays all 15 entries and
 their bundles before sealing the registration event. Both records bind the
-original raw and semantic spec/plan pins, all three SourceV5 manifest pins,
+original raw and semantic spec/plan pins, the complete selected SourceV5 manifest cohort,
 host controls, boot identity, chronology/stage/controller/input/reader/producer
 module pins, the original schedule digest, and the completion, sealed ledger,
 and terminal-head pins. Registration must precede creation of the original

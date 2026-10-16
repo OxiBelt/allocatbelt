@@ -1229,9 +1229,19 @@ def _selected_prepared_host_binding(
         "allocatbelt.application-source5-preparation-completion.v1",
         "allocatbelt.application-source5-preparation-completion.v2",
     }, "prepared-input completion is not a closed V1/V2 generation")
+    source_manifests = completion.get("source_manifests")
+    require(type(source_manifests) is dict and len(source_manifests) in (2, 3) and
+            all(type(host_id) is str and host_id for host_id in source_manifests),
+            "prepared-input completion omits its complete original host manifest map")
+    expected_host_ids = set(source_manifests)
     pilots = completion.get("pilots")
-    require(type(pilots) is list and len(pilots) == 3,
-            "prepared-input completion does not preserve all three host bindings")
+    require(type(pilots) is list and len(pilots) == len(expected_host_ids),
+            "prepared-input completion does not preserve every host binding")
+    pilot_host_values = [item.get("host_id") for item in pilots if type(item) is dict]
+    require(len(pilot_host_values) == len(pilots) and
+            all(type(host_id) is str and host_id for host_id in pilot_host_values) and
+            set(pilot_host_values) == expected_host_ids,
+            "prepared-input pilot host set differs from its original manifest map")
     matches = [item for item in pilots if type(item) is dict and item.get("host_id") == host_id]
     require(len(matches) == 1,
             "prepared-input completion has no unique selected-host fixed binding")
@@ -1260,17 +1270,23 @@ def _selected_prepared_host_resource_proof(
     require(completion.get("schema") ==
             "allocatbelt.application-source5-preparation-completion.v2",
             "bounded resource proof requires preparation-completion.v2")
+    source_manifests = completion.get("source_manifests")
+    require(type(source_manifests) is dict and len(source_manifests) in (2, 3) and
+            all(type(host_id) is str and host_id for host_id in source_manifests),
+            "bounded completion omits its complete original host manifest map")
+    expected_host_ids = set(source_manifests)
     pilots = completion.get("pilots")
-    require(type(pilots) is list and len(pilots) == 3,
-            "bounded completion does not preserve the exact three-host pilot set")
+    require(type(pilots) is list and len(pilots) == len(expected_host_ids),
+            "bounded completion does not preserve the exact host pilot set")
     host_ids = sorted(item.get("host_id") for item in pilots
                       if type(item) is dict and type(item.get("host_id")) is str)
-    require(len(host_ids) == 3 and len(set(host_ids)) == 3,
-            "bounded completion does not preserve the exact three-host pilot set")
+    require(len(host_ids) == len(pilots) and set(host_ids) == expected_host_ids and
+            len(set(host_ids)) == len(expected_host_ids),
+            "bounded completion does not preserve the exact profile-bound host pilot set")
     budgets = exact(completion.get("resource_budgets"), set(host_ids),
                     "bounded completion per-host resource budget map")
     capacity_rows = completion.get("capacity_preparations")
-    require(type(capacity_rows) is list and len(capacity_rows) == 3,
+    require(type(capacity_rows) is list and len(capacity_rows) == len(expected_host_ids),
             "bounded completion omits a host capacity resource record")
     matches = [row for row in capacity_rows
                if type(row) is dict and row.get("host_id") == host_id]

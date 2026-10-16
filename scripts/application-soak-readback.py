@@ -2743,7 +2743,8 @@ def _verify_v5_campaign_inputs(recipe: dict[str, Any], source_audit: dict[str, A
     require(type(plan_semantic) is str and re.fullmatch(r"[0-9a-f]{64}", plan_semantic) is not None and plan_semantic == plan_pin["semantic_sha256"], "SourceV5 campaign plan semantic digest differs")
     input_root = Path(spec_pin["path"]).resolve(strict=True).parent
     source_refs = spec.get("source_manifests")
-    require(type(source_refs) is list and len(source_refs) == 3, "SourceV5 spec must name exactly three source manifests")
+    require(type(source_refs) is list and len(source_refs) in (2, 3),
+            "SourceV5 spec must name a complete supported source-manifest set")
     sources: dict[str, dict[str, Any]] = {}
     for index, reference_value in enumerate(source_refs):
         reference = exact_object(reference_value, {"host_id", "relative_path", "sha256"}, f"SourceV5 source reference[{index}]")

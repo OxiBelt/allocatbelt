@@ -1,7 +1,20 @@
 # Source5 pre-Spec input preparation
 
+The current qualification matrix selects SpecV3
+`qualification_profile: "two_kvm_hosts_v1"`: two KVM guests, with all original
+per-host gates and the three-hour Soak retained. Preparation core v3 preserves
+that selector and any existing capacity-floor selector. Core v1/v2 shapes
+remain unchanged. Omitting the qualification selector retains the legacy
+three-host matrix used by the examples below; existing generations cannot
+change their host membership or be retagged.
+
+The selected two-host generation has 30 capacity contexts, 480 feedback
+templates, 60 rate rows, and 240 oracle references. It retains 360 exploratory
+pilot jobs per host. These counts describe input closure, not completed runs
+or evidence of a performance gain.
+
 This additive lane closes the capacity-byte cycle before SpecV3 and PlanV3
-exist. It freezes one prospective three-host campaign generation, measures
+exist. It freezes one prospective campaign generation for the selected hosts, measures
 the 15 real application capacity contexts on a selected host, and later
 bridges those exact producer bytes into final inputs. The archived SpecV3,
 PlanV3, and capacity-stage-v1 validators remain unchanged.
@@ -939,9 +952,10 @@ keeps its original keys and static 64 MiB/s floor. This selector starts a new
 source/spec/preparation generation; it does not update or retag existing
 SourceV5 manifests, preparation intents, probes, or captures.
 
-The selected SpecV3 carries the same policy ID. Its preparation core uses the
-additive core-v2 schema and preserves that ID exactly; the old core-v1 shape is
-unchanged when selection is absent. The bridge requires all three pinned
+The selected SpecV3 carries the same policy ID. Its preparation core uses
+core v2 for the legacy host matrix or core v3 for the explicit two-KVM
+qualification profile, preserving both applicable selectors exactly. The old
+core-v1 shape is unchanged when selection is absent. The bridge requires all pinned
 SourceV5 feedback-policy artifacts to publish the same descriptor and binds
 the descriptor through the Rust source inventory, runtime source hashes,
 final SpecV3, preparation intent, and PlanV3 templates. Only external-pressure

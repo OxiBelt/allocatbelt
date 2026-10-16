@@ -196,7 +196,8 @@ def _load_source5_stack(
     expected_module_pins: dict[str, dict[str, dict[str, str]]] | None = None,
 ) -> tuple[types.ModuleType, types.ModuleType, types.ModuleType, dict[str, dict[str, tuple[bytes, Path, dict[str, Any]]]]]:
     """Capture the inventory, inputs and controller before executing any of them."""
-    _require(type(sources) is dict and len(sources) == 3, "SourceV5 stack requires all three source manifests")
+    _require(type(sources) is dict and len(sources) in (2, 3),
+             "SourceV5 stack requires a complete supported host manifest set")
     critical_paths = {
         "source_inventory": "scripts/application-source-inventory.py",
         "campaign_inputs": "scripts/application-campaign-inputs.py",
@@ -316,9 +317,12 @@ def _source_inputs(
     }, "preparation request")
     _require(request["schema"] == REQUEST_SCHEMA, "unsupported Source5 preparation request schema")
     hosts = request["core"].get("hosts") if type(request["core"]) is dict else None
-    _require(type(hosts) is list and len(hosts) == 3, "preparation request must pin the complete three-host core")
+    _require(type(hosts) is list and len(hosts) in (2, 3),
+             "preparation request must pin a complete supported host core")
     host_ids = [host.get("host_id") for host in hosts if type(host) is dict]
-    _require(len(host_ids) == 3 and len(set(host_ids)) == 3, "preparation request has missing or duplicate host IDs")
+    _require(len(host_ids) == len(hosts) and len(set(host_ids)) == len(host_ids) and
+             all(type(host_id) is str and host_id for host_id in host_ids),
+             "preparation request has missing or duplicate host IDs")
     manifest_pins = _exact(request["source_manifests"], set(host_ids), "preparation SourceV5 manifest pins")
     observed_pins = _exact(request["observed_hosts"], set(host_ids), "preparation observed-host pins")
 
@@ -335,6 +339,13 @@ def _source_inputs(
         source_raw_shas[host_id] = actual
 
     campaign, inputs, _inventory, _critical_modules = _load_source5_stack(source_values, source_root)
+    try:
+        validated_core = inputs._validate_preparation_core(request["core"])
+    except Exception as error:
+        raise PreparationError(f"preparation request core failed captured SourceV5 validation: {error}") from error
+    validated_host_ids = [host["host_id"] for host in validated_core["hosts"]]
+    _require(host_ids == validated_host_ids and set(source_values) == set(validated_host_ids),
+             "preparation request source and observed-host maps differ from its validated core")
     for host_id in host_ids:
         source = source_values[host_id]
         modules: dict[str, dict[str, str]] = {}
@@ -414,7 +425,7 @@ def build_preparation_intent(
 def read_preparation_intent(
     preparation_pin: dict[str, Any], source_root: Path, input_root: Path,
 ) -> tuple[dict[str, Any], dict[str, dict[str, Any]], dict[str, Any], dict[str, Any]]:
-    """Load and recheck intent, all three SourceV5 manifests and host records."""
+    """Load and recheck the full profile-bound SourceV5 host set."""
     source_root = _safe_root(source_root, "SourceV5 root")
     input_root = _safe_root(input_root, "preparation input root")
     pin = _exact(preparation_pin, {"path", "sha256"}, "preparation raw pin")
@@ -427,9 +438,11 @@ def read_preparation_intent(
     host_records = core_value.get("hosts") if type(core_value) is dict else None
     _require(type(source_module_pins) is dict and type(host_records) is list,
              "preparation source pins or core host list is malformed")
-    host_ids = {item.get("host_id") for item in host_records if type(item) is dict}
-    _require(len(host_ids) == 3 and set(source_module_pins) == host_ids,
-             "preparation source pins do not cover exactly the frozen three-host cohort")
+    host_ids = [item.get("host_id") for item in host_records if type(item) is dict]
+    _require(len(host_ids) == len(host_records) and len(host_ids) in (2, 3) and
+             all(type(host_id) is str and host_id for host_id in host_ids) and
+             len(set(host_ids)) == len(host_ids) and set(source_module_pins) == set(host_ids),
+             "preparation source pins do not cover the complete frozen host cohort")
     expected_module_pins: dict[str, dict[str, Any]] = {}
     for host_id, source_pin in value["source_pins"].items():
         _exact(source_pin, {"manifest", "modules", "artifacts"}, f"{host_id} preparation source record")
@@ -456,6 +469,13 @@ def read_preparation_intent(
     campaign, inputs, _inventory, _critical_modules = _load_source5_stack(
         source_values, source_root, expected_module_pins,
     )
+    try:
+        validated_core = inputs._validate_preparation_core(core_value)
+    except Exception as error:
+        raise PreparationError(f"preparation core failed captured SourceV5 validation: {error}") from error
+    _require(host_ids == [host["host_id"] for host in validated_core["hosts"]] and
+             set(source_values) == set(host_ids),
+             "preparation source pins differ from the validated core host order")
     for host_id, source in source_values.items():
         for role, relative in inputs.PREPARATION_MODULE_PATHS.items():
             raw, _module_path, entry = _capture_typed_source_file(source, source_root, relative, role)
@@ -516,9 +536,15 @@ def _read_pinned_json(
 
 def _verify_spec_source_refs(
     spec: dict[str, Any], preparation: dict[str, Any], sources: dict[str, dict[str, Any]],
+    validated_host_ids: set[str],
 ) -> None:
     refs = spec.get("source_manifests")
-    _require(type(refs) is list and len(refs) == 3, "SpecV3 source-manifest refs are incomplete")
+    _require(type(validated_host_ids) is set and len(validated_host_ids) in (2, 3) and
+             set(sources) == validated_host_ids and
+             {host.get("host_id") for host in spec.get("hosts", []) if type(host) is dict} == validated_host_ids,
+             "SpecV3 host set differs from its validated profile and source cohort")
+    _require(type(refs) is list and len(refs) == len(validated_host_ids),
+             "SpecV3 source-manifest refs are incomplete")
     observed: dict[str, tuple[str, str]] = {}
     for index, value in enumerate(refs):
         ref = _exact(value, {"host_id", "relative_path", "sha256"}, f"SpecV3 source-manifest ref[{index}]")
@@ -531,7 +557,41 @@ def _verify_spec_source_refs(
         host_id: (item["manifest"]["relative_path"], item["manifest"]["semantic_sha256"])
         for host_id, item in preparation["source_pins"].items()
     }
-    _require(observed == expected, "SpecV3 source manifest paths/semantic pins differ from the preparation generation")
+    _require(set(expected) == validated_host_ids and observed == expected,
+             "SpecV3 source manifest paths/semantic pins differ from the preparation generation")
+
+
+def _validate_prepared_context_matrix(
+    rows: object, expected_context_keys: set[tuple[str, str, str]],
+    label: str, *, nested_capacity_key: bool = False,
+) -> dict[tuple[str, str, str], dict[str, Any]]:
+    """Require one ordered-or-unordered row per exact frozen host/context key."""
+    _require(type(expected_context_keys) is set and bool(expected_context_keys),
+             f"{label} has no validated expected context set")
+    _require(type(rows) is list and len(rows) == len(expected_context_keys),
+             f"{label} does not contain every validated host/context row")
+    observed: dict[tuple[str, str, str], dict[str, Any]] = {}
+    for index, row_value in enumerate(rows):
+        _require(type(row_value) is dict, f"{label}[{index}] is malformed")
+        row = row_value
+        if nested_capacity_key:
+            capacity_key = row.get("capacity_key")
+            _require(type(capacity_key) is dict,
+                     f"{label}[{index}] has no capacity context key")
+            workload, profile = capacity_key.get("workload"), capacity_key.get("profile")
+        else:
+            workload, profile = row.get("workload"), row.get("profile")
+        host_id = row.get("host_id")
+        _require(all(type(value) is str and value
+                     for value in (host_id, workload, profile)),
+                 f"{label}[{index}] has a malformed host/context identity")
+        key = (host_id, workload, profile)
+        _require(key in expected_context_keys and key not in observed,
+                 f"{label}[{index}] has an unknown or duplicate host/context key")
+        observed[key] = row
+    _require(set(observed) == expected_context_keys,
+             f"{label} differs from the exact validated host/context set")
+    return observed
 
 
 def _relative_input_pin(root: Path, absolute_path: str | Path, raw_sha256: str, label: str) -> dict[str, str]:
@@ -866,7 +926,10 @@ def _prepared_host_binding_inputs(
         raise PreparationError(
             f"cannot project original SpecV3 onto preparation core: {error}",
         ) from error
-    _verify_spec_source_refs(spec, preparation, sources)
+    _verify_spec_source_refs(
+        spec, preparation, sources,
+        {host["host_id"] for host in core["hosts"]},
+    )
     _require(host_id in sources and any(
         type(item) is dict and item.get("host_id") == host_id
         for item in spec.get("hosts", [])
@@ -1476,7 +1539,7 @@ def _verify_pilot_overlay_generation(
     _require(source_scope["campaign_artifacts_root"] == str(campaign_artifacts_root) and
              source_scope["historical_runner_sha256"] == spec["runner_sha256"],
              "fixed-pair overlay campaign-artifact root or historical runner differs from the supplied generation")
-    manifest_pins = _exact(source_scope["manifests"], set(sources), "fixed-pair overlay three-host SourceV5 pins")
+    manifest_pins = _exact(source_scope["manifests"], set(sources), "fixed-pair overlay SourceV5 host pins")
     expected_manifests: dict[str, Any] = {}
     for source_host, source_value in sources.items():
         manifest = preparation["source_pins"][source_host]["manifest"]
@@ -1679,7 +1742,10 @@ def export_capacity_pilot(
         _require(core == preparation["core"], "initial SpecV3 changed a prospectively frozen preparation field")
     except Exception as error:
         raise PreparationError(f"initial SpecV3 does not match the preparation core: {error}") from error
-    _verify_spec_source_refs(spec, preparation, sources)
+    _verify_spec_source_refs(
+        spec, preparation, sources,
+        {host["host_id"] for host in core["hosts"]},
+    )
     _require(plan.get("spec_sha256") == campaign.digest_object(spec),
              "original initial PlanV3 was not frozen from the pinned initial SpecV3")
     runtime_sha = sources[host_id]["runtime_readback_validator"]["sha256"]
@@ -1885,18 +1951,19 @@ def _replay_prepared_capacity_inputs(
     source_root = _safe_root(SOURCE_ROOT, "SourceV5 root")
     preparation, sources, campaign, inputs = read_preparation_intent(preparation_pin, source_root, input_root)
     host_ids = [host["host_id"] for host in preparation["core"]["hosts"]]
-    require_three = len(host_ids) == 3
-    _require(require_three, "prepared-input completion requires the full three-host cohort")
+    _require(len(host_ids) in (2, 3) and len(set(host_ids)) == len(host_ids) and
+             set(host_ids) == set(sources),
+             "prepared-input completion requires the exact validated host cohort")
     bounded_preparation = resource_budget_pins is not None
     if bounded_preparation:
         resource_budget_pins = _exact(
             resource_budget_pins, set(host_ids), "caller-frozen per-host preparation budgets",
         )
 
-    # Replay all three actual SourceV5 capacity-preparation completions before
+    # Replay each actual SourceV5 capacity-preparation completion before
     # accepting any final SpecV3 evidence pins.
-    _require(type(capacity_completion_pins) is list and len(capacity_completion_pins) == 3,
-             "capacity preparation completion set must cover all three hosts")
+    _require(type(capacity_completion_pins) is list and len(capacity_completion_pins) == len(host_ids),
+             "capacity preparation completion set must cover every validated host")
     stage_relative = "scripts/application-capacity-stage.py"
     stage_raw, stage_path, stage_record = _capture_typed_source_file(
         sources[host_ids[0]], source_root, stage_relative, "capacity-stage verifier",
@@ -2047,7 +2114,7 @@ def _replay_prepared_capacity_inputs(
         for host_id in host_ids for cell in preparation["core"]["cells"]
     }
     _require(set(capacity_by_host) == set(host_ids) and set(capacity_entries) == expected_context_keys,
-             "capacity preparation completions do not cover all three hosts and 45 contexts")
+             "capacity preparation completions do not cover every host and its 15 contexts")
 
     return (
         prep_ref,
@@ -2079,9 +2146,9 @@ def replay_prepared_capacity_inputs_bounded(
     resource_budget_pins: dict[str, Any],
     source_root: Path, input_root: Path,
 ) -> dict[str, Any]:
-    """Replay the genuine three-host capacity cohort before rates or oracles exist.
+    """Replay the genuine profile-bound capacity cohort before rates or oracles exist.
 
-    Completeness here covers only the original 45 capacity contexts. It does
+    Completeness here covers only each host's original 15 capacity contexts. It does
     not authorize exploration, establish a final input generation, or pass
     any application qualification gate.
     """
@@ -2093,9 +2160,10 @@ def replay_prepared_capacity_inputs_bounded(
              Path(preparation_ref["path"]).is_absolute() and
              Path(preparation_ref["path"]).parent == checked_input,
              "capacity generation differs from its actual Source/input roots")
-    _require(type(capacity_completion_pins) is list and len(capacity_completion_pins) == 3 and
-             type(resource_budget_pins) is dict and len(resource_budget_pins) == 3,
-             "capacity generation requires all three caller-frozen bounded host inputs")
+    _require(type(capacity_completion_pins) is list and len(capacity_completion_pins) in (2, 3) and
+             type(resource_budget_pins) is dict and
+             len(resource_budget_pins) == len(capacity_completion_pins),
+             "capacity generation requires one caller-frozen bounded input per host")
     bounded_inputs = []
     for index, value in enumerate(capacity_completion_pins):
         item = _exact(value, {
@@ -2173,7 +2241,7 @@ def verify_prepared_capacity_generation_bounded(
              value["generation_sha256"] == pin["semantic_sha256"] == _sha256(_canonical(body)),
              "capacity generation schema, flags or raw/semantic pin differs")
     rows = value["capacity_preparations"]
-    _require(type(rows) is list and len(rows) == 3,
+    _require(type(rows) is list and len(rows) in (2, 3),
              "capacity generation omits an original host")
     capacity_inputs = []
     for index, row in enumerate(rows):
@@ -2256,7 +2324,10 @@ def complete_prepared_inputs(
     except Exception as error:
         raise PreparationError(f"final SpecV3 cannot be projected onto the frozen preparation core: {error}") from error
     _require(final_core == preparation["core"], "final SpecV3 changed a preparation-declared field")
-    _verify_spec_source_refs(final_spec, preparation, sources)
+    _verify_spec_source_refs(
+        final_spec, preparation, sources,
+        {host["host_id"] for host in final_core["hosts"]},
+    )
     _require(final_spec.get("campaign_id") == preparation["core"]["campaign_id"] and
              final_plan.get("campaign_id") == final_spec["campaign_id"] and
              final_plan.get("spec_sha256") == campaign.digest_object(final_spec),
@@ -2275,17 +2346,21 @@ def complete_prepared_inputs(
     _require(final_validation.get("rates_frozen") is True and final_validation.get("oracles_frozen") is True and
              final_validation.get("plan_sha256") in (None, final_plan.get("plan_sha256")),
              "final SpecV3 rate/oracle slots are not complete")
+    validated_host_ids = final_validation.get("host_ids")
+    _require(type(validated_host_ids) is list and
+             set(validated_host_ids) == set(host_ids),
+             "final SpecV3 validation changed the preparation host set")
+    expected_context_count = len(validated_host_ids) * 15
+    _require(len(expected_context_keys) == expected_context_count,
+             "validated SpecV3 host/context set is not the exact 15-context matrix")
 
     # Every final capacity input must cite the exact earlier TSV and producer
     # receipt, plus the host's complete pre-Spec ledger completion.
     final_templates = final_spec.get("qualification_inputs", {}).get("capacity_templates")
-    _require(type(final_templates) is list and len(final_templates) == 45,
-             "final SpecV3 capacity evidence matrix is incomplete")
-    final_template_map: dict[tuple[str, str, str], dict[str, Any]] = {}
-    for item in final_templates:
-        key = (item["host_id"], item["workload"], item["profile"])
-        _require(key not in final_template_map, "final SpecV3 capacity evidence repeats a context")
-        final_template_map[key] = item
+    final_template_map = _validate_prepared_context_matrix(
+        final_templates, expected_context_keys,
+        "final SpecV3 capacity evidence matrix",
+    )
     preparation_template_map = {
         (item["host_id"], item["workload"], item["profile"]): item
         for item in preparation["capacity_templates"]
@@ -2320,9 +2395,11 @@ def complete_prepared_inputs(
             "stage_completion_raw_sha256": prep_completion["sha256"],
         })
 
-    # Replay the 45 host/context v2 scopes against each exact prepared TSV.
-    _require(type(pressure_calibration_pins) is list and len(pressure_calibration_pins) == 45,
-             "context pressure calibration set must cover all 45 host/workload/profile keys")
+    # Replay every host/context v2 scope against its exact prepared TSV.
+    _validate_prepared_context_matrix(
+        pressure_calibration_pins, expected_context_keys,
+        "context pressure calibration set", nested_capacity_key=True,
+    )
     pressure_reader_relative = "scripts/application-pressure-readback.py"
     pressure_reader_raw, pressure_reader_path, pressure_reader_record = _capture_typed_source_file(
         sources[host_ids[0]], source_root, pressure_reader_relative, "pressure-scope reader",
@@ -2338,12 +2415,10 @@ def complete_prepared_inputs(
         for item in preparation["condition_intensities"]
     }
     final_conditions = final_spec.get("qualification_inputs", {}).get("pressure_conditions")
-    _require(type(final_conditions) is list and len(final_conditions) == 45,
-             "final SpecV3 pressure-condition matrix is incomplete")
-    final_condition_map = {
-        (item["host_id"], item["capacity_key"]["workload"], item["capacity_key"]["profile"]): item
-        for item in final_conditions
-    }
+    final_condition_map = _validate_prepared_context_matrix(
+        final_conditions, expected_context_keys,
+        "final SpecV3 pressure-condition matrix", nested_capacity_key=True,
+    )
     pressure_seen: set[tuple[str, str, str]] = set()
     pressure_records: list[dict[str, Any]] = []
     filled_pressure: list[dict[str, Any]] = []
@@ -2533,7 +2608,8 @@ def complete_prepared_inputs(
 
     # Replay each host's original 360 APP fixed-pair records through the same
     # exporter, then derive the unchanged six-pair 70/90 percent medians.
-    _require(type(pilot_pins) is list and len(pilot_pins) == 3, "capacity pilot set must cover all three hosts")
+    _require(type(pilot_pins) is list and len(pilot_pins) == len(host_ids),
+             "capacity pilot set must cover every validated host")
     pilot_seen: set[str] = set()
     pilot_outputs: list[dict[str, Any]] = []
     derived_rates: dict[tuple[str, str, str, int], dict[str, Any]] = {}
@@ -2597,8 +2673,8 @@ def complete_prepared_inputs(
             "fixed_pair_evidence_sha256": _sha256(_canonical(replayed_pin["pair_evidence"])),
             "replay_raw_sha256": replayed_pin["raw_sha256"],
         })
-    _require(pilot_seen == set(host_ids) and len(derived_rates) == 3 * 15 * 2,
-             "capacity pilot set does not produce the complete three-host 70/90 rate matrix")
+    _require(pilot_seen == set(host_ids) and len(derived_rates) == len(host_ids) * 15 * 2,
+             "capacity pilot set does not produce every host's complete 70/90 rate matrix")
     final_rate_map = {
         (item["host_id"], item["family"], item["profile"], item["load_percent"]): item
         for item in final_spec["rates"]
@@ -2608,7 +2684,8 @@ def complete_prepared_inputs(
 
     # Verify all producer-generated oracle rows and bind the complete 360-row
     # map by the original host manifest raw provenance.
-    _require(type(oracle_pins) is list and len(oracle_pins) == 3, "oracle manifest set must cover all three hosts")
+    _require(type(oracle_pins) is list and len(oracle_pins) == len(host_ids),
+             "oracle manifest set must cover every validated host")
     oracle_seen: set[str] = set()
     oracle_outputs: list[dict[str, Any]] = []
     verified_oracles: dict[tuple[str, str, str, str, int], dict[str, Any]] = {}
@@ -2674,8 +2751,9 @@ def complete_prepared_inputs(
             "preregistration_sha256": manifest["spec_preregistration_sha256"],
             "oracle_count": len(rows_by_key), "oracles": list(entries),
         })
-    _require(oracle_seen == set(host_ids) and len(verified_oracles) == 3 * 15 * 4 * 2,
-             "oracle manifests do not establish the full 360-reference matrix")
+    _require(oracle_seen == set(host_ids) and
+             len(verified_oracles) == len(host_ids) * 15 * 4 * 2,
+             "oracle manifests do not establish every host's full 120-reference matrix")
     _require(final_oracles == verified_oracles, "final SpecV3 oracle map contains an unverified or substituted reference")
 
     final_plan_path = Path(_exact(final_plan_pin, {"path", "sha256"}, "final PlanV3 raw pin")["path"])
@@ -2759,9 +2837,10 @@ def complete_prepared_inputs_bounded(
     captured_pilot_read_providers: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Bridge only independently replayed v2 bounded capacity completions."""
-    _require(type(capacity_completion_pins) is list and len(capacity_completion_pins) == 3,
-             "bounded preparation bridge requires the complete three-host capacity set")
-    _require(type(resource_budget_pins) is dict and len(resource_budget_pins) == 3,
+    _require(type(capacity_completion_pins) is list and len(capacity_completion_pins) in (2, 3),
+             "bounded preparation bridge requires a complete supported capacity set")
+    _require(type(resource_budget_pins) is dict and
+             len(resource_budget_pins) == len(capacity_completion_pins),
              "bounded preparation bridge requires one caller-frozen budget per host")
     bounded_capacity_inputs: list[dict[str, Any]] = []
     for index, value in enumerate(capacity_completion_pins):
@@ -2785,13 +2864,20 @@ def complete_prepared_inputs_bounded(
 
 def _prepared_input_replay_arguments(completion: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
     """Reconstruct original verifier inputs without changing any raw pin."""
-    _require(type(completion.get("capacity_preparations")) is list and len(completion["capacity_preparations"]) == 3 and
-             type(completion.get("pressure_calibrations")) is list and len(completion["pressure_calibrations"]) == 45 and
-             type(completion.get("pilots")) is list and len(completion["pilots"]) == 3 and
-             type(completion.get("oracles")) is list and len(completion["oracles"]) == 3,
-             "prepared-input completion omits a host or context evidence generation")
+    source_manifests = completion.get("source_manifests")
+    _require(type(source_manifests) is dict and len(source_manifests) in (2, 3),
+             "prepared-input completion omits its original host manifest map")
+    host_ids = set(source_manifests)
+    _require(type(completion.get("capacity_preparations")) is list and
+             len(completion["capacity_preparations"]) == len(host_ids) and
+             type(completion.get("pressure_calibrations")) is list and
+             len(completion["pressure_calibrations"]) == len(host_ids) * 15 and
+             type(completion.get("pilots")) is list and len(completion["pilots"]) == len(host_ids) and
+             type(completion.get("oracles")) is list and len(completion["oracles"]) == len(host_ids),
+             "prepared-input completion omits a host or profile-bound context evidence generation")
     capacity_inputs: list[dict[str, Any]] = []
     resource_budget_pins: dict[str, Any] = {}
+    capacity_host_ids: set[str] = set()
     bounded_completion = completion.get("schema") == PREPARED_BOUNDED_COMPLETION_SCHEMA
     for index, record_value in enumerate(completion["capacity_preparations"]):
         record_fields = {
@@ -2802,6 +2888,11 @@ def _prepared_input_replay_arguments(completion: dict[str, Any]) -> dict[str, li
             record_fields |= {"resource_budget", "resource_monitor"}
         record = _exact(record_value, record_fields,
                         f"prepared-input capacity completion[{index}]")
+        _require(record["host_id"] in host_ids,
+                 f"prepared-input capacity completion[{index}] has an unknown host")
+        _require(record["host_id"] not in capacity_host_ids,
+                 "prepared-input capacity completion repeats a host")
+        capacity_host_ids.add(record["host_id"])
         completion_file = _exact(record["completion"], {"path", "raw_sha256"}, f"capacity completion[{index}] raw pin")
         host_receipt = _exact(record["host_verification"], {
             "path", "raw_sha256", "receipt_sha256",
@@ -2826,6 +2917,7 @@ def _prepared_input_replay_arguments(completion: dict[str, Any]) -> dict[str, li
         capacity_inputs.append(capacity_input)
 
     pressure_inputs: list[dict[str, Any]] = []
+    pressure_counts: dict[str, int] = {host_id: 0 for host_id in host_ids}
     pressure_input_fields = {
         "host_id", "condition_id", "capacity_key", "condition_pin", "context_policy_pin",
         "calibration_pin", "calibration_receipt_pin", "observed_host_pin", "capacity_bundle_pin",
@@ -2839,18 +2931,25 @@ def _prepared_input_replay_arguments(completion: dict[str, Any]) -> dict[str, li
             "context_policy", "calibration", "receipt", "scope_receipt", "context_policy_sha256",
             "capacity_bundle_pin", "evidence_path_map",
         }, f"prepared-input pressure calibration[{index}]")
+        _require(record["host_id"] in host_ids,
+                 f"prepared-input pressure calibration[{index}] has an unknown host")
+        pressure_counts[record["host_id"]] += 1
         reconstructed = {key: record[key] for key in pressure_input_fields if key in record}
         _require(set(reconstructed) == pressure_input_fields,
                  f"prepared-input pressure calibration[{index}] omits original raw pins")
         pressure_inputs.append(reconstructed)
 
     pilot_inputs: list[dict[str, Any]] = []
+    pilot_host_ids: set[str] = set()
     for index, record_value in enumerate(completion["pilots"]):
         record = _exact(record_value, {
             "host_id", "campaign_artifacts_root", "manifest", "semantic_sha256", "initial_spec", "initial_plan",
             "prepared_host_binding", "spec_preregistration_sha256", "fixed_pair_count", "fixed_pair_evidence",
             "fixed_pair_evidence_sha256", "replay_raw_sha256",
         }, f"prepared-input pilot[{index}]")
+        _require(record["host_id"] in host_ids and record["host_id"] not in pilot_host_ids,
+                 f"prepared-input pilot[{index}] has an unknown or repeated host")
+        pilot_host_ids.add(record["host_id"])
         prepared_host_binding = _validate_prepared_fixed_host_binding(record["prepared_host_binding"])
         pair_evidence = record["fixed_pair_evidence"]
         _require(type(pair_evidence) is list and len(pair_evidence) == 360,
@@ -2889,17 +2988,24 @@ def _prepared_input_replay_arguments(completion: dict[str, Any]) -> dict[str, li
         })
 
     oracle_inputs: list[dict[str, Any]] = []
+    oracle_host_ids: set[str] = set()
     for index, record_value in enumerate(completion["oracles"]):
         record = _exact(record_value, {
             "host_id", "manifest", "artifact_root", "semantic_sha256", "source_manifest_semantic_sha256",
             "preregistration_sha256", "oracle_count", "oracles",
         }, f"prepared-input oracle manifest[{index}]")
+        _require(record["host_id"] in host_ids and record["host_id"] not in oracle_host_ids,
+                 f"prepared-input oracle manifest[{index}] has an unknown or repeated host")
+        oracle_host_ids.add(record["host_id"])
         manifest = _exact(record["manifest"], {"path", "raw_sha256"}, f"oracle manifest[{index}] raw pin")
         oracle_inputs.append({
             "host_id": record["host_id"],
             "manifest": {"path": manifest["path"], "sha256": manifest["raw_sha256"]},
             "artifact_root": record["artifact_root"],
         })
+    _require(capacity_host_ids == pilot_host_ids == oracle_host_ids == host_ids and
+             all(count == 15 for count in pressure_counts.values()),
+             "prepared-input completion records do not preserve the exact per-host evidence matrix")
     result = {
         "capacity_completion_pins": capacity_inputs,
         "pressure_calibration_pins": pressure_inputs,
