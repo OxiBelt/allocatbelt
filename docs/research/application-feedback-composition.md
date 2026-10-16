@@ -111,6 +111,23 @@ and the existing successful fixed predecessor before it can confirm a cell.
 Expectations V5 and V6 do not change fixed-family rate policy, historical V1–V4
 expectations, original nonces, or the original campaign matrix.
 
+## First calibrated ProbeV2 output
+
+`emit_initial_calibrated_probe_v2(request_pin)` and the `emit-initial-probe`
+CLI produce the first construction stdout before a Spec or Plan exists. The
+distinct initial request contains no prior probe or invented digest. Preflight
+verifies the full SourceV5/artifact set, native ELF identity, prepared capacity
+bundle, observed host and live controls before the Source-pinned Fixed owner
+launches the exact constructor under finite output and TMP budgets.
+
+The owner return is retained before output validation. Successful output must
+pass the existing ProbeV2/policy checks, fresh input rechecks and exact private
+output-layout checks. The distinct emission receipt remains ineligible;
+`verify_initial_calibrated_probe_emission` replays resident origin-host evidence
+without launching its APP constructor again. It provides no portable archive
+replay or campaign callback authority. The later capture-v2 operation still
+performs its separate equality rerun using the genuinely emitted probe pin.
+
 ## Owned ProbeV2 capture and offline replay
 
 `capture_calibrated_probe_v2(request, request_raw_sha256, observed_host_pin,

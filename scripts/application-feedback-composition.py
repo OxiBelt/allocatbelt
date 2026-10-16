@@ -24,6 +24,9 @@ from typing import Any, Callable
 
 REQUEST_SCHEMA = "allocatbelt.application-feedback-composition-request.v1"
 REQUEST_SCHEMA_V2 = "allocatbelt.application-feedback-composition-request.v2"
+INITIAL_PROBE_REQUEST_SCHEMA = "allocatbelt.application-feedback-initial-probe-request.v1"
+INITIAL_PROBE_EMISSION_SCHEMA = "allocatbelt.application-feedback-initial-probe-emission.v1"
+INITIAL_PROBE_EMISSION_ROLE = "initial_calibrated_constructor_only"
 POLICY_SCHEMA = "allocatbelt.application-feedback-resolved-policy.v1"
 POLICY_SCHEMA_V2 = "allocatbelt.application-feedback-resolved-policy.v2"
 RECEIPT_SCHEMA = "allocatbelt.application-feedback-composition-receipt.v1"
@@ -55,6 +58,17 @@ PROBE_CAPTURE_START_ROLE = "calibrated_construction_probe"
 PROBE_OWNER_RESULT_SCHEMA = "allocatbelt.application-feedback-probe-owner-result.v1"
 PROBE_TMPDIR_INVENTORY_SCHEMA = "allocatbelt.application-feedback-probe-tmpdir-inventory.v1"
 PROBE_CAPTURE_FAILURE_SCHEMA = "allocatbelt.application-feedback-probe-capture-failure.v1"
+INITIAL_PROBE_EMISSION_RECEIPT_FIELDS = {
+    "schema", "role", "verification_scope", "request_pin", "source_manifest", "context", "allocator",
+    "capacity_bundle", "capacity_floor_policy_id", "binary", "observed_host",
+    "origin_facts_before", "origin_facts_after", "requested_launch", "start_callback_count",
+    "start_callback_proof", "owner_result_pin", "owner_supervision_sha256",
+    "stdout", "stderr", "construction_probe", "resolved_policy_sha256",
+    "timeout_ns", "storage_budget", "output_mount_initial", "output_mount_final",
+    "tmpdir_initial", "tmpdir_final", "tmpdir_inventory_pin", "owner_modules",
+    "exit_status", "qualification_eligible", "execution_ready",
+    "controller_chronology_proven", "receipt_sha256",
+}
 MAX_PROBE_OWNER_RESULT_BYTES = 16 * 1024 * 1024
 MAX_PROBE_TMPDIR_INVENTORY_BYTES = 16 * 1024 * 1024
 MAX_PROBE_CAPTURE_FAILURE_BYTES = 64 * 1024
@@ -114,6 +128,23 @@ def absolute_path(value: object, label: str) -> Path:
     path = Path(value)
     require(path.is_absolute() and str(path) == value and ".." not in PurePosixPath(value).parts, f"{label} must be normalized and absolute")
     return path
+
+
+def _path_is_within(root: Path, candidate: Path, label: str) -> bool:
+    root_path = absolute_path(str(root), f"{label} root")
+    candidate_path = absolute_path(str(candidate), f"{label} candidate")
+    try:
+        resolved_root = root_path.resolve(strict=True)
+        resolved_candidate = candidate_path.resolve(strict=True)
+    except OSError as error:
+        raise CompositionError(f"cannot resolve closed {label} paths: {error}") from error
+    require(resolved_root == root_path and resolved_candidate == candidate_path,
+            f"{label} root/candidate traverses an alias")
+    try:
+        resolved_candidate.relative_to(resolved_root)
+        return True
+    except ValueError:
+        return False
 
 
 def _unique(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -349,22 +380,29 @@ def _pinned_source_module(source: dict[str, Any], key: str, relative: str, label
     return module
 
 
-def _load_verified_inputs(request: dict[str, Any]) -> tuple[Any, Any, dict[str, Any], dict[str, Any], dict[str, Any]]:
+def _load_source_context_inputs(
+    request: dict[str, Any], allocator: object,
+) -> tuple[Any, Any, dict[str, Any], dict[str, Any], dict[str, Any]]:
     source_pin = exact(request["source_manifest"], {"path", "raw_sha256"}, "SourceV5 manifest pin")
     source_path = absolute_path(source_pin["path"], "SourceV5 manifest path")
-    source, source_raw, source_raw_sha = _read_canonical(source_path, "SourceV5 manifest", source_pin["raw_sha256"])
+    source, _source_raw, _source_raw_sha = _read_canonical(
+        source_path, "SourceV5 manifest", source_pin["raw_sha256"],
+    )
     require(source.get("schema") == SOURCE_SCHEMA_V5, "composition requires a SourceV5 manifest")
     source_root = absolute_path(request["source_root"], "SourceV5 source root")
     require(source_root == SOURCE_ROOT, "composition source root must be the root containing its pinned harness siblings")
     context = exact(request["context"], {"host_id", "workload", "profile", "calibration_id"}, "composition context")
     require(all(type(context[key]) is str and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,95}", context[key]) for key in context), "composition context has an invalid token")
     reader = _pinned_source_module(source, "feedback_validator", FEEDBACK_READER, "feedback validator", MAX_METADATA_BYTES)
-    probe_pin = exact(request["construction_probe"], {"path", "raw_sha256", "allocator", "binary_sha256"}, "construction probe pin")
-    require(probe_pin["allocator"] in reader.APPLICATION_ALLOCATOR_LABELS, "construction probe allocator is outside the original application artifact set")
+    require(type(allocator) is str and allocator in reader.APPLICATION_ALLOCATOR_LABELS,
+            "SourceV5 selected allocator is outside the original application artifact set")
+    artifact = exact(source.get("artifacts", {}).get(allocator), {"path", "sha256"},
+                     "SourceV5 selected application artifact")
+    binary_sha = digest(artifact["sha256"], "SourceV5 selected application artifact SHA-256")
     identity = {
         "host_id": context["host_id"], "workload": context["workload"], "profile": context["profile"],
-        "allocator": probe_pin["allocator"], "source_sha256": source["source"]["source_tree_sha256"],
-        "binary_sha256": digest(probe_pin["binary_sha256"], "construction probe binary SHA-256"),
+        "allocator": allocator, "source_sha256": source["source"]["source_tree_sha256"],
+        "binary_sha256": binary_sha,
     }
     require(source["build"]["host_id"] == context["host_id"], "composition host differs from SourceV5 build host")
     minimal = {"schema": EXPECTATION_SCHEMA_V5, "mode": "pressure_validation", "identity": identity}
@@ -373,6 +411,17 @@ def _load_verified_inputs(request: dict[str, Any]) -> tuple[Any, Any, dict[str, 
     except Exception as error:
         raise CompositionError(f"pinned SourceV5 full verifier rejected the source: {error}") from error
     producer = _pinned_source_module(source, "byte_capacity_producer", CAPACITY_PRODUCER, "byte-capacity producer", MAX_METADATA_BYTES)
+    return reader, producer, source, context, identity
+
+
+def _load_verified_inputs(request: dict[str, Any]) -> tuple[Any, Any, dict[str, Any], dict[str, Any], dict[str, Any]]:
+    probe_pin = exact(request["construction_probe"], {"path", "raw_sha256", "allocator", "binary_sha256"}, "construction probe pin")
+    reader, producer, source, context, identity = _load_source_context_inputs(
+        request, probe_pin["allocator"],
+    )
+    require(digest(probe_pin["binary_sha256"], "construction probe binary SHA-256") ==
+            identity["binary_sha256"],
+            "construction probe binary differs from its SourceV5 application artifact")
     return reader, producer, source, context, identity
 
 
@@ -1900,6 +1949,1552 @@ def capture_calibrated_probe_v2(
         raise
 
 
+def _read_initial_probe_request(request_pin_value: object) -> tuple[dict[str, Any], dict[str, str], bytes]:
+    request_pin = exact(request_pin_value, {"path", "raw_sha256"},
+                         "initial ProbeV2 request pin")
+    request_path = absolute_path(request_pin["path"], "initial ProbeV2 request path")
+    request_sha = digest(request_pin["raw_sha256"], "initial ProbeV2 request raw SHA-256")
+    request, raw, actual = _read_canonical(
+        request_path, "initial ProbeV2 request", request_sha,
+    )
+    try:
+        info = request_path.stat(follow_symlinks=False)
+    except OSError as error:
+        raise CompositionError(f"cannot inspect initial ProbeV2 request: {error}") from error
+    require(stat.S_ISREG(info.st_mode) and info.st_uid == os.getuid() and
+            info.st_nlink == 1 and stat.S_IMODE(info.st_mode) == 0o600,
+            "initial ProbeV2 request must be an owned immutable mode-0600 regular file")
+    return request, {"path": str(request_path), "raw_sha256": actual}, raw
+
+
+def _validate_initial_probe_request(value: object) -> dict[str, Any]:
+    base_keys = {
+        "schema", "source_root", "source_manifest", "context", "allocator",
+        "capacity_bundle", "observed_host", "output_root", "emission_id",
+        "timeout_ns", "storage_budget",
+    }
+    request = exact(value, base_keys | ({"capacity_floor_policy_id"}
+                  if type(value) is dict and "capacity_floor_policy_id" in value else set()),
+                   "initial ProbeV2 request")
+    require(request["schema"] == INITIAL_PROBE_REQUEST_SCHEMA,
+            "unsupported initial ProbeV2 request schema")
+    source_root = absolute_path(request["source_root"], "initial ProbeV2 SourceV5 root")
+    require(source_root == SOURCE_ROOT,
+            "initial ProbeV2 SourceV5 root must contain this executing helper")
+    source_pin = exact(request["source_manifest"], {"path", "raw_sha256"},
+                       "initial ProbeV2 SourceV5 manifest pin")
+    absolute_path(source_pin["path"], "initial ProbeV2 SourceV5 manifest path")
+    digest(source_pin["raw_sha256"], "initial ProbeV2 SourceV5 manifest raw SHA-256")
+    context = exact(request["context"], {
+        "host_id", "workload", "profile", "calibration_id",
+    }, "initial ProbeV2 context")
+    for key, item in context.items():
+        require(type(item) is str and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,95}", item)
+                is not None, f"initial ProbeV2 context {key} is malformed")
+    allocator = request["allocator"]
+    require(type(allocator) is str and allocator in (
+        "allocatbelt", "mimalloc-secure", "mimalloc-standard", "system",
+    ), "initial ProbeV2 allocator is outside the original application artifact set")
+    bundle = exact(request["capacity_bundle"], {"request", "artifact", "receipt"},
+                   "initial ProbeV2 capacity bundle")
+    bundle_paths: list[str] = []
+    for name, item in bundle.items():
+        pin = exact(item, {"path", "raw_sha256"}, f"initial ProbeV2 capacity {name} pin")
+        absolute_path(pin["path"], f"initial ProbeV2 capacity {name} path")
+        digest(pin["raw_sha256"], f"initial ProbeV2 capacity {name} raw SHA-256")
+        bundle_paths.append(pin["path"])
+    require(len(set(bundle_paths)) == 3,
+            "initial ProbeV2 capacity request, artifact, and receipt paths must be distinct")
+    host_pin = exact(request["observed_host"], {"path", "raw_sha256"},
+                     "initial ProbeV2 observed-host pin")
+    absolute_path(host_pin["path"], "initial ProbeV2 observed-host path")
+    digest(host_pin["raw_sha256"], "initial ProbeV2 observed-host raw SHA-256")
+    require(host_pin["path"] not in bundle_paths and source_pin["path"] not in bundle_paths and
+            host_pin["path"] != source_pin["path"],
+            "initial ProbeV2 source, host, and capacity inputs must have distinct paths")
+    absolute_path(request["output_root"], "initial ProbeV2 output root")
+    require(type(request["emission_id"]) is str and
+            re.fullmatch(r"[a-f0-9]{32}", request["emission_id"]) is not None,
+            "initial ProbeV2 emission ID must be a fresh lowercase 128-bit token")
+    require(type(request["timeout_ns"]) is int and
+            0 < request["timeout_ns"] <= MAX_PROBE_CAPTURE_TIMEOUT_NS,
+            "initial ProbeV2 timeout must be a positive bound of at most 30 seconds")
+    _validate_probe_storage_budget(request["storage_budget"])
+    if "capacity_floor_policy_id" in request:
+        require(request["capacity_floor_policy_id"] == CAPACITY_FLOOR_POLICY_ID,
+                "initial ProbeV2 capacity floor policy ID is unknown")
+    return request
+
+
+def _validate_probe_storage_budget(value: object) -> dict[str, int]:
+    budget = exact(value, {
+        "tmpdir_bytes", "tmpdir_inodes", "stdout_bytes", "stderr_bytes",
+        "owner_result_bytes", "inventory_bytes", "failure_bytes", "receipt_bytes",
+        "output_inodes",
+    }, "initial ProbeV2 storage budget")
+    for key, number in budget.items():
+        require(type(number) is int and number > 0,
+                f"initial ProbeV2 storage budget {key} must be a positive integer")
+    require(budget["tmpdir_bytes"] <= 1024 * 1024 * 1024 and
+            budget["tmpdir_inodes"] <= 4096 and
+            budget["stdout_bytes"] <= 512 * 1024 and
+            budget["stderr_bytes"] <= MAX_PROBE_STDERR_BYTES and
+            budget["owner_result_bytes"] == MAX_PROBE_OWNER_RESULT_BYTES and
+            budget["inventory_bytes"] == MAX_PROBE_TMPDIR_INVENTORY_BYTES and
+            budget["failure_bytes"] == MAX_PROBE_CAPTURE_FAILURE_BYTES and
+            budget["receipt_bytes"] <= MAX_PROBE_CAPTURE_RECEIPT_BYTES and
+            7 <= budget["output_inodes"] <= 4096,
+            "initial ProbeV2 storage budget exceeds its fixed finite owner limits")
+    return budget
+
+
+def _validate_initial_probe_floor_policy(
+    request: dict[str, Any], source: dict[str, Any], reader: Any,
+) -> str | None:
+    artifact = exact(source.get("feedback_policy"), {"schema", "policy", "policy_sha256"},
+                     "SourceV5 feedback policy artifact")
+    body = artifact["policy"]
+    if artifact["schema"] == "allocatbelt.application-feedback-policy-artifact.v1":
+        require("capacity_floor_policy_id" not in request,
+                "initial ProbeV2 request selects a floor absent from its SourceV5 policy")
+        return None
+    require(artifact["schema"] == "allocatbelt.application-feedback-policy-artifact.v2",
+            "initial ProbeV2 SourceV5 feedback policy schema is unsupported")
+    descriptor = reader._validate_capacity_floor_policy_descriptor(
+        body.get("capacity_floor_policy"),
+    )
+    selected = request.get("capacity_floor_policy_id")
+    require(selected == descriptor["policy_id"] == CAPACITY_FLOOR_POLICY_ID,
+            "initial ProbeV2 floor selection differs from the Source-published policy")
+    return selected
+
+
+def _initial_probe_host_context(
+    host_pin: dict[str, str], context: dict[str, Any], source: dict[str, Any],
+    capacity_stage: Any,
+) -> tuple[dict[str, Any], str, dict[str, Any]]:
+    host_path = absolute_path(host_pin["path"], "initial ProbeV2 observed-host path")
+    host, _host_raw, host_sha = _read_canonical(
+        host_path, "initial ProbeV2 observed-host context", host_pin["raw_sha256"],
+    )
+    host = exact(host, {
+        "schema", "host_id", "boot_id_sha256", "controls_sha256", "controls",
+        "kernel_release", "cpu_model", "cpu_affinity", "network_namespace_inode",
+    }, "initial ProbeV2 observed-host context")
+    require(host["schema"] == "allocatbelt.application-capacity-host-context.v1" and
+            host["host_id"] == context["host_id"],
+            "initial ProbeV2 observed-host identity differs from the Source-selected context")
+    controls = exact(host["controls"], {
+        "cpu_model", "microcode_sha256", "kernel_release", "governor",
+        "frequency_policy", "boost_policy", "cpu_set", "numa_policy",
+        "cgroup_policy_sha256", "background_load_policy_sha256",
+        "x86_64_v3_capability_sha256", "target_triple", "target_cpu",
+    }, "initial ProbeV2 observed host controls")
+    require(host["controls_sha256"] == sha256(canonical(controls)) and
+            host["kernel_release"] == controls["kernel_release"] and
+            host["cpu_model"] == controls["cpu_model"] and
+            controls["target_triple"] == source["build"]["target_triple"] and
+            controls["target_cpu"] == source["build"]["target_cpu"],
+            "initial ProbeV2 observed-host controls differ from their digest or Source build target")
+    digest(host["boot_id_sha256"], "initial ProbeV2 boot ID SHA-256")
+    affinity = host["cpu_affinity"]
+    require(type(affinity) is list and bool(affinity) and
+            all(type(cpu) is int and 0 <= cpu <= 65_535 for cpu in affinity) and
+            affinity == sorted(set(affinity)) and
+            capacity_stage._parse_cpu_set(controls["cpu_set"]) == affinity,
+            "initial ProbeV2 observed affinity differs from its canonical frozen CPU set")
+    uint(host["network_namespace_inode"], "initial ProbeV2 network namespace inode", positive=True)
+    origin = _live_probe_origin_facts(host)
+    try:
+        require(capacity_stage._live_cpu_model() == host["cpu_model"] and
+                capacity_stage._boot_id_sha256() == host["boot_id_sha256"],
+                "initial ProbeV2 live CPU model or boot identity differs from the observed host")
+    except Exception as error:
+        raise CompositionError(f"initial ProbeV2 live host check failed: {error}") from error
+    return host, host_sha, origin
+
+
+def _validate_initial_probe_start_proof(
+    value: object, argv: list[str], environment: dict[str, str],
+) -> dict[str, Any]:
+    start = exact(value, {
+        "pid", "start_ticks", "requested_argv", "requested_argv_sha256",
+        "environment_sha256",
+    }, "FixedR8 initial ProbeV2 minimal start proof")
+    uint(start["pid"], "initial ProbeV2 owner PID", positive=True,
+         maximum=(1 << 31) - 1)
+    uint(start["start_ticks"], "initial ProbeV2 owner start ticks", positive=True,
+         maximum=(1 << 64) - 1)
+    require(start["requested_argv"] == argv and
+            start["requested_argv_sha256"] == sha256(canonical(argv)) and
+            start["environment_sha256"] == sha256(canonical(environment)),
+            "initial ProbeV2 minimal start proof differs from the actual requested launch")
+    return start
+
+
+def _validate_initial_probe_binary_identity(
+    value: object, *, expected_path: Path, source_relative_path: str,
+    expected_sha256: str, expected_descriptor: dict[str, int], maximum_size: int,
+) -> dict[str, int]:
+    binary = exact(value, {
+        "path", "source_relative_path", "raw_sha256", "device", "inode", "size",
+    }, "initial ProbeV2 opened binary identity")
+    require(binary["path"] == str(expected_path) and
+            binary["source_relative_path"] == source_relative_path and
+            binary["raw_sha256"] == expected_sha256,
+            "initial ProbeV2 binary path/hash differs from its SourceV5 artifact")
+    descriptor = {
+        "device": uint(binary["device"], "initial ProbeV2 opened binary device", positive=True),
+        "inode": uint(binary["inode"], "initial ProbeV2 opened binary inode", positive=True),
+        "size": uint(binary["size"], "initial ProbeV2 opened binary size", positive=True,
+                     maximum=maximum_size),
+    }
+    require(descriptor == expected_descriptor,
+            "initial ProbeV2 opened ELF device/inode/size differs from the stable Source artifact")
+    return descriptor
+
+
+def _validate_initial_probe_direct_binary(
+    direct: object, *, expected_path: Path, expected_sha256: str,
+    expected_descriptor: dict[str, int], maximum_size: int,
+) -> dict[str, int]:
+    require(type(direct) is dict and direct.get("binary_path") == str(expected_path) and
+            direct.get("binary_sha256") == expected_sha256,
+            "FixedR8 opened executable differs from the SourceV5 application artifact")
+    descriptor = {
+        "device": uint(direct.get("binary_device"), "FixedR8 binary device", positive=True),
+        "inode": uint(direct.get("binary_inode"), "FixedR8 binary inode", positive=True),
+        "size": uint(direct.get("binary_size"), "FixedR8 binary size", positive=True,
+                     maximum=maximum_size),
+    }
+    require(descriptor == expected_descriptor,
+            "FixedR8 opened ELF device/inode/size differs from the stable Source artifact")
+    return descriptor
+
+
+def _validate_initial_probe_owner_return(
+    direct: object, started: list[dict[str, Any]], *, argv: list[str],
+    environment: dict[str, str], cwd: Path, affinity: list[int],
+    network_namespace_inode: int, binary: Path, binary_sha256: str,
+    binary_descriptor: dict[str, int], maximum_binary_size: int,
+    fixed: Any, capacity_stage: Any,
+) -> tuple[dict[str, Any], dict[str, int]]:
+    require(type(direct) is dict and type(started) is list,
+            "initial ProbeV2 owner return/callbacks are malformed")
+    start = _validate_initial_probe_start_proof(
+        direct.get("start"), argv, environment,
+    )
+    require(len(started) == 1 and started[0] == start,
+            "initial ProbeV2 owner callback does not match its actual minimal start")
+    actual_binary = _validate_initial_probe_direct_binary(
+        direct, expected_path=binary, expected_sha256=binary_sha256,
+        expected_descriptor=binary_descriptor, maximum_size=maximum_binary_size,
+    )
+    capacity_stage._verify_owned_process_supervision(
+        direct.get("supervision"), start, fixed,
+    )
+    require(direct.get("status") == 0 and direct.get("child_return_code") == 0 and
+            direct.get("received_signal") is None and
+            direct["supervision"].get("cleanup_status") == "verified" and
+            direct.get("requested_argv") == argv and
+            direct.get("requested_argv_sha256") == sha256(canonical(argv)) and
+            direct.get("environment") == environment and
+            direct.get("environment_sha256") == sha256(canonical(environment)) and
+            direct.get("cwd") == str(cwd) and
+            direct.get("cpu_affinity") == affinity and
+            direct.get("network_namespace_inode") == network_namespace_inode,
+            "initial ProbeV2 owner did not prove successful cleanup and its exact requested launch")
+    return start, actual_binary
+
+
+def _load_initial_probe_source_stack(
+    request: dict[str, Any],
+) -> tuple[Any, Any, Any, Any, Any, Any, dict[str, Any], dict[str, Any], dict[str, Any], dict[str, str], Path, str, dict[str, int]]:
+    reader, producer, source, context, identity = _load_source_context_inputs(
+        request, request["allocator"],
+    )
+    source_pin = exact(request["source_manifest"], {"path", "raw_sha256"},
+                       "initial ProbeV2 SourceV5 manifest pin")
+    source_path = absolute_path(source_pin["path"], "initial ProbeV2 SourceV5 manifest path")
+    source, _source_raw, source_raw_sha = _read_canonical(
+        source_path, "initial ProbeV2 SourceV5 manifest", source_pin["raw_sha256"],
+    )
+    require(source.get("schema") == SOURCE_SCHEMA_V5 and
+            source["build"]["host_id"] == context["host_id"],
+            "initial ProbeV2 selected host differs from its full SourceV5 build identity")
+    controller = _pinned_source_module(
+        source, "campaign_controller", "scripts/application-campaign.py",
+        "campaign controller", MAX_METADATA_BYTES,
+    )
+    try:
+        controller.verify_source_manifest(
+            source, source_root=SOURCE_ROOT, verify_artifacts=True,
+        )
+    except Exception as error:
+        raise CompositionError(
+            f"pinned full SourceV5/artifact verifier rejected initial ProbeV2 inputs: {error}",
+        ) from error
+    composition_record = reader._source_v5_regular_record(
+        source["source"], "scripts/application-feedback-composition.py",
+        "feedback composition emitter",
+    )
+    active_raw, active_sha = _read_stable(
+        Path(__file__).resolve(), "active feedback composition emitter", MAX_METADATA_BYTES,
+    )
+    require(active_sha == composition_record["sha256"] and
+            len(active_raw) == composition_record["size"],
+            "active initial ProbeV2 emitter differs from the exact SourceV5 typed inventory entry")
+    fixed, fixed_sha = _captured_source_module(
+        reader, source, FIXED_PAIR_OWNER, "FixedR8 direct process owner",
+    )
+    helper, helper_sha = _captured_source_module(
+        reader, source, PROBE_OWNER_HELPER, "FixedR8 launch identity helper",
+    )
+    capacity_stage, capacity_stage_sha = _captured_source_module(
+        reader, source, "scripts/application-capacity-stage.py",
+        "Source5 capacity host/process verifier",
+    )
+    require(callable(getattr(reader, "_stable_file_sha256", None)) and
+            callable(getattr(reader, "_validate_calibrated_construction_evidence", None)) and
+            callable(getattr(reader, "resolve_calibrated_feedback_policy_v5", None)) and
+            callable(getattr(fixed, "_run_direct_process", None)) and
+            callable(getattr(fixed, "_prepare_member_tmpdir", None)) and
+            callable(getattr(fixed, "_bounded_tmpdir_monitor", None)) and
+            callable(getattr(helper, "_proc_start_ticks", None)) and
+            callable(getattr(helper, "_hash_open_executable", None)) and
+            callable(getattr(capacity_stage, "_verify_owned_process_supervision", None)) and
+            callable(getattr(capacity_stage, "_parse_cpu_set", None)) and
+            callable(getattr(capacity_stage, "_live_cpu_model", None)),
+            "Source-pinned initial ProbeV2 reader, Fixed owner, or capacity verifier APIs are unavailable")
+    binary_record = exact(source["artifacts"].get(identity["allocator"]), {"path", "sha256"},
+                          "SourceV5 selected application artifact")
+    try:
+        _relative, binary = controller.safe_relative_artifact(
+            SOURCE_ROOT, binary_record["path"], "SourceV5 selected application binary",
+        )
+    except Exception as error:
+        raise CompositionError(f"SourceV5 selected application binary path is invalid: {error}") from error
+    binary_sha, binary_size, binary_mode = reader._stable_file_sha256(
+        binary, "SourceV5 selected application binary", reader.MAX_APP_BINARY_BYTES,
+    )
+    require(binary_sha == binary_record["sha256"] == identity["binary_sha256"] and
+            binary_mode & 0o111 != 0,
+            "selected SourceV5 application binary hash/mode differs from its published artifact")
+    binary_identity = _validate_initial_probe_elf(binary, reader.MAX_APP_BINARY_BYTES)
+    require(binary_identity["size"] == binary_size,
+            "SourceV5 ELF size differs from its stable artifact hash descriptor")
+    return (
+        reader, producer, controller, fixed, helper, capacity_stage, source, context,
+        identity, {"path": source_pin["path"], "raw_sha256": source_raw_sha},
+        binary, binary_sha, binary_identity,
+    )
+
+
+def _validate_initial_probe_elf(path: Path, maximum_size: int) -> dict[str, int]:
+    require(type(maximum_size) is int and maximum_size >= 20,
+            "SourceV5 application binary is shorter than an ELF header")
+    try:
+        before_path = path.lstat()
+        descriptor = os.open(
+            path, os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) |
+            getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0),
+        )
+    except OSError as error:
+        raise CompositionError(f"cannot safely inspect SourceV5 ELF header: {error}") from error
+    try:
+        before = os.fstat(descriptor)
+        key = lambda info: (info.st_dev, info.st_ino, info.st_mode, info.st_size,
+                            info.st_mtime_ns, info.st_ctime_ns)
+        require(stat.S_ISREG(before.st_mode) and key(before) == key(before_path) and
+                before.st_mode & 0o111 != 0 and 20 <= before.st_size <= maximum_size and
+                before.st_dev > 0 and before.st_ino > 0,
+                "SourceV5 selected binary changed or exceeds its bounded ELF size")
+        header = os.read(descriptor, 20)
+        after_fd, after_path = os.fstat(descriptor), path.lstat()
+        require(len(header) == 20 and key(before) == key(after_fd) == key(after_path),
+                "SourceV5 selected binary changed while reading its ELF header")
+    finally:
+        os.close(descriptor)
+    require(header[:4] == b"\x7fELF" and header[4] == 2 and header[5] == 1 and
+            header[6] == 1 and int.from_bytes(header[16:18], "little") in (2, 3) and
+            int.from_bytes(header[18:20], "little") == 62,
+            "SourceV5 selected binary is not a little-endian x86_64 ELF executable")
+    return {"device": before.st_dev, "inode": before.st_ino, "size": before.st_size}
+
+
+def _require_initial_probe_private_output(path: Path, label: str) -> os.stat_result:
+    require(path.resolve(strict=True) == path,
+            f"{label} traverses a symlink or output alias")
+    try:
+        info = path.stat(follow_symlinks=False)
+    except OSError as error:
+        raise CompositionError(f"cannot inspect {label}: {error}") from error
+    require(stat.S_ISREG(info.st_mode) and info.st_uid == os.getuid() and
+            info.st_nlink == 1 and stat.S_IMODE(info.st_mode) == 0o600,
+            f"{label} is not one owned private mode-0600 regular file")
+    return info
+
+
+def _probe_output_mount_bounds(
+    fixed: Any, output_root: Path, budget: dict[str, int],
+) -> tuple[dict[str, Any], int, int]:
+    output_reservation = sum(budget[key] for key in (
+        "tmpdir_bytes", "stdout_bytes", "stderr_bytes", "owner_result_bytes",
+        "inventory_bytes", "failure_bytes", "receipt_bytes",
+    ))
+    inode_reservation = budget["tmpdir_inodes"] + budget["output_inodes"]
+    mount = fixed._mount_identity(output_root)
+    require(mount["available_bytes"] >= output_reservation and
+            mount["available_inodes"] >= inode_reservation,
+            "initial ProbeV2 output mount cannot reserve all bounded output and TMP evidence")
+    return mount, output_reservation, inode_reservation
+
+
+def _verify_initial_probe_success_layout(
+    emission_dir: Path, budget_value: object, *, include_receipt: bool,
+) -> dict[str, int]:
+    budget = _validate_probe_storage_budget(budget_value)
+    expected = {
+        "tmp": "directory", "stdout.bin": "file", "stderr.bin": "file",
+        "owner-result.json": "file", "tmpdir-inventory.json": "file",
+    }
+    if include_receipt:
+        expected["emission-receipt.json"] = "file"
+    byte_limits = {
+        "stdout.bin": budget["stdout_bytes"],
+        "stderr.bin": budget["stderr_bytes"],
+        "owner-result.json": budget["owner_result_bytes"],
+        "tmpdir-inventory.json": budget["inventory_bytes"],
+        "emission-receipt.json": budget["receipt_bytes"],
+        "capture-failure.json": budget["failure_bytes"],
+    }
+    aggregate_limit = sum(byte_limits.values())
+    seen: set[str] = set()
+    file_bytes = 0
+    inode_count = 0
+    try:
+        entries = os.scandir(emission_dir)
+    except OSError as error:
+        raise CompositionError(f"cannot scan initial ProbeV2 success directory: {error}") from error
+    try:
+        for entry in entries:
+            inode_count += 1
+            require(inode_count <= budget["output_inodes"],
+                    "initial ProbeV2 output directory exceeded its inode allowance during scan")
+            require(entry.name not in seen,
+                    "initial ProbeV2 output directory contains a duplicate name")
+            seen.add(entry.name)
+            try:
+                info = entry.stat(follow_symlinks=False)
+            except OSError as error:
+                raise CompositionError(
+                    f"cannot inspect initial ProbeV2 output entry {entry.name}: {error}",
+                ) from error
+            require(not stat.S_ISLNK(info.st_mode) and
+                    (stat.S_ISREG(info.st_mode) or stat.S_ISDIR(info.st_mode)) and
+                    info.st_uid == os.getuid(),
+                    "initial ProbeV2 output contains a linked, special, or unowned entry")
+            kind = "directory" if stat.S_ISDIR(info.st_mode) else "file"
+            if kind == "file":
+                file_bytes += info.st_size
+                require(file_bytes <= aggregate_limit,
+                        "initial ProbeV2 output files exceed the aggregate reserved byte budget")
+                if entry.name in byte_limits:
+                    require(info.st_size <= byte_limits[entry.name],
+                            f"initial ProbeV2 output {entry.name} exceeds its exact byte slot")
+                require(stat.S_IMODE(info.st_mode) == 0o600 and info.st_nlink == 1,
+                        "initial ProbeV2 output file is not a private single-link inode")
+            else:
+                require(entry.name == "tmp" and stat.S_IMODE(info.st_mode) == 0o700,
+                        "initial ProbeV2 success directory contains an unexpected directory")
+            require(expected.get(entry.name) == kind,
+                    f"initial ProbeV2 success directory contains an unexpected charged entry: {entry.name}")
+    finally:
+        entries.close()
+    require(seen == set(expected),
+            "initial ProbeV2 success directory lacks an exact required output entry")
+    return {"inode_count": inode_count, "file_bytes": file_bytes}
+
+
+def _initial_probe_failure_record(
+    emission_dir: Path, emission_id: str, stage: str, error: BaseException,
+    stdout_path: Path, stderr_path: Path, budget: dict[str, int],
+    owner_result_pin: dict[str, str] | None = None, *,
+    owner_result_overflow: dict[str, Any] | None = None,
+    inventory_pin: dict[str, str] | None = None,
+) -> Path:
+    def output_pin(path: Path, maximum: int) -> dict[str, str | None] | None:
+        try:
+            _raw, raw_sha = _read_stable(path, "failed initial ProbeV2 output", maximum)
+        except Exception:
+            return None
+        return {"path": str(path), "raw_sha256": raw_sha}
+
+    body = {
+        "schema": "allocatbelt.application-feedback-initial-probe-failure.v1",
+        "emission_id": emission_id, "stage": stage,
+        "error_type": type(error).__name__[:128],
+        "error_message": str(error)[:4096],
+        "owner_result_pin": owner_result_pin,
+        "owner_result_overflow": owner_result_overflow,
+        "tmpdir_inventory_pin": inventory_pin,
+        "stdout": output_pin(stdout_path, budget["stdout_bytes"]),
+        "stderr": output_pin(stderr_path, budget["stderr_bytes"]),
+        "qualification_eligible": False, "execution_ready": False,
+        "controller_chronology_proven": False,
+    }
+    value = {**body, "failure_sha256": sha256(canonical(body))}
+    raw = canonical(value)
+    require(len(raw) <= budget["failure_bytes"],
+            "initial ProbeV2 failure record exceeds its reserved finite bound")
+    path = emission_dir / "capture-failure.json"
+    _write_exclusive(path, raw)
+    return path
+
+
+def _seal_initial_probe_emission_receipt(value: object) -> tuple[dict[str, Any], bytes]:
+    body = exact(value, INITIAL_PROBE_EMISSION_RECEIPT_FIELDS - {"receipt_sha256"},
+                 "initial ProbeV2 emission receipt body")
+    receipt = {**body, "receipt_sha256": sha256(canonical(body))}
+    return receipt, canonical(receipt)
+
+
+def _initial_probe_receipt_template_size(value: object) -> int:
+    receipt = exact(value, INITIAL_PROBE_EMISSION_RECEIPT_FIELDS,
+                     "initial ProbeV2 receipt size projection")
+    budget = _validate_probe_storage_budget(receipt["storage_budget"])
+    template = copy.deepcopy(receipt)
+    max_u64 = (1 << 64) - 1
+    template["receipt_sha256"] = "f" * 64
+    template["start_callback_count"] = 1
+    start = exact(template["start_callback_proof"], {
+        "pid", "start_ticks", "requested_argv", "requested_argv_sha256",
+        "environment_sha256",
+    }, "initial ProbeV2 receipt start size projection")
+    start.update({
+        "pid": (1 << 31) - 1, "start_ticks": max_u64,
+        "requested_argv_sha256": "f" * 64,
+        "environment_sha256": "f" * 64,
+    })
+    owner_pin = exact(template["owner_result_pin"], {
+        "path", "raw_sha256", "owner_result_sha256",
+    }, "initial ProbeV2 receipt owner-result size projection")
+    owner_pin.update({"raw_sha256": "f" * 64, "owner_result_sha256": "f" * 64})
+    template["owner_supervision_sha256"] = "f" * 64
+    for name, maximum in (("stdout", budget["stdout_bytes"]),
+                          ("stderr", budget["stderr_bytes"])):
+        pin = exact(template[name], {"path", "raw_sha256", "byte_count"},
+                    f"initial ProbeV2 receipt {name} size projection")
+        pin.update({"raw_sha256": "f" * 64, "byte_count": maximum})
+    probe = exact(template["construction_probe"], {
+        "path", "raw_sha256", "allocator", "binary_sha256",
+    }, "initial ProbeV2 receipt result-probe size projection")
+    probe["raw_sha256"] = "f" * 64
+    template["resolved_policy_sha256"] = "f" * 64
+    template["exit_status"] = (1 << 31) - 1
+    binary = exact(template["binary"], {
+        "path", "source_relative_path", "raw_sha256", "device", "inode", "size",
+    }, "initial ProbeV2 receipt binary size projection")
+    binary.update({
+        "raw_sha256": "f" * 64, "device": max_u64, "inode": max_u64,
+        "size": max_u64,
+    })
+    for name in ("output_mount_initial", "output_mount_final"):
+        mount = template[name]
+        require(type(mount) is dict and "available_bytes" in mount and
+                "available_inodes" in mount,
+                f"initial ProbeV2 receipt {name} size projection is malformed")
+        mount["available_bytes"] = max_u64
+        mount["available_inodes"] = max_u64
+    tmp_final = template["tmpdir_final"]
+    require(type(tmp_final) is dict, "initial ProbeV2 TMPDIR final size projection is malformed")
+    tmp_final.update({
+        "device": max_u64, "inode": max_u64,
+        "bytes_used": budget["tmpdir_bytes"],
+        "file_count": budget["tmpdir_inodes"],
+        "directory_count": budget["tmpdir_inodes"],
+        "available_bytes": max_u64, "available_inodes": max_u64,
+    })
+    tmp_initial = template["tmpdir_initial"]
+    require(type(tmp_initial) is dict and "available_bytes" in tmp_initial and
+            "available_inodes" in tmp_initial,
+            "initial ProbeV2 TMPDIR initial size projection is malformed")
+    tmp_initial["available_bytes"] = max_u64
+    tmp_initial["available_inodes"] = max_u64
+    inventory_pin = exact(template["tmpdir_inventory_pin"], {
+        "path", "raw_sha256", "inventory_sha256",
+    }, "initial ProbeV2 receipt inventory size projection")
+    inventory_pin.update({"raw_sha256": "f" * 64, "inventory_sha256": "f" * 64})
+    return len(canonical(template))
+
+
+def _validate_initial_probe_receipt_budget(
+    receipt_value: object, receipt_raw: bytes, request_budget_value: object,
+) -> dict[str, int]:
+    receipt = exact(receipt_value, INITIAL_PROBE_EMISSION_RECEIPT_FIELDS,
+                    "initial ProbeV2 receipt byte-budget value")
+    budget = _validate_probe_storage_budget(request_budget_value)
+    body = {key: item for key, item in receipt.items() if key != "receipt_sha256"}
+    require(receipt["receipt_sha256"] == sha256(canonical(body)) and
+            receipt["storage_budget"] == budget and
+            type(receipt_raw) is bytes and receipt_raw == canonical(receipt) and
+            len(receipt_raw) <= MAX_PROBE_CAPTURE_RECEIPT_BYTES and
+            len(receipt_raw) <= budget["receipt_bytes"] and
+            _initial_probe_receipt_template_size(receipt) <= budget["receipt_bytes"],
+            "initial ProbeV2 receipt exceeds or understates its original request byte reservation")
+    return budget
+
+
+def emit_initial_calibrated_probe_v2(
+    request_pin: object, *, resource_monitor: Callable[[], bool] | None = None,
+) -> dict[str, Any]:
+    """Emit the first calibrated ProbeV2 stdout under the Source-pinned owner."""
+    require(resource_monitor is None or callable(resource_monitor),
+            "initial ProbeV2 resource monitor must be callable or None")
+    request, request_ref, request_raw = _read_initial_probe_request(request_pin)
+    request = _validate_initial_probe_request(request)
+    require(canonical(request) == request_raw,
+            "initial ProbeV2 request changed during canonical validation")
+    request = json.loads(canonical(request).decode("ascii"))
+    source_and_evidence_pins = [
+        request["source_manifest"], request["observed_host"],
+        *request["capacity_bundle"].values(),
+    ]
+    require(not _path_is_within(SOURCE_ROOT, Path(request_ref["path"]),
+                                "initial ProbeV2 request Source containment") and
+            all(not _path_is_within(SOURCE_ROOT, Path(pin["path"]),
+                                    "initial ProbeV2 evidence Source containment")
+                for pin in source_and_evidence_pins),
+            "initial ProbeV2 request and immutable evidence must remain outside SourceV5")
+    budget = dict(request["storage_budget"])
+    stack = _load_initial_probe_source_stack(request)
+    (reader, producer, _controller, fixed, helper, capacity_stage, source, context,
+     identity, source_pin, binary, source_binary_sha, binary_descriptor) = stack
+    require(source_pin["raw_sha256"] == request["source_manifest"]["raw_sha256"],
+            "initial ProbeV2 SourceV5 raw pin changed during full-source preflight")
+    try:
+        reader._validate_v2_workload_profile(context["workload"], context["profile"])
+    except Exception as error:
+        raise CompositionError(f"SourceV5 rejected initial ProbeV2 workload/profile: {error}") from error
+    capacity_floor_policy_id = _validate_initial_probe_floor_policy(
+        request, source, reader,
+    )
+    host, host_sha, origin_before = _initial_probe_host_context(
+        request["observed_host"], context, source, capacity_stage,
+    )
+    bundle = request["capacity_bundle"]
+    _capacity_request, _capacity_receipt, capacity_hashes = _verify_capacity_request_binding(
+        reader, producer, source, context, identity, source_pin, bundle,
+    )
+    capacity_path = absolute_path(bundle["artifact"]["path"],
+                                  "initial ProbeV2 capacity TSV path")
+    output_base = fixed._private_output_root(
+        request["output_root"], SOURCE_ROOT, create=False,
+    )
+    require(not _path_is_within(SOURCE_ROOT, output_base,
+                                "initial ProbeV2 output Source containment"),
+            "initial ProbeV2 output root must remain outside SourceV5")
+    output_mount_base = fixed._mount_identity(output_base)
+    emission_id = request["emission_id"]
+    emission_dir = output_base / emission_id
+    require(not emission_dir.exists() and not emission_dir.is_symlink(),
+            "initial ProbeV2 emission directory must be fresh and unreused")
+    try:
+        emission_dir.mkdir(mode=0o700)
+    except OSError as error:
+        raise CompositionError(f"cannot create fresh initial ProbeV2 output directory: {error}") from error
+    directory_info = emission_dir.stat(follow_symlinks=False)
+    require(stat.S_ISDIR(directory_info.st_mode) and directory_info.st_uid == os.getuid() and
+            stat.S_IMODE(directory_info.st_mode) == 0o700,
+            "initial ProbeV2 emission directory is not an owned private directory")
+    tmpdir = emission_dir / "tmp"
+    stdout_path = emission_dir / "stdout.bin"
+    stderr_path = emission_dir / "stderr.bin"
+    owner_result_path = emission_dir / "owner-result.json"
+    inventory_path = emission_dir / "tmpdir-inventory.json"
+    receipt_path = emission_dir / "emission-receipt.json"
+    failure_path = emission_dir / "capture-failure.json"
+
+    budget_for_owner = {
+        "tmpdir_bytes": budget["tmpdir_bytes"],
+        "tmpdir_inodes": budget["tmpdir_inodes"],
+    }
+    try:
+        initial_tmp = fixed._prepare_member_tmpdir(
+            tmpdir, emission_dir, budget_for_owner,
+        )
+        output_mount_initial, output_reservation, inode_reservation = \
+            _probe_output_mount_bounds(fixed, emission_dir, budget)
+        require(fixed._mount_static(output_mount_initial) == initial_tmp["mount"] and
+                output_mount_base["filesystem_type"] not in ("tmpfs", "ramfs", "devtmpfs"),
+                "initial ProbeV2 output and TMP roots do not share a disk-backed mount")
+        environment = {
+            "PATH": "/usr/bin:/bin", "LANG": "C", "LC_ALL": "C",
+            "TMPDIR": str(tmpdir),
+        }
+        argv = [
+            str(binary), "--emit-feedback-policy-only", "--workload", context["workload"],
+            "--profile", context["profile"], "--capacity-calibration-file", str(capacity_path),
+            "--capacity-calibration-sha256", capacity_hashes["artifact"],
+            "--host-id", context["host_id"], "--source-sha256", identity["source_sha256"],
+        ]
+        if capacity_floor_policy_id is not None:
+            argv.extend(["--capacity-floor-policy-id", capacity_floor_policy_id])
+        requested_launch = {
+            "argv": argv, "environment": environment, "cwd": str(SOURCE_ROOT),
+            "affinity": host["cpu_affinity"],
+            "network_namespace_inode": host["network_namespace_inode"],
+        }
+        source_semantic_sha = digest(source["manifest_sha256"],
+                                     "initial ProbeV2 SourceV5 semantic SHA-256")
+        source_tree_sha = digest(source["source"]["source_tree_sha256"],
+                                 "initial ProbeV2 SourceV5 tree SHA-256")
+        source_build_sha = reader.digest_object(source["build"])
+        origin_body = {
+            "schema": "allocatbelt.application-feedback-probe-origin-facts.v1",
+            "host_id": host["host_id"],
+            "boot_id_sha256": origin_before["boot_id_sha256"],
+            "kernel_release": origin_before["kernel_release"],
+            "cpu_affinity": origin_before["cpu_affinity"],
+            "network_namespace_inode": origin_before["network_namespace_inode"],
+            "observed_host_raw_sha256": host_sha,
+        }
+        origin_record = {
+            **origin_body, "origin_facts_sha256": sha256(canonical(origin_body)),
+        }
+        max_u64 = (1 << 64) - 1
+        start_template = {
+            "pid": (1 << 31) - 1, "start_ticks": max_u64,
+            "requested_argv": argv,
+            "requested_argv_sha256": "f" * 64,
+            "environment_sha256": "f" * 64,
+        }
+        tmp_final_template = {
+            "path": str(tmpdir), "device": max_u64, "inode": max_u64,
+            "mode": 0o700, "mount": fixed._mount_static(output_mount_initial),
+            "bytes_used": budget["tmpdir_bytes"],
+            "file_count": budget["tmpdir_inodes"],
+            "directory_count": budget["tmpdir_inodes"],
+            "bytes_limit": budget["tmpdir_bytes"],
+            "inode_limit": budget["tmpdir_inodes"],
+            "available_bytes": max_u64, "available_inodes": max_u64,
+        }
+        output_mount_final_template = {
+            **fixed._mount_static(output_mount_initial),
+            "available_bytes": max_u64, "available_inodes": max_u64,
+        }
+        reader_record = reader._source_v5_regular_record(
+            source["source"], FEEDBACK_READER, "feedback validator",
+        )
+        producer_record = reader._source_v5_regular_record(
+            source["source"], CAPACITY_PRODUCER, "byte-capacity producer",
+        )
+        controller_record = reader._source_v5_regular_record(
+            source["source"], "scripts/application-campaign.py", "campaign controller",
+        )
+        capacity_stage_record = reader._source_v5_regular_record(
+            source["source"], "scripts/application-capacity-stage.py",
+            "capacity host/process verifier",
+        )
+        fixed_record = reader._source_v5_regular_record(
+            source["source"], FIXED_PAIR_OWNER, "FixedR8 direct process owner",
+        )
+        helper_record = reader._source_v5_regular_record(
+            source["source"], PROBE_OWNER_HELPER, "launch identity helper",
+        )
+        composition_record = reader._source_v5_regular_record(
+            source["source"], "scripts/application-feedback-composition.py",
+            "feedback composition emitter",
+        )
+        owner_modules = {
+            "feedback_reader": {"path": FEEDBACK_READER, "raw_sha256": reader_record["sha256"]},
+            "capacity_producer": {"path": CAPACITY_PRODUCER, "raw_sha256": producer_record["sha256"]},
+            "campaign_controller": {"path": "scripts/application-campaign.py",
+                                    "raw_sha256": controller_record["sha256"]},
+            "capacity_stage": {"path": "scripts/application-capacity-stage.py",
+                               "raw_sha256": capacity_stage_record["sha256"]},
+            "fixed_pair": {"path": FIXED_PAIR_OWNER, "raw_sha256": fixed_record["sha256"]},
+            "launch_identity_helper": {"path": PROBE_OWNER_HELPER,
+                                       "raw_sha256": helper_record["sha256"]},
+            "feedback_composition": {
+                "path": "scripts/application-feedback-composition.py",
+                "raw_sha256": composition_record["sha256"],
+            },
+        }
+        binary_template = {
+            "path": str(binary), "source_relative_path": source["artifacts"][identity["allocator"]]["path"],
+            "raw_sha256": source_binary_sha, "device": max_u64,
+            "inode": max_u64, "size": max_u64,
+        }
+        receipt_template = {
+        "schema": INITIAL_PROBE_EMISSION_SCHEMA,
+        "role": INITIAL_PROBE_EMISSION_ROLE,
+        "verification_scope": "origin_host_resident_paths",
+            "request_pin": request_ref,
+            "source_manifest": {
+                "path": source_pin["path"], "raw_sha256": source_pin["raw_sha256"],
+                "semantic_sha256": source_semantic_sha,
+                "source_tree_sha256": source_tree_sha,
+                "build_sha256": source_build_sha,
+            },
+            "context": context, "allocator": identity["allocator"],
+            "capacity_bundle": bundle,
+            "capacity_floor_policy_id": capacity_floor_policy_id,
+            "binary": binary_template,
+            "observed_host": {"path": request["observed_host"]["path"],
+                              "raw_sha256": host_sha},
+            "origin_facts_before": origin_record,
+            "origin_facts_after": origin_record,
+            "requested_launch": requested_launch,
+            "start_callback_count": 1,
+            "start_callback_proof": start_template,
+            "owner_result_pin": {
+                "path": str(owner_result_path), "raw_sha256": "f" * 64,
+                "owner_result_sha256": "f" * 64,
+            },
+            "owner_supervision_sha256": "f" * 64,
+            "stdout": {"path": str(stdout_path), "raw_sha256": "f" * 64,
+                       "byte_count": budget["stdout_bytes"]},
+            "stderr": {"path": str(stderr_path), "raw_sha256": "f" * 64,
+                       "byte_count": budget["stderr_bytes"]},
+            "construction_probe": {
+                "path": str(stdout_path), "raw_sha256": "f" * 64,
+                "allocator": identity["allocator"],
+                "binary_sha256": source_binary_sha,
+            },
+            "resolved_policy_sha256": "f" * 64,
+            "timeout_ns": request["timeout_ns"], "storage_budget": budget,
+            "output_mount_initial": output_mount_initial,
+            "output_mount_final": output_mount_final_template,
+            "tmpdir_initial": initial_tmp, "tmpdir_final": tmp_final_template,
+            "tmpdir_inventory_pin": {
+                "path": str(inventory_path), "raw_sha256": "f" * 64,
+                "inventory_sha256": "f" * 64,
+            },
+            "owner_modules": owner_modules,
+            "exit_status": (1 << 31) - 1,
+            "qualification_eligible": False, "execution_ready": False,
+            "controller_chronology_proven": False, "receipt_sha256": "f" * 64,
+        }
+        require(_initial_probe_receipt_template_size(receipt_template) <=
+                budget["receipt_bytes"],
+                "initial ProbeV2 receipt budget is below its complete bounded template")
+        fixed._require_waitable_sigchld()
+        if resource_monitor is not None:
+            try:
+                monitor_stop = bool(resource_monitor())
+            except BaseException as error:
+                path = _initial_probe_failure_record(
+                    emission_dir, emission_id, "resource_monitor_prelaunch", error,
+                    stdout_path, stderr_path, budget,
+                )
+                raise CompositionError(
+                    f"initial ProbeV2 outer resource monitor failed; failure retained at {path}: {error}",
+                ) from error
+            if monitor_stop:
+                failure = CompositionError(
+                    "initial ProbeV2 outer resource monitor refused before Popen",
+                )
+                path = _initial_probe_failure_record(
+                    emission_dir, emission_id, "resource_monitor_prelaunch", failure,
+                    stdout_path, stderr_path, budget,
+                )
+                raise CompositionError(f"{failure}; failure retained at {path}")
+        started: list[dict[str, Any]] = []
+        tmpdir_monitor = fixed._bounded_tmpdir_monitor(
+            tmpdir, budget["tmpdir_bytes"], budget["tmpdir_inodes"],
+            expected_root=initial_tmp,
+        )
+
+        def combined_resource_monitor() -> bool:
+            tmpdir_stop = bool(tmpdir_monitor())
+            outer_stop = bool(resource_monitor()) if resource_monitor is not None else False
+            return tmpdir_stop or outer_stop
+
+        try:
+            direct = fixed._run_direct_process(
+                argv, binary, source_binary_sha, SOURCE_ROOT, environment,
+                host["cpu_affinity"], stdout_path, stderr_path,
+                budget["stdout_bytes"], budget["stderr_bytes"],
+                request["timeout_ns"] / 1_000_000_000, helper,
+                expected_tmpdir=tmpdir,
+                expected_network_inode=host["network_namespace_inode"],
+                on_started=lambda proof: started.append(proof),
+                capture_identity=False, resource_monitor=combined_resource_monitor,
+            )
+        except BaseException as error:
+            try:
+                retained = _initial_probe_failure_record(
+                    emission_dir, emission_id, "owner_process_supervision", error,
+                    stdout_path, stderr_path, budget,
+                )
+            except BaseException as record_error:
+                raise CompositionError(
+                    f"FixedR8 initial ProbeV2 owner raised {type(error).__name__}: {error}; "
+                    f"failure record also failed: {record_error}",
+                ) from error
+            raise CompositionError(
+                f"FixedR8 initial ProbeV2 owner raised {type(error).__name__}: {error}; "
+                f"failure retained at {retained}",
+            ) from error
+
+        # Preserve the direct owner return before interpreting its result or outputs.
+        try:
+            owner_result, owner_result_raw = _probe_owner_result(direct, started)
+        except BaseException as error:
+            retained = _initial_probe_failure_record(
+                emission_dir, emission_id, "owner_result_serialize", error,
+                stdout_path, stderr_path, budget,
+            )
+            raise CompositionError(
+                f"initial ProbeV2 owner returned nonserializable evidence; failure retained at {retained}",
+            ) from error
+        owner_result_sha = sha256(owner_result_raw)
+        if len(owner_result_raw) > budget["owner_result_bytes"]:
+            supervision = direct.get("supervision", {}) if type(direct) is dict else {}
+            overflow = {
+                "raw_sha256": owner_result_sha, "byte_length": len(owner_result_raw),
+                "status": direct.get("status") if type(direct) is dict else None,
+                "child_return_code": direct.get("child_return_code") if type(direct) is dict else None,
+                "cleanup_status": supervision.get("cleanup_status") if type(supervision) is dict else None,
+                "signal_record_count": len(supervision.get("signals", []))
+                if type(supervision.get("signals")) is list else None,
+                "start_callback_count": len(started),
+            }
+            failure = CompositionError(
+                "complete initial ProbeV2 FixedR8 owner result exceeds its reserved bound",
+            )
+            retained = _initial_probe_failure_record(
+                emission_dir, emission_id, "owner_result_budget", failure,
+                stdout_path, stderr_path, budget,
+                owner_result_overflow=overflow,
+            )
+            raise CompositionError(f"{failure}; bounded diagnostic retained at {retained}")
+        try:
+            _write_exclusive(owner_result_path, owner_result_raw)
+            owner_readback, owner_readback_sha = _read_stable(
+                owner_result_path, "persisted initial ProbeV2 owner result",
+                budget["owner_result_bytes"],
+            )
+            _require_initial_probe_private_output(
+                owner_result_path, "persisted initial ProbeV2 owner result",
+            )
+            require(owner_readback == owner_result_raw and owner_readback_sha == owner_result_sha,
+                    "persisted initial ProbeV2 owner result differs from the complete direct return")
+        except BaseException as error:
+            supervision = direct.get("supervision", {}) if type(direct) is dict else {}
+            overflow = {
+                "raw_sha256": owner_result_sha, "byte_length": len(owner_result_raw),
+                "status": direct.get("status") if type(direct) is dict else None,
+                "child_return_code": direct.get("child_return_code") if type(direct) is dict else None,
+                "cleanup_status": supervision.get("cleanup_status") if type(supervision) is dict else None,
+                "signal_record_count": len(supervision.get("signals", []))
+                if type(supervision.get("signals")) is list else None,
+                "start_callback_count": len(started),
+            }
+            try:
+                retained = _initial_probe_failure_record(
+                    emission_dir, emission_id, "owner_result_persist", error,
+                    stdout_path, stderr_path, budget,
+                    owner_result_overflow=overflow,
+                )
+            except BaseException as record_error:
+                raise CompositionError(
+                    f"initial ProbeV2 owner result could not be persisted ({error}); "
+                    f"overflow diagnostic also failed: {record_error}",
+                ) from error
+            raise CompositionError(
+                f"initial ProbeV2 owner result could not be persisted; bounded failure retained at {retained}",
+            ) from error
+        owner_result_pin = {
+            "path": str(owner_result_path), "raw_sha256": owner_result_sha,
+            "owner_result_sha256": owner_result["owner_result_sha256"],
+        }
+        inventory_pin: dict[str, str] | None = None
+        try:
+            start, opened_binary_descriptor = _validate_initial_probe_owner_return(
+                direct, started, argv=argv, environment=environment,
+                cwd=SOURCE_ROOT, affinity=host["cpu_affinity"],
+                network_namespace_inode=host["network_namespace_inode"],
+                binary=binary, binary_sha256=source_binary_sha,
+                binary_descriptor=binary_descriptor,
+                maximum_binary_size=reader.MAX_APP_BINARY_BYTES,
+                fixed=fixed, capacity_stage=capacity_stage,
+            )
+            stdout_raw, stdout_sha = _read_stable(
+                stdout_path, "initial calibrated ProbeV2 stdout", reader.MAX_PROBE_OUTPUT_BYTES,
+            )
+            stderr_raw, stderr_sha = _read_stable(
+                stderr_path, "initial calibrated ProbeV2 stderr", reader.MAX_PROBE_OUTPUT_BYTES,
+            )
+            _require_initial_probe_private_output(stdout_path, "initial ProbeV2 stdout")
+            _require_initial_probe_private_output(stderr_path, "initial ProbeV2 stderr")
+            require(len(stdout_raw) <= budget["stdout_bytes"] and
+                    len(stderr_raw) <= budget["stderr_bytes"] and not stderr_raw,
+                    "initial ProbeV2 stdout/stderr does not fit the reserved outputs or stderr is nonempty")
+            probe, probe_raw, probe_sha = _read_canonical(
+                stdout_path, "first calibrated ProbeV2 stdout", stdout_sha,
+                reader.MAX_PROBE_OUTPUT_BYTES,
+            )
+            require(probe_raw == stdout_raw and probe_sha == stdout_sha and
+                    probe["schema"] == reader.CALIBRATED_PROBE_SCHEMA_V2,
+                    "first owner stdout is not one canonical calibrated ProbeV2 JSON value")
+            policy = reader.resolve_calibrated_feedback_policy_v5(
+                source, probe, bundle["artifact"], identity,
+                capacity_floor_policy_id=capacity_floor_policy_id,
+            )
+            reader._validate_calibrated_construction_evidence(source, probe, identity)
+            policy_sha = reader.digest_object(policy)
+            host_after, host_after_sha, origin_after = _initial_probe_host_context(
+                request["observed_host"], context, source, capacity_stage,
+            )
+            require(host_after_sha == host_sha and origin_after == origin_before and
+                    host_after == host,
+                    "initial ProbeV2 host identity changed during the owned constructor")
+
+            # Reopen all original immutable pins after the process returns.
+            post_request, post_request_ref, post_request_raw = _read_initial_probe_request(
+                request_ref,
+            )
+            require(post_request_ref == request_ref and post_request_raw == request_raw and
+                    _validate_initial_probe_request(post_request) == request,
+                    "initial ProbeV2 request changed during constructor execution")
+            post_stack = _load_initial_probe_source_stack(request)
+            (post_reader, post_producer, _post_controller, _post_fixed,
+             _post_helper, _post_stage, post_source, post_context, post_identity,
+             post_source_pin, post_binary, post_binary_sha,
+             post_binary_descriptor) = post_stack
+            require(post_source_pin == source_pin and post_context == context and
+                    post_identity == identity and post_binary == binary and
+                    post_binary_sha == source_binary_sha and
+                    post_binary_descriptor == binary_descriptor and
+                    post_source == source,
+                    "SourceV5 identity changed during initial ProbeV2 emission")
+            _post_request, _post_capacity_receipt, post_capacity_hashes = \
+                _verify_capacity_request_binding(
+                    post_reader, post_producer, post_source, post_context, post_identity,
+                    post_source_pin, bundle,
+                )
+            require(post_capacity_hashes == capacity_hashes and
+                    _validate_initial_probe_floor_policy(request, post_source, post_reader) ==
+                    capacity_floor_policy_id,
+                    "capacity/floor inputs changed during initial ProbeV2 emission")
+
+            tmpdir_final = fixed._tmpdir_usage(tmpdir, {
+                "bytes_limit": budget["tmpdir_bytes"],
+                "inode_limit": budget["tmpdir_inodes"],
+            })
+            fixed._verify_tmpdir_storage(
+                initial_tmp, tmpdir_final, str(tmpdir), budget["tmpdir_bytes"],
+                budget["tmpdir_inodes"], "initial calibrated ProbeV2 constructor",
+            )
+            entries = _capture_tmpdir_inventory(
+                tmpdir, budget["tmpdir_bytes"], budget["tmpdir_inodes"],
+            )
+            inventory_body = {"schema": PROBE_TMPDIR_INVENTORY_SCHEMA, "entries": entries}
+            inventory_value = {
+                **inventory_body, "inventory_sha256": sha256(canonical(inventory_body)),
+            }
+            inventory_raw = canonical(inventory_value)
+            require(len(inventory_raw) <= budget["inventory_bytes"],
+                    "initial ProbeV2 TMPDIR inventory exceeds its reserved sidecar bound")
+            _write_exclusive(inventory_path, inventory_raw)
+            _require_initial_probe_private_output(
+                inventory_path, "initial ProbeV2 TMPDIR inventory",
+            )
+            inventory_pin = {
+                "path": str(inventory_path), "raw_sha256": sha256(inventory_raw),
+                "inventory_sha256": inventory_value["inventory_sha256"],
+            }
+            _verify_initial_probe_success_layout(
+                emission_dir, budget, include_receipt=False,
+            )
+            output_mount_final = fixed._mount_identity(emission_dir)
+            require(fixed._mount_static(output_mount_final) ==
+                    fixed._mount_static(output_mount_initial) and
+                    output_mount_final["available_bytes"] >= output_reservation and
+                    output_mount_final["available_inodes"] >= inode_reservation,
+                    "initial ProbeV2 output mount fell below its complete reserved budget")
+            require(_live_probe_origin_facts(host) == origin_before,
+                    "initial ProbeV2 live boot/kernel/affinity/netns changed before receipt sealing")
+            binary_info = {
+                "path": str(binary),
+                "source_relative_path": source["artifacts"][identity["allocator"]]["path"],
+                "raw_sha256": source_binary_sha,
+                "device": opened_binary_descriptor["device"],
+                "inode": opened_binary_descriptor["inode"],
+                "size": opened_binary_descriptor["size"],
+            }
+            receipt_body = {
+                "schema": INITIAL_PROBE_EMISSION_SCHEMA,
+                "role": INITIAL_PROBE_EMISSION_ROLE,
+                "verification_scope": "origin_host_resident_paths",
+                "request_pin": request_ref,
+                "source_manifest": {
+                    "path": source_pin["path"], "raw_sha256": source_pin["raw_sha256"],
+                    "semantic_sha256": source_semantic_sha,
+                    "source_tree_sha256": source_tree_sha,
+                    "build_sha256": source_build_sha,
+                },
+                "context": context, "allocator": identity["allocator"],
+                "capacity_bundle": bundle,
+                "capacity_floor_policy_id": capacity_floor_policy_id,
+                "binary": binary_info,
+                "observed_host": {
+                    "path": request["observed_host"]["path"], "raw_sha256": host_sha,
+                },
+                "origin_facts_before": origin_record,
+                "origin_facts_after": origin_record,
+                "requested_launch": requested_launch,
+                "start_callback_count": len(started),
+                "start_callback_proof": start,
+                "owner_result_pin": owner_result_pin,
+                "owner_supervision_sha256": sha256(canonical(direct["supervision"])),
+                "stdout": {
+                    "path": str(stdout_path), "raw_sha256": stdout_sha,
+                    "byte_count": len(stdout_raw),
+                },
+                "stderr": {
+                    "path": str(stderr_path), "raw_sha256": stderr_sha,
+                    "byte_count": len(stderr_raw),
+                },
+                "construction_probe": {
+                    "path": str(stdout_path), "raw_sha256": stdout_sha,
+                    "allocator": identity["allocator"],
+                    "binary_sha256": source_binary_sha,
+                },
+                "resolved_policy_sha256": policy_sha,
+                "timeout_ns": request["timeout_ns"], "storage_budget": budget,
+                "output_mount_initial": output_mount_initial,
+                "output_mount_final": output_mount_final,
+                "tmpdir_initial": initial_tmp, "tmpdir_final": tmpdir_final,
+                "tmpdir_inventory_pin": inventory_pin,
+                "owner_modules": owner_modules,
+                "exit_status": direct["status"],
+                "qualification_eligible": False, "execution_ready": False,
+                "controller_chronology_proven": False,
+            }
+            receipt_value, receipt_raw = _seal_initial_probe_emission_receipt(receipt_body)
+            _validate_initial_probe_receipt_budget(
+                receipt_value, receipt_raw, budget,
+            )
+            receipt_identity = _write_initial_probe_receipt_exclusive(
+                receipt_path, receipt_raw,
+            )
+            try:
+                receipt_raw_check, receipt_raw_sha = _read_stable(
+                    receipt_path, "initial ProbeV2 emission receipt", budget["receipt_bytes"],
+                )
+                require(receipt_raw_check == receipt_raw and
+                        receipt_raw_sha == sha256(receipt_raw),
+                        "initial ProbeV2 emission receipt differs after exclusive persistence")
+                final_mount_after_receipt = fixed._mount_identity(emission_dir)
+                require(fixed._mount_static(final_mount_after_receipt) ==
+                        fixed._mount_static(output_mount_initial) and
+                        final_mount_after_receipt["available_bytes"] >= output_reservation and
+                        final_mount_after_receipt["available_inodes"] >= inode_reservation,
+                        "initial ProbeV2 output mount fell below its complete budget after receipt persistence")
+                _verify_initial_probe_success_layout(
+                    emission_dir, budget, include_receipt=True,
+                )
+            except BaseException:
+                try:
+                    _unlink_exact_output(receipt_path, receipt_identity)
+                except Exception:
+                    pass
+                raise
+            receipt_pin = {
+                "path": str(receipt_path), "raw_sha256": receipt_raw_sha,
+                "receipt_sha256": receipt_value["receipt_sha256"],
+            }
+            return {
+                "construction_probe": receipt_value["construction_probe"],
+                "emission_receipt": receipt_pin,
+            }
+        except BaseException as error:
+            if not failure_path.exists():
+                try:
+                    retained = _initial_probe_failure_record(
+                        emission_dir, emission_id, "post_owner_validation", error,
+                        stdout_path, stderr_path, budget, owner_result_pin,
+                        inventory_pin=inventory_pin,
+                    )
+                except BaseException as record_error:
+                    raise CompositionError(
+                        f"initial ProbeV2 validation failed after owner return ({error}); "
+                        f"owner result remains at {owner_result_path}; failure record failed: {record_error}",
+                    ) from error
+                raise CompositionError(
+                    f"initial ProbeV2 validation failed after owner return ({error}); "
+                    f"owner result and failure evidence remain at {retained}",
+                ) from error
+            raise
+    except BaseException as error:
+        if failure_path.exists():
+            raise
+        try:
+            retained = _initial_probe_failure_record(
+                emission_dir, emission_id, "initial_probe_preflight_or_storage", error,
+                stdout_path, stderr_path, budget,
+            )
+        except BaseException as record_error:
+            raise CompositionError(
+                f"initial ProbeV2 preflight/storage failed ({error}); failure record also failed: {record_error}",
+            ) from error
+        raise CompositionError(
+            f"initial ProbeV2 preflight/storage failed ({error}); failure evidence retained at {retained}",
+        ) from error
+
+
+def verify_initial_calibrated_probe_emission(receipt_pin: object) -> dict[str, Any]:
+    """Replay an origin-host receipt without launching its APP constructor again."""
+    receipt_ref = exact(receipt_pin, {"path", "raw_sha256", "receipt_sha256"},
+                        "initial ProbeV2 emission receipt pin")
+    receipt_path = absolute_path(receipt_ref["path"], "initial ProbeV2 emission receipt path")
+    digest(receipt_ref["raw_sha256"], "initial ProbeV2 receipt raw SHA-256")
+    digest(receipt_ref["receipt_sha256"], "initial ProbeV2 receipt semantic SHA-256")
+    receipt, receipt_raw, receipt_raw_sha = _read_canonical(
+        receipt_path, "initial ProbeV2 emission receipt", receipt_ref["raw_sha256"],
+        MAX_PROBE_CAPTURE_RECEIPT_BYTES,
+    )
+    receipt = exact(receipt, INITIAL_PROBE_EMISSION_RECEIPT_FIELDS,
+                    "initial ProbeV2 emission receipt")
+    receipt_body = {key: item for key, item in receipt.items() if key != "receipt_sha256"}
+    require(receipt["schema"] == INITIAL_PROBE_EMISSION_SCHEMA and
+            receipt["role"] == INITIAL_PROBE_EMISSION_ROLE and
+            receipt["verification_scope"] == "origin_host_resident_paths" and
+            receipt["receipt_sha256"] == sha256(canonical(receipt_body)) ==
+            receipt_ref["receipt_sha256"] and receipt_raw_sha == receipt_ref["raw_sha256"] and
+            receipt_raw == canonical(receipt),
+            "initial ProbeV2 emission receipt schema, raw pin, or semantic digest differs")
+    require(receipt["qualification_eligible"] is False and
+            receipt["execution_ready"] is False and
+            receipt["controller_chronology_proven"] is False and
+            receipt["exit_status"] == 0,
+            "initial ProbeV2 receipt claims readiness or lacks a successful constructor return")
+    receipt_info = receipt_path.stat(follow_symlinks=False)
+    require(stat.S_ISREG(receipt_info.st_mode) and receipt_info.st_uid == os.getuid() and
+            receipt_info.st_nlink == 1 and stat.S_IMODE(receipt_info.st_mode) == 0o600,
+            "initial ProbeV2 receipt is not a private immutable regular file")
+
+    request_ref = exact(receipt["request_pin"], {"path", "raw_sha256"},
+                        "initial ProbeV2 receipt request pin")
+    request, request_ref_read, _request_raw = _read_initial_probe_request(request_ref)
+    request = _validate_initial_probe_request(request)
+    require(request_ref_read == request_ref and request["emission_id"] == receipt_path.parent.name,
+            "initial ProbeV2 receipt is detached from its exact original request/emission ID")
+    verify_inputs = [request["source_manifest"], request["observed_host"],
+                     *request["capacity_bundle"].values()]
+    require(not _path_is_within(SOURCE_ROOT, Path(request_ref["path"]),
+                                "initial ProbeV2 receipt request Source containment") and
+            all(not _path_is_within(SOURCE_ROOT, Path(pin["path"]),
+                                    "initial ProbeV2 receipt input Source containment")
+                for pin in verify_inputs),
+            "initial ProbeV2 receipt inputs are inside the immutable Source")
+    request_budget = _validate_probe_storage_budget(request["storage_budget"])
+    _validate_initial_probe_receipt_budget(
+        receipt, receipt_raw, request_budget,
+    )
+    (reader, producer, controller, fixed, helper, capacity_stage, source, context,
+     identity, source_pin, binary, binary_sha,
+     binary_descriptor) = _load_initial_probe_source_stack(request)
+    source_value = {
+        "path": source_pin["path"], "raw_sha256": source_pin["raw_sha256"],
+        "semantic_sha256": source["manifest_sha256"],
+        "source_tree_sha256": source["source"]["source_tree_sha256"],
+        "build_sha256": reader.digest_object(source["build"]),
+    }
+    require(receipt["source_manifest"] == source_value and
+            receipt["context"] == context and receipt["allocator"] == identity["allocator"] and
+            receipt["capacity_bundle"] == request["capacity_bundle"] and
+            receipt["capacity_floor_policy_id"] ==
+                _validate_initial_probe_floor_policy(request, source, reader),
+            "initial ProbeV2 receipt Source/context/capacity/floor binding differs")
+    require(receipt["timeout_ns"] == request["timeout_ns"] and
+            receipt["storage_budget"] == request["storage_budget"],
+            "initial ProbeV2 receipt timeout or storage reservation differs from its request")
+    expected_owner_modules = {
+        "feedback_reader": {
+            "path": FEEDBACK_READER,
+            "raw_sha256": reader._source_v5_regular_record(
+                source["source"], FEEDBACK_READER, "feedback validator",
+            )["sha256"],
+        },
+        "capacity_producer": {
+            "path": CAPACITY_PRODUCER,
+            "raw_sha256": reader._source_v5_regular_record(
+                source["source"], CAPACITY_PRODUCER, "byte-capacity producer",
+            )["sha256"],
+        },
+        "campaign_controller": {
+            "path": "scripts/application-campaign.py",
+            "raw_sha256": reader._source_v5_regular_record(
+                source["source"], "scripts/application-campaign.py", "campaign controller",
+            )["sha256"],
+        },
+        "capacity_stage": {
+            "path": "scripts/application-capacity-stage.py",
+            "raw_sha256": reader._source_v5_regular_record(
+                source["source"], "scripts/application-capacity-stage.py",
+                "capacity host/process verifier",
+            )["sha256"],
+        },
+        "fixed_pair": {
+            "path": FIXED_PAIR_OWNER,
+            "raw_sha256": reader._source_v5_regular_record(
+                source["source"], FIXED_PAIR_OWNER, "FixedR8 direct process owner",
+            )["sha256"],
+        },
+        "launch_identity_helper": {
+            "path": PROBE_OWNER_HELPER,
+            "raw_sha256": reader._source_v5_regular_record(
+                source["source"], PROBE_OWNER_HELPER, "launch identity helper",
+            )["sha256"],
+        },
+        "feedback_composition": {
+            "path": "scripts/application-feedback-composition.py",
+            "raw_sha256": reader._source_v5_regular_record(
+                source["source"], "scripts/application-feedback-composition.py",
+                "feedback composition emitter",
+            )["sha256"],
+        },
+    }
+    require(receipt["owner_modules"] == expected_owner_modules,
+            "initial ProbeV2 receipt owner/module hashes differ from SourceV5 inventory")
+
+    host, host_sha, origin = _initial_probe_host_context(
+        request["observed_host"], context, source, capacity_stage,
+    )
+    require(receipt["observed_host"] == {
+        "path": request["observed_host"]["path"], "raw_sha256": host_sha,
+    }, "initial ProbeV2 receipt observed-host pin differs")
+    for label in ("origin_facts_before", "origin_facts_after"):
+        item = exact(receipt[label], {
+            "schema", "host_id", "boot_id_sha256", "kernel_release", "cpu_affinity",
+            "network_namespace_inode", "observed_host_raw_sha256", "origin_facts_sha256",
+        }, f"initial ProbeV2 {label}")
+        body = {key: value for key, value in item.items() if key != "origin_facts_sha256"}
+        require(item["schema"] == "allocatbelt.application-feedback-probe-origin-facts.v1" and
+                item["host_id"] == host["host_id"] and
+                item["boot_id_sha256"] == origin["boot_id_sha256"] and
+                item["kernel_release"] == origin["kernel_release"] and
+                item["cpu_affinity"] == origin["cpu_affinity"] and
+                item["network_namespace_inode"] == origin["network_namespace_inode"] and
+                item["observed_host_raw_sha256"] == host_sha and
+                item["origin_facts_sha256"] == sha256(canonical(body)),
+                f"initial ProbeV2 {label} differs from current live origin facts")
+    require(receipt["origin_facts_before"] == receipt["origin_facts_after"],
+            "initial ProbeV2 origin identity changed during constructor execution")
+
+    bundle = request["capacity_bundle"]
+    _capacity_request, _capacity_receipt, capacity_hashes = _verify_capacity_request_binding(
+        reader, producer, source, context, identity, source_pin, bundle,
+    )
+    capacity_path = absolute_path(bundle["artifact"]["path"],
+                                  "initial ProbeV2 capacity TSV path")
+    output_base = fixed._private_output_root(request["output_root"], SOURCE_ROOT, create=False)
+    require(not _path_is_within(SOURCE_ROOT, output_base,
+                                "initial ProbeV2 receipt output Source containment"),
+            "initial ProbeV2 receipt output root is inside SourceV5")
+    emission_dir = output_base / request["emission_id"]
+    require(receipt_path == emission_dir / "emission-receipt.json" and
+            receipt_path.parent == emission_dir and
+            stat.S_IMODE(emission_dir.stat(follow_symlinks=False).st_mode) == 0o700,
+            "initial ProbeV2 receipt path is outside its exact private emission directory")
+    paths = {
+        "stdout": emission_dir / "stdout.bin",
+        "stderr": emission_dir / "stderr.bin",
+        "owner_result": emission_dir / "owner-result.json",
+        "inventory": emission_dir / "tmpdir-inventory.json",
+        "tmpdir": emission_dir / "tmp",
+    }
+    budget = request_budget
+    _verify_initial_probe_success_layout(
+        emission_dir, budget, include_receipt=True,
+    )
+
+    expected_argv = [
+        str(binary), "--emit-feedback-policy-only", "--workload", context["workload"],
+        "--profile", context["profile"], "--capacity-calibration-file", str(capacity_path),
+        "--capacity-calibration-sha256", capacity_hashes["artifact"],
+        "--host-id", context["host_id"], "--source-sha256", identity["source_sha256"],
+    ]
+    floor_id = receipt["capacity_floor_policy_id"]
+    if floor_id is not None:
+        expected_argv.extend(["--capacity-floor-policy-id", floor_id])
+    expected_environment = {
+        "PATH": "/usr/bin:/bin", "LANG": "C", "LC_ALL": "C",
+        "TMPDIR": str(paths["tmpdir"]),
+    }
+    launch = exact(receipt["requested_launch"], {
+        "argv", "environment", "cwd", "affinity", "network_namespace_inode",
+    }, "initial ProbeV2 requested launch")
+    require(launch == {
+        "argv": expected_argv, "environment": expected_environment,
+        "cwd": str(SOURCE_ROOT), "affinity": host["cpu_affinity"],
+        "network_namespace_inode": host["network_namespace_inode"],
+    }, "initial ProbeV2 receipt requested argv/environment differs from Source/capacity/host")
+
+    owner_pin = exact(receipt["owner_result_pin"], {
+        "path", "raw_sha256", "owner_result_sha256",
+    }, "initial ProbeV2 owner result pin")
+    require(owner_pin["path"] == str(paths["owner_result"]),
+            "initial ProbeV2 owner result path differs from its private directory")
+    owner_result, owner_raw, owner_raw_sha = _read_canonical(
+        paths["owner_result"], "initial ProbeV2 owner result", owner_pin["raw_sha256"],
+        MAX_PROBE_OWNER_RESULT_BYTES,
+    )
+    _require_initial_probe_private_output(paths["owner_result"],
+                                          "initial ProbeV2 owner result")
+    owner_result = exact(owner_result, {
+        "schema", "direct", "start_callback_count", "start_callback_proofs",
+        "owner_result_sha256",
+    }, "initial ProbeV2 owner result")
+    owner_body = {key: item for key, item in owner_result.items()
+                  if key != "owner_result_sha256"}
+    require(owner_result["schema"] == PROBE_OWNER_RESULT_SCHEMA and
+            owner_result["owner_result_sha256"] == sha256(canonical(owner_body)) ==
+            owner_pin["owner_result_sha256"] and owner_raw_sha == owner_pin["raw_sha256"] and
+            owner_raw == canonical(owner_result) and
+            owner_result["start_callback_count"] == receipt["start_callback_count"] == 1,
+            "initial ProbeV2 complete owner result raw/self digest or callback count differs")
+    direct = owner_result["direct"]
+    require(type(direct) is dict and type(owner_result["start_callback_proofs"]) is list and
+            owner_result["start_callback_proofs"] == [receipt["start_callback_proof"]],
+            "initial ProbeV2 owner result lacks its exact actual start callback")
+    start, opened_descriptor = _validate_initial_probe_owner_return(
+        direct, owner_result["start_callback_proofs"], argv=expected_argv,
+        environment=expected_environment, cwd=SOURCE_ROOT,
+        affinity=host["cpu_affinity"],
+        network_namespace_inode=host["network_namespace_inode"],
+        binary=binary, binary_sha256=binary_sha,
+        binary_descriptor=binary_descriptor,
+        maximum_binary_size=reader.MAX_APP_BINARY_BYTES,
+        fixed=fixed, capacity_stage=capacity_stage,
+    )
+    require(start == receipt["start_callback_proof"],
+            "initial ProbeV2 minimal start proof differs from the actual request")
+    binary_receipt = exact(receipt["binary"], {
+        "path", "source_relative_path", "raw_sha256", "device", "inode", "size",
+    }, "initial ProbeV2 opened binary identity")
+    _validate_initial_probe_binary_identity(
+        binary_receipt, expected_path=binary,
+        source_relative_path=source["artifacts"][identity["allocator"]]["path"],
+        expected_sha256=binary_sha, expected_descriptor=binary_descriptor,
+        maximum_size=reader.MAX_APP_BINARY_BYTES,
+    )
+    require(opened_descriptor == binary_descriptor and
+            receipt["owner_supervision_sha256"] == sha256(canonical(direct["supervision"])),
+            "initial ProbeV2 direct owner return differs from its bound ELF/supervision proof")
+
+    stdout_pin = exact(receipt["stdout"], {"path", "raw_sha256", "byte_count"},
+                       "initial ProbeV2 stdout pin")
+    stderr_pin = exact(receipt["stderr"], {"path", "raw_sha256", "byte_count"},
+                       "initial ProbeV2 stderr pin")
+    require(stdout_pin["path"] == str(paths["stdout"]) and
+            stderr_pin["path"] == str(paths["stderr"]),
+            "initial ProbeV2 stdout/stderr paths differ from the exact output directory")
+    stdout_raw, stdout_sha = _read_stable(
+        paths["stdout"], "initial ProbeV2 stdout", reader.MAX_PROBE_OUTPUT_BYTES,
+    )
+    stderr_raw, stderr_sha = _read_stable(
+        paths["stderr"], "initial ProbeV2 stderr", reader.MAX_PROBE_OUTPUT_BYTES,
+    )
+    _require_initial_probe_private_output(paths["stdout"], "initial ProbeV2 stdout")
+    _require_initial_probe_private_output(paths["stderr"], "initial ProbeV2 stderr")
+    require(receipt["storage_budget"] == budget,
+            "initial ProbeV2 receipt storage budget changed after request replay")
+    require(len(stdout_raw) == stdout_pin["byte_count"] <= budget["stdout_bytes"] and
+            stdout_sha == stdout_pin["raw_sha256"] and
+            len(stderr_raw) == stderr_pin["byte_count"] <= budget["stderr_bytes"] and
+            stderr_sha == stderr_pin["raw_sha256"] and not stderr_raw,
+            "initial ProbeV2 output raw pins, sizes, or empty-stderr condition differ")
+    probe_pin = exact(receipt["construction_probe"], {
+        "path", "raw_sha256", "allocator", "binary_sha256",
+    }, "initial ProbeV2 construction-probe result pin")
+    require(probe_pin == {
+        "path": str(paths["stdout"]), "raw_sha256": stdout_sha,
+        "allocator": identity["allocator"], "binary_sha256": binary_sha,
+    }, "initial ProbeV2 result pin does not point to the actual first stdout")
+    probe, probe_raw, probe_sha = _read_canonical(
+        paths["stdout"], "initial calibrated ProbeV2", stdout_sha,
+        reader.MAX_PROBE_OUTPUT_BYTES,
+    )
+    require(probe_raw == stdout_raw and probe_sha == stdout_sha and
+            probe.get("schema") == reader.CALIBRATED_PROBE_SCHEMA_V2,
+            "initial ProbeV2 stdout is not canonical calibrated ProbeV2 JSON")
+    checked_sha, checked_probe, _binary, _root, _capacity_sha, _capacity_path = \
+        reader._check_calibrated_construction_probe_v2_inputs(
+            probe_pin, source, bundle["artifact"], identity,
+            capacity_floor_policy_id=floor_id,
+        )
+    require(checked_sha == probe_sha and checked_probe == probe,
+            "SourceV5 static ProbeV2 checker returned different first stdout bytes")
+    policy = reader.resolve_calibrated_feedback_policy_v5(
+        source, probe, bundle["artifact"], identity,
+        capacity_floor_policy_id=floor_id,
+    )
+    reader._validate_calibrated_construction_evidence(source, probe, identity)
+    require(receipt["resolved_policy_sha256"] == reader.digest_object(policy),
+            "initial ProbeV2 resolved numeric policy digest differs")
+
+    inventory_pin = exact(receipt["tmpdir_inventory_pin"], {
+        "path", "raw_sha256", "inventory_sha256",
+    }, "initial ProbeV2 TMPDIR inventory pin")
+    require(inventory_pin["path"] == str(emission_dir / "tmpdir-inventory.json"),
+            "initial ProbeV2 TMPDIR inventory path differs")
+    inventory, inventory_raw, inventory_raw_sha = _read_canonical(
+        Path(inventory_pin["path"]), "initial ProbeV2 TMPDIR inventory",
+        inventory_pin["raw_sha256"], budget["inventory_bytes"],
+    )
+    _require_initial_probe_private_output(Path(inventory_pin["path"]),
+                                          "initial ProbeV2 TMPDIR inventory")
+    inventory = exact(inventory, {"schema", "entries", "inventory_sha256"},
+                      "initial ProbeV2 TMPDIR inventory")
+    inventory_body = {key: item for key, item in inventory.items()
+                      if key != "inventory_sha256"}
+    require(inventory["schema"] == PROBE_TMPDIR_INVENTORY_SCHEMA and
+            inventory["inventory_sha256"] == sha256(canonical(inventory_body)) ==
+            inventory_pin["inventory_sha256"] and inventory_raw_sha == inventory_pin["raw_sha256"] and
+            inventory_raw == canonical(inventory),
+            "initial ProbeV2 TMPDIR inventory raw/self digest differs")
+    initial_tmp = receipt["tmpdir_initial"]
+    final_tmp = receipt["tmpdir_final"]
+    fixed._verify_tmpdir_storage(
+        initial_tmp, final_tmp, str(paths["tmpdir"]), budget["tmpdir_bytes"],
+        budget["tmpdir_inodes"], "initial ProbeV2 emission receipt",
+    )
+    actual_entries = _capture_tmpdir_inventory(
+        paths["tmpdir"], budget["tmpdir_bytes"], budget["tmpdir_inodes"],
+    )
+    require(inventory["entries"] == actual_entries,
+            "initial ProbeV2 TMPDIR inventory differs from current owned descendants")
+    output_reservation = sum(budget[key] for key in (
+        "tmpdir_bytes", "stdout_bytes", "stderr_bytes", "owner_result_bytes",
+        "inventory_bytes", "failure_bytes", "receipt_bytes",
+    ))
+    inode_reservation = budget["tmpdir_inodes"] + budget["output_inodes"]
+    initial_mount = receipt["output_mount_initial"]
+    final_mount = receipt["output_mount_final"]
+    static_initial = fixed._mount_static(initial_mount)
+    static_final = fixed._mount_static(final_mount)
+    require(static_initial == static_final and
+            initial_mount["available_bytes"] >= output_reservation and
+            initial_mount["available_inodes"] >= inode_reservation and
+            final_mount["available_bytes"] >= output_reservation and
+            final_mount["available_inodes"] >= inode_reservation,
+            "initial ProbeV2 output mount proof is below its complete reservation")
+    current_mount = fixed._mount_identity(emission_dir)
+    require(fixed._mount_static(current_mount) == static_initial and
+            current_mount["available_bytes"] >= output_reservation and
+            current_mount["available_inodes"] >= inode_reservation,
+            "initial ProbeV2 output mount no longer satisfies its frozen reservation")
+    _verify_initial_probe_success_layout(
+        emission_dir, budget, include_receipt=True,
+    )
+    return receipt
+
+
 def compose_calibrated_policy_v5(request: object, request_raw_sha256: object) -> tuple[dict[str, Any], dict[str, Any]]:
     """Replay the pinned producer bundle and resolve a prelaunch V5 policy."""
     value = _validate_resolve_request(request)
@@ -2220,6 +3815,94 @@ def _write_exclusive(path: Path, raw: bytes) -> None:
         os.close(fd)
 
 
+def _write_initial_probe_receipt_exclusive(
+    path: Path, raw: bytes,
+) -> tuple[int, int]:
+    """Durably create one receipt and remove only its inode after a failed write."""
+    require(path.is_absolute() and str(path) == os.path.normpath(str(path)) and
+            type(raw) is bytes and len(raw) <= MAX_PROBE_CAPTURE_RECEIPT_BYTES,
+            "initial ProbeV2 receipt write path or bytes are outside their fixed bound")
+    parent = path.parent
+    try:
+        parent_info = parent.lstat()
+        require(parent.resolve(strict=True) == parent and
+                stat.S_ISDIR(parent_info.st_mode) and parent_info.st_uid == os.getuid() and
+                stat.S_IMODE(parent_info.st_mode) == 0o700,
+                "initial ProbeV2 receipt parent is not an owned private directory")
+        directory_fd = os.open(
+            parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) |
+            getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+        )
+    except OSError as error:
+        raise CompositionError(f"cannot safely open initial ProbeV2 receipt parent: {error}") from error
+    descriptor = -1
+    identity: tuple[int, int] | None = None
+    try:
+        anchored = os.fstat(directory_fd)
+        require((anchored.st_dev, anchored.st_ino) ==
+                (parent_info.st_dev, parent_info.st_ino),
+                "initial ProbeV2 receipt parent changed while opening")
+        descriptor = os.open(
+            path.name, os.O_WRONLY | os.O_CREAT | os.O_EXCL |
+            getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+            0o600, dir_fd=directory_fd,
+        )
+        created = os.fstat(descriptor)
+        identity = (created.st_dev, created.st_ino)
+        require(stat.S_ISREG(created.st_mode) and created.st_uid == os.getuid() and
+                created.st_nlink == 1,
+                "initial ProbeV2 receipt descriptor is not its exact private regular inode")
+        os.fchmod(descriptor, 0o600)
+        offset = 0
+        while offset < len(raw):
+            written = os.write(descriptor, raw[offset:])
+            require(written > 0, "initial ProbeV2 receipt write made no progress")
+            offset += written
+        os.fsync(descriptor)
+        final = os.fstat(descriptor)
+        require(identity == (final.st_dev, final.st_ino) and
+                stat.S_ISREG(final.st_mode) and final.st_uid == os.getuid() and
+                stat.S_IMODE(final.st_mode) == 0o600 and final.st_nlink == 1 and
+                final.st_size == len(raw),
+                "initial ProbeV2 receipt inode differs after durable write")
+        os.fsync(directory_fd)
+        return identity
+    except BaseException:
+        if identity is not None:
+            try:
+                current = os.stat(path.name, dir_fd=directory_fd, follow_symlinks=False)
+                if (current.st_dev, current.st_ino) == identity:
+                    os.unlink(path.name, dir_fd=directory_fd)
+                    os.fsync(directory_fd)
+            except OSError:
+                pass
+        raise
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        os.close(directory_fd)
+
+
+def _unlink_exact_output(path: Path, expected_identity: tuple[int, int]) -> None:
+    """Remove only one owned regular inode after its enclosing write fails validation."""
+    require(path.is_absolute() and str(path) == os.path.normpath(str(path)),
+            "owned output removal path must be normalized and absolute")
+    directory_fd = os.open(
+        path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) |
+        getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+    )
+    try:
+        info = os.stat(path.name, dir_fd=directory_fd, follow_symlinks=False)
+        require(stat.S_ISREG(info.st_mode) and info.st_uid == os.getuid() and
+                stat.S_IMODE(info.st_mode) == 0o600 and info.st_nlink == 1 and
+                (info.st_dev, info.st_ino) == expected_identity,
+                "refusing to remove an output that is not its exact private inode")
+        os.unlink(path.name, dir_fd=directory_fd)
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
@@ -2231,6 +3914,12 @@ def _parser() -> argparse.ArgumentParser:
     finalize.add_argument("--request", type=Path, required=True)
     finalize.add_argument("--expectation-output", type=Path, required=True)
     finalize.add_argument("--receipt-output", type=Path, required=True)
+    initial_probe = commands.add_parser(
+        "emit-initial-probe",
+        help="emit first calibrated ProbeV2 stdout with the Source-pinned direct owner",
+    )
+    initial_probe.add_argument("--request", type=Path, required=True)
+    initial_probe.add_argument("--request-sha256", required=True)
     return parser
 
 
@@ -2244,6 +3933,16 @@ def main(argv: list[str] | None = None) -> int:
         except (UnicodeError, json.JSONDecodeError, RecursionError) as error:
             raise CompositionError(f"composition request is invalid JSON: {error}") from error
         require(type(request) is dict and canonical(request) == request_raw, "composition request is not canonical JSON")
+        if args.command == "emit-initial-probe":
+            supplied_sha = digest(args.request_sha256,
+                                  "initial ProbeV2 CLI request raw SHA-256")
+            require(supplied_sha == request_sha,
+                    "initial ProbeV2 CLI request bytes differ from the supplied raw SHA-256")
+            result = emit_initial_calibrated_probe_v2({
+                "path": str(request_path), "raw_sha256": supplied_sha,
+            })
+            sys.stdout.buffer.write(canonical(result))
+            return 0
         if args.command == "resolve":
             policy, receipt = compose_calibrated_policy_v5(request, request_sha)
             _write_exclusive(absolute_path(str(args.policy_output), "resolved policy output"), canonical(policy))
