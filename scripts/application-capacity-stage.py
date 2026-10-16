@@ -3251,7 +3251,9 @@ def _estimate_preparation_resource_monitor_report_bytes(
         "tmpdir_inodes": U64_MAX,
         "tmpdir_by_device": {
             str(U64_MAX - index): {"bytes": U64_MAX, "inodes": U64_MAX}
-            for index in range(min(16, tmpdir_root_count))
+            # PreparationResourceMonitor._check_report_size_bound reserves
+            # all sixteen slots regardless of the current root count.
+            for index in range(16)
         },
         "monitor_report_count_before": U64_MAX,
         "job_monitor_report_count_before": U64_MAX,

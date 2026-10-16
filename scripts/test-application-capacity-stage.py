@@ -429,6 +429,104 @@ def live_host_controls() -> dict[str, Any]:
     }
 
 
+class PreparationResourceMonitorReportBoundTests(unittest.TestCase):
+    def _construct_monitor(
+        self, root: Path, *, sample_interval_ms: int, process_deadline_seconds: int,
+    ) -> tuple[stage.PreparationResourceMonitor, int, int]:
+        generation = root / "generation"
+        job_dir = generation / "jobs" / "job-a"
+        trace_dir = job_dir / "trace"
+        tmpdir_parent = root / "tmpdirs"
+        tmpdir_roots = [
+            tmpdir_parent / f"root-{index:02d}" for index in range(15)
+        ]
+        for directory in (generation, job_dir, trace_dir, tmpdir_parent, *tmpdir_roots):
+            directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+            directory.chmod(0o700)
+
+        fixed_sha256 = sha(Path(fixed_pair_owner.__file__).read_bytes())
+        context = {"stack": {
+            "fixed_pair": fixed_pair_owner,
+            "fixed_pair_sha256": fixed_sha256,
+        }}
+        ceilings = {
+            "monitor_sample_interval_milliseconds": sample_interval_ms,
+            "process_deadline_seconds": process_deadline_seconds,
+        }
+        report_bound = stage._estimate_preparation_resource_monitor_report_bytes(
+            ceilings, fixed_pair_owner, tmpdir_root_count=len(tmpdir_roots),
+        )
+        tmpdir_pins = [
+            stage._bounded_root_identity(fixed_pair_owner, path, "monitor-bound TMPDIR")
+            for path in tmpdir_roots
+        ]
+        stage_root = stage._bounded_root_identity(
+            fixed_pair_owner, generation, "monitor-bound generation",
+        )
+        job_root = stage._bounded_root_identity(
+            fixed_pair_owner, job_dir, "monitor-bound job",
+        )
+        trace_root = stage._bounded_root_identity(
+            fixed_pair_owner, trace_dir, "monitor-bound trace",
+        )
+        high_water = {key: 0 for key in (
+            "job_output_bytes", "job_output_inodes", "generation_bytes",
+            "generation_inodes", "tmpdir_bytes", "tmpdir_inodes",
+        )}
+        progress = {
+            "expected_monitor_report_count": 30,
+            "monitor_report_count": 0,
+            "job_monitor_report_counts": {},
+            "high_water": high_water,
+        }
+        budget = {
+            "pin": {
+                "path": str(root / "resource-budget.json"),
+                "raw_sha256": "a" * 64,
+                "semantic_sha256": "b" * 64,
+            },
+            "ceilings": ceilings,
+            "monitor_report_max_bytes": report_bound,
+            "monitor_report_max_samples": stage._preparation_resource_monitor_sample_count(
+                ceilings, fixed_pair_owner,
+            ),
+            "monitor_report_count": 30,
+        }
+        monitor = stage.PreparationResourceMonitor(
+            context, budget, generation, job_dir, trace_dir, tmpdir_pins,
+            progress, stage_root, job_root, trace_root,
+        )
+        return monitor, report_bound, monitor.maximum_samples
+
+    def test_estimator_and_runtime_checker_share_sixteen_device_worst_case(self) -> None:
+        cases = (
+            (1000, 1200, 1207),
+            (100, 60, 643),
+        )
+        for interval_ms, deadline_seconds, expected_samples in cases:
+            with self.subTest(interval_ms=interval_ms, deadline_seconds=deadline_seconds):
+                with tempfile.TemporaryDirectory(
+                    prefix="capacity-monitor-device-bound-",
+                ) as temporary:
+                    monitor, report_bound, sample_count = self._construct_monitor(
+                        Path(temporary), sample_interval_ms=interval_ms,
+                        process_deadline_seconds=deadline_seconds,
+                    )
+                    try:
+                        self.assertEqual(sample_count, expected_samples)
+                        self.assertEqual(
+                            report_bound,
+                            stage._estimate_preparation_resource_monitor_report_bytes(
+                                monitor.ceilings, fixed_pair_owner, tmpdir_root_count=15,
+                            ),
+                        )
+                        self.assertLessEqual(report_bound, stage.MAX_METADATA_BYTES)
+                        if expected_samples == 1207:
+                            self.assertEqual(report_bound, 7_640_957)
+                    finally:
+                        monitor.close()
+
+
 class CapacityStageCliTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
