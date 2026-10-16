@@ -1450,6 +1450,305 @@ class PacketRoundTripTests(unittest.TestCase):
                     fixture["execution_manifest_pin"],
                 )
 
+    def test_fixed_v3_read_ack_checks_the_actual_offered_request_pin(self) -> None:
+        """Structural profile witness; this does not establish GPG authority."""
+        with tempfile.TemporaryDirectory(prefix="source5-fixed-v3-read-ack-") as tmp:
+            root = Path(tmp)
+            fixture = self._fixture(root)
+            owner_directory = private(root / "fixed-owner-receipts")
+            owner_pins = {}
+            owner_rows = []
+            for role in ("component_receipt", "fixed_pair_host_receipt"):
+                receipt_body = {
+                    "schema": "allocatbelt.test-source5-owner-receipt.v1",
+                    "role": role, "structural_fixture": True,
+                }
+                receipt_semantic = sha(canonical(receipt_body))
+                raw = canonical({
+                    **receipt_body, "receipt_sha256": receipt_semantic,
+                })
+                origin = owner_directory / f"{role}.json"
+                origin.write_bytes(raw)
+                os.chmod(origin, 0o600)
+                receipt_pin = {
+                    "path": str(origin), "raw_sha256": sha(raw),
+                    "semantic_sha256": receipt_semantic,
+                }
+                owner_pins[role] = receipt_pin
+                owner_rows.append({
+                    "origin_path": str(origin), "role": role,
+                    "byte_count": len(raw), "raw_sha256": sha(raw),
+                    "semantic_sha256": receipt_semantic,
+                })
+            mount = {
+                "mount_id": 1, "major_minor": "0:1",
+                "mount_root": "/", "mount_point": "/",
+                "filesystem_type": "ext4", "mount_source": "test",
+                "device": 1,
+            }
+            proofs = []
+            for ordinal in (0, 1):
+                for domain in ("", "probe_tmpdir"):
+                    proof = {
+                        "role": "component_receipt",
+                        "path": str(root / "tmp-facts" /
+                                    f"{ordinal}-{domain or 'member'}"),
+                        "owner_receipt_pin": owner_pins["component_receipt"],
+                        "member_ordinal": ordinal, "device": 1,
+                        "inode": 100 + len(proofs), "mode": 0o700,
+                        "bytes_used": 0, "file_count": 0,
+                        "directory_count": 0, "bytes_limit": 1024,
+                        "inode_limit": 16, "mount": mount,
+                    }
+                    if domain:
+                        proof["domain"] = domain
+                    proofs.append(proof)
+            context = fixture["request"]["context"]
+            request_body = {
+                "schema": packet.REQUEST_SCHEMA_V3,
+                "context": context,
+                "job_record_pin": fixture["request"]["job_record_pin"],
+                "authorization": fixture["request"]["authorization"],
+                "predecessor_ack_pin": context["predecessor_ack_pin"],
+                "owner_receipt_pins": owner_pins,
+                "empty_tmp_proofs": proofs,
+                "entries": sorted(owner_rows,
+                                  key=lambda row: row["origin_path"]),
+                "request_sha256": "",
+            }
+            request = {
+                **request_body,
+                "request_sha256": sha(canonical({
+                    key: value for key, value in request_body.items()
+                    if key != "request_sha256"
+                })),
+            }
+            self.assertEqual(packet._validate_request(request), request)
+            request_raw = canonical(request)
+            request_path = fixture["request_path"]
+            request_path.write_bytes(request_raw)
+            os.chmod(request_path, 0o600)
+            request_pin = {
+                "path": str(request_path), "raw_sha256": sha(request_raw),
+                "semantic_sha256": request["request_sha256"],
+            }
+
+            source5_root = (
+                root / "private" / context["campaign_id"] /
+                context["host_id"] / "source5"
+            )
+            job_sha = "e" * 64
+            job_leaf = f"000001-{job_sha}.json"
+            objects = []
+            for row in request["entries"]:
+                object_id = packet._object_identity(
+                    row["origin_path"], row["raw_sha256"],
+                )
+                objects.append({
+                    **row, "object_id": object_id,
+                    "object_pin": {
+                        "path": str(source5_root / "objects" / object_id),
+                        "raw_sha256": row["raw_sha256"],
+                        "semantic_sha256": row["raw_sha256"],
+                        "byte_count": row["byte_count"],
+                    },
+                })
+            manifest_body = {
+                "schema": "allocatbelt.application-source5-evidence-object-manifest.v1",
+                "campaign_id": context["campaign_id"],
+                "host_id": context["host_id"], "phase": context["phase"],
+                "job_index": context["job_index"], "job_ordinal": 1,
+                "job_sha256": job_sha, "run_id": fixture["run_id"],
+                "job_record_raw_sha256":
+                    request["job_record_pin"]["raw_sha256"],
+                "predecessor_ack_pin": request["predecessor_ack_pin"],
+                "objects": objects, "object_count": len(objects),
+                "payload_bytes": sum(row["byte_count"]
+                                     for row in request["entries"]),
+            }
+            manifest = {
+                **manifest_body,
+                "manifest_sha256": sha(canonical(manifest_body)),
+            }
+            manifest_raw = canonical(manifest)
+            manifest_pin = {
+                "path": str(source5_root / "objects" / "manifests" /
+                            context["phase"] / job_leaf),
+                "raw_sha256": sha(manifest_raw),
+                "semantic_sha256": manifest["manifest_sha256"],
+            }
+            checkpoint_body = {
+                "schema": packet.CHECKPOINT_SCHEMA_V3,
+                "request_pin": request_pin, "context": context,
+                "job_record_pin": request["job_record_pin"],
+                "authorization": request["authorization"],
+                "predecessor_ack_pin": request["predecessor_ack_pin"],
+                "owner_receipt_pins": owner_pins,
+                "empty_tmp_proofs": proofs,
+                "object_manifest_pin": manifest_pin,
+                "entries": request["entries"],
+            }
+            checkpoint = {
+                **checkpoint_body,
+                "checkpoint_sha256": sha(canonical(checkpoint_body)),
+            }
+            checkpoint_raw = canonical(checkpoint)
+            checkpoint_pin = {
+                "path": str(source5_root / "checkpoints" /
+                            context["phase"] / job_leaf),
+                "raw_sha256": sha(checkpoint_raw),
+                "semantic_sha256": checkpoint["checkpoint_sha256"],
+            }
+            job_document = json.loads(fixture["job_raw"])
+            validation = {
+                "path": str(source5_root / "validation" / "job-records" /
+                            context["phase"] / job_leaf),
+                "origin_path": request["job_record_pin"]["path"],
+                "raw_sha256": request["job_record_pin"]["raw_sha256"],
+                "semantic_sha256": job_document["record_sha256"],
+                "byte_count": len(fixture["job_raw"]),
+            }
+            durable = {
+                "commit_id": "1" * 64,
+                "archive_source5_directory": {
+                    "path": str(source5_root), "device": 1, "inode": 2,
+                    "mode": 0o700,
+                },
+                "checkpoint_pin": checkpoint_pin,
+                "object_manifest_pin": manifest_pin,
+                "object_reopen_sha256": "2" * 64,
+                "object_count": len(objects),
+                "payload_bytes": manifest["payload_bytes"],
+                "job_record_validation": validation,
+            }
+            ack_body = {
+                "schema": "allocatbelt.application-source5-evidence-durable-ack.v1",
+                "checkpoint_pin": checkpoint_pin,
+                "object_manifest_pin": manifest_pin,
+                "predecessor_ack_pin": request["predecessor_ack_pin"],
+                "signer_fingerprint": context["authorized_signer_fingerprint"],
+                "durable_commit": durable,
+            }
+            ack = {**ack_body, "ack_sha256": sha(canonical(ack_body))}
+            signature = b"structural-test-signature"
+            members = [
+                ("checkpoint.json", checkpoint_raw),
+                ("object-manifest.json", manifest_raw),
+                ("ack.json", canonical(ack)),
+                ("ack.sig", signature),
+            ]
+            bundle_raw = b"".join(
+                packet._tar_header(name, len(raw)) + raw +
+                b"\x00" * ((-len(raw)) % packet.TAR_BLOCK_BYTES)
+                for name, raw in members
+            )
+            bundle_raw += b"\x00" * 1024
+            bundle_raw += b"\x00" * ((-len(bundle_raw)) % packet.TAR_RECORD_BYTES)
+            self.assertEqual(
+                len(bundle_raw),
+                packet._tar_size((name, len(raw)) for name, raw in members),
+            )
+            receiver_path = fixture["receiver_path"]
+            receiver_path.write_bytes(bundle_raw)
+            os.chmod(receiver_path, 0o600)
+            bundle_pin = {
+                "path": str(receiver_path), "raw_sha256": sha(bundle_raw),
+                "byte_count": len(bundle_raw),
+            }
+            retention = fixture["budget"]["path_catalogue"][
+                "retention_policy"
+            ]
+            maximum_ack_bytes = retention["maximum_ack_bundle_bytes"]
+            maximum_signature_bytes = retention["maximum_signature_bytes"]
+            limits = (1 << 20, 1, 1 << 20, 16,
+                      [str(fixture["source_root"])],
+                      str(fixture["scratch_root"]), maximum_ack_bytes,
+                      maximum_signature_bytes)
+
+            def offer_for(pin_value):
+                offer = packet._offer_body(
+                    pin_value, str(fixture["packet_path"]), "b" * 64, 512,
+                    str(receiver_path), maximum_ack_bytes,
+                )
+                raw = canonical(offer)
+                offer_pin = {
+                    "path": str(fixture["offer_path"]),
+                    "raw_sha256": sha(raw),
+                    "semantic_sha256": offer["offer_sha256"],
+                }
+                return offer, raw, offer_pin
+
+            def read_with_profile(pin_value):
+                offer, offer_raw, offer_pin = offer_for(pin_value)
+                with mock.patch.object(
+                    packet, "_validate_transfer_offer_with_profile",
+                    return_value=(offer, offer_pin, limits, {
+                        "required_request_schema": packet.REQUEST_SCHEMA_V3,
+                    }),
+                ):
+                    return packet.read_ack_bundle(
+                        receiver_path, fixture["budget_raw"],
+                        fixture["budget_pin"], offer_raw, offer_pin,
+                        bundle_pin, fixture["signer_context_raw"],
+                        fixture["signer_context_pin"],
+                        fixture["execution_manifest_raw"],
+                        fixture["execution_manifest_pin"],
+                        budget_context=context,
+                    )
+
+            imported = read_with_profile(request_pin)
+            self.assertEqual(imported["checkpoint_raw"], checkpoint_raw)
+            self.assertEqual(imported["checkpoint"]["schema"],
+                             packet.CHECKPOINT_SCHEMA_V3)
+
+            legacy_body = dict(request)
+            legacy_body["schema"] = packet.REQUEST_SCHEMA
+            legacy_body["empty_tmp_proofs"] = [
+                proof for proof in proofs if "domain" not in proof
+            ]
+            legacy_body["request_sha256"] = ""
+            legacy = {
+                **legacy_body,
+                "request_sha256": sha(canonical({
+                    key: value for key, value in legacy_body.items()
+                    if key != "request_sha256"
+                })),
+            }
+            legacy_raw = canonical(legacy)
+            request_path.write_bytes(legacy_raw)
+            os.chmod(request_path, 0o600)
+            legacy_pin = {
+                "path": str(request_path), "raw_sha256": sha(legacy_raw),
+                "semantic_sha256": legacy["request_sha256"],
+            }
+            with self.assertRaisesRegex(
+                    packet.TransferPacketError,
+                    "actual checkpoint request schema"):
+                read_with_profile(legacy_pin)
+
+            request_path.unlink()
+            with self.assertRaises(OSError):
+                read_with_profile(request_pin)
+
+            request_path.write_bytes(request_raw)
+            os.chmod(request_path, 0o600)
+            request_path.write_bytes(b"changed request bytes\n")
+            os.chmod(request_path, 0o600)
+            with self.assertRaisesRegex(packet.TransferPacketError,
+                                        "request bytes differ from their offer pin"):
+                read_with_profile(request_pin)
+
+            request_path.write_bytes(request_raw)
+            os.chmod(request_path, 0o600)
+            bad_semantic_pin = {
+                "path": str(request_path),
+                "raw_sha256": request_pin["raw_sha256"],
+                "semantic_sha256": "f" * 64,
+            }
+            with self.assertRaisesRegex(packet.TransferPacketError,
+                                        "request semantic pin differs"):
+                read_with_profile(bad_semantic_pin)
+
     def test_inline_pin_rejects_noncanonical_or_unbounded_input_before_read(self) -> None:
         invalid = (
             "{}\n", '{"x":1,"x":1}', '{ "x":1}',

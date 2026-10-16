@@ -1797,14 +1797,22 @@ def _validate_preparatory_profile_v1(
             "verify_path_catalogue_chunks_with_reader",
             "iter_path_catalogue_rows_with_reader",
         )
+        fixed_catalogue_api = (
+            "validate_fixed_pair_v3_path_catalogue_manifest",
+            "verify_fixed_pair_v3_path_catalogue_chunks_with_reader",
+            "iter_fixed_pair_v3_path_catalogue_rows_with_reader",
+        )
+        fixed_profile = any(name in budget_namespace
+                            for name in fixed_catalogue_api)
+        if fixed_profile:
+            catalogue_api = fixed_catalogue_api
         _require(all(callable(budget_namespace.get(name))
                      for name in catalogue_api),
                  "selected Source path-catalogue module lacks its captured row APIs")
-        catalogue = budget_namespace["validate_path_catalogue_manifest"](
+        catalogue = budget_namespace[catalogue_api[0]](
             budget["path_catalogue"],
         )
-        checked_catalogue = budget_namespace[
-            "verify_path_catalogue_chunks_with_reader"](
+        checked_catalogue = budget_namespace[catalogue_api[1]](
                 catalogue, catalogue_reader,
             )
         _require(checked_catalogue == catalogue,
@@ -1812,7 +1820,7 @@ def _validate_preparatory_profile_v1(
         width_rows = []
         spec_path_rows = []
         spec_role_rows = []
-        for row in budget_namespace["iter_path_catalogue_rows_with_reader"](
+        for row in budget_namespace[catalogue_api[2]](
                 catalogue, catalogue_reader):
             if row["path"] == width_raw_pin["path"]:
                 width_rows.append(row)
@@ -1866,6 +1874,17 @@ def _validate_preparatory_profile_v1(
             )
         _require(checked_budget == budget,
                  "selected Source prep budget validator changed its projection")
+        required_request_schema = None
+        selector_name = "required_archive_request_schema_v1"
+        if fixed_profile or selector_name in budget_namespace:
+            selector = budget_namespace.get(selector_name)
+            _require(callable(selector),
+                     "selected Source Fixed profile lacks its schema selector")
+            required_request_schema = selector(budget, manifest, context)
+            _require(required_request_schema in {None, REQUEST_SCHEMA_V3} and
+                     (not fixed_profile or
+                      required_request_schema == REQUEST_SCHEMA_V3),
+                     "selected Source Fixed profile returned an invalid schema requirement")
         archive_transport = budget["archive_transport"]
         _require(type(archive_transport) is dict and
                  archive_transport.get("schema") ==
@@ -1887,6 +1906,8 @@ def _validate_preparatory_profile_v1(
             "width": width, "width_pin": width_raw_pin,
             "catalogue": catalogue, "catalogue_reader": catalogue_reader,
             "catalogue_module": budget_namespace,
+            "catalogue_iterator_name": catalogue_api[2],
+            "required_request_schema": required_request_schema,
             "preparatory_module": prep_namespace,
             "spec_raw": spec_raw,
             "transport_row": row,
@@ -2532,6 +2553,7 @@ def _campaign_signature_limit(
     root_local: bool = False,
     require_v4_manifest: bool = False,
     captured_preparatory_artifact_reader=None,
+    request_schema: str | None = None,
 ) -> int:
     pin = _pin(budget_pin, "campaign host evidence budget pin")
     _require(_sha(raw) == pin["raw_sha256"],
@@ -2553,6 +2575,10 @@ def _campaign_signature_limit(
             root_local=root_local,
             captured_preparatory_artifact_reader=captured_preparatory_artifact_reader,
         )
+        required_schema = profile.get("required_request_schema")
+        _require(request_schema is None or required_schema is None or
+                 request_schema == required_schema,
+                 "checkpoint request schema differs from its selected Source profile")
         retention = profile["catalogue"].get("retention_policy")
         _require(type(retention) is dict,
                  "preparatory path catalogue lacks its signer quota")
@@ -2748,6 +2774,7 @@ def _validate_archive_signer_context(
     catalogue_cache_root: str | None = None,
     root_local: bool = False,
     captured_preparatory_artifact_reader=None,
+    request_schema: str | None = None,
 ) -> dict[str, Any]:
     context_pin = _pin(signer_context_pin, "archive signer-context pin")
     _require(type(raw) is bytes and _sha(raw) == context_pin["raw_sha256"],
@@ -2788,6 +2815,7 @@ def _validate_archive_signer_context(
         root_local=root_local,
         require_v4_manifest=width_bound,
         captured_preparatory_artifact_reader=captured_preparatory_artifact_reader,
+        request_schema=request_schema,
     )
     fingerprint = _fingerprint(
         value["authorized_primary_fingerprint"],
@@ -3042,7 +3070,9 @@ def _validate_preparatory_host_budget_object_rows(
     found: dict[str, dict[str, Any]] = {}
     tree_roots: set[str] = set()
     catalogue_module = profile["catalogue_module"]
-    rows = catalogue_module["iter_path_catalogue_rows_with_reader"](
+    rows = catalogue_module[profile.get(
+        "catalogue_iterator_name", "iter_path_catalogue_rows_with_reader",
+    )](
         catalogue, profile["catalogue_reader"],
     )
     for row in rows:
@@ -5924,6 +5954,9 @@ def archive_job_checkpoint(
 ) -> dict[str, Any]:
     """Copy, seal, and sign one completed job outside every timed lane."""
     rows = list(rows)
+    request_value = _validate_checkpoint_request(_parse_checkpoint_metadata(
+        request_bytes, "transferred checkpoint request",
+    ))
     checked_context = _validate_context(context)
     source_manifest_raw, execution_manifest_raw, journal_width_contract_raw = \
         _validate_local_dependencies(
@@ -5957,6 +5990,7 @@ def archive_job_checkpoint(
         ),
         root_local=True,
         require_v4_manifest=execution_manifest_raw is not None,
+        request_schema=request_value["schema"],
     )
     signer_value = _exact(signer, {
         "gpg_executable", "gpg_homedir", "primary_fingerprint",
@@ -7029,6 +7063,7 @@ def _verify_signed_ack_metadata(
         catalogue_cache_root=catalogue_cache_root,
         root_local=root_local_budget,
         captured_preparatory_artifact_reader=captured_preparatory_artifact_reader,
+        request_schema=request["schema"],
     )
     fingerprint = signer["fingerprint"]
     signature_limit = signer["maximum_signature_bytes"]
@@ -7430,6 +7465,9 @@ def verify_durable_ack(
         catalogue_chunk_paths=catalogue_chunk_paths,
         catalogue_cache_root=catalogue_cache_root,
         root_local=root_local_budget,
+        request_schema=_validate_checkpoint_request(_parse_checkpoint_metadata(
+            request_raw, "transferred checkpoint request profile",
+        ))["schema"],
     )
     fingerprint = signer["fingerprint"]
     signature_limit = signer["maximum_signature_bytes"]

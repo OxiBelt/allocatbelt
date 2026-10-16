@@ -24,6 +24,9 @@ from typing import Any, BinaryIO, Iterable
 REQUEST_SCHEMA = "allocatbelt.application-source5-evidence-checkpoint-request.v1"
 REQUEST_SCHEMA_V2 = "allocatbelt.application-source5-evidence-checkpoint-request.v2"
 REQUEST_SCHEMA_V3 = "allocatbelt.application-source5-evidence-checkpoint-request.v3"
+CHECKPOINT_SCHEMA = "allocatbelt.application-source5-evidence-job-checkpoint.v1"
+CHECKPOINT_SCHEMA_V2 = "allocatbelt.application-source5-evidence-job-checkpoint.v2"
+CHECKPOINT_SCHEMA_V3 = "allocatbelt.application-source5-evidence-job-checkpoint.v3"
 PROBE_TMPDIR_INVENTORY_SCHEMA_V1 = \
     "allocatbelt.application-feedback-probe-tmpdir-inventory.v1"
 PACKET_PIN_SCHEMA = "allocatbelt.application-source5-evidence-transfer-packet-pin.v1"
@@ -215,6 +218,43 @@ class TransferPacketError(ValueError):
 def _require(condition: bool, message: str) -> None:
     if not condition:
         raise TransferPacketError(message)
+
+
+def _profile_required_request_schema(profile: object) -> str | None:
+    """Return the requirement from the fully checked Source archive profile."""
+    if profile is None:
+        return None
+    _require(type(profile) is dict,
+             "selected Source archive profile is not an object")
+    if "required_request_schema" not in profile:
+        # An older, exactly pinned Source archive has no Fixed profile hook.
+        return None
+    required = profile["required_request_schema"]
+    _require(required is None or
+             (type(required) is str and required == REQUEST_SCHEMA_V3),
+             "selected Source archive profile returned an unknown request schema")
+    return required
+
+
+def _require_profile_request_schema(
+    profile: object, actual_request_schema: object,
+) -> None:
+    required = _profile_required_request_schema(profile)
+    if required is not None:
+        _require(type(actual_request_schema) is str and
+                 actual_request_schema == required,
+                 "actual checkpoint request schema differs from its selected Source profile")
+
+
+def _request_schema_for_checkpoint_schema(checkpoint_schema: object) -> str:
+    paired = {
+        CHECKPOINT_SCHEMA: REQUEST_SCHEMA,
+        CHECKPOINT_SCHEMA_V2: REQUEST_SCHEMA_V2,
+        CHECKPOINT_SCHEMA_V3: REQUEST_SCHEMA_V3,
+    }
+    _require(type(checkpoint_schema) is str and checkpoint_schema in paired,
+             "checkpoint schema has no exact request-schema pairing")
+    return paired[checkpoint_schema]
 
 
 def _exact(value: object, fields: set[str], label: str) -> dict[str, Any]:
@@ -1149,6 +1189,7 @@ def _validate_preparatory_budget_profile_v1(
              type(profile.get("catalogue")) is dict and
              type(profile.get("transport_row")) is dict,
              "selected Source prep archive validator returned a malformed profile")
+    _profile_required_request_schema(profile)
     row = profile["transport_row"]
     catalogue = profile["catalogue"]
     source_retention = budget["retention_policy"].get("source_policy")
@@ -2027,7 +2068,6 @@ def _validate_budget_context(
             catalogue_cache_root=catalogue_cache_root,
             root_local=root_local,
         )
-        _validate_budget_origin_pins(budget, context)
         return
     budget, _is_r6 = _exact_host_budget(budget, "host evidence budget")
     _validate_host_budget_revision(
@@ -2788,7 +2828,7 @@ def _read_regular_absolute(path_value: object, maximum: int,
         os.close(parent_fd)
 
 
-def _budget_limits(
+def _budget_limits_with_archive_profile(
     budget_raw: bytes, budget_pin: object, campaign_id: str, host_id: str,
     *, budget_context: dict[str, Any] | None = None,
     source_manifest_raw: bytes | None = None,
@@ -2799,7 +2839,8 @@ def _budget_limits(
     catalogue_chunk_paths: dict[str, str] | None = None,
     catalogue_cache_root: str | None = None,
     root_local: bool = False,
-) -> tuple[int, int, int, int, list[str], str, int, int]:
+) -> tuple[tuple[int, int, int, int, list[str], str, int, int],
+           dict[str, Any] | None]:
     pin = _pin(budget_pin, "host evidence budget pin")
     _require(_sha(budget_raw) == pin["raw_sha256"],
              "host evidence budget bytes differ from their raw pin")
@@ -2810,7 +2851,7 @@ def _budget_limits(
     if budget_probe.get("schema") == PREPARATORY_BUDGET_SCHEMA_V1:
         _require(budget_context is not None,
                  "preparatory budget validation requires its exact original job context")
-        budget, _profile, limits = _validate_preparatory_budget_profile_v1(
+        budget, profile, limits = _validate_preparatory_budget_profile_v1(
             budget_raw, pin, budget_context, campaign_id, host_id,
             source_manifest_raw=source_manifest_raw,
             execution_manifest_raw=execution_manifest_raw,
@@ -2821,7 +2862,7 @@ def _budget_limits(
             catalogue_cache_root=catalogue_cache_root,
             root_local=root_local,
         )
-        return limits
+        return limits, profile
     _require(len(budget_raw) <= MAX_JSON_BYTES,
              "final host evidence budget exceeds its unchanged metadata ceiling")
     budget, is_width_bound = _exact_host_budget(
@@ -2907,9 +2948,37 @@ def _budget_limits(
     source_roots = catalogue.get("root_byte_bounds")
     _require(type(source_roots) is dict and source_roots,
              "budget path catalogue has no source roots")
-    return (max_packet, max_packet_inodes, max_window_bytes,
-            max_window_inodes, list(source_roots), scratch_roots[0],
-            max_ack_bundle, max_signature)
+    return ((max_packet, max_packet_inodes, max_window_bytes,
+             max_window_inodes, list(source_roots), scratch_roots[0],
+             max_ack_bundle, max_signature), None)
+
+
+def _budget_limits(
+    budget_raw: bytes, budget_pin: object, campaign_id: str, host_id: str,
+    *, budget_context: dict[str, Any] | None = None,
+    source_manifest_raw: bytes | None = None,
+    execution_manifest_raw: bytes | None = None,
+    plan_raw: bytes | None = None,
+    journal_width_contract_raw: bytes | None = None,
+    spec_raw: bytes | None = None,
+    catalogue_chunk_paths: dict[str, str] | None = None,
+    catalogue_cache_root: str | None = None,
+    root_local: bool = False,
+) -> tuple[int, int, int, int, list[str], str, int, int]:
+    """Keep the legacy eight-value ABI for non-request-aware consumers."""
+    limits, _profile = _budget_limits_with_archive_profile(
+        budget_raw, budget_pin, campaign_id, host_id,
+        budget_context=budget_context,
+        source_manifest_raw=source_manifest_raw,
+        execution_manifest_raw=execution_manifest_raw,
+        plan_raw=plan_raw,
+        journal_width_contract_raw=journal_width_contract_raw,
+        spec_raw=spec_raw,
+        catalogue_chunk_paths=catalogue_chunk_paths,
+        catalogue_cache_root=catalogue_cache_root,
+        root_local=root_local,
+    )
+    return limits
 
 
 def _validate_fixed_v3_tmp_proofs(request: dict[str, Any]) -> None:
@@ -3346,7 +3415,7 @@ def _budget_and_pin_for_request(
     )
     _require(actual == pin["raw_sha256"],
              "host budget local bytes differ from checkpoint request raw pin")
-    limits = _budget_limits(
+    limits, profile = _budget_limits_with_archive_profile(
         raw, pin, request["context"]["campaign_id"],
         request["context"]["host_id"],
         budget_context=request["context"],
@@ -3356,6 +3425,7 @@ def _budget_and_pin_for_request(
         journal_width_contract_raw=journal_width_contract_raw,
         spec_raw=spec_raw,
     )
+    _require_profile_request_schema(profile, request["schema"])
     return _parse_canonical(raw, "pinned host budget"), raw, limits
 
 
@@ -3466,10 +3536,11 @@ def publish_transfer_offer(
         maximum_bytes=PREPARATORY_MAX_BUDGET_BYTES,
     )
     context = request["context"]
-    _validate_budget_origin_pins(budget, context)
+    if budget.get("schema") != PREPARATORY_BUDGET_SCHEMA_V1:
+        _validate_budget_origin_pins(budget, context)
     if request["schema"] in {REQUEST_SCHEMA_V2, REQUEST_SCHEMA_V3}:
         _entry_catalogue_rows(request, budget)
-    limits = _budget_limits(
+    limits, profile = _budget_limits_with_archive_profile(
         budget_raw, budget_pin_checked, context["campaign_id"],
         context["host_id"],
         budget_context=context,
@@ -3479,6 +3550,7 @@ def publish_transfer_offer(
         journal_width_contract_raw=journal_width_contract_raw,
         spec_raw=spec_raw,
     )
+    _require_profile_request_schema(profile, request["schema"])
     (max_packet, packet_inodes, _window_bytes, _window_inodes, _roots,
      _scratch, max_ack, _max_signature) = limits
     _require(packet_inodes == 1 and packet_size <= max_packet,
@@ -3559,7 +3631,7 @@ def publish_transfer_offer(
         os.close(parent_fd)
 
 
-def validate_transfer_offer(
+def _validate_transfer_offer_with_profile(
     offer_raw: bytes, offer_pin: object, budget_raw: bytes,
     budget_pin: object, *,
     catalogue_chunk_paths: dict[str, str] | None = None,
@@ -3571,7 +3643,8 @@ def validate_transfer_offer(
     journal_width_contract_raw: bytes | None = None,
     spec_raw: bytes | None = None,
 ) -> tuple[dict[str, Any], dict[str, str],
-           tuple[int, int, int, int, list[str], str, int, int]]:
+           tuple[int, int, int, int, list[str], str, int, int],
+           dict[str, Any] | None]:
     offer = _exact(_parse_canonical(offer_raw, "archive transfer offer"), {
         "schema", "checkpoint_request_pin", "transfer_packet_pin",
         "acknowledgement_receiver", "offer_sha256",
@@ -3614,7 +3687,7 @@ def validate_transfer_offer(
              _budget_body_semantic_sha256(budget) ==
              budget_pin_checked["semantic_sha256"],
              "offer budget semantic pin differs")
-    limits = _budget_limits(
+    limits, profile = _budget_limits_with_archive_profile(
         budget_raw, budget_pin_checked, budget["campaign_id"],
         budget["host_id"],
         budget_context=budget_context,
@@ -3672,7 +3745,35 @@ def validate_transfer_offer(
              receiver_cap == rows[receiver_path]["max_file_bytes"] and
              receiver_cap <= max_ack,
              "offer paths or caps differ from the pinned catalogue")
-    return offer, checked_offer_pin, limits
+    return offer, checked_offer_pin, limits, profile
+
+
+def validate_transfer_offer(
+    offer_raw: bytes, offer_pin: object, budget_raw: bytes,
+    budget_pin: object, *,
+    catalogue_chunk_paths: dict[str, str] | None = None,
+    catalogue_cache_root: str | None = None,
+    budget_context: dict[str, Any] | None = None,
+    source_manifest_raw: bytes | None = None,
+    execution_manifest_raw: bytes | None = None,
+    plan_raw: bytes | None = None,
+    journal_width_contract_raw: bytes | None = None,
+    spec_raw: bytes | None = None,
+) -> tuple[dict[str, Any], dict[str, str],
+           tuple[int, int, int, int, list[str], str, int, int]]:
+    """Validate a request-less offer without claiming its request version."""
+    offer, pin, limits, _profile = _validate_transfer_offer_with_profile(
+        offer_raw, offer_pin, budget_raw, budget_pin,
+        catalogue_chunk_paths=catalogue_chunk_paths,
+        catalogue_cache_root=catalogue_cache_root,
+        budget_context=budget_context,
+        source_manifest_raw=source_manifest_raw,
+        execution_manifest_raw=execution_manifest_raw,
+        plan_raw=plan_raw,
+        journal_width_contract_raw=journal_width_contract_raw,
+        spec_raw=spec_raw,
+    )
+    return offer, pin, limits
 
 
 def _catalogue_rows_for_paths(
@@ -4028,7 +4129,8 @@ def export_transfer_packet(
         journal_width_contract_raw=journal_width_contract_raw,
         spec_raw=spec_raw,
     )
-    _validate_budget_origin_pins(_budget, request["context"])
+    if _budget.get("schema") != PREPARATORY_BUDGET_SCHEMA_V1:
+        _validate_budget_origin_pins(_budget, request["context"])
     (max_packet, max_packet_inodes, max_window_bytes, max_window_inodes,
      roots, scratch_root, max_ack_bundle_bytes, max_signature_bytes) = limits
     rows = request["entries"]
@@ -4793,6 +4895,50 @@ def _validate_ack_bundle_documents(
     return checkpoint, manifest, ack
 
 
+def _read_ack_bundle_documents_fd(
+    fd: int, file_size: int, maximum_signature_bytes: int,
+) -> list[bytes]:
+    """Read one exact four-member ACK bundle from an already bounded fd."""
+    names = ["checkpoint.json", "object-manifest.json", "ack.json", "ack.sig"]
+    docs: list[bytes] = []
+    offset = 0
+    for name in names:
+        header = _read_tar_header(fd, offset, file_size)
+        maximum = (
+            maximum_signature_bytes if name == "ack.sig" else
+            MAX_ARCHIVE_REQUEST_CHECKPOINT_BYTES
+            if name == "checkpoint.json" else MAX_JSON_BYTES
+        )
+        _require(header is not None and header["name"] == name and
+                 header["typeflag"] == b"0" and header["mode"] == 0o600 and
+                 header["uid"] == 0 and header["gid"] == 0 and
+                 header["mtime"] == 0 and header["linkname"] == b"" and
+                 header["size"] <= maximum,
+                 "ACK bundle member names/types/sizes are not the exact four-file set")
+        data_offset = offset + TAR_BLOCK_BYTES
+        raw = _read_tar_bytes(fd, data_offset, header["size"], maximum,
+                              f"ACK bundle {name}")
+        docs.append(raw)
+        offset = _require_zero_padding(fd, data_offset, header["size"],
+                                       f"ACK bundle {name}")
+    _require(_read_tar_header(fd, offset, file_size) is None,
+             "ACK bundle contains an extra member")
+    offset += TAR_BLOCK_BYTES
+    _require(os.pread(fd, TAR_BLOCK_BYTES, offset) ==
+             b"\x00" * TAR_BLOCK_BYTES,
+             "ACK bundle lacks its full tar end marker")
+    offset += TAR_BLOCK_BYTES
+    _require(offset <= file_size and
+             file_size - offset < TAR_RECORD_BYTES and
+             _read_tar_bytes(fd, offset, file_size - offset,
+                             TAR_RECORD_BYTES, "ACK bundle trailer") ==
+                 b"\x00" * (file_size - offset) and
+             _tar_size(zip(names, [len(raw) for raw in docs], strict=True)) ==
+                 file_size,
+             "ACK bundle size/trailer differs from its exact four-file closure")
+    return docs
+
+
 def build_ack_bundle(
     checkpoint_raw: bytes, manifest_raw: bytes, ack_raw: bytes,
     signature_raw: bytes, budget_raw: bytes, budget_pin: object,
@@ -4809,7 +4955,7 @@ def build_ack_bundle(
     checkpoint_document = _parse_checkpoint_metadata(
         checkpoint_raw, "final checkpoint",
     )
-    limits = _budget_limits(
+    limits, profile = _budget_limits_with_archive_profile(
         budget_raw, budget_pin,
         checkpoint_document["context"]["campaign_id"],
         checkpoint_document["context"]["host_id"],
@@ -4827,6 +4973,9 @@ def build_ack_bundle(
     checkpoint, _manifest, _ack = _validate_ack_bundle_documents(
         checkpoint_raw, manifest_raw, ack_raw, signature_raw,
         maximum_signature_bytes,
+    )
+    _require_profile_request_schema(
+        profile, _request_schema_for_checkpoint_schema(checkpoint["schema"]),
     )
     _require(checkpoint["context"]["resource_budget_pin"] ==
              _pin(budget_pin, "host evidence budget pin"),
@@ -4918,6 +5067,7 @@ def read_ack_bundle(
         budget_raw, "host evidence budget",
         maximum_bytes=PREPARATORY_MAX_BUDGET_BYTES,
     )
+    offered_request = None
     if (budget_probe.get("schema") == PREPARATORY_BUDGET_SCHEMA_V1 and
             budget_context is None):
         request_pin = _pin(offer_probe["checkpoint_request_pin"],
@@ -4933,8 +5083,10 @@ def read_ack_bundle(
         ))
         _require(request["request_sha256"] == request_pin["semantic_sha256"],
                  "host preparatory request semantic pin differs from its offer")
+        offered_request = request
         budget_context = request["context"]
-    offer, _offer_pin, limits = validate_transfer_offer(
+    offer, _offer_pin, limits, budget_profile = \
+        _validate_transfer_offer_with_profile(
         offer_raw, offer_pin, budget_raw, budget_pin,
         catalogue_chunk_paths=catalogue_chunk_paths,
         catalogue_cache_root=catalogue_cache_root,
@@ -4945,6 +5097,30 @@ def read_ack_bundle(
         journal_width_contract_raw=journal_width_contract_raw,
         spec_raw=spec_raw,
     )
+    if (_profile_required_request_schema(budget_profile) is not None and
+            offered_request is None):
+        request_pin = _pin(offer["checkpoint_request_pin"],
+                           "required-profile ACK request pin")
+        request_raw, request_sha, _request_info = _read_regular_absolute(
+            request_pin["path"], MAX_ARCHIVE_REQUEST_CHECKPOINT_BYTES,
+            "required-profile offered checkpoint request",
+        )
+        _require(request_sha == request_pin["raw_sha256"],
+                 "required-profile request bytes differ from their offer pin")
+        offered_request = _validate_request(_parse_checkpoint_metadata(
+            request_raw, "required-profile offered checkpoint request",
+        ))
+        _require(offered_request["request_sha256"] ==
+                 request_pin["semantic_sha256"],
+                 "required-profile request semantic pin differs from its offer")
+    if offered_request is not None:
+        _require_profile_request_schema(
+            budget_profile, offered_request["schema"],
+        )
+        if budget_context is not None:
+            _require_same_budget_context(
+                budget_context, offered_request["context"],
+            )
     maximum_signature_bytes = limits[-1]
     if budget_probe.get("schema") == PREPARATORY_BUDGET_SCHEMA_V1:
         budget = _exact(budget_probe, PREPARATORY_BUDGET_FIELDS_V1,
@@ -4974,55 +5150,26 @@ def read_ack_bundle(
         actual_sha = _hash_packet_fd(fd, info)
         _require(actual_sha == raw_sha and info.st_size == bundle_size,
                  "ACK bundle raw bytes differ from their transfer pin")
-        names = ["checkpoint.json", "object-manifest.json", "ack.json", "ack.sig"]
-        docs = []
-        offset = 0
-        for index, name in enumerate(names):
-            header = _read_tar_header(fd, offset, info.st_size)
-            maximum = (
-                maximum_signature_bytes if name == "ack.sig" else
-                MAX_ARCHIVE_REQUEST_CHECKPOINT_BYTES
-                if name == "checkpoint.json" else MAX_JSON_BYTES
-            )
-            _require(header is not None and header["name"] == name and
-                     header["typeflag"] == b"0" and header["mode"] == 0o600 and
-                     header["uid"] == 0 and header["gid"] == 0 and
-                     header["mtime"] == 0 and header["linkname"] == b"" and
-                     header["size"] <= maximum,
-                     "ACK bundle member names/types/sizes are not the exact four-file set")
-            data_offset = offset + TAR_BLOCK_BYTES
-            raw = _read_tar_bytes(fd, data_offset, header["size"], maximum,
-                                  f"ACK bundle {name}")
-            digest = _sha(raw)
-            docs.append(raw)
-            offset = _require_zero_padding(fd, data_offset, header["size"],
-                                           f"ACK bundle {name}")
-        _require(_read_tar_header(fd, offset, info.st_size) is None,
-                 "ACK bundle contains an extra member")
-        offset += TAR_BLOCK_BYTES
-        _require(os.pread(fd, TAR_BLOCK_BYTES, offset) ==
-                 b"\x00" * TAR_BLOCK_BYTES,
-                 "ACK bundle lacks its full tar end marker")
-        offset += TAR_BLOCK_BYTES
-        _require(offset <= info.st_size and
-                 info.st_size - offset < TAR_RECORD_BYTES and
-                 _read_tar_bytes(fd, offset, info.st_size - offset,
-                                 TAR_RECORD_BYTES,
-                                 "ACK bundle trailer") ==
-                     b"\x00" * (info.st_size - offset) and
-                 _tar_size(zip(names, [len(raw) for raw in docs], strict=True)) ==
-                     info.st_size,
-                 "ACK bundle size/trailer differs from its exact four-file closure")
+        docs = _read_ack_bundle_documents_fd(
+            fd, info.st_size, maximum_signature_bytes,
+        )
         checkpoint, manifest, ack = _validate_ack_bundle_documents(
             docs[0], docs[1], docs[2], docs[3], maximum_signature_bytes,
         )
+        _require_profile_request_schema(
+            budget_profile,
+            _request_schema_for_checkpoint_schema(checkpoint["schema"]),
+        )
         context = checkpoint["context"]
+        if budget_context is not None:
+            _require_same_budget_context(budget_context, context)
         width_bound = (budget.get("schema") == PREPARATORY_BUDGET_SCHEMA_V1 or (
             (set(budget) == HOST_BUDGET_FIELDS_R6 or
              set(budget) == HOST_BUDGET_FIELDS_V3) and
             budget.get("execution_manifest_schema") == EXECUTION_SCHEMA_V4
         ))
-        _validate_budget_origin_pins(budget, context)
+        if budget.get("schema") != PREPARATORY_BUDGET_SCHEMA_V1:
+            _validate_budget_origin_pins(budget, context)
         signer_context = _validate_archive_signer_context(
             signer_context_raw, signer_context_pin, context,
             maximum_signature_bytes, execution_manifest_pin,
@@ -5118,7 +5265,8 @@ def publish_ack_bundle(
     This operation takes no phase lock: its waiting controller already owns
     that lock and observes only the immutable final receiver path.
     """
-    offer, checked_offer_pin, limits = validate_transfer_offer(
+    offer, checked_offer_pin, limits, budget_profile = \
+        _validate_transfer_offer_with_profile(
         offer_raw, offer_pin, budget_raw, budget_pin,
         budget_context=budget_context,
         source_manifest_raw=source_manifest_raw,
@@ -5167,6 +5315,29 @@ def publish_ack_bundle(
             actual_sha = _hash_packet_fd(source_fd, before)
             _require(actual_sha == raw_sha and before.st_size == byte_count,
                      "uploaded ACK .incoming bytes differ from the coordinator pin")
+            if _profile_required_request_schema(budget_profile) is not None:
+                documents = _read_ack_bundle_documents_fd(
+                    source_fd, before.st_size, limits[-1],
+                )
+                checkpoint, _manifest, _ack = _validate_ack_bundle_documents(
+                    documents[0], documents[1], documents[2], documents[3],
+                    limits[-1],
+                )
+                _require_profile_request_schema(
+                    budget_profile,
+                    _request_schema_for_checkpoint_schema(checkpoint["schema"]),
+                )
+                _require(checkpoint["request_pin"] ==
+                         offer["checkpoint_request_pin"] and
+                         checkpoint["context"]["resource_budget_pin"] ==
+                             _pin(budget_pin, "host evidence budget pin"),
+                         "uploaded ACK documents differ from the offered request/budget")
+                if budget_context is not None:
+                    _require_same_budget_context(
+                        budget_context, checkpoint["context"],
+                    )
+                _require(_hash_packet_fd(source_fd, before) == raw_sha,
+                         "uploaded ACK .incoming changed while its documents were validated")
             os.fsync(source_fd)
             _require(_info_key(before) == _info_key(os.fstat(source_fd)) and
                      _info_key(before) == _info_key(os.stat(
@@ -5349,7 +5520,8 @@ def import_transfer_packet(
     spec_raw: bytes | None = None,
 ) -> dict[str, Any]:
     """Verify the complete no-link packet before writing its first stage file."""
-    offer, checked_offer_pin, offer_limits = validate_transfer_offer(
+    offer, checked_offer_pin, offer_limits, budget_profile = \
+        _validate_transfer_offer_with_profile(
         offer_raw, offer_pin, budget_raw, budget_pin,
         catalogue_chunk_paths=catalogue_chunk_paths,
         catalogue_cache_root=catalogue_cache_root,
@@ -5396,10 +5568,12 @@ def import_transfer_packet(
             packet_fd, packet_info, expected, parsed_budget,
             catalogue_chunk_paths, catalogue_cache_root,
         )
+        _require_profile_request_schema(budget_profile, request["schema"])
         context = request["context"]
         if expected_context is not None:
             _require_same_budget_context(expected_context, context)
-        _validate_budget_origin_pins(parsed_budget, context)
+        if parsed_budget.get("schema") != PREPARATORY_BUDGET_SCHEMA_V1:
+            _validate_budget_origin_pins(parsed_budget, context)
         _require(context["campaign_id"] == parsed_budget["campaign_id"] and
                  context["host_id"] == parsed_budget["host_id"] and
                  _pin(context["resource_budget_pin"], "request host budget") ==

@@ -363,6 +363,16 @@ their existing contracts. V3 adds no payload tree or APP invocation. Source
 budget activation must separately select and reserve the four-proof profile;
 generic V3 parsing alone does not admit a campaign.
 
+Preparatory readers select catalogue algorithms and the required checkpoint
+schema from the fully validated, typed Source budget module. Publication,
+import, signed metadata reads, durable verification and host ACK readback
+enforce that requirement against the actual request/checkpoint bytes. Host
+readback checks the offered request even when its caller supplies a budget
+context. A new profile rejects a V1 downgrade before acceptance or publication;
+older Source profiles retain their existing catalogue and raw ACK-publication
+contracts. This does not implement final V5 budget admission or SourceA's
+numeric-owner authority.
+
 Recorded Fixed replay also accepts an explicit bounded `global_artifact_reader`
 for historical Spec, Plan, Source JSON and host-observation metadata. It checks
 the original raw pins and canonical bytes without opening ambient historical
