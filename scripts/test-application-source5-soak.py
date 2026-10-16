@@ -2045,6 +2045,14 @@ class Source5SoakPublicApiTests(unittest.TestCase):
             host_budget_path, None,
         )
         contract = projected["contract"]
+        contract_body = {
+            key: value for key, value in contract.items()
+            if key != "contract_sha256"
+        }
+        self.assertEqual(
+            contract["contract_sha256"],
+            hashlib.sha256(controller.canonical_bytes(contract_body)).hexdigest(),
+        )
         expected_counts = {
             "exploration": 360, "aa": 48, "confirmation": 8100,
             "pressure": 8100, "soak": 1,

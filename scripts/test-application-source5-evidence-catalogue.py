@@ -80,6 +80,50 @@ class EvidenceCatalogueTests(unittest.TestCase):
                 dictionary=False,
             )
 
+    def test_fixed_member_slots_support_legacy_literal_and_shared_projection(self) -> None:
+        legacy = ast.parse('def _construct_members():\n    outputs = {"stdout": 1}\n')
+        self.assertEqual(catalogue._fixed_pair_member_slots(legacy), ["stdout"])
+        shared = ast.parse(
+            'def _construct_members(context, runtime_bindings):\n'
+            '    return _project_members(context, runtime_bindings, identities)\n'
+            'def _construct_members_closed_recorded(context, runtime_bindings):\n'
+            '    return _project_members(context, runtime_bindings, identities)\n'
+            'def _project_members(context, runtime_bindings, identities):\n'
+            '    outputs = {"stdout": 1}\n',
+        )
+        self.assertEqual(catalogue._fixed_pair_member_slots(shared), ["stdout"])
+
+    def test_rehashed_shared_projector_dispatch_drift_is_rejected(self) -> None:
+        source, owner_bytes = source_fixture()
+        fixed_path = catalogue.OWNER_PATHS["fixed_pair"]
+        original = owner_bytes[fixed_path]
+        call = b"return _project_members(context, runtime_bindings, identities)"
+        self.assertEqual(original.count(call), 2)
+        for ordinal in (0, 1):
+            for replacement in (
+                b"return _other_projector(context, runtime_bindings, identities)",
+                b"return _project_members(context, identities, runtime_bindings)",
+                b"return list(_project_members(context, runtime_bindings, identities))",
+            ):
+                with self.subTest(ordinal=ordinal, replacement=replacement):
+                    chunks = original.split(call)
+                    chunks[ordinal] += replacement
+                    mutated = chunks[0] + (call if ordinal != 0 else b"") + chunks[1] + (call if ordinal != 1 else b"") + chunks[2]
+                    changed = {**owner_bytes, fixed_path: mutated}
+                    with self.assertRaises(catalogue.CatalogueError):
+                        catalogue.inspect_owner_evidence_contracts(repin_source(source, changed), changed)
+
+    def test_shared_projector_missing_or_ambiguous_schema_is_rejected(self) -> None:
+        source, owner_bytes = source_fixture()
+        fixed_path = catalogue.OWNER_PATHS["fixed_pair"]
+        original = owner_bytes[fixed_path]
+        for replacement in (b"output_paths = {", b"outputs = {}\n        outputs = {"):
+            with self.subTest(replacement=replacement):
+                changed = {**owner_bytes, fixed_path: original.replace(b"        outputs = {", b"        " + replacement, 1)}
+                self.assertNotEqual(changed[fixed_path], original)
+                with self.assertRaises(catalogue.CatalogueError):
+                    catalogue.inspect_owner_evidence_contracts(repin_source(source, changed), changed)
+
     def test_cleanup_poll_interval_accepts_repeated_identical_source_calls(self) -> None:
         tree = ast.parse(
             "def cleanup():\n"

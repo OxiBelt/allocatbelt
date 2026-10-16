@@ -169,6 +169,82 @@ class Source5PreparationInputTests(unittest.TestCase):
         self.assertEqual(len({item["prospective_nonce"] for item in value["capacity_templates"]}), 45)
         self.assertTrue(all(value is False for value in value["eligibility"].values()))
 
+    def test_capacity_stage_budget_binds_current_fixed_and_preparation_module_pins(self) -> None:
+        fixed_path = SCRIPT_DIR / "application-fixed-pair.py"
+        fixed_hash = hashlib.sha256(fixed_path.read_bytes()).hexdigest()
+        fixed_owner = load_script(fixed_path, "source5_typed_fixed_pair_budget_owner")
+        self.assertEqual(capacity_stage.PREPARATION_FIXED_PAIR_R4_WALKER_SHA256,
+                         fixed_hash)
+        fixture, _spec = preparation_fixture()
+        fixed_relative = inputs.PREPARATION_MODULE_PATHS["fixed_pair"]
+        for source_pin in fixture["source_pins"].values():
+            source_pin["modules"]["fixed_pair"] = {
+                "path": fixed_relative, "sha256": fixed_hash,
+            }
+        with tempfile.TemporaryDirectory(prefix="source5-fixed-stage-abi-") as temporary:
+            input_root = Path(temporary).resolve()
+            preparation_path = input_root / "preparation.json"
+            inputs.build_preparation_intent(
+                fixture["core"], fixture["source_pins"],
+                fixture["observed_hosts"], fixture["capacity_templates"],
+                fixture["condition_intensities"], preparation_path,
+            )
+            preparation_raw = preparation_path.read_bytes()
+            preparation_value = json.loads(preparation_raw.decode("utf-8"))
+            preparation_pin = {
+                "path": str(preparation_path),
+                "raw_sha256": hashlib.sha256(preparation_raw).hexdigest(),
+                "semantic_sha256": preparation_value["preparation_sha256"],
+            }
+            host_id = preparation_value["core"]["hosts"][0]["host_id"]
+            ceilings = {
+                "maximum_job_output_bytes": capacity_stage.MAX_PREPARATION_JOB_OUTPUT_BYTES,
+                "maximum_job_output_inodes": capacity_stage.MAX_PREPARATION_JOB_OUTPUT_INODES,
+                "maximum_generation_bytes": capacity_stage.MAX_PREPARATION_GENERATION_BYTES,
+                "maximum_generation_inodes": capacity_stage.MAX_PREPARATION_GENERATION_INODES,
+                "maximum_tmpdir_bytes": fixed_owner.MAX_TMPDIR_BYTES,
+                "maximum_tmpdir_inodes": fixed_owner.MAX_TMPDIR_INODES,
+                "maximum_trace_file_bytes": capacity_stage.MAX_TRACE_FILE_BYTES,
+                "durable_receipt_reserve_bytes": capacity_stage.MAX_PREPARATION_GENERATION_BYTES,
+                "durable_receipt_reserve_inodes": capacity_stage.MAX_PREPARATION_GENERATION_INODES,
+                "minimum_free_bytes": 1,
+                "minimum_free_inodes": 1,
+                "monitor_sample_interval_milliseconds": 1000,
+                "process_deadline_seconds": preparation_value["core"]["deadlines"]["process_seconds"],
+            }
+            budget = inputs.build_preparation_resource_budget(
+                preparation_value, preparation_pin, host_id, ceilings,
+            )
+            budget_path = input_root / "resource-budget.json"
+            budget_raw = inputs._canonical(budget)
+            budget_path.write_bytes(budget_raw)
+            budget_path.chmod(0o600)
+            context = {
+                "input_root": input_root,
+                "source_root": SCRIPT_DIR.parent.resolve(strict=True),
+                "preparation_path": preparation_path,
+                "preparation_raw_sha256": preparation_pin["raw_sha256"],
+                "preparation_semantic_sha256": preparation_pin["semantic_sha256"],
+                "preparation": preparation_value,
+                "host_id": host_id,
+                "stack": {
+                    "inputs": inputs,
+                    "fixed_pair": fixed_owner,
+                    "fixed_pair_sha256": fixed_hash,
+                    "fixed_pair_path": fixed_relative,
+                },
+            }
+            result = capacity_stage._prepare_capacity_resource_budget_context(
+                context,
+                {"path": str(budget_path),
+                 "sha256": hashlib.sha256(budget_raw).hexdigest()},
+                monitor_report_count=30,
+            )
+            captured_pin = preparation_value["source_pins"][host_id]["modules"]["fixed_pair"]
+            self.assertEqual(captured_pin, {"path": fixed_relative, "sha256": fixed_hash})
+            self.assertEqual(result["fixed_pair_sha256"], fixed_hash)
+            self.assertEqual(result["monitor_report_count"], 30)
+
     def test_resource_budget_is_separate_caller_frozen_and_bound_to_v1_intent(self) -> None:
         self.assertEqual(
             capacity_stage.PREPARATION_FIXED_PAIR_R4_WALKER_SHA256,
@@ -3554,6 +3630,90 @@ class OriginalMetadataCapacityPilotTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(module.PreparationError, "open_view provider"):
             function(pins, records, "host-a", captured_read_provider=object())
+
+class ClosedRecordedOwnerSelectorTests(unittest.TestCase):
+    """Selector tests; no mock result is treated as numeric evidence."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.module = load_script(
+            SCRIPT_DIR / "application-source5-input-preparation.py",
+            "closed_recorded_owner_selector_target",
+        )
+
+    def test_named_completion_route_keeps_v1_provenance_and_selects_closed_owner(self):
+        module = self.module
+        completion = {"path": "/inputs/completion.json", "raw_sha256": "a" * 64,
+                      "semantic_sha256": "b" * 64}
+        provenance_v1 = {"schema": "allocatbelt.application-source5-prepared-inputs-provenance.v1"}
+        source_root = Path("/source")
+        input_root = Path("/inputs")
+        providers = {"host-a": object(), "host-b": object()}
+        reader = lambda _pin, _maximum: b"raw2 bytes"
+        sentinel = RuntimeError("closed route reached private replay")
+        with patch.object(
+                module, "_verify_prepared_inputs_completion_impl",
+                side_effect=sentinel) as replay:
+            with self.assertRaisesRegex(RuntimeError, "closed route reached"):
+                module.verify_prepared_inputs_completion_closed_recorded_v1(
+                    completion, provenance_v1, source_root, input_root,
+                    captured_pilot_read_providers=providers,
+                    global_artifact_reader=reader,
+                )
+        replay.assert_called_once_with(
+            completion, provenance_v1, source_root, input_root,
+            captured_pilot_read_providers=providers, recorded_host=True,
+            global_artifact_reader=reader, closed_recorded=True,
+        )
+        self.assertEqual(
+            tuple(inspect.signature(
+                module.verify_prepared_inputs_completion_closed_recorded_v1,
+            ).parameters),
+            ("completion_pin", "provenance_v1", "source_root", "input_root",
+             "captured_pilot_read_providers", "global_artifact_reader"),
+        )
+
+    def test_capacity_export_selects_only_the_named_closed_fixed_owner(self):
+        module = self.module
+        checkpoint_raw = b"source-authenticated checkpoint bytes"
+        checkpoint_pin = {
+            "path": "/origin/checkpoint.json",
+            "raw_sha256": hashlib.sha256(checkpoint_raw).hexdigest(),
+            "semantic_sha256": "c" * 64,
+        }
+        view = {
+            "checkpoint_pin": checkpoint_pin,
+            "checkpoint_raw": checkpoint_raw,
+            "objects": {}, "stage_root": "/tmp/sourcea-window",
+        }
+        selected = RuntimeError("named closed fixed API selected")
+        closed_api = mock.Mock(side_effect=selected)
+        old_api = mock.Mock(side_effect=AssertionError("resident recorded API selected"))
+        fixed = types.SimpleNamespace(
+            verify_fixed_pair_overlay_closed_recorded_captured_v1=closed_api,
+            verify_fixed_pair_overlay_recorded_captured_v1=old_api,
+        )
+        reader = lambda _pin, _maximum: b"raw2 bytes"
+        overlay_pin = {"path": "/origin/pair/fixed-pair-execution-overlay.json",
+                       "sha256": "d" * 64}
+        receipt_pin = {"path": "/origin/pair/fixed-pair-execution-receipt.json",
+                       "sha256": "e" * 64}
+        host_pin = {"path": "/origin/host.json", "raw_sha256": "f" * 64,
+                    "host_verification_sha256": "1" * 64}
+        overlay = {"job": {"value": {"run_id": "source-job"}}}
+        with self.assertRaisesRegex(RuntimeError, "named closed fixed API selected"):
+            module._verify_capacity_pilot_captured_pair(
+                fixed, view, overlay_pin, receipt_pin, host_pin,
+                overlay, "2" * 64, recorded_host=True,
+                global_artifact_reader=reader, closed_recorded=True,
+            )
+        closed_api.assert_called_once_with(
+            overlay_pin, receipt_pin, host_pin, view["objects"],
+            Path(view["stage_root"]), checkpoint_pin=checkpoint_pin,
+            checkpoint_raw=checkpoint_raw, global_artifact_reader=reader,
+        )
+        old_api.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

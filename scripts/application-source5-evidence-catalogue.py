@@ -338,6 +338,39 @@ def _assigned_literal(tree: ast.Module, function_name: str, target: str,
             ))
 
 
+def _fixed_pair_member_slots(tree: ast.Module) -> list[str]:
+    """Read the literal schema from the checked owner or its shared projector."""
+    label = "fixed-pair owner"
+    owner = _function(tree, "_construct_members", label)
+    declarations = [
+        node for node in ast.walk(owner)
+        if isinstance(node, (ast.Assign, ast.AnnAssign)) and any(
+            isinstance(target, ast.Name) and target.id == "outputs"
+            for target in (node.targets if isinstance(node, ast.Assign) else [node.target])
+        )
+    ]
+    if declarations:
+        return _assigned_literal(tree, "_construct_members", "outputs", label,
+                                 dictionary=True)
+    # A delegated owner must return the shared projector directly. Do not
+    # search unrelated functions for a convenient literal schema.
+    expected = ast.parse(
+        "_project_members(context, runtime_bindings, identities)", mode="eval",
+    ).body
+    for name in ("_construct_members", "_construct_members_closed_recorded"):
+        function = _function(tree, name, label)
+        returns = [node for node in ast.walk(function) if isinstance(node, ast.Return)]
+        calls = [node for node in ast.walk(function) if isinstance(node, ast.Call)
+                 and isinstance(node.func, ast.Name) and node.func.id == "_project_members"]
+        _require(len(returns) == 1 and function.body[-1] is returns[0] and
+                 len(calls) == 1 and returns[0].value is calls[0] and
+                 ast.dump(calls[0], include_attributes=False) ==
+                 ast.dump(expected, include_attributes=False),
+                 f"{label}.{name} does not return the exact shared member projector")
+    return _assigned_literal(tree, "_project_members", "outputs", label,
+                             dictionary=True)
+
+
 def _exact_call_set(tree: ast.Module, function_name: str, label: str) -> list[str]:
     function = _function(tree, function_name, label)
     matches: list[ast.AST] = []
@@ -425,10 +458,7 @@ def inspect_owner_evidence_contracts(
     }
 
     fixed_tree = trees["fixed_pair"]
-    fixed_member_slots = _assigned_literal(
-        fixed_tree, "_construct_members", "outputs",
-        "fixed-pair owner", dictionary=True,
-    )
+    fixed_member_slots = _fixed_pair_member_slots(fixed_tree)
     fixed_pair_slots = _fixed_pair_root_slots(fixed_tree)
     fixed_limits = _top_level_constants(fixed_tree, {
         "MAX_PAIR_OUTPUT_BYTES", "MAX_OUTPUT_FILES", "MAX_OUTPUT_DIRECTORIES",

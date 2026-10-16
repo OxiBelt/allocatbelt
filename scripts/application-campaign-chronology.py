@@ -9099,7 +9099,7 @@ def _source5_evidence_chunks(
         finally:
             stream.close()
         return
-    if type(value) is Path:
+    if isinstance(value, Path):
         descriptor = None
         try:
             descriptor = os.open(value, os.O_RDONLY |
@@ -12083,7 +12083,7 @@ def _source5_open_v3_index_and_budget(
             row = store.get(path)
             raw_bytes = None if row is None else row.get("raw_bytes")
             require(row is not None and
-                    (type(raw_bytes) is Path or
+                    (isinstance(raw_bytes, Path) or
                      (getattr(raw_bytes, "source5_captured_object_v2", False) is True and
                       callable(getattr(raw_bytes, "open_stream", None)))),
                     f"Source5 captured store omits transport object {path}")

@@ -33,6 +33,7 @@ HOST_VERIFICATION_SCHEMA = "allocatbelt.application-fixed-pair-host-verification
 HOST_VERIFICATION_IDENTITY_SCHEMA = "allocatbelt.application-fixed-pair-host-verification-identity.v1"
 CAPTURED_REPLAY_CONTEXT_SCHEMA_V1 = "allocatbelt.application-fixed-pair-captured-replay-context.v1"
 RECORDED_HOST_CAPTURED_REPLAY_CONTEXT_SCHEMA_V1 = "allocatbelt.application-fixed-pair-recorded-host-captured-replay-context.v1"
+CLOSED_RECORDED_CAPTURED_REPLAY_CONTEXT_SCHEMA_V1 = "allocatbelt.application-fixed-pair-closed-recorded-captured-replay-context.v1"
 EVIDENCE_PATH_MAP_SCHEMA = "allocatbelt.application-pressure-evidence-path-map.v1"
 PROBE_SCHEMA = "allocatbelt.application-fixed-pair-construction-probe.v1"
 APP_STARTED_SCHEMA = "allocatbelt.application-fixed-pair-app-start.v1"
@@ -604,6 +605,7 @@ def _load_source_inputs(
     offline_facts: dict[str, Any] | None = None,
     recorded_host: bool = False,
     global_artifact_reader: Callable[[dict[str, str], int], bytes] | None = None,
+    closed_recorded: bool = False,
 ) -> dict[str, Any]:
     # Only the origin-host launcher inspects startup hooks or SIGCHLD. Offline
     # replay has no process/lock capability and consumes its pinned host facts.
@@ -611,6 +613,11 @@ def _load_source_inputs(
             "recorded-host input reconstruction requires strict peer receipt facts")
     require(global_artifact_reader is None or recorded_host,
             "historical global reads require the recorded-host route")
+    require(type(closed_recorded) is bool and
+            (not closed_recorded or
+             (recorded_host and offline_facts is not None and
+              global_artifact_reader is not None and not create_output)),
+            "closed recorded reconstruction requires its explicit captured owner inputs")
     if offline_facts is None:
         _reject_ambient_startup_hooks()
         _require_waitable_sigchld()
@@ -761,7 +768,7 @@ def _load_source_inputs(
             controller.verify_source_manifest(
                 source_value,
                 source_root=source_root if other_host == host_id else None,
-                verify_artifacts=(other_host == host_id),
+                verify_artifacts=(other_host == host_id and not closed_recorded),
             )
         except Exception as error:
             raise FixedPairError(f"captured SourceV5 full verifier rejected {other_host}: {error}") from error
@@ -834,6 +841,7 @@ def _load_source_inputs(
         "cpu_ids": cpu_ids,
         "input_root": input_root,
         "offline_facts": offline_facts,
+        "closed_recorded": closed_recorded,
     }
 
 
@@ -904,7 +912,75 @@ def _derive_expected_environment(
     }
 
 
-def _construct_members(context: dict[str, Any], runtime_bindings: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def _lexical_source_artifact_path(root: Path, relative: object, label: str) -> Path:
+    """Build a normalized historical source path without touching its target."""
+    relative_text = _safe_relative(relative, f"{label} relative path")
+    path = root / PurePosixPath(relative_text)
+    require(path.is_absolute() and path != root and root in path.parents,
+            f"{label} escapes the selected SourceV5 root")
+    return path
+
+
+def _require_closed_recorded_job(context: dict[str, Any]) -> None:
+    job = context["job"]
+    spec = context["spec"]
+    require(job.get("phase") == "exploration" and job.get("mode") == "capacity" and
+            job.get("comparison_family") == "fixed_policy" and
+            job.get("comparison_kind") == "capacity_pilot" and
+            spec.get("rates") == [] and spec.get("oracles") == [] and
+            not ("oracles" in job and job["oracles"]),
+            "closed recorded replay supports only the original exploration capacity-pilot fixed-policy jobs")
+
+
+def _construct_members(
+    context: dict[str, Any], runtime_bindings: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Resolve and inspect each resident APP before deterministic projection."""
+    identities: dict[str, dict[str, str]] = {}
+    for descriptor in _member_descriptors(context["job"], context["controller"]):
+        allocator = descriptor["allocator"]
+        if allocator in identities:
+            continue
+        binary_pin = exact(context["source"]["artifacts"][allocator],
+                           {"path", "sha256"}, f"SourceV5 {allocator} APP descriptor")
+        binary = _safe_child(context["source_root"], binary_pin["path"],
+                             f"SourceV5 {allocator} APP binary")
+        raw_sha = _hash_regular_file(binary, MAX_BINARY_BYTES, "SourceV5 APP binary")
+        require(raw_sha == binary_pin["sha256"],
+                "APP binary differs from its original SourceV5 artifact descriptor")
+        require(binary.stat().st_mode & 0o111 != 0,
+                "SourceV5 APP binary is not executable")
+        identities[allocator] = {"path": str(binary), "sha256": raw_sha}
+    return _project_members(context, runtime_bindings, identities)
+
+
+def _construct_members_closed_recorded(
+    context: dict[str, Any], runtime_bindings: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Reconstruct members from pinned Source identities without peer ELF IO."""
+    _require_closed_recorded_job(context)
+    identities: dict[str, dict[str, str]] = {}
+    for descriptor in _member_descriptors(context["job"], context["controller"]):
+        allocator = descriptor["allocator"]
+        if allocator in identities:
+            continue
+        binary_pin = exact(context["source"]["artifacts"][allocator],
+                           {"path", "sha256"}, f"SourceV5 {allocator} APP descriptor")
+        require(is_sha(binary_pin["sha256"]),
+                f"SourceV5 {allocator} APP identity has a malformed digest")
+        binary = _lexical_source_artifact_path(
+            context["source_root"], binary_pin["path"],
+            f"historical SourceV5 {allocator} APP binary",
+        )
+        identities[allocator] = {"path": str(binary), "sha256": binary_pin["sha256"]}
+    return _project_members(context, runtime_bindings, identities)
+
+
+def _project_members(
+    context: dict[str, Any], runtime_bindings: list[dict[str, Any]],
+    binary_identities: dict[str, dict[str, str]],
+) -> list[dict[str, Any]]:
+    """Build the unchanged deterministic member projection from established identities."""
     job = context["job"]
     spec = context["spec"]
     source = context["source"]
@@ -912,6 +988,9 @@ def _construct_members(context: dict[str, Any], runtime_bindings: list[dict[str,
     reader = context["loaded_modules"]["runtime_reader"]
     controller = context["controller"]
     descriptors = _member_descriptors(job, controller)
+    used_allocators = {item["allocator"] for item in descriptors}
+    require(set(binary_identities) == used_allocators,
+            "established APP identities do not cover the exact original member set")
     binding_map = {(item["pair"], item["executor"], item["allocator"]): item for item in runtime_bindings}
     require(len(binding_map) == 2, "original runtime binding list has duplicate process identities")
     deadlines = dict(spec["deadlines"])
@@ -932,11 +1011,19 @@ def _construct_members(context: dict[str, Any], runtime_bindings: list[dict[str,
         require(contract["configuration"]["resource_policy"] == "fixed_primary_v1" and contract["configuration"]["feedback_enabled"] == "false", "fixed APP expectation changed its original fixed-policy/feedback-off contract")
         for bucket in contract["byte_buckets"].values():
             require(bucket["bytes_per_second"] == 17_179_869_184 and bucket["ceiling_bytes_per_second"] == 17_179_869_184, "fixed APP byte rate differs from the original 16 GiB/s contract")
-        binary_pin = source["artifacts"][descriptor["allocator"]]
-        binary = _safe_child(context["source_root"], binary_pin["path"], f"SourceV5 {descriptor['allocator']} APP binary")
-        raw_sha = _hash_regular_file(binary, MAX_BINARY_BYTES, "SourceV5 APP binary")
-        require(raw_sha == binary_pin["sha256"] and binding["recipe"]["identity"]["binary_sha256"] == raw_sha, "APP binary differs from original SourceV5/runtime binding")
-        require(binary.stat().st_mode & 0o111 != 0, "SourceV5 APP binary is not executable")
+        binary_identity = exact(binary_identities[descriptor["allocator"]],
+                                {"path", "sha256"}, "established SourceV5 APP identity")
+        binary = Path(binary_identity["path"])
+        raw_sha = binary_identity["sha256"]
+        source_binary = exact(source["artifacts"][descriptor["allocator"]],
+                              {"path", "sha256"}, "SourceV5 APP artifact identity")
+        require(binary == _lexical_source_artifact_path(
+                    context["source_root"], source_binary["path"],
+                    f"SourceV5 {descriptor['allocator']} APP binary"),
+                "established APP path differs from its selected SourceV5 artifact descriptor")
+        require(is_sha(raw_sha) and raw_sha == source_binary["sha256"] and
+                binding["recipe"]["identity"]["binary_sha256"] == raw_sha,
+                "APP binary identity differs from original SourceV5/runtime recipe pins")
         oracle_entry = _member_oracle(job, descriptor["allocator"])
         oracle_path = None
         oracle_sha256 = None
@@ -1110,17 +1197,20 @@ def _construct_overlay(
     artifact_view: CapturedFixedPairArtifactsV1 | None = None,
     recorded_host: bool = False,
     global_artifact_reader: Callable[[dict[str, str], int], bytes] | None = None,
+    closed_recorded: bool = False,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     context = _load_source_inputs(
         original_pins, execution_pins, exact_job, observed_host_pin, output_root_value,
         create_output=create_output, offline_facts=offline_facts,
         recorded_host=recorded_host,
         global_artifact_reader=global_artifact_reader,
+        closed_recorded=closed_recorded,
     )
     context["write_runtime_bindings"] = write_runtime_bindings
     context["artifact_view"] = artifact_view
     bindings, binding_manifest, binding_raw, binding_sha = _runtime_bindings_for_job(context)
-    members = _construct_members(context, bindings)
+    members = (_construct_members_closed_recorded(context, bindings) if closed_recorded else
+               _construct_members(context, bindings))
     context["members"] = members
     context["runtime_bindings_raw"] = binding_raw
     context["runtime_bindings_sha256"] = binding_sha
@@ -1286,6 +1376,7 @@ def _read_overlay_with_host_facts(
     *, artifact_view: CapturedFixedPairArtifactsV1 | None = None,
     recorded_host: bool = False,
     global_artifact_reader: Callable[[dict[str, str], int], bytes] | None = None,
+    closed_recorded: bool = False,
 ) -> tuple[dict[str, Any], bytes, str, dict[str, Any], dict[str, Any]]:
     require(not recorded_host or (offline_facts is not None and artifact_view is not None),
             "recorded-host overlay reconstruction requires captured bytes and strict host receipt facts")
@@ -1299,6 +1390,7 @@ def _read_overlay_with_host_facts(
         create_output=False, write_runtime_bindings=False, offline_facts=offline_facts,
         artifact_view=artifact_view, recorded_host=recorded_host,
         global_artifact_reader=global_artifact_reader,
+        closed_recorded=closed_recorded,
     )
     require(canonical_bytes(reconstructed) == raw, "fixed-pair overlay differs from independent SourceV5/PlanV3 reconstruction")
     return overlay, raw, raw_sha, context, reconstructed
@@ -1307,6 +1399,21 @@ def _read_overlay_with_host_facts(
 def _read_overlay(overlay_pin: object) -> tuple[dict[str, Any], bytes, str, dict[str, Any], dict[str, Any]]:
     """Keep the archived v1 reader on strict live-host reconstruction."""
     return _read_overlay_with_host_facts(overlay_pin, None)
+
+
+def _read_overlay_closed_recorded_with_host_facts(
+    overlay_pin: object, offline_facts: dict[str, Any],
+    artifact_view: CapturedFixedPairArtifactsV1,
+    global_artifact_reader: Callable[[dict[str, str], int], bytes],
+) -> tuple[dict[str, Any], bytes, str, dict[str, Any], dict[str, Any]]:
+    """Select the Source-pinned closed reconstruction for this named owner only."""
+    require(callable(global_artifact_reader),
+            "closed recorded overlay reconstruction requires its exact raw2 reader")
+    return _read_overlay_with_host_facts(
+        overlay_pin, offline_facts, artifact_view=artifact_view,
+        recorded_host=True, global_artifact_reader=global_artifact_reader,
+        closed_recorded=True,
+    )
 
 
 def _validate_fixed_pair_evidence_path_map(value: object, overlay: dict[str, Any], host_receipt_path: Path) -> dict[str, Path]:
@@ -2621,6 +2728,32 @@ def _run_construction_probe(
     }
 
 
+def _source_snapshot_projection(
+    context: dict[str, Any], *, current_commit: str, spec_sha: str, plan_sha: str,
+    manifests: dict[str, str], modules: dict[str, str], binaries: dict[str, str],
+    oracles: dict[str, str], host_sha: str, runtime_sha: str,
+) -> dict[str, Any]:
+    """Project independently established immutable inputs into receipt schema."""
+    source = context["source"]
+    return {
+        "spec_raw_sha256": spec_sha,
+        "plan_raw_sha256": plan_sha,
+        "spec_semantic_sha256": context["spec_semantic_sha256"],
+        "plan_semantic_sha256": context["plan_semantic_sha256"],
+        "source_tree_sha256": source["source"]["source_tree_sha256"],
+        "source_git_commit": current_commit,
+        "source_manifest_pins": manifests,
+        "module_pins": modules,
+        "binary_pins": binaries,
+        "oracle_pins": oracles,
+        "observed_host_sha256": host_sha,
+        "runtime_bindings_sha256": runtime_sha,
+        "typed_inventory_sha256": context["inventory_module"].digest_records(
+            source["source"]["files"],
+        ),
+    }
+
+
 def _snapshot_source_inputs(
     context: dict[str, Any], *,
     global_artifact_reader: Callable[[dict[str, str], int], bytes] | None = None,
@@ -2707,21 +2840,97 @@ def _snapshot_source_inputs(
     runtime_raw, runtime_sha = _read_pair_artifact(runtime_path, "original runtime bindings after execution", MAX_RUNTIME_BYTES, context.get("artifact_view"))
     expected_runtime = context["runtime_bindings_raw"]
     require(runtime_raw == expected_runtime and runtime_sha == context["runtime_bindings_sha256"], "original runtime binding manifest changed after execution")
-    return {
-        "spec_raw_sha256": spec_sha,
-        "plan_raw_sha256": plan_sha,
-        "spec_semantic_sha256": context["spec_semantic_sha256"],
-        "plan_semantic_sha256": context["plan_semantic_sha256"],
-        "source_tree_sha256": source["source"]["source_tree_sha256"],
-        "source_git_commit": current_commit,
-        "source_manifest_pins": manifests,
-        "module_pins": modules,
-        "binary_pins": binaries,
-        "oracle_pins": oracles,
-        "observed_host_sha256": host_sha,
-        "runtime_bindings_sha256": runtime_sha,
-        "typed_inventory_sha256": context["inventory_module"].digest_records(source["source"]["files"]),
-    }
+    return _source_snapshot_projection(
+        context, current_commit=current_commit, spec_sha=spec_sha, plan_sha=plan_sha,
+        manifests=manifests, modules=modules, binaries=binaries, oracles=oracles,
+        host_sha=host_sha, runtime_sha=runtime_sha,
+    )
+
+
+def _snapshot_source_inputs_closed_recorded(
+    context: dict[str, Any],
+    global_artifact_reader: Callable[[dict[str, str], int], bytes],
+) -> dict[str, Any]:
+    """Derive the expected logical snapshot without inspecting historical ELFs."""
+    require(context.get("closed_recorded") is True and callable(global_artifact_reader),
+            "closed recorded snapshot requires its selected Source reader")
+    controller = context["controller"]
+    source = context["source"]
+    root = context["source_root"]
+    try:
+        controller.verify_source_manifest(source, source_root=root, verify_artifacts=False)
+        tree = context["inventory_module"].verify_source_tree(
+            root, source["source"]["source_tree_sha256"], source["source"]["files"],
+        )
+        current_commit = controller.run_checked(
+            ["git", "rev-parse", "HEAD"], root, 120.0,
+        ).decode().strip()
+    except Exception as error:
+        raise FixedPairError(f"closed recorded SourceV5 verification failed: {error}") from error
+    require(tree.get("entries") == source["source"]["files"] and
+            current_commit == source["source"]["git_commit"],
+            "current SourceV5 code/build identity differs from the pinned selected Source")
+    _spec_path, _spec, spec_raw, spec_sha = _read_recorded_global_json_pin(
+        {"path": str(context["spec_path"]), "sha256": context["spec_raw_sha256"]},
+        "closed recorded original SpecV3 snapshot", MAX_SPEC_BYTES,
+        global_artifact_reader,
+    )
+    _plan_path, _plan, plan_raw, plan_sha = _read_recorded_global_json_pin(
+        {"path": str(context["plan_path"]), "sha256": context["plan_raw_sha256"]},
+        "closed recorded original PlanV3 snapshot", MAX_PLAN_BYTES,
+        global_artifact_reader,
+    )
+    require(spec_raw == context["spec_raw"] and plan_raw == context["plan_raw"],
+            "pinned historical SpecV3 or PlanV3 bytes changed during replay")
+    manifests: dict[str, str] = {}
+    for host, value in context["source_manifest_records"].items():
+        _path, _manifest, _raw, actual = _read_recorded_global_json_pin(
+            value["pin"], f"closed recorded SourceV5 manifest {host}",
+            MAX_MANIFEST_BYTES, global_artifact_reader,
+        )
+        require(actual == value["pin"]["sha256"],
+                f"historical SourceV5 manifest raw pin changed: {host}")
+        manifests[host] = actual
+    modules: dict[str, str] = {}
+    for name, pin in context["modules"].items():
+        path = _safe_child(root, pin["path"], f"current SourceV5 module {name}")
+        actual = _hash_regular_file(path, MAX_SOURCE_BYTES,
+                                    f"current SourceV5 module {name}")
+        require(actual == pin["sha256"],
+                f"current SourceV5 module identity changed: {name}")
+        modules[name] = actual
+    binaries: dict[str, str] = {}
+    for allocator in ALLOCATORS:
+        pin = exact(source["artifacts"][allocator], {"path", "sha256"},
+                    f"historical SourceV5 {allocator} APP identity")
+        _lexical_source_artifact_path(root, pin["path"],
+                                      f"historical SourceV5 {allocator} APP")
+        require(is_sha(pin["sha256"]),
+                f"historical SourceV5 {allocator} APP digest is malformed")
+        binaries[allocator] = pin["sha256"]
+    oracles: dict[str, str] = {}
+    for member in context["members"]:
+        require(member["oracle"] is None,
+                "closed recorded capacity replay cannot virtualize an oracle path")
+    _host_path, _host, _host_raw, host_sha = _read_recorded_global_json_pin(
+        context["host_pin"], "closed recorded observed-host snapshot",
+        MAX_MANIFEST_BYTES, global_artifact_reader,
+    )
+    require(host_sha == context["host_pin"]["sha256"],
+            "historical observed-host raw pin changed during replay")
+    runtime_path = context["output_root"] / ".fixed-pair-runtime-bindings.json"
+    runtime_raw, runtime_sha = _read_pair_artifact(
+        runtime_path, "closed recorded runtime bindings", MAX_RUNTIME_BYTES,
+        context.get("artifact_view"),
+    )
+    require(runtime_raw == context["runtime_bindings_raw"] and
+            runtime_sha == context["runtime_bindings_sha256"],
+            "captured runtime binding artifact differs from deterministic PlanV3 recipes")
+    return _source_snapshot_projection(
+        context, current_commit=current_commit, spec_sha=spec_sha, plan_sha=plan_sha,
+        manifests=manifests, modules=modules, binaries=binaries, oracles=oracles,
+        host_sha=host_sha, runtime_sha=runtime_sha,
+    )
 
 
 def _hash_output_tree(
@@ -2822,7 +3031,8 @@ def _validate_runtime_v2(
         stored_validation, stored_sha = _read_pair_artifact(validation_path, "fixed APP runtime validation", MAX_RUNTIME_BYTES, view)
         require(stored_validation == validation_raw, "fixed APP runtime validation output differs from the pinned reader")
     else:
-        require(view is None, "captured replay refuses to create a missing runtime validation receipt")
+        require(view is None and context.get("closed_recorded") is not True,
+                "captured replay refuses to create a missing runtime validation receipt")
         stored_sha = write_exclusive(validation_path, validation_raw, "fixed APP runtime validation")
     expected_validation = {
         "schema": reader.EXPECTATION_SCHEMA,
@@ -3458,29 +3668,37 @@ def _verify_start_proof(
     overlay: dict[str, Any], member: dict[str, Any], attempt: dict[str, Any], overlay_sha256: str,
     *, require_success: bool, offline_facts: dict[str, Any] | None = None,
     recorded_zero_tmp_proofs: list[dict[str, Any]] | None = None,
+    closed_recorded: bool = False,
 ) -> None:
-    proof = attempt.get("start")
-    require(type(proof) is dict, "attempted APP member lacks its actual start proof")
-    body = dict(proof)
+    start_proof = attempt.get("start")
+    require(type(start_proof) is dict, "attempted APP member lacks its actual start proof")
+    body = dict(start_proof)
     claimed = body.pop("identity_sha256", None)
     require(claimed == sha256_bytes(canonical_bytes(body)), "APP start identity digest is invalid")
-    require(proof.get("schema") == APP_STARTED_SCHEMA and proof.get("role") == "fixed_application_member", "APP start proof has the wrong direct-execution role")
-    require(type(proof.get("pid")) is int and proof["pid"] > 0 and type(proof.get("start_ticks")) is int and proof["start_ticks"] > 0, "APP start proof lacks a positive PID/start-ticks identity")
-    require(proof.get("executable_path") == member["binary"]["path"] and proof.get("executable_sha256") == member["binary"]["sha256"], "APP start proof executable differs from the source-pinned normal binary")
-    binary_info = Path(member["binary"]["path"]).stat(follow_symlinks=False)
-    if offline_facts is None:
-        require((proof.get("executable_device"), proof.get("executable_inode"), proof.get("executable_size")) == (binary_info.st_dev, binary_info.st_ino, binary_info.st_size), "APP start proof descriptor device/inode/size differs from the pinned normal binary")
+    require(start_proof.get("schema") == APP_STARTED_SCHEMA and start_proof.get("role") == "fixed_application_member", "APP start proof has the wrong direct-execution role")
+    require(type(start_proof.get("pid")) is int and start_proof["pid"] > 0 and type(start_proof.get("start_ticks")) is int and start_proof["start_ticks"] > 0, "APP start proof lacks a positive PID/start-ticks identity")
+    require(start_proof.get("executable_path") == member["binary"]["path"] and start_proof.get("executable_sha256") == member["binary"]["sha256"], "APP start proof executable differs from the source-pinned normal binary")
+    if closed_recorded:
+        require(type(start_proof.get("executable_device")) is int and start_proof["executable_device"] >= 0 and
+                type(start_proof.get("executable_inode")) is int and start_proof["executable_inode"] > 0 and
+                type(start_proof.get("executable_size")) is int and
+                0 < start_proof["executable_size"] <= MAX_BINARY_BYTES,
+                "historical APP start proof stat facts are malformed")
     else:
-        require(type(proof.get("executable_device")) is int and proof["executable_device"] >= 0 and
-                type(proof.get("executable_inode")) is int and proof["executable_inode"] > 0 and
-                proof.get("executable_size") == binary_info.st_size,
-                "peer APP start proof device/inode/size fields are malformed or differ from the source-pinned binary size")
-    require(proof.get("requested_argv") == member["argv"] == proof.get("executed_argv"), "APP requested/executed argv differs from the exact original normal command")
-    require(proof.get("requested_argv_sha256") == proof.get("executed_argv_sha256") == sha256_bytes(canonical_bytes(member["argv"])), "APP argv digest differs from the original normal command")
-    require(proof.get("environment") == member["environment"] and proof.get("environment_sha256") == sha256_bytes(canonical_bytes(member["environment"])), "APP observed full environment differs from the exact identity allowlist")
-    require(proof.get("cwd") == member["cwd"] and proof.get("tmpdir") == member["tmpdir"]["path"], "APP observed cwd/TMPDIR differs from the pinned member paths")
-    require(proof.get("cpu_affinity") == member["affinity"]["cpus"], "APP observed affinity differs from the exact host CPU set")
-    require(proof.get("network_namespace_inode") == member["network_namespace_inode"], "APP observed network namespace differs from the host pin")
+        binary_info = Path(member["binary"]["path"]).stat(follow_symlinks=False)
+        if offline_facts is None:
+            require((start_proof.get("executable_device"), start_proof.get("executable_inode"), start_proof.get("executable_size")) == (binary_info.st_dev, binary_info.st_ino, binary_info.st_size), "APP start proof descriptor device/inode/size differs from the pinned normal binary")
+        else:
+            require(type(start_proof.get("executable_device")) is int and start_proof["executable_device"] >= 0 and
+                    type(start_proof.get("executable_inode")) is int and start_proof["executable_inode"] > 0 and
+                    start_proof.get("executable_size") == binary_info.st_size,
+                    "peer APP start proof device/inode/size fields are malformed or differ from the source-pinned binary size")
+    require(start_proof.get("requested_argv") == member["argv"] == start_proof.get("executed_argv"), "APP requested/executed argv differs from the exact original normal command")
+    require(start_proof.get("requested_argv_sha256") == start_proof.get("executed_argv_sha256") == sha256_bytes(canonical_bytes(member["argv"])), "APP argv digest differs from the original normal command")
+    require(start_proof.get("environment") == member["environment"] and start_proof.get("environment_sha256") == sha256_bytes(canonical_bytes(member["environment"])), "APP observed full environment differs from the exact identity allowlist")
+    require(start_proof.get("cwd") == member["cwd"] and start_proof.get("tmpdir") == member["tmpdir"]["path"], "APP observed cwd/TMPDIR differs from the pinned member paths")
+    require(start_proof.get("cpu_affinity") == member["affinity"]["cpus"], "APP observed affinity differs from the exact host CPU set")
+    require(start_proof.get("network_namespace_inode") == member["network_namespace_inode"], "APP observed network namespace differs from the host pin")
     if attempt.get("tmpdir_final") is not None:
         if offline_facts is None:
             _verify_tmpdir_storage(
@@ -3488,25 +3706,24 @@ def _verify_start_proof(
                 member["tmpdir"]["bytes_limit"], member["tmpdir"]["inode_limit"],
                 f"APP member {member['ordinal']}",
             )
+        elif recorded_zero_tmp_proofs is None:
+            _verify_tmpdir_storage_offline(
+                attempt.get("tmpdir_initial"), attempt["tmpdir_final"], member["tmpdir"]["path"],
+                member["tmpdir"]["bytes_limit"], member["tmpdir"]["inode_limit"],
+                offline_facts["host_verification"]["output_mount"], f"APP member {member['ordinal']}",
+            )
         else:
-            if recorded_zero_tmp_proofs is None:
-                _verify_tmpdir_storage_offline(
-                    attempt.get("tmpdir_initial"), attempt["tmpdir_final"], member["tmpdir"]["path"],
-                    member["tmpdir"]["bytes_limit"], member["tmpdir"]["inode_limit"],
-                    offline_facts["host_verification"]["output_mount"], f"APP member {member['ordinal']}",
-                )
-            else:
-                proof = _recorded_tmp_proof_for_member(
-                    recorded_zero_tmp_proofs, member["ordinal"], None,
-                    f"APP member {member['ordinal']}",
-                )
-                _verify_tmpdir_storage_recorded_offline(
-                    attempt.get("tmpdir_initial"), attempt["tmpdir_final"], member["tmpdir"]["path"],
-                    member["tmpdir"]["bytes_limit"], member["tmpdir"]["inode_limit"],
-                    offline_facts["host_verification"]["output_mount"],
-                    f"APP member {member['ordinal']}", proof=proof, expected_domain=None,
-                    expected_ordinal=member["ordinal"],
-                )
+            tmp_proof = _recorded_tmp_proof_for_member(
+                recorded_zero_tmp_proofs, member["ordinal"], None,
+                f"APP member {member['ordinal']}",
+            )
+            _verify_tmpdir_storage_recorded_offline(
+                attempt.get("tmpdir_initial"), attempt["tmpdir_final"], member["tmpdir"]["path"],
+                member["tmpdir"]["bytes_limit"], member["tmpdir"]["inode_limit"],
+                offline_facts["host_verification"]["output_mount"],
+                f"APP member {member['ordinal']}", proof=tmp_proof, expected_domain=None,
+                expected_ordinal=member["ordinal"],
+            )
     else:
         require(not require_success, "valid APP member has no final TMPDIR mount/storage proof")
     events = attempt.get("start_events")
@@ -3514,10 +3731,10 @@ def _verify_start_proof(
     event = events[0]
     require(event.get("schema") == APP_STARTED_SCHEMA and event.get("role") == "fixed_application_member" and event.get("overlay_sha256") == overlay_sha256, "APP start callback event has the wrong role or overlay binding")
     require(event.get("campaign_id") == overlay["campaign_id"] and event.get("host_id") == overlay["host_id"] and event.get("run_id") == overlay["job"]["value"]["run_id"], "APP start callback event differs from its original campaign/job")
-    require(event.get("member_ordinal") == member["ordinal"] and event.get("descriptor") == member["descriptor"] and event.get("proof") == proof, "APP start callback event differs from its exact member proof")
+    require(event.get("member_ordinal") == member["ordinal"] and event.get("descriptor") == member["descriptor"] and event.get("proof") == start_proof, "APP start callback event differs from its exact member proof")
     terminal = attempt.get("terminal_event")
     require(type(terminal) is dict and terminal.get("schema") == APP_TERMINAL_SCHEMA, "APP attempt has no terminal lifecycle callback proof")
-    require(terminal.get("overlay_sha256") == event.get("overlay_sha256") and terminal.get("pid") == proof["pid"] and terminal.get("descriptor") == member["descriptor"], "APP terminal event is not joined to the actual started PID/member")
+    require(terminal.get("overlay_sha256") == event.get("overlay_sha256") and terminal.get("pid") == start_proof["pid"] and terminal.get("descriptor") == member["descriptor"], "APP terminal event is not joined to the actual started PID/member")
     require(terminal.get("cleanup") == attempt.get("supervision") and terminal.get("status") == attempt.get("status"), "APP terminal event differs from direct supervisor cleanup/status")
     _verify_cleanup_record(
         attempt["supervision"], f"APP member {member['ordinal']}",
@@ -3619,6 +3836,63 @@ def _recorded_tmp_proof_for_member(
     return matches[0]
 
 
+def _verify_closed_recorded_binary_stat_joins(
+    overlay: dict[str, Any], receipt: dict[str, Any],
+    probes_by_ordinal: dict[Any, Any],
+) -> None:
+    """Join persisted APP/probe stat observations without origin file IO."""
+    members = {item["ordinal"]: item for item in overlay["members"]}
+    attempts = receipt["member_attempts"]
+    require(type(attempts) is list and len(attempts) <= 2,
+            "closed recorded APP attempts exceed their fixed pair bound")
+    if receipt["status"] == "valid_pair":
+        require(len(attempts) == 2 and len(probes_by_ordinal) == 2,
+                "valid closed recorded pair omits a member or construction probe")
+    for attempt in attempts:
+        require(type(attempt) is dict and type(attempt.get("ordinal")) is int and
+                attempt["ordinal"] in members,
+                "closed recorded APP attempt has an unknown member ordinal")
+        ordinal = attempt["ordinal"]
+        start_value = attempt.get("start")
+        if start_value is None:
+            continue
+        start_proof = exact(start_value, {
+            "schema", "role", "pid", "start_ticks", "executable_path",
+            "executable_sha256", "executable_device", "executable_inode",
+            "executable_size", "requested_argv", "requested_argv_sha256",
+            "executed_argv", "executed_argv_sha256", "environment",
+            "environment_sha256", "cwd", "tmpdir", "cpu_affinity",
+            "network_namespace_inode", "identity_sha256",
+        }, "closed recorded APP start identity")
+        member = members[ordinal]
+        require(start_proof["executable_path"] == member["binary"]["path"] and
+                start_proof["executable_sha256"] == member["binary"]["sha256"] and
+                type(start_proof["executable_device"]) is int and
+                start_proof["executable_device"] >= 0 and
+                type(start_proof["executable_inode"]) is int and
+                start_proof["executable_inode"] > 0 and
+                type(start_proof["executable_size"]) is int and
+                0 < start_proof["executable_size"] <= MAX_BINARY_BYTES,
+                "closed recorded APP start stat facts do not join to its Source-derived member")
+        probe = probes_by_ordinal.get(ordinal)
+        if probe is not None:
+            require(type(probe) is dict and
+                    probe.get("binary") == member["binary"] and
+                    type(probe.get("binary_device")) is int and
+                    probe["binary_device"] >= 0 and
+                    type(probe.get("binary_inode")) is int and
+                    probe["binary_inode"] > 0 and
+                    (probe["binary_device"], probe["binary_inode"]) ==
+                    (start_proof["executable_device"],
+                     start_proof["executable_inode"]),
+                    "closed recorded construction-probe stat differs from the persisted APP start identity")
+    if receipt["status"] == "valid_pair":
+        require({attempt["ordinal"] for attempt in attempts} == {0, 1} and
+                {ordinal for ordinal, probe in probes_by_ordinal.items()
+                 if type(probe) is dict} == {0, 1},
+                "valid closed recorded pair has duplicate or missing member stat joins")
+
+
 def _verify_fixed_pair_overlay_replay(
     overlay_pin: dict[str, Any], receipt_pin: dict[str, Any],
     offline_facts: dict[str, Any] | None = None,
@@ -3626,6 +3900,7 @@ def _verify_fixed_pair_overlay_replay(
     recorded_zero_tmp_proofs: list[dict[str, Any]] | None = None,
     preconstructed_context: tuple[dict[str, Any], bytes, str, dict[str, Any], dict[str, Any]] | None = None,
     global_artifact_reader: Callable[[dict[str, str], int], bytes] | None = None,
+    closed_recorded: bool = False,
 ) -> dict[str, Any]:
     """Shared raw artifact replay; host mode comes only from its caller."""
     require(artifact_view is None or offline_facts is not None,
@@ -3637,10 +3912,17 @@ def _verify_fixed_pair_overlay_replay(
             "recorded fixed replay requires its exact four receipt-derived TMPDIR proofs")
     require(global_artifact_reader is None or recorded_zero_tmp_proofs is not None,
             "historical global reads require the recorded fixed replay route")
+    require(type(closed_recorded) is bool and
+            (not closed_recorded or
+             (global_artifact_reader is not None and artifact_view is not None and
+              offline_facts is not None and recorded_zero_tmp_proofs is not None)),
+            "closed recorded numeric replay requires its exact authenticated owner inputs")
     if preconstructed_context is not None:
         require(offline_facts is not None and artifact_view is not None and
                 preconstructed_context[3].get("artifact_view") is artifact_view and
-                preconstructed_context[3].get("offline_facts") == offline_facts,
+                preconstructed_context[3].get("offline_facts") == offline_facts and
+                (not closed_recorded or
+                 preconstructed_context[3].get("closed_recorded") is True),
                 "preconstructed fixed replay context differs from its strict host/artifact view")
         overlay, _overlay_raw, overlay_sha, context, _reconstructed = preconstructed_context
     elif offline_facts is None:
@@ -3648,6 +3930,8 @@ def _verify_fixed_pair_overlay_replay(
     else:
         overlay, _overlay_raw, overlay_sha, context, _reconstructed = _read_overlay_with_host_facts(
             overlay_pin, offline_facts, artifact_view=artifact_view,
+            global_artifact_reader=global_artifact_reader,
+            closed_recorded=closed_recorded,
         )
     pin = exact(receipt_pin, {"path", "sha256"}, "fixed-pair receipt raw pin")
     receipt_path = (_safe_absolute(pin["path"], "fixed-pair receipt path")
@@ -3682,10 +3966,16 @@ def _verify_fixed_pair_overlay_replay(
     require(receipt["execution_ready"] is False and receipt["campaign_chronology_complete"] is False, "fixed-pair component receipt made an execution-readiness or campaign-chronology claim")
     require(receipt["historical_runner_sha256"] == overlay["sources"]["historical_runner_sha256"] and receipt["execution_modules"] == overlay["modules"] and receipt["execution_source"] == overlay["execution_source"], "executor sidecar relabeled the historical runner or changed its new module pins")
     require(receipt["status"] in ("valid_pair", "failed_or_invalid"), "fixed-pair receipt has an unknown terminal status")
-    current_snapshot = _snapshot_source_inputs(
+    current_snapshot = (_snapshot_source_inputs_closed_recorded(
+        context, global_artifact_reader,
+    ) if closed_recorded else _snapshot_source_inputs(
         context, global_artifact_reader=global_artifact_reader,
-    )
-    if receipt["source_pins_after"] is not None:
+    ))
+    if closed_recorded:
+        require(receipt["source_pins_before"] == current_snapshot and
+                receipt["source_pins_after"] == current_snapshot,
+                "both historical Source snapshots differ from independent closed reconstruction")
+    elif receipt["source_pins_after"] is not None:
         require(receipt["source_pins_after"] == current_snapshot, "post-run SourceV5/spec/plan/binary/oracle/module pins differ during offline replay")
     else:
         require(receipt["status"] == "failed_or_invalid", "successful fixed pair omitted its post-run immutable input snapshot")
@@ -3710,6 +4000,8 @@ def _verify_fixed_pair_overlay_replay(
         require(all(item.get("reader", {}).get("validated") is True for item in receipt["construction_probes"]), "valid fixed pair contains an unvalidated construction probe")
         require(receipt["errors"] == [] and receipt["process_validation_errors"] == [None, None], "valid fixed pair retained a validation error")
     probes_by_ordinal = {item.get("member_ordinal"): item for item in receipt["construction_probes"] if type(item) is dict}
+    if closed_recorded:
+        _verify_closed_recorded_binary_stat_joins(overlay, receipt, probes_by_ordinal)
     for member in overlay["members"]:
         probe = probes_by_ordinal.get(member["ordinal"])
         if probe is not None and probe.get("validated") is not False:
@@ -3727,6 +4019,7 @@ def _verify_fixed_pair_overlay_replay(
                 overlay, member, attempt, overlay_sha,
                 require_success=receipt["status"] == "valid_pair", offline_facts=offline_facts,
                 recorded_zero_tmp_proofs=recorded_zero_tmp_proofs,
+                closed_recorded=closed_recorded,
             )
         else:
             _verify_cleanup_record(attempt.get("supervision", {}), f"failed APP launch {member['ordinal']}", require_success=False)
@@ -4364,6 +4657,32 @@ def _prepare_captured_fixed_pair_replay_v1(
     return prepared, context, (overlay, raw, overlay_sha, context, reconstructed)
 
 
+def _prepare_closed_recorded_fixed_pair_replay_v1(
+    overlay_pin: object, receipt_pin: object, host_verification_pin: object,
+    references: object, stage_root: Path, *,
+    global_artifact_reader: Callable[[dict[str, str], int], bytes],
+) -> tuple[dict[str, Any], dict[str, Any], tuple[
+    dict[str, Any], bytes, str, dict[str, Any], dict[str, Any],
+]]:
+    """Prepare the explicit closed Source projection while retaining captures."""
+    prepared = _prepare_captured_fixed_pair_replay_envelopes_v1(
+        overlay_pin, receipt_pin, host_verification_pin, references, stage_root,
+        global_artifact_reader=global_artifact_reader,
+    )
+    overlay, raw, overlay_sha, context, reconstructed = (
+        _read_overlay_closed_recorded_with_host_facts(
+            overlay_pin, prepared["offline_facts"], prepared["artifact_view"],
+            global_artifact_reader,
+        )
+    )
+    pin = exact(overlay_pin, {"path", "sha256"}, "closed recorded overlay pin")
+    require(context["artifact_view"] is prepared["artifact_view"] and
+            context["offline_facts"] == prepared["offline_facts"] and
+            overlay == prepared["overlay"] and overlay_sha == pin["sha256"],
+            "closed recorded reconstruction changed its captured overlay or host facts")
+    return prepared, context, (overlay, raw, overlay_sha, context, reconstructed)
+
+
 def _load_recorded_checkpoint_archive(context: dict[str, Any]) -> types.ModuleType:
     """Load the zero-proof verifier from the selected typed SourceV5 bytes."""
     relative = "scripts/application-source5-evidence-archive.py"
@@ -4644,6 +4963,52 @@ def verify_fixed_pair_overlay_recorded_captured_v1(
         "execution_receipt": prepared["execution_receipt"],
         "host_verification_pin": prepared["host_verification_pin"],
         "full_replay_verified": True,
+        "qualification_eligible": False,
+    }
+
+
+def verify_fixed_pair_overlay_closed_recorded_captured_v1(
+    overlay_pin: object, receipt_pin: object, host_verification_pin: object,
+    references: object, stage_root: Path, *, checkpoint_pin: object,
+    checkpoint_raw: object,
+    global_artifact_reader: Callable[[dict[str, str], int], bytes],
+) -> dict[str, Any]:
+    """Replay captured fixed numeric evidence from closed historical identities.
+
+    SourceA must select this API only inside its fresh authenticated recorded
+    operation. This owner reconstructs the selected Source's expected members
+    and snapshots from pinned descriptors, while current Source code and all
+    captured numerical artifacts remain physically verified. It does not
+    verify current APP residency, authorize APP launch, or qualify a campaign.
+    """
+    require(callable(global_artifact_reader),
+            "closed recorded replay requires its exact Source-owned raw2 reader")
+    prepared, context, preconstructed_context = (
+        _prepare_closed_recorded_fixed_pair_replay_v1(
+            overlay_pin, receipt_pin, host_verification_pin, references,
+            stage_root, global_artifact_reader=global_artifact_reader,
+        )
+    )
+    proofs = _recorded_fixed_zero_tmp_proofs(
+        context, prepared, checkpoint_pin, checkpoint_raw,
+    )
+    verification = _verify_fixed_pair_overlay_replay(
+        overlay_pin, receipt_pin, prepared["offline_facts"],
+        artifact_view=prepared["artifact_view"],
+        recorded_zero_tmp_proofs=proofs,
+        preconstructed_context=preconstructed_context,
+        global_artifact_reader=global_artifact_reader,
+        closed_recorded=True,
+    )
+    return {
+        "schema": CLOSED_RECORDED_CAPTURED_REPLAY_CONTEXT_SCHEMA_V1,
+        "verification": verification,
+        "overlay": prepared["overlay"],
+        "execution_receipt": prepared["execution_receipt"],
+        "host_verification_pin": prepared["host_verification_pin"],
+        "full_replay_verified": True,
+        "resident_executable_verified": False,
+        "app_launch_permitted": False,
         "qualification_eligible": False,
     }
 

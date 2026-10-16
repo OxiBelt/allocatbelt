@@ -8243,6 +8243,578 @@ def _source5_analyzer_scratch_projection(
     return projection
 
 
+def _source5_prepared_capture_storage_rows(
+    context: CampaignContext, budget_module: Any,
+) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]],
+           dict[tuple[str, str], str]]:
+    """Reconcile the stored capture projection with its rich SourceA proof."""
+    hosts = context.manifest.get("hosts")
+    require(type(hosts) is list and len(hosts) in {2, 3} and
+            all(type(host) is str and host for host in hosts) and
+            len(set(hosts)) == len(hosts),
+            "Source5 retained capture host order is malformed")
+    proofs = exact(context.prepared_exploration_proofs, set(hosts),
+                   "Source5 retained rich-proof cohort")
+    declaration = exact(context.prepared_capture_declaration, {
+        "schema", "cohort_host_ids", "objects",
+    }, "Source5 retained capture declaration")
+    storage_rows = context.prepared_capture_storage_rows
+    require(type(storage_rows) is list and
+            declaration["cohort_host_ids"] == hosts and
+            type(declaration["objects"]) is list and
+            len(storage_rows) == len(declaration["objects"]) and
+            callable(context.lineage_artifact_reader),
+            "Source5 retained capture rows do not close over the fresh proof and reader")
+    bridge = context.modules[SOURCE5_PREPARED_BRIDGE_BUDGET_SOURCE_PATH]
+    typed_pin = getattr(bridge, "__source5_typed_pin__", None)
+    require(type(typed_pin) is dict and
+            typed_pin.get("path") == SOURCE5_PREPARED_BRIDGE_BUDGET_SOURCE_PATH and
+            declaration["schema"] == getattr(
+                bridge,
+                "SOURCE5_PREPARED_EXPLORATION_CAPTURE_DECLARATION_SCHEMA_V1",
+                None,
+            ) and callable(getattr(
+                budget_module, "_catalogue_row", None,
+            )),
+            "Source5 retained capture rows lack their typed Bridge/Budget producers")
+
+    def full_pin(value: object, label: str) -> dict[str, str]:
+        pin = exact(value, {"path", "raw_sha256", "semantic_sha256"}, label)
+        require(type(pin["path"]) is str and pin["path"].startswith("/") and
+                is_sha(pin["raw_sha256"]) and is_sha(pin["semantic_sha256"]),
+                f"{label} is malformed")
+        return dict(pin)
+
+    def remember_hostless(
+        value: object, role: str, label: str,
+        *, fields: set[str] = {"path", "raw_sha256"},
+    ) -> None:
+        pin = exact(value, fields, label)
+        raw_pin_value = raw_pin({
+            "path": pin["path"], "raw_sha256": pin["raw_sha256"],
+        }, label)
+        key = (raw_pin_value["path"], raw_pin_value["raw_sha256"])
+        prior = hostless_roles.get(key)
+        require(prior is None or prior == role,
+                f"Source5 shared retained origin has crossed roles: {label}")
+        hostless_roles[key] = role
+
+    hostless_roles: dict[tuple[str, str], str] = {}
+    common_originals = None
+    proof_index_rows: dict[str, list[dict[str, Any]]] = {}
+    proof_by_host: dict[str, dict[str, Any]] = {}
+    for host in hosts:
+        proof = proofs[host]
+        require(type(proof) is dict and
+                proof.get("schema") ==
+                    "allocatbelt.application-source5-prepared-exploration-lineage-proof.v2" and
+                proof.get("campaign_id") == context.manifest.get("campaign_id") and
+                proof.get("host_id") == host and proof.get("job_count") == 360 and
+                proof.get("callback_count") == 2160 and
+                proof.get("component_replay_required") is True and
+                proof.get("fresh_sourcea_gpg_replay_required") is True and
+                proof.get("qualification_eligible") is False and
+                type(proof.get("bridge_header")) is dict and
+                type(proof.get("ancestor")) is dict and
+                type(proof.get("capture_context")) is dict and
+                type(proof.get("index_rows")) is list and
+                len(proof["index_rows"]) == 360,
+                f"Source5 {host} retained rows lack the actual nonauthorizing rich proof")
+        originals = exact(proof["capture_context"].get(
+            "preparatory_original_pins"), {
+                "preparation", "capacity_generation", "initial_spec",
+                "initial_plan", "source_manifests", "observed_hosts",
+                "typed_modules", "archive_signer_context",
+                "capacity_registration", "execution_basis_sha256",
+            }, f"Source5 {host} rich-proof original pins")
+        shared = {
+            "preparation": raw_pin(
+                originals["preparation"], f"Source5 {host} shared preparation",
+            ),
+            "capacity_generation": full_pin(
+                {key: originals["capacity_generation"][key]
+                 for key in ("path", "raw_sha256", "semantic_sha256")},
+                f"Source5 {host} shared capacity generation",
+            ),
+            "initial_spec": full_pin(
+                originals["initial_spec"], f"Source5 {host} initial Spec",
+            ),
+            "initial_plan": full_pin(
+                originals["initial_plan"], f"Source5 {host} initial Plan",
+            ),
+        }
+        if common_originals is None:
+            common_originals = shared
+        else:
+            require(shared == common_originals,
+                    "Source5 retained common preparation/Spec/Plan raw pins differ across proofs")
+        remember_hostless(shared["preparation"], "preparation",
+                          f"Source5 {host} common preparation pin")
+        remember_hostless(shared["capacity_generation"], "capacity_completion",
+                          f"Source5 {host} common capacity-generation pin",
+                          fields={"path", "raw_sha256", "semantic_sha256"})
+        remember_hostless(shared["initial_spec"], "spec_v3",
+                          f"Source5 {host} common initial Spec pin",
+                          fields={"path", "raw_sha256", "semantic_sha256"})
+        remember_hostless(shared["initial_plan"], "plan_v3",
+                          f"Source5 {host} common initial Plan pin",
+                          fields={"path", "raw_sha256", "semantic_sha256"})
+        header_initial = exact(proof["bridge_header"].get("initial"), {
+            "execution_manifest_pin", "spec_pin", "plan_pin",
+            "source_manifest_pins", "observed_host_pin",
+            "capacity_generation_sha256", "capacity_registration_head",
+            "host_budget_pin", "journal_width_pin", "fixed_spec_host_pin",
+            "prepared_host_binding_sha256", "signer_context_pin",
+            "signer_fingerprint", "maximum_signature_bytes",
+        }, f"Source5 {host} rich-proof bridge-header origin pins")
+        execution_manifest_pin = full_pin(
+            header_initial["execution_manifest_pin"],
+            f"Source5 {host} initial execution-manifest pin",
+        )
+        remember_hostless(
+            execution_manifest_pin, "execution_manifest",
+            f"Source5 {host} initial execution-manifest pin",
+            fields={"path", "raw_sha256", "semantic_sha256"},
+        )
+
+        signer_ref = exact(originals["archive_signer_context"], {
+            "artifact", "semantic_sha256",
+        }, f"Source5 {host} archive signer-context reference")
+        signer_pin = raw_pin(signer_ref["artifact"],
+                             f"Source5 {host} archive signer-context pin")
+        signer_raw = context.lineage_artifact_reader(
+            dict(signer_pin), MAX_ARCHIVE_SIGNER_CONTEXT_BYTES,
+        )
+        require(type(signer_raw) is bytes and
+                0 < len(signer_raw) <= MAX_ARCHIVE_SIGNER_CONTEXT_BYTES and
+                sha256(signer_raw) == signer_pin["raw_sha256"],
+                f"Source5 {host} signer context differs from its closed captured raw pin")
+        try:
+            signer_value = json.loads(signer_raw)
+        except (UnicodeError, json.JSONDecodeError, RecursionError) as error:
+            raise Source5CampaignError(
+                f"Source5 {host} captured signer context is malformed",
+            ) from error
+        signer_value = exact(signer_value, {
+            "schema", "campaign_id", "host_id", "authorized_primary_fingerprint",
+            "maximum_signature_bytes", "keyring_pin", "gpgv_pin",
+            "signature_format", "signer_context_sha256",
+        }, f"Source5 {host} captured signer context")
+        signer_body = {key: value for key, value in signer_value.items()
+                       if key != "signer_context_sha256"}
+        require(signer_raw == canonical_bytes(signer_value) and
+                signer_value["campaign_id"] == context.manifest["campaign_id"] and
+                signer_value["host_id"] == host and
+                signer_value["signer_context_sha256"] ==
+                    signer_ref["semantic_sha256"] ==
+                    sha256(canonical_bytes(signer_body)),
+                f"Source5 {host} signer context is not its exact Source-owned DTO")
+        for key, role in (("keyring_pin", "source5_archive_signer_keyring"),
+                          ("gpgv_pin", "source5_archive_signer_gpgv")):
+            remember_hostless(signer_value[key], role,
+                              f"Source5 {host} captured signer {key}")
+        proof_index_rows[host] = proof["index_rows"]
+        proof_by_host[host] = proof
+
+    if context.manifest.get("schema") == EXECUTION_SCHEMA_V5:
+        provenance = exact(context.prepared_input_provenance_v2, {
+            "schema", "preparation_pin", "final_spec_pin", "final_plan_pin",
+            "exploration_lineage",
+        }, "Source5 retained V5 preparation provenance")
+        require(provenance["schema"] ==
+                "allocatbelt.application-source5-prepared-inputs-provenance.v2" and
+                raw_pin(provenance["preparation_pin"],
+                        "Source5 retained V5 preparation provenance pin") ==
+                    common_originals["preparation"],
+                "Source5 retained common preparation pin differs from current V5 provenance")
+
+    declaration_rows: dict[tuple[str, str], dict[str, Any]] = {}
+    declaration_paths: set[str] = set()
+    for index, item_value in enumerate(declaration["objects"]):
+        item = exact(item_value, {
+            "origin_pin", "role", "host_id", "maximum_bytes", "byte_count",
+            "phase", "run_id", "row_index", "job_sha256",
+        }, f"Source5 retained capture declaration row[{index}]")
+        pin = raw_pin(item["origin_pin"],
+                      f"Source5 retained capture declaration pin[{index}]")
+        key = (pin["path"], pin["raw_sha256"])
+        require(key not in declaration_rows and pin["path"] not in declaration_paths,
+                "Source5 retained capture declaration repeats an origin path or pin")
+        require(type(item["role"]) is str and item["role"] and
+                (item["host_id"] is None or item["host_id"] in hosts) and
+                type(item["maximum_bytes"]) is int and item["maximum_bytes"] > 0 and
+                type(item["byte_count"]) is int and
+                0 < item["byte_count"] <= item["maximum_bytes"],
+                f"Source5 retained capture declaration row[{index}] has a bad role/host/cap/size")
+        if item["host_id"] is None:
+            require(hostless_roles.get(key) == item["role"],
+                    f"Source5 hostless retained origin is not a proven common role/pin: {pin['path']}")
+        if item["phase"] is None:
+            require(item["run_id"] is None and item["row_index"] is None and
+                    item["job_sha256"] is None,
+                    f"Source5 retained global row[{index}] carries a job join")
+        else:
+            host = item["host_id"]
+            require(item["phase"] == "exploration" and host in hosts and
+                    type(item["row_index"]) is int and
+                    0 <= item["row_index"] < 360 and
+                    is_sha(item["job_sha256"]),
+                    f"Source5 retained indexed row[{index}] has a bad Plan join")
+            proof = proof_by_host[host]
+            index_row = proof_index_rows[host][item["row_index"]]
+            job = index_row.get("job")
+            role_pins = {
+                "source5_job_record": index_row.get("job_record_pin"),
+                "source5_checkpoint_request": index_row.get(
+                    "archive_pins", {},
+                ).get("request_pin"),
+                "source5_checkpoint": index_row.get(
+                    "archive_pins", {},
+                ).get("checkpoint_pin"),
+                "source5_object_manifest": index_row.get(
+                    "archive_pins", {},
+                ).get("object_manifest_pin"),
+                "source5_archive_ack": index_row.get(
+                    "archive_pins", {},
+                ).get("ack_pin"),
+                "source5_archive_signature": index_row.get(
+                    "archive_pins", {},
+                ).get("signature_pin"),
+            }
+            source_pin = role_pins.get(item["role"])
+            require(type(job) is dict and index_row.get("row_index") ==
+                    item["row_index"] and
+                    sha256(canonical_bytes(job)) == item["job_sha256"] ==
+                        index_row.get("job_sha256") and
+                    job.get("host_id") == host and job.get("phase") == "exploration" and
+                    job.get("run_id") == item["run_id"] and
+                    type(source_pin) is dict and
+                    source_pin.get("path") == pin["path"] and
+                    source_pin.get("raw_sha256") == pin["raw_sha256"],
+                    f"Source5 retained indexed row[{index}] differs from rich proof Plan/pin")
+        declaration_rows[key] = item
+        declaration_paths.add(pin["path"])
+
+    require(len(storage_rows) == len(declaration_rows),
+            "Source5 retained storage row count differs from its capture declaration")
+    retained_rows: list[dict[str, Any]] = []
+    retained_by_path: dict[str, dict[str, Any]] = {}
+    retained_keys: set[tuple[str, str]] = set()
+    for index, row_value in enumerate(storage_rows):
+        row = budget_module._catalogue_row(
+            row_value, f"Source5 retained capture storage row[{index}]",
+        )
+        origin = exact(row["origin_pin"], {
+            "raw_sha256", "semantic_sha256",
+        }, f"Source5 retained storage origin[{index}]")
+        key = (row["path"], origin["raw_sha256"])
+        descriptor = declaration_rows.get(key)
+        require(type(descriptor) is dict and row["path"] not in retained_by_path and
+                key not in retained_keys,
+                "Source5 retained storage rows repeat or escape the exact declaration")
+        expected_row = {
+            "path": key[0], "kind": "file", "role": descriptor["role"],
+            "host_id": descriptor["host_id"],
+            "max_bytes": descriptor["byte_count"],
+            "max_file_bytes": descriptor["byte_count"], "max_inodes": 1,
+            "storage_root": None, "owner": "inputs",
+            "phase": descriptor["phase"], "run_id": descriptor["run_id"],
+            "member_index": None, "aggregate_id": None,
+            "aggregate_max_bytes": None,
+            "origin_pin": {"raw_sha256": key[1], "semantic_sha256": None},
+        }
+        require(row == expected_row and
+                origin["raw_sha256"] == key[1] and
+                origin["semantic_sha256"] is None and
+                descriptor["byte_count"] <= descriptor["maximum_bytes"],
+                f"Source5 retained storage row[{index}] changed its exact Bridge role/host/phase/run/size/cap")
+        retained_rows.append(row)
+        retained_by_path[row["path"]] = row
+        retained_keys.add(key)
+    require(retained_keys == set(declaration_rows) and
+            retained_by_path.keys() == declaration_paths,
+            "Source5 retained storage rows omit a declared captured origin")
+    return retained_rows, retained_by_path, hostless_roles
+
+
+def _source5_selected_source_artifact_records(
+    context: CampaignContext, chronology_roles: dict[str, int],
+) -> list[dict[str, Any]]:
+    """Read only the selected host's runnable Source artifacts under SourceRoot."""
+    selected_host = context.host_id
+    sources = context.sources
+    require(type(sources) is dict and selected_host in sources and
+            sources[selected_host] == context.source,
+            "Source5 selected Source metadata is not the exact current host document")
+    owner_source = sources[selected_host]
+    artifact_refs: list[tuple[dict[str, Any], str, int]] = []
+    artifact_refs.extend((item, "normal_app_output",
+                          context.fixed_pair.MAX_BINARY_BYTES)
+                         for item in owner_source["artifacts"].values())
+    artifact_refs.extend((item, "source5_soak_artifact",
+                          context.fixed_pair.MAX_BINARY_BYTES)
+                         for item in owner_source["soak_artifacts"].values())
+    artifact_refs.append((owner_source["analysis_artifact"],
+                          "analysis_artifact",
+                          chronology_roles["analysis_artifact"]))
+    calibration = owner_source["resource_domain_calibration"]
+    artifact_refs.extend((calibration[name], "capacity_artifact",
+                          chronology_roles["capacity_artifact"])
+                         for name in ("binary", "output"))
+    result = []
+    for artifact, role, maximum in artifact_refs:
+        relative = artifact.get("path")
+        require(type(relative) is str and relative and
+                PurePosixPath(relative).as_posix() == relative and
+                not PurePosixPath(relative).is_absolute() and
+                ".." not in PurePosixPath(relative).parts,
+                f"Source5 selected {role} path is not a normalized Source-relative path")
+        path = context.source_root / PurePosixPath(relative)
+        actual = context.fixed_pair._hash_regular_file(
+            path, maximum, f"Source5 selected {role} artifact {relative}",
+        )
+        info = path.stat(follow_symlinks=False)
+        require(stat.S_ISREG(info.st_mode) and
+                actual == artifact["sha256"] and
+                0 < info.st_size <= maximum,
+                f"Source5 selected {role} artifact raw pin/size changed: {path}")
+        result.append({
+            "path": path.absolute(), "role": role, "maximum": maximum,
+            "exact_size": int(info.st_size), "raw_sha256": actual,
+            "host_id": selected_host,
+        })
+    return result
+
+
+def _source5_validate_retained_file_alias(
+    retained_row: dict[str, Any], *, path: Path, role: str, owner: str,
+    host_id: str | None, phase: str | None, run_id: str | None,
+    maximum: int, exact_size: int | None, raw_sha256: str | None,
+) -> None:
+    """Reuse an exact selected Source file row; reject every output alias."""
+    require(owner == "source_artifact" and
+            retained_row["path"] == str(path.absolute()) and
+            retained_row["role"] == role and
+            retained_row["host_id"] == host_id and
+            retained_row["phase"] == phase and
+            retained_row["run_id"] == run_id and
+            retained_row["kind"] == "file" and
+            retained_row["owner"] == "inputs" and
+            retained_row["storage_root"] is None and
+            type(retained_row["origin_pin"]) is dict and
+            retained_row["origin_pin"].get("semantic_sha256") is None and
+            retained_row["origin_pin"].get("raw_sha256") == raw_sha256 and
+            retained_row["max_file_bytes"] == exact_size == retained_row["max_bytes"] and
+            type(maximum) is int and 0 < exact_size <= maximum,
+            f"Source5 output aliases a retained historical path or its selected Source metadata differs: {path}")
+
+
+def _source5_register_current_input_pin(
+    current_input_pins: dict[tuple[str, str, str], list[dict[str, Any]]],
+    pin_value: object, role: str, host: str | None, maximum: int,
+    semantic_sha256: str | None, label: str, *,
+    expected_raw: bytes | None = None,
+) -> None:
+    if (type(pin_value) is dict and
+            {"path", "raw_sha256"} <= set(pin_value) <= {
+                "path", "raw_sha256", "semantic_sha256",
+                "receipt_sha256", "signer_fingerprint",
+            }):
+        pin = raw_pin({"path": pin_value["path"],
+                       "raw_sha256": pin_value["raw_sha256"]}, label)
+    else:
+        pin = raw_pin(pin_value, label)
+    require(type(maximum) is int and maximum > 0 and
+            (semantic_sha256 is None or is_sha(semantic_sha256)),
+            f"Source5 {label} current-input cap/semantic pin is malformed")
+    expected_raw_sha256 = None
+    expected_raw_size = None
+    if expected_raw is not None:
+        require(type(expected_raw) is bytes and
+                sha256(expected_raw) == pin["raw_sha256"],
+                f"Source5 {label} current Source bytes differ from their raw pin")
+        expected_raw_sha256 = sha256(expected_raw)
+        expected_raw_size = len(expected_raw)
+    current_input_pins.setdefault(
+        (pin["path"], pin["raw_sha256"], role), [],
+    ).append({
+        "host_id": host, "maximum_bytes": maximum,
+        "semantic_sha256": semantic_sha256,
+        "expected_raw_sha256": expected_raw_sha256,
+        "expected_raw_size": expected_raw_size,
+    })
+
+
+def _source5_register_current_signer_tool_pins(
+    context: CampaignContext,
+    remember: Callable[..., None],
+) -> None:
+    signer_context = context.archive_signer_context
+    require(type(signer_context) is dict,
+            "Source5 current signer tool pins lack their selected context")
+    for name, role, maximum in (
+        ("keyring_pin", "source5_archive_signer_keyring",
+         MAX_ARCHIVE_KEYRING_BYTES),
+        ("gpgv_pin", "source5_archive_signer_gpgv",
+         MAX_ARCHIVE_GPGV_BYTES),
+    ):
+        remember(
+            signer_context[name], role, context.host_id, maximum, None,
+            f"Source5 current signer {name}",
+        )
+
+
+def _source5_captured_current_input_row(
+    context: CampaignContext,
+    retained_by_path: dict[str, dict[str, Any]],
+    hostless_retained_roles: dict[tuple[str, str], str],
+    current_input_pins: dict[tuple[str, str, str], list[dict[str, Any]]],
+    emitted_retained_keys: set[tuple[str, str]],
+    pin_value: object, role: str, maximum: int, label: str, *,
+    semantic_sha256: str | None = None, host: str | None = None,
+) -> dict[str, Any] | None:
+    """Resolve one current input against its exact closed historical row."""
+    pin = raw_pin(pin_value, label)
+    retained = retained_by_path.get(pin["path"])
+    if retained is None:
+        return None
+    require(retained["origin_pin"]["raw_sha256"] == pin["raw_sha256"],
+            f"Source5 current input crossed the retained raw identity: {pin['path']}")
+    key = (pin["path"], pin["raw_sha256"])
+    require(key in emitted_retained_keys,
+            f"Source5 retained current input precedes its exact Bridge row: {pin['path']}")
+    uses = current_input_pins.get(
+        (pin["path"], pin["raw_sha256"], role), [],
+    )
+    valid_uses = [use for use in uses
+                  if use["host_id"] == host and
+                  use["semantic_sha256"] == semantic_sha256 and
+                  use["maximum_bytes"] >= retained["max_file_bytes"]]
+    require(bool(valid_uses) and retained["role"] == role and
+            retained["origin_pin"]["semantic_sha256"] is None and
+            (retained["host_id"] == host or
+             (retained["host_id"] is None and
+              hostless_retained_roles.get(
+                  (pin["path"], pin["raw_sha256"]),
+              ) == role)) and
+            retained["max_file_bytes"] <= maximum,
+            f"Source5 current input differs from its retained role/host/cap/Source pin: {pin['path']}")
+    try:
+        captured_raw = context.lineage_artifact_reader(
+            dict(pin), maximum,
+        )
+    except Exception as error:
+        raise Source5CampaignError(
+            f"Source5 retained input is absent from the closed capture: {pin['path']}: {error}",
+        ) from error
+    require(type(captured_raw) is bytes and
+            len(captured_raw) == retained["max_file_bytes"] and
+            sha256(captured_raw) == pin["raw_sha256"],
+            f"Source5 retained input differs from its closed raw pin: {pin['path']}")
+    expected_hashes = {use["expected_raw_sha256"] for use in valid_uses
+                       if use["expected_raw_sha256"] is not None}
+    expected_sizes = {use["expected_raw_size"] for use in valid_uses
+                      if use["expected_raw_size"] is not None}
+    require((not expected_hashes or expected_hashes == {sha256(captured_raw)}) and
+            (not expected_sizes or expected_sizes == {len(captured_raw)}),
+            f"Source5 retained Source DTO differs from its captured bytes: {pin['path']}")
+    if role == "observed_host":
+        try:
+            observed = json.loads(captured_raw)
+        except (UnicodeError, json.JSONDecodeError, RecursionError) as error:
+            raise Source5CampaignError(
+                f"Source5 retained observed-host DTO is malformed: {pin['path']}",
+            ) from error
+        host_spec = next(
+            item for item in context.spec["hosts"]
+            if item["host_id"] == host
+        )
+        try:
+            context.modules["scripts/application-campaign-inputs.py"].\
+                _validate_observed_host_structure(observed, host_spec, host)
+        except Exception as error:
+            raise Source5CampaignError(
+                f"Source5 retained observed-host Source facts changed: {pin['path']}: {error}",
+            ) from error
+    return {"pin": pin, "row": retained, "captured_raw": captured_raw}
+
+
+def _source5_append_catalogue_spool_record(
+    record_spool: Any, record: dict[str, Any], reserved_bytes: int,
+) -> int:
+    encoded = canonical_bytes(record)
+    require(record_spool.tell() + len(encoded) <= reserved_bytes,
+            "Source5 producer path spool exceeded the caller-reserved scratch bytes")
+    record_spool.write(encoded)
+    return len(encoded)
+
+
+def _source5_emit_retained_storage_rows(
+    retained_rows: list[dict[str, Any]],
+    retained_keys: set[tuple[str, str]],
+    append_record: Callable[[dict[str, Any]], None],
+    add_parent_directories: Callable[..., None],
+) -> set[tuple[str, str]]:
+    """Emit each exact Bridge row before any current input can reuse it."""
+    emitted: set[tuple[str, str]] = set()
+    for row in retained_rows:
+        key = (row["path"], row["origin_pin"]["raw_sha256"])
+        require(key in retained_keys and key not in emitted,
+                "Source5 retained Bridge row is missing or repeated before live inputs")
+        append_record(row)
+        emitted.add(key)
+        add_parent_directories(
+            Path(row["path"]), row["owner"], row["storage_root"],
+            row["phase"], row["run_id"],
+        )
+    return emitted
+
+
+def _source5_catalogue_record_stream(
+    record_spool: Any, record_spool_count: int,
+    directory_specs: dict[str, dict[str, Any]],
+    scratch_reservation: dict[str, Any], budget_module: Any,
+):
+    """Yield canonical producer rows and always close their bounded spool."""
+    try:
+        record_spool.flush()
+        spool_bytes = record_spool.seek(0, os.SEEK_END)
+        directory_rows = directory_specs.values()
+        directory_bytes = sum(len(canonical_bytes(row))
+                              for row in directory_rows)
+        input_bytes = spool_bytes + directory_bytes
+        input_count = record_spool_count + len(directory_specs)
+        run_count = max(1, (input_count +
+                           budget_module.PATH_CATALOGUE_RUN_ROWS - 1) //
+                        budget_module.PATH_CATALOGUE_RUN_ROWS)
+        merge_overlap = ((run_count + budget_module.PATH_CATALOGUE_MERGE_FANOUT - 1) //
+                         budget_module.PATH_CATALOGUE_MERGE_FANOUT
+                         if run_count > budget_module.PATH_CATALOGUE_MERGE_FANOUT
+                         else 0)
+        required_scratch_bytes = input_bytes * 3
+        required_scratch_inodes = 2 + run_count + merge_overlap
+        require(scratch_reservation["reserved_bytes"] >= required_scratch_bytes and
+                scratch_reservation["reserved_inodes"] >= required_scratch_inodes,
+                "Source5 caller scratch reservation cannot hold the bounded external sort peak")
+        record_spool.seek(0)
+        while True:
+            line = record_spool.readline()
+            if not line:
+                break
+            require(line.endswith(b"\n") and b"\r" not in line,
+                    "Source5 catalogue row spool framing differs")
+            try:
+                value = json.loads(line.decode("ascii"))
+            except (UnicodeError, json.JSONDecodeError, RecursionError) as error:
+                raise Source5CampaignError(
+                    "Source5 catalogue row spool is malformed",
+                ) from error
+            yield value
+        yield from directory_rows
+    finally:
+        record_spool.close()
+
+
 def _source5_path_catalogue_records(
     context: CampaignContext, pressure_material_index: Path,
     soak_material_index: Path, storage_reservation: dict[str, Any],
@@ -8260,6 +8832,148 @@ def _source5_path_catalogue_records(
     artifact_root = context.artifact_root
     output_root = context.output_root
     budget_module = context.modules[EVIDENCE_BUDGET_SOURCE_PATH]
+    is_v5 = context.manifest.get("schema") == EXECUTION_SCHEMA_V5
+    if is_v5:
+        retained_rows, retained_by_path, hostless_retained_roles = \
+            _source5_prepared_capture_storage_rows(context, budget_module)
+    else:
+        retained_rows, retained_by_path, hostless_retained_roles = [], {}, {}
+    current_input_pins: dict[
+        tuple[str, str, str], list[dict[str, Any]]
+    ] = {}
+
+    def remember_current_pin(
+        pin_value: object, role: str, host: str | None, maximum: int,
+        semantic_sha256: str | None, label: str, *,
+        expected_raw: bytes | None = None,
+    ) -> None:
+        _source5_register_current_input_pin(
+            current_input_pins, pin_value, role, host, maximum,
+            semantic_sha256, label, expected_raw=expected_raw,
+        )
+
+    if is_v5:
+        for selected_host, pin in context.source_manifest_pins.items():
+            source_doc = context.sources[selected_host]
+            source_raw = canonical_bytes(source_doc)
+            source_body = {key: value for key, value in source_doc.items()
+                           if key != "manifest_sha256"}
+            require(source_doc.get("manifest_sha256") ==
+                    sha256(canonical_bytes(source_body)) and
+                    sha256(source_raw) == pin["raw_sha256"],
+                    f"Source5 {selected_host} in-memory Source DTO differs from its captured raw pin")
+            remember_current_pin(
+                pin, "source_manifest", selected_host, 16 * 1024 * 1024,
+                source_doc["manifest_sha256"],
+                f"Source5 {selected_host} current Source manifest",
+                expected_raw=source_raw,
+            )
+        for selected_host, wrapper_value in context.manifest["observed_hosts"].items():
+            wrapper = exact(wrapper_value, {
+                "artifact", "host_fingerprint_sha256", "controls_sha256",
+            }, f"Source5 {selected_host} current observed-host reference")
+            remember_current_pin(
+                wrapper["artifact"], "observed_host", selected_host,
+                16 * 1024 * 1024, None,
+                f"Source5 {selected_host} current observed-host pin",
+            )
+        remember_current_pin(
+            context.spec_pin, "spec_v3", host_id, 32 * 1024 * 1024,
+            context.spec_semantic_sha256, "Source5 current SpecV3",
+            expected_raw=context.spec_raw,
+        )
+        remember_current_pin(
+            context.plan_pin, "plan_v3", host_id, 256 * 1024 * 1024,
+            context.plan_semantic_sha256, "Source5 current PlanV3",
+            expected_raw=context.plan_raw,
+        )
+        manifest_raw = canonical_bytes(context.manifest)
+        remember_current_pin(
+            context.manifest_pin, "execution_manifest", host_id,
+            MAX_MANIFEST_BYTES, context.manifest["manifest_sha256"],
+            "Source5 current execution manifest", expected_raw=manifest_raw,
+        )
+        if (context.journal_width_contract is not None and
+                context.journal_width_contract_pin is not None):
+            remember_current_pin(
+                context.journal_width_contract_pin, "journal_width_contract",
+                host_id,
+                budget_module.MAX_JOURNAL_WIDTH_CONTRACT_BYTES,
+                context.journal_width_contract_pin["semantic_sha256"],
+                "Source5 current journal-width contract",
+                expected_raw=canonical_bytes(context.journal_width_contract),
+            )
+        if (context.archive_signer_context is not None and
+                context.archive_signer_context_pin is not None):
+            remember_current_pin(
+                context.archive_signer_context_pin,
+                "source5_archive_signer_context", host_id,
+                MAX_ARCHIVE_SIGNER_CONTEXT_BYTES,
+                context.archive_signer_context_pin["semantic_sha256"],
+                "Source5 current archive signer context",
+                expected_raw=canonical_bytes(context.archive_signer_context),
+            )
+            _source5_register_current_signer_tool_pins(
+                context, remember_current_pin,
+            )
+        generation = context.manifest.get("prepared_input_generation")
+        if type(generation) is dict:
+            completion_pin = exact(generation.get("completion"), {
+                "path", "raw_sha256", "semantic_sha256",
+            }, "Source5 current prepared completion")
+            remember_current_pin(
+                completion_pin, "prepared_completion", host_id,
+                MAX_ARTIFACT_BYTES, completion_pin["semantic_sha256"],
+                "Source5 current prepared completion",
+            )
+            provenance = generation.get("provenance")
+            if type(provenance) is dict:
+                prep_pin = exact(provenance.get("preparation_pin"), {
+                    "path", "raw_sha256",
+                }, "Source5 current preparation provenance pin")
+                remember_current_pin(
+                    prep_pin, "preparation", host_id, MAX_ARTIFACT_BYTES,
+                    None, "Source5 current preparation provenance",
+                )
+        if type(context.capacity_completion) is dict:
+            capacity_pin = context.capacity_completion.get("artifact")
+            if type(capacity_pin) is dict and set(capacity_pin) == {
+                    "path", "raw_sha256"}:
+                remember_current_pin(
+                    capacity_pin, "capacity_completion", host_id,
+                    16 * 1024 * 1024, None,
+                    "Source5 current capacity completion",
+                )
+        registration = context.manifest.get("prepared_capacity_registration")
+        if type(registration) is dict:
+            for name, role, maximum, semantic_key in (
+                ("completion", "capacity_completion", MAX_ARTIFACT_BYTES,
+                 "semantic_sha256"),
+                ("host_completion", "capacity_completion", MAX_ARTIFACT_BYTES,
+                 "semantic_sha256"),
+                ("host_verification", "capacity_host_receipt", MAX_ARTIFACT_BYTES,
+                 "receipt_sha256"),
+                ("ledger", "capacity_ledger", MAX_ARTIFACT_BYTES, None),
+            ):
+                pin_value = registration.get(name)
+                if type(pin_value) is dict and {
+                        "path", "raw_sha256"} <= set(pin_value):
+                    remember_current_pin(
+                        {"path": pin_value["path"],
+                         "raw_sha256": pin_value["raw_sha256"]},
+                        role, host_id, maximum,
+                        (pin_value.get(semantic_key)
+                         if semantic_key is not None else None),
+                        f"Source5 current capacity registration {name}",
+                    )
+        if type(context.prepared_input_completion) is dict:
+            for other_host, pin_value in context.prepared_input_completion.get(
+                    "resource_budgets", {}).items():
+                remember_current_pin(
+                    pin_value, "preparation", other_host, MAX_ARTIFACT_BYTES,
+                    pin_value.get("semantic_sha256"),
+                    f"Source5 current {other_host} resource budget",
+                )
     directory_specs: dict[str, dict[str, Any]] = {}
     reservation_roots = storage_reservation.get("roots")
     require(type(reservation_roots) is list,
@@ -8281,7 +8995,18 @@ def _source5_path_catalogue_records(
              Path(context.manifest["original_inputs"]["campaign_artifacts_root"]))
     record_spool = tempfile.TemporaryFile(mode="w+b", dir=scratch_root)
     record_spool_count = 0
-    seen_origin_paths: set[str] = set()
+    retained_keys = {
+        (row["path"], row["origin_pin"]["raw_sha256"])
+        for row in retained_rows
+    }
+    emitted_retained_keys: set[tuple[str, str]] = set()
+
+    def append_record(record: dict[str, Any]) -> None:
+        nonlocal record_spool_count
+        _source5_append_catalogue_spool_record(
+            record_spool, record, scratch_reservation["reserved_bytes"],
+        )
+        record_spool_count += 1
 
     def storage_domain(path: Path) -> str:
         matches = [root for root in writable_roots if path.is_relative_to(root)]
@@ -8296,6 +9021,8 @@ def _source5_path_catalogue_records(
         if storage_root == "auto":
             storage_root = storage_domain(path)
         key = str(path)
+        require(key not in retained_by_path,
+                f"Source5 directory aliases a retained historical file: {path}")
         if key not in directory_specs:
             directory_specs[key] = {
                 "path": key, "kind": "tree", "role": "directory_node",
@@ -8327,8 +9054,18 @@ def _source5_path_catalogue_records(
         semantic_sha256: str | None = None, file_label: str | None = None,
         host: str | None = None,
     ) -> None:
-        nonlocal record_spool_count
         path = Path(path_value).absolute()
+        retained = retained_by_path.get(str(path))
+        if retained is not None:
+            _source5_validate_retained_file_alias(
+                retained, path=path, role=role, owner=owner, host_id=host,
+                phase=phase, run_id=run_id, maximum=int(maximum),
+                exact_size=exact_size, raw_sha256=raw_sha256,
+            )
+            require((str(path), retained["origin_pin"]["raw_sha256"]) in
+                    emitted_retained_keys,
+                    f"Source5 retained file was not emitted before its Source use: {path}")
+            return
         if storage_root == "auto":
             storage_root = storage_domain(path)
         maximum = int(maximum)
@@ -8353,14 +9090,7 @@ def _source5_path_catalogue_records(
             "aggregate_max_bytes": aggregate_maximum,
             "origin_pin": pin,
         }
-        encoded = canonical_bytes(record)
-        require(record_spool.tell() + len(encoded) <=
-                scratch_reservation["reserved_bytes"],
-                "Source5 producer path spool exceeded the caller-reserved scratch bytes")
-        record_spool.write(encoded)
-        record_spool_count += 1
-        if raw_sha256 is not None:
-            seen_origin_paths.add(str(path))
+        append_record(record)
         parents(path, owner, storage_root, phase, run_id)
 
     def add_tree(
@@ -8372,6 +9102,10 @@ def _source5_path_catalogue_records(
         aggregate_maximum: int | None = None,
     ) -> None:
         path = Path(path_value).absolute()
+        require(str(path) not in retained_by_path and
+                not any(Path(retained_path).is_relative_to(path)
+                        for retained_path in retained_by_path),
+                f"Source5 output tree aliases a retained historical path: {path}")
         if storage_root == "auto":
             storage_root = storage_domain(path)
         key = str(path)
@@ -8395,6 +9129,14 @@ def _source5_path_catalogue_records(
         label: str, *, semantic_sha256: str | None = None,
         host: str | None = None,
     ) -> dict[str, str]:
+        retained_input = _source5_captured_current_input_row(
+            context, retained_by_path, hostless_retained_roles,
+            current_input_pins, emitted_retained_keys,
+            pin_value, role, maximum, label,
+            semantic_sha256=semantic_sha256, host=host,
+        )
+        if retained_input is not None:
+            return retained_input["pin"]
         pin = raw_pin(pin_value, label)
         path = Path(pin["path"])
         actual = context.fixed_pair._hash_regular_file(
@@ -8409,6 +9151,23 @@ def _source5_path_catalogue_records(
                  semantic_sha256=semantic_sha256, file_label=label, host=host)
         return pin
 
+    if is_v5:
+        emitted_retained_keys = _source5_emit_retained_storage_rows(
+            retained_rows, retained_keys, append_record, parents,
+        )
+
+    resident_source_artifacts = _source5_selected_source_artifact_records(
+        context, chronology_roles,
+    )
+    if is_v5:
+        for record in resident_source_artifacts:
+            remember_current_pin(
+                {"path": str(record["path"]),
+                 "raw_sha256": record["raw_sha256"]},
+                record["role"], record["host_id"], record["maximum"],
+                None, f"Source5 selected resident {record['role']}",
+            )
+
     # Original source closure: exact Source.files rows, including literal links.
     for row in source["source"]["files"]:
         path = context.source_root / PurePosixPath(row["path"])
@@ -8422,32 +9181,13 @@ def _source5_path_catalogue_records(
                 "source_manifest", 16 * 1024 * 1024, "source",
                 f"Source5 {host} manifest", semantic_sha256=semantic,
                 host=host)
-    for owner_host, owner_source in context.sources.items():
-        artifact_refs: list[tuple[dict[str, Any], str, int]] = []
-        artifact_refs.extend((item, "normal_app_output",
-                              context.fixed_pair.MAX_BINARY_BYTES)
-                             for item in owner_source["artifacts"].values())
-        artifact_refs.extend((item, "source5_soak_artifact",
-                              context.fixed_pair.MAX_BINARY_BYTES)
-                             for item in owner_source["soak_artifacts"].values())
-        artifact_refs.append((owner_source["analysis_artifact"],
-                              "analysis_artifact",
-                              chronology_roles["analysis_artifact"]))
-        calibration = owner_source["resource_domain_calibration"]
-        artifact_refs.extend((calibration[name], "capacity_artifact",
-                              chronology_roles["capacity_artifact"])
-                             for name in ("binary", "output"))
-        for artifact, role, maximum in artifact_refs:
-            path = context.source_root / PurePosixPath(artifact["path"])
-            actual = context.fixed_pair._hash_regular_file(
-                path, maximum, f"Source5 {role} artifact {artifact['path']}",
-            )
-            info = path.stat(follow_symlinks=False)
-            require(actual == artifact["sha256"],
-                    f"Source5 {role} artifact raw pin changed: {path}")
-            add_file(path, role, int(info.st_size), "source_artifact",
-                     storage_root=None, exact_size=int(info.st_size),
-                     raw_sha256=actual, host=host_id)
+    for record in resident_source_artifacts:
+        add_file(
+            record["path"], record["role"], record["maximum"],
+            "source_artifact", storage_root=None,
+            exact_size=record["exact_size"], raw_sha256=record["raw_sha256"],
+            host=record["host_id"],
+        )
 
     # Original SpecV3, PlanV3, execution manifest, host and prepared pins.
     add_pin(context.spec_pin, "spec_v3", 32 * 1024 * 1024, "inputs",
@@ -8536,27 +9276,8 @@ def _source5_path_catalogue_records(
         add_pin(prep_pin, "preparation", MAX_ARTIFACT_BYTES, "inputs",
                 "Source5 preparation", host=host_id)
         if context.manifest.get("schema") == EXECUTION_SCHEMA_V5:
-            require(type(context.prepared_capture_storage_rows) is list and
-                    type(context.prepared_capture_declaration) is dict,
-                    "Source5 v5 catalogue lacks its complete captured-lineage closure")
-            for row in context.prepared_capture_storage_rows:
-                if row["path"] in seen_origin_paths:
-                    continue
-                origin = row["origin_pin"]
-                require(type(origin) is dict and
-                        is_sha(origin.get("raw_sha256")),
-                        "Source5 v5 captured metadata catalogue row lacks its exact raw pin")
-                add_file(
-                    row["path"], row["role"], row["max_bytes"], row["owner"],
-                    storage_root=row["storage_root"], phase=row["phase"],
-                    run_id=row["run_id"], member_index=row["member_index"],
-                    aggregate_id=row["aggregate_id"],
-                    aggregate_maximum=row["aggregate_max_bytes"],
-                    exact_size=row["max_bytes"],
-                    raw_sha256=origin["raw_sha256"],
-                    semantic_sha256=origin["semantic_sha256"],
-                    host=row["host_id"],
-                )
+            require(emitted_retained_keys == retained_keys,
+                    "Source5 v5 catalogue omitted a validated Bridge capture row")
     if type(context.prepared_input_completion) is dict:
         for other_host, pin in context.prepared_input_completion.get(
                 "resource_budgets", {}).items():
@@ -9620,46 +10341,10 @@ def _source5_path_catalogue_records(
                      caps["stage_map_bytes"], "source5_controller",
                      storage_root=str(output_root), phase=phase, run_id=run_id)
 
-    def row_stream():
-        try:
-            record_spool.flush()
-            spool_bytes = record_spool.seek(0, os.SEEK_END)
-            directory_rows = directory_specs.values()
-            directory_bytes = sum(len(canonical_bytes(row))
-                                  for row in directory_rows)
-            input_bytes = spool_bytes + directory_bytes
-            input_count = record_spool_count + len(directory_specs)
-            run_count = max(1, (input_count +
-                               budget_module.PATH_CATALOGUE_RUN_ROWS - 1) //
-                            budget_module.PATH_CATALOGUE_RUN_ROWS)
-            merge_overlap = ((run_count + budget_module.PATH_CATALOGUE_MERGE_FANOUT - 1) //
-                             budget_module.PATH_CATALOGUE_MERGE_FANOUT
-                             if run_count > budget_module.PATH_CATALOGUE_MERGE_FANOUT
-                             else 0)
-            required_scratch_bytes = input_bytes * 3
-            required_scratch_inodes = 2 + run_count + merge_overlap
-            require(scratch_reservation["reserved_bytes"] >= required_scratch_bytes and
-                    scratch_reservation["reserved_inodes"] >= required_scratch_inodes,
-                    "Source5 caller scratch reservation cannot hold the bounded external sort peak")
-            record_spool.seek(0)
-            while True:
-                line = record_spool.readline()
-                if not line:
-                    break
-                require(line.endswith(b"\n") and b"\r" not in line,
-                        "Source5 catalogue row spool framing differs")
-                try:
-                    value = json.loads(line.decode("ascii"))
-                except (UnicodeError, json.JSONDecodeError, RecursionError) as error:
-                    raise Source5CampaignError(
-                        "Source5 catalogue row spool is malformed",
-                    ) from error
-                yield value
-            yield from directory_rows
-        finally:
-            record_spool.close()
-
-    return row_stream(), pressure_materials
+    return _source5_catalogue_record_stream(
+        record_spool, record_spool_count, directory_specs,
+        scratch_reservation, budget_module,
+    ), pressure_materials
 
 
 def _validate_live_storage_reservation(
@@ -17803,8 +18488,8 @@ def build_source5_preparatory_execution_manifest(
 ) -> dict[str, Any]:
     """Build a host-scoped prep manifest only after SourceA verifies setup."""
     require(type(manifest_core) is dict and
-            type(storage_reservation_path) is Path and
-            type(output_directory) is Path and output_directory.is_absolute(),
+            isinstance(storage_reservation_path, Path) and
+            isinstance(output_directory, Path) and output_directory.is_absolute(),
             "preparatory manifest builder inputs are malformed")
     campaign_id = manifest_core.get("campaign_id")
     host_id = manifest_core.get("host_id")

@@ -13,7 +13,9 @@ import io
 import json
 import os
 import signal
+import shutil
 import stat
+import subprocess
 import sys
 import tempfile
 import threading
@@ -2935,6 +2937,746 @@ class RecordedFixedCheckpointV3Tests(unittest.TestCase):
                 FIXED._recorded_fixed_zero_tmp_proofs(
                     owner_context, prepared, reordered_pin, reordered_raw,
                 )
+
+class ClosedRecordedFixedProjectionTests(unittest.TestCase):
+    """Constructor tests only; synthetic bindings are not numeric owner evidence."""
+
+    def _capacity_case(self, root: Path):
+        context, bindings = _real_binding_case(root, write_expectations=False)
+        context["job"]["phase"] = "exploration"
+        context["job"]["comparison_kind"] = "capacity_pilot"
+        context["spec"]["rates"] = []
+        context["spec"]["oracles"] = []
+        context["closed_recorded"] = True
+        return context, bindings
+
+    def test_closed_member_projection_uses_source_identity_without_peer_elf_io(self):
+        with tempfile.TemporaryDirectory(prefix="closed-fixed-member-projection-") as temporary:
+            context, bindings = self._capacity_case(Path(temporary))
+            descriptor = context["source"]["artifacts"]["allocatbelt"]
+            peer_binary = context["source_root"] / descriptor["path"]
+            peer_binary.unlink()
+            with patch.object(
+                    FIXED, "_hash_regular_file",
+                    side_effect=AssertionError("closed route hashed a peer ELF")),                  patch.object(
+                    Path, "stat",
+                    side_effect=AssertionError("closed route statted a peer ELF")):
+                members = FIXED._construct_members_closed_recorded(
+                    context, bindings,
+                )
+            self.assertEqual(len(members), 2)
+            self.assertEqual(
+                {item["binary"]["path"] for item in members},
+                {str(peer_binary)},
+            )
+            self.assertEqual(
+                {item["binary"]["sha256"] for item in members},
+                {descriptor["sha256"]},
+            )
+            self.assertFalse(peer_binary.exists())
+            peer_binary.write_bytes(b"different peer ELF at the same logical path")
+            with patch.object(
+                    FIXED, "_hash_regular_file",
+                    side_effect=AssertionError("closed route hashed a different peer ELF")), \
+                 patch.object(
+                    Path, "stat",
+                    side_effect=AssertionError("closed route statted a different peer ELF")):
+                changed_peer_members = FIXED._construct_members_closed_recorded(
+                    context, bindings,
+                )
+            self.assertEqual(
+                [item["binary"] for item in changed_peer_members],
+                [item["binary"] for item in members],
+            )
+            with self.assertRaises(FIXED.FixedPairError):
+                FIXED._construct_members(context, bindings)
+
+    def test_closed_projection_rejects_open_loop_and_non_pilot_modes(self):
+        with tempfile.TemporaryDirectory(prefix="closed-fixed-mode-guard-") as temporary:
+            context, bindings = self._capacity_case(Path(temporary))
+            context["job"]["mode"] = "open_loop"
+            with self.assertRaisesRegex(FIXED.FixedPairError, "only the original exploration capacity-pilot"):
+                FIXED._construct_members_closed_recorded(context, bindings)
+
+    def test_recorded_start_stat_facts_join_to_probe_and_member_without_origin_io(self):
+        with tempfile.TemporaryDirectory(prefix="closed-fixed-stat-joins-") as temporary:
+            context, bindings = self._capacity_case(Path(temporary))
+            members = FIXED._construct_members(context, bindings)
+            probes = {}
+            attempts = []
+            for member in members:
+                start_body = {
+                    "schema": FIXED.APP_STARTED_SCHEMA,
+                    "role": "fixed_application_member",
+                    "pid": 42000 + member["ordinal"],
+                    "start_ticks": 52000 + member["ordinal"],
+                    "executable_path": member["binary"]["path"],
+                    "executable_sha256": member["binary"]["sha256"],
+                    "executable_device": 17,
+                    "executable_inode": 23,
+                    "executable_size": 4096,
+                    "requested_argv": member["argv"],
+                    "requested_argv_sha256": FIXED.sha256_bytes(FIXED.canonical_bytes(member["argv"])),
+                    "executed_argv": member["argv"],
+                    "executed_argv_sha256": FIXED.sha256_bytes(FIXED.canonical_bytes(member["argv"])),
+                    "environment": member["environment"],
+                    "environment_sha256": FIXED.sha256_bytes(FIXED.canonical_bytes(member["environment"])),
+                    "cwd": member["cwd"], "tmpdir": member["tmpdir"]["path"],
+                    "cpu_affinity": member["affinity"]["cpus"],
+                    "network_namespace_inode": member["network_namespace_inode"],
+                }
+                start = {**start_body, "identity_sha256": FIXED.sha256_bytes(
+                    FIXED.canonical_bytes(start_body),
+                )}
+                attempts.append({"ordinal": member["ordinal"], "start": start})
+                self.assertEqual(set(attempts[-1]), {"ordinal", "start"})
+                probes[member["ordinal"]] = {
+                    "binary": member["binary"],
+                    "binary_device": 17, "binary_inode": 23,
+                }
+            receipt = {"status": "valid_pair", "member_attempts": attempts}
+            overlay = {"members": members}
+            with patch.object(
+                    Path, "stat",
+                    side_effect=AssertionError("recorded stat join touched origin")):
+                FIXED._verify_closed_recorded_binary_stat_joins(
+                    overlay, receipt, probes,
+                )
+            probes[0]["binary_inode"] += 1
+            with self.assertRaisesRegex(FIXED.FixedPairError, "persisted APP start identity"):
+                FIXED._verify_closed_recorded_binary_stat_joins(
+                    overlay, receipt, probes,
+                )
+
+    def test_recorded_tmp_proofs_preserve_the_app_start_callback(self):
+        """Use persisted producer shape and archive-derived TMP facts only."""
+        with tempfile.TemporaryDirectory(prefix="fixed-start-tmp-join-") as temporary:
+            root = Path(temporary)
+            context, bindings = self._capacity_case(root)
+            members = FIXED._construct_members(context, bindings)
+            static_mount = {
+                "mount_id": 41, "major_minor": "8:1", "mount_root": "/",
+                "mount_point": "/tmp", "filesystem_type": "ext4",
+                "mount_source": "/dev/test", "device": 8,
+            }
+            output_mount = {**static_mount,
+                            "available_bytes": 4 * FIXED.MAX_TMPDIR_BYTES,
+                            "available_inodes": 4 * FIXED.MAX_TMPDIR_INODES}
+            overlay_sha = "9" * 64
+            overlay = {
+                "campaign_id": "fixed-start-tmp-test", "host_id": "host-a",
+                "job": {"value": {"run_id": context["job"]["run_id"]}},
+            }
+            attempts = []
+            probes = []
+            for member in members:
+                ordinal = member["ordinal"]
+                tmp_path = member["tmpdir"]["path"]
+                tmp_initial = {
+                    "path": tmp_path, "device": 8, "inode": 100 + ordinal,
+                    "mode": 0o700, "mount": static_mount,
+                    "available_bytes": 2 * FIXED.MAX_TMPDIR_BYTES,
+                    "available_inodes": 2 * FIXED.MAX_TMPDIR_INODES,
+                    "bytes_limit": FIXED.MAX_TMPDIR_BYTES,
+                    "inode_limit": FIXED.MAX_TMPDIR_INODES,
+                }
+                tmp_final = {
+                    **tmp_initial, "bytes_used": 0, "file_count": 0,
+                    "directory_count": 0,
+                }
+                probe_final = {
+                    **tmp_initial, "path": member["outputs"]["probe_tmpdir"],
+                    "inode": 200 + ordinal, "bytes_used": 0,
+                    "file_count": 0, "directory_count": 0,
+                }
+                executable = Path(member["binary"]["path"]).stat(follow_symlinks=False)
+                start_body = {
+                    "schema": FIXED.APP_STARTED_SCHEMA,
+                    "role": "fixed_application_member",
+                    "pid": 43000 + ordinal, "start_ticks": 53000 + ordinal,
+                    "executable_path": member["binary"]["path"],
+                    "executable_sha256": member["binary"]["sha256"],
+                    "executable_device": 17, "executable_inode": 23,
+                    "executable_size": executable.st_size,
+                    "requested_argv": member["argv"],
+                    "requested_argv_sha256": FIXED.sha256_bytes(FIXED.canonical_bytes(member["argv"])),
+                    "executed_argv": member["argv"],
+                    "executed_argv_sha256": FIXED.sha256_bytes(FIXED.canonical_bytes(member["argv"])),
+                    "environment": member["environment"],
+                    "environment_sha256": FIXED.sha256_bytes(FIXED.canonical_bytes(member["environment"])),
+                    "cwd": member["cwd"], "tmpdir": tmp_path,
+                    "cpu_affinity": member["affinity"]["cpus"],
+                    "network_namespace_inode": member["network_namespace_inode"],
+                }
+                start_proof = {**start_body, "identity_sha256": FIXED.sha256_bytes(
+                    FIXED.canonical_bytes(start_body),
+                )}
+                cleanup = {
+                    "group_signal_after_leader_reap_count": 0, "signals": [],
+                    "leader_reaped": True, "remaining_session_members": [],
+                    "cleanup_status": "verified", "cleanup_errors": [],
+                }
+                start_event = {
+                    "schema": FIXED.APP_STARTED_SCHEMA,
+                    "overlay_sha256": overlay_sha,
+                    "campaign_id": overlay["campaign_id"], "host_id": overlay["host_id"],
+                    "run_id": overlay["job"]["value"]["run_id"],
+                    "member_ordinal": ordinal, "descriptor": member["descriptor"],
+                    "role": "fixed_application_member", "proof": start_proof,
+                }
+                terminal_event = {
+                    "schema": FIXED.APP_TERMINAL_SCHEMA,
+                    "overlay_sha256": overlay_sha, "pid": start_proof["pid"],
+                    "descriptor": member["descriptor"], "cleanup": cleanup,
+                    "status": 0,
+                }
+                # This is the persisted attempt projection consumed here;
+                # transient _run_direct_process binary_* fields are absent.
+                attempt = {
+                    "ordinal": ordinal, "descriptor": member["descriptor"],
+                    "attempted": True, "status": 0,
+                    "child_return_code": 0, "start": start_proof,
+                    "start_events": [start_event], "terminal_event": terminal_event,
+                    "supervision": cleanup,
+                    "tmpdir_initial": tmp_initial, "tmpdir_final": tmp_final,
+                }
+                self.assertFalse({"binary_path", "binary_sha256", "binary_device",
+                                  "binary_inode", "binary_size"} & set(attempt))
+                attempts.append(attempt)
+                probes.append({"member_ordinal": ordinal, "tmpdir_final": probe_final})
+            receipt_body = {
+                "schema": FIXED.RECEIPT_SCHEMA, "status": "valid_pair",
+                "member_attempts": attempts, "construction_probes": probes,
+            }
+            receipt = {**receipt_body, "receipt_sha256": FIXED.sha256_bytes(
+                FIXED.canonical_bytes(receipt_body),
+            )}
+            receipt_pin = {
+                "path": str(root / "owner" / "fixed-pair-execution-receipt.json"),
+                "raw_sha256": FIXED.sha256_bytes(FIXED.canonical_bytes(receipt)),
+                "semantic_sha256": receipt["receipt_sha256"],
+            }
+            tmp_proofs = ARCHIVE._zero_fixed_tmp_proofs(
+                receipt, receipt_pin, "component_receipt",
+                include_probe_tmp_proofs=True,
+            )
+            self.assertEqual(len(tmp_proofs), 4)
+            self.assertEqual(
+                [(item["member_ordinal"], item.get("domain")) for item in tmp_proofs],
+                [(0, None), (1, None), (0, "probe_tmpdir"), (1, "probe_tmpdir")],
+            )
+            host_facts = {"host_verification": {"output_mount": output_mount}}
+            for member, attempt in zip(members, attempts, strict=True):
+                FIXED._verify_start_proof(
+                    overlay, member, attempt, overlay_sha, require_success=True,
+                    offline_facts=host_facts,
+                    recorded_zero_tmp_proofs=tmp_proofs,
+                )
+            # The closed route preserves lifecycle joins after the historical
+            # executable disappears. The archive proofs remain receipt-derived.
+            peer_binary = Path(members[0]["binary"]["path"])
+            peer_binary.unlink()
+            for member, attempt in zip(members, attempts, strict=True):
+                FIXED._verify_start_proof(
+                    overlay, member, attempt, overlay_sha, require_success=True,
+                    offline_facts=host_facts,
+                    recorded_zero_tmp_proofs=tmp_proofs,
+                    closed_recorded=True,
+                )
+            changed = dict(attempts[0])
+            changed_event = dict(attempts[0]["start_events"][0])
+            changed_event["proof"] = {**attempts[0]["start"],
+                                       "pid": attempts[0]["start"]["pid"] + 1}
+            changed["start_events"] = [changed_event]
+            with self.assertRaisesRegex(FIXED.FixedPairError, "callback event differs"):
+                FIXED._verify_start_proof(
+                    overlay, members[0], changed, overlay_sha,
+                    require_success=True, offline_facts=host_facts,
+                    recorded_zero_tmp_proofs=tmp_proofs,
+                    closed_recorded=True,
+                )
+            bad_terminal = dict(attempts[0])
+            bad_terminal["terminal_event"] = {
+                **attempts[0]["terminal_event"],
+                "pid": attempts[0]["terminal_event"]["pid"] + 1,
+            }
+            with self.assertRaisesRegex(FIXED.FixedPairError, "actual started PID"):
+                FIXED._verify_start_proof(
+                    overlay, members[0], bad_terminal, overlay_sha,
+                    require_success=True, offline_facts=host_facts,
+                    recorded_zero_tmp_proofs=tmp_proofs,
+                    closed_recorded=True,
+                )
+
+    def test_closed_api_has_an_explicit_nonresident_result_schema(self):
+        self.assertTrue(callable(
+            FIXED.verify_fixed_pair_overlay_closed_recorded_captured_v1,
+        ))
+        self.assertNotEqual(
+            FIXED.CLOSED_RECORDED_CAPTURED_REPLAY_CONTEXT_SCHEMA_V1,
+            FIXED.RECORDED_HOST_CAPTURED_REPLAY_CONTEXT_SCHEMA_V1,
+        )
+
+
+def build_native_fixed_owner_fixture_manifest(
+    manifest_path: Path, *, fixture_root: Path, stage_root: Path,
+    overlay_pin: dict[str, str], receipt_pin: dict[str, str],
+    host_verification_pin: dict[str, str], checkpoint_pin: dict[str, str],
+    checkpoint_raw_path: Path, references: dict[str, dict[str, object]],
+    global_documents: dict[str, dict[str, object]], alternate_allocator: str,
+) -> dict[str, str]:
+    """Package real Source/archive owner bytes for the one-pair native runner.
+
+    The helper verifies and pins bytes already produced by a native component
+    and its real Archive checkpoint. It creates no owner result, signature,
+    stat observation, or SourceA authority claim.
+    """
+    root = FIXED._safe_absolute(str(fixture_root), "native owner fixture root")
+    root_info = root.lstat()
+    if (not stat.S_ISDIR(root_info.st_mode) or root_info.st_uid != os.getuid() or
+            stat.S_IMODE(root_info.st_mode) != 0o700):
+        raise FIXED.FixedPairError("native owner fixture root must be owned mode-0700 storage")
+    stage = FIXED._safe_absolute(str(stage_root), "native owner fixture stage")
+    output = FIXED._safe_absolute(str(manifest_path.parent),
+                                  "native owner fixture manifest directory")
+    if (output != root or stage.parent != root or not manifest_path.is_absolute() or
+            manifest_path != root / "owner-fixture.json"):
+        raise FIXED.FixedPairError("native owner fixture layout is not the exact private root/stage form")
+    stage_info = stage.lstat()
+    if (not stat.S_ISDIR(stage_info.st_mode) or stage_info.st_uid != os.getuid() or
+            stat.S_IMODE(stage_info.st_mode) != 0o700):
+        raise FIXED.FixedPairError("native owner fixture stage must be a real mode-0700 directory")
+    references = FIXED.exact(references, set(references),
+                             "native Source-owned capture reference map")
+    packed_references = {}
+    for origin, raw_reference in references.items():
+        reference = FIXED.exact(raw_reference, {
+            "origin_path", "path", "role", "host_id", "raw_sha256",
+            "semantic_sha256", "byte_count", "maximum_bytes",
+        }, f"native capture reference {origin}")
+        local = FIXED._safe_absolute(reference["path"],
+                                     f"native capture object {origin}")
+        if local.parent != stage or reference["origin_path"] != origin:
+            raise FIXED.FixedPairError("native capture object is outside its flat stage or changed origin")
+        raw, checksum, info = FIXED.read_stable(
+            local, f"native capture object {origin}", reference["maximum_bytes"],
+        )
+        if (info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) != 0o400 or
+                info.st_nlink != 1 or
+                checksum != reference["raw_sha256"] or
+                len(raw) != reference["byte_count"]):
+            raise FIXED.FixedPairError("native capture object differs from its owned 0400 raw pin")
+        packed_references[origin] = {
+            "relative_path": local.relative_to(root).as_posix(),
+            **{key: reference[key] for key in (
+                "role", "host_id", "raw_sha256", "semantic_sha256",
+                "byte_count", "maximum_bytes",
+            )},
+        }
+    global_documents = FIXED.exact(
+        global_documents, set(global_documents), "native Source raw2 document map",
+    )
+    packed_documents = {}
+    for origin, raw_value in global_documents.items():
+        document = FIXED.exact(raw_value, {"path", "raw_sha256"},
+                               f"native raw2 document {origin}")
+        local = FIXED._safe_absolute(document["path"],
+                                     f"native raw2 capture {origin}")
+        local.relative_to(root)
+        raw, checksum, info = FIXED.read_stable(
+            local, f"native raw2 capture {origin}", FIXED.MAX_PLAN_BYTES,
+        )
+        if info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) != 0o400 or checksum != document["raw_sha256"]:
+            raise FIXED.FixedPairError("native raw2 document differs from its owned 0400 raw pin")
+        packed_documents[origin] = {
+            "relative_path": local.relative_to(root).as_posix(),
+            "raw_sha256": checksum,
+        }
+    overlay_pin = FIXED.exact(overlay_pin, {"path", "sha256"}, "native overlay pin")
+    receipt_pin = FIXED.exact(receipt_pin, {"path", "sha256"}, "native receipt pin")
+    host_verification_pin = FIXED.exact(host_verification_pin, {
+        "path", "raw_sha256", "host_verification_sha256",
+    }, "native strict-host pin")
+    checkpoint_pin = FIXED.exact(checkpoint_pin, {
+        "path", "raw_sha256", "semantic_sha256",
+    }, "native checkpoint pin")
+    checkpoint_raw_path = FIXED._safe_absolute(
+        str(checkpoint_raw_path), "native checkpoint raw file",
+    )
+    checkpoint_raw_path.relative_to(root)
+    checkpoint_raw, checkpoint_sha, checkpoint_info = FIXED.read_stable(
+        checkpoint_raw_path, "native checkpoint raw file",
+        FIXED.MAX_RECORDED_CHECKPOINT_BYTES,
+    )
+    if (checkpoint_info.st_uid != os.getuid() or
+            stat.S_IMODE(checkpoint_info.st_mode) != 0o400 or
+            checkpoint_sha != checkpoint_pin["raw_sha256"]):
+        raise FIXED.FixedPairError("native checkpoint raw file differs from its owned 0400 pin")
+    if alternate_allocator not in FIXED.ALLOCATORS:
+        raise FIXED.FixedPairError("native peer allocator is outside the original artifact set")
+    manifest = {
+        "schema": "allocatbelt.application-fixed-pair-native-owner-fixture.v1",
+        "scope": "component_owner_numeric_only",
+        "fixture_root": str(root),
+        "stage_root": stage.relative_to(root).as_posix(),
+        "overlay_pin": overlay_pin,
+        "receipt_pin": receipt_pin,
+        "host_verification_pin": host_verification_pin,
+        "checkpoint_pin": checkpoint_pin,
+        "checkpoint_raw_relative": checkpoint_raw_path.relative_to(root).as_posix(),
+        "references": packed_references,
+        "global_documents": packed_documents,
+        "alternate_allocator": alternate_allocator,
+    }
+    raw = FIXED.canonical_bytes(manifest)
+    checksum = FIXED.write_exclusive(
+        manifest_path, raw, "native one-pair owner fixture manifest", mode=0o600,
+    )
+    return {"path": str(manifest_path), "sha256": checksum}
+
+
+class ClosedRecordedFixedNativeFixtureTests(unittest.TestCase):
+    """One-pair owner numeric runner for a real captured component fixture.
+
+    The fixture is generated by a native Source5 component run. This command
+    proves Fixed owner parity only; it does not authenticate SourceA ACKs or
+    grant registration/admission authority.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        manifest_text = os.environ.get("ALLOCATBELT_CLOSED_FIXED_NATIVE_FIXTURE")
+        if not manifest_text:
+            raise unittest.SkipTest(
+                "requires a real one-pair capture bundle; see the R2 native recipe",
+            )
+        manifest_path = Path(manifest_text)
+        raw, checksum, info = FIXED.read_stable(
+            manifest_path, "native Fixed owner fixture manifest", FIXED.MAX_PLAN_BYTES,
+        )
+        if info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) != 0o600:
+            raise AssertionError("native fixture manifest must be an owned mode-0600 file")
+        value = json.loads(raw.decode("utf-8"))
+        if type(value) is not dict or raw != FIXED.canonical_bytes(value):
+            raise AssertionError("native fixture manifest is not canonical JSON")
+        if value.get("schema") != "allocatbelt.application-fixed-pair-native-owner-fixture.v1" or \
+                value.get("scope") != "component_owner_numeric_only":
+            raise AssertionError("native fixture must name the exact one-pair owner-only schema")
+        required = {
+            "schema", "scope", "fixture_root", "stage_root", "overlay_pin",
+            "receipt_pin", "host_verification_pin", "checkpoint_pin",
+            "checkpoint_raw_relative", "references", "global_documents",
+            "alternate_allocator",
+        }
+        FIXED.exact(value, required, "native Fixed owner fixture manifest")
+        root = Path(value["fixture_root"])
+        if not root.is_absolute() or root.resolve(strict=True) != root or \
+                manifest_path.resolve(strict=True).parent != root:
+            raise AssertionError("native fixture root must be the real parent of its manifest")
+        root_info = root.lstat()
+        if (not stat.S_ISDIR(root_info.st_mode) or root_info.st_uid != os.getuid() or
+                stat.S_IMODE(root_info.st_mode) != 0o700):
+            raise AssertionError("native fixture root must be an owned mode-0700 directory")
+        cls.fixture = value
+        cls.fixture_root = root
+        cls.fixture_manifest_sha256 = checksum
+
+    def _local_path(self, relative: object, label: str) -> Path:
+        if type(relative) is not str or not relative or "\\" in relative:
+            raise AssertionError(f"{label} relative path is malformed")
+        pure = Path(relative)
+        if pure.is_absolute() or ".." in pure.parts or pure.as_posix() != relative:
+            raise AssertionError(f"{label} path escapes the native fixture")
+        path = self.fixture_root / pure
+        if path.resolve(strict=True) != path:
+            raise AssertionError(f"{label} traverses a symlink")
+        path.relative_to(self.fixture_root)
+        return path
+
+    def _owner_inputs(self):
+        fixture = self.fixture
+        stage_root = self._local_path(fixture["stage_root"], "capture stage")
+        references = FIXED.exact(fixture["references"], set(fixture["references"]),
+                                 "native fixed capture references")
+        built_references = {}
+        for origin, value in references.items():
+            value = FIXED.exact(value, {
+                "relative_path", "role", "host_id", "raw_sha256",
+                "semantic_sha256", "byte_count", "maximum_bytes",
+            }, f"native capture reference {origin}")
+            local = self._local_path(value["relative_path"],
+                                     f"native capture object {origin}")
+            if local.parent != stage_root:
+                raise AssertionError("native capture files must share one flat private stage")
+            built_references[origin] = {
+                "origin_path": origin, "path": str(local),
+                **{key: value[key] for key in (
+                    "role", "host_id", "raw_sha256", "semantic_sha256",
+                    "byte_count", "maximum_bytes",
+                )},
+            }
+        documents = FIXED.exact(
+            fixture["global_documents"], set(fixture["global_documents"]),
+            "native historical raw2 document map",
+        )
+        local_documents = {}
+        for origin, value in documents.items():
+            value = FIXED.exact(value, {"relative_path", "raw_sha256"},
+                                f"native raw2 document {origin}")
+            local = self._local_path(value["relative_path"],
+                                     f"native raw2 document {origin}")
+            info = local.lstat()
+            if not stat.S_ISREG(info.st_mode) or stat.S_IMODE(info.st_mode) != 0o400:
+                raise AssertionError("native raw2 documents must be captured as regular 0400 files")
+            local_documents[origin] = {
+                "path": local, "raw_sha256": value["raw_sha256"],
+            }
+
+        def global_reader(pin, maximum):
+            pin = FIXED.exact(pin, {"path", "raw_sha256"},
+                              "native raw2 requested document")
+            document = local_documents.get(pin["path"])
+            if document is None or document["raw_sha256"] != pin["raw_sha256"]:
+                raise AssertionError("native raw2 request is outside the captured pin map")
+            raw, digest, _info = FIXED.read_stable(
+                document["path"], "native raw2 historical document", maximum,
+            )
+            if digest != pin["raw_sha256"]:
+                raise AssertionError("native raw2 document hash differs from its pin")
+            return raw
+
+        checkpoint_pin = FIXED.exact(fixture["checkpoint_pin"], {
+            "path", "raw_sha256", "semantic_sha256",
+        }, "native Source5 checkpoint pin")
+        checkpoint_path = self._local_path(
+            fixture["checkpoint_raw_relative"], "native checkpoint bytes",
+        )
+        checkpoint_raw, checkpoint_sha, _info = FIXED.read_stable(
+            checkpoint_path, "native Source5 checkpoint bytes",
+            FIXED.MAX_RECORDED_CHECKPOINT_BYTES,
+        )
+        if checkpoint_sha != checkpoint_pin["raw_sha256"]:
+            raise AssertionError("native checkpoint bytes differ from their raw pin")
+        overlay_pin = FIXED.exact(fixture["overlay_pin"], {"path", "sha256"},
+                                  "native overlay pin")
+        receipt_pin = FIXED.exact(fixture["receipt_pin"], {"path", "sha256"},
+                                  "native execution receipt pin")
+        host_pin = FIXED.exact(fixture["host_verification_pin"], {
+            "path", "raw_sha256", "host_verification_sha256",
+        }, "native strict-host receipt pin")
+        return (stage_root, built_references, global_reader, checkpoint_pin,
+                checkpoint_raw, overlay_pin, receipt_pin, host_pin)
+
+    def test_one_pair_resident_parity_then_closed_missing_and_different_peer(self):
+        (stage_root, references, global_reader, checkpoint_pin, checkpoint_raw,
+         overlay_pin, receipt_pin, host_pin) = self._owner_inputs()
+        captured_view = FIXED.CapturedFixedPairArtifactsV1(references, stage_root)
+        overlay_raw, overlay_sha = captured_view.read(
+            overlay_pin["path"], "native fixed overlay", FIXED.MAX_PLAN_BYTES,
+        )
+        overlay = json.loads(overlay_raw.decode("utf-8"))
+        if overlay_sha != overlay_pin["sha256"]:
+            self.fail("native overlay bytes differ from their pin")
+        if overlay["job"]["value"].get("phase") != "exploration" or \
+                overlay["job"]["value"].get("mode") != "capacity":
+            self.fail("native one-pair fixture must use an original exploration capacity job")
+        source_root = Path(overlay["sources"]["selected"]["root"])
+        source_root.relative_to(self.fixture_root)
+        Path(overlay["output_root"]).relative_to(self.fixture_root)
+        module_pin = overlay["modules"]["executor"]
+        fixed_path = source_root / module_pin["path"]
+        fixed_raw, fixed_sha, _info = FIXED.read_stable(
+            fixed_path, "native selected Fixed source", FIXED.MAX_SOURCE_BYTES,
+        )
+        if fixed_sha != module_pin["sha256"]:
+            self.fail("native Fixed source module differs from the overlay pin")
+        fixed = FIXED._load_pinned_module(
+            fixed_raw, fixed_path, "closed_native_fixed_owner",
+        )
+        baseline = fixed.verify_fixed_pair_overlay_recorded_captured_v1(
+            overlay_pin, receipt_pin, host_pin, references, stage_root,
+            checkpoint_pin=checkpoint_pin, checkpoint_raw=checkpoint_raw,
+            global_artifact_reader=global_reader,
+        )
+        if (baseline["verification"]["status"] != "valid_pair" or
+                baseline["verification"]["verified"] is not True or
+                baseline["full_replay_verified"] is not True):
+            self.fail("real resident pair did not replay as valid")
+        self.assertEqual(set(baseline["verification"]), {
+            "schema", "verified", "status", "qualification_eligible",
+            "receipt_sha256", "overlay_sha256", "run_id",
+        })
+        if len(baseline["execution_receipt"]["construction_probes"]) != 2 or \
+                len(baseline["execution_receipt"]["member_attempts"]) != 2 or \
+                len(baseline["execution_receipt"]["process_metrics"]) != 2:
+            self.fail("native one-pair fixture lacks two probes, APP attempts, and numeric metrics")
+        if len(json.loads(checkpoint_raw.decode("utf-8")).get("empty_tmp_proofs", [])) != 4:
+            self.fail("native checkpoint does not preserve all four receipt-derived TMP proofs")
+
+        host_id = overlay["host_id"]
+        source_pin = overlay["sources"]["manifests"][host_id]["pin"]
+        source_raw = global_reader({
+            "path": source_pin["path"], "raw_sha256": source_pin["sha256"],
+        }, FIXED.MAX_MANIFEST_BYTES)
+        source_value = json.loads(source_raw.decode("utf-8"))
+        allocator = overlay["members"][0]["descriptor"]["allocator"]
+        binary_pin = source_value["artifacts"][allocator]
+        binary_path = source_root / binary_pin["path"]
+        binary_path.relative_to(self.fixture_root)
+        binary_info = binary_path.lstat()
+        if stat.S_ISLNK(binary_info.st_mode) or not stat.S_ISREG(binary_info.st_mode):
+            self.fail("native selected peer ELF is not a regular file")
+        original_binary = binary_path.read_bytes()
+        original_mode = stat.S_IMODE(binary_info.st_mode)
+        if hashlib.sha256(original_binary).hexdigest() != binary_pin["sha256"]:
+            self.fail("native selected ELF differs from its Source artifact pin")
+        alternate_allocator = self.fixture["alternate_allocator"]
+        if alternate_allocator == allocator:
+            self.fail("native fixture alternate allocator aliases the selected allocator")
+        alternate_pin = source_value["artifacts"][alternate_allocator]
+        alternate_path = source_root / alternate_pin["path"]
+        alternate_raw = alternate_path.read_bytes()
+        if hashlib.sha256(alternate_raw).hexdigest() != alternate_pin["sha256"] or \
+                hashlib.sha256(alternate_raw).hexdigest() == binary_pin["sha256"]:
+            self.fail("native alternate ELF is not a distinct Source-pinned artifact")
+
+        temporary_roots = set()
+        for member in overlay["members"]:
+            temporary_roots.add(member["tmpdir"]["path"])
+            temporary_roots.add(member["outputs"]["probe_tmpdir"])
+        backups = []
+        temporary_pairs = []
+        for index, value in enumerate(sorted(temporary_roots)):
+            path = Path(value)
+            path.relative_to(self.fixture_root)
+            if path.exists():
+                info = path.lstat()
+                if not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode):
+                    self.fail("native historical TMP origin is not a real directory")
+                if any(path.iterdir()):
+                    self.fail("native recorded TMP origin is not empty")
+                backup = path.with_name(path.name + f".native-backup-{index}")
+                if backup.exists() or backup.is_symlink():
+                    self.fail("native TMP backup path already exists")
+                temporary_pairs.append((path, backup))
+        try:
+            for path, backup in temporary_pairs:
+                path.rename(backup)
+                backups.append((path, backup))
+        except BaseException:
+            for path, backup in reversed(backups):
+                backup.rename(path)
+            raise
+
+        original_open = os.open
+        original_stat = os.stat
+        original_popen = subprocess.Popen
+        binary_name = str(binary_path)
+
+        def guarded_open(path, *args, **kwargs):
+            try:
+                path_text = os.fspath(path)
+            except TypeError:
+                path_text = None
+            if path_text == binary_name:
+                raise AssertionError("closed Fixed replay opened the historical peer ELF")
+            return original_open(path, *args, **kwargs)
+
+        def guarded_stat(path, *args, **kwargs):
+            try:
+                path_text = os.fspath(path)
+            except TypeError:
+                path_text = None
+            if path_text == binary_name:
+                raise AssertionError("closed Fixed replay statted the historical peer ELF")
+            return original_stat(path, *args, **kwargs)
+
+        def guarded_popen(*args, **kwargs):
+            command = args[0] if args else kwargs.get("args")
+            if type(command) is str:
+                first = command.split()[0] if command.split() else ""
+            elif type(command) in (list, tuple) and command:
+                first = os.fspath(command[0])
+            else:
+                first = ""
+            if Path(first).name not in {"git", "rustc", "cargo"}:
+                raise AssertionError("closed Fixed replay launched an APP or probe")
+            return original_popen(*args, **kwargs)
+
+        try:
+            binary_path.unlink()
+            with self.assertRaises(fixed.FixedPairError):
+                fixed.verify_fixed_pair_overlay_recorded_captured_v1(
+                    overlay_pin, receipt_pin, host_pin, references, stage_root,
+                    checkpoint_pin=checkpoint_pin, checkpoint_raw=checkpoint_raw,
+                    global_artifact_reader=global_reader,
+                )
+            missing_validation = dict(references)
+            validation_origin = overlay["members"][0]["outputs"]["runtime_validation"]
+            if validation_origin not in missing_validation:
+                self.fail("native capture omits the original runtime validation owner file")
+            del missing_validation[validation_origin]
+            with patch.object(fixed, "write_exclusive",
+                              side_effect=AssertionError("closed replay wrote a missing runtime receipt")):
+                with self.assertRaises(fixed.FixedPairError):
+                    fixed.verify_fixed_pair_overlay_closed_recorded_captured_v1(
+                        overlay_pin, receipt_pin, host_pin, missing_validation, stage_root,
+                        checkpoint_pin=checkpoint_pin, checkpoint_raw=checkpoint_raw,
+                        global_artifact_reader=global_reader,
+                    )
+            with patch.object(os, "open", side_effect=guarded_open), \
+                 patch.object(os, "stat", side_effect=guarded_stat), \
+                 patch.object(subprocess, "Popen", side_effect=guarded_popen), \
+                 patch.object(fixed, "write_exclusive",
+                              side_effect=AssertionError("closed replay wrote an owner receipt")):
+                absent = fixed.verify_fixed_pair_overlay_closed_recorded_captured_v1(
+                    overlay_pin, receipt_pin, host_pin, references, stage_root,
+                    checkpoint_pin=checkpoint_pin, checkpoint_raw=checkpoint_raw,
+                    global_artifact_reader=global_reader,
+                )
+            binary_path.write_bytes(alternate_raw)
+            binary_path.chmod(original_mode)
+            with self.assertRaises(fixed.FixedPairError):
+                fixed.verify_fixed_pair_overlay_recorded_captured_v1(
+                    overlay_pin, receipt_pin, host_pin, references, stage_root,
+                    checkpoint_pin=checkpoint_pin, checkpoint_raw=checkpoint_raw,
+                    global_artifact_reader=global_reader,
+                )
+            with patch.object(os, "open", side_effect=guarded_open), \
+                 patch.object(os, "stat", side_effect=guarded_stat), \
+                 patch.object(subprocess, "Popen", side_effect=guarded_popen), \
+                 patch.object(fixed, "write_exclusive",
+                              side_effect=AssertionError("closed replay wrote an owner receipt")):
+                different_peer = fixed.verify_fixed_pair_overlay_closed_recorded_captured_v1(
+                    overlay_pin, receipt_pin, host_pin, references, stage_root,
+                    checkpoint_pin=checkpoint_pin, checkpoint_raw=checkpoint_raw,
+                    global_artifact_reader=global_reader,
+                )
+            for path, _backup in backups:
+                self.assertFalse(path.exists(), "closed replay recreated a historical TMP root")
+            for result in (absent, different_peer):
+                self.assertTrue(result["full_replay_verified"])
+                self.assertEqual(result["verification"]["status"], "valid_pair")
+                self.assertTrue(result["verification"]["verified"])
+                self.assertEqual(result["verification"], baseline["verification"])
+                self.assertEqual(result["overlay"], baseline["overlay"])
+                self.assertEqual(result["execution_receipt"], baseline["execution_receipt"])
+                self.assertEqual(result["host_verification_pin"], baseline["host_verification_pin"])
+                self.assertFalse(result["resident_executable_verified"])
+                self.assertFalse(result["app_launch_permitted"])
+                self.assertFalse(result["qualification_eligible"])
+        finally:
+            if binary_path.exists() or binary_path.is_symlink():
+                binary_path.unlink()
+            binary_path.write_bytes(original_binary)
+            binary_path.chmod(original_mode)
+            for path, backup in reversed(backups):
+                if path.is_symlink() or (path.exists() and not path.is_dir()):
+                    path.unlink()
+                elif path.exists():
+                    shutil.rmtree(path)
+                backup.rename(path)
+
 
 class CapturedFixedPairArtifactViewTests(unittest.TestCase):
     """Physical capture checks; synthetic origin metadata is never host proof."""

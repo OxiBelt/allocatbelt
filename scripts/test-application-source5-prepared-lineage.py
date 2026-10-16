@@ -3331,6 +3331,340 @@ class GeneratedH6TwoHostBridgeTests(unittest.TestCase):
                 evidence_budget_module=self.views[first_host].budget_module,
             )
 
+    def _retained_storage_context(self, proofs):
+        selected = self.views[self.host_ids[0]].context
+        return types.SimpleNamespace(
+            manifest=selected.manifest,
+            prepared_exploration_proofs=proofs,
+            prepared_capture_declaration=self.rebuilt_declaration,
+            prepared_capture_storage_rows=self.rebuilt_storage_rows,
+            lineage_artifact_reader=self.capture_reader,
+            modules={
+                source5_campaign.SOURCE5_PREPARED_BRIDGE_BUDGET_SOURCE_PATH:
+                    self.bridge_module,
+            },
+        )
+
+    def test_retained_storage_rows_are_exact_source_bridge_rows_after_origin_removal(self) -> None:
+        """Exercise the projection helper on fresh proofs and a closed capture only."""
+        context = self._retained_storage_context(self.production_proofs)
+        retained, retained_by_path, _hostless_roles = \
+            source5_campaign._source5_prepared_capture_storage_rows(
+                context, self.views[self.host_ids[0]].budget_module,
+            )
+        self.assertEqual(retained, self.rebuilt_storage_rows)
+        self.assertEqual(
+            retained_by_path,
+            {row["path"]: row for row in self.rebuilt_storage_rows},
+        )
+        self.assertEqual(len(retained), len(self.rebuilt_declaration["objects"]))
+        self.assertTrue(all(
+            not Path(origin).exists() and not Path(origin).is_symlink()
+            for origin in self.origins
+        ))
+
+    def test_retained_storage_projection_rejects_crossed_shared_raw_pin(self) -> None:
+        changed = copy.deepcopy(self.production_proofs)
+        peer = self.host_ids[1]
+        changed[peer]["capture_context"]["preparatory_original_pins"][
+            "preparation"]["raw_sha256"] = "0" * 64
+        context = self._retained_storage_context(changed)
+        with self.assertRaisesRegex(
+                source5_campaign.Source5CampaignError,
+                "common preparation/Spec/Plan raw pins differ across proofs",
+        ):
+            source5_campaign._source5_prepared_capture_storage_rows(
+                context, self.views[self.host_ids[0]].budget_module,
+            )
+
+    def test_retained_storage_projection_keeps_execution_pin_exactly_full(self) -> None:
+        """Keep the original full execution pin exact before raw projection."""
+        host = self.host_ids[0]
+        for mutation in ("extra-field", "crossed-raw"):
+            changed = copy.deepcopy(self.production_proofs)
+            pin = changed[host]["bridge_header"]["initial"][
+                "execution_manifest_pin"]
+            if mutation == "extra-field":
+                pin["unexpected"] = True
+            else:
+                pin["raw_sha256"] = (
+                    "0" * 64 if pin["raw_sha256"] != "0" * 64 else "1" * 64
+                )
+            context = self._retained_storage_context(changed)
+            with self.subTest(mutation=mutation), self.assertRaises(
+                    source5_campaign.Source5CampaignError):
+                source5_campaign._source5_prepared_capture_storage_rows(
+                    context, self.views[host].budget_module,
+                )
+
+    def test_retained_current_inputs_join_source_and_signer_rows_without_origin_reads(self) -> None:
+        """Exercise the producer's current-input resolver on closed real capture data."""
+        host, peer_host = self.host_ids
+        view = self.views[host]
+        context = self._retained_storage_context(self.production_proofs)
+        retained, retained_by_path, hostless_roles = \
+            source5_campaign._source5_prepared_capture_storage_rows(
+                context, view.budget_module,
+            )
+        current_input_pins = {}
+        retained_keys = {
+            (row["path"], row["origin_pin"]["raw_sha256"])
+            for row in retained
+        }
+        first_source_pin = view.context.source_manifest_pins[host]
+        with self.assertRaisesRegex(
+                source5_campaign.Source5CampaignError,
+                "precedes its exact Bridge row",
+        ):
+            source5_campaign._source5_captured_current_input_row(
+                context, retained_by_path, hostless_roles, current_input_pins,
+                set(), first_source_pin, "source_manifest",
+                16 * 1024 * 1024, "test input before retained row",
+                semantic_sha256=view.context.sources[host]["manifest_sha256"],
+                host=host,
+            )
+        emitted_retained_keys = source5_campaign._source5_emit_retained_storage_rows(
+            retained, retained_keys, lambda _row: None, lambda *_args: None,
+        )
+
+        def remember(pin_value, role, current_host, maximum, semantic, label,
+                     *, expected_raw=None):
+            source5_campaign._source5_register_current_input_pin(
+                current_input_pins, pin_value, role, current_host, maximum,
+                semantic, label, expected_raw=expected_raw,
+            )
+
+        for source_host, source_doc in view.context.sources.items():
+            pin = view.context.source_manifest_pins[source_host]
+            source_raw = source5_campaign.canonical_bytes(source_doc)
+            semantic = source_doc["manifest_sha256"]
+            remember(
+                pin, "source_manifest", source_host, 16 * 1024 * 1024,
+                semantic, f"test current {source_host} Source manifest",
+                expected_raw=source_raw,
+            )
+            matched = source5_campaign._source5_captured_current_input_row(
+                context, retained_by_path, hostless_roles, current_input_pins,
+                emitted_retained_keys, pin, "source_manifest", 16 * 1024 * 1024,
+                f"test current {source_host} Source manifest",
+                semantic_sha256=semantic, host=source_host,
+            )
+            self.assertEqual(matched["row"], retained_by_path[pin["path"]])
+            self.assertEqual(matched["captured_raw"], source_raw)
+            self.assertIsNone(matched["row"]["origin_pin"]["semantic_sha256"])
+            self.assertEqual(matched["row"]["owner"], "inputs")
+
+        source_pin = view.context.source_manifest_pins[host]
+        source_doc = view.context.sources[host]
+        source_row = retained_by_path[source_pin["path"]]
+        wrong_raw = ("0" * 64 if source_pin["raw_sha256"] != "0" * 64
+                     else "1" * 64)
+        with self.assertRaises(source5_campaign.Source5CampaignError):
+            source5_campaign._source5_captured_current_input_row(
+                context, retained_by_path, hostless_roles, current_input_pins,
+                emitted_retained_keys,
+                {"path": source_pin["path"], "raw_sha256": wrong_raw},
+                "source_manifest", 16 * 1024 * 1024,
+                "test crossed Source raw identity",
+                semantic_sha256=source_doc["manifest_sha256"], host=host,
+            )
+        for wrong_role, wrong_host, wrong_maximum, wrong_semantic in (
+            ("capacity_completion", host, 16 * 1024 * 1024,
+             source_doc["manifest_sha256"]),
+            ("source_manifest", peer_host, 16 * 1024 * 1024,
+             source_doc["manifest_sha256"]),
+            ("source_manifest", host, source_row["max_file_bytes"] - 1,
+             source_doc["manifest_sha256"]),
+            ("source_manifest", host, 16 * 1024 * 1024,
+             "a" * 64 if source_doc["manifest_sha256"] != "a" * 64 else "b" * 64),
+        ):
+            with self.subTest(role=wrong_role, host=wrong_host,
+                              maximum=wrong_maximum, semantic=wrong_semantic), \
+                    self.assertRaises(source5_campaign.Source5CampaignError):
+                source5_campaign._source5_captured_current_input_row(
+                    context, retained_by_path, hostless_roles,
+                    current_input_pins, emitted_retained_keys,
+                    source_pin, wrong_role,
+                    wrong_maximum, "test crossed current Source join",
+                    semantic_sha256=wrong_semantic, host=wrong_host,
+                )
+
+        source5_campaign._source5_register_current_signer_tool_pins(
+            view.context, remember,
+        )
+        for name, role, maximum in (
+            ("keyring_pin", "source5_archive_signer_keyring",
+             source5_campaign.MAX_ARCHIVE_KEYRING_BYTES),
+            ("gpgv_pin", "source5_archive_signer_gpgv",
+             source5_campaign.MAX_ARCHIVE_GPGV_BYTES),
+        ):
+            pin = view.context.archive_signer_context[name]
+            matched = source5_campaign._source5_captured_current_input_row(
+                context, retained_by_path, hostless_roles, current_input_pins,
+                emitted_retained_keys, pin, role, maximum,
+                f"test current signer {name}", host=host,
+            )
+            self.assertEqual(matched["row"], retained_by_path[pin["path"]])
+            self.assertIsNone(matched["row"]["host_id"])
+            self.assertEqual(matched["row"]["role"], role)
+            self.assertEqual(matched["row"]["owner"], "inputs")
+            self.assertIsNone(matched["row"]["origin_pin"]["semantic_sha256"])
+            self.assertEqual(
+                matched["captured_raw"],
+                self.capture_reader(pin, maximum),
+            )
+            with self.assertRaises(source5_campaign.Source5CampaignError):
+                source5_campaign._source5_captured_current_input_row(
+                    context, retained_by_path, {}, current_input_pins,
+                    emitted_retained_keys, pin, role, maximum,
+                    f"test unproven hostless {name}",
+                    host=host,
+                )
+
+        with self.assertRaises(source5_campaign.Source5CampaignError):
+            source5_campaign._source5_validate_retained_file_alias(
+                source_row, path=Path(source_row["path"]),
+                role=source_row["role"], owner="fixed_pair",
+                host_id=source_row["host_id"], phase=source_row["phase"],
+                run_id=source_row["run_id"],
+                maximum=source_row["max_file_bytes"],
+                exact_size=source_row["max_file_bytes"],
+                raw_sha256=source_row["origin_pin"]["raw_sha256"],
+            )
+        self.assertTrue(all(
+            not Path(origin).exists() and not Path(origin).is_symlink()
+            for origin in self.origins
+        ))
+        self.assertEqual(len(retained), len(self.rebuilt_storage_rows))
+
+    def test_retained_rows_use_bounded_producer_spool_and_close_on_failure(self) -> None:
+        """Exercise retained emission/streaming helpers, not a full V5 catalogue."""
+        context = self._retained_storage_context(self.production_proofs)
+        retained, _retained_by_path, _hostless_roles = \
+            source5_campaign._source5_prepared_capture_storage_rows(
+                context, self.views[self.host_ids[0]].budget_module,
+            )
+        budget_module = self.views[self.host_ids[0]].budget_module
+        encoded_size = sum(
+            len(source5_campaign.canonical_bytes(row)) for row in retained
+        )
+        self.assertGreater(encoded_size, 0)
+        spool = tempfile.TemporaryFile(mode="w+b", dir=self.root)
+        retained_keys = {
+            (row["path"], row["origin_pin"]["raw_sha256"])
+            for row in retained
+        }
+        emitted = source5_campaign._source5_emit_retained_storage_rows(
+            retained, retained_keys,
+            lambda row: source5_campaign._source5_append_catalogue_spool_record(
+                spool, row, encoded_size * 3,
+            ),
+            lambda *_args: None,
+        )
+        self.assertEqual(emitted, retained_keys)
+        self.assertEqual(len(emitted), len(retained))
+        run_count = max(
+            1, (len(retained) + budget_module.PATH_CATALOGUE_RUN_ROWS - 1) //
+            budget_module.PATH_CATALOGUE_RUN_ROWS,
+        )
+        merge_overlap = (
+            (run_count + budget_module.PATH_CATALOGUE_MERGE_FANOUT - 1) //
+            budget_module.PATH_CATALOGUE_MERGE_FANOUT
+            if run_count > budget_module.PATH_CATALOGUE_MERGE_FANOUT else 0
+        )
+        scratch = {
+            "reserved_bytes": encoded_size * 3,
+            "reserved_inodes": 2 + run_count + merge_overlap,
+        }
+        stream = source5_campaign._source5_catalogue_record_stream(
+            spool, len(retained), {}, scratch, budget_module,
+        )
+        self.assertEqual(list(stream), retained)
+        self.assertTrue(spool.closed)
+
+        capped_spool = tempfile.TemporaryFile(mode="w+b", dir=self.root)
+        with self.assertRaisesRegex(
+                source5_campaign.Source5CampaignError,
+                "producer path spool exceeded",
+        ):
+            source5_campaign._source5_emit_retained_storage_rows(
+                retained, retained_keys,
+                lambda row: source5_campaign._source5_append_catalogue_spool_record(
+                    capped_spool, row, encoded_size - 1,
+                ),
+                lambda *_args: None,
+            )
+        self.assertLessEqual(capped_spool.tell(), encoded_size - 1)
+        capped_spool.close()
+
+        under_reserved_spool = tempfile.TemporaryFile(mode="w+b", dir=self.root)
+        for row in retained:
+            source5_campaign._source5_append_catalogue_spool_record(
+                under_reserved_spool, row, encoded_size * 3,
+            )
+        under_reserved = dict(scratch)
+        under_reserved["reserved_bytes"] -= 1
+        failed_stream = source5_campaign._source5_catalogue_record_stream(
+            under_reserved_spool, len(retained), {}, under_reserved,
+            budget_module,
+        )
+        with self.assertRaisesRegex(
+                source5_campaign.Source5CampaignError,
+                "bounded external sort peak",
+        ):
+            next(failed_stream)
+        self.assertTrue(under_reserved_spool.closed)
+
+    def test_selected_source_artifact_reader_ignores_peer_elf_and_detects_selected_mutation(self) -> None:
+        """Test the selected-artifact helper, not a resealed peer Source cohort."""
+        selected_host, peer_host = self.host_ids
+        view = self.views[selected_host]
+        selected_context = copy.copy(view.context)
+        selected_source = view.context.sources[selected_host]
+        peer_source = copy.deepcopy(view.context.sources[peer_host])
+        artifact_name, selected_artifact = next(
+            iter(selected_source["artifacts"].items()),
+        )
+        peer_artifact = dict(selected_artifact)
+        peer_artifact["sha256"] = (
+            "0" * 64 if selected_artifact["sha256"] != "0" * 64 else "1" * 64
+        )
+        peer_source["artifacts"][artifact_name] = peer_artifact
+        selected_context.sources = dict(view.context.sources)
+        selected_context.sources[peer_host] = peer_source
+        selected_context.source = selected_source
+        chronology_roles = view.context.owner_evidence_contract[
+            "pressure_pair"]["chronology_role_byte_limits"]
+        records = source5_campaign._source5_selected_source_artifact_records(
+            selected_context, chronology_roles,
+        )
+        self.assertTrue(records)
+        self.assertEqual({record["host_id"] for record in records}, {selected_host})
+
+        with tempfile.TemporaryDirectory(
+                prefix="source5-selected-resident-mutation-", dir=self.root) as temporary:
+            mutated_root = Path(temporary)
+            for record in records:
+                source_path = record["path"]
+                relative = source_path.relative_to(view.context.source_root)
+                target = mutated_root / relative
+                target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+                shutil.copy2(source_path, target)
+            selected_path = records[0]["path"]
+            target = mutated_root / selected_path.relative_to(view.context.source_root)
+            before = target.read_bytes()
+            self.assertTrue(before)
+            mode = stat.S_IMODE(target.stat().st_mode)
+            target.chmod(mode | stat.S_IWUSR)
+            target.write_bytes(bytes([before[0] ^ 1]) + before[1:])
+            target.chmod(mode)
+            mutated_context = copy.copy(selected_context)
+            mutated_context.source_root = mutated_root
+            with self.assertRaises(source5_campaign.Source5CampaignError):
+                source5_campaign._source5_selected_source_artifact_records(
+                    mutated_context, chronology_roles,
+                )
+
     def test_production_capture_rejects_missing_or_tampered_indexed_object(self) -> None:
         descriptor_by_pin = {
             (row["origin_pin"]["path"], row["origin_pin"]["raw_sha256"]): row

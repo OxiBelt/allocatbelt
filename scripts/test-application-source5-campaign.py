@@ -4872,5 +4872,68 @@ class Source5SoakJobRecordBoundTests(unittest.TestCase):
                 metric_cache.update(previous_cache)
 
 
+class ConcretePathBoundaryTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.controller = load_source("concrete_path_source5_controller", CONTROLLER_PATH)
+        cls.chronology = load_source("concrete_path_sourcea", CHRONOLOGY_PATH)
+
+    def test_public_preparatory_builder_accepts_concrete_paths_and_preserves_existing_manifest(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="preparatory-concrete-path-") as name:
+            root = Path(name)
+            artifact_root = root / "artifacts"
+            campaign_id = "component-path-guard"
+            host_id = "host-a"
+            output = artifact_root / campaign_id / "source5" / host_id
+            output.mkdir(mode=0o700, parents=True)
+            existing = output / "preparatory-execution-manifest-v1.json"
+            raw = b"existing immutable manifest\n"
+            existing.write_bytes(raw)
+            existing.chmod(0o600)
+            core = {"campaign_id": campaign_id, "host_id": host_id,
+                    "artifact_root": str(artifact_root)}
+            reservation = root / "storage-reservation.json"
+            with self.assertRaisesRegex(self.controller.Source5CampaignError,
+                                        "manifest already exists"):
+                self.controller.build_source5_preparatory_execution_manifest(
+                    core, reservation, output,
+                )
+            self.assertEqual(existing.read_bytes(), raw)
+            for wrong_reservation, wrong_output in (
+                    (str(reservation), output), (reservation, str(output))):
+                with self.assertRaisesRegex(self.controller.Source5CampaignError,
+                                            "builder inputs are malformed"):
+                    self.controller.build_source5_preparatory_execution_manifest(
+                        core, wrong_reservation, wrong_output,
+                    )
+
+    def test_captured_concrete_path_keeps_exact_size_mode_and_no_follow_checks(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="captured-concrete-path-") as name:
+            root = Path(name)
+            path = root / "captured.bin"
+            raw = b"captured object bytes\n"
+            path.write_bytes(raw)
+            path.chmod(0o600)
+            self.assertEqual(b"".join(self.chronology._source5_evidence_chunks(
+                path, len(raw), "concrete captured object", maximum_bytes=len(raw),
+            )), raw)
+            for wrong_count in (len(raw) - 1, len(raw) + 1):
+                with self.assertRaises(self.chronology.ChronologyError):
+                    list(self.chronology._source5_evidence_chunks(
+                        path, wrong_count, "incorrect captured size",
+                    ))
+            alias = root / "alias.bin"
+            alias.symlink_to(path)
+            with self.assertRaises(self.chronology.ChronologyError):
+                list(self.chronology._source5_evidence_chunks(
+                    alias, len(raw), "symlink captured object",
+                ))
+            path.chmod(0o644)
+            with self.assertRaises(self.chronology.ChronologyError):
+                list(self.chronology._source5_evidence_chunks(
+                    path, len(raw), "nonprivate captured object",
+                ))
+
+
 if __name__ == "__main__":
     unittest.main()

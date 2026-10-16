@@ -1996,7 +1996,12 @@ def _verify_capacity_pilot_captured_pair(
     overlay: dict[str, Any], overlay_raw_sha: str,
     *, recorded_host: bool = False,
     global_artifact_reader: Callable[[dict[str, str], int], bytes] | None = None,
+    closed_recorded: bool = False,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
+    _require(type(closed_recorded) is bool and
+             (not closed_recorded or (recorded_host and
+                                      callable(global_artifact_reader))),
+             "closed recorded fixed replay requires its Source-owned numeric route")
     if recorded_host:
         checkpoint_pin = _exact(view.get("checkpoint_pin"), {
             "path", "raw_sha256", "semantic_sha256",
@@ -2007,23 +2012,34 @@ def _verify_capacity_pilot_captured_pair(
                  "SourceA-authenticated checkpoint bytes differ from their exact raw pin")
         global_reader_kwargs = ({} if global_artifact_reader is None else
                                 {"global_artifact_reader": global_artifact_reader})
-        replay = fixed.verify_fixed_pair_overlay_recorded_captured_v1(
+        replay_function = (fixed.verify_fixed_pair_overlay_closed_recorded_captured_v1
+                          if closed_recorded else
+                          fixed.verify_fixed_pair_overlay_recorded_captured_v1)
+        replay = replay_function(
             overlay_pin, receipt_pin, host_pin,
             view["objects"], Path(view["stage_root"]),
             checkpoint_pin=checkpoint_pin, checkpoint_raw=checkpoint_raw,
             **global_reader_kwargs,
         )
-        expected_schema = fixed.RECORDED_HOST_CAPTURED_REPLAY_CONTEXT_SCHEMA_V1
+        expected_schema = (fixed.CLOSED_RECORDED_CAPTURED_REPLAY_CONTEXT_SCHEMA_V1
+                           if closed_recorded else
+                           fixed.RECORDED_HOST_CAPTURED_REPLAY_CONTEXT_SCHEMA_V1)
     else:
         replay = fixed.verify_fixed_pair_overlay_captured_v1(
             overlay_pin, receipt_pin, host_pin,
             view["objects"], Path(view["stage_root"]),
         )
         expected_schema = fixed.CAPTURED_REPLAY_CONTEXT_SCHEMA_V1
-    _exact(replay, {
+    replay_fields = {
         "schema", "verification", "overlay", "execution_receipt",
         "host_verification_pin", "full_replay_verified", "qualification_eligible",
-    }, "captured capacity-pilot owner replay")
+    }
+    if closed_recorded:
+        replay_fields |= {"resident_executable_verified", "app_launch_permitted"}
+        _require(replay.get("resident_executable_verified") is False and
+                 replay.get("app_launch_permitted") is False,
+                 "closed fixed owner made a resident-executable or launch claim")
+    _exact(replay, replay_fields, "captured capacity-pilot owner replay")
     verification = _exact(replay["verification"], {
         "schema", "verified", "status", "qualification_eligible",
         "receipt_sha256", "overlay_sha256", "run_id",
@@ -2051,6 +2067,7 @@ def _export_capacity_pilot_impl(
     recorded_host: bool,
     global_artifact_reader: Callable[[dict[str, str], int], bytes] | None = None,
     original_metadata: bool = False,
+    closed_recorded: bool = False,
 ) -> dict[str, Any]:
     """Replay six original fixed-pair receipts per context/allocator and export the rate pilot.
 
@@ -2064,6 +2081,11 @@ def _export_capacity_pilot_impl(
              "capacity-pilot before-publication hook must be absent or callable")
     _require(global_artifact_reader is None or recorded_host,
              "historical global metadata reader is reserved for recorded-host pilot replay")
+    _require(type(closed_recorded) is bool and
+             (not closed_recorded or
+              (recorded_host and global_artifact_reader is not None and
+               captured_read_provider is not None and not original_metadata)),
+             "closed recorded pilot selector requires SourceA-owned inputs")
     _require(type(original_metadata) is bool and
              (not original_metadata or
               (not recorded_host and global_artifact_reader is None and
@@ -2206,6 +2228,7 @@ def _export_capacity_pilot_impl(
                         host_verification_pin, overlay, overlay_raw_sha,
                         recorded_host=recorded_host,
                         global_artifact_reader=(global_artifact_reader if recorded_host else None),
+                        closed_recorded=closed_recorded,
                     )
             except Exception as error:
                 raise PreparationError(f"original fixed-pair receipt[{index}] failed generation-bound offline replay: {error}") from error
@@ -3335,6 +3358,7 @@ def _complete_prepared_inputs_impl(
     recorded_host: bool = False,
     global_artifact_reader: Callable[[dict[str, str], int], bytes] | None = None,
     input_root: Path | None = None,
+    closed_recorded: bool = False,
 ) -> dict[str, Any]:
     """Bridge independently replayed preparation evidence into final frozen inputs."""
     _require(type(recorded_host) is bool and
@@ -3342,6 +3366,12 @@ def _complete_prepared_inputs_impl(
              "historical global reader is reserved for recorded-host completion replay")
     _require(not recorded_host or captured_pilot_read_providers is not None,
              "recorded-host completion requires its captured pilot provider cohort")
+    _require(type(closed_recorded) is bool and
+             (not closed_recorded or
+              (recorded_host and callable(global_artifact_reader) and
+               captured_pilot_read_providers is not None and
+               write_completion is False)),
+             "closed recorded completion is restricted to the read-only Source-owned route")
     _require(input_root is None or recorded_host,
              "explicit nested input-root replay is reserved for the recorded completion route")
     (
@@ -3370,6 +3400,8 @@ def _complete_prepared_inputs_impl(
     captured_pilot_providers = _capacity_pilot_provider_map(
         captured_pilot_read_providers, host_ids,
     )
+    _require(not closed_recorded or len(host_ids) == 2,
+             "closed recorded completion requires the exact two-host SourceA cohort")
 
     final_spec, final_spec_raw, final_spec_raw_sha = _read_pinned_json(final_spec_pin, "final completed SpecV3")
     final_plan, final_plan_raw, final_plan_raw_sha = _read_pinned_json(final_plan_pin, "final completed PlanV3", MAX_PLAN_BYTES)
@@ -3707,17 +3739,31 @@ def _complete_prepared_inputs_impl(
                           export_capacity_pilot)
         pilot_reader_kwargs = ({} if global_artifact_reader is None or not recorded_host else
                                {"global_artifact_reader": global_artifact_reader})
-        replayed_pin = pilot_exporter({
-            "preparation": preparation_pin,
-            "spec": initial_spec_pin,
-            "plan": initial_plan_pin,
-            "source_root": str(source_root),
-            "input_root": str(input_root),
-            "campaign_artifacts_root": pilot_input["campaign_artifacts_root"],
-            "prepared_host_binding": pilot_input["prepared_host_binding"],
-            "output": None,
-        }, pilot_input["verified_fixed_records"], host_id,
-            **pilot_replay_kwargs, **pilot_reader_kwargs)
+        if closed_recorded:
+            replayed_pin = _export_capacity_pilot_impl({
+                "preparation": preparation_pin,
+                "spec": initial_spec_pin,
+                "plan": initial_plan_pin,
+                "source_root": str(source_root),
+                "input_root": str(input_root),
+                "campaign_artifacts_root": pilot_input["campaign_artifacts_root"],
+                "prepared_host_binding": pilot_input["prepared_host_binding"],
+                "output": None,
+            }, pilot_input["verified_fixed_records"], host_id,
+                **pilot_replay_kwargs, **pilot_reader_kwargs,
+                recorded_host=True, closed_recorded=True)
+        else:
+            replayed_pin = pilot_exporter({
+                "preparation": preparation_pin,
+                "spec": initial_spec_pin,
+                "plan": initial_plan_pin,
+                "source_root": str(source_root),
+                "input_root": str(input_root),
+                "campaign_artifacts_root": pilot_input["campaign_artifacts_root"],
+                "prepared_host_binding": pilot_input["prepared_host_binding"],
+                "output": None,
+            }, pilot_input["verified_fixed_records"], host_id,
+                **pilot_replay_kwargs, **pilot_reader_kwargs)
         _require(replayed_pin["raw_sha256"] == pilot_raw_sha and
                  replayed_pin["semantic_sha256"] == campaign.digest_object(pilot),
                  f"{host_id} pilot manifest differs from complete replay of its original fixed-pair receipts")
@@ -3887,6 +3933,23 @@ def _complete_prepared_inputs_impl(
             for host_id in host_ids
         }
     completion = {**body, "completion_sha256": _sha256(_canonical(body))}
+    if closed_recorded:
+        _require(len(pilot_outputs) == 2 and
+                 all(item.get("fixed_pair_count") == 360 and
+                     type(item.get("fixed_pair_evidence")) is list and
+                     len(item["fixed_pair_evidence"]) == 360
+                     for item in pilot_outputs) and
+                 sum(item["fixed_pair_count"] for item in pilot_outputs) == 720,
+                 "closed recorded completion did not bind all 720 fixed numeric owners")
+        _require(type(captured_pilot_providers) is types.MappingProxyType and
+                 set(captured_pilot_providers) == set(host_ids),
+                 "closed recorded completion lost its exact two-host provider cohort")
+        for host_id in host_ids:
+            complete = getattr(captured_pilot_providers[host_id], "require_complete", None)
+            _require(callable(complete),
+                     f"{host_id} SourceA provider cannot prove all owner windows are closed")
+            _require(complete() is None,
+                     f"{host_id} SourceA provider returned an unsupported completion result")
     if write_completion:
         _write_private_json_new(output, completion, source_root, allow_existing_identical=True)
     raw_sha = _sha256(_canonical(completion))
@@ -4147,6 +4210,7 @@ def _verify_prepared_inputs_completion_impl(
     captured_pilot_read_providers: dict[str, Any] | None = None,
     recorded_host: bool = False,
     global_artifact_reader: Callable[[dict[str, str], int], bytes] | None = None,
+    closed_recorded: bool = False,
 ) -> dict[str, Any]:
     """Read-only replay of a frozen preparation-completion receipt.
 
@@ -4161,6 +4225,11 @@ def _verify_prepared_inputs_completion_impl(
              "historical global reader is reserved for recorded-host completion replay")
     _require(not recorded_host or captured_pilot_read_providers is not None,
              "recorded-host completion replay requires its captured provider cohort")
+    _require(type(closed_recorded) is bool and
+             (not closed_recorded or
+              (recorded_host and callable(global_artifact_reader) and
+               captured_pilot_read_providers is not None)),
+             "closed recorded completion requires the named Source-owned inputs")
     completion_ref = _exact(completion_pin, {
         "path", "raw_sha256", "semantic_sha256",
     }, "prepared-input completion pin")
@@ -4223,21 +4292,31 @@ def _verify_prepared_inputs_completion_impl(
             _require(replay_arguments.get("resource_budget_pins") == completion["resource_budgets"],
                      "prepared-input bounded budget map differs from its per-host capacity records")
             replay_kwargs["resource_budget_pins"] = completion["resource_budgets"]
-        replay_function = (complete_prepared_inputs_recorded_host if recorded_host else
-                           complete_prepared_inputs)
+        replay_function = (None if closed_recorded else
+                           (complete_prepared_inputs_recorded_host if recorded_host else
+                            complete_prepared_inputs))
         if recorded_host:
             replay_kwargs["input_root"] = input_root_checked
             if global_artifact_reader is not None:
                 replay_kwargs["global_artifact_reader"] = global_artifact_reader
-        replay = replay_function(
+        replay_arguments_values = (
             {"path": preparation_pin["path"], "sha256": preparation_pin["raw_sha256"]},
             replay_arguments["capacity_completion_pins"],
             replay_arguments["pressure_calibration_pins"],
             replay_arguments["pilot_pins"], replay_arguments["oracle_pins"],
             {"path": final_spec_pin["path"], "sha256": final_spec_pin["raw_sha256"]},
             {"path": final_plan_pin["path"], "sha256": final_plan_pin["raw_sha256"]},
-            **replay_kwargs,
         )
+        if closed_recorded:
+            _require(len(completion["source_manifests"]) == 2,
+                     "closed recorded completion must preserve exactly two Source hosts")
+            replay = _complete_prepared_inputs_impl(
+                *replay_arguments_values, **replay_kwargs,
+                recorded_host=True, closed_recorded=True,
+            )
+        else:
+            replay = replay_function(*replay_arguments_values, **replay_kwargs)
+
     except Exception as error:
         raise PreparationError(f"prepared-input completion failed its independent offline evidence replay: {error}") from error
     expected = replay.get("replayed_completion")
@@ -4277,6 +4356,30 @@ def verify_prepared_inputs_completion_recorded_host(
         completion_pin, provenance_pins, source_root, input_root,
         captured_pilot_read_providers=captured_pilot_read_providers,
         recorded_host=True, **reader_kwargs,
+    )
+
+
+def verify_prepared_inputs_completion_closed_recorded_v1(
+    completion_pin: dict[str, Any], provenance_v1: dict[str, Any],
+    source_root: Path, input_root: Path, *,
+    captured_pilot_read_providers: dict[str, Any],
+    global_artifact_reader: Callable[[dict[str, str], int], bytes],
+) -> dict[str, Any]:
+    """Replay exact prepared-input completion through the closed Fixed owner.
+
+    This named SourceA-only route preserves the V1 provenance projection and
+    selects the closed numeric owner internally. The SourceA provider cohort
+    must expose its one-use window and completion checks; no verifier callback
+    or caller-selected owner implementation can replace the pinned Source.
+    """
+    _require(type(captured_pilot_read_providers) is dict and
+             callable(global_artifact_reader),
+             "closed recorded completion requires its exact SourceA providers and raw2 reader")
+    return _verify_prepared_inputs_completion_impl(
+        completion_pin, provenance_v1, source_root, input_root,
+        captured_pilot_read_providers=captured_pilot_read_providers,
+        recorded_host=True, global_artifact_reader=global_artifact_reader,
+        closed_recorded=True,
     )
 
 
