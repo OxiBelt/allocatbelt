@@ -56,6 +56,8 @@ EVIDENCE_TRANSFER_PACKET_SOURCE_PATH = \
     "scripts/application-source5-evidence-transfer-packet.py"
 SOURCE5_INPUT_PREPARATION_SOURCE_PATH = \
     "scripts/application-source5-input-preparation.py"
+SOURCE5_PREPARED_LINEAGE_SOURCE_PATH = \
+    "scripts/application-source5-prepared-lineage.py"
 HELPER_INPUT_SCHEMA = "allocatbelt.application-source5-helper-input.v1"
 JOB_RECORD_SCHEMA = "allocatbelt.application-source5-job-record.v1"
 ANALYSIS_SCHEMA = "allocatbelt.application-source5-phase-analysis.v1"
@@ -716,6 +718,7 @@ def load_context(
             EVIDENCE_ARCHIVE_SOURCE_PATH,
             EVIDENCE_TRANSFER_PACKET_SOURCE_PATH,
             PREPARATORY_BUDGET_SOURCE_PATH,
+            SOURCE5_PREPARED_LINEAGE_SOURCE_PATH,
         })
     if schema in (EXECUTION_SCHEMA_V2, EXECUTION_SCHEMA_V3,
                   EXECUTION_SCHEMA_V4, PREPARATORY_EXECUTION_SCHEMA):
@@ -14138,6 +14141,15 @@ def _parser() -> argparse.ArgumentParser:
     )
     export_pilot.add_argument("--manifest", required=True, type=Path)
     export_pilot.add_argument("--host-id", required=True)
+    seal_lineage = commands.add_parser(
+        "seal-preparatory-lineage",
+        help="seal the initial exploration metadata through its held SourceA verifier",
+    )
+    seal_lineage.add_argument("--manifest", required=True, type=Path)
+    seal_lineage.add_argument("--host-id", required=True)
+    seal_lineage.add_argument("--pilot", required=True, type=Path)
+    seal_lineage.add_argument("--pilot-raw-sha256", required=True)
+    seal_lineage.add_argument("--pilot-semantic-sha256", required=True)
     run = commands.add_parser("run-host", help="execute the exact original phase schedule for one native host")
     run.add_argument("--manifest", required=True, type=Path)
     run.add_argument("--host-id", required=True)
@@ -15316,6 +15328,76 @@ def _source5_prepared_fixed_spec_host_artifact(
     return dict(fixed_pin), raw, binding
 
 
+def _source5_preparatory_lineage_output_rows(
+    context: CampaignContext,
+) -> dict[str, dict[str, Any]]:
+    """Project future lineage files through the exact selected Source module."""
+    require(context.manifest.get("schema") == PREPARATORY_EXECUTION_SCHEMA and
+            context.scope == PREPARATORY_SCOPE,
+            "preparatory lineage outputs require the exact scoped profile")
+    module = _load_source_module(
+        context.manifest["modules"][context.host_id], context.source,
+        context.source_root, SOURCE5_PREPARED_LINEAGE_SOURCE_PATH,
+        "preparatory lineage projection",
+    )
+    project = getattr(module, "project_prepared_exploration_lineage_outputs", None)
+    require(callable(project),
+            "selected Source lineage module lacks its finite output projection")
+    jobs = _host_jobs(context, "exploration")
+    require(len(jobs) == 360,
+            "preparatory lineage outputs require all original 360 jobs")
+    try:
+        result = project(context.manifest["campaign_id"], context.host_id,
+                         str(context.output_root), jobs)
+    except Exception as error:
+        raise Source5CampaignError(
+            f"selected Source lineage projection failed: {error}",
+        ) from error
+    result = exact(result, {"header", "index"},
+                   "Source-derived preparatory lineage output rows")
+    base = (context.output_root / context.manifest["campaign_id"] / "source5" /
+            context.host_id / "preparatory-exploration-lineage-v1")
+    names = {"header": "bridge-header.json", "index": "record-index.jsonl"}
+    budget_module = context.modules[EVIDENCE_BUDGET_SOURCE_PATH]
+    rows = {}
+    for kind, name in names.items():
+        row = budget_module._catalogue_row(
+            result[kind], f"preparatory lineage {kind} Source row",
+        )
+        cap = row["max_bytes"]
+        require(type(cap) is int and 0 < cap <= (1 << 64) - 1 and row == {
+            "path": str(base / name), "kind": "file", "role": "preparation",
+            "host_id": context.host_id, "max_bytes": cap, "max_file_bytes": cap,
+            "max_inodes": 1, "storage_root": str(context.output_root),
+            "owner": "source5_controller", "phase": None, "run_id": None,
+            "member_index": None, "aggregate_id": None,
+            "aggregate_max_bytes": None, "origin_pin": None,
+        }, "preparatory lineage output changed its closed Source path/role/cap")
+        rows[kind] = row
+    return rows
+
+
+def _source5_validate_preparatory_lineage_catalogue(
+    context: CampaignContext, catalogue: dict[str, Any], budget_module: Any,
+) -> dict[str, dict[str, Any]]:
+    """Require both exact future lineage rows in the authenticated catalogue."""
+    projected = _source5_preparatory_lineage_output_rows(context)
+    expected = {row["path"]: row for row in projected.values()}
+    parent = Path(projected["header"]["path"]).parent
+    found = {}
+    for row in budget_module.iter_path_catalogue_rows(catalogue):
+        path = Path(row["path"])
+        if not path.is_relative_to(parent) or row["role"] == "directory_node":
+            continue
+        require(row["path"] in expected and row["path"] not in found and
+                row == expected[row["path"]],
+                "preparatory catalogue changes or adds a lineage output")
+        found[row["path"]] = row
+    require(found == expected,
+            "preparatory catalogue omits an exact Source-derived lineage output")
+    return projected
+
+
 def _source5_preparatory_path_rows(
     context: CampaignContext, reservation: dict[str, Any],
     reservation_pin: dict[str, Any], width_pin: dict[str, str],
@@ -15575,6 +15657,12 @@ def _source5_preparatory_path_rows(
         phase="exploration", run_id=None, host=host_id,
         add_to_job=False,
     )
+    for lineage_row in _source5_preparatory_lineage_output_rows(context).values():
+        add_file(
+            lineage_row["path"], lineage_row["role"], lineage_row["max_bytes"],
+            lineage_row["owner"], storage_root=lineage_row["storage_root"],
+            host=host_id, add_to_job=False,
+        )
     add_file(context.spec_pin["path"], "spec_v3",
              len(canonical_bytes(context.spec)),
              "inputs", storage_root=None,
@@ -16847,6 +16935,7 @@ def _validate_source5_preparatory_profile_artifacts(
         budget_value["path_catalogue"],
     )
     catalogue = budget_module.verify_path_catalogue_chunks(catalogue)
+    _source5_validate_preparatory_lineage_catalogue(context, catalogue, budget_module)
     width_rows = [row for row in budget_module.iter_path_catalogue_rows(catalogue)
                   if row["role"] == "preparatory_journal_width_contract"]
     require(len(width_rows) == 1 and
@@ -17116,6 +17205,14 @@ def _source5_preparatory_dispatch_storage_requirements(
     _source5_assert_uncompleted_catalogue_paths_absent(
         context, budget, module, finished,
     )
+    lineage_rows = _source5_validate_preparatory_lineage_catalogue(
+        context, catalogue, module,
+    )
+    if expected_index < len(jobs):
+        for row in lineage_rows.values():
+            path = Path(row["path"])
+            require(not path.exists() and not path.is_symlink(),
+                    "preparatory dispatch cannot follow an already-created lineage artifact")
     storage = budget["storage_reservation"]
     roots = {row["path"]: row for row in storage["roots"]}
     byte_credit = {root: 0 for root in roots}
@@ -17337,6 +17434,61 @@ def export_source5_preparatory_capacity_pilot(context: CampaignContext) -> dict[
                         _Source5PreparatoryArchiveReadProvider(context))
 
 
+def seal_source5_preparatory_lineage(
+    context: CampaignContext, pilot_pin: object,
+) -> dict[str, Any]:
+    """Seal initial metadata without adding a callback or qualifying its metrics."""
+    require(context.manifest.get("schema") == PREPARATORY_EXECUTION_SCHEMA and
+            context.scope == PREPARATORY_SCOPE,
+            "preparatory lineage sealing requires the exact scoped execution")
+    pin = exact(pilot_pin, {"path", "raw_sha256", "semantic_sha256"},
+                "original preparatory capacity-pilot full pin")
+    expected_pilot = (context.output_root / context.manifest["campaign_id"] /
+                      "source5" / context.host_id / "exploration" / "capacity-pilot.json")
+    require(pin["path"] == str(expected_pilot) and
+            is_sha(pin["raw_sha256"]) and is_sha(pin["semantic_sha256"]),
+            "preparatory lineage pilot differs from the original reserved path/full pin")
+    sealer = getattr(context.chronology,
+                     "seal_source5_preparatory_exploration_bridge_locked", None)
+    require(callable(sealer), "selected SourceA lacks its held initial lineage sealer")
+    with context.chronology.campaign_host_lock(
+            context.output_root, context.manifest["campaign_id"], context.host_id) as lock:
+        result = sealer(lock, api_pin(context.manifest_pin), pilot_pin=dict(pin))
+        result = exact(result, {
+            "schema", "campaign_id", "host_id", "bridge_header", "record_index",
+            "job_count", "callback_count", "initial_journal_head",
+            "initial_journal_record_count", "component_replay_required",
+            "fresh_sourcea_gpg_replay_required", "qualification_eligible",
+        }, "SourceA initial lineage seal")
+        require(result["schema"] ==
+                    "allocatbelt.application-source5-prepared-exploration-lineage-seal.v1" and
+                result["campaign_id"] == context.manifest["campaign_id"] and
+                result["host_id"] == context.host_id and
+                type(result["job_count"]) is int and result["job_count"] == 360 and
+                type(result["callback_count"]) is int and result["callback_count"] == 2160 and
+                type(result["initial_journal_record_count"]) is int and
+                result["initial_journal_record_count"] == 2161 and
+                is_sha(result["initial_journal_head"]) and
+                result["component_replay_required"] is True and
+                result["fresh_sourcea_gpg_replay_required"] is True and
+                result["qualification_eligible"] is False,
+                "SourceA initial lineage seal changed identity, counts or replay requirements")
+        rows = _source5_preparatory_lineage_output_rows(context)
+        for name, role in (("bridge_header", "header"), ("record_index", "index")):
+            output_pin = raw_pin(result[name], f"SourceA lineage {name}")
+            require(output_pin["path"] == rows[role]["path"],
+                    "SourceA initial lineage seal changed its Source-derived output path")
+            _raw, actual, info = read_stable(
+                Path(output_pin["path"]), f"SourceA lineage {name} readback",
+                rows[role]["max_file_bytes"],
+            )
+            require(actual == output_pin["raw_sha256"] and
+                    info.st_uid == os.getuid() and info.st_nlink == 1 and
+                    stat.S_IMODE(info.st_mode) == 0o600,
+                    "SourceA initial lineage seal readback changed its private bytes")
+        return result
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = _parser()
     args = parser.parse_args(argv)
@@ -17368,6 +17520,12 @@ def main(argv: list[str] | None = None) -> int:
         context = load_context(args.manifest, args.host_id)
         if args.command == "export-preparatory-capacity-pilot":
             result = export_source5_preparatory_capacity_pilot(context)
+        elif args.command == "seal-preparatory-lineage":
+            result = seal_source5_preparatory_lineage(context, {
+                "path": str(args.pilot),
+                "raw_sha256": args.pilot_raw_sha256,
+                "semantic_sha256": args.pilot_semantic_sha256,
+            })
         elif args.command == "verify":
             with context.chronology.campaign_host_lock(
                 context.output_root, context.manifest["campaign_id"],

@@ -511,6 +511,29 @@ class PreparatoryDispatchStorageTests(unittest.TestCase):
                     declarations.append(rows[-1])
                     closure[key + "_pin"] = {**pin, "path": "/Root-private/" + key}
                 closures[jobs[0]["run_id"]] = closure
+            # This fixture trusts the SourceA lineage projection boundary. It
+            # checks dispatch's real filesystem absence guard for these two
+            # Source-derived, reserved paths; it does not validate the source
+            # projection or claim Source authority.
+            lineage_root = (roots["output"] / "campaign/source5/host" /
+                            "preparatory-exploration-lineage-v1")
+            lineage_rows = {}
+            for kind, name in (
+                ("header", "bridge-header.json"),
+                ("index", "record-index.jsonl"),
+            ):
+                row = {
+                    "path": str(lineage_root / name), "kind": "file",
+                    "role": "preparation", "host_id": "host",
+                    "storage_root": str(roots["output"]),
+                    "max_bytes": 65536, "max_file_bytes": 65536,
+                    "max_inodes": 1, "owner": "source5_controller",
+                    "phase": None, "run_id": None, "member_index": None,
+                    "aggregate_id": None, "aggregate_max_bytes": None,
+                    "origin_pin": None,
+                }
+                lineage_rows[kind] = row
+                rows.append(row)
             for root in roots.values():
                 rows.append({"path": str(root), "kind": "tree", "role": "directory_node",
                              "storage_root": str(root), "max_bytes": 0, "max_file_bytes": 0,
@@ -562,6 +585,7 @@ class PreparatoryDispatchStorageTests(unittest.TestCase):
                     "_source5_validate_resume_prefix_locked": (completed, records),
                     "_validate_locked_context": {"state": state},
                     "_validate_source5_preparatory_profile_artifacts": None,
+                    "_source5_validate_preparatory_lineage_catalogue": lineage_rows,
                     "_source5_archive_read_control_ledger_state": (0, "0" * 64, 0, None),
                     "_source5_verify_completed_archive_metadata": declarations,
                     "_source5_recheck_reclaimed_job_origins": None,
@@ -578,6 +602,32 @@ class PreparatoryDispatchStorageTests(unittest.TestCase):
             context.artifact_root.parent.chmod(0o755)
             with self.assertRaisesRegex(h.Source5CampaignError, "not owned and private"):
                 h._source5_preparatory_dispatch_storage_requirements(context, object(), completed)
+
+    def test_existing_lineage_header_refuses_the_next_owner(self):
+        with self.case() as (context, _rows, _saved, _roots, _immutable, completed):
+            path = (context.output_root / "campaign/source5/host" /
+                    "preparatory-exploration-lineage-v1/bridge-header.json")
+            path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            path.write_bytes(b"preexisting lineage header\n")
+            with self.assertRaisesRegex(
+                h.Source5CampaignError, "already-created lineage artifact",
+            ):
+                h._source5_preparatory_dispatch_storage_requirements(
+                    context, object(), completed,
+                )
+
+    def test_existing_lineage_index_refuses_the_next_owner(self):
+        with self.case() as (context, _rows, _saved, _roots, _immutable, completed):
+            path = (context.output_root / "campaign/source5/host" /
+                    "preparatory-exploration-lineage-v1/record-index.jsonl")
+            path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            path.write_bytes(b"preexisting lineage index\n")
+            with self.assertRaisesRegex(
+                h.Source5CampaignError, "already-created lineage artifact",
+            ):
+                h._source5_preparatory_dispatch_storage_requirements(
+                    context, object(), completed,
+                )
 
     def test_setup_frontier_credits_only_exact_current_bytes_once(self):
         with self.case() as (context, _rows, saved, roots, _immutable, completed):

@@ -18788,6 +18788,589 @@ def export_source5_preparatory_capacity_pilot_locked(
     )
 
 
+SOURCE5_PREPARED_LINEAGE_SOURCE_PATH = "scripts/application-source5-prepared-lineage.py"
+
+
+def _source5_preparatory_lineage_output_rows_held(
+    prepared: dict[str, Any], lineage_module: types.ModuleType,
+    jobs: list[dict[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    """Recompute both initial-only rows and match them to the pinned catalogue."""
+    project = getattr(lineage_module, "project_prepared_exploration_lineage_outputs", None)
+    require(callable(project),
+            "Source-pinned prepared-lineage module lacks its pure output projection")
+    try:
+        projected = project(
+            prepared["campaign_id"], prepared["host_id"],
+            str(prepared["output_root"]), jobs,
+        )
+    except Exception as error:
+        raise ChronologyError(f"Source-pinned lineage output projection failed: {error}") from error
+    projected = _exact(projected, {"header", "index"},
+                        "Source5 prepared-lineage output projection")
+    h_modules = prepared.get("_source5_preparatory_h_modules")
+    budget_module = h_modules.get("evidence_budget") if type(h_modules) is dict else None
+    require(callable(getattr(budget_module, "validate_path_catalogue_manifest", None)) and
+            callable(getattr(budget_module, "verify_path_catalogue_chunks", None)) and
+            callable(getattr(budget_module, "iter_path_catalogue_rows", None)),
+            "Source5 lineage has no source-pinned typed catalogue reader")
+    budget = prepared.get("source5_host_evidence_budget")
+    require(type(budget) is dict and type(budget.get("path_catalogue")) is dict,
+            "Source5 lineage has no actual verified host path catalogue")
+    try:
+        catalogue = budget_module.validate_path_catalogue_manifest(budget["path_catalogue"])
+        catalogue = budget_module.verify_path_catalogue_chunks(catalogue)
+        rows = list(budget_module.iter_path_catalogue_rows(catalogue))
+    except Exception as error:
+        raise ChronologyError(f"Source5 lineage path catalogue replay failed: {error}") from error
+    expected_rows = {
+        projected[name]["path"]: _exact(
+            projected[name], _SOURCE5_PREPARATORY_PILOT_ROW_FIELDS,
+            f"Source5 lineage {name} output row",
+        )
+        for name in ("header", "index")
+    }
+    parent = Path(projected["header"]["path"]).parent
+    found: dict[str, dict[str, Any]] = {}
+    for value in rows:
+        require(type(value) is dict and type(value.get("path")) is str,
+                "Source5 lineage catalogue contains a malformed row")
+        path = Path(value["path"])
+        if path.is_relative_to(parent) and value.get("role") != "directory_node":
+            require(value["path"] in expected_rows and value["path"] not in found and
+                    _exact(value, _SOURCE5_PREPARATORY_PILOT_ROW_FIELDS,
+                           "Source5 lineage catalogue output row") ==
+                        expected_rows[value["path"]],
+                    "Source5 lineage catalogue adds or changes an output under its exact directory")
+            found[value["path"]] = value
+    require(found == expected_rows,
+            "Source5 lineage catalogue omits one of its exact header/index output rows")
+    return projected
+
+
+
+def _source5_preparatory_lineage_record_pair_digest(
+    record: dict[str, Any], job: dict[str, Any], binding_sha256: str,
+) -> str:
+    """Rebuild the unchanged pilot pair digest from the old signed record pins."""
+    evidence = record.get("evidence")
+    require(type(evidence) is dict,
+            "Source5 lineage retained record has no fixed-pair evidence")
+    overlay = _exact(evidence.get("overlay"), {"path", "raw_sha256"},
+                     "Source5 lineage original overlay pin")
+    receipt = _exact(evidence.get("receipt"), {"path", "raw_sha256"},
+                     "Source5 lineage original receipt pin")
+    host = _exact(evidence.get("host_receipt"), {
+        "path", "raw_sha256", "host_verification_sha256",
+    }, "Source5 lineage original strict host receipt pin")
+    for label, pin in (("overlay", overlay), ("receipt", receipt)):
+        _source5_artifact_pin(pin, f"Source5 lineage {label}")
+    _source5_artifact_pin(
+        {"path": host["path"], "raw_sha256": host["raw_sha256"]},
+        "Source5 lineage strict host receipt",
+    )
+    _digest(host["host_verification_sha256"],
+            "Source5 lineage strict host verification digest")
+    _digest(binding_sha256, "Source5 lineage prepared-host binding digest")
+    return sha256_bytes(canonical_bytes({
+        "overlay_raw_sha256": overlay["raw_sha256"],
+        "receipt_raw_sha256": receipt["raw_sha256"],
+        "verified_receipt_sha256": receipt["raw_sha256"],
+        "host_verification_raw_sha256": host["raw_sha256"],
+        "host_verification_sha256": host["host_verification_sha256"],
+        "prepared_host_binding_sha256": binding_sha256,
+        "run_id": job["run_id"],
+    }))
+
+
+
+def _source5_preparatory_lineage_index_bytes(
+    rows: list[dict[str, Any]], maximum_bytes: int,
+) -> bytes:
+    """Serialize 360 canonical Source rows, each already LF-terminated once."""
+    maximum = _uint(maximum_bytes, "Source5 lineage index byte cap", positive=True)
+    require(type(rows) is list and len(rows) == 360 and
+            all(type(row) is dict for row in rows),
+            "Source5 lineage index requires all 360 actual ordered rows")
+    lines = []
+    total = 0
+    for index, row in enumerate(rows):
+        line = canonical_bytes(row)
+        require(line.endswith(b"\n") and not line.endswith(b"\n\n") and
+                b"\r" not in line,
+                f"Source5 lineage row[{index}] is not one canonical LF-terminated line")
+        total += len(line)
+        require(total <= maximum,
+                "Source5 lineage index exceeds its exact Source catalogue cap")
+        lines.append(line)
+    raw = b"".join(lines)
+    require(len(raw) == total and raw.count(b"\n") == 360,
+            "Source5 lineage index serialization changed its exact 360-line boundary")
+    return raw
+
+
+
+def _source5_remove_lineage_output_if_owned(
+    path: Path, identity: tuple[int, int] | None,
+) -> None:
+    """Remove only one output inode created by this bounded publication."""
+    if identity is None:
+        return
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return
+    if (stat.S_ISREG(info.st_mode) and info.st_uid == os.getuid() and
+            stat.S_IMODE(info.st_mode) == 0o600 and info.st_nlink == 1 and
+            (info.st_dev, info.st_ino) == identity):
+        path.unlink()
+        _fsync_directory(path.parent)
+
+
+
+def _source5_write_lineage_output_exclusive(
+    path: Path, raw: bytes, maximum_bytes: int,
+) -> tuple[int, int]:
+    """Durably publish one exact-catalogued private file without replacement."""
+    maximum = _uint(maximum_bytes, "Source5 lineage output byte cap", positive=True)
+    require(type(raw) is bytes and 0 < len(raw) <= maximum,
+            "Source5 lineage output exceeds its exact catalogue cap")
+    require(path.parent.is_dir() and not path.exists() and not path.is_symlink(),
+            f"refusing to replace Source5 lineage output {path}")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | \
+        getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags, 0o600)
+    identity: tuple[int, int] | None = None
+    try:
+        before = os.fstat(descriptor)
+        identity = (before.st_dev, before.st_ino)
+        os.fchmod(descriptor, 0o600)
+        before = os.fstat(descriptor)
+        require(stat.S_ISREG(before.st_mode) and before.st_uid == os.getuid() and
+                stat.S_IMODE(before.st_mode) == 0o600 and before.st_nlink == 1 and
+                before.st_size == 0,
+                "new Source5 lineage output is not an owned private empty inode")
+        offset = 0
+        while offset < len(raw):
+            written = os.write(descriptor, raw[offset:])
+            require(written > 0, "Source5 lineage output write made no progress")
+            offset += written
+        os.fsync(descriptor)
+        after = os.fstat(descriptor)
+        path_info = path.lstat()
+        require(stat.S_ISREG(after.st_mode) and stat.S_ISREG(path_info.st_mode) and
+                (after.st_dev, after.st_ino) == identity ==
+                    (path_info.st_dev, path_info.st_ino) and
+                after.st_uid == path_info.st_uid == os.getuid() and
+                stat.S_IMODE(after.st_mode) == stat.S_IMODE(path_info.st_mode) == 0o600 and
+                after.st_nlink == path_info.st_nlink == 1 and
+                after.st_size == path_info.st_size == len(raw),
+                "Source5 lineage output metadata changed during durable publication")
+    except BaseException:
+        _source5_remove_lineage_output_if_owned(path, identity)
+        raise
+    finally:
+        os.close(descriptor)
+    try:
+        _fsync_directory(path.parent)
+    except BaseException:
+        _source5_remove_lineage_output_if_owned(path, identity)
+        raise
+    return identity
+
+
+
+def _source5_preparatory_lineage_recheck_held(
+    lock: CampaignHostLock, execution_manifest_pin: object,
+    manifest: dict[str, Any], prepared: dict[str, Any], state: dict[str, Any],
+    manifest_pin: dict[str, str], epoch: str, journal_pin: dict[str, str],
+    ledger_pin: dict[str, str], pilot_pin: dict[str, str],
+    projected: dict[str, dict[str, Any]],
+    archive_checks: list[tuple[dict[str, Any], dict[str, Any], dict[str, str]]],
+) -> None:
+    """Reopen the old source/journal/records after all per-job signature checks."""
+    fresh_manifest, fresh_prepared, fresh_state, fresh_pin = \
+        _prepare_source5_preparatory_context_held(lock, execution_manifest_pin)
+    require(fresh_manifest == manifest and fresh_pin == manifest_pin and
+            _source5_analysis_epoch(fresh_prepared) == epoch and
+            fresh_state["head"] == state["head"] and
+            fresh_state["record_count"] == state["record_count"] and
+            fresh_state["source5_seen_jobs"] == state["source5_seen_jobs"] and
+            fresh_state["source5_finished"] == state["source5_finished"],
+            "Source5 lineage source/journal epoch changed during signed record collection")
+    maximum_events, maximum_bytes = _journal_limits(fresh_prepared)
+    require(fresh_state["record_count"] <= maximum_events,
+            "Source5 lineage journal exceeded its plan-derived event ceiling")
+    journal_raw, journal_info = _read_stable(
+        _journal_path(lock), "Source5 lineage journal recheck", maximum_bytes,
+    )
+    require(stat.S_IMODE(journal_info.st_mode) == 0o600 and
+            journal_info.st_uid == os.getuid() and journal_info.st_nlink == 1 and
+            {"path": str(_journal_path(lock)), "raw_sha256": sha256_bytes(journal_raw)} == journal_pin,
+            "Source5 lineage journal bytes changed after their own chain replay")
+    jobs = [job for job in fresh_prepared["plan"]["jobs"]["exploration"]
+            if job.get("host_id") == fresh_prepared["host_id"]]
+    fresh_lineage_module = _source5_captured_source_module(
+        fresh_prepared, SOURCE5_PREPARED_LINEAGE_SOURCE_PATH,
+        "Source5 prepared-lineage catalogue recheck",
+    )
+    fresh_projected = _source5_preparatory_lineage_output_rows_held(
+        fresh_prepared, fresh_lineage_module, jobs,
+    )
+    require(fresh_projected == projected,
+            "Source5 lineage catalogue output caps changed during signed record collection")
+    fresh_ledger_prepared = dict(fresh_prepared)
+    fresh_ledger_prepared.pop("_source5_archived_replay_ledgers", None)
+    ledger = _source5_archived_journal_ledger(fresh_ledger_prepared, "exploration")
+    require(set(ledger) == {job["run_id"] for job in jobs},
+            "Source5 lineage phase ledger changed its exact original Plan prefix")
+    ledger_path = (fresh_prepared["output_root"] / fresh_prepared["campaign_id"] /
+                   "source5" / fresh_prepared["host_id"] / "exploration" /
+                   "controller-ledger.jsonl")
+    ledger_raw, ledger_info = _read_stable(
+        ledger_path, "Source5 lineage phase ledger recheck",
+        len(jobs) * MAX_EVENT_BYTES,
+    )
+    require(stat.S_IMODE(ledger_info.st_mode) == 0o600 and
+            ledger_info.st_uid == os.getuid() and ledger_info.st_nlink == 1 and
+            {"path": str(ledger_path), "raw_sha256": sha256_bytes(ledger_raw)} == ledger_pin,
+            "Source5 lineage phase-ledger bytes changed after their exact job replay")
+    pilot_path = Path(pilot_pin["path"])
+    _pilot_row, _pilot_output, pilot_maximum, _readback_rows = \
+        _source5_preparatory_capacity_pilot_reservation_held(fresh_prepared)
+    pilot_raw, pilot_info = _read_stable(
+        pilot_path, "Source5 lineage capacity-pilot recheck", pilot_maximum,
+    )
+    require(stat.S_IMODE(pilot_info.st_mode) == 0o600 and
+            pilot_info.st_uid == os.getuid() and pilot_info.st_nlink == 1 and
+            sha256_bytes(pilot_raw) == pilot_pin["raw_sha256"],
+            "Source5 lineage capacity-pilot bytes changed during record collection")
+    signer, _signer_pin = _source5_preparatory_signer_context(
+        fresh_manifest, fresh_prepared["host_id"],
+    )
+    for job, authority, record_pin in archive_checks:
+        record_raw, record_info = _read_stable(
+            Path(record_pin["path"]), "Source5 lineage retained record recheck",
+            MAX_EVENT_BYTES,
+        )
+        require(stat.S_IMODE(record_info.st_mode) == 0o600 and
+                record_info.st_uid == os.getuid() and record_info.st_nlink == 1 and
+                sha256_bytes(record_raw) == record_pin["raw_sha256"],
+                "Source5 lineage retained record changed after its own GPG verification")
+        leaf = f"{job['ordinal']:06d}-{sha256_bytes(canonical_bytes(job))}"
+        metadata = (fresh_prepared["output_root"] / fresh_prepared["campaign_id"] /
+                    "chronology" / fresh_prepared["host_id"] /
+                    "evidence-checkpoints" / "exploration")
+        local = {
+            "request_pin": (metadata / f"{leaf}.request.json", 128 * 1024 * 1024),
+            "checkpoint_pin": (metadata / f"{leaf}.checkpoint.json", 128 * 1024 * 1024),
+            "object_manifest_pin": (metadata / f"{leaf}.object-manifest.json", 32 * 1024 * 1024),
+            "ack_pin": (metadata / f"{leaf}.ack.json", 32 * 1024 * 1024),
+            "signature_pin": (metadata / f"{leaf}.ack.sig",
+                              signer["maximum_signature_bytes"]),
+        }
+        for name, (path, maximum) in local.items():
+            pin = authority[name]
+            raw, info = _read_stable(path, f"Source5 lineage {name} recheck", maximum)
+            require(stat.S_IMODE(info.st_mode) == 0o600 and
+                    info.st_uid == os.getuid() and info.st_nlink == 1 and
+                    sha256_bytes(raw) == pin["raw_sha256"],
+                    f"Source5 lineage {name} changed after its own GPG verification")
+    require(_source5_analysis_epoch(fresh_prepared) == epoch and
+            _read_journal(lock, fresh_prepared)["head"] == state["head"],
+            "Source5 lineage journal/source epoch changed at the end of its fresh recheck")
+
+
+
+def _source5_seal_preparatory_exploration_bridge_held(
+    old_lock: CampaignHostLock, initial_execution_pin: object, *,
+    pilot_pin: object,
+) -> dict[str, Any]:
+    """Seal only the immutable initial generation after its 360 signed jobs."""
+    require(_lock_token_is_live(old_lock),
+            "Source5 lineage sealing requires its actual old fd-owned host lock")
+    manifest, prepared, state, manifest_pin = \
+        _prepare_source5_preparatory_context_held(old_lock, initial_execution_pin)
+    require(manifest["schema"] == SOURCE5_PREPARATORY_EXECUTION_SCHEMA_V1 and
+            state["record_count"] == 2161 and
+            state["prepared_capacity_registration"] is not None and
+            state["source5_pending"] is None and
+            state["source5_cleanup_blocked"] is False and
+            state["source5_failed_owner_window"] is False and
+            not state["cleanup_blocked"] and not state["source5_failed_owner_window"],
+            "Source5 lineage requires one setup row and the complete clean original journal")
+    host_id, campaign_id = prepared["host_id"], prepared["campaign_id"]
+    jobs = [job for job in prepared["plan"]["jobs"]["exploration"]
+            if job.get("host_id") == host_id]
+    finished_keys = {("exploration", job["run_id"]) for job in jobs}
+    require(len(jobs) == 360 and len(finished_keys) == 360 and
+            state["source5_seen_jobs"] == finished_keys and
+            set(state["source5_finished"]) == finished_keys and
+            not state["source5_authorized"] and
+            all(state["source5_finished"][key]["state"] == "valid_pair"
+                for key in finished_keys),
+            "Source5 lineage requires every original exploration job and terminal exactly once")
+    epoch = _source5_analysis_epoch(prepared)
+    lineage_module = _source5_captured_source_module(
+        prepared, SOURCE5_PREPARED_LINEAGE_SOURCE_PATH,
+        "Source5 initial prepared-exploration lineage algorithm",
+    )
+    projected = _source5_preparatory_lineage_output_rows_held(
+        prepared, lineage_module, jobs,
+    )
+    _pilot_row, output_path, pilot_maximum, _readback_rows = \
+        _source5_preparatory_capacity_pilot_reservation_held(prepared)
+    pilot_value_pin = _exact(pilot_pin, {"path", "raw_sha256", "semantic_sha256"},
+                             "Source5 original capacity-pilot full pin")
+    _digest(pilot_value_pin["raw_sha256"], "Source5 original capacity-pilot raw digest")
+    _digest(pilot_value_pin["semantic_sha256"], "Source5 original capacity-pilot semantic digest")
+    require(pilot_value_pin["path"] == str(output_path),
+            "Source5 original capacity-pilot pin changed its deterministic reserved path")
+    pilot_raw, pilot_info = _read_stable(
+        output_path, "Source5 original capacity pilot", pilot_maximum,
+    )
+    require(stat.S_IMODE(pilot_info.st_mode) == 0o600 and
+            pilot_info.st_uid == os.getuid() and pilot_info.st_nlink == 1 and
+            sha256_bytes(pilot_raw) == pilot_value_pin["raw_sha256"],
+            "Source5 original capacity-pilot raw bytes differ from their full caller pin")
+    pilot = _parse_object(pilot_raw, "Source5 original capacity pilot", pilot_maximum)
+    h_modules = prepared["_source5_preparatory_h_modules"]
+    campaign = h_modules["campaign"]
+    input_preparation = h_modules["input_preparation"]
+    require(pilot.get("schema") == input_preparation.PILOT_SCHEMA and
+            pilot.get("host_id") == host_id and
+            pilot.get("spec_sha256") == campaign.preregistration_digest(prepared["spec"]) and
+            campaign.digest_object(pilot) == pilot_value_pin["semantic_sha256"],
+            "Source5 original capacity pilot changed its initial Spec/host semantic binding")
+    pair_map_function = getattr(lineage_module, "_pilot_pair_map", None)
+    require(callable(pair_map_function),
+            "Source5 prepared-lineage source lacks its pure original-pair map checker")
+    try:
+        pair_map = pair_map_function(pilot, campaign)
+    except Exception as error:
+        raise ChronologyError(f"Source5 original capacity-pilot pair map failed: {error}") from error
+    fixed_module = h_modules.get("fixed_pair")
+    verified_records, expected = _source5_preparatory_capacity_pilot_records_held(
+        prepared, state, fixed_module,
+    )
+    require(len(verified_records) == len(expected) == len(jobs) and
+            all(row["job"] == job for row, job in zip(expected, jobs, strict=True)),
+            "Source5 lineage record collector changed the exact original Plan order")
+    fixed_host = _source5_preparatory_fixed_host_inputs(
+        prepared, manifest["preparatory_capacity_generation"],
+    )
+    binding = fixed_host["prepared_host_binding"]
+    initial = {
+        "execution_manifest_pin": {
+            "path": manifest_pin["path"], "raw_sha256": manifest_pin["sha256"],
+            "semantic_sha256": manifest["manifest_sha256"],
+        },
+        "spec_pin": dict(prepared["original_pins"]["spec"]),
+        "plan_pin": dict(prepared["original_pins"]["plan"]),
+        "source_manifest_pins": _json_copy(prepared["original_pins"]["source_manifests"]),
+        "observed_host_pin": {
+            key: prepared["original_pins"]["observed_host"][key]
+            for key in ("path", "raw_sha256", "boot_id_sha256", "controls_sha256")
+        },
+        "capacity_generation_sha256":
+            manifest["preparatory_capacity_generation"]["completion"]["semantic_sha256"],
+        "capacity_registration_head": state["registration_head"],
+        "host_budget_pin": dict(prepared["source5_host_evidence_budget_pin"]),
+        "journal_width_pin": dict(prepared["source5_journal_width_contract_pin"]),
+        "fixed_spec_host_pin": {
+            **fixed_host["fixed_spec_host_pin"],
+            "semantic_sha256": binding["spec_host_semantic_sha256"],
+        },
+        "prepared_host_binding_sha256": binding["binding_sha256"],
+    }
+    signer, signer_pin = _source5_preparatory_signer_context(manifest, host_id)
+    initial["signer_context_pin"] = dict(signer_pin)
+    initial["signer_fingerprint"] = signer["authorized_primary_fingerprint"]
+    initial["maximum_signature_bytes"] = signer["maximum_signature_bytes"]
+    maximum_events, maximum_journal_bytes = _journal_limits(prepared)
+    require(state["record_count"] <= maximum_events,
+            "Source5 lineage journal exceeds its plan-derived event ceiling")
+    journal_path = _journal_path(old_lock)
+    journal_raw, journal_info = _read_stable(
+        journal_path, "Source5 initial lineage chronology journal", maximum_journal_bytes,
+    )
+    require(stat.S_IMODE(journal_info.st_mode) == 0o600 and
+            journal_info.st_uid == os.getuid() and journal_info.st_nlink == 1 and
+            sha256_bytes(journal_raw) != "0" * 64,
+            "Source5 initial lineage journal is not its own private bounded file")
+    ledger_path = (prepared["output_root"] / campaign_id / "source5" / host_id /
+                   "exploration" / "controller-ledger.jsonl")
+    ledger_map = _source5_archived_journal_ledger(prepared, "exploration")
+    require(set(ledger_map) == {job["run_id"] for job in jobs},
+            "Source5 initial lineage phase ledger is not the complete original job order")
+    ledger_raw, ledger_info = _read_stable(
+        ledger_path, "Source5 initial lineage exploration ledger",
+        len(jobs) * MAX_EVENT_BYTES,
+    )
+    require(stat.S_IMODE(ledger_info.st_mode) == 0o600 and
+            ledger_info.st_uid == os.getuid() and ledger_info.st_nlink == 1,
+            "Source5 initial lineage phase ledger is not an owned private file")
+    index_rows: list[dict[str, Any]] = []
+    archive_checks: list[tuple[dict[str, Any], dict[str, Any], dict[str, str]]] = []
+    for index, (job, collected, pilot_record) in enumerate(zip(
+            jobs, expected, verified_records, strict=True)):
+        record_pin = _exact(collected["job_record_pin"], {"path", "raw_sha256"},
+                            f"Source5 lineage original record pin[{index}]")
+        record_path = Path(record_pin["path"])
+        record_raw, record_info = _read_stable(
+            record_path, f"Source5 lineage original job record[{index}]", MAX_EVENT_BYTES,
+        )
+        require(stat.S_IMODE(record_info.st_mode) == 0o600 and
+                record_info.st_uid == os.getuid() and record_info.st_nlink == 1 and
+                sha256_bytes(record_raw) == record_pin["raw_sha256"],
+                f"Source5 lineage original record[{index}] changed its collector pin")
+        record = _parse_object(record_raw, f"Source5 lineage original job record[{index}]",
+                               MAX_EVENT_BYTES)
+        finished = state["source5_finished"][("exploration", job["run_id"])]
+        summary = _source5_finished_structural_summary(finished)
+        authority = _source5_archived_journal_metadata(
+            finished["details"], summary, manifest, prepared,
+        )
+        require(type(authority) is dict and
+                authority.get("component_replay_required") is True and
+                authority.get("qualification_eligible") is False and
+                authority.get("job_record_raw_sha256") == record_pin["raw_sha256"],
+                f"Source5 lineage original record[{index}] has no fresh own signed ACK authority")
+        archive_pins = {name: authority[name] for name in (
+            "request_pin", "checkpoint_pin", "object_manifest_pin",
+            "ack_pin", "signature_pin",
+        )}
+        pair_sha = _source5_preparatory_lineage_record_pair_digest(
+            record, job, binding["binding_sha256"],
+        )
+        evidence = record["evidence"]
+        overlay = evidence["overlay"]
+        receipt = evidence["receipt"]
+        host_receipt = evidence["host_receipt"]
+        pair_key = (job["family"], job["profile"], job["allocator"], job["ordinal"])
+        require(pair_map.get(pair_key) == pair_sha and
+                collected["record"]["job"] == job and
+                pilot_record["overlay"] == {
+                    "path": overlay["path"], "sha256": overlay["raw_sha256"],
+                } and pilot_record["receipt"] == {
+                    "path": receipt["path"], "sha256": receipt["raw_sha256"],
+                } and pilot_record["host_verification"] == host_receipt,
+                f"Source5 lineage pilot pair[{index}] differs from its original retained record")
+        row = lineage_module.build_prepared_exploration_lineage_index_row(
+            index, job, campaign_id, host_id, str(prepared["output_root"]),
+            record_pin, archive_pins, pair_sha, record,
+        )
+        index_rows.append(row)
+        archive_checks.append((job, archive_pins, record_pin))
+    index_raw = _source5_preparatory_lineage_index_bytes(
+        index_rows, projected["index"]["max_bytes"],
+    )
+    index_pin = {"path": projected["index"]["path"],
+                 "raw_sha256": sha256_bytes(index_raw)}
+    header = lineage_module.build_prepared_exploration_bridge_header(
+        campaign_id, host_id, str(prepared["output_root"]), initial,
+        {"pin": {"path": str(journal_path),
+                 "raw_sha256": sha256_bytes(journal_raw)},
+         "byte_count": len(journal_raw), "record_count": state["record_count"],
+         "head": state["head"]},
+        {"pin": {"path": str(ledger_path),
+                 "raw_sha256": sha256_bytes(ledger_raw)},
+         "row_count": len(jobs)},
+        pilot_value_pin, index_pin,
+    )
+    header_raw = canonical_bytes(header)
+    require(len(header_raw) <= projected["header"]["max_bytes"],
+            "Source5 lineage header exceeds its exact reserved catalogue cap")
+    validate_documents = getattr(
+        lineage_module, "validate_prepared_exploration_lineage_documents", None,
+    )
+    require(callable(validate_documents),
+            "Source-pinned prepared-lineage module lacks its canonical document validator")
+    checked_header, checked_rows = validate_documents(header_raw, index_raw, jobs)
+    require(checked_header == header and len(checked_rows) == len(jobs),
+            "Source5 lineage documents changed their actual initial-only projection")
+    journal_pin = {"path": str(journal_path),
+                   "raw_sha256": sha256_bytes(journal_raw)}
+    ledger_pin = {"path": str(ledger_path),
+                  "raw_sha256": sha256_bytes(ledger_raw)}
+    pilot_raw_pin = {"path": pilot_value_pin["path"],
+                     "raw_sha256": pilot_value_pin["raw_sha256"]}
+    _source5_preparatory_lineage_recheck_held(
+        old_lock, initial_execution_pin, manifest, prepared, state, manifest_pin,
+        epoch, journal_pin, ledger_pin, pilot_raw_pin, projected, archive_checks,
+    )
+    header_path = Path(projected["header"]["path"])
+    index_path = Path(projected["index"]["path"])
+    require(header_path.parent == index_path.parent and
+            header_path == prepared["output_root"] / campaign_id / "source5" /
+                host_id / "preparatory-exploration-lineage-v1" / "bridge-header.json" and
+            index_path == prepared["output_root"] / campaign_id / "source5" /
+                host_id / "preparatory-exploration-lineage-v1" / "record-index.jsonl" and
+            not header_path.exists() and not header_path.is_symlink() and
+            not index_path.exists() and not index_path.is_symlink(),
+            "Source5 lineage publication paths are occupied or differ from their exact projection")
+    _ensure_private_tree(prepared["output_root"], header_path.parent)
+    published: list[tuple[Path, tuple[int, int]]] = []
+    try:
+        published.append((header_path, _source5_write_lineage_output_exclusive(
+            header_path, header_raw, projected["header"]["max_file_bytes"],
+        )))
+        published.append((index_path, _source5_write_lineage_output_exclusive(
+            index_path, index_raw, projected["index"]["max_file_bytes"],
+        )))
+        header_readback, header_info = _read_stable(
+            header_path, "Source5 prepared-lineage bridge header readback",
+            projected["header"]["max_file_bytes"],
+        )
+        index_readback, index_info = _read_stable(
+            index_path, "Source5 prepared-lineage record-index readback",
+            projected["index"]["max_file_bytes"],
+        )
+        require(stat.S_IMODE(header_info.st_mode) == stat.S_IMODE(index_info.st_mode) == 0o600 and
+                header_info.st_uid == index_info.st_uid == os.getuid() and
+                header_info.st_nlink == index_info.st_nlink == 1 and
+                header_readback == header_raw and index_readback == index_raw and
+                validate_documents(header_readback, index_readback, jobs) ==
+                    (header, checked_rows),
+                "Source5 prepared-lineage output changed after exclusive publication")
+    except BaseException:
+        for path, identity in reversed(published):
+            try:
+                _source5_remove_lineage_output_if_owned(path, identity)
+            except OSError:
+                pass
+        raise
+    return {
+        "schema": "allocatbelt.application-source5-prepared-exploration-lineage-seal.v1",
+        "campaign_id": campaign_id, "host_id": host_id,
+        "bridge_header": {"path": str(header_path),
+                          "raw_sha256": sha256_bytes(header_raw)},
+        "record_index": {"path": str(index_path),
+                         "raw_sha256": sha256_bytes(index_raw)},
+        "job_count": len(jobs), "callback_count": 2160,
+        "initial_journal_head": state["head"],
+        "initial_journal_record_count": state["record_count"],
+        "component_replay_required": True,
+        "fresh_sourcea_gpg_replay_required": True,
+        "qualification_eligible": False,
+    }
+
+
+
+@_serialize_locked_api
+def seal_source5_preparatory_exploration_bridge_locked(
+    old_lock: CampaignHostLock, initial_execution_pin: object, *,
+    pilot_pin: object,
+) -> dict[str, Any]:
+    """Seal exact initial records after fresh Source-owned journal/GPG replay."""
+    require(_lock_token_is_live(old_lock),
+            "Source5 lineage sealing requires its active old fd-owned lock")
+    return _source5_seal_preparatory_exploration_bridge_held(
+        old_lock, initial_execution_pin, pilot_pin=pilot_pin,
+    )
+
+
+
 def _source5_fixed_preflight_host_pin(
     prepared: dict[str, Any], overlay: dict[str, Any],
 ) -> dict[str, str]:

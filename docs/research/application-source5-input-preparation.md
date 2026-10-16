@@ -631,6 +631,39 @@ come from the separate Source-owned wrapper. The fixed owner still requires
 its resident original inputs and retained directory context. These APIs do
 not establish cross-host replay portability or qualification readiness.
 
+### Initial exploration lineage
+
+The preparatory catalogue reserves two global files before any original APP
+runs: `preparatory-exploration-lineage-v1/bridge-header.json` and
+`record-index.jsonl`, under the selected host's Source5 output directory.
+Their Source-derived bounds include all 360 original jobs and escaped path
+limits. Either file appearing before the complete successful prefix prevents
+another owner from starting.
+
+After exporting the original capacity pilot, seal the initial metadata with
+the controller's explicit operation:
+
+```sh
+python3 scripts/application-source5-campaign.py seal-preparatory-lineage \
+  --manifest /private/initial/execution.json --host-id HOST \
+  --pilot /private/initial/CAMPAIGN/source5/HOST/exploration/capacity-pilot.json \
+  --pilot-raw-sha256 PILOT_RAW_SHA256 \
+  --pilot-semantic-sha256 PILOT_SEMANTIC_SHA256
+```
+
+Supply the pilot at its actual reserved host path. SourceA holds its original
+host lock, rechecks the original journal and all 360 signed archive records,
+and exclusively writes the header and index. Sealing adds no APP run or
+chronology callback. The files retain the original generation's pins and do
+not contain a later execution-manifest pin.
+
+The pure lineage verifier consumes a closed byte reader and independently
+pinned Source algorithms. It checks the permitted input-slot fills, original
+journal chain, ordered phase ledger and indexed callback witnesses. Its
+result requires component and fresh SourceA GPG replay. These component APIs
+do not establish a successful full captured-store join or final qualification;
+the final imported-history gate remains a separate integration requirement.
+
 For a read-only completion replay, supply `output: null`. The exporter still
 reconstructs and validates all 360 original pairs and recomputes the pilot
 bytes, but creates no replay file under the frozen input tree. Completion
