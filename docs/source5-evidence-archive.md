@@ -331,3 +331,10 @@ when extents can be shared. Storage admission must account for that limitation.
 These byte readers do not authenticate signatures, replay numeric owners, admit
 a final budget or authorize application launches. The Source-owned authority
 and storage validators must perform those checks before qualification starts.
+
+The read-only signed-ACK API also accepts an explicit `captured_keyring_reader`
+for a historical public keyring. It checks those bytes against the original
+raw pin and Source byte limit, then verifies the signature with the actual
+current pinned `gpgv` executable. The default route still opens the original
+keyring. This adds no reclaim authority; SourceA must still authenticate the
+complete journal, metadata and numeric-owner closure before issuing a gate.

@@ -5081,6 +5081,7 @@ def _gpg_sign(raw: bytes, signer: object) -> bytes:
 
 def _verify_detached_signature(
     ack_raw: bytes, signature_raw: bytes, signer_pin: object,
+    *, captured_keyring_reader=None,
 ) -> str:
     signer = _exact(signer_pin, {
         "fingerprint", "keyring_pin", "gpgv_pin",
@@ -5089,10 +5090,21 @@ def _verify_detached_signature(
                                "archive verification fingerprint")
     keyring_pin = _pin_raw(signer["keyring_pin"], "archive public keyring pin")
     gpgv_pin = _pin_raw(signer["gpgv_pin"], "pinned gpgv executable")
-    keyring = Path(keyring_pin["path"])
-    keyring_raw, keyring_sha, _ = _read_absolute_external_file(
-        keyring, MAX_GPG_OUTPUT_BYTES * 16, "archive public keyring",
-    )
+    keyring_maximum = MAX_GPG_OUTPUT_BYTES * 16
+    if captured_keyring_reader is None:
+        keyring_raw, keyring_sha, _ = _read_absolute_external_file(
+            Path(keyring_pin["path"]), keyring_maximum, "archive public keyring",
+        )
+    else:
+        _require(callable(captured_keyring_reader),
+                 "captured public keyring reader is not callable")
+        try:
+            keyring_raw = captured_keyring_reader(dict(keyring_pin), keyring_maximum)
+        except Exception as error:
+            raise EvidenceArchiveError("captured public keyring could not be read") from error
+        _require(type(keyring_raw) is bytes and 0 < len(keyring_raw) <= keyring_maximum,
+                 "captured public keyring violates its Source byte bound")
+        keyring_sha = _sha(keyring_raw)
     _require(keyring_sha == keyring_pin["raw_sha256"],
              "archive public keyring changed from its raw pin")
     gpgv_path = Path(gpgv_pin["path"])
@@ -6585,6 +6597,7 @@ def _verify_signed_ack_metadata(
     budget_dependency_cache_root: str | None = None,
     budget_catalogue_map_raw: bytes | None = None,
     budget_catalogue_cache_root: str | None = None,
+    captured_keyring_reader=None,
 ) -> dict[str, Any]:
     """Verify one persisted signed ACK and its complete metadata signature closure.
 
@@ -6596,6 +6609,9 @@ def _verify_signed_ack_metadata(
     _require(purpose in {"predecessor", "read"} and
              ((purpose == "predecessor") == (successor_run_id is not None)),
              "metadata ACK verifier purpose/successor binding differs")
+    _require(captured_keyring_reader is None or
+             (purpose == "read" and callable(captured_keyring_reader)),
+             "captured keyring bytes are reserved for read-only ACK verification")
     checked_checkpoint = _validate_checkpoint(checkpoint)
     context = checked_checkpoint["context"]
     check_pin = _pin(
@@ -6872,11 +6888,18 @@ def _verify_signed_ack_metadata(
              len(signature_raw) <= signature_limit and
              checked_signature["signer_fingerprint"] == fingerprint,
              "persisted detached signature differs from its exact pin or quota")
-    primary = _verify_detached_signature(ack_raw, signature_raw, {
+    verification_signer = {
         "fingerprint": fingerprint,
         "keyring_pin": signer["keyring_pin"],
         "gpgv_pin": signer["gpgv_pin"],
-    })
+    }
+    if captured_keyring_reader is None:
+        primary = _verify_detached_signature(ack_raw, signature_raw, verification_signer)
+    else:
+        primary = _verify_detached_signature(
+            ack_raw, signature_raw, verification_signer,
+            captured_keyring_reader=captured_keyring_reader,
+        )
     _require(primary == fingerprint,
              "detached signature verifier returned a different primary fingerprint")
     result = {
@@ -6990,6 +7013,7 @@ def verify_signed_ack_for_read(
     budget_dependency_cache_root: str | None = None,
     budget_catalogue_map_raw: bytes | None = None,
     budget_catalogue_cache_root: str | None = None,
+    captured_keyring_reader=None,
 ) -> dict[str, Any]:
     """Verify one arbitrary successful PlanV3 job for readback, never reclaim.
 
@@ -6997,6 +7021,8 @@ def verify_signed_ack_for_read(
     Plan, manifest, ACK, signature, signer context, execution manifest and
     optional v4 width contract. It never opens remote archive/object paths or
     local payload paths and returns a distinct non-reclaim capability.
+    An explicit captured keyring reader supplies only pinned public bytes;
+    the current pinned gpgv executable is still opened and executed normally.
     """
     return _verify_signed_ack_metadata(
         checkpoint_pin, checkpoint, checkpoint_raw, request_raw,
@@ -7013,6 +7039,7 @@ def verify_signed_ack_for_read(
         budget_dependency_cache_root=budget_dependency_cache_root,
         budget_catalogue_map_raw=budget_catalogue_map_raw,
         budget_catalogue_cache_root=budget_catalogue_cache_root,
+        captured_keyring_reader=captured_keyring_reader,
     )
 
 

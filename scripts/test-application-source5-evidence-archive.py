@@ -1242,6 +1242,46 @@ class GpgIdentityTests(unittest.TestCase):
                         "maximum_signature_bytes": 1,
                     })
 
+                # Keep the origin identity while reading a distinct real capture.
+                captured = private(root / "captured") / "public-keyring.gpg"
+                captured.write_bytes(exported.stdout)
+                captured.chmod(0o400)
+                old_keyring_pin = {"path": str(keyring), "raw_sha256": sha(exported.stdout)}
+                signer = {"fingerprint": fingerprint, "keyring_pin": old_keyring_pin,
+                          "gpgv_pin": {"path": str(gpgv_path), "raw_sha256": sha(gpgv_raw)}}
+                keyring.unlink()
+                calls = []
+
+                def captured_reader(pin, maximum):
+                    self.assertEqual(pin, old_keyring_pin)
+                    raw = captured.read_bytes()
+                    self.assertLessEqual(len(raw), maximum)
+                    calls.append(dict(pin))
+                    return raw
+
+                self.assertEqual(archive._verify_detached_signature(
+                    ack, signature, signer, captured_keyring_reader=captured_reader,
+                ), fingerprint)
+                self.assertFalse(keyring.exists())
+                self.assertEqual(calls, [old_keyring_pin])
+                for changed_ack, changed_signature, reader in (
+                    (ack + b"changed", signature, captured_reader),
+                    (ack, b"invalid signature", captured_reader),
+                    (ack, signature, lambda pin, maximum: b"wrong public keyring"),
+                    (ack, signature, lambda pin, maximum: b""),
+                    (ack, signature, lambda pin, maximum: bytearray(exported.stdout)),
+                    (ack, signature, lambda pin, maximum: b"X" * (maximum + 1)),
+                ):
+                    with self.subTest(ack_changed=changed_ack != ack,
+                                      signature_changed=changed_signature != signature):
+                        with self.assertRaises(archive.EvidenceArchiveError):
+                            archive._verify_detached_signature(
+                                changed_ack, changed_signature, signer,
+                                captured_keyring_reader=reader,
+                            )
+                with self.assertRaises(OSError):
+                    archive._verify_detached_signature(ack, signature, signer)
+
 
 class HostBudgetR6SchemaTests(unittest.TestCase):
     def _fixture(self, *, width_bound: bool):
@@ -1543,9 +1583,35 @@ class PredecessorAckMetadataTests(unittest.TestCase):
                 "raw_sha256": sha(signer_context_raw),
                 "semantic_sha256": signer_context["signer_context_sha256"],
             }
+            # This legacy V4 metadata fixture uses the original three-host
+            # cohort. Only host-a is selected for this single-job read.
+            peer_signer_wrappers = {}
+            peer_width_wrappers = {}
+            for peer in ("host-b", "host-c"):
+                peer_body = {**signer_body, "host_id": peer}
+                peer_value = {**peer_body,
+                              "signer_context_sha256": sha(canonical(peer_body))}
+                peer_raw = canonical(peer_value)
+                peer_signer_wrappers[peer] = {
+                    "artifact": {"path": str(root / "inputs" / (peer + "-signer.json")),
+                                 "raw_sha256": sha(peer_raw)},
+                    "semantic_sha256": peer_value["signer_context_sha256"],
+                }
+                peer_width_body = {**width_body, "host_id": peer,
+                                   "source_manifest_pin": pinned(
+                                       root / "inputs" / (peer + "-source.json"),
+                                       (peer + "-source").encode())}
+                peer_width_value = {**peer_width_body,
+                                    "contract_sha256": sha(canonical(peer_width_body))}
+                peer_width_raw = canonical(peer_width_value)
+                peer_width_wrappers[peer] = {
+                    "artifact": {"path": str(root / "artifacts" / (peer + "-width.json")),
+                                 "raw_sha256": sha(peer_width_raw)},
+                    "semantic_sha256": peer_width_value["contract_sha256"],
+                }
             execution_body = {
                 "schema": archive.EXECUTION_SCHEMA_V4,
-                "campaign_id": "campaign-a", "hosts": ["host-a"],
+                "campaign_id": "campaign-a", "hosts": ["host-a", "host-b", "host-c"],
                 "original_inputs": {}, "execution_sources": {},
                 "modules": {}, "observed_hosts": {},
                 "artifact_root": str(root / "artifacts"),
@@ -1556,6 +1622,7 @@ class PredecessorAckMetadataTests(unittest.TestCase):
                 "prepared_input_generation": {},
                 "prepared_capacity_registration": {},
                 "archive_signer_contexts": {
+                    **peer_signer_wrappers,
                     "host-a": {
                         "artifact": {
                             "path": signer_context_pin["path"],
@@ -1566,6 +1633,7 @@ class PredecessorAckMetadataTests(unittest.TestCase):
                     },
                 },
                 "journal_width_contracts": {
+                    **peer_width_wrappers,
                     "host-a": {
                         "artifact": {"path": width_pin["path"],
                                      "raw_sha256": width_pin["raw_sha256"]},
@@ -1589,7 +1657,12 @@ class PredecessorAckMetadataTests(unittest.TestCase):
                 "spec": pinned(root / "inputs" / "spec.json", b"spec"),
                 "plan": plan_pin,
                 "execution_manifest": execution_pin,
-                "source_manifests": {"host-a": source_pin},
+                "source_manifests": {
+                    "host-a": source_pin,
+                    **{peer: pinned(root / "inputs" / (peer + "-source.json"),
+                                    (peer + "-source").encode())
+                       for peer in ("host-b", "host-c")},
+                },
                 "source_tree_sha256": "3" * 64,
             }
             catalogue_body = {
