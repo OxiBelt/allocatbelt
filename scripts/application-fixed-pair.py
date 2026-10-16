@@ -181,6 +181,34 @@ def read_json_pin(pin_value: object, label: str, maximum: int) -> tuple[Path, di
     return path, value, raw, actual
 
 
+def _read_recorded_global_json_pin(
+    pin_value: object, label: str, maximum: int,
+    global_artifact_reader: Callable[[dict[str, str], int], bytes],
+) -> tuple[Path, dict[str, Any], bytes, str]:
+    """Parse one exact historical JSON pin supplied by the recorded owner."""
+    pin = exact(pin_value, {"path", "sha256"}, f"{label} raw pin")
+    path = _captured_origin_path(pin["path"], f"{label} path")
+    require(is_sha(pin["sha256"]), f"{label} raw SHA-256 is malformed")
+    require(type(maximum) is int and maximum >= 0,
+            f"{label} byte limit is malformed")
+    require(callable(global_artifact_reader),
+            "recorded global artifact reader is not callable")
+    raw = global_artifact_reader(
+        {"path": pin["path"], "raw_sha256": pin["sha256"]}, maximum,
+    )
+    require(type(raw) is bytes, f"{label} reader did not return bytes")
+    require(len(raw) <= maximum, f"{label} exceeds its finite byte limit")
+    actual = sha256_bytes(raw)
+    require(actual == pin["sha256"], f"{label} differs from its raw SHA-256 pin")
+    try:
+        value = json.loads(raw.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError, RecursionError) as error:
+        raise FixedPairError(f"{label} is not bounded UTF-8 JSON: {error}") from error
+    require(type(value) is dict and raw == canonical_bytes(value),
+            f"{label} is not canonical JSON")
+    return path, value, raw, actual
+
+
 def write_exclusive(path: Path, raw: bytes, label: str, mode: int = 0o600) -> str:
     require(not path.exists() and not path.is_symlink(), f"refusing to replace {label}")
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
@@ -438,6 +466,7 @@ def _host_observation(host_pin: object, spec: dict[str, Any], host_id: str) -> t
 def _host_observation_offline(
     host_pin: object, spec: dict[str, Any], host_id: str,
     host_verification: dict[str, Any],
+    *, global_artifact_reader: Callable[[dict[str, str], int], bytes] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Use only facts captured by the strict peer verifier, never local /proc."""
     identity = exact(host_verification, {
@@ -450,9 +479,15 @@ def _host_observation_offline(
             identity["host_verification_sha256"] == sha256_bytes(canonical_bytes(identity_body)),
             "strict peer host identity schema, host or digest is invalid")
     pin = exact(host_pin, {"path", "sha256"}, "observed host contract raw pin")
-    path = _safe_absolute(pin["path"], "observed host contract path")
-    require(is_sha(pin["sha256"]), "observed host contract raw SHA-256 is malformed")
-    raw, raw_sha, _info = read_stable(path, "observed host contract", MAX_MANIFEST_BYTES)
+    if global_artifact_reader is None:
+        path = _safe_absolute(pin["path"], "observed host contract path")
+        require(is_sha(pin["sha256"]), "observed host contract raw SHA-256 is malformed")
+        raw, raw_sha, _info = read_stable(path, "observed host contract", MAX_MANIFEST_BYTES)
+    else:
+        path, _value, raw, raw_sha = _read_recorded_global_json_pin(
+            pin, "observed host contract", MAX_MANIFEST_BYTES,
+            global_artifact_reader,
+        )
     require(raw_sha == pin["sha256"] == host_verification["observed_host_raw_sha256"],
             "peer host-verification receipt refers to different observed-host bytes")
     try:
@@ -484,6 +519,7 @@ def _host_observation_offline(
 
 def _offline_host_observation(
     offline_facts: object, host_pin: object, spec: dict[str, Any], host_id: str,
+    *, global_artifact_reader: Callable[[dict[str, str], int], bytes] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Validate outer receipt and its separately versioned nested host identity."""
     facts = exact(offline_facts, {"schema", "host_verification"}, "strict peer host-verification receipt")
@@ -495,7 +531,10 @@ def _offline_host_observation(
     }, "strict peer nested host identity")
     require(identity["schema"] == HOST_VERIFICATION_IDENTITY_SCHEMA,
             "strict peer nested host identity schema is invalid")
-    return _host_observation_offline(host_pin, spec, host_id, identity)
+    return _host_observation_offline(
+        host_pin, spec, host_id, identity,
+        global_artifact_reader=global_artifact_reader,
+    )
 
 
 def _inventory_entry(inventory: list[dict[str, Any]], relative: str, label: str) -> dict[str, Any]:
@@ -564,11 +603,14 @@ def _load_source_inputs(
     observed_host_pin: object, output_root_value: object, *, create_output: bool,
     offline_facts: dict[str, Any] | None = None,
     recorded_host: bool = False,
+    global_artifact_reader: Callable[[dict[str, str], int], bytes] | None = None,
 ) -> dict[str, Any]:
     # Only the origin-host launcher inspects startup hooks or SIGCHLD. Offline
     # replay has no process/lock capability and consumes its pinned host facts.
     require(not recorded_host or offline_facts is not None,
             "recorded-host input reconstruction requires strict peer receipt facts")
+    require(global_artifact_reader is None or recorded_host,
+            "historical global reads require the recorded-host route")
     if offline_facts is None:
         _reject_ambient_startup_hooks()
         _require_waitable_sigchld()
@@ -576,8 +618,22 @@ def _load_source_inputs(
         "spec", "spec_semantic_sha256", "plan", "plan_semantic_sha256", "source_manifests", "campaign_artifacts_root",
     }, "original input pins")
     execution = exact(execution_pins, {"source_root", "selected_host_id", "modules"}, "execution pins")
-    spec_path, spec, spec_raw, spec_raw_sha = read_json_pin(original["spec"], "original SpecV3", MAX_SPEC_BYTES)
-    plan_path, plan, plan_raw, plan_raw_sha = read_json_pin(original["plan"], "original PlanV3", MAX_PLAN_BYTES)
+    if global_artifact_reader is None:
+        spec_path, spec, spec_raw, spec_raw_sha = read_json_pin(
+            original["spec"], "original SpecV3", MAX_SPEC_BYTES,
+        )
+        plan_path, plan, plan_raw, plan_raw_sha = read_json_pin(
+            original["plan"], "original PlanV3", MAX_PLAN_BYTES,
+        )
+    else:
+        spec_path, spec, spec_raw, spec_raw_sha = _read_recorded_global_json_pin(
+            original["spec"], "original SpecV3", MAX_SPEC_BYTES,
+            global_artifact_reader,
+        )
+        plan_path, plan, plan_raw, plan_raw_sha = _read_recorded_global_json_pin(
+            original["plan"], "original PlanV3", MAX_PLAN_BYTES,
+            global_artifact_reader,
+        )
     require(is_sha(original["spec_semantic_sha256"]) and sha256_bytes(canonical_bytes(spec)) == original["spec_semantic_sha256"], "SpecV3 semantic digest differs from its separate pin")
     require(spec.get("schema") == "allocatbelt.application-campaign-spec.v3", "fixed-pair executor requires the original immutable SpecV3")
     plan_semantic = plan.get("plan_sha256")
@@ -604,16 +660,30 @@ def _load_source_inputs(
         reference = exact(reference_value, {"host_id", "relative_path", "sha256"}, f"SpecV3 source reference[{index}]")
         host_id = reference["host_id"]
         relative = _safe_relative(reference["relative_path"], f"source manifest {host_id} relative path")
-        source_path = _safe_child(input_root, relative, f"original source manifest {host_id}")
         supplied_pin = exact(source_pins[host_id], {"path", "sha256"}, f"source manifest {host_id} raw pin")
+        if global_artifact_reader is None:
+            source_path = _safe_child(input_root, relative, f"original source manifest {host_id}")
+        else:
+            source_path = _captured_origin_path(
+                str(input_root / relative),
+                f"original source manifest {host_id}",
+            )
         require(supplied_pin["path"] == str(source_path) and is_sha(supplied_pin["sha256"]), f"source manifest {host_id} raw pin differs from its original SpecV3 reference path")
-        raw, raw_sha, _info = read_stable(source_path, f"source manifest {host_id}", MAX_MANIFEST_BYTES)
-        require(raw_sha == supplied_pin["sha256"], f"source manifest {host_id} differs from its raw pin")
-        try:
-            source_value = json.loads(raw.decode("utf-8"))
-        except (UnicodeError, json.JSONDecodeError, RecursionError) as error:
-            raise FixedPairError(f"source manifest {host_id} is not bounded JSON: {error}") from error
-        require(type(source_value) is dict and raw == canonical_bytes(source_value), f"source manifest {host_id} is not canonical JSON")
+        if global_artifact_reader is None:
+            raw, raw_sha, _info = read_stable(
+                source_path, f"source manifest {host_id}", MAX_MANIFEST_BYTES,
+            )
+            require(raw_sha == supplied_pin["sha256"], f"source manifest {host_id} differs from its raw pin")
+            try:
+                source_value = json.loads(raw.decode("utf-8"))
+            except (UnicodeError, json.JSONDecodeError, RecursionError) as error:
+                raise FixedPairError(f"source manifest {host_id} is not bounded JSON: {error}") from error
+            require(type(source_value) is dict and raw == canonical_bytes(source_value), f"source manifest {host_id} is not canonical JSON")
+        else:
+            source_path, source_value, raw, raw_sha = _read_recorded_global_json_pin(
+                supplied_pin, f"source manifest {host_id}", MAX_MANIFEST_BYTES,
+                global_artifact_reader,
+            )
         require(source_value.get("schema") == "allocatbelt.application-source-manifest.v5", f"source manifest {host_id} is not SourceV5")
         require(source_value.get("manifest_sha256") == reference["sha256"], f"source manifest {host_id} semantic digest differs from its original SpecV3 reference")
         sources[host_id] = source_value
@@ -672,6 +742,7 @@ def _load_source_inputs(
     else:
         host_value, observed = _offline_host_observation(
             offline_facts, observed_host_pin, spec, host_id,
+            global_artifact_reader=global_artifact_reader,
         )
     host_pin_path = observed["pin"]["path"]
 
@@ -1038,11 +1109,13 @@ def _construct_overlay(
     offline_facts: dict[str, Any] | None = None,
     artifact_view: CapturedFixedPairArtifactsV1 | None = None,
     recorded_host: bool = False,
+    global_artifact_reader: Callable[[dict[str, str], int], bytes] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     context = _load_source_inputs(
         original_pins, execution_pins, exact_job, observed_host_pin, output_root_value,
         create_output=create_output, offline_facts=offline_facts,
         recorded_host=recorded_host,
+        global_artifact_reader=global_artifact_reader,
     )
     context["write_runtime_bindings"] = write_runtime_bindings
     context["artifact_view"] = artifact_view
@@ -1212,9 +1285,12 @@ def _read_overlay_with_host_facts(
     overlay_pin: object, offline_facts: dict[str, Any] | None = None,
     *, artifact_view: CapturedFixedPairArtifactsV1 | None = None,
     recorded_host: bool = False,
+    global_artifact_reader: Callable[[dict[str, str], int], bytes] | None = None,
 ) -> tuple[dict[str, Any], bytes, str, dict[str, Any], dict[str, Any]]:
     require(not recorded_host or (offline_facts is not None and artifact_view is not None),
             "recorded-host overlay reconstruction requires captured bytes and strict host receipt facts")
+    require(global_artifact_reader is None or recorded_host,
+            "historical global reads require the recorded-host route")
     overlay, raw, raw_sha, path = _read_overlay_raw(overlay_pin, artifact_view=artifact_view)
     original_pins, execution_pins, job, host_pin, output_root = _derive_overlay_inputs(overlay)
     require(path == Path(output_root) / "fixed-pair-execution-overlay.json", "overlay path differs from its immutable output-root location")
@@ -1222,6 +1298,7 @@ def _read_overlay_with_host_facts(
         original_pins, execution_pins, job, host_pin, output_root,
         create_output=False, write_runtime_bindings=False, offline_facts=offline_facts,
         artifact_view=artifact_view, recorded_host=recorded_host,
+        global_artifact_reader=global_artifact_reader,
     )
     require(canonical_bytes(reconstructed) == raw, "fixed-pair overlay differs from independent SourceV5/PlanV3 reconstruction")
     return overlay, raw, raw_sha, context, reconstructed
@@ -2544,7 +2621,10 @@ def _run_construction_probe(
     }
 
 
-def _snapshot_source_inputs(context: dict[str, Any]) -> dict[str, Any]:
+def _snapshot_source_inputs(
+    context: dict[str, Any], *,
+    global_artifact_reader: Callable[[dict[str, str], int], bytes] | None = None,
+) -> dict[str, Any]:
     controller = context["controller"]
     source = context["source"]
     root = context["source_root"]
@@ -2557,13 +2637,37 @@ def _snapshot_source_inputs(context: dict[str, Any]) -> dict[str, Any]:
     except Exception as error:
         raise FixedPairError(f"post-run SourceV5 verification failed: {error}") from error
     require(tree.get("entries") == source["source"]["files"] and current_commit == source["source"]["git_commit"], "post-run Git source identity differs from the selected SourceV5 snapshot")
-    spec_raw, spec_sha, _spec_info = read_stable(context["spec_path"], "original SpecV3 after execution", MAX_SPEC_BYTES)
-    plan_raw, plan_sha, _plan_info = read_stable(context["plan_path"], "original PlanV3 after execution", MAX_PLAN_BYTES)
+    if global_artifact_reader is None:
+        spec_raw, spec_sha, _spec_info = read_stable(
+            context["spec_path"], "original SpecV3 after execution", MAX_SPEC_BYTES,
+        )
+        plan_raw, plan_sha, _plan_info = read_stable(
+            context["plan_path"], "original PlanV3 after execution", MAX_PLAN_BYTES,
+        )
+    else:
+        _spec_path, _spec, spec_raw, spec_sha = _read_recorded_global_json_pin(
+            {"path": str(context["spec_path"]), "sha256": context["spec_raw_sha256"]},
+            "original SpecV3 after execution", MAX_SPEC_BYTES,
+            global_artifact_reader,
+        )
+        _plan_path, _plan, plan_raw, plan_sha = _read_recorded_global_json_pin(
+            {"path": str(context["plan_path"]), "sha256": context["plan_raw_sha256"]},
+            "original PlanV3 after execution", MAX_PLAN_BYTES,
+            global_artifact_reader,
+        )
     require(spec_raw == context["spec_raw"] and plan_raw == context["plan_raw"], "original SpecV3 or PlanV3 bytes changed during fixed-pair execution")
     manifests: dict[str, str] = {}
     for host, value in context["source_manifest_records"].items():
         path = Path(value["pin"]["path"])
-        _raw, actual, _info = read_stable(path, f"SourceV5 manifest {host} after execution", MAX_MANIFEST_BYTES)
+        if global_artifact_reader is None:
+            _raw, actual, _info = read_stable(
+                path, f"SourceV5 manifest {host} after execution", MAX_MANIFEST_BYTES,
+            )
+        else:
+            _path, _manifest, _raw, actual = _read_recorded_global_json_pin(
+                value["pin"], f"SourceV5 manifest {host} after execution",
+                MAX_MANIFEST_BYTES, global_artifact_reader,
+            )
         require(actual == value["pin"]["sha256"], f"SourceV5 manifest raw pin changed after execution: {host}")
         manifests[host] = actual
     modules: dict[str, str] = {}
@@ -2588,7 +2692,16 @@ def _snapshot_source_inputs(context: dict[str, Any]) -> dict[str, Any]:
         actual = _hash_regular_file(path, MAX_ORACLE_BYTES, "original APP oracle after execution")
         require(actual == oracle["artifact"]["sha256"] == oracle["entry"]["sha256"], "original PlanV3 oracle changed after execution")
         oracles[str(path)] = actual
-    host_raw, host_sha, _host_info = read_stable(Path(context["host_pin"]["path"]), "observed host contract after execution", MAX_MANIFEST_BYTES)
+    if global_artifact_reader is None:
+        host_raw, host_sha, _host_info = read_stable(
+            Path(context["host_pin"]["path"]),
+            "observed host contract after execution", MAX_MANIFEST_BYTES,
+        )
+    else:
+        _host_path, _host, host_raw, host_sha = _read_recorded_global_json_pin(
+            context["host_pin"], "observed host contract after execution",
+            MAX_MANIFEST_BYTES, global_artifact_reader,
+        )
     require(host_sha == context["host_pin"]["sha256"], "observed host contract changed after execution")
     runtime_path = context["output_root"] / ".fixed-pair-runtime-bindings.json"
     runtime_raw, runtime_sha = _read_pair_artifact(runtime_path, "original runtime bindings after execution", MAX_RUNTIME_BYTES, context.get("artifact_view"))
@@ -3512,6 +3625,7 @@ def _verify_fixed_pair_overlay_replay(
     *, artifact_view: CapturedFixedPairArtifactsV1 | None = None,
     recorded_zero_tmp_proofs: list[dict[str, Any]] | None = None,
     preconstructed_context: tuple[dict[str, Any], bytes, str, dict[str, Any], dict[str, Any]] | None = None,
+    global_artifact_reader: Callable[[dict[str, str], int], bytes] | None = None,
 ) -> dict[str, Any]:
     """Shared raw artifact replay; host mode comes only from its caller."""
     require(artifact_view is None or offline_facts is not None,
@@ -3521,6 +3635,8 @@ def _verify_fixed_pair_overlay_replay(
              type(recorded_zero_tmp_proofs) is list and
              len(recorded_zero_tmp_proofs) == 4),
             "recorded fixed replay requires its exact four receipt-derived TMPDIR proofs")
+    require(global_artifact_reader is None or recorded_zero_tmp_proofs is not None,
+            "historical global reads require the recorded fixed replay route")
     if preconstructed_context is not None:
         require(offline_facts is not None and artifact_view is not None and
                 preconstructed_context[3].get("artifact_view") is artifact_view and
@@ -3566,7 +3682,9 @@ def _verify_fixed_pair_overlay_replay(
     require(receipt["execution_ready"] is False and receipt["campaign_chronology_complete"] is False, "fixed-pair component receipt made an execution-readiness or campaign-chronology claim")
     require(receipt["historical_runner_sha256"] == overlay["sources"]["historical_runner_sha256"] and receipt["execution_modules"] == overlay["modules"] and receipt["execution_source"] == overlay["execution_source"], "executor sidecar relabeled the historical runner or changed its new module pins")
     require(receipt["status"] in ("valid_pair", "failed_or_invalid"), "fixed-pair receipt has an unknown terminal status")
-    current_snapshot = _snapshot_source_inputs(context)
+    current_snapshot = _snapshot_source_inputs(
+        context, global_artifact_reader=global_artifact_reader,
+    )
     if receipt["source_pins_after"] is not None:
         require(receipt["source_pins_after"] == current_snapshot, "post-run SourceV5/spec/plan/binary/oracle/module pins differ during offline replay")
     else:
@@ -4097,9 +4215,10 @@ class CapturedFixedPairArtifactsV1:
                 "maximum_bytes": MAX_PAIR_OUTPUT_BYTES}
 
 
-def prepare_captured_fixed_pair_replay_v1(
+def _prepare_captured_fixed_pair_replay_envelopes_v1(
     overlay_pin: object, receipt_pin: object, host_verification_pin: object,
-    references: object, stage_root: Path,
+    references: object, stage_root: Path, *,
+    global_artifact_reader: Callable[[dict[str, str], int], bytes] | None = None,
 ) -> dict[str, Any]:
     """Validate captured envelopes/host facts; full numeric replay is separate."""
     overlay_pin = exact(overlay_pin, {"path", "sha256"}, "captured overlay pin")
@@ -4163,14 +4282,22 @@ def prepare_captured_fixed_pair_replay_v1(
             "captured strict host mount differs from the original bounded output facts")
     spec_pin = exact(overlay["spec"], {"pin", "semantic_sha256"},
                      "captured fixed SpecV3 binding")
-    _path, spec, _raw, _sha = read_json_pin(spec_pin["pin"],
-                                         "resident original SpecV3", MAX_SPEC_BYTES)
+    if global_artifact_reader is None:
+        _path, spec, _raw, _sha = read_json_pin(
+            spec_pin["pin"], "resident original SpecV3", MAX_SPEC_BYTES,
+        )
+    else:
+        _path, spec, _raw, _sha = _read_recorded_global_json_pin(
+            spec_pin["pin"], "recorded original SpecV3", MAX_SPEC_BYTES,
+            global_artifact_reader,
+        )
     require(sha256_bytes(canonical_bytes(spec)) == spec_pin["semantic_sha256"],
             "captured fixed SpecV3 semantic pin differs")
     facts = {"schema": host["schema"],
              "host_verification": host["host_verification"]}
     _offline_host_observation(facts, overlay["sources"]["observed_host"]["pin"],
-                              spec, overlay["host_id"])
+                              spec, overlay["host_id"],
+                              global_artifact_reader=global_artifact_reader)
     inventory = exact(receipt["output_artifacts"], {
         "files", "total_bytes", "maximum_bytes",
     }, "captured fixed receipt inventory")
@@ -4201,19 +4328,32 @@ def prepare_captured_fixed_pair_replay_v1(
             "qualification_eligible": False}
 
 
-def _prepare_captured_fixed_pair_replay_v1(
+def prepare_captured_fixed_pair_replay_v1(
     overlay_pin: object, receipt_pin: object, host_verification_pin: object,
     references: object, stage_root: Path,
+) -> dict[str, Any]:
+    """Validate captured envelopes/host facts; full numeric replay is separate."""
+    return _prepare_captured_fixed_pair_replay_envelopes_v1(
+        overlay_pin, receipt_pin, host_verification_pin, references, stage_root,
+    )
+
+
+def _prepare_captured_fixed_pair_replay_v1(
+    overlay_pin: object, receipt_pin: object, host_verification_pin: object,
+    references: object, stage_root: Path, *,
+    global_artifact_reader: Callable[[dict[str, str], int], bytes] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any], tuple[
     dict[str, Any], bytes, str, dict[str, Any], dict[str, Any],
 ]]:
     """Prepare recorded-host reconstruction while preserving all source checks."""
-    prepared = prepare_captured_fixed_pair_replay_v1(
+    prepared = _prepare_captured_fixed_pair_replay_envelopes_v1(
         overlay_pin, receipt_pin, host_verification_pin, references, stage_root,
+        global_artifact_reader=global_artifact_reader,
     )
     overlay, raw, overlay_sha, context, reconstructed = _read_overlay_with_host_facts(
         overlay_pin, prepared["offline_facts"],
         artifact_view=prepared["artifact_view"], recorded_host=True,
+        global_artifact_reader=global_artifact_reader,
     )
     pin = exact(overlay_pin, {"path", "sha256"}, "recorded overlay pin")
     require(context["artifact_view"] is prepared["artifact_view"] and
@@ -4313,7 +4453,7 @@ def _recorded_fixed_zero_tmp_proofs(
     context: dict[str, Any], prepared: dict[str, Any],
     checkpoint_pin_value: object, checkpoint_raw: object,
 ) -> list[dict[str, Any]]:
-    """Join a SourceA-authenticated v2 checkpoint to this exact fixed receipt.
+    """Join a SourceA-authenticated v2/v3 checkpoint to this exact fixed receipt.
 
     The caller must select this owner route only after SourceA has freshly
     verified the checkpoint pin against the retained signed ACK and journal.
@@ -4345,9 +4485,14 @@ def _recorded_fixed_zero_tmp_proofs(
             f"SourceV5 archive rejected the recorded fixed checkpoint: {error}",
         ) from error
 
-    require(checkpoint.get("schema") == archive.CHECKPOINT_SCHEMA_V2 and
+    checkpoint_schema = checkpoint.get("schema")
+    fixed_v3_schema = getattr(archive, "CHECKPOINT_SCHEMA_V3", None)
+    require((checkpoint_schema == archive.CHECKPOINT_SCHEMA_V2 or
+             (fixed_v3_schema ==
+              "allocatbelt.application-source5-evidence-job-checkpoint.v3" and
+              checkpoint_schema == fixed_v3_schema)) and
             checkpoint.get("checkpoint_sha256") == checkpoint_pin["semantic_sha256"],
-            "recorded fixed replay requires the exact signed v2 checkpoint pin")
+            "recorded fixed replay requires the exact signed v2/v3 checkpoint pin")
     overlay = prepared["overlay"]
     receipt = prepared["execution_receipt"]
     host_receipt = prepared["host_verification_receipt"]
@@ -4463,6 +4608,7 @@ def verify_fixed_pair_overlay_recorded_captured_v1(
     overlay_pin: object, receipt_pin: object, host_verification_pin: object,
     references: object, stage_root: Path, *, checkpoint_pin: object,
     checkpoint_raw: object,
+    global_artifact_reader: Callable[[dict[str, str], int], bytes] | None = None,
 ) -> dict[str, Any]:
     """Replay one captured fixed pair using SourceA-authenticated empty TMP proofs.
 
@@ -4471,12 +4617,15 @@ def verify_fixed_pair_overlay_recorded_captured_v1(
     API. This owner independently validates the typed SourceV5 archive code,
     checkpoint structure, receipt joins, and all four zero proofs. The raw
     checkpoint argument alone is evidence, never signature authority.
-    The pinned SourceV5 tree and original Spec/Plan/input/binary files still
-    use the existing local readers; only recorded output, artifact-root and
-    empty-TMP paths may be absent on this host.
+    The optional raw reader applies only to historical Spec/Plan/Source/host
+    JSON pins. Current Source code, APP binaries, input payloads and the
+    physical0400 job-stage artifacts retain their existing local checks.
     """
+    require(global_artifact_reader is None or callable(global_artifact_reader),
+            "recorded global artifact reader is not callable")
     prepared, context, preconstructed_context = _prepare_captured_fixed_pair_replay_v1(
         overlay_pin, receipt_pin, host_verification_pin, references, stage_root,
+        global_artifact_reader=global_artifact_reader,
     )
     proofs = _recorded_fixed_zero_tmp_proofs(
         context, prepared, checkpoint_pin, checkpoint_raw,
@@ -4486,6 +4635,7 @@ def verify_fixed_pair_overlay_recorded_captured_v1(
         artifact_view=prepared["artifact_view"],
         recorded_zero_tmp_proofs=proofs,
         preconstructed_context=preconstructed_context,
+        global_artifact_reader=global_artifact_reader,
     )
     return {
         "schema": RECORDED_HOST_CAPTURED_REPLAY_CONTEXT_SCHEMA_V1,

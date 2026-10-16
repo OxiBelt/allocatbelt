@@ -1976,6 +1976,72 @@ class FixedPairPureContractTests(unittest.TestCase):
                     "raw_sha256": FIXED.sha256_bytes(malformed_checkpoint),
                     "semantic_sha256": "f" * 64,
                 }
+                global_json_origins = [
+                    (spec_path, spec_raw), (plan_path, plan_raw),
+                    (observed_host_path, observed_host_raw),
+                    *(
+                        (Path(pin["path"]), Path(pin["path"]).read_bytes())
+                        for pin in source_manifest_pins.values()
+                    ),
+                ]
+                global_json_stage = stage_root / "historical-global-json"
+                global_json_stage.mkdir(mode=0o700)
+                global_json_captures = {}
+                for index, (origin, raw) in enumerate(global_json_origins):
+                    digest = FIXED.sha256_bytes(raw)
+                    local = global_json_stage / f"{index:04d}.json"
+                    local.write_bytes(raw)
+                    local.chmod(0o400)
+                    global_json_captures[(str(origin), digest)] = local
+                    origin.unlink()
+                self.assertTrue(all(not origin.exists() for origin, _raw in global_json_origins))
+                global_json_reads = []
+
+                def global_json_reader(pin, maximum):
+                    self.assertEqual(set(pin), {"path", "raw_sha256"})
+                    local = global_json_captures[(pin["path"], pin["raw_sha256"])]
+                    local_info = local.lstat()
+                    self.assertTrue(stat.S_ISREG(local_info.st_mode))
+                    self.assertEqual(stat.S_IMODE(local_info.st_mode), 0o400)
+                    raw, _sha, _info = FIXED.read_stable(
+                        local, "captured historical JSON", maximum,
+                    )
+                    global_json_reads.append(pin["path"])
+                    return raw
+
+                with self.assertRaisesRegex(
+                    FIXED.FixedPairError, "unavailable|cannot safely open",
+                ):
+                    FIXED.verify_fixed_pair_overlay_captured_v1(
+                        overlay_pin, execution_receipt_pin,
+                        host_verification_pin, references, stage_root,
+                    )
+                with (
+                    patch.object(FIXED, "_load_pinned_module", side_effect=load_controller),
+                    patch.object(FIXED, "_module_pins", side_effect=captured_module_pins),
+                    patch.object(FIXED, "_runtime_bindings_for_job", side_effect=runtime_bindings),
+                    patch.object(FIXED, "_construct_members", side_effect=members),
+                    patch.object(FIXED, "_snapshot_source_inputs", return_value={"fixture_source_snapshot": True}),
+                ):
+                    with self.assertRaisesRegex(
+                        FIXED.FixedPairError,
+                        "SourceV5 archive rejected the recorded fixed checkpoint",
+                    ):
+                        FIXED.verify_fixed_pair_overlay_recorded_captured_v1(
+                            overlay_pin, execution_receipt_pin,
+                            host_verification_pin, references, stage_root,
+                            checkpoint_pin=malformed_checkpoint_pin,
+                            checkpoint_raw=malformed_checkpoint,
+                            global_artifact_reader=global_json_reader,
+                        )
+                self.assertIn(str(spec_path), global_json_reads)
+                self.assertIn(str(plan_path), global_json_reads)
+                self.assertIn(str(observed_host_path), global_json_reads)
+                self.assertTrue(all(not origin.exists() for origin, _raw in global_json_origins))
+                for origin, raw in global_json_origins:
+                    origin.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+                    origin.write_bytes(raw)
+
                 with patch.object(
                     FIXED, "_verify_fixed_pair_overlay_replay",
                     side_effect=AssertionError("malformed checkpoint reached numeric replay"),
@@ -2435,6 +2501,440 @@ class CapturedFixedPairReplayTests(unittest.TestCase):
             with self.assertRaisesRegex(reader.ValidationError, "required byte sources"):
                 reader.validate_construction_probe(recipe, fixture.source, artifact_reader=view.read)
 
+
+class RecordedGlobalMetadataReaderTests(unittest.TestCase):
+    def test_recorded_load_uses_captured_historical_json_and_resident_source_inputs(self):
+        fixture_path = SCRIPT.with_name("test-application-campaign-inputs.py")
+        fixture_spec = importlib.util.spec_from_file_location(
+            "fixed_pair_global_json_fixtures", fixture_path,
+        )
+        assert fixture_spec is not None and fixture_spec.loader is not None
+        fixture_module = importlib.util.module_from_spec(fixture_spec)
+        sys.modules[fixture_spec.name] = fixture_module
+        fixture_spec.loader.exec_module(fixture_module)
+        campaign = fixture_module.campaign
+        spec_value, sources = fixture_module.spec_v3_fixture()
+        fixture_module.fixtures.add_frozen_rates(spec_value, include_oracles=True)
+
+        source_root = SCRIPT.parent.parent.resolve(strict=True)
+        allowed_cpus = sorted(os.sched_getaffinity(0))
+        selected_host = spec_value["hosts"][0]["host_id"]
+        host_value = next(
+            item for item in spec_value["hosts"] if item["host_id"] == selected_host
+        )
+        host_value["controls"]["cpu_set"] = ",".join(map(str, allowed_cpus))
+        host_value["host_fingerprint_sha256"] = FIXED.sha256_bytes(
+            FIXED.canonical_bytes(host_value["controls"]),
+        )
+
+        with tempfile.TemporaryDirectory(prefix="fixed-recorded-global-json-") as temporary:
+            root = Path(temporary).resolve()
+            input_root = root / "historical-inputs"
+            input_root.mkdir(mode=0o700)
+
+            def write_input(pin, raw):
+                path = input_root / pin["relative_path"]
+                path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+                path.write_bytes(raw)
+                pin["raw_sha256"] = FIXED.sha256_bytes(raw)
+                return path
+
+            current_payloads = []
+            for template in spec_value["qualification_inputs"]["capacity_templates"]:
+                request_raw = campaign.canonical_bytes({
+                    "schema": "allocatbelt.application-capacity-request-template.v1",
+                    "minimum_interval_seconds": 10,
+                })
+                storage = None
+                if template["workload"] in ("disk", "mixed"):
+                    storage = {
+                        "scope": "application_file_io",
+                        "root_path": str(root / "application-files"),
+                        "filesystem_type": "ext4",
+                        "device_major_minor": "8:1",
+                        "minimum_free_bytes": 4096,
+                    }
+                network = None
+                if template["workload"] in ("http", "mixed"):
+                    network = {
+                        "scope": "ipv4_loopback_application_bytes",
+                        "interface": "lo", "address": "127.0.0.1",
+                        "namespace_inode": 77,
+                    }
+                context_raw = campaign.canonical_bytes({
+                    "schema": "allocatbelt.application-capacity-context-template.v1",
+                    "storage": storage, "network": network,
+                })
+                current_payloads.extend((
+                    write_input(template["request_template"], request_raw),
+                    write_input(template["context_template"], context_raw),
+                ))
+            for condition in spec_value["qualification_inputs"]["pressure_conditions"]:
+                current_payloads.extend((
+                    write_input(condition["condition"], b"resident pressure condition\n"),
+                    write_input(
+                        condition["pressure_calibration"]["artifact"],
+                        b"resident pressure calibration artifact\n",
+                    ),
+                    write_input(
+                        condition["pressure_calibration"]["receipt"],
+                        b"resident pressure calibration receipt\n",
+                    ),
+                ))
+                condition["condition_sha256"] = condition["condition"]["raw_sha256"]
+
+            source_manifest_pins = {}
+            for host_id, source_value in sources.items():
+                reference = next(
+                    item for item in spec_value["source_manifests"]
+                    if item["host_id"] == host_id
+                )
+                relative = f"source/{host_id}.json"
+                reference["relative_path"] = relative
+                source_raw = FIXED.canonical_bytes(source_value)
+                source_path = input_root / relative
+                source_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+                source_path.write_bytes(source_raw)
+                source_manifest_pins[host_id] = {
+                    "path": str(source_path),
+                    "sha256": FIXED.sha256_bytes(source_raw),
+                }
+
+            spec_path = input_root / "spec-v3.json"
+            spec_raw = FIXED.canonical_bytes(spec_value)
+            spec_path.write_bytes(spec_raw)
+            jobs = campaign.build_jobs(spec_value, "exploration")
+            exact_job = next(item for item in jobs if item["host_id"] == selected_host)
+            plan_body = {
+                "schema": campaign.PLAN_SCHEMA_V3,
+                "campaign_id": spec_value["campaign_id"],
+                "spec_sha256": campaign.digest_object(spec_value),
+                "source_manifests": {
+                    host_id: item["manifest_sha256"]
+                    for host_id, item in sources.items()
+                },
+                "jobs": {"exploration": jobs},
+            }
+            plan_value = {
+                **plan_body,
+                "plan_sha256": campaign.digest_object(plan_body, "plan_sha256"),
+            }
+            plan_path = input_root / "plan-v3.json"
+            plan_raw = FIXED.canonical_bytes(plan_value)
+            plan_path.write_bytes(plan_raw)
+
+            observed_host_path = input_root / "observed-host.json"
+            observed_host_raw = FIXED.canonical_bytes(host_value)
+            observed_host_path.write_bytes(observed_host_raw)
+            original_pins = {
+                "spec": {"path": str(spec_path), "sha256": FIXED.sha256_bytes(spec_raw)},
+                "spec_semantic_sha256": campaign.digest_object(spec_value),
+                "plan": {"path": str(plan_path), "sha256": FIXED.sha256_bytes(plan_raw)},
+                "plan_semantic_sha256": plan_value["plan_sha256"],
+                "source_manifests": source_manifest_pins,
+                "campaign_artifacts_root": str(root / "historical-artifacts"),
+            }
+            execution_modules = {
+                name: {
+                    "path": relative,
+                    "sha256": next(
+                        item["sha256"] for item in sources[selected_host]["source"]["files"]
+                        if item["path"] == relative
+                    ),
+                }
+                for name, relative in FIXED.MODULE_PATHS.items()
+            }
+            execution_pins = {
+                "source_root": str(source_root),
+                "selected_host_id": selected_host,
+                "modules": execution_modules,
+            }
+            output_root = root / "historical-output"
+            observed_pin = {
+                "path": str(observed_host_path),
+                "sha256": FIXED.sha256_bytes(observed_host_raw),
+            }
+            host_identity_body = {
+                "schema": FIXED.HOST_VERIFICATION_IDENTITY_SCHEMA,
+                "host_id": selected_host,
+                "observed_host_raw_sha256": observed_pin["sha256"],
+                "process_affinity": allowed_cpus,
+                "network_namespace_inode": 77,
+                "output_mount": {},
+            }
+            host_identity = {
+                **host_identity_body,
+                "host_verification_sha256": FIXED.sha256_bytes(
+                    FIXED.canonical_bytes(host_identity_body),
+                ),
+            }
+            offline_facts = {
+                "schema": FIXED.HOST_VERIFICATION_SCHEMA,
+                "host_verification": host_identity,
+            }
+
+            global_origins = [
+                (spec_path, spec_raw), (plan_path, plan_raw),
+                (observed_host_path, observed_host_raw),
+                *(
+                    (Path(pin["path"]), Path(pin["path"]).read_bytes())
+                    for pin in source_manifest_pins.values()
+                ),
+            ]
+            global_stage = root / "captured-global-json"
+            global_stage.mkdir(mode=0o700)
+            captures = {}
+            for index, (origin, raw) in enumerate(global_origins):
+                digest = FIXED.sha256_bytes(raw)
+                local = global_stage / f"{index:04d}.json"
+                local.write_bytes(raw)
+                local.chmod(0o400)
+                captures[(str(origin), digest)] = local
+                origin.unlink()
+            self.assertTrue(all(not origin.exists() for origin, _raw in global_origins))
+            self.assertTrue(all(path.is_file() for path in current_payloads))
+
+            read_caps = {
+                str(spec_path): FIXED.MAX_SPEC_BYTES,
+                str(plan_path): FIXED.MAX_PLAN_BYTES,
+                str(observed_host_path): FIXED.MAX_MANIFEST_BYTES,
+                **{
+                    pin["path"]: FIXED.MAX_MANIFEST_BYTES
+                    for pin in source_manifest_pins.values()
+                },
+            }
+            reads = []
+
+            def global_reader(pin, maximum):
+                self.assertEqual(set(pin), {"path", "raw_sha256"})
+                self.assertEqual(maximum, read_caps[pin["path"]])
+                local = captures[(pin["path"], pin["raw_sha256"])]
+                info = local.lstat()
+                self.assertTrue(stat.S_ISREG(info.st_mode))
+                self.assertEqual(stat.S_IMODE(info.st_mode), 0o400)
+                raw, _sha, _info = FIXED.read_stable(local, "captured historical JSON", maximum)
+                reads.append(pin["path"])
+                return raw
+
+            original_loader = FIXED._load_pinned_module
+
+            def load_controller(raw, path, label):
+                module = original_loader(raw, path, label)
+                if label == "campaign_controller":
+                    def verify_source_manifest(value, source_root=None, verify_artifacts=True):
+                        campaign.verify_source_manifest(value, verify_artifacts=False)
+                        if source_root is not None:
+                            campaign.source_inventory_module().verify_source_tree(
+                                source_root, value["source"]["source_tree_sha256"],
+                                value["source"]["files"],
+                            )
+
+                    def verify_plan(value, validator_sha256=None, campaign_inputs_module_sha256=None):
+                        FIXED.require(
+                            value["plan_sha256"] == campaign.digest_object(value, "plan_sha256"),
+                            "recorded fixture plan semantic digest differs",
+                        )
+                        FIXED.require(
+                            validator_sha256 == sources[selected_host]["runtime_readback_validator"]["sha256"] and
+                            campaign_inputs_module_sha256 == campaign.campaign_inputs_source_sha256(sources),
+                            "recorded fixture plan SourceV5 module pins differ",
+                        )
+
+                    module.verify_source_manifest = verify_source_manifest
+                    module.verify_plan = verify_plan
+                return module
+
+            with patch.object(FIXED, "_load_pinned_module", side_effect=load_controller):
+                context = FIXED._load_source_inputs(
+                    original_pins, execution_pins, exact_job, observed_pin,
+                    str(output_root), create_output=False,
+                    offline_facts=offline_facts, recorded_host=True,
+                    global_artifact_reader=global_reader,
+                )
+            self.assertEqual(context["spec_path"], spec_path)
+            self.assertEqual(context["plan_path"], plan_path)
+            self.assertEqual(context["input_root"], input_root)
+            self.assertTrue(context["input_root"].is_dir())
+            self.assertTrue(all(path.is_file() for path in current_payloads))
+            self.assertIn(str(spec_path), reads)
+            self.assertIn(str(plan_path), reads)
+            self.assertIn(str(observed_host_path), reads)
+            self.assertEqual(len(reads), 2 + len(source_manifest_pins) + 1)
+            self.assertEqual(set(reads), set(read_caps))
+            with self.assertRaisesRegex(FIXED.FixedPairError, "unavailable|cannot safely open"):
+                FIXED._load_source_inputs(
+                    original_pins, execution_pins, exact_job, observed_pin,
+                    str(output_root), create_output=False,
+                    offline_facts=offline_facts, recorded_host=True,
+                )
+
+            with self.assertRaisesRegex(FIXED.FixedPairError, "differs from its raw SHA-256"):
+                FIXED._read_recorded_global_json_pin(
+                    {"path": str(spec_path), "sha256": "0" * 64},
+                    "original SpecV3", FIXED.MAX_SPEC_BYTES,
+                    lambda _pin, _maximum: spec_raw,
+                )
+
+            def missing_reader(_pin, _maximum):
+                raise FIXED.FixedPairError("captured historical JSON pin is missing")
+
+            with self.assertRaisesRegex(FIXED.FixedPairError, "pin is missing"):
+                FIXED._read_recorded_global_json_pin(
+                    {"path": str(spec_path), "sha256": FIXED.sha256_bytes(spec_raw)},
+                    "original SpecV3", FIXED.MAX_SPEC_BYTES, missing_reader,
+                )
+
+            changed_host = copy.deepcopy(host_value)
+            changed_host["controls"]["kernel_release"] += "-changed"
+            changed_host["host_fingerprint_sha256"] = FIXED.sha256_bytes(
+                FIXED.canonical_bytes(changed_host["controls"]),
+            )
+            changed_host_raw = FIXED.canonical_bytes(changed_host)
+            changed_host_pin = {
+                "path": str(observed_host_path),
+                "sha256": FIXED.sha256_bytes(changed_host_raw),
+            }
+            changed_identity_body = {
+                **host_identity_body,
+                "observed_host_raw_sha256": changed_host_pin["sha256"],
+            }
+            changed_identity = {
+                **changed_identity_body,
+                "host_verification_sha256": FIXED.sha256_bytes(
+                    FIXED.canonical_bytes(changed_identity_body),
+                ),
+            }
+            with self.assertRaisesRegex(
+                FIXED.FixedPairError,
+                "differs from the original SpecV3 host entry",
+            ):
+                FIXED._offline_host_observation(
+                    {"schema": FIXED.HOST_VERIFICATION_SCHEMA,
+                     "host_verification": changed_identity},
+                    changed_host_pin, spec_value, selected_host,
+                    global_artifact_reader=lambda _pin, _maximum: changed_host_raw,
+                )
+
+
+class RecordedFixedCheckpointV3Tests(unittest.TestCase):
+    """Structural SourceV5 checkpoint join; this is not APP evidence."""
+
+    def test_fixed_owner_derives_v3_proofs_from_the_exact_receipt(self):
+        fixture_path = SCRIPT.with_name("test-application-source5-evidence-archive.py")
+        fixture_spec = importlib.util.spec_from_file_location(
+            "fixed_pair_v3_archive_fixtures", fixture_path,
+        )
+        assert fixture_spec is not None and fixture_spec.loader is not None
+        fixture_module = importlib.util.module_from_spec(fixture_spec)
+        sys.modules[fixture_spec.name] = fixture_module
+        fixture_spec.loader.exec_module(fixture_module)
+
+        with tempfile.TemporaryDirectory(prefix="fixed-owner-v3-closure-") as temporary:
+            root = Path(temporary)
+            output = root / "output"
+            output.mkdir(mode=0o700)
+            sample = fixture_module.fixed_host_receipt_fixture(
+                root, state="valid_pair",
+            )
+            fixture = sample["fixture"]
+            request, request_pin = ARCHIVE.build_fixed_checkpoint_request_v3(
+                sample["context"], fixture["job_record_pin"],
+                fixture["record_raw"], fixture["plan_raw"], sample["rows"],
+                sample["owner_receipts"], output / "request.json",
+            )
+            request_raw = (output / "request.json").read_bytes()
+            manifest_pin = {
+                "path": str(root / "archive" / "objects" / "manifest.json"),
+                "raw_sha256": "a" * 64,
+                "semantic_sha256": "b" * 64,
+            }
+            checkpoint, checkpoint_pin = ARCHIVE.build_job_checkpoint(
+                request_pin, request_raw, sample["context"],
+                fixture["job_record_pin"], fixture["record_raw"],
+                fixture["plan_raw"], sample["rows"],
+                sample["owner_receipts"], manifest_pin,
+                output / "checkpoint.json",
+            )
+            checkpoint_raw = (output / "checkpoint.json").read_bytes()
+
+            archive_path = SCRIPT.with_name("application-source5-evidence-archive.py")
+            archive_raw = archive_path.read_bytes()
+            archive_info = archive_path.stat(follow_symlinks=False)
+            archive_mode = f"{stat.S_IFMT(archive_info.st_mode) | stat.S_IMODE(archive_info.st_mode):06o}"
+            archive_entry = {
+                "path": "scripts/application-source5-evidence-archive.py",
+                "kind": "file", "mode": archive_mode,
+                "sha256": FIXED.sha256_bytes(archive_raw),
+                "size": len(archive_raw),
+            }
+            host_ids = ("host-a", "host-b", "host-c")
+            source = {"source": {"files": [archive_entry]}}
+            owner_context = {
+                "source_root": SCRIPT.parent.parent.resolve(strict=True),
+                "sources": {host_id: source for host_id in host_ids},
+                "spec": {
+                    "schema": "allocatbelt.application-campaign-spec.v3",
+                    "hosts": [
+                        {"host_id": "host-a", "venue": "bare_metal",
+                         "host_fingerprint_sha256": "1" * 64, "controls": {}},
+                        {"host_id": "host-b", "venue": "kvm_guest",
+                         "host_fingerprint_sha256": "2" * 64, "controls": {}},
+                        {"host_id": "host-c", "venue": "kvm_guest",
+                         "host_fingerprint_sha256": "3" * 64, "controls": {}},
+                    ],
+                },
+                "controller": types.SimpleNamespace(
+                    qualification_host_count=lambda _spec: 3,
+                ),
+                "plan": fixture["plan"],
+            }
+            overlay = json.loads(sample["overlay_raw"])
+            execution_row = next(
+                row for row in sample["rows"]
+                if row["role"] == "component_receipt"
+            )
+            host_pin = fixture["record"]["evidence"]["host_receipt"]
+            prepared = {
+                "overlay": overlay,
+                "execution_receipt": json.loads(
+                    sample["owner_receipts"][execution_row["origin_path"]],
+                ),
+                "host_verification_receipt": json.loads(
+                    sample["owner_receipts"][host_pin["path"]],
+                ),
+                "host_verification_pin": host_pin,
+            }
+            proofs = FIXED._recorded_fixed_zero_tmp_proofs(
+                owner_context, prepared, checkpoint_pin, checkpoint_raw,
+            )
+            self.assertEqual(checkpoint["schema"], ARCHIVE.CHECKPOINT_SCHEMA_V3)
+            self.assertEqual(proofs, request["empty_tmp_proofs"])
+            self.assertEqual(len(proofs), 4)
+
+            reordered = dict(checkpoint)
+            reordered["empty_tmp_proofs"] = list(
+                reversed(checkpoint["empty_tmp_proofs"]),
+            )
+            checkpoint_body = {
+                key: value for key, value in reordered.items()
+                if key != "checkpoint_sha256"
+            }
+            reordered["checkpoint_sha256"] = FIXED.sha256_bytes(
+                FIXED.canonical_bytes(checkpoint_body),
+            )
+            reordered_raw = FIXED.canonical_bytes(reordered)
+            reordered_pin = {
+                "path": checkpoint_pin["path"],
+                "raw_sha256": FIXED.sha256_bytes(reordered_raw),
+                "semantic_sha256": reordered["checkpoint_sha256"],
+            }
+            with self.assertRaisesRegex(
+                FIXED.FixedPairError,
+                "SourceV5 archive rejected the recorded fixed checkpoint",
+            ):
+                FIXED._recorded_fixed_zero_tmp_proofs(
+                    owner_context, prepared, reordered_pin, reordered_raw,
+                )
 
 class CapturedFixedPairArtifactViewTests(unittest.TestCase):
     """Physical capture checks; synthetic origin metadata is never host proof."""

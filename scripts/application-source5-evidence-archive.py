@@ -23,8 +23,10 @@ from typing import Any, Iterable
 CONTEXT_SCHEMA_V1 = "allocatbelt.application-source5-evidence-archive-context.v1"
 REQUEST_SCHEMA_V1 = "allocatbelt.application-source5-evidence-checkpoint-request.v1"
 REQUEST_SCHEMA_V2 = "allocatbelt.application-source5-evidence-checkpoint-request.v2"
+REQUEST_SCHEMA_V3 = "allocatbelt.application-source5-evidence-checkpoint-request.v3"
 CHECKPOINT_SCHEMA_V1 = "allocatbelt.application-source5-evidence-job-checkpoint.v1"
 CHECKPOINT_SCHEMA_V2 = "allocatbelt.application-source5-evidence-job-checkpoint.v2"
+CHECKPOINT_SCHEMA_V3 = "allocatbelt.application-source5-evidence-job-checkpoint.v3"
 PROBE_TMPDIR_INVENTORY_SCHEMA_V1 = \
     "allocatbelt.application-feedback-probe-tmpdir-inventory.v1"
 FIXED_PAIR_OVERLAY_SCHEMA_V1 = \
@@ -242,6 +244,17 @@ _OPAQUE_TREE_CATALOGUE_CACHE: dict[
 ] = {}
 
 
+def _checkpoint_schema_for_request_schema(request_schema: object) -> str:
+    paired = {
+        REQUEST_SCHEMA_V1: CHECKPOINT_SCHEMA_V1,
+        REQUEST_SCHEMA_V2: CHECKPOINT_SCHEMA_V2,
+        REQUEST_SCHEMA_V3: CHECKPOINT_SCHEMA_V3,
+    }
+    _require(type(request_schema) is str and request_schema in paired,
+             "Source5 checkpoint request schema has no exact checkpoint pairing")
+    return paired[request_schema]
+
+
 class EvidenceArchiveError(ValueError):
     """A Source5 archive input, durable object, or signed ACK is invalid."""
 
@@ -284,6 +297,9 @@ def _checkpoint_metadata_limit(value: object) -> int:
     if type(value) is dict and value.get("schema") in {
             REQUEST_SCHEMA_V2, CHECKPOINT_SCHEMA_V2}:
         return MAX_ARCHIVE_REQUEST_CHECKPOINT_BYTES
+    if type(value) is dict and value.get("schema") in {
+            REQUEST_SCHEMA_V3, CHECKPOINT_SCHEMA_V3}:
+        return MAX_JSON_BYTES
     return MAX_JSON_BYTES
 
 
@@ -4418,9 +4434,31 @@ def _validate_tree_inventory_payloads(
         _validate_probe_capture_tree_receipt(tree, receipt, receipt_pin)
 
 
+def _fixed_pair_tmp_proof_shape(empty_tmp_proofs: object) -> bool:
+    if type(empty_tmp_proofs) is not list or len(empty_tmp_proofs) != 4 or \
+            any(type(item) is not dict for item in empty_tmp_proofs):
+        return False
+    member = [item for item in empty_tmp_proofs if "domain" not in item]
+    probes = [item for item in empty_tmp_proofs
+              if item.get("domain") == "probe_tmpdir"]
+    return (
+        len(member) == len(probes) == 2 and
+        all(item.get("role") == "component_receipt"
+            for item in empty_tmp_proofs) and
+        all(type(item.get("member_ordinal")) is int and
+            item["member_ordinal"] in (0, 1)
+            for item in empty_tmp_proofs) and
+        sorted(item.get("member_ordinal") for item in member) == [0, 1] and
+        sorted(item.get("member_ordinal") for item in probes) == [0, 1] and
+        all(item.get("domain") in (None, "probe_tmpdir")
+            for item in empty_tmp_proofs)
+    )
+
+
 def _require_success_tmp_proofs(
     record: dict[str, Any], empty_tmp_proofs: list[dict[str, Any]],
     *, require_probe_tmp_proofs: bool = False,
+    require_fixed_pair_tmp_proofs: bool = False,
 ) -> None:
     phase = record["job"]["phase"]
     state = record["state"]
@@ -4431,6 +4469,10 @@ def _require_success_tmp_proofs(
         )
         _require(members == [0, 1],
                  f"successful {phase} job lacks both owner-return zero TMPDIR facts")
+        if require_fixed_pair_tmp_proofs:
+            _require(phase in {"exploration", "aa", "confirmation"} and
+                     _fixed_pair_tmp_proof_shape(empty_tmp_proofs),
+                     "fixed-pair v3 checkpoint requires exactly four receipt-derived TMP proofs")
         if (require_probe_tmp_proofs and
                 phase in {"exploration", "aa", "confirmation"}):
             probe_members = sorted(
@@ -4453,12 +4495,18 @@ def _checkpoint_request_projection(
     plan_bytes: bytes, rows: Iterable[object],
     owner_receipt_bytes: dict[str, bytes],
     tree_inventories_value: object | None = None,
+    *, fixed_pair_request_v3: bool = False,
 ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
     if tree_inventories_value is not None:
         tree_inventories_value = list(tree_inventories_value)
         if not tree_inventories_value:
             tree_inventories_value = None
     checked_context = _validate_context(context)
+    if fixed_pair_request_v3:
+        _require(tree_inventories_value is None and
+                 checked_context["phase"] in {
+                     "exploration", "aa", "confirmation",
+                 }, "fixed-pair v3 checkpoint requests require a fixed phase and no tree inventories")
     record, authorization, identity = _validate_job_record(
         checked_context, job_record_pin, job_record_bytes, plan_bytes,
     )
@@ -4473,8 +4521,19 @@ def _checkpoint_request_projection(
         row["origin_path"] for row in checked_rows
         if _is_owner_receipt_role(row["role"])
     }
+    receipt_roles = {
+        row["role"] for row in checked_rows
+        if _is_owner_receipt_role(row["role"])
+    }
     _require(set(owner_receipt_bytes) == receipt_origins,
              "owner receipt byte set differs from the exact receipt-role closure")
+    if fixed_pair_request_v3:
+        _require(record["state"] == "valid_pair" and
+                 receipt_roles == {
+                     "component_receipt", "fixed_pair_host_receipt",
+                 } and
+                 record["evidence"].get("host_receipt") is not None,
+                 "fixed-pair v3 checkpoint requires the successful exact component and strict host receipts")
     by_origin = {row["origin_path"]: row for row in checked_rows}
     owner_pins: dict[str, dict[str, str]] = {}
     empty_proofs: list[dict[str, Any]] = []
@@ -4503,7 +4562,9 @@ def _checkpoint_request_projection(
         owner_pins[role] = receipt_pin
         empty_proofs.extend(_zero_usage_proofs(
             receipt, receipt_pin, role,
-            include_probe_tmp_proofs=tree_inventories_value is not None,
+            include_probe_tmp_proofs=(
+                fixed_pair_request_v3 or tree_inventories_value is not None
+            ),
         ))
     owner_pins = {role: owner_pins[role] for role in sorted(owner_pins)}
     _validate_fixed_pair_host_receipt_bindings(
@@ -4539,9 +4600,11 @@ def _checkpoint_request_projection(
     _require_success_tmp_proofs(
         record, empty_proofs,
         require_probe_tmp_proofs=tree_inventories_value is not None,
+        require_fixed_pair_tmp_proofs=fixed_pair_request_v3,
     )
     request_body = {
-        "schema": (REQUEST_SCHEMA_V1 if tree_inventories_value is None
+        "schema": (REQUEST_SCHEMA_V3 if fixed_pair_request_v3 else
+                   REQUEST_SCHEMA_V1 if tree_inventories_value is None
                    else REQUEST_SCHEMA_V2),
         "context": checked_context,
         "job_record_pin": job_pin,
@@ -4576,12 +4639,19 @@ def _validate_checkpoint_request(value: object) -> dict[str, Any]:
     if value.get("schema") == REQUEST_SCHEMA_V1:
         request = _exact(value, base_fields, "Source5 job checkpoint request v1")
         tree_inventories = None
+        fixed_pair_request_v3 = False
     elif value.get("schema") == REQUEST_SCHEMA_V2:
         request = _exact(value, base_fields | {"tree_inventories"},
                           "Source5 job checkpoint request v2")
         tree_inventories = request["tree_inventories"]
         _require(type(tree_inventories) is list and bool(tree_inventories),
                  "v2 checkpoint request requires at least one exact tree declaration")
+        fixed_pair_request_v3 = False
+    elif value.get("schema") == REQUEST_SCHEMA_V3:
+        request = _exact(value, base_fields,
+                         "fixed-pair Source5 checkpoint request v3")
+        tree_inventories = None
+        fixed_pair_request_v3 = True
     else:
         raise EvidenceArchiveError("Source5 job checkpoint request schema differs")
     context = _validate_context(request["context"])
@@ -4592,6 +4662,13 @@ def _validate_checkpoint_request(value: object) -> dict[str, Any]:
                  sorted(request["owner_receipt_pins"]) and
              type(request["empty_tmp_proofs"]) is list,
              "checkpoint-request receipt/predecessor facts are malformed")
+    if fixed_pair_request_v3:
+        _require(context["phase"] in {"exploration", "aa", "confirmation"} and
+                 set(request["owner_receipt_pins"]) == {
+                     "component_receipt", "fixed_pair_host_receipt",
+                 } and
+                 _fixed_pair_tmp_proof_shape(request["empty_tmp_proofs"]),
+                 "fixed-pair v3 request lacks its exact four-proof fixed closure")
     entries = _validate_rows(request["entries"])
     job_pin = _pin_raw(request["job_record_pin"],
                        "checkpoint-request job record pin")
@@ -4610,8 +4687,7 @@ def _validate_checkpoint_request(value: object) -> dict[str, Any]:
     # Validate proof/pin structure through the exact final-checkpoint validator
     # without inventing a manifest pin or publishing a final checkpoint.
     provisional = {
-        "schema": (CHECKPOINT_SCHEMA_V1 if tree_inventories is None
-                   else CHECKPOINT_SCHEMA_V2),
+        "schema": _checkpoint_schema_for_request_schema(request["schema"]),
         "request_pin": {
             "path": "/request.json", "raw_sha256": "0" * 64,
             "semantic_sha256": "0" * 64,
@@ -4674,6 +4750,45 @@ def build_checkpoint_request(
         os.close(parent_fd)
 
 
+def build_fixed_checkpoint_request_v3(
+    context: object, job_record_pin: object, job_record_bytes: bytes,
+    plan_bytes: bytes, rows: Iterable[object],
+    owner_receipt_bytes: dict[str, bytes],
+    output_path: str | os.PathLike[str],
+) -> tuple[dict[str, Any], dict[str, str]]:
+    """Write a fixed-only request with four receipt-derived TMP proofs."""
+    request, _record, _identity = _checkpoint_request_projection(
+        context, job_record_pin, job_record_bytes, plan_bytes, rows,
+        owner_receipt_bytes, fixed_pair_request_v3=True,
+    )
+    output = Path(_absolute_path(os.fspath(output_path),
+                                 "fixed-pair checkpoint-request output path"))
+    _require(output.parent.is_dir() and
+             output.parent.resolve(strict=True) == output.parent,
+             "fixed-pair checkpoint-request output parent is absent or aliased")
+    parent_fd = _open_dir_path(str(output.parent),
+                               "fixed-pair checkpoint-request output parent",
+                               private_final=True)
+    try:
+        raw = _canonical_checkpoint_metadata(request)
+        raw_sha, size = _write_at(
+            parent_fd, output.name, raw,
+            "fixed-pair v3 checkpoint request",
+        )
+        reopened, reopened_sha, _ = _read_at(
+            parent_fd, output.name, _checkpoint_metadata_limit(request),
+            "fixed-pair v3 checkpoint request", expected_bytes=size,
+        )
+        _require(reopened == raw and reopened_sha == raw_sha,
+                 "fixed-pair v3 checkpoint request failed independent reopen verification")
+        return request, {
+            "path": str(output), "raw_sha256": raw_sha,
+            "semantic_sha256": request["request_sha256"],
+        }
+    finally:
+        os.close(parent_fd)
+
+
 def build_job_checkpoint(
     request_pin: object, request_bytes: bytes,
     context: object, job_record_pin: object, job_record_bytes: bytes,
@@ -4687,9 +4802,11 @@ def build_job_checkpoint(
         request_bytes, "checkpoint request",
     ))
     tree_inventories = parsed_request.get("tree_inventories")
+    fixed_pair_request_v3 = parsed_request["schema"] == REQUEST_SCHEMA_V3
     request, _record, _identity = _checkpoint_request_projection(
         context, job_record_pin, job_record_bytes, plan_bytes, rows,
         owner_receipt_bytes, tree_inventories,
+        fixed_pair_request_v3=fixed_pair_request_v3,
     )
     checked_request_pin = _pin(request_pin, "checkpoint request pin")
     _require(type(request_bytes) is bytes and
@@ -4701,8 +4818,7 @@ def build_job_checkpoint(
     checked_context = _validate_context(context)
     job_pin = _pin_raw(job_record_pin, "Source5 job record pin")
     checkpoint_body = {
-        "schema": (CHECKPOINT_SCHEMA_V1 if tree_inventories is None
-                   else CHECKPOINT_SCHEMA_V2),
+        "schema": _checkpoint_schema_for_request_schema(request["schema"]),
         "request_pin": checked_request_pin,
         "context": checked_context,
         "job_record_pin": job_pin,
@@ -4758,12 +4874,19 @@ def _validate_checkpoint(
     if value.get("schema") == CHECKPOINT_SCHEMA_V1:
         checkpoint = _exact(value, base_fields, "Source5 job checkpoint v1")
         tree_inventories = None
+        fixed_pair_checkpoint_v3 = False
     elif value.get("schema") == CHECKPOINT_SCHEMA_V2:
         checkpoint = _exact(value, base_fields | {"tree_inventories"},
                              "Source5 job checkpoint v2")
         tree_inventories = checkpoint["tree_inventories"]
         _require(type(tree_inventories) is list and bool(tree_inventories),
                  "v2 checkpoint requires at least one exact tree declaration")
+        fixed_pair_checkpoint_v3 = False
+    elif value.get("schema") == CHECKPOINT_SCHEMA_V3:
+        checkpoint = _exact(value, base_fields,
+                             "fixed-pair Source5 job checkpoint v3")
+        tree_inventories = None
+        fixed_pair_checkpoint_v3 = True
     else:
         raise EvidenceArchiveError("Source5 job checkpoint schema differs")
     _pin(checkpoint["request_pin"], "checkpoint request pin")
@@ -4776,6 +4899,13 @@ def _validate_checkpoint(
                  sorted(checkpoint["owner_receipt_pins"]) and
              type(checkpoint["empty_tmp_proofs"]) is list,
              "checkpoint receipt or TMP proof maps are malformed")
+    if fixed_pair_checkpoint_v3:
+        _require(context["phase"] in {"exploration", "aa", "confirmation"} and
+                 set(checkpoint["owner_receipt_pins"]) == {
+                     "component_receipt", "fixed_pair_host_receipt",
+                 } and
+                 _fixed_pair_tmp_proof_shape(checkpoint["empty_tmp_proofs"]),
+                 "fixed-pair v3 checkpoint lacks its exact four-proof fixed closure")
     entries = _validate_rows(checkpoint["entries"])
     if tree_inventories is not None:
         _validate_tree_inventories(
@@ -4804,6 +4934,9 @@ def _validate_checkpoint(
         _require(checkpoint["owner_receipt_pins"].get(role) == owner_pin and
                  proof.get("bytes_used") == 0,
                  "empty TMP proof is not tied to its exact zero-usage owner receipt")
+        if fixed_pair_checkpoint_v3:
+            _uint(proof.get("bytes_used"),
+                  "fixed-pair v3 TMP proof byte count")
         if proof.get("domain") == "application_tmpdir":
             _exact(proof, {
                 "role", "path", "owner_receipt_pin", "member_ordinal",
@@ -4814,7 +4947,9 @@ def _validate_checkpoint(
             _require(proof["inode_count"] == 0,
                      "Soak application TMPDIR inode count is not zero")
             _digest(proof["inventory_sha256"], "Soak TMP inventory digest")
-        elif checkpoint["schema"] == CHECKPOINT_SCHEMA_V2 and \
+        elif checkpoint["schema"] in {
+                CHECKPOINT_SCHEMA_V2, CHECKPOINT_SCHEMA_V3,
+        } and \
                 proof.get("domain") == "probe_tmpdir":
             _exact(proof, {
                 "role", "path", "owner_receipt_pin", "member_ordinal",
@@ -4836,6 +4971,9 @@ def _validate_checkpoint(
                 "mount_id", "major_minor", "mount_root", "mount_point",
                 "filesystem_type", "mount_source", "device",
             }, "ProbeV2 empty TMP mount")
+            if fixed_pair_checkpoint_v3:
+                _uint(mount["device"],
+                      "fixed-pair v3 probe TMP mount device")
             _require(mount["device"] == proof["device"],
                      "ProbeV2 empty TMP mount device differs")
         else:
@@ -4858,6 +4996,9 @@ def _validate_checkpoint(
                 "mount_id", "major_minor", "mount_root", "mount_point",
                 "filesystem_type", "mount_source", "device",
             }, "empty TMP proof mount")
+            if fixed_pair_checkpoint_v3:
+                _uint(mount["device"],
+                      "fixed-pair v3 member TMP mount device")
             _require(mount["device"] == proof["device"],
                      "empty TMP mount device differs from the owner proof")
         proof_order.append((role, proof["member_ordinal"],
@@ -5839,6 +5980,7 @@ def archive_job_checkpoint(
     request, _request_record, job_identity = _checkpoint_request_projection(
         checked_context, job_record_pin, job_record_bytes, plan_bytes, rows,
         owner_receipt_bytes, tree_inventories,
+        fixed_pair_request_v3=request_value["schema"] == REQUEST_SCHEMA_V3,
     )
     _require(request_value == request and
              checked_request_pin["semantic_sha256"] == request["request_sha256"],
@@ -6582,8 +6724,14 @@ def _verify_owner_receipt_bytes(
         expected_proofs = _zero_usage_proofs(
             receipt, pin, role,
             include_probe_tmp_proofs=(
-                checkpoint["schema"] == CHECKPOINT_SCHEMA_V2
+                checkpoint["schema"] in {
+                    CHECKPOINT_SCHEMA_V2, CHECKPOINT_SCHEMA_V3,
+                }
             ),
+        )
+        expected_proofs.sort(
+            key=lambda item: (item["role"], item["member_ordinal"],
+                              item.get("domain", "")),
         )
         if expected_proofs:
             matching = [item for item in checkpoint["empty_tmp_proofs"]
@@ -6730,6 +6878,9 @@ def _verify_signed_ack_metadata(
         require_probe_tmp_proofs=(
             checked_checkpoint["schema"] == CHECKPOINT_SCHEMA_V2
         ),
+        require_fixed_pair_tmp_proofs=(
+            checked_checkpoint["schema"] == CHECKPOINT_SCHEMA_V3
+        ),
     )
 
     request_pin = _pin(checked_checkpoint["request_pin"],
@@ -6739,6 +6890,8 @@ def _verify_signed_ack_metadata(
     )
     _require(_sha(request_raw) == request_pin["raw_sha256"] and
              request["request_sha256"] == request_pin["semantic_sha256"] and
+             checked_checkpoint["schema"] ==
+                 _checkpoint_schema_for_request_schema(request["schema"]) and
              request["context"] == context and
              request["job_record_pin"] == checked_job_pin and
              request["authorization"] == authorization and
@@ -7161,6 +7314,9 @@ def verify_durable_ack(
         require_probe_tmp_proofs=(
             checked_checkpoint["schema"] == CHECKPOINT_SCHEMA_V2
         ),
+        require_fixed_pair_tmp_proofs=(
+            checked_checkpoint["schema"] == CHECKPOINT_SCHEMA_V3
+        ),
     )
     if expected_predecessor is None:
         _require(checked_checkpoint["predecessor_ack_pin"] is None,
@@ -7360,9 +7516,12 @@ def verify_durable_ack(
             checked_context, job_record_pin, job_record_bytes, plan_bytes,
             checked_checkpoint["entries"], owner_receipt_bytes,
             checked_checkpoint.get("tree_inventories"),
+            fixed_pair_request_v3=(request["schema"] == REQUEST_SCHEMA_V3),
         )
     _require(_sha(request_raw) == request_pin["raw_sha256"] and
              request_pin["semantic_sha256"] == request["request_sha256"] and
+             checked_checkpoint["schema"] ==
+                 _checkpoint_schema_for_request_schema(request["schema"]) and
              request == expected_request and
              request["context"] == checked_context and
              request["job_record_pin"] == checked_checkpoint["job_record_pin"] and
@@ -7733,7 +7892,9 @@ def reclaim_acknowledged_local_paths(
         for tree in checked.get("tree_inventories", [])
         for entry in tree["entries"] if entry["kind"] == "file"
     }
-    if checked["schema"] == CHECKPOINT_SCHEMA_V2:
+    if checked["schema"] in {
+            CHECKPOINT_SCHEMA_V2, CHECKPOINT_SCHEMA_V3,
+    }:
         record, _authorization, _identity = _validate_job_record(
             checked["context"], checked["job_record_pin"],
             job_record_bytes, plan_bytes,
@@ -7742,6 +7903,7 @@ def reclaim_acknowledged_local_paths(
             checked, checked_stage_map, os.fspath(staging_root),
             record,
         )
+    if checked["schema"] == CHECKPOINT_SCHEMA_V2:
         for tree in checked["tree_inventories"]:
             receipt_pin = tree["owner_receipt_pin"]
             receipt_raw = owner_receipts[receipt_pin["path"]]

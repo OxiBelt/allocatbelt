@@ -196,13 +196,20 @@ def selected_budget_source_fixture() -> tuple[bytes, dict, bytes]:
 def fixed_host_receipt_fixture(
     root: Path, *, state: str = "invalid_pair",
 ) -> dict:
-    """Build the actual H14 fixed host-receipt and pinned object projection."""
+    """Build structural H14 closure metadata; this is not APP execution evidence."""
     fixture = source5_fixture(root, state=state)
     job = fixture["job"]
     overlay_path = str(root / "pair" / "fixed-pair-execution-overlay.json")
     execution_path = str(root / "pair" / "fixed-pair-execution-receipt.json")
     host_receipt_path = str(root / "fixed-host-receipts" / "job.json")
     observed_path = str(root / "inputs" / "observed-host.json")
+    source_manifest_path = str(root / "source.json")
+    source_manifest_raw = b"source"
+    source_manifest_pin = {
+        "path": source_manifest_path,
+        "raw_sha256": sha(source_manifest_raw),
+        "semantic_sha256": sha(source_manifest_raw),
+    }
     static_mount = {
         "mount_id": 41, "major_minor": "8:1", "mount_root": "/",
         "mount_point": "/tmp", "filesystem_type": "ext4",
@@ -221,7 +228,11 @@ def fixed_host_receipt_fixture(
                            "sha256": fixture["plan_pin"]["raw_sha256"]},
                  "semantic_sha256": fixture["plan_pin"]["semantic_sha256"]},
         "sources": {
-            "manifests": {},
+            "manifests": {"host-a": {
+                "pin": {"path": source_manifest_path,
+                        "sha256": source_manifest_pin["raw_sha256"]},
+                "manifest_sha256": source_manifest_pin["semantic_sha256"],
+            }},
             "selected": {
                 "host_id": "host-a", "root": str(root / "source"),
                 "git_commit": "a" * 40, "source_tree_sha256": "b" * 64,
@@ -266,6 +277,17 @@ def fixed_host_receipt_fixture(
             {"ordinal": ordinal, "tmpdir_final": {
                 "path": str(root / f"member-{ordinal}-tmp"),
                 "device": 8, "inode": 100 + ordinal, "mode": 0o700,
+                "mount": static_mount, "bytes_used": 0,
+                "file_count": 0, "directory_count": 0,
+                "bytes_limit": 1024, "inode_limit": 64,
+                "available_bytes": 4096, "available_inodes": 128,
+            }}
+            for ordinal in range(2)
+        ]
+        execution_body["construction_probes"] = [
+            {"member_ordinal": ordinal, "tmpdir_final": {
+                "path": str(root / f"probe-{ordinal}-tmp"),
+                "device": 8, "inode": 200 + ordinal, "mode": 0o700,
                 "mount": static_mount, "bytes_used": 0,
                 "file_count": 0, "directory_count": 0,
                 "bytes_limit": 1024, "inode_limit": 64,
@@ -995,6 +1017,213 @@ class CheckpointRequestTests(unittest.TestCase):
                     output / "bad-request.json",
                 )
             self.assertFalse((output / "bad-request.json").exists())
+
+
+class FixedCheckpointRequestV3Tests(unittest.TestCase):
+    """Structural archive fixture; it does not claim native APP execution."""
+
+    def _request(self, root: Path):
+        output = private(root / "output")
+        sample = fixed_host_receipt_fixture(root, state="valid_pair")
+        fixture = sample["fixture"]
+        request, request_pin = archive.build_fixed_checkpoint_request_v3(
+            sample["context"], fixture["job_record_pin"],
+            fixture["record_raw"], fixture["plan_raw"], sample["rows"],
+            sample["owner_receipts"], output / "fixed-request.json",
+        )
+        return output, sample, request, request_pin
+
+    def test_fixed_v3_request_and_checkpoint_round_trip_four_receipt_proofs(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="source5-fixed-checkpoint-v3-") as tmp:
+            root = Path(tmp)
+            output, sample, request, request_pin = self._request(root)
+            fixture = sample["fixture"]
+            self.assertEqual(request["schema"], archive.REQUEST_SCHEMA_V3)
+            self.assertEqual(set(request), {
+                "schema", "context", "job_record_pin", "authorization",
+                "predecessor_ack_pin", "owner_receipt_pins", "empty_tmp_proofs",
+                "entries", "request_sha256",
+            })
+            self.assertNotIn("tree_inventories", request)
+            self.assertEqual(len(request["empty_tmp_proofs"]), 4)
+            self.assertEqual(
+                [(proof["member_ordinal"], proof.get("domain"))
+                 for proof in request["empty_tmp_proofs"]],
+                [(0, None), (0, "probe_tmpdir"),
+                 (1, None), (1, "probe_tmpdir")],
+            )
+            component_pin = request["owner_receipt_pins"]["component_receipt"]
+            component_receipt = json.loads(
+                sample["owner_receipts"][component_pin["path"]],
+            )
+            derived = archive._zero_fixed_tmp_proofs(
+                component_receipt, component_pin, "component_receipt",
+                include_probe_tmp_proofs=True,
+            )
+            derived.sort(key=lambda item: (
+                item["role"], item["member_ordinal"], item.get("domain", ""),
+            ))
+            self.assertEqual(request["empty_tmp_proofs"], derived)
+            self.assertEqual(archive._validate_checkpoint_request(request), request)
+            self.assertEqual(archive._checkpoint_metadata_limit(request),
+                             archive.MAX_JSON_BYTES)
+
+            request_raw = (output / "fixed-request.json").read_bytes()
+            manifest_pin = {
+                "path": str(root / "archive" / "objects" / "manifest.json"),
+                "raw_sha256": "a" * 64, "semantic_sha256": "b" * 64,
+            }
+            checkpoint, checkpoint_pin = archive.build_job_checkpoint(
+                request_pin, request_raw, sample["context"],
+                fixture["job_record_pin"], fixture["record_raw"],
+                fixture["plan_raw"], sample["rows"],
+                sample["owner_receipts"], manifest_pin,
+                output / "fixed-checkpoint.json",
+            )
+            self.assertEqual(checkpoint["schema"], archive.CHECKPOINT_SCHEMA_V3)
+            self.assertEqual(set(checkpoint), {
+                "schema", "request_pin", "context", "job_record_pin",
+                "authorization", "predecessor_ack_pin", "owner_receipt_pins",
+                "empty_tmp_proofs", "object_manifest_pin", "entries",
+                "checkpoint_sha256",
+            })
+            self.assertEqual(checkpoint["empty_tmp_proofs"], derived)
+            self.assertEqual(archive._validate_checkpoint(checkpoint), checkpoint)
+            self.assertEqual(checkpoint_pin["semantic_sha256"],
+                             checkpoint["checkpoint_sha256"])
+            self.assertEqual(archive._checkpoint_metadata_limit(checkpoint),
+                             archive.MAX_JSON_BYTES)
+
+            staging = root / "staging"
+            staging.mkdir(mode=0o700)
+            stage_rows = []
+            owner_receipts = dict(sample["owner_receipts"])
+            owner_receipts[next(
+                row["origin_path"] for row in sample["rows"]
+                if row["role"] == "fixed_pair_artifact"
+            )] = sample["overlay_raw"]
+            for index, entry in enumerate(checkpoint["entries"]):
+                raw = owner_receipts[entry["origin_path"]]
+                local = staging / f"{index:04d}"
+                local.write_bytes(raw)
+                local.chmod(0o600)
+                info = local.lstat()
+                local_pin = {
+                    "path": str(local), "kind": "regular",
+                    "device": info.st_dev, "inode": info.st_ino,
+                    "mode": stat.S_IMODE(info.st_mode),
+                    "byte_count": len(raw), "raw_sha256": sha(raw),
+                }
+                stage_rows.append({
+                    "origin_path": entry["origin_path"],
+                    "object_id": archive._object_identity(
+                        entry["origin_path"], entry["raw_sha256"],
+                    ),
+                    "remote_object_pin": {},
+                    "local_staged_file": local_pin,
+                })
+            verified_receipts = archive._verify_owner_receipt_bytes(
+                checkpoint, {"rows": stage_rows}, str(staging), fixture["record"],
+            )
+            self.assertEqual(verified_receipts, sample["owner_receipts"])
+
+            legacy, _legacy_pin = archive.build_checkpoint_request(
+                sample["context"], fixture["job_record_pin"],
+                fixture["record_raw"], fixture["plan_raw"], sample["rows"],
+                sample["owner_receipts"], output / "legacy-request.json",
+            )
+            self.assertEqual(legacy["schema"], archive.REQUEST_SCHEMA_V1)
+            self.assertEqual(len(legacy["empty_tmp_proofs"]), 2)
+            self.assertNotIn("tree_inventories", legacy)
+
+    def test_fixed_v3_rejects_reordered_duplicate_and_unjoined_proofs(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="source5-fixed-checkpoint-v3-negative-") as tmp:
+            root = Path(tmp)
+            _output, _sample, request, _request_pin = self._request(root)
+
+            def rehash_request(value):
+                body = {key: item for key, item in value.items()
+                        if key != "request_sha256"}
+                value["request_sha256"] = sha(canonical(body))
+                return value
+
+            reordered = dict(request)
+            reordered["empty_tmp_proofs"] = list(
+                reversed(request["empty_tmp_proofs"]),
+            )
+            with self.assertRaisesRegex(archive.EvidenceArchiveError,
+                                        "not sorted unique"):
+                archive._validate_checkpoint_request(rehash_request(reordered))
+
+            duplicate = dict(request)
+            duplicate["empty_tmp_proofs"] = [
+                dict(proof) for proof in request["empty_tmp_proofs"]
+            ]
+            duplicate["empty_tmp_proofs"][1] = dict(
+                duplicate["empty_tmp_proofs"][0],
+            )
+            with self.assertRaisesRegex(archive.EvidenceArchiveError,
+                                        "four-proof fixed closure"):
+                archive._validate_checkpoint_request(rehash_request(duplicate))
+
+            malformed_ordinal = dict(request)
+            malformed_ordinal["empty_tmp_proofs"] = [
+                dict(proof) for proof in request["empty_tmp_proofs"]
+            ]
+            malformed_ordinal["empty_tmp_proofs"][0]["member_ordinal"] = "0"
+            with self.assertRaisesRegex(archive.EvidenceArchiveError,
+                                        "four-proof fixed closure"):
+                archive._validate_checkpoint_request(
+                    rehash_request(malformed_ordinal),
+                )
+
+            unjoined = dict(request)
+            unjoined["empty_tmp_proofs"] = [
+                {**proof, "owner_receipt_pin": dict(proof["owner_receipt_pin"])}
+                for proof in request["empty_tmp_proofs"]
+            ]
+            unjoined["empty_tmp_proofs"][0]["owner_receipt_pin"]["raw_sha256"] = "f" * 64
+            with self.assertRaisesRegex(archive.EvidenceArchiveError,
+                                        "exact zero-usage owner receipt"):
+                archive._validate_checkpoint_request(rehash_request(unjoined))
+
+            boolean_count = dict(request)
+            boolean_count["empty_tmp_proofs"] = [
+                dict(proof) for proof in request["empty_tmp_proofs"]
+            ]
+            boolean_count["empty_tmp_proofs"][0]["bytes_used"] = False
+            with self.assertRaisesRegex(archive.EvidenceArchiveError,
+                                        "finite integer bound"):
+                archive._validate_checkpoint_request(rehash_request(boolean_count))
+
+            with_tree = dict(request, tree_inventories=[])
+            with self.assertRaisesRegex(archive.EvidenceArchiveError,
+                                        "unexpected field set"):
+                archive._validate_checkpoint_request(rehash_request(with_tree))
+
+            wrong_phase = dict(request)
+            wrong_phase["context"] = dict(request["context"], phase="soak")
+            with self.assertRaisesRegex(archive.EvidenceArchiveError,
+                                        "four-proof fixed closure"):
+                archive._validate_checkpoint_request(rehash_request(wrong_phase))
+
+            failed_root = root / "failed-job"
+            failed_root.mkdir(mode=0o700)
+            failed = fixed_host_receipt_fixture(
+                failed_root, state="invalid_pair",
+            )
+            failed_output = private(failed_root / "output")
+            with self.assertRaisesRegex(
+                archive.EvidenceArchiveError,
+                "successful exact component and strict host receipts",
+            ):
+                archive.build_fixed_checkpoint_request_v3(
+                    failed["context"], failed["fixture"]["job_record_pin"],
+                    failed["fixture"]["record_raw"],
+                    failed["fixture"]["plan_raw"], failed["rows"],
+                    failed["owner_receipts"], failed_output / "must-not-exist.json",
+                )
+            self.assertFalse((failed_output / "must-not-exist.json").exists())
 
 
 class ExecutionManifestSignerBindingTests(unittest.TestCase):

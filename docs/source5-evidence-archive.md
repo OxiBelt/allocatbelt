@@ -347,3 +347,25 @@ or catalogue files. It retains the complete Source-owned preparation, width,
 plan, catalogue and budget checks. This route requires captured keyring bytes,
 rejects mixed physical dependency maps, and does not extend reclaim authority.
 The original host and six-copy cache routes keep their existing behavior.
+
+## Fixed checkpoints with construction-probe proofs
+
+`build_fixed_checkpoint_request_v3` derives four empty-TMP proofs from a
+successful Fixed receipt: both APP members and both construction probes. It
+requires the strict Fixed host receipt and preserves the original job,
+authorization and owner pins. Request/checkpoint V3 use the V1 base fields
+without a tree-inventory field. Their metadata ceiling is 32 MiB.
+
+Checkpoint construction, transfer and recorded Fixed replay retain the exact
+request/checkpoint version and canonical member/probe proof order. V1's
+default two-member route and V2's genuine nonempty tree-inventory route retain
+their existing contracts. V3 adds no payload tree or APP invocation. Source
+budget activation must separately select and reserve the four-proof profile;
+generic V3 parsing alone does not admit a campaign.
+
+Recorded Fixed replay also accepts an explicit bounded `global_artifact_reader`
+for historical Spec, Plan, Source JSON and host-observation metadata. It checks
+the original raw pins and canonical bytes without opening ambient historical
+paths. Source code, executables, prepared inputs and oracles retain their
+resident checks. This byte-reader extension grants no signature or launch
+authority.

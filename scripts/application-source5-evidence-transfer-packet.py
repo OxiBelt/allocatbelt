@@ -23,6 +23,7 @@ from typing import Any, BinaryIO, Iterable
 
 REQUEST_SCHEMA = "allocatbelt.application-source5-evidence-checkpoint-request.v1"
 REQUEST_SCHEMA_V2 = "allocatbelt.application-source5-evidence-checkpoint-request.v2"
+REQUEST_SCHEMA_V3 = "allocatbelt.application-source5-evidence-checkpoint-request.v3"
 PROBE_TMPDIR_INVENTORY_SCHEMA_V1 = \
     "allocatbelt.application-feedback-probe-tmpdir-inventory.v1"
 PACKET_PIN_SCHEMA = "allocatbelt.application-source5-evidence-transfer-packet-pin.v1"
@@ -2911,6 +2912,57 @@ def _budget_limits(
             max_ack_bundle, max_signature)
 
 
+def _validate_fixed_v3_tmp_proofs(request: dict[str, Any]) -> None:
+    """Check the closed Fixed wire profile; owner bytes are verified by Archive."""
+    _require(request["context"]["phase"] in {
+                 "exploration", "aa", "confirmation",
+             } and set(request["owner_receipt_pins"]) == {
+                 "component_receipt", "fixed_pair_host_receipt",
+             }, "v3 request requires the strict Fixed owner profile")
+    proofs = request["empty_tmp_proofs"]
+    _require(len(proofs) == 4,
+             "v3 request requires all four Fixed TMP proofs")
+    expected_order = [("component_receipt", ordinal, domain)
+                      for ordinal in (0, 1)
+                      for domain in ("", "probe_tmpdir")]
+    order = []
+    for index, proof_value in enumerate(proofs):
+        _require(type(proof_value) is dict,
+                 f"v3 TMP proof[{index}] is not an object")
+        fields = {
+            "role", "path", "owner_receipt_pin", "member_ordinal",
+            "device", "inode", "mode", "mount", "bytes_used",
+            "file_count", "directory_count", "bytes_limit", "inode_limit",
+        }
+        if proof_value.get("domain") == "probe_tmpdir":
+            fields.add("domain")
+        proof = _exact(proof_value, fields, f"v3 TMP proof[{index}]")
+        _require(proof["role"] == "component_receipt" and
+                 _pin(proof["owner_receipt_pin"], "v3 TMP owner pin") ==
+                    request["owner_receipt_pins"]["component_receipt"],
+                 "v3 TMP proof differs from the exact Fixed owner pin")
+        _path(proof["path"], "v3 TMP path")
+        for field in ("member_ordinal", "device", "inode", "mode",
+                      "bytes_used", "file_count", "directory_count",
+                      "bytes_limit", "inode_limit"):
+            _uint(proof[field], f"v3 TMP proof {field}")
+        _require(proof["inode"] > 0 and proof["mode"] == 0o700 and
+                 proof["bytes_used"] == proof["file_count"] ==
+                    proof["directory_count"] == 0 and
+                 proof["bytes_limit"] > 0 and proof["inode_limit"] > 0,
+                 "v3 TMP proof counters or private identity differ")
+        mount = _exact(proof["mount"], {
+            "mount_id", "major_minor", "mount_root", "mount_point",
+            "filesystem_type", "mount_source", "device",
+        }, "v3 TMP mount")
+        _require(mount["device"] == proof["device"],
+                 "v3 TMP mount device differs")
+        order.append((proof["role"], proof["member_ordinal"],
+                      proof.get("domain", "")))
+    _require(order == expected_order,
+             "v3 TMP proofs must be the canonical four member/probe facts")
+
+
 def _validate_request(value: object) -> dict[str, Any]:
     base_fields = {
         "schema", "context", "job_record_pin", "authorization",
@@ -2918,8 +2970,8 @@ def _validate_request(value: object) -> dict[str, Any]:
         "entries", "request_sha256",
     }
     _require(type(value) is dict, "checkpoint request is not an object")
-    if value.get("schema") == REQUEST_SCHEMA:
-        request = _exact(value, base_fields, "checkpoint request v1")
+    if value.get("schema") in {REQUEST_SCHEMA, REQUEST_SCHEMA_V3}:
+        request = _exact(value, base_fields, "checkpoint request v1/v3")
         tree_inventories = None
     elif value.get("schema") == REQUEST_SCHEMA_V2:
         request = _exact(value, base_fields | {"tree_inventories"},
@@ -3010,6 +3062,8 @@ def _validate_request(value: object) -> dict[str, Any]:
         _validate_tree_inventories(
             tree_inventories, rows, request["owner_receipt_pins"],
         )
+    if request["schema"] == REQUEST_SCHEMA_V3:
+        _validate_fixed_v3_tmp_proofs(request)
     authorization = _exact(request["authorization"], {
         "authorization_id", "authorization_head", "terminal_head",
         "component_sha256", "process_metrics_sha256",
@@ -3413,7 +3467,7 @@ def publish_transfer_offer(
     )
     context = request["context"]
     _validate_budget_origin_pins(budget, context)
-    if request["schema"] == REQUEST_SCHEMA_V2:
+    if request["schema"] in {REQUEST_SCHEMA_V2, REQUEST_SCHEMA_V3}:
         _entry_catalogue_rows(request, budget)
     limits = _budget_limits(
         budget_raw, budget_pin_checked, context["campaign_id"],
@@ -4594,6 +4648,11 @@ def _validate_ack_bundle_documents(
                "final checkpoint v2")
         request_schema = REQUEST_SCHEMA_V2
         tree_inventories = checkpoint["tree_inventories"]
+    elif checkpoint.get("schema") == \
+            "allocatbelt.application-source5-evidence-job-checkpoint.v3":
+        _exact(checkpoint, checkpoint_base_fields, "final checkpoint v3")
+        request_schema = REQUEST_SCHEMA_V3
+        tree_inventories = None
     else:
         raise TransferPacketError("final checkpoint schema differs")
     request_pin = _pin(checkpoint["request_pin"], "checkpoint request pin")
