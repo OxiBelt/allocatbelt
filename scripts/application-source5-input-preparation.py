@@ -18,7 +18,7 @@ import stat
 import sys
 import types
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 
 SOURCE_ROOT = Path(__file__).resolve().parent.parent
@@ -199,6 +199,7 @@ def _capture_typed_source_file(
 def _load_source5_stack(
     sources: dict[str, dict[str, Any]], source_root: Path,
     expected_module_pins: dict[str, dict[str, dict[str, str]]] | None = None,
+    *, metadata_only: bool = False,
 ) -> tuple[types.ModuleType, types.ModuleType, types.ModuleType, dict[str, dict[str, tuple[bytes, Path, dict[str, Any]]]]]:
     """Capture the inventory, inputs and controller before executing any of them."""
     _require(type(sources) is dict and len(sources) in (2, 3),
@@ -279,13 +280,17 @@ def _load_source5_stack(
 
     campaign.source_inventory_module = pinned_inventory_module
     campaign.campaign_inputs_module = pinned_campaign_inputs_module
+    _require(type(metadata_only) is bool,
+             "SourceV5 metadata-only stack selector is malformed")
     try:
         for host_id, source in sources.items():
             campaign.verify_source_manifest(
-                source, source_root=source_root, verify_artifacts=True,
+                source, source_root=source_root,
+                verify_artifacts=not metadata_only,
             )
     except Exception as error:
-        raise PreparationError(f"captured SourceV5 full manifest verifier rejected the cohort: {error}") from error
+        mode = "metadata" if metadata_only else "full"
+        raise PreparationError(f"captured SourceV5 {mode} manifest verifier rejected the cohort: {error}") from error
     if expected_module_pins is not None:
         for host_id, source in sources.items():
             modules = expected_module_pins[host_id]
@@ -427,10 +432,13 @@ def build_preparation_intent(
         raise PreparationError(f"Source5 preparation intent validation/build failed: {error}") from error
 
 
-def read_preparation_intent(
+def _read_preparation_intent_impl(
     preparation_pin: dict[str, Any], source_root: Path, input_root: Path,
+    *, metadata_only: bool = False,
 ) -> tuple[dict[str, Any], dict[str, dict[str, Any]], dict[str, Any], dict[str, Any]]:
-    """Load and recheck the full profile-bound SourceV5 host set."""
+    """Load and recheck the complete profile-bound SourceV5 host set."""
+    _require(type(metadata_only) is bool,
+             "SourceV5 metadata-only intent selector is malformed")
     source_root = _safe_root(source_root, "SourceV5 root")
     input_root = _safe_root(input_root, "preparation input root")
     pin = _exact(preparation_pin, {"path", "sha256"}, "preparation raw pin")
@@ -473,6 +481,7 @@ def read_preparation_intent(
         source_values[host_id] = source
     campaign, inputs, _inventory, _critical_modules = _load_source5_stack(
         source_values, source_root, expected_module_pins,
+        metadata_only=metadata_only,
     )
     try:
         validated_core = inputs._validate_preparation_core(core_value)
@@ -501,6 +510,24 @@ def read_preparation_intent(
         raise PreparationError(f"Source5 preparation intent replay failed: {error}") from error
     _require(value["preparation_sha256"] == validation["preparation_sha256"], "preparation semantic digest differs after input replay")
     return value, source_values, campaign, inputs
+
+
+def read_preparation_intent(
+    preparation_pin: dict[str, Any], source_root: Path, input_root: Path,
+) -> tuple[dict[str, Any], dict[str, dict[str, Any]], dict[str, Any], dict[str, Any]]:
+    """Load and recheck the full profile-bound SourceV5 host set."""
+    return _read_preparation_intent_impl(
+        preparation_pin, source_root, input_root, metadata_only=False,
+    )
+
+
+def read_preparation_intent_metadata_v1(
+    preparation_pin: dict[str, Any], source_root: Path, input_root: Path,
+) -> tuple[dict[str, Any], dict[str, dict[str, Any]], dict[str, Any], dict[str, Any]]:
+    """Replay real Source code and current input pins without requiring peer ELFs locally."""
+    return _read_preparation_intent_impl(
+        preparation_pin, source_root, input_root, metadata_only=True,
+    )
 
 
 def capacity_bundle_pin(entry: dict[str, Any], source_manifest_pin: dict[str, Any]) -> dict[str, Any]:
@@ -537,6 +564,78 @@ def _read_pinned_json(
         raise PreparationError(f"{label} is not bounded UTF-8 JSON: {error}") from error
     _require(type(value) is dict and _canonical(value) == raw, f"{label} is not canonical JSON")
     return value, raw, actual
+
+
+def _read_recorded_global_json_pin(
+    pin_value: dict[str, Any], label: str, maximum: int,
+    global_artifact_reader: Callable[[dict[str, str], int], bytes],
+) -> tuple[dict[str, Any], bytes, str]:
+    """Read historical metadata only as bounded bytes from the closed reader."""
+    pin = _exact(pin_value, {"path", "sha256"}, f"{label} historical raw pin")
+    path_text = pin["path"]
+    _require(type(path_text) is str and path_text.startswith("/") and
+             str(Path(path_text)) == path_text and ".." not in Path(path_text).parts and
+             "\x00" not in path_text and type(maximum) is int and maximum > 0 and
+             callable(global_artifact_reader),
+             f"{label} historical identity or captured byte bound is malformed")
+    expected = pin["sha256"]
+    _require(type(expected) is str and len(expected) == 64 and
+             all(char in "0123456789abcdef" for char in expected),
+             f"{label} historical raw SHA-256 is malformed")
+    try:
+        raw = global_artifact_reader({"path": path_text, "raw_sha256": expected}, maximum)
+    except Exception as error:
+        raise PreparationError(
+            f"{label} closed historical reader refused its exact raw pin: {error}",
+        ) from error
+    _require(type(raw) is bytes and 0 < len(raw) <= maximum and
+             _sha256(raw) == expected,
+             f"{label} captured historical bytes differ from the exact raw pin")
+    try:
+        value = json.loads(raw.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError, RecursionError) as error:
+        raise PreparationError(
+            f"{label} captured historical bytes are not bounded UTF-8 JSON: {error}",
+        ) from error
+    try:
+        canonical = _canonical(value) if type(value) is dict else None
+    except (TypeError, ValueError, RecursionError) as error:
+        raise PreparationError(
+            f"{label} captured historical bytes are not canonical JSON: {error}",
+        ) from error
+    _require(type(value) is dict and canonical == raw,
+             f"{label} captured historical bytes are not canonical JSON")
+    return value, raw, expected
+
+
+def _read_generation_json_pin(
+    pin_value: dict[str, Any], label: str, maximum: int,
+    global_artifact_reader: Callable[[dict[str, str], int], bytes] | None,
+) -> tuple[dict[str, Any], bytes, str]:
+    """Use resident reads by default; recorded history never falls back."""
+    if global_artifact_reader is None:
+        return _read_pinned_json(pin_value, label, maximum)
+    return _read_recorded_global_json_pin(
+        pin_value, label, maximum, global_artifact_reader,
+    )
+
+
+def _lexical_absolute_path(value: object, label: str) -> Path:
+    _require(type(value) is str and value.startswith("/") and "\x00" not in value,
+             f"{label} must be an absolute path identity")
+    path = Path(value)
+    _require(path.is_absolute() and str(path) == value and ".." not in path.parts,
+             f"{label} is not a normalized absolute path identity")
+    return path
+
+
+def _lexically_within(root: Path, candidate: Path) -> bool:
+    """Compare historical path identities without consulting old filesystems."""
+    try:
+        candidate.relative_to(root)
+        return True
+    except ValueError:
+        return False
 
 
 def _verify_spec_source_refs(
@@ -959,14 +1058,19 @@ def _validate_prepared_fixed_host_binding(value: Any) -> dict[str, Any]:
 def _prepared_host_binding_inputs(
     preparation_pin: dict[str, Any], spec_pin: dict[str, Any],
     source_root: Path, input_root: Path, host_id: str,
+    *, metadata_only: bool = False,
 ) -> tuple[dict[str, Any], dict[str, dict[str, Any]], Any, Any,
            dict[str, Any], dict[str, str]]:
-    """Load the exact resident preparation and empty-rate Spec generation once."""
+    """Load the selected Source profile and empty-rate Spec generation once."""
+    _require(type(metadata_only) is bool,
+             "prepared-host metadata-only selector is malformed")
     source_root = _safe_root(Path(source_root), "SourceV5 root")
     input_root = _safe_root(Path(input_root), "preparation input root")
     _require(not _within(source_root, input_root),
              "preparation input root must remain outside SourceV5")
-    preparation, sources, campaign_module, inputs = read_preparation_intent(
+    intent_reader = (read_preparation_intent_metadata_v1 if metadata_only else
+                     read_preparation_intent)
+    preparation, sources, campaign_module, inputs = intent_reader(
         preparation_pin, source_root, input_root,
     )
     spec_pin_value = _exact(spec_pin, {"path", "sha256"},
@@ -1316,14 +1420,23 @@ def _prepared_fixed_host_binding_for_spec_host(
 
     fixed_pin = _exact(fixed_spec_host_pin, {"path", "raw_sha256"},
                        "fixed SpecV3 host-record pin")
-    fixed_path = Path(fixed_pin["path"])
-    _require(fixed_path.is_absolute() and _within(input_root, fixed_path),
-             "fixed Spec host record is outside the original private input tree")
-    fixed_relative = fixed_path.relative_to(input_root).as_posix()
-    pinned_fixed_path = (
-        input_root / fixed_relative if fixed_spec_host_record is not None else
-        _safe_child(input_root, fixed_relative, "fixed Spec host record")
+    fixed_path = _lexical_absolute_path(
+        fixed_pin["path"], "fixed SpecV3 host-record identity",
     )
+    if fixed_spec_host_record is None:
+        _require(_within(input_root, fixed_path),
+                 "fixed Spec host record is outside the original private input tree")
+        fixed_relative = fixed_path.relative_to(input_root).as_posix()
+        pinned_fixed_path = _safe_child(input_root, fixed_relative,
+                                        "fixed Spec host record")
+    else:
+        # The SourceA recorded route has already checked this exact historical
+        # pin against its closed captured catalogue. Preserve its origin text
+        # without resolving or statting the old input tree.
+        _require(_lexically_within(input_root, fixed_path),
+                 "captured fixed Spec host identity is outside the original input-root identity")
+        fixed_relative = fixed_path.relative_to(input_root).as_posix()
+        pinned_fixed_path = input_root / fixed_relative
     _require(str(pinned_fixed_path) == fixed_pin["path"],
              "fixed Spec host path is not a normalized identity path")
     if fixed_spec_host_record is None:
@@ -1364,7 +1477,9 @@ def _prepared_fixed_host_binding_for_spec_host(
 
 def _prepared_fixed_host_binding_for_overlay(
     preparation: dict[str, Any], spec: dict[str, Any], overlay: dict[str, Any],
-    inputs: Any, input_root: Path, host_id: str,
+    inputs: Any, input_root: Path, host_id: str, *,
+    prepared_context: tuple[Path, dict[str, Any], str] | None = None,
+    fixed_spec_host_record: tuple[dict[str, Any], bytes, str] | None = None,
 ) -> dict[str, Any]:
     """Bind the legacy overlay host facts to the shared Spec/capacity bridge."""
     _require(host_id == overlay.get("host_id"),
@@ -1382,6 +1497,10 @@ def _prepared_fixed_host_binding_for_overlay(
     binding = _prepared_fixed_host_binding_for_spec_host(
         preparation, spec, inputs, input_root, host_id,
         {"path": overlay_pin["path"], "raw_sha256": overlay_pin["sha256"]},
+        prepared_context=prepared_context,
+        fixed_spec_host_record=(None if fixed_spec_host_record is None else
+                                (fixed_spec_host_record[0], fixed_spec_host_record[1],
+                                 fixed_spec_host_record[2])),
     )
     spec_host = next(item for item in spec["hosts"]
                      if item["host_id"] == host_id)
@@ -1472,19 +1591,23 @@ def _read_prepared_capacity_host_context(
     return prepared_path, prepared_value, prepared_sha
 
 
-def materialize_prepared_host_binding(
+def _materialize_prepared_host_binding_impl(
     preparation_pin: dict[str, Any], spec_pin: dict[str, Any],
     source_root: Path, input_root: Path, host_id: str,
+    *, metadata_only: bool,
 ) -> dict[str, Any]:
-    """Materialize the selected Spec host and bind it to the capacity observation.
+    """Materialize one canonical Spec host through the named Source profile.
 
     This preparatory operation writes only the canonical ``Spec.host`` value at
     its deterministic private input-root path. It does not create or synthesize
     a fixed-pair overlay.
     """
+    _require(type(metadata_only) is bool,
+             "prepared-host metadata-only selector is malformed")
     (preparation, _sources, campaign_module, inputs, spec,
      _spec_pin_value) = _prepared_host_binding_inputs(
         preparation_pin, spec_pin, source_root, input_root, host_id,
+        metadata_only=metadata_only,
     )
     source_root = _safe_root(Path(source_root), "SourceV5 root")
     input_root = _safe_root(Path(input_root), "preparation input root")
@@ -1527,14 +1650,40 @@ def materialize_prepared_host_binding(
             "prepared_host_binding": binding}
 
 
-def verify_prepared_host_binding(
+def materialize_prepared_host_binding(
     preparation_pin: dict[str, Any], spec_pin: dict[str, Any],
     source_root: Path, input_root: Path, host_id: str,
 ) -> dict[str, Any]:
-    """Read-only verification of a pre-materialized Spec host binding."""
+    """Materialize the selected Spec host using the full resident Source check."""
+    return _materialize_prepared_host_binding_impl(
+        preparation_pin, spec_pin, source_root, input_root, host_id,
+        metadata_only=False,
+    )
+
+
+def materialize_prepared_host_binding_metadata_v1(
+    preparation_pin: dict[str, Any], spec_pin: dict[str, Any],
+    source_root: Path, input_root: Path, host_id: str,
+) -> dict[str, Any]:
+    """Materialize the same Spec host after the named Source metadata replay."""
+    return _materialize_prepared_host_binding_impl(
+        preparation_pin, spec_pin, source_root, input_root, host_id,
+        metadata_only=True,
+    )
+
+
+def _verify_prepared_host_binding_impl(
+    preparation_pin: dict[str, Any], spec_pin: dict[str, Any],
+    source_root: Path, input_root: Path, host_id: str,
+    *, metadata_only: bool,
+) -> dict[str, Any]:
+    """Read-only verification through the named Source profile."""
+    _require(type(metadata_only) is bool,
+             "prepared-host metadata-only selector is malformed")
     (preparation, _sources, _campaign, inputs, spec,
      _spec_pin_value) = _prepared_host_binding_inputs(
         preparation_pin, spec_pin, source_root, input_root, host_id,
+        metadata_only=metadata_only,
     )
     input_root = _safe_root(Path(input_root), "preparation input root")
     path = _fixed_spec_host_path(input_root, host_id)
@@ -1563,6 +1712,28 @@ def verify_prepared_host_binding(
             "prepared_host_binding": binding}
 
 
+def verify_prepared_host_binding(
+    preparation_pin: dict[str, Any], spec_pin: dict[str, Any],
+    source_root: Path, input_root: Path, host_id: str,
+) -> dict[str, Any]:
+    """Read-only verification with the full resident Source check."""
+    return _verify_prepared_host_binding_impl(
+        preparation_pin, spec_pin, source_root, input_root, host_id,
+        metadata_only=False,
+    )
+
+
+def verify_prepared_host_binding_metadata_v1(
+    preparation_pin: dict[str, Any], spec_pin: dict[str, Any],
+    source_root: Path, input_root: Path, host_id: str,
+) -> dict[str, Any]:
+    """Read-only verification after the named Source metadata replay."""
+    return _verify_prepared_host_binding_impl(
+        preparation_pin, spec_pin, source_root, input_root, host_id,
+        metadata_only=True,
+    )
+
+
 def _verify_pilot_overlay_generation(
     overlay: dict[str, Any], expected_job: dict[str, Any], spec: dict[str, Any], spec_path: Path, spec_raw_sha: str,
     plan: dict[str, Any], plan_path: Path, plan_raw_sha: str, preparation: dict[str, Any],
@@ -1570,6 +1741,7 @@ def _verify_pilot_overlay_generation(
     campaign: Any, inputs: Any, inventory_module: Any, fixed: types.ModuleType,
     prepared_host_binding: dict[str, Any],
     campaign_artifacts_root: Path,
+    global_artifact_reader: Callable[[dict[str, str], int], bytes] | None = None,
 ) -> None:
     """Bind one internally valid overlay to this exact original generation."""
     _exact(overlay, {
@@ -1603,10 +1775,35 @@ def _verify_pilot_overlay_generation(
     expected_manifests: dict[str, Any] = {}
     for source_host, source_value in sources.items():
         manifest = preparation["source_pins"][source_host]["manifest"]
-        expected_path = str(_safe_child(input_root, manifest["relative_path"], f"{source_host} original SourceV5 manifest"))
+        relative_text = manifest["relative_path"]
+        relative = Path(relative_text)
+        _require(type(relative_text) is str and not relative.is_absolute() and
+                 str(relative) == relative_text and ".." not in relative.parts,
+                 f"{source_host} original SourceV5 relative path is not normalized")
+        origin_path = input_root / relative
+        if global_artifact_reader is None:
+            expected_path = str(_safe_child(
+                input_root, relative_text, f"{source_host} original SourceV5 manifest",
+            ))
+            original_source = source_value
+        else:
+            expected_path = str(origin_path)
+            original_source, original_source_raw, original_source_sha = \
+                _read_recorded_global_json_pin(
+                    {"path": expected_path, "sha256": manifest["raw_sha256"]},
+                    f"{source_host} historical SourceV5 manifest",
+                    MAX_MANIFEST_BYTES, global_artifact_reader,
+                )
+            _require(original_source_sha == manifest["raw_sha256"] and
+                     original_source == source_value and
+                     original_source.get("manifest_sha256") == manifest["semantic_sha256"] and
+                     _sha256(_canonical({key: item for key, item in original_source.items()
+                                         if key != "manifest_sha256"})) ==
+                         manifest["semantic_sha256"],
+                     f"{source_host} historical SourceV5 bytes differ from current preparation identity")
         expected_manifests[source_host] = {
             "pin": {"path": expected_path, "sha256": manifest["raw_sha256"]},
-            "manifest_sha256": manifest["semantic_sha256"],
+            "manifest_sha256": original_source["manifest_sha256"],
         }
     _require(manifest_pins == expected_manifests,
              "fixed-pair overlay SourceV5 raw/semantic pins differ from the prepared cohort")
@@ -1664,8 +1861,73 @@ def _verify_pilot_overlay_generation(
              runtime["plan_entry_sha256"] == _sha256(_canonical(planned_bindings)),
              "fixed-pair overlay runtime/nonces differ from the exact original PlanV3 recipes")
 
+    prepared_context = None
+    fixed_spec_host_record = None
+    if global_artifact_reader is not None:
+        checked_binding = _validate_prepared_fixed_host_binding(prepared_host_binding)
+        host_id = expected_job["host_id"]
+        spec_hosts = [item for item in spec.get("hosts", [])
+                      if type(item) is dict and item.get("host_id") == host_id]
+        _require(len(spec_hosts) == 1,
+                 "recorded pilot replay has no unique historical Spec host")
+        spec_host = spec_hosts[0]
+        prepared_record = _exact(preparation.get("observed_hosts", {}).get(host_id),
+                                 {"relative_path", "raw_sha256"},
+                                 f"{host_id} current preparation observation pin")
+        prepared_relative = Path(prepared_record["relative_path"])
+        _require(not prepared_relative.is_absolute() and
+                 str(prepared_relative) == prepared_record["relative_path"] and
+                 ".." not in prepared_relative.parts,
+                 f"{host_id} prepared observation relative path is not normalized")
+        prepared_origin_path = str(input_root / prepared_relative)
+        prepared_pin = _exact(checked_binding["prepared_host_context_pin"],
+                              {"path", "raw_sha256"},
+                              f"{host_id} bound prepared capacity-host context pin")
+        _require(prepared_pin == {"path": prepared_origin_path,
+                                  "raw_sha256": prepared_record["raw_sha256"]},
+                 f"{host_id} historical capacity-host pin differs from current preparation")
+        prepared_value, prepared_raw, prepared_sha = _read_recorded_global_json_pin(
+            {"path": prepared_pin["path"],
+             "sha256": prepared_pin["raw_sha256"]},
+            f"{host_id} historical capacity-host context",
+            MAX_MANIFEST_BYTES, global_artifact_reader,
+        )
+        try:
+            inputs._validate_observed_host_structure(prepared_value, spec_host, host_id)
+        except Exception as error:
+            raise PreparationError(
+                f"{host_id} captured historical capacity-host context failed Source validation: {error}",
+            ) from error
+        prepared_context = (Path(prepared_pin["path"]), prepared_value, prepared_sha)
+
+        fixed_pin = _exact(checked_binding["fixed_spec_host_pin"],
+                           {"path", "raw_sha256"},
+                           f"{host_id} bound historical fixed Spec host pin")
+        expected_fixed_path = str(_fixed_spec_host_path(input_root, host_id))
+        _require(fixed_pin["path"] == expected_fixed_path,
+                 f"{host_id} fixed Spec host pin changed its deterministic identity")
+        overlay_host = _exact(overlay["sources"]["observed_host"], {
+            "pin", "host_fingerprint_sha256", "controls_sha256", "process_affinity",
+            "network_namespace_inode",
+        }, f"{host_id} fixed-pair historical Spec host facts")
+        overlay_host_pin = _exact(overlay_host["pin"], {"path", "sha256"},
+                                  f"{host_id} fixed-pair historical Spec host pin")
+        _require(overlay_host_pin == {"path": fixed_pin["path"],
+                                      "sha256": fixed_pin["raw_sha256"]},
+                 f"{host_id} fixed-pair overlay host pin differs from the prepared binding")
+        fixed_value, fixed_raw, fixed_sha = _read_recorded_global_json_pin(
+            {"path": fixed_pin["path"], "sha256": fixed_pin["raw_sha256"]},
+            f"{host_id} historical fixed Spec host record",
+            MAX_MANIFEST_BYTES, global_artifact_reader,
+        )
+        _require(fixed_value == spec_host and fixed_raw == _canonical(spec_host),
+                 f"{host_id} historical fixed Spec host bytes differ from the old Spec host")
+        fixed_spec_host_record = (fixed_value, fixed_raw, fixed_sha)
+
     derived_host_binding = _prepared_fixed_host_binding_for_overlay(
         preparation, spec, overlay, inputs, input_root, expected_job["host_id"],
+        prepared_context=prepared_context,
+        fixed_spec_host_record=fixed_spec_host_record,
     )
     _require(_validate_prepared_fixed_host_binding(prepared_host_binding) == derived_host_binding,
              "fixed-pair Spec host and prepared capacity-host context differ from the declared versioned bridge")
@@ -1733,6 +1995,7 @@ def _verify_capacity_pilot_captured_pair(
     receipt_pin: dict[str, Any], host_pin: dict[str, Any],
     overlay: dict[str, Any], overlay_raw_sha: str,
     *, recorded_host: bool = False,
+    global_artifact_reader: Callable[[dict[str, str], int], bytes] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     if recorded_host:
         checkpoint_pin = _exact(view.get("checkpoint_pin"), {
@@ -1742,10 +2005,13 @@ def _verify_capacity_pilot_captured_pair(
         _require(type(checkpoint_raw) is bytes and
                  _sha256(checkpoint_raw) == checkpoint_pin["raw_sha256"],
                  "SourceA-authenticated checkpoint bytes differ from their exact raw pin")
+        global_reader_kwargs = ({} if global_artifact_reader is None else
+                                {"global_artifact_reader": global_artifact_reader})
         replay = fixed.verify_fixed_pair_overlay_recorded_captured_v1(
             overlay_pin, receipt_pin, host_pin,
             view["objects"], Path(view["stage_root"]),
             checkpoint_pin=checkpoint_pin, checkpoint_raw=checkpoint_raw,
+            **global_reader_kwargs,
         )
         expected_schema = fixed.RECORDED_HOST_CAPTURED_REPLAY_CONTEXT_SCHEMA_V1
     else:
@@ -1783,6 +2049,7 @@ def _export_capacity_pilot_impl(
     preparation_final_pins: dict[str, Any], verified_fixed_records: list[dict[str, Any]], host_id: str,
     *, captured_read_provider: Any = None, before_publication: Any = None,
     recorded_host: bool,
+    global_artifact_reader: Callable[[dict[str, str], int], bytes] | None = None,
 ) -> dict[str, Any]:
     """Replay six original fixed-pair receipts per context/allocator and export the rate pilot.
 
@@ -1794,6 +2061,8 @@ def _export_capacity_pilot_impl(
     """
     _require(before_publication is None or callable(before_publication),
              "capacity-pilot before-publication hook must be absent or callable")
+    _require(global_artifact_reader is None or recorded_host,
+             "historical global metadata reader is reserved for recorded-host pilot replay")
     pins = _exact(preparation_final_pins, {
         "preparation", "spec", "plan", "source_root", "input_root", "campaign_artifacts_root",
         "prepared_host_binding", "output",
@@ -1801,18 +2070,34 @@ def _export_capacity_pilot_impl(
     prepared_host_binding = _validate_prepared_fixed_host_binding(pins["prepared_host_binding"])
     source_root = _safe_root(Path(pins["source_root"]), "SourceV5 root")
     input_root = _safe_root(Path(pins["input_root"]), "original campaign input root")
-    campaign_artifacts_root = _safe_root(Path(pins["campaign_artifacts_root"]), "original campaign artifact root")
-    _require(type(pins["campaign_artifacts_root"]) is str and
-             pins["campaign_artifacts_root"] == str(campaign_artifacts_root),
-             "campaign-artifact root pin must be a normalized absolute path string")
-    _require(not _within(source_root, campaign_artifacts_root),
+    if recorded_host and global_artifact_reader is not None:
+        campaign_artifacts_root = _lexical_absolute_path(
+            pins["campaign_artifacts_root"], "historical campaign artifact-root identity",
+        )
+    else:
+        campaign_artifacts_root = _safe_root(
+            Path(pins["campaign_artifacts_root"]), "original campaign artifact root",
+        )
+        _require(type(pins["campaign_artifacts_root"]) is str and
+                 pins["campaign_artifacts_root"] == str(campaign_artifacts_root),
+                 "campaign-artifact root pin must be a normalized absolute path string")
+    _require(not _lexically_within(source_root, campaign_artifacts_root),
              "capacity-pilot campaign artifact root must remain outside SourceV5")
-    preparation, sources, campaign, inputs = read_preparation_intent(
+    intent_reader = (read_preparation_intent_metadata_v1
+                     if recorded_host and global_artifact_reader is not None else
+                     read_preparation_intent)
+    preparation, sources, campaign, inputs = intent_reader(
         pins["preparation"], source_root, input_root,
     )
     _require(host_id in sources, "capacity-pilot host is not in the full SourceV5 cohort")
-    spec, spec_raw, spec_raw_sha = _read_pinned_json(pins["spec"], "initial empty-rate SpecV3")
-    plan, plan_raw, plan_raw_sha = _read_pinned_json(pins["plan"], "original initial PlanV3", MAX_PLAN_BYTES)
+    spec, spec_raw, spec_raw_sha = _read_generation_json_pin(
+        pins["spec"], "initial empty-rate SpecV3", MAX_REQUEST_BYTES,
+        global_artifact_reader if recorded_host else None,
+    )
+    plan, plan_raw, plan_raw_sha = _read_generation_json_pin(
+        pins["plan"], "original initial PlanV3", MAX_PLAN_BYTES,
+        global_artifact_reader if recorded_host else None,
+    )
     _require(spec.get("schema") == campaign.SPEC_SCHEMA_V3 and spec.get("rates") == [] and spec.get("oracles") == [],
              "capacity-pilot export requires the original SpecV3 with both rate/oracle slots empty")
     try:
@@ -1891,6 +2176,7 @@ def _export_capacity_pilot_impl(
                     plan, Path(pins["plan"]["path"]), plan_raw_sha, preparation, sources,
                     source_root, input_root, campaign, inputs, campaign.source_inventory_module(), fixed,
                     prepared_host_binding, campaign_artifacts_root,
+                    global_artifact_reader=(global_artifact_reader if recorded_host else None),
                 )
                 if captured_view is None:
                     verified = fixed.verify_fixed_pair_overlay_offline(
@@ -1902,6 +2188,7 @@ def _export_capacity_pilot_impl(
                         fixed, captured_view, overlay_pin, receipt_pin,
                         host_verification_pin, overlay, overlay_raw_sha,
                         recorded_host=recorded_host,
+                        global_artifact_reader=(global_artifact_reader if recorded_host else None),
                     )
             except Exception as error:
                 raise PreparationError(f"original fixed-pair receipt[{index}] failed generation-bound offline replay: {error}") from error
@@ -2037,6 +2324,7 @@ def export_capacity_pilot(
 def export_capacity_pilot_recorded_host(
     preparation_final_pins: dict[str, Any], verified_fixed_records: list[dict[str, Any]], host_id: str,
     *, captured_read_provider: Any, before_publication: Any = None,
+    global_artifact_reader: Callable[[dict[str, str], int], bytes] | None = None,
 ) -> dict[str, Any]:
     """Replay after SourceA has verified each retained signed ACK and lineage.
 
@@ -2048,20 +2336,39 @@ def export_capacity_pilot_recorded_host(
         preparation_final_pins, verified_fixed_records, host_id,
         captured_read_provider=captured_read_provider,
         before_publication=before_publication, recorded_host=True,
+        global_artifact_reader=global_artifact_reader,
     )
 
 
 def _replay_prepared_capacity_inputs(
     preparation_pin: dict[str, Any], capacity_completion_pins: list[dict[str, Any]],
     resource_budget_pins: dict[str, Any] | None,
+    *, input_root: Path | None = None, metadata_only: bool = False,
 ) -> tuple:
     """Share the original complete pre-Spec capacity replay without a final gate."""
+    _require(type(metadata_only) is bool,
+             "capacity replay metadata-only selector is malformed")
     prep_ref = _exact(preparation_pin, {"path", "sha256"}, "preparation input pin")
     prep_path = Path(prep_ref["path"])
     _require(prep_path.is_absolute(), "preparation input path must be absolute")
-    input_root = _safe_root(prep_path.parent, "preparation input root")
+    explicit_input_root = input_root is not None
+    input_root = _safe_root(
+        prep_path.parent if input_root is None else input_root,
+        "preparation input root",
+    )
+    if explicit_input_root or metadata_only:
+        _require(_within(input_root, prep_path) and
+                 prep_path.resolve(strict=True) != input_root,
+                 "capacity replay preparation is outside its actual input root")
+    elif not metadata_only:
+        _require(prep_path.parent == input_root,
+                 "ordinary capacity replay retains its preparation-directory input root")
     source_root = _safe_root(SOURCE_ROOT, "SourceV5 root")
-    preparation, sources, campaign, inputs = read_preparation_intent(preparation_pin, source_root, input_root)
+    intent_reader = (read_preparation_intent_metadata_v1 if metadata_only else
+                     read_preparation_intent)
+    preparation, sources, campaign, inputs = intent_reader(
+        preparation_pin, source_root, input_root,
+    )
     host_ids = [host["host_id"] for host in preparation["core"]["hosts"]]
     _require(len(host_ids) in (2, 3) and len(set(host_ids)) == len(host_ids) and
              set(host_ids) == set(sources),
@@ -2261,11 +2568,12 @@ def _is_initial_two_kvm_host_order(host_ids: object) -> bool:
             len(set(host_ids)) == 2 and host_ids == sorted(host_ids))
 
 
-def replay_prepared_capacity_inputs_bounded(
+def _replay_prepared_capacity_inputs_bounded_impl(
     preparation_pin: dict[str, Any],
     capacity_completion_pins: list[dict[str, Any]],
     resource_budget_pins: dict[str, Any],
     source_root: Path, input_root: Path,
+    *, metadata_only: bool,
 ) -> dict[str, Any]:
     """Replay the genuine profile-bound capacity cohort before rates or oracles exist.
 
@@ -2273,13 +2581,17 @@ def replay_prepared_capacity_inputs_bounded(
     not authorize exploration, establish a final input generation, or pass
     any application qualification gate.
     """
+    _require(type(metadata_only) is bool,
+             "capacity generation metadata-only selector is malformed")
     checked_source = _safe_root(source_root, "capacity generation SourceV5 root")
     checked_input = _safe_root(input_root, "capacity generation input root")
     preparation_ref = _exact(preparation_pin, {"path", "sha256"},
                              "capacity generation preparation pin")
+    preparation_path = Path(preparation_ref["path"])
     _require(checked_source == _safe_root(SOURCE_ROOT, "active SourceV5 root") and
-             Path(preparation_ref["path"]).is_absolute() and
-             Path(preparation_ref["path"]).parent == checked_input,
+             preparation_path.is_absolute() and
+             (metadata_only and _within(checked_input, preparation_path) or
+              not metadata_only and preparation_path.parent == checked_input),
              "capacity generation differs from its actual Source/input roots")
     _require(type(capacity_completion_pins) is list and len(capacity_completion_pins) in (2, 3) and
              type(resource_budget_pins) is dict and
@@ -2296,6 +2608,7 @@ def replay_prepared_capacity_inputs_bounded(
         bounded_inputs.append({**item, "resource_budget_pin": budget_pin})
     replay = _replay_prepared_capacity_inputs(
         preparation_ref, bounded_inputs, resource_budget_pins,
+        input_root=checked_input, metadata_only=metadata_only,
     )
     (prep_ref, replay_input, replay_source, preparation, _sources, _campaign, _inputs,
      host_ids, bounded, _capacity_by_host, _completion_pins, _entries,
@@ -2316,17 +2629,49 @@ def replay_prepared_capacity_inputs_bounded(
     return {**body, "generation_sha256": _sha256(_canonical(body))}
 
 
-def build_prepared_capacity_generation_bounded(
+def replay_prepared_capacity_inputs_bounded(
+    preparation_pin: dict[str, Any],
+    capacity_completion_pins: list[dict[str, Any]],
+    resource_budget_pins: dict[str, Any],
+    source_root: Path, input_root: Path,
+) -> dict[str, Any]:
+    """Replay bounded capacity inputs using the legacy all-resident Source check."""
+    return _replay_prepared_capacity_inputs_bounded_impl(
+        preparation_pin, capacity_completion_pins, resource_budget_pins,
+        source_root, input_root, metadata_only=False,
+    )
+
+
+def replay_prepared_capacity_inputs_bounded_metadata_v1(
+    preparation_pin: dict[str, Any],
+    capacity_completion_pins: list[dict[str, Any]],
+    resource_budget_pins: dict[str, Any],
+    source_root: Path, input_root: Path,
+) -> dict[str, Any]:
+    """Replay bounded capacity inputs from real Source code and actual input roots."""
+    return _replay_prepared_capacity_inputs_bounded_impl(
+        preparation_pin, capacity_completion_pins, resource_budget_pins,
+        source_root, input_root, metadata_only=True,
+    )
+
+
+def _build_prepared_capacity_generation_bounded_impl(
     preparation_pin: dict[str, Any],
     capacity_completion_pins: list[dict[str, Any]],
     resource_budget_pins: dict[str, Any],
     source_root: Path, input_root: Path, output: Path,
+    *, metadata_only: bool,
 ) -> dict[str, Any]:
     """Persist one independently replayed capacity-only preparation receipt."""
+    _require(type(metadata_only) is bool,
+             "capacity generation metadata-only selector is malformed")
     checked_input = _safe_root(input_root, "capacity generation input root")
     _require(output == checked_input / "prepared-capacity-generation.json",
              "capacity generation output is outside its fixed private input location")
-    value = replay_prepared_capacity_inputs_bounded(
+    replay_function = (replay_prepared_capacity_inputs_bounded_metadata_v1
+                       if metadata_only else
+                       replay_prepared_capacity_inputs_bounded)
+    value = replay_function(
         preparation_pin, capacity_completion_pins, resource_budget_pins,
         source_root, checked_input,
     )
@@ -2338,11 +2683,40 @@ def build_prepared_capacity_generation_bounded(
             "semantic_sha256": value["generation_sha256"]}
 
 
-def verify_prepared_capacity_generation_bounded(
+def build_prepared_capacity_generation_bounded(
+    preparation_pin: dict[str, Any],
+    capacity_completion_pins: list[dict[str, Any]],
+    resource_budget_pins: dict[str, Any],
+    source_root: Path, input_root: Path, output: Path,
+) -> dict[str, Any]:
+    """Persist a bounded capacity receipt using the legacy all-resident check."""
+    return _build_prepared_capacity_generation_bounded_impl(
+        preparation_pin, capacity_completion_pins, resource_budget_pins,
+        source_root, input_root, output, metadata_only=False,
+    )
+
+
+def build_prepared_capacity_generation_bounded_metadata_v1(
+    preparation_pin: dict[str, Any],
+    capacity_completion_pins: list[dict[str, Any]],
+    resource_budget_pins: dict[str, Any],
+    source_root: Path, input_root: Path, output: Path,
+) -> dict[str, Any]:
+    """Persist a bounded capacity receipt using the named metadata-only peer route."""
+    return _build_prepared_capacity_generation_bounded_impl(
+        preparation_pin, capacity_completion_pins, resource_budget_pins,
+        source_root, input_root, output, metadata_only=True,
+    )
+
+
+def _verify_prepared_capacity_generation_bounded_impl(
     generation_pin: dict[str, Any], preparation_pin: dict[str, Any],
     source_root: Path, input_root: Path,
+    *, metadata_only: bool,
 ) -> dict[str, Any]:
     """Recompute the capacity-only receipt from every original producer input."""
+    _require(type(metadata_only) is bool,
+             "capacity generation metadata-only selector is malformed")
     pin = _exact(generation_pin, {"path", "raw_sha256", "semantic_sha256"},
                  "prepared capacity generation pin")
     checked_input = _safe_root(input_root, "capacity generation input root")
@@ -2375,13 +2749,38 @@ def verify_prepared_capacity_generation_bounded(
             "verification_receipt_pin": row["host_verification"],
             "evidence_path_map": row["evidence_path_map"],
         })
-    replayed = replay_prepared_capacity_inputs_bounded(
+    replay_function = (replay_prepared_capacity_inputs_bounded_metadata_v1
+                       if metadata_only else
+                       replay_prepared_capacity_inputs_bounded)
+    replayed = replay_function(
         preparation_pin, capacity_inputs, value["resource_budgets"],
         source_root, checked_input,
     )
     _require(_canonical(replayed) == raw,
              "capacity generation differs from full original bounded capacity replay")
     return replayed
+
+
+def verify_prepared_capacity_generation_bounded(
+    generation_pin: dict[str, Any], preparation_pin: dict[str, Any],
+    source_root: Path, input_root: Path,
+) -> dict[str, Any]:
+    """Recompute a capacity receipt using the legacy all-resident Source check."""
+    return _verify_prepared_capacity_generation_bounded_impl(
+        generation_pin, preparation_pin, source_root, input_root,
+        metadata_only=False,
+    )
+
+
+def verify_prepared_capacity_generation_bounded_metadata_v1(
+    generation_pin: dict[str, Any], preparation_pin: dict[str, Any],
+    source_root: Path, input_root: Path,
+) -> dict[str, Any]:
+    """Recompute a capacity receipt with real Source code and actual input roots."""
+    return _verify_prepared_capacity_generation_bounded_impl(
+        generation_pin, preparation_pin, source_root, input_root,
+        metadata_only=True,
+    )
 
 
 def _read_initial_pressure_bindings(
@@ -2707,9 +3106,10 @@ def _initial_spec_value(
     return spec
 
 
-def export_initial_spec_plan(
+def _export_initial_spec_plan_impl(
     preparation_pin: dict[str, Any], capacity_generation_pin: dict[str, Any],
     pressure_bindings_pin: dict[str, Any], source_root: Path, input_root: Path,
+    *, metadata_only: bool,
 ) -> dict[str, Any]:
     """Export a prospective initial SpecV3/PlanV3 from complete real inputs.
 
@@ -2721,7 +3121,11 @@ def export_initial_spec_plan(
     input_root = _safe_root(Path(input_root), "initial SpecV3 input root")
     _require(source_root != input_root,
              "initial SpecV3 SourceV5 and private input roots must be separate")
-    preparation, sources, campaign, inputs = read_preparation_intent(
+    _require(type(metadata_only) is bool,
+             "initial SpecV3 metadata-only selector is malformed")
+    intent_reader = (read_preparation_intent_metadata_v1 if metadata_only else
+                     read_preparation_intent)
+    preparation, sources, campaign, inputs = intent_reader(
         preparation_pin, source_root, input_root,
     )
     host_ids = [host["host_id"] for host in preparation["core"]["hosts"]]
@@ -2731,7 +3135,10 @@ def export_initial_spec_plan(
     generation_pin = _exact(capacity_generation_pin, {
         "path", "raw_sha256", "semantic_sha256",
     }, "initial SpecV3 capacity generation pin")
-    capacity_generation = verify_prepared_capacity_generation_bounded(
+    generation_verifier = (verify_prepared_capacity_generation_bounded_metadata_v1
+                           if metadata_only else
+                           verify_prepared_capacity_generation_bounded)
+    capacity_generation = generation_verifier(
         generation_pin, preparation_pin, source_root, input_root,
     )
     _require(capacity_generation.get("campaign_id") == preparation["core"]["campaign_id"] and
@@ -2840,6 +3247,28 @@ def export_initial_spec_plan(
     }
 
 
+def export_initial_spec_plan(
+    preparation_pin: dict[str, Any], capacity_generation_pin: dict[str, Any],
+    pressure_bindings_pin: dict[str, Any], source_root: Path, input_root: Path,
+) -> dict[str, Any]:
+    """Export the prospective initial generation with full resident Source checks."""
+    return _export_initial_spec_plan_impl(
+        preparation_pin, capacity_generation_pin, pressure_bindings_pin,
+        source_root, input_root, metadata_only=False,
+    )
+
+
+def export_initial_spec_plan_metadata_v1(
+    preparation_pin: dict[str, Any], capacity_generation_pin: dict[str, Any],
+    pressure_bindings_pin: dict[str, Any], source_root: Path, input_root: Path,
+) -> dict[str, Any]:
+    """Export the same prospective generation after real Source-code metadata replay."""
+    return _export_initial_spec_plan_impl(
+        preparation_pin, capacity_generation_pin, pressure_bindings_pin,
+        source_root, input_root, metadata_only=True,
+    )
+
+
 def _capacity_pilot_provider_map(
     providers: object, host_ids: list[str],
 ) -> Any:
@@ -2851,7 +3280,7 @@ def _capacity_pilot_provider_map(
     return types.MappingProxyType(dict(checked))
 
 
-def complete_prepared_inputs(
+def _complete_prepared_inputs_impl(
     preparation_pin: dict[str, Any],
     capacity_completion_pins: list[dict[str, Any]],
     pressure_calibration_pins: list[dict[str, Any]],
@@ -2862,8 +3291,18 @@ def complete_prepared_inputs(
     *, write_completion: bool = True,
     resource_budget_pins: dict[str, Any] | None = None,
     captured_pilot_read_providers: dict[str, Any] | None = None,
+    recorded_host: bool = False,
+    global_artifact_reader: Callable[[dict[str, str], int], bytes] | None = None,
+    input_root: Path | None = None,
 ) -> dict[str, Any]:
     """Bridge independently replayed preparation evidence into final frozen inputs."""
+    _require(type(recorded_host) is bool and
+             (global_artifact_reader is None or recorded_host),
+             "historical global reader is reserved for recorded-host completion replay")
+    _require(not recorded_host or captured_pilot_read_providers is not None,
+             "recorded-host completion requires its captured pilot provider cohort")
+    _require(input_root is None or recorded_host,
+             "explicit nested input-root replay is reserved for the recorded completion route")
     (
         prep_ref,
         input_root,
@@ -2883,6 +3322,8 @@ def complete_prepared_inputs(
         prep_path,
     ) = _replay_prepared_capacity_inputs(
         preparation_pin, capacity_completion_pins, resource_budget_pins,
+        input_root=input_root,
+        metadata_only=recorded_host,
     )
 
     captured_pilot_providers = _capacity_pilot_provider_map(
@@ -3201,18 +3642,31 @@ def complete_prepared_inputs(
         _require(host_id == host_ids[index], "capacity pilot list changed the frozen host order")
         pilot_seen.add(host_id)
         manifest_pin = _exact(pilot_input["manifest"], {"path", "sha256"}, f"{host_id} pilot manifest pin")
-        pilot, _pilot_raw, pilot_raw_sha = _read_pinned_json(manifest_pin, f"{host_id} capacity pilot manifest", MAX_MANIFEST_BYTES)
+        pilot, _pilot_raw, pilot_raw_sha = _read_generation_json_pin(
+            manifest_pin, f"{host_id} capacity pilot manifest", MAX_MANIFEST_BYTES,
+            global_artifact_reader if recorded_host else None,
+        )
         initial_spec_pin = _exact(pilot_input["initial_spec"], {"path", "sha256"}, f"{host_id} original SpecV3 pin")
         initial_plan_pin = _exact(pilot_input["initial_plan"], {"path", "sha256"}, f"{host_id} original PlanV3 pin")
-        initial_spec_value, _initial_spec_raw, initial_spec_sha = _read_pinned_json(initial_spec_pin, f"{host_id} original SpecV3")
-        initial_plan_value, _initial_plan_raw, initial_plan_sha = _read_pinned_json(initial_plan_pin, f"{host_id} original PlanV3", MAX_PLAN_BYTES)
+        initial_spec_value, _initial_spec_raw, initial_spec_sha = _read_generation_json_pin(
+            initial_spec_pin, f"{host_id} original SpecV3", MAX_REQUEST_BYTES,
+            global_artifact_reader if recorded_host else None,
+        )
+        initial_plan_value, _initial_plan_raw, initial_plan_sha = _read_generation_json_pin(
+            initial_plan_pin, f"{host_id} original PlanV3", MAX_PLAN_BYTES,
+            global_artifact_reader if recorded_host else None,
+        )
         identity = (initial_spec_sha, initial_plan_sha)
         _require(initial_spec_identity is None or initial_spec_identity == identity,
                  "host capacity pilots do not preserve one common original SpecV3/PlanV3 generation")
         initial_spec_identity = identity
         pilot_replay_kwargs = ({} if captured_pilot_providers is None else
                                {"captured_read_provider": captured_pilot_providers[host_id]})
-        replayed_pin = export_capacity_pilot({
+        pilot_exporter = (export_capacity_pilot_recorded_host if recorded_host else
+                          export_capacity_pilot)
+        pilot_reader_kwargs = ({} if global_artifact_reader is None or not recorded_host else
+                               {"global_artifact_reader": global_artifact_reader})
+        replayed_pin = pilot_exporter({
             "preparation": preparation_pin,
             "spec": initial_spec_pin,
             "plan": initial_plan_pin,
@@ -3221,7 +3675,8 @@ def complete_prepared_inputs(
             "campaign_artifacts_root": pilot_input["campaign_artifacts_root"],
             "prepared_host_binding": pilot_input["prepared_host_binding"],
             "output": None,
-        }, pilot_input["verified_fixed_records"], host_id, **pilot_replay_kwargs)
+        }, pilot_input["verified_fixed_records"], host_id,
+            **pilot_replay_kwargs, **pilot_reader_kwargs)
         _require(replayed_pin["raw_sha256"] == pilot_raw_sha and
                  replayed_pin["semantic_sha256"] == campaign.digest_object(pilot),
                  f"{host_id} pilot manifest differs from complete replay of its original fixed-pair receipts")
@@ -3400,6 +3855,57 @@ def complete_prepared_inputs(
     if not write_completion:
         result["replayed_completion"] = completion
     return result
+
+
+def complete_prepared_inputs(
+    preparation_pin: dict[str, Any],
+    capacity_completion_pins: list[dict[str, Any]],
+    pressure_calibration_pins: list[dict[str, Any]],
+    pilot_pins: list[dict[str, Any]],
+    oracle_pins: list[dict[str, Any]],
+    final_spec_pin: dict[str, Any],
+    final_plan_pin: dict[str, Any],
+    *, write_completion: bool = True,
+    resource_budget_pins: dict[str, Any] | None = None,
+    captured_pilot_read_providers: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Bridge evidence through the unchanged ordinary resident route."""
+    return _complete_prepared_inputs_impl(
+        preparation_pin, capacity_completion_pins, pressure_calibration_pins,
+        pilot_pins, oracle_pins, final_spec_pin, final_plan_pin,
+        write_completion=write_completion,
+        resource_budget_pins=resource_budget_pins,
+        captured_pilot_read_providers=captured_pilot_read_providers,
+    )
+
+
+def complete_prepared_inputs_recorded_host(
+    preparation_pin: dict[str, Any],
+    capacity_completion_pins: list[dict[str, Any]],
+    pressure_calibration_pins: list[dict[str, Any]],
+    pilot_pins: list[dict[str, Any]],
+    oracle_pins: list[dict[str, Any]],
+    final_spec_pin: dict[str, Any],
+    final_plan_pin: dict[str, Any],
+    *, captured_pilot_read_providers: dict[str, Any],
+    global_artifact_reader: Callable[[dict[str, str], int], bytes] | None = None,
+    write_completion: bool = True,
+    resource_budget_pins: dict[str, Any] | None = None,
+    input_root: Path | None = None,
+) -> dict[str, Any]:
+    """Replay completion with exact captured pilot views and optional closed old bytes."""
+    _require(type(captured_pilot_read_providers) is dict,
+             "recorded-host completion requires an all-host captured provider map")
+    reader_kwargs = ({} if global_artifact_reader is None else
+                     {"global_artifact_reader": global_artifact_reader})
+    return _complete_prepared_inputs_impl(
+        preparation_pin, capacity_completion_pins, pressure_calibration_pins,
+        pilot_pins, oracle_pins, final_spec_pin, final_plan_pin,
+        write_completion=write_completion,
+        resource_budget_pins=resource_budget_pins,
+        captured_pilot_read_providers=captured_pilot_read_providers,
+        recorded_host=True, input_root=input_root, **reader_kwargs,
+    )
 
 
 def complete_prepared_inputs_bounded(
@@ -3594,10 +4100,12 @@ def _prepared_input_replay_arguments(completion: dict[str, Any]) -> dict[str, li
     return result
 
 
-def verify_prepared_inputs_completion(
+def _verify_prepared_inputs_completion_impl(
     completion_pin: dict[str, Any], provenance_pins: dict[str, Any],
     source_root: Path, input_root: Path, *,
     captured_pilot_read_providers: dict[str, Any] | None = None,
+    recorded_host: bool = False,
+    global_artifact_reader: Callable[[dict[str, str], int], bytes] | None = None,
 ) -> dict[str, Any]:
     """Read-only replay of a frozen preparation-completion receipt.
 
@@ -3607,6 +4115,11 @@ def verify_prepared_inputs_completion(
     replay then revalidates every capacity, pressure, six-pair pilot and oracle
     artifact before comparing the complete canonical body byte-for-byte.
     """
+    _require(type(recorded_host) is bool and
+             (global_artifact_reader is None or recorded_host),
+             "historical global reader is reserved for recorded-host completion replay")
+    _require(not recorded_host or captured_pilot_read_providers is not None,
+             "recorded-host completion replay requires its captured provider cohort")
     completion_ref = _exact(completion_pin, {
         "path", "raw_sha256", "semantic_sha256",
     }, "prepared-input completion pin")
@@ -3646,8 +4159,12 @@ def verify_prepared_inputs_completion(
     _require(source_root_checked == _safe_root(SOURCE_ROOT, "active SourceV5 root") and
              preparation_path.is_absolute(),
              "prepared-input replay SourceV5 root or preparation path is invalid")
-    _require(input_root_checked == preparation_path.parent.resolve(strict=True),
-             "prepared-input replay input root differs from the pinned preparation generation")
+    if recorded_host:
+        _require(_within(input_root_checked, preparation_path),
+                 "recorded prepared-input replay root does not contain its preparation generation")
+    else:
+        _require(input_root_checked == preparation_path.parent.resolve(strict=True),
+                 "prepared-input replay input root differs from the pinned preparation generation")
     for role, pin_value, recorded in (
         ("preparation", preparation_pin, completion["preparation"]),
         ("final SpecV3", final_spec_pin, completion["final_spec"]),
@@ -3665,7 +4182,13 @@ def verify_prepared_inputs_completion(
             _require(replay_arguments.get("resource_budget_pins") == completion["resource_budgets"],
                      "prepared-input bounded budget map differs from its per-host capacity records")
             replay_kwargs["resource_budget_pins"] = completion["resource_budgets"]
-        replay = complete_prepared_inputs(
+        replay_function = (complete_prepared_inputs_recorded_host if recorded_host else
+                           complete_prepared_inputs)
+        if recorded_host:
+            replay_kwargs["input_root"] = input_root_checked
+            if global_artifact_reader is not None:
+                replay_kwargs["global_artifact_reader"] = global_artifact_reader
+        replay = replay_function(
             {"path": preparation_pin["path"], "sha256": preparation_pin["raw_sha256"]},
             replay_arguments["capacity_completion_pins"],
             replay_arguments["pressure_calibration_pins"],
@@ -3683,6 +4206,37 @@ def verify_prepared_inputs_completion(
              replay.get("path") == completion_ref["path"],
              "prepared-input completion differs from deterministic replay of its frozen provenance pins")
     return completion
+
+
+def verify_prepared_inputs_completion(
+    completion_pin: dict[str, Any], provenance_pins: dict[str, Any],
+    source_root: Path, input_root: Path, *,
+    captured_pilot_read_providers: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Read-only replay through the unchanged ordinary resident route."""
+    return _verify_prepared_inputs_completion_impl(
+        completion_pin, provenance_pins, source_root, input_root,
+        captured_pilot_read_providers=captured_pilot_read_providers,
+        recorded_host=False,
+    )
+
+
+def verify_prepared_inputs_completion_recorded_host(
+    completion_pin: dict[str, Any], provenance_pins: dict[str, Any],
+    source_root: Path, input_root: Path, *,
+    captured_pilot_read_providers: dict[str, Any],
+    global_artifact_reader: Callable[[dict[str, str], int], bytes] | None = None,
+) -> dict[str, Any]:
+    """Replay the exact completion body using captured host views."""
+    _require(type(captured_pilot_read_providers) is dict,
+             "recorded-host completion verification requires an all-host provider map")
+    reader_kwargs = ({} if global_artifact_reader is None else
+                     {"global_artifact_reader": global_artifact_reader})
+    return _verify_prepared_inputs_completion_impl(
+        completion_pin, provenance_pins, source_root, input_root,
+        captured_pilot_read_providers=captured_pilot_read_providers,
+        recorded_host=True, **reader_kwargs,
+    )
 
 
 def _parser() -> argparse.ArgumentParser:

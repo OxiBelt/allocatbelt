@@ -8,6 +8,7 @@ from contextlib import contextmanager
 import hashlib
 import importlib.machinery
 import importlib.util
+import inspect
 import json
 import os
 import stat
@@ -1023,7 +1024,8 @@ class Source5PreparationInputTests(unittest.TestCase):
             prepared_observed_raw = campaign.canonical_bytes(prepared_observed)
             prepared_observed_path.write_bytes(prepared_observed_raw)
             prepared_observed_sha = hashlib.sha256(prepared_observed_raw).hexdigest()
-            spec_observed_path = input_root / "spec-host-record.json"
+            spec_observed_path = preparation._fixed_spec_host_path(input_root, selected_host)
+            spec_observed_path.parent.mkdir(mode=0o700)
             spec_observed_raw = campaign.canonical_bytes(selected_spec_host)
             spec_observed_path.write_bytes(spec_observed_raw)
             host_fingerprint = selected_spec_host["host_fingerprint_sha256"]
@@ -1110,6 +1112,51 @@ class Source5PreparationInputTests(unittest.TestCase):
                     preparation_value, sources, source_root, input_root, campaign, inputs,
                     fake_inventory, fixed, prepared_host_binding, artifact_root,
                 )
+
+                # Structural recorded-route witness: remove historical origin
+                # files and require exact bytes from the raw reader. It does
+                # not claim SourceA whitelist authority or a full pilot replay.
+                captured_globals = {}
+                for source_host, source_pin in source_pins.items():
+                    manifest = source_pin["manifest"]
+                    origin = input_root / manifest["relative_path"]
+                    captured_globals[(str(origin), manifest["raw_sha256"])] = origin.read_bytes()
+                    origin.unlink()
+                prepared_key = (str(prepared_observed_path), prepared_observed_sha)
+                captured_globals[prepared_key] = prepared_observed_raw
+                prepared_observed_path.unlink()
+                fixed_host_sha = hashlib.sha256(spec_observed_raw).hexdigest()
+                fixed_key = (str(spec_observed_path), fixed_host_sha)
+                captured_globals[fixed_key] = spec_observed_raw
+                spec_observed_path.unlink()
+                captured_calls = []
+
+                def captured_global_reader(pin, maximum):
+                    captured_calls.append((pin["path"], pin["raw_sha256"]))
+                    self.assertEqual(maximum, preparation.MAX_MANIFEST_BYTES)
+                    return captured_globals[(pin["path"], pin["raw_sha256"])]
+
+                preparation._verify_pilot_overlay_generation(
+                    overlay, expected_job, spec, spec_path, spec_sha, plan, plan_path, plan_sha,
+                    preparation_value, sources, source_root, input_root, campaign, inputs,
+                    fake_inventory, fixed, prepared_host_binding, artifact_root,
+                    global_artifact_reader=captured_global_reader,
+                )
+                self.assertEqual(set(captured_calls), set(captured_globals))
+                self.assertFalse(prepared_observed_path.exists())
+                self.assertFalse(spec_observed_path.exists())
+                self.assertTrue(all(not (input_root / row["manifest"]["relative_path"]).exists()
+                                    for row in source_pins.values()))
+
+                with self.assertRaisesRegex(preparation.PreparationError, "closed historical reader refused"):
+                    preparation._verify_pilot_overlay_generation(
+                        overlay, expected_job, spec, spec_path, spec_sha, plan, plan_path, plan_sha,
+                        preparation_value, sources, source_root, input_root, campaign, inputs,
+                        fake_inventory, fixed, prepared_host_binding, artifact_root,
+                        global_artifact_reader=lambda pin, maximum: (_ for _ in ()).throw(
+                            KeyError("historical origin missing"),
+                        ),
+                    )
 
     def test_public_prepared_host_binding_keeps_spec_and_capacity_context_pins_distinct(self) -> None:
         preparation = load_script(
@@ -2492,6 +2539,807 @@ class CapacityPilotByteBoundTests(unittest.TestCase):
                     self.preparation._row_uint(
                         {"count": value}, "count", "test count",
                     )
+
+
+class RecordedHistoricalGlobalReaderTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.preparation = load_script(
+            SCRIPT_DIR / "application-source5-input-preparation.py",
+            "recorded_historical_global_reader_target",
+        )
+
+    def _metadata_intent_fixture(self, root: Path) -> dict:
+        """Build a structurally complete SourceV5 two-KVM intent on real Source bytes."""
+        source_fixture = load_script(
+            SCRIPT_DIR / "test-application-campaign-inputs.py",
+            f"recorded_global_source_fixture_{root.name}",
+        )
+        source_campaign = source_fixture.campaign
+        source_inputs = source_fixture.inputs
+        source_root = SCRIPT_DIR.parent.resolve(strict=True)
+        spec, all_sources = source_fixture.spec_v3_fixture(
+            capacity_floor_policy_id=source_inputs.CAPACITY_FLOOR_POLICY_ID,
+        )
+        rustc_verbose = source_campaign.run_checked(
+            ["rustc", "-Vv"], source_root,
+        ).decode("utf-8").splitlines()
+        cargo_version = source_campaign.run_checked(
+            ["cargo", "-V"], source_root,
+        ).decode("utf-8").strip()
+        source_commit = source_campaign.run_checked(
+            ["git", "rev-parse", "HEAD"], source_root,
+        ).decode("ascii").strip()
+        release = next(
+            line.removeprefix("release: ") for line in rustc_verbose
+            if line.startswith("release: ")
+        )
+
+        host_rows = [copy.deepcopy(host) for host in spec["hosts"]
+                     if host["venue"] == "kvm_guest"]
+        host_ids = [host["host_id"] for host in host_rows]
+        self.assertEqual(len(host_ids), 2)
+        spec["hosts"] = host_rows
+        spec["qualification_profile"] = source_inputs.TWO_KVM_QUALIFICATION_PROFILE
+        spec["capacity_floor_policy_id"] = source_inputs.CAPACITY_FLOOR_POLICY_ID
+        spec["qualification_inputs"]["capacity_templates"] = [
+            row for row in spec["qualification_inputs"]["capacity_templates"]
+            if row["host_id"] in set(host_ids)
+        ]
+        spec["qualification_inputs"]["pressure_conditions"] = [
+            row for row in spec["qualification_inputs"]["pressure_conditions"]
+            if row["host_id"] in set(host_ids)
+        ]
+        spec["source_manifests"] = [
+            {**row, "relative_path": f"sources/{row['host_id']}.json"}
+            for row in spec["source_manifests"] if row["host_id"] in set(host_ids)
+        ]
+
+        sources = {host_id: copy.deepcopy(all_sources[host_id]) for host_id in host_ids}
+        fixture_tag = hashlib.sha256(str(root).encode("utf-8")).hexdigest()[:12]
+        for host_index, host_id in enumerate(host_ids):
+            source = sources[host_id]
+            source["source"]["git_commit"] = source_commit
+            source["build"]["rustc_release"] = release
+            source["build"]["rustc_verbose"] = rustc_verbose
+            source["build"]["cargo_version"] = cargo_version
+            source["resource_domain_calibration"]["source"] = {
+                key: source["source"][key]
+                for key in ("git_commit", "source_tree_sha256", "cargo_lock_sha256")
+            }
+            source["resource_domain_calibration"]["build"] = copy.deepcopy(source["build"])
+            source["resource_domain_calibration"]["build_sha256"] = \
+                source_campaign.digest_object(source["build"])
+            source["soak_artifacts"] = {
+                "allocatbelt": copy.deepcopy(source["soak_artifacts"]["allocatbelt"]),
+            }
+            # These valid SourceV5 metadata rows deliberately use the same
+            # relative artifact paths with distinct per-host hashes. No ELF is
+            # claimed or created; the full resident verifier must reject them.
+            for allocator_index, allocator in enumerate(source_campaign.ALLOCATORS):
+                digit = "12345678"[host_index * 4 + allocator_index]
+                source["artifacts"][allocator] = {
+                    "path": f"target/recorded-global-peer-{fixture_tag}/{allocator}",
+                    "sha256": digit * 64,
+                }
+            source["manifest_sha256"] = source_campaign.digest_object(source)
+
+        for ref in spec["source_manifests"]:
+            ref["sha256"] = sources[ref["host_id"]]["manifest_sha256"]
+        spec["runtime_binding"]["feedback_policy_sha256"] = \
+            sources[host_ids[0]]["feedback_policy"]["policy_sha256"]
+        core = source_inputs.preparation_core_from_spec(spec)
+
+        source_root_info = source_root
+        input_root = root / "input-root"
+        input_root.mkdir(mode=0o700)
+
+        def write_input(relative: str, raw: bytes) -> str:
+            path = input_root / relative
+            cursor = input_root
+            for part in Path(relative).parts[:-1]:
+                cursor = cursor / part
+                cursor.mkdir(mode=0o700, exist_ok=True)
+                os.chmod(cursor, 0o700)
+            path.write_bytes(raw)
+            path.chmod(0o600)
+            return hashlib.sha256(raw).hexdigest()
+
+        source_pins = {}
+        observed_hosts = {}
+        for host_index, host in enumerate(host_rows):
+            host_id = host["host_id"]
+            source = sources[host_id]
+            source_raw = source_campaign.canonical_bytes(source)
+            source_raw_sha = write_input(f"sources/{host_id}.json", source_raw)
+            records = {row["path"]: row for row in source["source"]["files"]}
+            modules = {
+                role: {"path": path, "sha256": records[path]["sha256"]}
+                for role, path in source_inputs.PREPARATION_MODULE_PATHS.items()
+            }
+            source_pins[host_id] = {
+                "manifest": {
+                    "relative_path": f"sources/{host_id}.json",
+                    "raw_sha256": source_raw_sha,
+                    "semantic_sha256": source["manifest_sha256"],
+                    "source_tree_sha256": source["source"]["source_tree_sha256"],
+                },
+                "modules": modules,
+                "artifacts": copy.deepcopy(source["artifacts"]),
+            }
+            observed = {
+                "schema": "allocatbelt.application-capacity-host-context.v1",
+                "host_id": host_id,
+                "boot_id_sha256": str(host_index + 1) * 64,
+                "controls_sha256": host["host_fingerprint_sha256"],
+                "controls": host["controls"],
+                "kernel_release": host["controls"]["kernel_release"],
+                "cpu_model": host["controls"]["cpu_model"],
+                "cpu_affinity": [0],
+                "network_namespace_inode": 1000 + host_index,
+            }
+            observed_raw = source_campaign.canonical_bytes(observed)
+            observed_sha = write_input(f"hosts/{host_id}.json", observed_raw)
+            observed_hosts[host_id] = {
+                "relative_path": f"hosts/{host_id}.json",
+                "raw_sha256": observed_sha,
+            }
+
+        template_fixture, _legacy_spec = preparation_fixture()
+        capacity_templates = [
+            copy.deepcopy(row) for row in template_fixture["capacity_templates"]
+            if row["host_id"] in set(host_ids)
+        ]
+        conditions = [
+            copy.deepcopy(row) for row in template_fixture["condition_intensities"]
+            if row["host_id"] in set(host_ids)
+        ]
+        for row in capacity_templates:
+            workload, profile, host_id = row["workload"], row["profile"], row["host_id"]
+            request_raw = source_campaign.canonical_bytes({
+                "schema": "allocatbelt.application-capacity-request-template.v1",
+                "minimum_interval_seconds": 10,
+            })
+            storage = None
+            if workload in ("disk", "mixed"):
+                storage = {
+                    "scope": "application_file_io",
+                    "root_path": str(input_root / "observed-storage" / host_id),
+                    "filesystem_type": "tmpfs",
+                    "device_major_minor": "0:1",
+                    "minimum_free_bytes": 64 * 1024 * 1024,
+                }
+            network = None
+            if workload in ("http", "mixed"):
+                network = {
+                    "scope": "ipv4_loopback_application_bytes",
+                    "interface": "lo", "address": "127.0.0.1",
+                    "namespace_inode": 1000 + host_ids.index(host_id),
+                }
+            context_raw = source_campaign.canonical_bytes({
+                "schema": "allocatbelt.application-capacity-context-template.v1",
+                "storage": storage, "network": network,
+            })
+            row["request_template"]["raw_sha256"] = write_input(
+                row["request_template"]["relative_path"], request_raw,
+            )
+            row["context_template"]["raw_sha256"] = write_input(
+                row["context_template"]["relative_path"], context_raw,
+            )
+        for row in conditions:
+            condition_value = {
+                "schema": source_inputs.SOURCE5_PRESSURE_CONDITION_SCHEMA,
+                "host_id": row["host_id"], "condition_id": row["condition_id"],
+                "capacity_key": row["capacity_key"],
+                "pressure_calibration_id": row["pressure_calibration_id"],
+                "readiness_threshold_rule": row["readiness_threshold_rule"],
+                "readiness_thresholds": row["readiness_thresholds"],
+                "pressure_thresholds": row["pressure_thresholds"],
+                "schedule": row["schedule"],
+            }
+            condition_raw = source_campaign.canonical_bytes(condition_value)
+            row["condition"]["raw_sha256"] = write_input(
+                row["condition"]["relative_path"], condition_raw,
+            )
+
+        output = input_root / "preparation-generations" / core["campaign_id"] / \
+            "preparation-intent.json"
+        output.parent.mkdir(mode=0o700, parents=True)
+        os.chmod(output.parent.parent, 0o700)
+        os.chmod(output.parent, 0o700)
+        spec_raw = source_campaign.canonical_bytes(spec)
+        spec_path = input_root / "fixture-binding-spec.json"
+        spec_sha = write_input("fixture-binding-spec.json", spec_raw)
+        source_inputs.build_preparation_intent(
+            core, source_pins, observed_hosts, capacity_templates, conditions, output,
+            source_manifest_values=sources, input_root=input_root,
+        )
+        preparation_raw = output.read_bytes()
+        preparation_value = json.loads(preparation_raw.decode("utf-8"))
+        return {
+            "source_root": source_root_info,
+            "input_root": input_root,
+            "host_ids": host_ids,
+            "campaign": source_campaign,
+            "sources": sources,
+            "source_inputs": source_inputs,
+            "spec": spec,
+            "spec_pin": {"path": str(spec_path), "sha256": spec_sha},
+            "preparation": preparation_value,
+            "preparation_pin": {
+                "path": str(output),
+                "sha256": hashlib.sha256(preparation_raw).hexdigest(),
+            },
+            "preparation_full_pin": {
+                "path": str(output),
+                "raw_sha256": hashlib.sha256(preparation_raw).hexdigest(),
+                "semantic_sha256": preparation_value["preparation_sha256"],
+            },
+        }
+
+    def test_historical_json_pin_uses_exact_raw_reader_projection(self):
+        module = self.preparation
+        value = {"schema": "component-historical-json.v1", "generation": "old"}
+        raw = module._canonical(value)
+        pin = {"path": "/captured/old/pilot.json", "sha256": module._sha256(raw)}
+        requests = []
+
+        def reader(request, maximum):
+            requests.append((request, maximum))
+            return raw
+
+        result = module._read_generation_json_pin(
+            pin, "old pilot", module.MAX_MANIFEST_BYTES, reader,
+        )
+        self.assertEqual(result, (value, raw, pin["sha256"]))
+        self.assertEqual(requests, [(
+            {"path": pin["path"], "raw_sha256": pin["sha256"]},
+            module.MAX_MANIFEST_BYTES,
+        )])
+
+    def test_historical_json_pin_rejects_bad_bytes_and_reader_failure(self):
+        module = self.preparation
+        raw = module._canonical({"schema": "component-historical-json.v1"})
+        pin = {"path": "/captured/old/spec.json", "sha256": module._sha256(raw)}
+        cases = (
+            ({**pin, "sha256": "0" * 64}, "wrong hash", module.MAX_MANIFEST_BYTES,
+             lambda _pin, _max: raw, "exact raw pin"),
+            (pin, "oversized", len(raw) - 1, lambda _pin, _max: raw, "exact raw pin"),
+            (pin, "wrong bytes type", module.MAX_MANIFEST_BYTES,
+             lambda _pin, _max: bytearray(raw), "exact raw pin"),
+            (pin, "missing", module.MAX_MANIFEST_BYTES,
+             lambda _pin, _max: (_ for _ in ()).throw(KeyError("not captured")),
+             "closed historical reader refused"),
+        )
+        for candidate, label, limit, reader, expected in cases:
+            with self.subTest(label=label):
+                with self.assertRaisesRegex(module.PreparationError, expected):
+                    module._read_generation_json_pin(candidate, label, limit, reader)
+        noncanonical = b'{"schema":"component-historical-json.v1" }'
+        with self.assertRaisesRegex(module.PreparationError, "canonical JSON"):
+            module._read_generation_json_pin(
+                {"path": pin["path"], "sha256": module._sha256(noncanonical)},
+                "noncanonical", module.MAX_MANIFEST_BYTES,
+                lambda _pin, _max: noncanonical,
+            )
+
+    def test_none_reader_keeps_the_resident_json_path(self):
+        module = self.preparation
+        value = {"schema": "resident-component.v1"}
+        raw = module._canonical(value)
+        with tempfile.TemporaryDirectory(prefix="inputprep-resident-default-") as temporary:
+            path = Path(temporary) / "resident.json"
+            path.write_bytes(raw)
+            result = module._read_generation_json_pin(
+                {"path": str(path), "sha256": module._sha256(raw)},
+                "resident final input", len(raw), None,
+            )
+        self.assertEqual(result, (value, raw, module._sha256(raw)))
+
+    def test_reader_is_recorded_only_and_metadata_entrypoints_are_named(self):
+        module = self.preparation
+        for function in (
+            module.export_capacity_pilot_recorded_host,
+            module.complete_prepared_inputs_recorded_host,
+            module.verify_prepared_inputs_completion_recorded_host,
+        ):
+            with self.subTest(function=function.__name__):
+                parameter = inspect.signature(function).parameters.get("global_artifact_reader")
+                self.assertIsNotNone(parameter)
+                self.assertIsNone(parameter.default)
+        for function in (
+            module.export_capacity_pilot, module.complete_prepared_inputs,
+            module.verify_prepared_inputs_completion,
+        ):
+            with self.subTest(function=function.__name__):
+                self.assertNotIn("global_artifact_reader", inspect.signature(function).parameters)
+        for name in (
+            "read_preparation_intent_metadata_v1",
+            "replay_prepared_capacity_inputs_bounded_metadata_v1",
+            "build_prepared_capacity_generation_bounded_metadata_v1",
+            "verify_prepared_capacity_generation_bounded_metadata_v1",
+            "export_initial_spec_plan_metadata_v1",
+            "materialize_prepared_host_binding_metadata_v1",
+            "verify_prepared_host_binding_metadata_v1",
+        ):
+            with self.subTest(name=name):
+                self.assertTrue(callable(getattr(module, name)))
+        binding_arguments = (
+            "preparation_pin", "spec_pin", "source_root", "input_root", "host_id",
+        )
+        for name in (
+            "materialize_prepared_host_binding", "verify_prepared_host_binding",
+            "materialize_prepared_host_binding_metadata_v1",
+            "verify_prepared_host_binding_metadata_v1",
+        ):
+            with self.subTest(name=name):
+                function = getattr(module, name)
+                self.assertEqual(tuple(inspect.signature(function).parameters),
+                                 binding_arguments)
+
+    def test_recorded_completion_forwards_reader_and_explicit_input_root(self):
+        module = self.preparation
+        providers = {host: object() for host in ("host-a", "host-b")}
+        reader = lambda _pin, _maximum: b"captured"
+        args = (
+            {"path": "/inputs/preparation-generations/campaign/preparation.json",
+             "sha256": "a" * 64},
+            [], [], [], [],
+            {"path": "/inputs/final-spec.json", "sha256": "b" * 64},
+            {"path": "/inputs/final-plan.json", "sha256": "c" * 64},
+        )
+        with mock.patch.object(
+                module, "_complete_prepared_inputs_impl",
+                return_value={"recorded": True}) as delegate:
+            result = module.complete_prepared_inputs_recorded_host(
+                *args, captured_pilot_read_providers=providers,
+                global_artifact_reader=reader, write_completion=False,
+                input_root=Path("/inputs"),
+            )
+        self.assertEqual(result, {"recorded": True})
+        delegate.assert_called_once_with(
+            *args, write_completion=False, resource_budget_pins=None,
+            captured_pilot_read_providers=providers, recorded_host=True,
+            input_root=Path("/inputs"), global_artifact_reader=reader,
+        )
+
+    def test_recorded_verifier_forwards_reader_to_private_replay(self):
+        module = self.preparation
+        providers = {host: object() for host in ("host-a", "host-b")}
+        reader = lambda _pin, _maximum: b"captured"
+        completion_pin = {
+            "path": "/inputs/completion.json", "raw_sha256": "d" * 64,
+            "semantic_sha256": "e" * 64,
+        }
+        provenance = {
+            "schema": "allocatbelt.application-source5-prepared-inputs-provenance.v1",
+            "preparation_pin": {
+                "path": "/inputs/preparation-generations/campaign/preparation.json",
+                "raw_sha256": "a" * 64,
+            },
+            "final_spec_pin": {"path": "/inputs/final-spec.json", "raw_sha256": "b" * 64},
+            "final_plan_pin": {"path": "/inputs/final-plan.json", "raw_sha256": "c" * 64},
+        }
+        with mock.patch.object(
+                module, "_verify_prepared_inputs_completion_impl",
+                return_value={"complete": True}) as replay:
+            result = module.verify_prepared_inputs_completion_recorded_host(
+                completion_pin, provenance, Path("/source"), Path("/inputs"),
+                captured_pilot_read_providers=providers,
+                global_artifact_reader=reader,
+            )
+        self.assertEqual(result, {"complete": True})
+        replay.assert_called_once_with(
+            completion_pin, provenance, Path("/source"), Path("/inputs"),
+            captured_pilot_read_providers=providers, recorded_host=True,
+            global_artifact_reader=reader,
+        )
+
+    def test_recorded_exporter_forwards_reader_to_fixed_owner_route(self):
+        module = self.preparation
+        reader = lambda _pin, _maximum: b"captured"
+        provider = object()
+        args = ({"schema": "component-preparation-pins"}, [], "host-a")
+        with mock.patch.object(
+                module, "_export_capacity_pilot_impl",
+                return_value={"pilot": True}) as exporter:
+            result = module.export_capacity_pilot_recorded_host(
+                *args, captured_read_provider=provider,
+                global_artifact_reader=reader,
+            )
+        self.assertEqual(result, {"pilot": True})
+        exporter.assert_called_once_with(
+            *args, captured_read_provider=provider, before_publication=None,
+            recorded_host=True, global_artifact_reader=reader,
+        )
+
+    def test_metadata_loader_accepts_distinct_peer_artifacts_while_full_loader_requires_local_files(self):
+        """Actual Source metadata replay accepts peer ELF bytes only as typed pins."""
+        with tempfile.TemporaryDirectory(prefix="inputprep-metadata-source-v2-") as temporary:
+            fixture = self._metadata_intent_fixture(Path(temporary))
+            module = self.preparation
+            value, sources, captured_campaign, captured_inputs = \
+                module.read_preparation_intent_metadata_v1(
+                    fixture["preparation_pin"], fixture["source_root"],
+                    fixture["input_root"],
+                )
+            self.assertEqual(value["preparation_sha256"],
+                             fixture["preparation"]["preparation_sha256"])
+            self.assertEqual(set(sources), set(fixture["host_ids"]))
+            self.assertEqual(captured_campaign.SOURCE_SCHEMA_V5,
+                             "allocatbelt.application-source-manifest.v5")
+            self.assertTrue(callable(captured_inputs.validate_preparation_intent))
+            first, second = fixture["host_ids"]
+            first_artifact = sources[first]["artifacts"]["allocatbelt"]
+            second_artifact = sources[second]["artifacts"]["allocatbelt"]
+            self.assertEqual(first_artifact["path"], second_artifact["path"])
+            self.assertNotEqual(first_artifact["sha256"], second_artifact["sha256"])
+            self.assertFalse(
+                (fixture["source_root"] / first_artifact["path"]).exists(),
+                "fixture must not create or imply a peer ELF",
+            )
+            with self.assertRaisesRegex(
+                    module.PreparationError, "full manifest verifier rejected"):
+                module.read_preparation_intent(
+                    fixture["preparation_pin"], fixture["source_root"],
+                    fixture["input_root"],
+                )
+
+    def test_nested_capacity_generation_metadata_reaches_real_loader_and_rejects_escape(self):
+        """Nested-root replay validates the actual intent before a missing completion fails."""
+        with tempfile.TemporaryDirectory(prefix="inputprep-nested-generation-v2-") as temporary:
+            fixture = self._metadata_intent_fixture(Path(temporary))
+            module = self.preparation
+            source_inputs = fixture["source_inputs"]
+            input_root = fixture["input_root"]
+            ceilings = {
+                "maximum_job_output_bytes": 1_073_741_824,
+                "maximum_job_output_inodes": 1024,
+                "maximum_generation_bytes": 2_147_483_648,
+                "maximum_generation_inodes": 8192,
+                "maximum_tmpdir_bytes": 1_073_741_824,
+                "maximum_tmpdir_inodes": 4096,
+                "maximum_trace_file_bytes": 536_870_912,
+                "durable_receipt_reserve_bytes": 1_048_576,
+                "durable_receipt_reserve_inodes": 8,
+                "minimum_free_bytes": 2_147_483_648,
+                "minimum_free_inodes": 10_000,
+                "monitor_sample_interval_milliseconds": 100,
+                "process_deadline_seconds": fixture["preparation"]["core"]["deadlines"]["process_seconds"],
+            }
+            budget_pins = {}
+            completion_inputs = []
+            for index, host_id in enumerate(fixture["host_ids"]):
+                budget = source_inputs.build_preparation_resource_budget(
+                    fixture["preparation"], fixture["preparation_full_pin"],
+                    host_id, ceilings,
+                )
+                budget_path = input_root / "resource-budgets" / f"{host_id}.json"
+                budget_path.parent.mkdir(mode=0o700, exist_ok=True)
+                os.chmod(budget_path.parent, 0o700)
+                budget_raw = source_inputs._canonical(budget)
+                budget_path.write_bytes(budget_raw)
+                budget_path.chmod(0o600)
+                budget_pins[host_id] = {
+                    "path": str(budget_path),
+                    "raw_sha256": hashlib.sha256(budget_raw).hexdigest(),
+                    "semantic_sha256": budget["resource_budget_sha256"],
+                }
+                completion_path = input_root / "capacity-preparations" / host_id / \
+                    "capacity-preparation-bounded-completion.json"
+                completion_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+                os.chmod(completion_path.parent.parent, 0o700)
+                os.chmod(completion_path.parent, 0o700)
+                completion_inputs.append({
+                    "host_id": host_id,
+                    "completion_pin": {
+                        "path": str(completion_path), "raw_sha256": str(index + 1) * 64,
+                    },
+                    "verification_receipt_pin": {
+                        "path": str(completion_path.with_name("host-verification.json")),
+                        "raw_sha256": str(index + 3) * 64,
+                    },
+                    "evidence_path_map": {
+                        "schema": capacity_stage.EVIDENCE_PATH_MAP_SCHEMA,
+                        "entries": [{"origin": str(input_root), "local": str(input_root)}],
+                    },
+                })
+
+            output = input_root / "prepared-capacity-generation.json"
+            with patch.object(
+                    module, "read_preparation_intent_metadata_v1",
+                    wraps=module.read_preparation_intent_metadata_v1) as metadata_reader:
+                with self.assertRaisesRegex(
+                        module.PreparationError,
+                        "cannot safely open capacity preparation completion"):
+                    module.build_prepared_capacity_generation_bounded_metadata_v1(
+                        fixture["preparation_pin"], completion_inputs, budget_pins,
+                        fixture["source_root"], input_root, output,
+                    )
+            metadata_reader.assert_called_once_with(
+                fixture["preparation_pin"], fixture["source_root"], input_root,
+            )
+            self.assertFalse(output.exists())
+
+            outside_root = Path(temporary) / "unrelated-input-root"
+            outside_root.mkdir(mode=0o700)
+            with patch.object(
+                    module, "read_preparation_intent_metadata_v1",
+                    wraps=module.read_preparation_intent_metadata_v1) as metadata_reader:
+                with self.assertRaisesRegex(
+                        module.PreparationError,
+                        "differs from its actual Source/input roots"):
+                    module.replay_prepared_capacity_inputs_bounded_metadata_v1(
+                        fixture["preparation_pin"], [], {},
+                        fixture["source_root"], outside_root,
+                    )
+            metadata_reader.assert_not_called()
+
+    def test_nested_initial_export_metadata_forwards_root_to_real_loader(self):
+        """The public initial exporter reaches Source validation with a nested intent."""
+        with tempfile.TemporaryDirectory(prefix="inputprep-nested-export-v2-") as temporary:
+            fixture = self._metadata_intent_fixture(Path(temporary))
+            module = self.preparation
+            input_root = fixture["input_root"]
+            generation_path = input_root / "prepared-capacity-generation.json"
+            generation_pin = {
+                "path": str(generation_path), "raw_sha256": "a" * 64,
+                "semantic_sha256": "b" * 64,
+            }
+            pressure_pin = {
+                "path": str(input_root / "initial-pressure-bindings.json"),
+                "raw_sha256": "c" * 64,
+            }
+            with patch.object(
+                    module, "read_preparation_intent_metadata_v1",
+                    wraps=module.read_preparation_intent_metadata_v1) as metadata_reader:
+                with self.assertRaisesRegex(
+                        module.PreparationError,
+                        "cannot safely open prepared capacity generation"):
+                    module.export_initial_spec_plan_metadata_v1(
+                        fixture["preparation_pin"], generation_pin, pressure_pin,
+                        fixture["source_root"], input_root,
+                    )
+            metadata_reader.assert_called_once_with(
+                fixture["preparation_pin"], fixture["source_root"], input_root,
+            )
+            self.assertFalse((input_root / "initial-spec-v3.json").exists())
+            self.assertFalse((input_root / "initial-plan-v3.json").exists())
+
+    def test_recorded_pilot_none_reader_preserves_full_source_validation_route(self):
+        """Only an explicit historical reader selects metadata-only Source checks."""
+        module = self.preparation
+        with tempfile.TemporaryDirectory(prefix="inputprep-pilot-reader-route-") as temporary:
+            root = Path(temporary)
+            source_root = root / "source"
+            input_root = root / "inputs"
+            artifact_root = root / "campaign-artifacts"
+            for path in (source_root, input_root, artifact_root):
+                path.mkdir(mode=0o700)
+            binding_body = {
+                "schema": module.PREPARED_FIXED_HOST_BINDING_SCHEMA,
+                "host_id": "host-route-test",
+                "fixed_spec_host_pin": {
+                    "path": str(input_root / "fixed-spec-host.json"),
+                    "raw_sha256": "a" * 64,
+                },
+                "prepared_host_context_pin": {
+                    "path": str(input_root / "prepared-host.json"),
+                    "raw_sha256": "b" * 64,
+                },
+                "spec_host_semantic_sha256": "c" * 64,
+                "boot_id_sha256": "d" * 64,
+                "kernel_release": "Linux-route-fixture",
+                "controls_sha256": "e" * 64,
+                "process_affinity": [0], "network_namespace_inode": 77,
+            }
+            binding = {
+                **binding_body,
+                "binding_sha256": hashlib.sha256(
+                    module._canonical(binding_body),
+                ).hexdigest(),
+            }
+            pins = {
+                "preparation": {"path": str(input_root / "preparation.json"),
+                                "sha256": "1" * 64},
+                "spec": {"path": str(input_root / "spec.json"),
+                         "sha256": "2" * 64},
+                "plan": {"path": str(input_root / "plan.json"),
+                         "sha256": "3" * 64},
+                "source_root": str(source_root), "input_root": str(input_root),
+                "campaign_artifacts_root": str(artifact_root),
+                "prepared_host_binding": binding, "output": None,
+            }
+            class ReaderRouteSelected(Exception):
+                pass
+
+            with patch.object(
+                    module, "read_preparation_intent",
+                    side_effect=ReaderRouteSelected("full")) as full_reader, \
+                 patch.object(
+                    module, "read_preparation_intent_metadata_v1",
+                    side_effect=ReaderRouteSelected("metadata")) as metadata_reader:
+                with self.assertRaisesRegex(ReaderRouteSelected, "full"):
+                    module.export_capacity_pilot_recorded_host(
+                        pins, [], "host-route-test", captured_read_provider=object(),
+                    )
+                full_reader.assert_called_once_with(
+                    pins["preparation"], source_root, input_root,
+                )
+                metadata_reader.assert_not_called()
+
+            reader = lambda _pin, _maximum: b"captured"
+            with patch.object(
+                    module, "read_preparation_intent",
+                    side_effect=ReaderRouteSelected("full")) as full_reader, \
+                 patch.object(
+                    module, "read_preparation_intent_metadata_v1",
+                    side_effect=ReaderRouteSelected("metadata")) as metadata_reader:
+                with self.assertRaisesRegex(ReaderRouteSelected, "metadata"):
+                    module.export_capacity_pilot_recorded_host(
+                        pins, [], "host-route-test", captured_read_provider=object(),
+                        global_artifact_reader=reader,
+                    )
+                full_reader.assert_not_called()
+                metadata_reader.assert_called_once_with(
+                    pins["preparation"], source_root, input_root,
+                )
+
+    def test_metadata_host_binding_materializer_and_verifier_preserve_source_and_spec_facts(self):
+        """Named Source checks preserve canonical storage; host/ELF facts are structural."""
+        with tempfile.TemporaryDirectory(prefix="inputprep-metadata-host-binding-") as temporary:
+            fixture = self._metadata_intent_fixture(Path(temporary))
+            module = self.preparation
+            host_id = fixture["host_ids"][0]
+            result = module.materialize_prepared_host_binding_metadata_v1(
+                fixture["preparation_pin"], fixture["spec_pin"],
+                fixture["source_root"], fixture["input_root"], host_id,
+            )
+            self.assertEqual(set(result), {
+                "fixed_spec_host_pin", "prepared_host_binding",
+            })
+            spec_host = next(row for row in fixture["spec"]["hosts"]
+                             if row["host_id"] == host_id)
+            expected_raw = fixture["campaign"].canonical_bytes(spec_host)
+            expected_path = fixture["input_root"] / "fixed-spec-hosts" / f"{host_id}.json"
+            self.assertEqual(result["fixed_spec_host_pin"], {
+                "path": str(expected_path),
+                "raw_sha256": hashlib.sha256(expected_raw).hexdigest(),
+            })
+            info = expected_path.stat(follow_symlinks=False)
+            self.assertEqual(expected_path.read_bytes(), expected_raw)
+            self.assertEqual(stat.S_IMODE(info.st_mode), 0o600)
+            self.assertEqual(info.st_nlink, 1)
+            self.assertEqual(
+                stat.S_IMODE(expected_path.parent.stat(follow_symlinks=False).st_mode),
+                0o700,
+            )
+            module._validate_prepared_fixed_host_binding(
+                result["prepared_host_binding"],
+            )
+            self.assertEqual(
+                module.verify_prepared_host_binding_metadata_v1(
+                    fixture["preparation_pin"], fixture["spec_pin"],
+                    fixture["source_root"], fixture["input_root"], host_id,
+                ),
+                result,
+            )
+            # The same source metadata is not an all-resident success signal.
+            # The legacy API still invokes the full verifier and refuses these
+            # intentionally absent per-host ELF bytes before touching Spec.host.
+            with self.assertRaisesRegex(
+                    module.PreparationError, "full manifest verifier rejected"):
+                module.verify_prepared_host_binding(
+                    fixture["preparation_pin"], fixture["spec_pin"],
+                    fixture["source_root"], fixture["input_root"], host_id,
+                )
+            self.assertEqual(expected_path.read_bytes(), expected_raw)
+            self.assertEqual(stat.S_IMODE(expected_path.stat(follow_symlinks=False).st_mode), 0o600)
+
+    def test_metadata_host_binding_verifier_is_readonly_for_bad_host_files_and_raw_pin(self):
+        """Metadata mode keeps physical checks; fixture host facts are structural only."""
+        with tempfile.TemporaryDirectory(prefix="inputprep-metadata-host-binding-readonly-") as temporary:
+            fixture = self._metadata_intent_fixture(Path(temporary))
+            module = self.preparation
+            input_root = fixture["input_root"]
+            host_id = fixture["host_ids"][0]
+            spec_host = next(row for row in fixture["spec"]["hosts"]
+                             if row["host_id"] == host_id)
+            expected_raw = fixture["campaign"].canonical_bytes(spec_host)
+            directory = input_root / "fixed-spec-hosts"
+            path = directory / f"{host_id}.json"
+
+            with self.assertRaisesRegex(
+                    module.PreparationError, "fixed Spec host directory is missing"):
+                module.verify_prepared_host_binding_metadata_v1(
+                    fixture["preparation_pin"], fixture["spec_pin"],
+                    fixture["source_root"], input_root, host_id,
+                )
+            self.assertFalse(directory.exists())
+
+            module.materialize_prepared_host_binding_metadata_v1(
+                fixture["preparation_pin"], fixture["spec_pin"],
+                fixture["source_root"], input_root, host_id,
+            )
+            self.assertEqual(path.read_bytes(), expected_raw)
+
+            changed = b"{}\n"
+            path.write_bytes(changed)
+            path.chmod(0o600)
+            with self.assertRaisesRegex(
+                    module.PreparationError,
+                    "differs from its exact raw pin|bytes/mode/link identity differ"):
+                module.verify_prepared_host_binding_metadata_v1(
+                    fixture["preparation_pin"], fixture["spec_pin"],
+                    fixture["source_root"], input_root, host_id,
+                )
+            self.assertEqual(path.read_bytes(), changed)
+            path.write_bytes(expected_raw)
+            path.chmod(0o600)
+
+            path.chmod(0o640)
+            with self.assertRaisesRegex(
+                    module.PreparationError, "bytes/mode/link identity differ"):
+                module.verify_prepared_host_binding_metadata_v1(
+                    fixture["preparation_pin"], fixture["spec_pin"],
+                    fixture["source_root"], input_root, host_id,
+                )
+            self.assertEqual(stat.S_IMODE(path.stat(follow_symlinks=False).st_mode), 0o640)
+            path.chmod(0o600)
+
+            alias = directory / "host-record-hardlink-alias.json"
+            os.link(path, alias)
+            with self.assertRaisesRegex(
+                    module.PreparationError, "bytes/mode/link identity differ"):
+                module.verify_prepared_host_binding_metadata_v1(
+                    fixture["preparation_pin"], fixture["spec_pin"],
+                    fixture["source_root"], input_root, host_id,
+                )
+            self.assertEqual(path.read_bytes(), expected_raw)
+            self.assertEqual(path.stat(follow_symlinks=False).st_nlink, 2)
+            alias.unlink()
+
+            target = input_root / "host-record-symlink-target.json"
+            target.write_bytes(expected_raw)
+            target.chmod(0o600)
+            path.unlink()
+            path.symlink_to(target)
+            with self.assertRaisesRegex(
+                    module.PreparationError, "regular nonsymlink file"):
+                module.verify_prepared_host_binding_metadata_v1(
+                    fixture["preparation_pin"], fixture["spec_pin"],
+                    fixture["source_root"], input_root, host_id,
+                )
+            self.assertTrue(path.is_symlink())
+            path.unlink()
+            target.unlink()
+
+            with self.assertRaisesRegex(
+                    module.PreparationError, "fixed Spec host record is missing"):
+                module.verify_prepared_host_binding_metadata_v1(
+                    fixture["preparation_pin"], fixture["spec_pin"],
+                    fixture["source_root"], input_root, host_id,
+                )
+            self.assertFalse(path.exists())
+
+            # Change the original host document without changing its frozen raw
+            # pin. Source's current input replay must refuse before any Spec.host
+            # write or repair.
+            observed_pin = fixture["preparation"]["observed_hosts"][host_id]
+            observed_path = input_root / observed_pin["relative_path"]
+            original_observed = observed_path.read_bytes()
+            changed_observed = json.loads(original_observed.decode("utf-8"))
+            changed_observed["boot_id_sha256"] = "f" * 64
+            observed_path.write_bytes(fixture["campaign"].canonical_bytes(changed_observed))
+            observed_path.chmod(0o600)
+            with self.assertRaisesRegex(
+                    module.PreparationError, "differs from its frozen raw pin"):
+                module.materialize_prepared_host_binding_metadata_v1(
+                    fixture["preparation_pin"], fixture["spec_pin"],
+                    fixture["source_root"], input_root, host_id,
+                )
+            self.assertFalse(path.exists())
+            self.assertNotEqual(observed_path.read_bytes(), original_observed)
 
 
 if __name__ == "__main__":
