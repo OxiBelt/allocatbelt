@@ -74,6 +74,11 @@ def _sha256(raw: bytes) -> str:
     return hashlib.sha256(raw).hexdigest()
 
 
+def _is_sha(value: object) -> bool:
+    return (type(value) is str and len(value) == 64 and
+            all(character in "0123456789abcdef" for character in value))
+
+
 def _exact(value: Any, keys: set[str], label: str) -> dict[str, Any]:
     _require(type(value) is dict and set(value) == keys, f"{label} has an unexpected field set")
     return value
@@ -694,6 +699,22 @@ def capacity_pilot_maximum_bytes(
 def _write_private_json_new(
     path: Path, value: dict[str, Any], source_root: Path, *, allow_existing_identical: bool = False,
 ) -> str:
+    return _write_private_json_new_bytes(
+        path, _canonical(value), source_root, size_class="request",
+        allow_existing_identical=allow_existing_identical,
+    )
+
+
+def _write_private_json_new_bytes(
+    path: Path, raw: bytes, source_root: Path, *, size_class: str,
+    allow_existing_identical: bool = False,
+) -> str:
+    size_bounds = {"request": MAX_REQUEST_BYTES, "campaign_plan": MAX_PLAN_BYTES}
+    _require(type(size_class) is str and size_class in size_bounds,
+             "new artifact writer requires a named finite Source artifact bound")
+    maximum_bytes = size_bounds[size_class]
+    _require(type(raw) is bytes and len(raw) <= maximum_bytes,
+             "new preparation artifact exceeds its finite size bound")
     _require(path.is_absolute(), "new artifact path must be absolute")
     parent = path.parent
     name = path.name
@@ -708,9 +729,7 @@ def _write_private_json_new(
              stat.S_IMODE(parent_info.st_mode) == 0o700 and parent_info.st_uid == os.getuid(),
              "new artifact parent must be an owned real mode-0700 directory")
     _require(not _within(source_root, path), "new artifact destination must be outside SourceV5")
-    raw = _canonical(value)
     checksum = _sha256(raw)
-    _require(len(raw) <= MAX_REQUEST_BYTES, "new preparation artifact exceeds its finite size bound")
     directory_fd = -1
     try:
         directory_fd = os.open(
@@ -852,6 +871,47 @@ def _write_private_json_new(
             os.close(directory_fd)
         except OSError:
             pass
+
+
+def _initial_spec_plan_payload_bytes(
+    spec: dict[str, Any], plan: dict[str, Any], campaign: Any,
+) -> tuple[bytes, bytes]:
+    spec_raw = _canonical(spec)
+    _require(len(spec_raw) <= MAX_REQUEST_BYTES,
+             "initial SpecV3 exceeds its finite private publication bound")
+    try:
+        plan_raw = campaign.campaign_plan_bytes(plan)
+        campaign_plan_limit = campaign.MAX_CAMPAIGN_PLAN_BYTES
+    except Exception as error:
+        raise PreparationError(f"initial PlanV3 bounded serialization failed: {error}") from error
+    _require(campaign_plan_limit == MAX_PLAN_BYTES,
+             "SourceV5 campaign PlanV3 bound differs from the anchored publication bound")
+    _require(type(plan_raw) is bytes and plan_raw == _canonical(plan) and
+             len(plan_raw) <= MAX_PLAN_BYTES,
+             "initial PlanV3 bytes differ from its bounded canonical serialization")
+    return spec_raw, plan_raw
+
+
+def _publish_initial_spec_plan_new(
+    spec_path: Path, plan_path: Path, spec: dict[str, Any], plan: dict[str, Any],
+    source_root: Path, campaign: Any,
+) -> tuple[str, str]:
+    _require(spec_path.is_absolute() and plan_path.is_absolute() and
+             spec_path != plan_path and spec_path.parent == plan_path.parent,
+             "initial SpecV3/PlanV3 must publish as distinct siblings")
+    _require(not spec_path.exists() and not spec_path.is_symlink() and
+             not plan_path.exists() and not plan_path.is_symlink(),
+             "initial SpecV3/PlanV3 export refuses to overwrite an existing generation")
+    spec_raw, plan_raw = _initial_spec_plan_payload_bytes(spec, plan, campaign)
+    spec_sha = _write_private_json_new_bytes(
+        spec_path, spec_raw, source_root, size_class="request",
+    )
+    plan_sha = _write_private_json_new_bytes(
+        plan_path, plan_raw, source_root, size_class="campaign_plan",
+    )
+    _require(spec_sha == _sha256(spec_raw) and plan_sha == _sha256(plan_raw),
+             "initial SpecV3/PlanV3 raw bytes changed during exclusive publication")
+    return spec_sha, plan_sha
 
 
 def _within(root: Path, path: Path) -> bool:
@@ -2190,6 +2250,15 @@ def _replay_prepared_capacity_inputs(
 
 PREPARED_CAPACITY_GENERATION_SCHEMA = \
     "allocatbelt.application-source5-prepared-capacity-generation.v1"
+INITIAL_PRESSURE_BINDINGS_SCHEMA = \
+    "allocatbelt.application-source5-initial-pressure-bindings.v1"
+INITIAL_SPEC_EXPORT_SCHEMA = \
+    "allocatbelt.application-source5-initial-spec-plan-export.v1"
+def _is_initial_two_kvm_host_order(host_ids: object) -> bool:
+    """Check the order of the cohort derived from the verified preparation."""
+    return (type(host_ids) is list and len(host_ids) == 2 and
+            all(type(host) is str and bool(host) for host in host_ids) and
+            len(set(host_ids)) == 2 and host_ids == sorted(host_ids))
 
 
 def replay_prepared_capacity_inputs_bounded(
@@ -2313,6 +2382,462 @@ def verify_prepared_capacity_generation_bounded(
     _require(_canonical(replayed) == raw,
              "capacity generation differs from full original bounded capacity replay")
     return replayed
+
+
+def _read_initial_pressure_bindings(
+    bindings_pin_value: object, input_root: Path,
+) -> list[dict[str, Any]]:
+    pin = _exact(bindings_pin_value, {"path", "raw_sha256"},
+                 "initial pressure bindings raw pin")
+    path = Path(pin["path"])
+    _require(path.is_absolute() and _within(input_root, path),
+             "initial pressure bindings file must be inside the frozen private input root")
+    bindings, _raw, actual = _read_pinned_json(
+        {"path": str(path), "sha256": pin["raw_sha256"]},
+        "initial pressure bindings", MAX_REQUEST_BYTES,
+    )
+    _require(actual == pin["raw_sha256"],
+             "initial pressure bindings raw digest changed")
+    value = _exact(bindings, {"schema", "entries"},
+                   "initial pressure bindings document")
+    _require(value["schema"] == INITIAL_PRESSURE_BINDINGS_SCHEMA and
+             type(value["entries"]) is list and len(value["entries"]) == 30,
+             "initial pressure bindings must contain the exact 30-row v1 matrix")
+    return value["entries"]
+
+
+def _validate_initial_pressure_binding_matrix(
+    preparation: dict[str, Any], pressure_binding_rows: object,
+) -> tuple[list[str], set[tuple[str, str, str]], dict[tuple[str, str, str], dict[str, Any]], list[tuple[str, str, str]]]:
+    """Bind exactly 30 supplied pressure rows to the frozen intent order."""
+    host_ids = [host["host_id"] for host in preparation["core"]["hosts"]]
+    expected_keys = {
+        (host_id, cell["workload"], cell["profile"])
+        for host_id in host_ids for cell in preparation["core"]["cells"]
+    }
+    _require(_is_initial_two_kvm_host_order(host_ids) and
+             len(expected_keys) == 30,
+             "initial pressure matrix requires the exact two-host 15-context profile")
+    conditions = preparation["condition_intensities"]
+    _require(type(conditions) is list and len(conditions) == 30,
+             "initial pressure matrix requires all original 30 conditions")
+    condition_map = {
+        (row["host_id"], row["capacity_key"]["workload"],
+         row["capacity_key"]["profile"]): row
+        for row in conditions
+    }
+    _require(set(condition_map) == expected_keys,
+             "initial pressure conditions do not match the exact host/context matrix")
+    _validate_prepared_context_matrix(
+        pressure_binding_rows, expected_keys,
+        "initial pressure calibration bindings", nested_capacity_key=True,
+    )
+    _require(type(pressure_binding_rows) is list and len(pressure_binding_rows) == 30,
+             "initial pressure binding list is incomplete")
+    pressure_order = [
+        (row["host_id"], row["capacity_key"]["workload"],
+         row["capacity_key"]["profile"])
+        for row in conditions
+    ]
+    _require(len(set(pressure_order)) == 30,
+             "initial condition-intensity order repeats a host/context")
+    binding_fields = {
+        "host_id", "condition_id", "capacity_key", "condition_pin",
+        "context_policy_pin", "calibration_pin", "calibration_receipt_pin",
+        "capacity_bundle_pin", "observed_host_pin", "evidence_path_map",
+    }
+    for index, (binding_value, expected_key) in enumerate(
+            zip(pressure_binding_rows, pressure_order)):
+        binding = _exact(binding_value, binding_fields,
+                         f"initial pressure binding[{index}]")
+        condition = condition_map[expected_key]
+        _require(binding["host_id"] == expected_key[0] and
+                 binding["condition_id"] == condition["condition_id"] and
+                 binding["capacity_key"] == condition["capacity_key"],
+                 f"initial pressure binding[{index}] changed its original condition/capacity identity or order")
+    return host_ids, expected_keys, condition_map, pressure_order
+
+
+def _replay_initial_pressure_bindings(
+    preparation: dict[str, Any], sources: dict[str, dict[str, Any]],
+    inputs: Any, source_root: Path, input_root: Path,
+    pressure_binding_rows: list[dict[str, Any]],
+    capacity_entries: dict[tuple[str, str, str], dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Replay actual scope receipts and project the immutable Spec rows."""
+    host_ids, expected_keys, condition_map, pressure_order = \
+        _validate_initial_pressure_binding_matrix(
+            preparation, pressure_binding_rows,
+        )
+    _require(_is_initial_two_kvm_host_order(host_ids) and
+             len(expected_keys) == 30 and set(capacity_entries) == expected_keys,
+             "initial pressure replay requires the exact two-host 15-context capacity generation")
+
+    relative = inputs.PREPARATION_MODULE_PATHS["pressure_readback"]
+    reader_raw, reader_path, reader_entry = _capture_typed_source_file(
+        sources[host_ids[0]], source_root, relative,
+        "initial pressure scope reader",
+    )
+    for host_id in host_ids:
+        module_pin = _exact(
+            preparation["source_pins"][host_id]["modules"]["pressure_readback"],
+            {"path", "sha256"},
+            f"{host_id} initial pressure-reader Source pin",
+        )
+        _require(module_pin == {"path": relative, "sha256": reader_entry["sha256"]},
+                 f"{host_id} initial pressure reader differs from the shared typed Source bytes")
+    pressure_reader = _execute_captured_module(
+        reader_raw, reader_path, "initial_pressure_readback",
+    )
+    verify_scope = getattr(pressure_reader, "verify_calibration_scope_v2_offline", None)
+    _require(callable(verify_scope),
+             "typed SourceV5 pressure reader lacks offline scope-v2 replay")
+
+    projected: list[dict[str, Any]] = []
+    for index, (binding_value, expected_key) in enumerate(
+            zip(pressure_binding_rows, pressure_order)):
+        binding = _exact(binding_value, {
+            "host_id", "condition_id", "capacity_key", "condition_pin",
+            "context_policy_pin", "calibration_pin", "calibration_receipt_pin",
+            "capacity_bundle_pin", "observed_host_pin", "evidence_path_map",
+        }, f"initial pressure binding[{index}]")
+        host_id = expected_key[0]
+        condition = condition_map[expected_key]
+        capacity_entry = capacity_entries[expected_key]
+        _require(binding["host_id"] == host_id and
+                 binding["condition_id"] == condition["condition_id"] and
+                 binding["capacity_key"] == condition["capacity_key"],
+                 f"initial pressure binding[{index}] changes its original condition/capacity identity")
+        condition_record = condition["condition"]
+        condition_path = _safe_child(
+            input_root, condition_record["relative_path"],
+            f"initial {expected_key} frozen pressure condition",
+        )
+        condition_pin = _exact(binding["condition_pin"], {
+            "path", "raw_sha256",
+        }, f"initial pressure binding[{index}] condition pin")
+        _require(condition_pin == {
+                     "path": str(condition_path),
+                     "raw_sha256": condition_record["raw_sha256"],
+                 },
+                 f"initial pressure binding[{index}] changed the original condition file pin")
+        manifest = preparation["source_pins"][host_id]["manifest"]
+        source_manifest_pin = {
+            "path": str(_safe_child(input_root, manifest["relative_path"],
+                                    f"{host_id} initial SourceV5 manifest")),
+            "raw_sha256": manifest["raw_sha256"],
+        }
+        expected_capacity_bundle = capacity_bundle_pin(
+            capacity_entry, source_manifest_pin,
+        )
+        _require(binding["capacity_bundle_pin"] == expected_capacity_bundle,
+                 f"initial pressure binding[{index}] does not consume the actual earlier capacity bundle")
+        observed_record = preparation["observed_hosts"][host_id]
+        expected_observed_pin = {
+            "path": str(_safe_child(input_root, observed_record["relative_path"],
+                                    f"{host_id} initial observed-host context")),
+            "raw_sha256": observed_record["raw_sha256"],
+        }
+        observed_pin = _exact(binding["observed_host_pin"], {
+            "path", "raw_sha256",
+        }, f"initial pressure binding[{index}] observed-host pin")
+        _require(observed_pin == expected_observed_pin,
+                 f"initial pressure binding[{index}] changed the observed-host bytes")
+        context_policy_pin = _exact(binding["context_policy_pin"], {
+            "path", "raw_sha256",
+        }, f"initial pressure binding[{index}] context-policy pin")
+        calibration_pin = _exact(binding["calibration_pin"], {
+            "path", "raw_sha256",
+        }, f"initial pressure binding[{index}] calibration pin")
+        receipt_pin = _exact(binding["calibration_receipt_pin"], {
+            "path", "raw_sha256", "scope_sha256",
+        }, f"initial pressure binding[{index}] strict scope-receipt pin")
+        for label, pin in (("context-policy bundle", context_policy_pin),
+                           ("pressure calibration", calibration_pin),
+                           ("strict scope receipt", receipt_pin)):
+            _require(Path(pin["path"]).is_absolute() and
+                     type(pin["raw_sha256"]) is str and
+                     _is_sha(pin["raw_sha256"]),
+                     f"initial pressure binding[{index}] {label} pin is malformed")
+        _require(_is_sha(receipt_pin["scope_sha256"]),
+                 f"initial pressure binding[{index}] scope digest is malformed")
+        try:
+            receipt = verify_scope(
+                calibration_pin, context_policy_pin, expected_capacity_bundle,
+                observed_pin, source_root=str(source_root),
+                evidence_path_map=binding["evidence_path_map"],
+                host_verification_pin=receipt_pin,
+            )
+        except Exception as error:
+            raise PreparationError(
+                f"initial pressure calibration[{index}] failed complete offline SourceV5 replay: {error}",
+            ) from error
+        source_value = sources[host_id]
+        _require(type(receipt) is dict and
+                 receipt.get("schema") == pressure_reader.CALIBRATION_SCOPE_RECEIPT_SCHEMA_V2 and
+                 receipt.get("replay_success") is True and receipt.get("validated") is True and
+                 receipt.get("execution_ready") is False and
+                 receipt.get("qualification_eligible") is False and
+                 receipt.get("controller_chronology_proven") is False and
+                 receipt.get("scope_sha256") == receipt_pin["scope_sha256"] and
+                 receipt.get("condition_id") == condition["condition_id"] and
+                 receipt.get("pressure_calibration_id") == condition["pressure_calibration_id"] and
+                 receipt.get("capacity_key") == condition["capacity_key"] and
+                 receipt.get("condition_sha256") == condition_record["raw_sha256"] and
+                 receipt.get("source_manifest_sha256") == manifest["raw_sha256"] and
+                 receipt.get("source_manifest_semantic_sha256") == manifest["semantic_sha256"] and
+                 receipt.get("source_tree_sha256") == manifest["source_tree_sha256"] and
+                 receipt.get("context_policy_bundle_raw_sha256") == context_policy_pin["raw_sha256"] and
+                 receipt.get("capacity_bundle_pins_sha256") == _sha256(_canonical(expected_capacity_bundle)) and
+                 receipt.get("capacity_tsv_raw_sha256") == capacity_entry["artifact"]["sha256"] and
+                 receipt.get("observed_host_raw_sha256") == observed_record["raw_sha256"] and
+                 receipt.get("driver_sha256") == source_value["qualification_harness"]["pressure_driver"]["sha256"] and
+                 receipt.get("reader_sha256") == source_value["qualification_harness"]["pressure_validator"]["sha256"] and
+                 receipt.get("pressure_thresholds") == condition["pressure_thresholds"] and
+                 receipt.get("readiness_thresholds") == condition["readiness_thresholds"] and
+                 receipt.get("sample_count") == 300,
+                 f"initial pressure calibration[{index}] receipt differs from its original Source/condition/capacity pins")
+        pressure_calibration = {
+            "calibration_id": condition["pressure_calibration_id"],
+            "artifact": _relative_input_pin(
+                input_root, calibration_pin["path"], calibration_pin["raw_sha256"],
+                f"initial {expected_key} pressure calibration artifact",
+            ),
+            "receipt": _relative_input_pin(
+                input_root, receipt_pin["path"], receipt_pin["raw_sha256"],
+                f"initial {expected_key} pressure scope receipt",
+            ),
+            "validator_sha256": source_value["qualification_harness"]["pressure_validator"]["sha256"],
+        }
+        _require(pressure_calibration["artifact"]["relative_path"] !=
+                 pressure_calibration["receipt"]["relative_path"] and
+                 pressure_calibration["artifact"]["relative_path"] !=
+                 condition_record["relative_path"] and
+                 pressure_calibration["receipt"]["relative_path"] !=
+                 condition_record["relative_path"],
+                 f"initial pressure calibration[{index}] aliases another immutable input")
+        projected.append({
+            "host_id": host_id,
+            "condition_id": condition["condition_id"],
+            "condition_sha256": condition_record["raw_sha256"],
+            "capacity_key": condition["capacity_key"],
+            "condition": {
+                "relative_path": condition_record["relative_path"],
+                "raw_sha256": condition_record["raw_sha256"],
+            },
+            "pressure_calibration": pressure_calibration,
+            "readiness_thresholds": condition["readiness_thresholds"],
+            "schedule": {
+                "duration_seconds": condition["schedule"]["duration_seconds"],
+                "sample_interval_ms": condition["schedule"]["sample_interval_ms"],
+                "seed": condition["schedule"]["seed"],
+            },
+        })
+    return projected
+
+
+def _initial_spec_value(
+    preparation: dict[str, Any], sources: dict[str, dict[str, Any]],
+    campaign: Any, inputs: Any, pressure_conditions: list[dict[str, Any]],
+) -> dict[str, Any]:
+    try:
+        core = inputs._validate_preparation_core(preparation.get("core"))
+    except Exception as error:
+        raise PreparationError(f"initial SpecV3 preparation core replay failed: {error}") from error
+    _require(core == preparation.get("core"),
+             "initial SpecV3 preparation core changed after intent replay")
+    _require(core.get("schema") == inputs.SOURCE5_PREPARATION_CORE_SCHEMA_V3 and
+             core.get("qualification_profile") == "two_kvm_hosts_v1",
+             "initial SpecV3 exporter requires the frozen two-KVM preparation core v3")
+    host_ids = [host["host_id"] for host in core["hosts"]]
+    _require(_is_initial_two_kvm_host_order(host_ids) and
+             all(host.get("venue") == "kvm_guest" for host in core["hosts"]),
+             "initial SpecV3 exporter is restricted to the verified two-KVM Source order")
+    core_fields = {key: value for key, value in core.items() if key != "schema"}
+    source_refs = []
+    for host_id in host_ids:
+        source_pin = _exact(preparation["source_pins"][host_id]["manifest"], {
+            "relative_path", "raw_sha256", "semantic_sha256", "source_tree_sha256",
+        }, f"{host_id} initial SourceV5 pin")
+        _require(sources[host_id]["manifest_sha256"] == source_pin["semantic_sha256"] and
+                 sources[host_id]["source"]["source_tree_sha256"] ==
+                    source_pin["source_tree_sha256"],
+                 f"{host_id} initial SourceV5 semantic/tree pin differs from the verified source")
+        source_refs.append({
+            "host_id": host_id,
+            "relative_path": source_pin["relative_path"],
+            "sha256": source_pin["semantic_sha256"],
+        })
+    capacity_templates = []
+    for index, template_value in enumerate(preparation["capacity_templates"]):
+        template = _exact(template_value, {
+            "host_id", "workload", "profile", "calibration_id", "calibrator",
+            "request_template", "context_template", "template_index", "run_id",
+            "prospective_nonce", "template_sha256", "source_manifest_sha256",
+            "source_sha256", "binary_sha256",
+        }, f"initial capacity template[{index}]")
+        capacity_templates.append({
+            key: template[key] for key in (
+                "host_id", "workload", "profile", "calibration_id", "calibrator",
+                "request_template", "context_template",
+            )
+        } | {"evidence": None})
+    _require(len(capacity_templates) == 30 and
+             all(row["evidence"] is None for row in capacity_templates),
+             "initial SpecV3 must preserve exactly 30 prospective capacity rows without later-fill evidence")
+    _require(type(pressure_conditions) is list and len(pressure_conditions) == 30,
+             "initial SpecV3 requires all 30 replayed pressure artifacts and scope receipts")
+    spec = {
+        "schema": campaign.SPEC_SCHEMA_V3,
+        **core_fields,
+        "source_manifests": source_refs,
+        "rates": [],
+        "oracles": [],
+        "qualification_inputs": {
+            "capacity_templates": capacity_templates,
+            "pressure_conditions": pressure_conditions,
+        },
+    }
+    try:
+        projected_core = inputs.preparation_core_from_spec(spec)
+    except Exception as error:
+        raise PreparationError(f"initial SpecV3 changed the SourceV5 preparation core: {error}") from error
+    _require(projected_core == core,
+             "initial SpecV3 changed the exact prospective preparation core")
+    return spec
+
+
+def export_initial_spec_plan(
+    preparation_pin: dict[str, Any], capacity_generation_pin: dict[str, Any],
+    pressure_bindings_pin: dict[str, Any], source_root: Path, input_root: Path,
+) -> dict[str, Any]:
+    """Export a prospective initial SpecV3/PlanV3 from complete real inputs.
+
+    All 30 pressure scope receipts are replayed using the Source-pinned reader.
+    Capacity evidence remains ``None`` in the initial generation; the returned
+    plan is prospective and cannot authorize application launches.
+    """
+    source_root = _safe_root(Path(source_root), "initial SpecV3 SourceV5 root")
+    input_root = _safe_root(Path(input_root), "initial SpecV3 input root")
+    _require(source_root != input_root,
+             "initial SpecV3 SourceV5 and private input roots must be separate")
+    preparation, sources, campaign, inputs = read_preparation_intent(
+        preparation_pin, source_root, input_root,
+    )
+    host_ids = [host["host_id"] for host in preparation["core"]["hosts"]]
+    _require(_is_initial_two_kvm_host_order(host_ids) and
+             preparation["core"].get("qualification_profile") == "two_kvm_hosts_v1",
+             "initial SpecV3 export is restricted to the verified two-KVM SourceV5 cohort")
+    generation_pin = _exact(capacity_generation_pin, {
+        "path", "raw_sha256", "semantic_sha256",
+    }, "initial SpecV3 capacity generation pin")
+    capacity_generation = verify_prepared_capacity_generation_bounded(
+        generation_pin, preparation_pin, source_root, input_root,
+    )
+    _require(capacity_generation.get("campaign_id") == preparation["core"]["campaign_id"] and
+             capacity_generation.get("complete") is True and
+             capacity_generation.get("qualification_eligible") is False,
+             "initial SpecV3 capacity generation is incomplete or claims qualification")
+    capacity_entries: dict[tuple[str, str, str], dict[str, Any]] = {}
+    capacity_rows = capacity_generation.get("capacity_preparations")
+    _require(type(capacity_rows) is list and len(capacity_rows) == 2,
+             "initial SpecV3 capacity generation does not contain both KVM hosts")
+    for host_index, row_value in enumerate(capacity_rows):
+        row = _exact(row_value, {
+            "host_id", "completion", "host_verification", "evidence_path_map",
+            "completion_sha256", "ledger", "capacity_preparation_templates_sha256",
+            "entries", "resource_budget", "resource_monitor",
+        }, f"initial capacity generation host[{host_index}]")
+        _require(row["host_id"] == host_ids[host_index] and
+                 type(row["entries"]) is list and len(row["entries"]) == 15,
+                 f"initial capacity generation host[{host_index}] changed its exact 15-context order")
+        for entry_index, entry in enumerate(row["entries"]):
+            key_value = _exact(entry.get("capacity_key"), {
+                "host_id", "workload", "profile", "calibration_id",
+            }, f"initial capacity generation host[{host_index}] entry[{entry_index}] key")
+            key = (key_value["host_id"], key_value["workload"], key_value["profile"])
+            _require(key[0] == row["host_id"] and key not in capacity_entries,
+                     "initial capacity generation repeats or crosses a host context")
+            capacity_entries[key] = entry
+    expected_keys = {
+        (host_id, cell["workload"], cell["profile"])
+        for host_id in host_ids for cell in preparation["core"]["cells"]
+    }
+    _require(len(expected_keys) == 30 and set(capacity_entries) == expected_keys,
+             "initial capacity generation does not cover all 30 original host contexts")
+    pressure_bindings = _read_initial_pressure_bindings(
+        pressure_bindings_pin, input_root,
+    )
+    pressure_conditions = _replay_initial_pressure_bindings(
+        preparation, sources, inputs, source_root, input_root,
+        pressure_bindings, capacity_entries,
+    )
+    spec = _initial_spec_value(
+        preparation, sources, campaign, inputs, pressure_conditions,
+    )
+    _require(spec["rates"] == [] and spec["oracles"] == [] and
+             len(spec["qualification_inputs"]["capacity_templates"]) == 30 and
+             all(item["evidence"] is None
+                 for item in spec["qualification_inputs"]["capacity_templates"]),
+             "initial SpecV3 must remain prospective with only its exact actual pressure matrix")
+    try:
+        validation = campaign.validate_spec(spec, sources, input_root)
+        inputs_sha = campaign.campaign_inputs_source_sha256(sources)
+        plan = campaign.freeze_plan(spec, sources, input_root)
+        campaign.verify_plan(
+            plan, sources[host_ids[0]]["runtime_readback_validator"]["sha256"],
+            inputs_sha,
+        )
+    except Exception as error:
+        raise PreparationError(
+            f"initial SpecV3/PlanV3 failed the unchanged SourceV5 validators: {error}",
+        ) from error
+    _require(validation.get("rates_frozen") is False and
+             validation.get("oracles_frozen") is False and
+             validation.get("confirmation_ready") is False and
+             validation.get("capacity_evidence_supplied") is False and
+             validation.get("capacity_evidence_supplied_count") == 0 and
+             validation.get("capacity_evidence_validation_complete") is False and
+             validation.get("full_gate_ready") is False and
+             plan.get("execution_ready") is False and
+             plan.get("full_gate_ready") is False and
+             len(plan["jobs"]["exploration"]) == 720 and
+             {host: sum(job["host_id"] == host
+                        for job in plan["jobs"]["exploration"])
+              for host in host_ids} == {host: 360 for host in host_ids} and
+             plan["jobs"]["confirmation"] == [] and
+             plan["jobs"]["pressure"] == [] and
+             len(plan["capacity_process_templates"]) == 30 and
+             len(plan["feedback_process_templates"]) == 480,
+             "initial SpecV3/PlanV3 changed its exact prospective two-host horizon or readiness state")
+    spec_path = input_root / "initial-spec-v3.json"
+    plan_path = input_root / "initial-plan-v3.json"
+    _require(not spec_path.exists() and not spec_path.is_symlink() and
+             not plan_path.exists() and not plan_path.is_symlink(),
+             "initial SpecV3/PlanV3 export refuses to overwrite an existing generation")
+    spec_sha, plan_sha = _publish_initial_spec_plan_new(
+        spec_path, plan_path, spec, plan, source_root, campaign,
+    )
+    return {
+        "schema": INITIAL_SPEC_EXPORT_SCHEMA,
+        "preparation": {
+            "path": str(Path(preparation_pin["path"])),
+            "raw_sha256": preparation_pin["sha256"],
+            "semantic_sha256": preparation["preparation_sha256"],
+        },
+        "capacity_generation": generation_pin,
+        "spec": {
+            "path": str(spec_path), "raw_sha256": spec_sha,
+            "semantic_sha256": campaign.digest_object(spec),
+        },
+        "plan": {
+            "path": str(plan_path), "raw_sha256": plan_sha,
+            "semantic_sha256": plan["plan_sha256"],
+        },
+        "qualification_eligible": False,
+        "execution_ready": False,
+        "full_gate_ready": False,
+    }
 
 
 def _capacity_pilot_provider_map(
@@ -3174,6 +3699,18 @@ def _parser() -> argparse.ArgumentParser:
     verify.add_argument("--intent-sha256", required=True)
     verify.add_argument("--source-root", type=Path, required=True)
     verify.add_argument("--input-root", type=Path, required=True)
+    initial = commands.add_parser(
+        "export-initial-spec", help="replay genuine pre-Spec capacity/pressure inputs and freeze initial SpecV3/PlanV3",
+    )
+    initial.add_argument("--preparation", type=Path, required=True)
+    initial.add_argument("--preparation-sha256", required=True)
+    initial.add_argument("--capacity-generation", type=Path, required=True)
+    initial.add_argument("--capacity-generation-raw-sha256", required=True)
+    initial.add_argument("--capacity-generation-semantic-sha256", required=True)
+    initial.add_argument("--pressure-bindings", type=Path, required=True)
+    initial.add_argument("--pressure-bindings-raw-sha256", required=True)
+    initial.add_argument("--source-root", type=Path, required=True)
+    initial.add_argument("--input-root", type=Path, required=True)
     completion = commands.add_parser("verify-completion", help="offline replay the prepared final input generation")
     completion.add_argument("--completion", type=Path, required=True)
     completion.add_argument("--completion-raw-sha256", required=True)
@@ -3202,6 +3739,18 @@ def main(argv: list[str] | None = None) -> int:
                 {"path": str(args.intent), "sha256": args.intent_sha256}, args.source_root, args.input_root,
             )
             result = inputs.validate_preparation_intent(intent, sources, args.input_root)
+        elif args.command == "export-initial-spec":
+            result = export_initial_spec_plan(
+                {"path": str(args.preparation), "sha256": args.preparation_sha256},
+                {
+                    "path": str(args.capacity_generation),
+                    "raw_sha256": args.capacity_generation_raw_sha256,
+                    "semantic_sha256": args.capacity_generation_semantic_sha256,
+                },
+                {"path": str(args.pressure_bindings),
+                 "raw_sha256": args.pressure_bindings_raw_sha256},
+                args.source_root, args.input_root,
+            )
         else:
             result = verify_prepared_inputs_completion(
                 {

@@ -491,7 +491,26 @@ class PressureReadbackV2Tests(unittest.TestCase):
         self.assertIn("expected_request_schema", source)
         self.assertIn("request.get('capacity_floor_policy_id')", source)
         self.assertIn("resolved_context_keys.add", source)
-        self.assertIn("expected_shared_context['capacity_floor_policy_id']", source)
+        self.assertIn("project_shared_context_policy_v2", source)
+        fixtures = _load_module(
+            "pressure_shared_floor_projection_fixtures",
+            SCRIPT_DIR / "test-application-source5-initial-spec-export.py",
+        )
+        source_pin, capacity, members = fixtures._context_policy_fixture()
+        floor = feedback_reader.CAPACITY_FLOOR_POLICY_ID
+        for member in members:
+            member["policy"]["context"]["capacity_floor_policy_id"] = floor
+        shared = readback.project_shared_context_policy_v2(
+            source_pin, capacity, members, floor,
+        )
+        self.assertEqual(shared["context"]["capacity_floor_policy_id"], floor)
+        for index in (0, 1):
+            source_pin, capacity, members = fixtures._context_policy_fixture()
+            for member in members:
+                member["policy"]["context"]["capacity_floor_policy_id"] = floor
+            members[index]["policy"]["context"]["capacity_floor_policy_id"] = "unknown-floor"
+            with self.subTest(member=index), self.assertRaises(readback.ReadbackError):
+                readback.project_shared_context_policy_v2(source_pin, capacity, members, floor)
 
     def test_pressure_policy_floor_selector_is_derived_from_exact_source_artifact(self) -> None:
         descriptor = {

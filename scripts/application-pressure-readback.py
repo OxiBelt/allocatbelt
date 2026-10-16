@@ -48,6 +48,7 @@ SOURCE5_SOAK_HOST_VERIFICATION_SCHEMA_V3 = "allocatbelt.application-source5-soak
 PRESSURE_PAIR_ORIGIN_FACTS_SCHEMA = "allocatbelt.application-pressure-pair-origin-facts.v1"
 CAPACITY_BUNDLE_PIN_SCHEMA_V2 = "allocatbelt.application-pressure-capacity-bundle-pin.v2"
 CONTEXT_POLICY_BUNDLE_SCHEMA_V2 = "allocatbelt.application-pressure-context-policy-bundle.v2"
+CAPACITY_FLOOR_POLICY_ID = "application_capacity_relative_tenth_v1"
 CALIBRATION_BINDING_SCHEMA_V2 = "allocatbelt.application-pressure-calibration-binding.v2"
 SOURCE5_PRESSURE_CONDITION_SCHEMA = "allocatbelt.application-source5-pressure-condition.v1"
 SOURCE5_MANIFEST_SCHEMA = "allocatbelt.application-source-manifest.v5"
@@ -1473,6 +1474,151 @@ def _context_policy_numeric_projection_digest_v2(value: object) -> str:
     })
 
 
+def project_shared_context_policy_v2(
+    expected_source_pin_value: object, capacity_bundle_pins_value: object,
+    replayed_members_value: object, selected_floor_policy_id_value: object = None,
+) -> dict[str, Any]:
+    """Build the shared numeric context policy from two Source-replayed members.
+
+    The member rows are the exact output of the composer replay path in
+    ``_verify_context_policy_bundle_v2`` or the additive pre-Spec bundle
+    writer. This function only projects those verified outputs; it accepts no
+    readiness or verification flags.
+    """
+    expected_source_pin = _raw_pin(
+        expected_source_pin_value, "shared policy expected SourceV5 manifest",
+    )
+    capacity_bundle = exact(capacity_bundle_pins_value, {
+        "schema", "capacity_key", "source_manifest", "request", "artifact",
+        "receipt",
+    }, "shared policy capacity bundle")
+    capacity_key = _capacity_key_v2(capacity_bundle["capacity_key"])
+    capacity_source_pin = _raw_pin(
+        capacity_bundle["source_manifest"], "shared policy capacity SourceV5 pin",
+    )
+    require(capacity_source_pin == expected_source_pin,
+            "shared policy capacity bundle uses a different SourceV5 manifest")
+    expected_capacity = {
+        name: _raw_pin(capacity_bundle[name], f"shared policy capacity {name}")
+        for name in ("request", "artifact", "receipt")
+    }
+    floor_policy_id = selected_floor_policy_id_value
+    require(floor_policy_id is None or
+            floor_policy_id == CAPACITY_FLOOR_POLICY_ID,
+            "shared policy selected capacity-floor ID is unknown")
+    replayed_members = replayed_members_value
+    require(type(replayed_members) is list and len(replayed_members) == 2,
+            "shared context policy requires exactly two composer-replayed members")
+    member_fields = {
+        "pair", "executor", "allocator", "binary_sha256", "probe_raw_sha256",
+        "request_raw_sha256", "resolved_policy_raw_sha256",
+        "resolved_policy_sha256", "composition_receipt_raw_sha256", "policy",
+    }
+    normalized_members = [
+        exact(value, member_fields, f"shared policy replayed member[{index}]")
+        for index, value in enumerate(replayed_members)
+    ]
+    first_policy = normalized_members[0]["policy"]
+    require(type(first_policy) is dict,
+            "shared policy first replayed member has no resolved numeric policy")
+    first_context = exact(first_policy.get("context"), {
+        "host_id", "workload", "profile", "calibration_id", "allocator",
+    } | ({"capacity_floor_policy_id"} if floor_policy_id is not None else set()),
+        "shared policy first resolved context")
+    require({key: first_context[key] for key in capacity_key} == capacity_key,
+            "shared policy resolved context differs from its prepared capacity key")
+    if floor_policy_id is not None:
+        require(first_context.get("capacity_floor_policy_id") == floor_policy_id,
+                "shared policy resolved context lost the selected capacity-floor ID")
+    stable_fields = (
+        "source_manifest_raw_sha256", "source_manifest_sha256", "source_tree_sha256",
+        "build_sha256", "base_policy_artifact_sha256", "base_policy_sha256",
+        "base_context_sha256", "capacity_request_raw_sha256",
+        "capacity_artifact_raw_sha256", "capacity_receipt_raw_sha256",
+        "resolution_rule_version",
+    )
+    resolutions = []
+    for index, member in enumerate(normalized_members):
+        policy_document = member["policy"]
+        require(type(policy_document) is dict,
+                f"shared policy member[{index}] has no resolved policy document")
+        context_fields = {
+            "host_id", "workload", "profile", "calibration_id", "allocator",
+        } | ({"capacity_floor_policy_id"} if floor_policy_id is not None else set())
+        context = exact(policy_document.get("context"), context_fields,
+                        f"shared policy member[{index}] resolved context")
+        require({key: context[key] for key in capacity_key} == capacity_key and
+                context["allocator"] == member["allocator"],
+                f"shared policy member[{index}] resolved context identity differs")
+        if floor_policy_id is not None:
+            require(context["capacity_floor_policy_id"] == floor_policy_id,
+                    f"shared policy member[{index}] lost the selected capacity-floor ID")
+        for field in ("pair", "executor", "allocator"):
+            text(member[field], f"shared policy member[{index}] {field}", 128)
+        for field in (
+            "binary_sha256", "probe_raw_sha256", "request_raw_sha256",
+            "resolved_policy_raw_sha256", "resolved_policy_sha256",
+            "composition_receipt_raw_sha256",
+        ):
+            sha256(member[field], f"shared policy member[{index}] {field}")
+        if index:
+            other = policy_document
+            require(other.get("policy") == first_policy.get("policy"),
+                    f"shared policy members resolve different numeric policies at member[{index}]")
+            for field in stable_fields:
+                require(other.get(field) == first_policy.get(field),
+                        f"shared policy members differ at stable field {field}")
+            other_context = {key: value for key, value in context.items()
+                             if key != "allocator"}
+            first_non_allocator = {key: value for key, value in first_context.items()
+                                   if key != "allocator"}
+            require(other_context == first_non_allocator,
+                    f"shared policy members differ in non-allocator context at member[{index}]")
+        resolutions.append({key: member[key] for key in (
+            "pair", "executor", "allocator", "binary_sha256", "probe_raw_sha256",
+            "request_raw_sha256", "resolved_policy_raw_sha256",
+            "resolved_policy_sha256", "composition_receipt_raw_sha256",
+        )})
+    numeric = first_policy.get("policy")
+    require(type(numeric) is dict and type(numeric.get("collector")) is dict,
+            "shared policy resolved numeric policy is malformed")
+    shared_context = {
+        key: first_context[key]
+        for key in ("host_id", "workload", "profile", "calibration_id")
+    }
+    if floor_policy_id is not None:
+        shared_context["capacity_floor_policy_id"] = floor_policy_id
+    policy_body = {
+        "schema": SOURCE5_PRESSURE_POLICY_SCHEMA,
+        "source_manifest": expected_source_pin,
+        "context": shared_context,
+        "capacity_bundle": expected_capacity,
+        "base_policy_artifact_sha256": first_policy["base_policy_artifact_sha256"],
+        "base_policy_sha256": first_policy["base_policy_sha256"],
+        "base_context_sha256": first_policy["base_context_sha256"],
+        "resolution_rule_version": first_policy["resolution_rule_version"],
+        "numeric_policy": numeric,
+        "baseline": numeric["collector"]["expected_global_control_baseline"],
+        "hard_ceilings": {
+            "global": numeric["global_ceilings"],
+            "tenant": numeric["tenant_ceilings"],
+        },
+        "normalization_denominators": {
+            "capacity_sources": numeric["capacity_sources"],
+            "scope_limits": numeric["scope_limits"],
+            "rate_buckets": numeric["rate_buckets"],
+        },
+        "member_resolutions": resolutions,
+    }
+    for field in (
+        "base_policy_artifact_sha256", "base_policy_sha256", "base_context_sha256",
+    ):
+        sha256(policy_body[field], f"shared policy {field}")
+    text(policy_body["resolution_rule_version"],
+         "shared policy resolution rule version", 128)
+    return {**policy_body, "policy_sha256": digest_object(policy_body)}
+
+
 def _source5_capacity_floor_policy_id(source_stack: dict[str, Any]) -> str | None:
     artifact = exact(source_stack["source"]["feedback_policy"], {
         "schema", "policy", "policy_sha256",
@@ -1542,8 +1688,6 @@ def _verify_context_policy_bundle_v2(
     sha256(policy["base_policy_sha256"], "SourceV5 base numeric policy SHA-256")
     sha256(policy["base_context_sha256"], "SourceV5 base context SHA-256")
     text(policy["resolution_rule_version"], "SourceV5 capacity resolution rule version", 128)
-    resolutions = policy["member_resolutions"]
-    require(type(resolutions) is list and len(resolutions) == 2, "shared policy must bind exactly the two original pressure members")
     members = context_bundle["members"]
     require(type(members) is list and len(members) == 2, "context-policy bundle must pin exactly two original pressure members")
     replayed_members = []
@@ -1625,53 +1769,10 @@ def _verify_context_policy_bundle_v2(
             "composition_receipt_raw_sha256": composition_sha,
             "policy": resolved_policy,
         })
-    first = replayed_members[0]["policy"]
-    first_context = first["context"]
-    for index, row in enumerate(replayed_members[1:], start=1):
-        other = row["policy"]
-        require(other["policy"] == first["policy"], f"context-policy members resolve different numeric policy at member[{index}]")
-        for field in (
-            "source_manifest_raw_sha256", "source_manifest_sha256", "source_tree_sha256", "build_sha256",
-            "base_policy_artifact_sha256", "base_policy_sha256", "base_context_sha256",
-            "capacity_request_raw_sha256", "capacity_artifact_raw_sha256", "capacity_receipt_raw_sha256",
-            "resolution_rule_version",
-        ):
-            require(other[field] == first[field], f"context-policy members differ at stable field {field}")
-        require({name: value for name, value in other["context"].items() if name != "allocator"} == {name: value for name, value in first_context.items() if name != "allocator"}, f"context-policy members differ in non-allocator context at member[{index}]")
-    require([{
-        key: row[key] for key in (
-            "pair", "executor", "allocator", "binary_sha256", "probe_raw_sha256",
-            "request_raw_sha256", "resolved_policy_raw_sha256", "resolved_policy_sha256",
-            "composition_receipt_raw_sha256",
-        )
-    } for row in replayed_members] == resolutions, "shared policy member-resolution references differ from composer-replayed inputs")
-    numeric = first["policy"]
-    expected_shared_context = {
-        key: first_context[key]
-        for key in ("host_id", "workload", "profile", "calibration_id")
-    }
-    if selected_floor_policy_id is not None:
-        expected_shared_context["capacity_floor_policy_id"] = selected_floor_policy_id
-    expected_shared = {
-        "schema": SOURCE5_PRESSURE_POLICY_SCHEMA,
-        "source_manifest": expected_source_pin,
-        "context": expected_shared_context,
-        "capacity_bundle": expected_capacity,
-        "base_policy_artifact_sha256": first["base_policy_artifact_sha256"],
-        "base_policy_sha256": first["base_policy_sha256"],
-        "base_context_sha256": first["base_context_sha256"],
-        "resolution_rule_version": first["resolution_rule_version"],
-        "numeric_policy": numeric,
-        "baseline": numeric["collector"]["expected_global_control_baseline"],
-        "hard_ceilings": {"global": numeric["global_ceilings"], "tenant": numeric["tenant_ceilings"]},
-        "normalization_denominators": {
-            "capacity_sources": numeric["capacity_sources"],
-            "scope_limits": numeric["scope_limits"],
-            "rate_buckets": numeric["rate_buckets"],
-        },
-        "member_resolutions": resolutions,
-    }
-    expected_shared["policy_sha256"] = digest_object(expected_shared)
+    expected_shared = project_shared_context_policy_v2(
+        expected_source_pin, capacity["pins"], replayed_members,
+        selected_floor_policy_id,
+    )
     require(policy == expected_shared, "shared policy document differs from the two pinned SourceV5 composer replays")
     context_sha = _context_policy_numeric_projection_digest_v2(expected_shared)
     return {
@@ -1680,6 +1781,179 @@ def _verify_context_policy_bundle_v2(
         "numeric_context_policy_sha256": context_sha,
         "members": replayed_members,
         "capacity_bundle_pins_sha256": digest_object(capacity["pins"]),
+    }
+
+
+def build_context_policy_bundle_v2(
+    source_manifest_pin_value: object, capacity_bundle_pins_value: object,
+    observed_host_pin_value: object, member_inputs_value: object,
+    source_root_value: object, output_directory_value: object,
+) -> dict[str, Any]:
+    """Write the exact shared pre-Spec policy bundle from real composer inputs.
+
+    Each member input supplies only its SourceV5 composer request pin and the
+    original member descriptor. The pinned Source composer resolves the
+    request and produces the member policy and receipt. This function never
+    launches APP or fabricates a construction probe.
+    """
+    source_pin = _raw_pin(source_manifest_pin_value,
+                          "initial context-policy SourceV5 manifest")
+    source_root = absolute_path(source_root_value,
+                                "initial context-policy SourceV5 root")
+    source_stack = _source5_stack(
+        source_pin, source_root, verify_git_commit=False,
+    )
+    observed_pin, observed = _verify_observed_host_pin_v2(
+        observed_host_pin_value,
+        text(source_stack["source"].get("build", {}).get("host_id"),
+             "initial context-policy SourceV5 build host", 96),
+    )
+    capacity = _verify_capacity_bundle_v2(
+        source_stack, capacity_bundle_pins_value, source_pin, observed,
+    )
+    selected_floor_policy_id = _source5_capacity_floor_policy_id(source_stack)
+    member_inputs = member_inputs_value
+    require(type(member_inputs) is list and len(member_inputs) == 2,
+            "initial context-policy builder requires exactly two original members")
+    output_directory = absolute_path(
+        output_directory_value, "initial context-policy output directory",
+    )
+    try:
+        output_info = output_directory.lstat()
+        require(output_directory.resolve(strict=True) == output_directory and
+                stat.S_ISDIR(output_info.st_mode) and not stat.S_ISLNK(output_info.st_mode) and
+                stat.S_IMODE(output_info.st_mode) == 0o700 and
+                output_info.st_uid == os.getuid(),
+                "initial context-policy output must be an owned private directory")
+        require(not any(output_directory.iterdir()),
+                "initial context-policy output directory must start empty")
+    except OSError as error:
+        raise ReadbackError(f"initial context-policy output directory is unavailable: {error}") from error
+    require(not output_directory.is_relative_to(source_root),
+            "initial context-policy output must be outside the SourceV5 tree")
+
+    replayed_members: list[dict[str, Any]] = []
+    bundle_members: list[dict[str, Any]] = []
+    writes: list[tuple[Path, bytes]] = []
+    seen_executors: set[str] = set()
+    expected_capacity = {
+        name: capacity["pins"][name]
+        for name in ("request", "artifact", "receipt")
+    }
+    request_context = capacity["capacity_key"]
+    for index, member_value in enumerate(member_inputs):
+        member = exact(member_value, {"descriptor", "request"},
+                       f"initial context-policy input member[{index}]")
+        descriptor = exact(member["descriptor"], {"pair", "executor", "allocator"},
+                           f"initial context-policy descriptor[{index}]")
+        pair = text(descriptor["pair"], f"initial context-policy pair[{index}]", 128)
+        executor = text(descriptor["executor"],
+                        f"initial context-policy executor[{index}]", 32)
+        allocator = text(descriptor["allocator"],
+                         f"initial context-policy allocator[{index}]", 64)
+        require(executor in ("bounded", "tokio") and pair == executor and
+                allocator in ("allocatbelt", "mimalloc-secure",
+                              "mimalloc-standard", "system") and
+                executor not in seen_executors,
+                f"initial context-policy member[{index}] is not one distinct original executor")
+        seen_executors.add(executor)
+        request_pin, request, request_raw, request_sha = _read_raw_pin(
+            member["request"], f"initial context-policy composer request[{index}]",
+            1 * 1024 * 1024,
+        )
+        _require_absolute_evidence_paths_mapped(request)
+        require(request.get("source_root") == str(source_root) and
+                _raw_pin(request.get("source_manifest"),
+                         f"initial context-policy request[{index}] SourceV5 pin") ==
+                    source_pin and
+                request.get("context") == request_context and
+                request.get("capacity_bundle") == expected_capacity,
+                f"initial context-policy request[{index}] changed its Source/capacity context")
+        construction_probe = exact(request.get("construction_probe"), {
+            "path", "raw_sha256", "allocator", "binary_sha256",
+        }, f"initial context-policy request[{index}] construction probe")
+        require(construction_probe["allocator"] == allocator and
+                construction_probe["binary_sha256"] ==
+                    source_stack["source"]["artifacts"][allocator]["sha256"],
+                f"initial context-policy member[{index}] probe differs from its real Source binary")
+        try:
+            resolved_policy, composition_receipt = \
+                source_stack["composer"].compose_calibrated_policy_v5(
+                    request, request_sha,
+                )
+        except Exception as error:
+            raise ReadbackError(
+                f"initial context-policy composer replay failed for member[{index}]: "
+                f"{type(error).__name__}: {error}",
+            ) from error
+        resolved_raw = canonical_bytes(resolved_policy)
+        receipt_raw = canonical_bytes(composition_receipt)
+        resolved_path = output_directory / f"member-{index:02d}-resolved-policy.json"
+        receipt_path = output_directory / f"member-{index:02d}-composition-receipt.json"
+        resolved_sha = sha256_bytes(resolved_raw)
+        receipt_sha = sha256_bytes(receipt_raw)
+        resolved_pin = {"path": str(resolved_path), "raw_sha256": resolved_sha}
+        receipt_pin = {"path": str(receipt_path), "raw_sha256": receipt_sha}
+        writes.extend(((resolved_path, resolved_raw), (receipt_path, receipt_raw)))
+        bundle_members.append({
+            "descriptor": {"pair": pair, "executor": executor,
+                           "allocator": allocator},
+            "request": request_pin,
+            "construction_probe": construction_probe,
+            "resolved_policy": resolved_pin,
+            "composition_receipt": receipt_pin,
+        })
+        replayed_members.append({
+            "pair": pair, "executor": executor, "allocator": allocator,
+            "binary_sha256": construction_probe["binary_sha256"],
+            "probe_raw_sha256": construction_probe["raw_sha256"],
+            "request_raw_sha256": request_sha,
+            "resolved_policy_raw_sha256": resolved_sha,
+            "resolved_policy_sha256": sha256(
+                resolved_policy.get("policy_sha256"),
+                f"initial context-policy member[{index}] policy digest",
+            ),
+            "composition_receipt_raw_sha256": receipt_sha,
+            "policy": resolved_policy,
+        })
+    require(seen_executors == {"bounded", "tokio"},
+            "initial context-policy members do not cover both original executors")
+    shared_policy = project_shared_context_policy_v2(
+        source_pin, capacity["pins"], replayed_members,
+        selected_floor_policy_id,
+    )
+    shared_raw = canonical_bytes(shared_policy)
+    shared_path = output_directory / "shared-numeric-context-policy.json"
+    shared_pin = {"path": str(shared_path),
+                  "raw_sha256": sha256_bytes(shared_raw)}
+    bundle = {
+        "schema": CONTEXT_POLICY_BUNDLE_SCHEMA_V2,
+        "artifact": shared_pin,
+        "members": bundle_members,
+    }
+    bundle_raw = canonical_bytes(bundle)
+    bundle_path = output_directory / "context-policy-bundle.json"
+    bundle_pin = {"path": str(bundle_path),
+                  "raw_sha256": sha256_bytes(bundle_raw)}
+
+    # Write the dependency files first and the bundle last, so its appearance
+    # is the final publication point for this exact pre-Spec artifact group.
+    for path, raw in writes:
+        _write_new_receipt(path, raw)
+    _write_new_receipt(shared_path, shared_raw)
+    _write_new_receipt(bundle_path, bundle_raw)
+    verified = _verify_context_policy_bundle_v2(
+        source_stack, bundle_pin, capacity, source_pin,
+    )
+    require(verified["policy"] == shared_policy and
+            verified["numeric_context_policy_sha256"] ==
+                _context_policy_numeric_projection_digest_v2(shared_policy),
+            "written initial context-policy bundle differs from its SourceV5 replay")
+    return {
+        "bundle_pin": bundle_pin, "policy_pin": shared_pin,
+        "numeric_context_policy_sha256": verified[
+            "numeric_context_policy_sha256"],
+        "qualification_eligible": False,
     }
 
 

@@ -25,6 +25,29 @@ readiness. A successful 15-context host preparation is not a six-pair pilot,
 rate calibration, four-allocator runtime result, A/A check, pressure
 qualification, or Soak result.
 
+## Prospective initial Spec and Plan
+
+`export_initial_spec_plan` and the `export-initial-spec` CLI consume the verified
+two-KVM preparation intent, complete bounded capacity generation, and a pinned
+`allocatbelt.application-source5-initial-pressure-bindings.v1` envelope. Its
+30 ordered bindings must replay every original pressure calibration and scope
+receipt against the exact Source, host, condition, policy and capacity inputs.
+Host IDs come from the verified preparation rather than SSH profile names.
+
+The exporter writes new `initial-spec-v3.json` and `initial-plan-v3.json` siblings
+inside the private input root. It validates both serialized payloads and their
+finite size bounds before creating either file. Rates and oracles stay empty,
+and capacity evidence slots remain `None`. Pressure calibration pins already
+contain their genuine final values: the lineage fill cannot replace them.
+The output retains false readiness and qualification flags.
+
+`build_context_policy_bundle_v2` in the pressure reader produces the shared
+numeric policy and bundle from two existing Source-pinned composer requests
+and construction probes. Its projection is shared with the independent
+validator. It launches no APP and does not create the initial ProbeV2 stdout.
+Actual capacity and pressure preparation, original exploration, and SourceA
+admission remain separate work.
+
 ## Source and host inputs
 
 The Python API can seal the independently replayed three-host capacity cohort
