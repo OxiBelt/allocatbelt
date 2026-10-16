@@ -32,6 +32,7 @@ RECEIPT_SCHEMA = "allocatbelt.application-fixed-pair-execution-receipt.v1"
 HOST_VERIFICATION_SCHEMA = "allocatbelt.application-fixed-pair-host-verification.v1"
 HOST_VERIFICATION_IDENTITY_SCHEMA = "allocatbelt.application-fixed-pair-host-verification-identity.v1"
 CAPTURED_REPLAY_CONTEXT_SCHEMA_V1 = "allocatbelt.application-fixed-pair-captured-replay-context.v1"
+RECORDED_HOST_CAPTURED_REPLAY_CONTEXT_SCHEMA_V1 = "allocatbelt.application-fixed-pair-recorded-host-captured-replay-context.v1"
 EVIDENCE_PATH_MAP_SCHEMA = "allocatbelt.application-pressure-evidence-path-map.v1"
 PROBE_SCHEMA = "allocatbelt.application-fixed-pair-construction-probe.v1"
 APP_STARTED_SCHEMA = "allocatbelt.application-fixed-pair-app-start.v1"
@@ -72,6 +73,7 @@ TMPDIR_MONITOR_MAX_DEPTH = 32
 # Bound a snapshot's temporary name collection to one full supported TMPDIR inode budget.
 # This source-level work limit is independent of a caller's frozen inode allowance.
 TMPDIR_MONITOR_MAX_ENUMERATED_ENTRIES = MAX_TMPDIR_INODES
+MAX_RECORDED_CHECKPOINT_BYTES = 128 * 1024 * 1024
 TERM_GRACE_SECONDS = 3.0
 KILL_REAP_SECONDS = 1.0
 PROBE_TIMEOUT_SECONDS = 30.0
@@ -308,6 +310,25 @@ def _private_output_root_offline(value: object, source_root: Path) -> Path:
     return path
 
 
+def _recorded_origin_roots(
+    output_root_value: object, artifact_root_value: object, source_root: Path,
+) -> tuple[Path, Path]:
+    """Validate recorded output/artifact names without requiring old roots locally."""
+    output_root = _captured_origin_path(output_root_value, "recorded fixed-pair output root")
+    artifact_root = _captured_origin_path(artifact_root_value, "recorded campaign oracle artifact root")
+    for path, label in (
+        (output_root, "recorded fixed-pair output root"),
+        (artifact_root, "recorded campaign artifact root"),
+    ):
+        try:
+            path.relative_to(source_root)
+            inside_source = True
+        except ValueError:
+            inside_source = False
+        require(not inside_source, f"{label} must remain outside the selected source tree")
+    return output_root, artifact_root
+
+
 def _parse_cpu_set(helper: types.ModuleType, value: str) -> list[int]:
     cpus = sorted(helper._parse_cpu_set(value))
     require(cpus and cpus == sorted(set(cpus)), "pinned host CPU set is empty or duplicated")
@@ -542,9 +563,12 @@ def _load_source_inputs(
     original_pins: dict[str, Any], execution_pins: dict[str, Any], exact_job: dict[str, Any],
     observed_host_pin: object, output_root_value: object, *, create_output: bool,
     offline_facts: dict[str, Any] | None = None,
+    recorded_host: bool = False,
 ) -> dict[str, Any]:
     # Only the origin-host launcher inspects startup hooks or SIGCHLD. Offline
     # replay has no process/lock capability and consumes its pinned host facts.
+    require(not recorded_host or offline_facts is not None,
+            "recorded-host input reconstruction requires strict peer receipt facts")
     if offline_facts is None:
         _reject_ambient_startup_hooks()
         _require_waitable_sigchld()
@@ -611,11 +635,17 @@ def _load_source_inputs(
     selected_host = sources[host_id]
     if offline_facts is None:
         output_root = _private_output_root(output_root_value, source_root, create=create_output)
+        artifact_root = _safe_absolute(original["campaign_artifacts_root"], "campaign oracle artifact root")
+    elif recorded_host:
+        require(not create_output, "recorded-host replay cannot create or replace a fixed-pair output root")
+        output_root, artifact_root = _recorded_origin_roots(
+            output_root_value, original["campaign_artifacts_root"], source_root,
+        )
     else:
         require(not create_output, "offline replay cannot create or replace a fixed-pair output root")
         output_root = _private_output_root_offline(output_root_value, source_root)
-    artifact_root = _safe_absolute(original["campaign_artifacts_root"], "campaign oracle artifact root")
-    require(artifact_root.is_dir(), "campaign oracle artifact root is not a directory")
+        artifact_root = _safe_absolute(original["campaign_artifacts_root"], "campaign oracle artifact root")
+    require(recorded_host or artifact_root.is_dir(), "campaign oracle artifact root is not a directory")
     try:
         artifact_root.relative_to(source_root)
         artifact_inside_source = True
@@ -1007,10 +1037,12 @@ def _construct_overlay(
     observed_host_pin: object, output_root_value: object, *, create_output: bool, write_runtime_bindings: bool,
     offline_facts: dict[str, Any] | None = None,
     artifact_view: CapturedFixedPairArtifactsV1 | None = None,
+    recorded_host: bool = False,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     context = _load_source_inputs(
         original_pins, execution_pins, exact_job, observed_host_pin, output_root_value,
         create_output=create_output, offline_facts=offline_facts,
+        recorded_host=recorded_host,
     )
     context["write_runtime_bindings"] = write_runtime_bindings
     context["artifact_view"] = artifact_view
@@ -1179,14 +1211,17 @@ def _read_overlay_raw(
 def _read_overlay_with_host_facts(
     overlay_pin: object, offline_facts: dict[str, Any] | None = None,
     *, artifact_view: CapturedFixedPairArtifactsV1 | None = None,
+    recorded_host: bool = False,
 ) -> tuple[dict[str, Any], bytes, str, dict[str, Any], dict[str, Any]]:
+    require(not recorded_host or (offline_facts is not None and artifact_view is not None),
+            "recorded-host overlay reconstruction requires captured bytes and strict host receipt facts")
     overlay, raw, raw_sha, path = _read_overlay_raw(overlay_pin, artifact_view=artifact_view)
     original_pins, execution_pins, job, host_pin, output_root = _derive_overlay_inputs(overlay)
     require(path == Path(output_root) / "fixed-pair-execution-overlay.json", "overlay path differs from its immutable output-root location")
     reconstructed, context = _construct_overlay(
         original_pins, execution_pins, job, host_pin, output_root,
         create_output=False, write_runtime_bindings=False, offline_facts=offline_facts,
-        artifact_view=artifact_view,
+        artifact_view=artifact_view, recorded_host=recorded_host,
     )
     require(canonical_bytes(reconstructed) == raw, "fixed-pair overlay differs from independent SourceV5/PlanV3 reconstruction")
     return overlay, raw, raw_sha, context, reconstructed
@@ -1979,10 +2014,11 @@ def _tmpdir_usage_offline(path: Path, byte_limit: int, inode_limit: int) -> dict
     return {"bytes_used": total_bytes, "file_count": file_count, "directory_count": directory_count}
 
 
-def _verify_tmpdir_storage_offline(
+def _validate_tmpdir_storage_offline_facts(
     initial: object, final: object, path_value: str,
     byte_limit: int, inode_limit: int, output_mount: dict[str, Any], label: str,
-) -> None:
+) -> tuple[dict[str, Any], dict[str, Any], Path]:
+    """Validate recorded peer TMP facts without opening the original path."""
     initial_value = exact(initial, {
         "path", "device", "inode", "mode", "mount", "available_bytes", "available_inodes",
         "bytes_limit", "inode_limit",
@@ -1991,7 +2027,7 @@ def _verify_tmpdir_storage_offline(
         "path", "device", "inode", "mode", "mount", "bytes_used", "file_count", "directory_count",
         "bytes_limit", "inode_limit", "available_bytes", "available_inodes",
     }, f"{label} peer final TMPDIR proof")
-    path = _safe_absolute(path_value, f"{label} peer TMPDIR")
+    path = _captured_origin_path(path_value, f"{label} peer TMPDIR")
     require(initial_value["path"] == final_value["path"] == str(path) and
             initial_value["bytes_limit"] == final_value["bytes_limit"] == byte_limit and
             initial_value["inode_limit"] == final_value["inode_limit"] == inode_limit and
@@ -2011,6 +2047,18 @@ def _verify_tmpdir_storage_offline(
             type(final_value["directory_count"]) is int and final_value["directory_count"] >= 0 and
             final_value["file_count"] + final_value["directory_count"] <= inode_limit,
             f"{label} peer TMPDIR final usage is malformed or exceeds its frozen bounds")
+    return initial_value, final_value, path
+
+
+def _verify_tmpdir_storage_offline(
+    initial: object, final: object, path_value: str,
+    byte_limit: int, inode_limit: int, output_mount: dict[str, Any], label: str,
+) -> None:
+    path = _safe_absolute(path_value, f"{label} peer TMPDIR")
+    initial_value, final_value, facts_path = _validate_tmpdir_storage_offline_facts(
+        initial, final, str(path), byte_limit, inode_limit, output_mount, label,
+    )
+    require(facts_path == path, f"{label} peer TMPDIR origin path changed")
     try:
         info = path.lstat()
     except OSError as error:
@@ -2021,6 +2069,51 @@ def _verify_tmpdir_storage_offline(
     usage = _tmpdir_usage_offline(path, byte_limit, inode_limit)
     require(usage == {key: final_value[key] for key in ("bytes_used", "file_count", "directory_count")},
             f"{label} peer TMPDIR copied contents differ from the strict host usage proof")
+
+
+def _verify_tmpdir_storage_recorded_offline(
+    initial: object, final: object, path_value: str,
+    byte_limit: int, inode_limit: int, output_mount: dict[str, Any], label: str,
+    *, proof: dict[str, Any], expected_domain: str | None,
+    expected_ordinal: int,
+) -> None:
+    """Use one already receipt-derived checkpoint proof for an absent origin."""
+    require(type(expected_ordinal) is int and expected_ordinal in (0, 1),
+            f"{label} recorded TMPDIR member ordinal is invalid")
+    _initial_value, final_value, path = _validate_tmpdir_storage_offline_facts(
+        initial, final, path_value, byte_limit, inode_limit, output_mount, label,
+    )
+    require(final_value["bytes_used"] == 0 and final_value["file_count"] == 0 and
+            final_value["directory_count"] == 0,
+            f"{label} recorded TMPDIR usage is not exactly zero")
+    expected = {
+        "path": str(path), "device": final_value["device"],
+        "inode": final_value["inode"], "mode": final_value["mode"],
+        "mount": final_value["mount"], "bytes_used": final_value["bytes_used"],
+        "file_count": final_value["file_count"],
+        "directory_count": final_value["directory_count"],
+        "bytes_limit": final_value["bytes_limit"],
+        "inode_limit": final_value["inode_limit"],
+    }
+    if expected_domain is not None:
+        expected["domain"] = expected_domain
+    proof_keys = set(expected) | {"role", "owner_receipt_pin", "member_ordinal"}
+    if expected_domain is not None:
+        proof_keys.add("domain")
+    proof = exact(proof, proof_keys, f"{label} signed checkpoint TMPDIR proof")
+    owner_pin = exact(proof["owner_receipt_pin"], {
+        "path", "raw_sha256", "semantic_sha256",
+    }, f"{label} checkpoint TMPDIR owner receipt pin")
+    _captured_origin_path(owner_pin["path"], f"{label} TMPDIR owner receipt origin")
+    require(type(proof["role"]) is str and
+            proof["role"] == "component_receipt" and
+            is_sha(owner_pin["raw_sha256"]) and is_sha(owner_pin["semantic_sha256"]) and
+            type(proof["member_ordinal"]) is int and proof["member_ordinal"] >= 0 and
+            proof["member_ordinal"] == expected_ordinal and
+            all(proof.get(key) == value for key, value in expected.items()) and
+            (expected_domain is None or proof.get("domain") == expected_domain) and
+            proof.get("bytes_used") == 0,
+            f"{label} recorded TMPDIR facts differ from its signed checkpoint proof")
 
 
 def _open_tmpdir_absolute_directory(path: Path) -> int:
@@ -3251,6 +3344,7 @@ def _verify_cleanup_record(cleanup: dict[str, Any], label: str, *, require_succe
 def _verify_start_proof(
     overlay: dict[str, Any], member: dict[str, Any], attempt: dict[str, Any], overlay_sha256: str,
     *, require_success: bool, offline_facts: dict[str, Any] | None = None,
+    recorded_zero_tmp_proofs: list[dict[str, Any]] | None = None,
 ) -> None:
     proof = attempt.get("start")
     require(type(proof) is dict, "attempted APP member lacks its actual start proof")
@@ -3282,11 +3376,24 @@ def _verify_start_proof(
                 f"APP member {member['ordinal']}",
             )
         else:
-            _verify_tmpdir_storage_offline(
-                attempt.get("tmpdir_initial"), attempt["tmpdir_final"], member["tmpdir"]["path"],
-                member["tmpdir"]["bytes_limit"], member["tmpdir"]["inode_limit"],
-                offline_facts["host_verification"]["output_mount"], f"APP member {member['ordinal']}",
-            )
+            if recorded_zero_tmp_proofs is None:
+                _verify_tmpdir_storage_offline(
+                    attempt.get("tmpdir_initial"), attempt["tmpdir_final"], member["tmpdir"]["path"],
+                    member["tmpdir"]["bytes_limit"], member["tmpdir"]["inode_limit"],
+                    offline_facts["host_verification"]["output_mount"], f"APP member {member['ordinal']}",
+                )
+            else:
+                proof = _recorded_tmp_proof_for_member(
+                    recorded_zero_tmp_proofs, member["ordinal"], None,
+                    f"APP member {member['ordinal']}",
+                )
+                _verify_tmpdir_storage_recorded_offline(
+                    attempt.get("tmpdir_initial"), attempt["tmpdir_final"], member["tmpdir"]["path"],
+                    member["tmpdir"]["bytes_limit"], member["tmpdir"]["inode_limit"],
+                    offline_facts["host_verification"]["output_mount"],
+                    f"APP member {member['ordinal']}", proof=proof, expected_domain=None,
+                    expected_ordinal=member["ordinal"],
+                )
     else:
         require(not require_success, "valid APP member has no final TMPDIR mount/storage proof")
     events = attempt.get("start_events")
@@ -3308,6 +3415,7 @@ def _verify_start_proof(
 def _verify_construction_probe(
     context: dict[str, Any], overlay: dict[str, Any], member: dict[str, Any], probe: dict[str, Any], overlay_sha256: str,
     *, offline_facts: dict[str, Any] | None = None,
+    recorded_zero_tmp_proofs: list[dict[str, Any]] | None = None,
 ) -> None:
     view = context.get("artifact_view")
     require(probe.get("schema") == PROBE_SCHEMA and probe.get("role") == "uncalibrated_construction_only", "construction probe receipt role is malformed")
@@ -3366,22 +3474,60 @@ def _verify_construction_probe(
             MAX_TMPDIR_BYTES, MAX_TMPDIR_INODES, f"construction probe member {member['ordinal']}",
         )
     else:
-        _verify_tmpdir_storage_offline(
-            probe.get("tmpdir_initial"), probe.get("tmpdir_final"), member["outputs"]["probe_tmpdir"],
-            MAX_TMPDIR_BYTES, MAX_TMPDIR_INODES, offline_facts["host_verification"]["output_mount"],
-            f"construction probe member {member['ordinal']}",
-        )
+        if recorded_zero_tmp_proofs is None:
+            _verify_tmpdir_storage_offline(
+                probe.get("tmpdir_initial"), probe.get("tmpdir_final"), member["outputs"]["probe_tmpdir"],
+                MAX_TMPDIR_BYTES, MAX_TMPDIR_INODES, offline_facts["host_verification"]["output_mount"],
+                f"construction probe member {member['ordinal']}",
+            )
+        else:
+            proof = _recorded_tmp_proof_for_member(
+                recorded_zero_tmp_proofs, member["ordinal"], "probe_tmpdir",
+                f"construction probe member {member['ordinal']}",
+            )
+            _verify_tmpdir_storage_recorded_offline(
+                probe.get("tmpdir_initial"), probe.get("tmpdir_final"), member["outputs"]["probe_tmpdir"],
+                MAX_TMPDIR_BYTES, MAX_TMPDIR_INODES,
+                offline_facts["host_verification"]["output_mount"],
+                f"construction probe member {member['ordinal']}",
+                proof=proof, expected_domain="probe_tmpdir",
+                expected_ordinal=member["ordinal"],
+            )
+
+
+def _recorded_tmp_proof_for_member(
+    proofs: list[dict[str, Any]], ordinal: int, domain: str | None, label: str,
+) -> dict[str, Any]:
+    matches = [proof for proof in proofs
+               if type(proof) is dict and proof.get("member_ordinal") == ordinal and
+               proof.get("domain") == domain]
+    require(len(matches) == 1,
+            f"{label} has no unique receipt-derived recorded TMPDIR proof")
+    return matches[0]
 
 
 def _verify_fixed_pair_overlay_replay(
     overlay_pin: dict[str, Any], receipt_pin: dict[str, Any],
     offline_facts: dict[str, Any] | None = None,
     *, artifact_view: CapturedFixedPairArtifactsV1 | None = None,
+    recorded_zero_tmp_proofs: list[dict[str, Any]] | None = None,
+    preconstructed_context: tuple[dict[str, Any], bytes, str, dict[str, Any], dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Shared raw artifact replay; host mode comes only from its caller."""
     require(artifact_view is None or offline_facts is not None,
             "captured fixed replay requires original strict-host receipt facts")
-    if offline_facts is None:
+    require(recorded_zero_tmp_proofs is None or
+            (artifact_view is not None and offline_facts is not None and
+             type(recorded_zero_tmp_proofs) is list and
+             len(recorded_zero_tmp_proofs) == 4),
+            "recorded fixed replay requires its exact four receipt-derived TMPDIR proofs")
+    if preconstructed_context is not None:
+        require(offline_facts is not None and artifact_view is not None and
+                preconstructed_context[3].get("artifact_view") is artifact_view and
+                preconstructed_context[3].get("offline_facts") == offline_facts,
+                "preconstructed fixed replay context differs from its strict host/artifact view")
+        overlay, _overlay_raw, overlay_sha, context, _reconstructed = preconstructed_context
+    elif offline_facts is None:
         overlay, _overlay_raw, overlay_sha, context, _reconstructed = _read_overlay(overlay_pin)
     else:
         overlay, _overlay_raw, overlay_sha, context, _reconstructed = _read_overlay_with_host_facts(
@@ -3450,7 +3596,8 @@ def _verify_fixed_pair_overlay_replay(
         probe = probes_by_ordinal.get(member["ordinal"])
         if probe is not None and probe.get("validated") is not False:
             _verify_construction_probe(context, overlay, member, probe, overlay_sha,
-                                       offline_facts=offline_facts)
+                                       offline_facts=offline_facts,
+                                       recorded_zero_tmp_proofs=recorded_zero_tmp_proofs)
     attempts_by_ordinal = {item.get("ordinal"): item for item in receipt["member_attempts"] if type(item) is dict}
     for member in overlay["members"]:
         attempt = attempts_by_ordinal.get(member["ordinal"])
@@ -3461,6 +3608,7 @@ def _verify_fixed_pair_overlay_replay(
             _verify_start_proof(
                 overlay, member, attempt, overlay_sha,
                 require_success=receipt["status"] == "valid_pair", offline_facts=offline_facts,
+                recorded_zero_tmp_proofs=recorded_zero_tmp_proofs,
             )
         else:
             _verify_cleanup_record(attempt.get("supervision", {}), f"failed APP launch {member['ordinal']}", require_success=False)
@@ -4053,6 +4201,239 @@ def prepare_captured_fixed_pair_replay_v1(
             "qualification_eligible": False}
 
 
+def _prepare_captured_fixed_pair_replay_v1(
+    overlay_pin: object, receipt_pin: object, host_verification_pin: object,
+    references: object, stage_root: Path,
+) -> tuple[dict[str, Any], dict[str, Any], tuple[
+    dict[str, Any], bytes, str, dict[str, Any], dict[str, Any],
+]]:
+    """Prepare recorded-host reconstruction while preserving all source checks."""
+    prepared = prepare_captured_fixed_pair_replay_v1(
+        overlay_pin, receipt_pin, host_verification_pin, references, stage_root,
+    )
+    overlay, raw, overlay_sha, context, reconstructed = _read_overlay_with_host_facts(
+        overlay_pin, prepared["offline_facts"],
+        artifact_view=prepared["artifact_view"], recorded_host=True,
+    )
+    pin = exact(overlay_pin, {"path", "sha256"}, "recorded overlay pin")
+    require(context["artifact_view"] is prepared["artifact_view"] and
+            context["offline_facts"] == prepared["offline_facts"] and
+            overlay == prepared["overlay"] and
+            overlay_sha == pin["sha256"],
+            "recorded-host reconstruction changed its captured overlay or host facts")
+    return prepared, context, (overlay, raw, overlay_sha, context, reconstructed)
+
+
+def _load_recorded_checkpoint_archive(context: dict[str, Any]) -> types.ModuleType:
+    """Load the zero-proof verifier from the selected typed SourceV5 bytes."""
+    relative = "scripts/application-source5-evidence-archive.py"
+    require(type(context) is dict and
+            isinstance(context.get("source_root"), Path) and
+            type(context.get("sources")) is dict and
+            type(context.get("spec")) is dict,
+            "recorded checkpoint loader lacks its reconstructed SourceV5 cohort")
+    controller = context.get("controller")
+    host_counter = getattr(controller, "qualification_host_count", None)
+    require(callable(host_counter),
+            "SourceV5 controller lacks its typed qualification host-count selector")
+    require(context["spec"].get("schema") == "allocatbelt.application-campaign-spec.v3",
+            "recorded fixed checkpoint loading requires the original SpecV3")
+    try:
+        host_count = host_counter(context["spec"])
+    except Exception as error:
+        raise FixedPairError(
+            f"SourceV5 controller rejected the recorded qualification profile: {error}",
+        ) from error
+    require(type(host_count) is int and host_count in (2, 3),
+            "SourceV5 qualification host-count selector returned an unsupported cohort size")
+    host_rows = context["spec"].get("hosts")
+    require(type(host_rows) is list and len(host_rows) == host_count,
+            "recorded fixed SpecV3 host list differs from its explicit qualification profile")
+    host_ids = []
+    venues = []
+    for index, host_value in enumerate(host_rows):
+        host = exact(host_value, {
+            "host_id", "venue", "host_fingerprint_sha256", "controls",
+        }, f"recorded fixed SpecV3 host[{index}]")
+        require(type(host["host_id"]) is str and bool(host["host_id"]) and
+                type(host["venue"]) is str and
+                is_sha(host["host_fingerprint_sha256"]) and
+                type(host["controls"]) is dict,
+                f"recorded fixed SpecV3 host[{index}] identity is malformed")
+        host_ids.append(host["host_id"])
+        venues.append(host["venue"])
+    require(len(set(host_ids)) == host_count and
+            all(venue in ("bare_metal", "kvm_guest") for venue in venues),
+            "recorded fixed SpecV3 host identities are duplicated or venues are invalid")
+    if host_count == 2:
+        require(venues == ["kvm_guest", "kvm_guest"],
+                "two-KVM qualification profile requires exactly two KVM guests")
+    else:
+        require(venues.count("bare_metal") == 1 and
+                venues.count("kvm_guest") == 2,
+                "legacy qualification profile requires one bare-metal host and two KVM guests")
+    source_root = context["source_root"]
+    source_hosts = context["sources"]
+    require(set(source_hosts) == set(host_ids),
+            "recorded fixed SourceV5 sources do not cover the exact SpecV3 host cohort")
+    records = []
+    for host_id in host_ids:
+        source = source_hosts[host_id]
+        require(type(source) is dict and type(source.get("source")) is dict and
+                type(source["source"].get("files")) is list,
+                f"{host_id} SourceV5 context is malformed")
+        record = _inventory_entry(
+            source["source"]["files"], relative,
+            f"{host_id} SourceV5 evidence archive verifier",
+        )
+        records.append((record["sha256"], record["size"], record["mode"]))
+    require(len(records) == host_count and len(set(records)) == 1,
+            "SourceV5 cohort has missing or different transitive checkpoint-proof verifier pins")
+    expected_sha, expected_size, expected_mode = records[0]
+    path = _safe_child(source_root, relative,
+                       "SourceV5 checkpoint-proof verifier")
+    raw, actual_sha, info = read_stable(
+        path, "SourceV5 checkpoint-proof verifier", MAX_SOURCE_BYTES,
+    )
+    actual_mode = f"{stat.S_IFMT(info.st_mode) | stat.S_IMODE(info.st_mode):06o}"
+    require(actual_sha == expected_sha and len(raw) == expected_size and
+            actual_mode == expected_mode,
+            "SourceV5 checkpoint-proof verifier differs from its typed transitive pin")
+    archive = _load_pinned_module(raw, path, "recorded_checkpoint_archive")
+    require(getattr(archive, "CHECKPOINT_SCHEMA_V2", None) ==
+            "allocatbelt.application-source5-evidence-job-checkpoint.v2" and
+            callable(getattr(archive, "_validate_checkpoint", None)) and
+            callable(getattr(archive, "_zero_fixed_tmp_proofs", None)) and
+            callable(getattr(archive, "_tmp_final_proof", None)),
+            "SourceV5 archive lacks the exact v2 fixed TMP proof validators")
+    return archive
+
+
+def _recorded_fixed_zero_tmp_proofs(
+    context: dict[str, Any], prepared: dict[str, Any],
+    checkpoint_pin_value: object, checkpoint_raw: object,
+) -> list[dict[str, Any]]:
+    """Join a SourceA-authenticated v2 checkpoint to this exact fixed receipt.
+
+    The caller must select this owner route only after SourceA has freshly
+    verified the checkpoint pin against the retained signed ACK and journal.
+    Raw checkpoint bytes alone do not establish that authority.
+    """
+    archive = _load_recorded_checkpoint_archive(context)
+    try:
+        checkpoint_pin = archive._pin(
+            checkpoint_pin_value, "recorded fixed Source5 checkpoint pin",
+        )
+        require(type(checkpoint_raw) is bytes and
+                len(checkpoint_raw) <= MAX_RECORDED_CHECKPOINT_BYTES and
+                sha256_bytes(checkpoint_raw) == checkpoint_pin["raw_sha256"],
+                "recorded fixed checkpoint bytes differ from their bounded raw pin")
+        try:
+            checkpoint_value = json.loads(checkpoint_raw.decode("utf-8"))
+        except (UnicodeError, json.JSONDecodeError, RecursionError) as error:
+            raise FixedPairError(
+                f"recorded fixed checkpoint is not bounded canonical JSON: {error}",
+            ) from error
+        require(type(checkpoint_value) is dict and
+                checkpoint_raw == canonical_bytes(checkpoint_value),
+                "recorded fixed checkpoint is not canonical JSON")
+        checkpoint = archive._validate_checkpoint(checkpoint_value)
+    except FixedPairError:
+        raise
+    except Exception as error:
+        raise FixedPairError(
+            f"SourceV5 archive rejected the recorded fixed checkpoint: {error}",
+        ) from error
+
+    require(checkpoint.get("schema") == archive.CHECKPOINT_SCHEMA_V2 and
+            checkpoint.get("checkpoint_sha256") == checkpoint_pin["semantic_sha256"],
+            "recorded fixed replay requires the exact signed v2 checkpoint pin")
+    overlay = prepared["overlay"]
+    receipt = prepared["execution_receipt"]
+    host_receipt = prepared["host_verification_receipt"]
+    job = overlay["job"]["value"]
+    checkpoint_context = checkpoint["context"]
+    host_id = overlay["host_id"]
+    source_manifest = overlay["sources"]["manifests"][host_id]
+    plan_binding = overlay["plan"]
+    host_jobs = [item for item in context["plan"]["jobs"].get(job["phase"], [])
+                 if type(item) is dict and item.get("host_id") == host_id]
+    matching_indices = [index for index, item in enumerate(host_jobs)
+                        if item == job]
+    require(len(matching_indices) == 1 and
+            checkpoint_context["campaign_id"] == overlay["campaign_id"] and
+            checkpoint_context["host_id"] == host_id and
+            checkpoint_context["phase"] == job["phase"] and
+            checkpoint_context["job_index"] == matching_indices[0] and
+            checkpoint_context["source_manifest_pin"] == {
+                "path": source_manifest["pin"]["path"],
+                "raw_sha256": source_manifest["pin"]["sha256"],
+                "semantic_sha256": source_manifest["manifest_sha256"],
+            } and
+            checkpoint_context["plan_pin"] == {
+                "path": plan_binding["pin"]["path"],
+                "raw_sha256": plan_binding["pin"]["sha256"],
+                "semantic_sha256": plan_binding["semantic_sha256"],
+            } and
+            Path(checkpoint["job_record_pin"]["path"]).name ==
+                f"{job['run_id']}.json",
+            "recorded fixed checkpoint differs from the original SourceV5 host/job/Plan generation")
+    owner_pins = checkpoint["owner_receipt_pins"]
+    component_pin = archive._pin(
+        owner_pins.get("component_receipt"),
+        "recorded fixed component receipt owner pin",
+    )
+    require(component_pin == {
+                "path": str(Path(overlay["output_root"]) /
+                            "fixed-pair-execution-receipt.json"),
+                "raw_sha256": sha256_bytes(canonical_bytes(receipt)),
+                "semantic_sha256": receipt["receipt_sha256"],
+            }, "recorded fixed checkpoint does not pin this exact execution receipt")
+    host_owner_pin = archive._pin(
+        owner_pins.get("fixed_pair_host_receipt"),
+        "recorded strict fixed-host receipt owner pin",
+    )
+    host_pin = prepared["host_verification_pin"]
+    require(host_owner_pin == {
+                "path": host_pin["path"],
+                "raw_sha256": host_pin["raw_sha256"],
+                "semantic_sha256": host_receipt["receipt_sha256"],
+            }, "recorded fixed checkpoint does not pin this strict host receipt")
+    try:
+        derived = archive._zero_fixed_tmp_proofs(
+            receipt, component_pin, "component_receipt",
+            include_probe_tmp_proofs=True,
+        )
+    except Exception as error:
+        raise FixedPairError(
+            f"SourceV5 archive rejected the fixed receipt TMP proofs: {error}",
+        ) from error
+    proof_key = lambda item: (item["role"], item["member_ordinal"],
+                              item.get("domain", ""))
+    derived = sorted(derived, key=proof_key)
+    checkpoint_proofs = checkpoint["empty_tmp_proofs"]
+    _require_recorded_fixed_checkpoint_zero_proofs(checkpoint_proofs, derived)
+    return derived
+
+
+def _require_recorded_fixed_checkpoint_zero_proofs(
+    checkpoint_proofs: object, receipt_proofs: object,
+) -> None:
+    require(type(checkpoint_proofs) is list and type(receipt_proofs) is list and
+            len(checkpoint_proofs) == len(receipt_proofs) == 4,
+            "recorded fixed checkpoint requires exactly four receipt-derived zero TMP proofs")
+    require(all(type(proof) is dict for proof in checkpoint_proofs) and
+            all(type(proof) is dict for proof in receipt_proofs) and
+            checkpoint_proofs == receipt_proofs and
+            sorted(proof["member_ordinal"] for proof in checkpoint_proofs
+                   if "domain" not in proof) == [0, 1] and
+            sorted(proof["member_ordinal"] for proof in checkpoint_proofs
+                   if proof.get("domain") == "probe_tmpdir") == [0, 1] and
+            all("domain" not in proof or proof.get("domain") == "probe_tmpdir"
+                for proof in checkpoint_proofs),
+            "recorded fixed checkpoint does not match its four exact receipt-derived zero TMP proofs")
+
+
 def verify_fixed_pair_overlay_captured_v1(
     overlay_pin: object, receipt_pin: object, host_verification_pin: object,
     references: object, stage_root: Path,
@@ -4076,6 +4457,45 @@ def verify_fixed_pair_overlay_captured_v1(
             "execution_receipt": prepared["execution_receipt"],
             "host_verification_pin": prepared["host_verification_pin"],
             "full_replay_verified": True, "qualification_eligible": False}
+
+
+def verify_fixed_pair_overlay_recorded_captured_v1(
+    overlay_pin: object, receipt_pin: object, host_verification_pin: object,
+    references: object, stage_root: Path, *, checkpoint_pin: object,
+    checkpoint_raw: object,
+) -> dict[str, Any]:
+    """Replay one captured fixed pair using SourceA-authenticated empty TMP proofs.
+
+    The SourceA caller must freshly bind this exact checkpoint pin to its
+    retained signed ACK, manifest, and journal lineage before choosing this
+    API. This owner independently validates the typed SourceV5 archive code,
+    checkpoint structure, receipt joins, and all four zero proofs. The raw
+    checkpoint argument alone is evidence, never signature authority.
+    The pinned SourceV5 tree and original Spec/Plan/input/binary files still
+    use the existing local readers; only recorded output, artifact-root and
+    empty-TMP paths may be absent on this host.
+    """
+    prepared, context, preconstructed_context = _prepare_captured_fixed_pair_replay_v1(
+        overlay_pin, receipt_pin, host_verification_pin, references, stage_root,
+    )
+    proofs = _recorded_fixed_zero_tmp_proofs(
+        context, prepared, checkpoint_pin, checkpoint_raw,
+    )
+    verification = _verify_fixed_pair_overlay_replay(
+        overlay_pin, receipt_pin, prepared["offline_facts"],
+        artifact_view=prepared["artifact_view"],
+        recorded_zero_tmp_proofs=proofs,
+        preconstructed_context=preconstructed_context,
+    )
+    return {
+        "schema": RECORDED_HOST_CAPTURED_REPLAY_CONTEXT_SCHEMA_V1,
+        "verification": verification,
+        "overlay": prepared["overlay"],
+        "execution_receipt": prepared["execution_receipt"],
+        "host_verification_pin": prepared["host_verification_pin"],
+        "full_replay_verified": True,
+        "qualification_eligible": False,
+    }
 
 
 def _load_cli_input(path: Path, label: str) -> dict[str, Any]:

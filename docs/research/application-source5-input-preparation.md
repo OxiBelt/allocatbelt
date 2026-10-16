@@ -592,6 +592,22 @@ closes the view before advancing to the next job or publishing the pilot.
 Read and context-exit failures propagate; captured failures cannot fall back
 to origin reads. Omitting the provider preserves the original offline path.
 
+`export_capacity_pilot_recorded_host` is a separate captured-only entry point
+for replay after original output and temporary directories have been removed.
+Each view also supplies the exact `checkpoint_pin` and `checkpoint_raw` that
+SourceA authenticated against its signed ACK and journal. The Source-pinned
+fixed owner joins the checkpoint to the original host, job, Plan and owner
+receipts, then derives and matches all four final zero-TMP proofs through the
+typed archive verifier. It treats absent origin paths as recorded names and
+checks the actual private capture files independently. Selection of this API
+requires the SourceA authentication boundary; a flag in a supplied view cannot
+select it through the ordinary exporter.
+
+The recorded path still requires the immutable SourceV5 tree, original
+Spec/Plan, inputs, binaries and any referenced oracles to be resident. Its
+component result cannot supply fresh GPG or qualification authority. A genuine
+successful SourceA-to-recorded-owner replay remains an integration requirement.
+
 The optional Python callback `before_publication(pilot_raw, prospective_result)`
 runs after all pair views close and the numerical rate validator succeeds,
 before any pilot file is written. It receives the exact canonical bytes and
@@ -608,7 +624,7 @@ preserved.
 
 The completion and completion-replay Python APIs forward the optional
 `captured_pilot_read_providers` map. An explicit map must cover exactly the
-three verified hosts with a callable `open_view` for each host. Selection is
+selected verified hosts with a callable `open_view` for each host. Selection is
 copied before replay so caller map mutation cannot redirect a host's reads.
 This interface supplies bytes; authenticated archive/journal authority must
 come from the separate Source-owned wrapper. The fixed owner still requires

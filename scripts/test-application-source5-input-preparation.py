@@ -1557,6 +1557,85 @@ class CapturedCapacityPilotExportTests(unittest.TestCase):
         "test_public_exporter_derives_rate_matrix_after_each_original_job_replay"
     )
 
+    def test_only_explicit_recorded_owner_entrypoint_consumes_checkpoint_fields(self):
+        """Dispatch contract only; mocked owners prove no GPG or APP authority."""
+        preparation = load_script(
+            SCRIPT_DIR / "application-source5-input-preparation.py",
+            "recorded_capacity_pilot_dispatch_target",
+        )
+        raw = b"untrusted provider checkpoint bytes"
+        checkpoint_pin = {
+            "path": "/origin/checkpoint.json",
+            "raw_sha256": hashlib.sha256(raw).hexdigest(),
+            "semantic_sha256": "a" * 64,
+        }
+        view = {
+            "objects": {}, "stage_root": "/tmp/unused-stage",
+            "checkpoint_pin": checkpoint_pin, "checkpoint_raw": raw,
+        }
+        overlay = {"job": {"value": {"run_id": "run-a"}}}
+        overlay_pin = {"path": "/origin/overlay.json", "sha256": "b" * 64}
+        receipt_pin = {"path": "/origin/receipt.json", "sha256": "c" * 64}
+        host_pin = {
+            "path": "/origin/host.json", "raw_sha256": "d" * 64,
+            "host_verification_sha256": "e" * 64,
+        }
+        verification = {
+            "schema": "receipt-v1", "verified": True,
+            "status": "valid_pair", "qualification_eligible": False,
+            "receipt_sha256": receipt_pin["sha256"],
+            "overlay_sha256": overlay_pin["sha256"], "run_id": "run-a",
+        }
+
+        class Owner:
+            CAPTURED_REPLAY_CONTEXT_SCHEMA_V1 = "captured-v1"
+            RECORDED_HOST_CAPTURED_REPLAY_CONTEXT_SCHEMA_V1 = "recorded-v1"
+            RECEIPT_SCHEMA = "receipt-v1"
+
+            def __init__(self):
+                self.strict_calls = []
+                self.recorded_calls = []
+
+            def verify_fixed_pair_overlay_captured_v1(self, *args):
+                self.strict_calls.append(args)
+                return {
+                    "schema": "captured-v1", "verification": verification,
+                    "overlay": overlay, "execution_receipt": {"status": "valid_pair"},
+                    "host_verification_pin": host_pin,
+                    "full_replay_verified": True, "qualification_eligible": False,
+                }
+
+            def verify_fixed_pair_overlay_recorded_captured_v1(
+                    self, *args, **kwargs):
+                self.recorded_calls.append((args, kwargs))
+                return {
+                    "schema": "recorded-v1", "verification": verification,
+                    "overlay": overlay, "execution_receipt": {"status": "valid_pair"},
+                    "host_verification_pin": host_pin,
+                    "full_replay_verified": True, "qualification_eligible": False,
+                }
+
+        owner = Owner()
+        strict_projection, _strict_receipt = \
+            preparation._verify_capacity_pilot_captured_pair(
+                owner, view, overlay_pin, receipt_pin, host_pin, overlay,
+                overlay_pin["sha256"],
+            )
+        self.assertEqual(strict_projection["status"], "valid_pair")
+        self.assertEqual(len(owner.strict_calls), 1)
+        self.assertEqual(owner.recorded_calls, [])
+
+        recorded_projection, _recorded_receipt = \
+            preparation._verify_capacity_pilot_captured_pair(
+                owner, view, overlay_pin, receipt_pin, host_pin, overlay,
+                overlay_pin["sha256"], recorded_host=True,
+            )
+        self.assertEqual(recorded_projection["status"], "valid_pair")
+        self.assertEqual(len(owner.recorded_calls), 1)
+        _args, kwargs = owner.recorded_calls[0]
+        self.assertEqual(kwargs["checkpoint_pin"], checkpoint_pin)
+        self.assertEqual(kwargs["checkpoint_raw"], raw)
+
     def _prepare_records(
         self, preparation, fixed_owner, records, expected_jobs, *,
         fault=None, record_count=None,

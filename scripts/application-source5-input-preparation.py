@@ -1672,11 +1672,28 @@ def _verify_capacity_pilot_captured_pair(
     fixed: Any, view: dict[str, Any], overlay_pin: dict[str, Any],
     receipt_pin: dict[str, Any], host_pin: dict[str, Any],
     overlay: dict[str, Any], overlay_raw_sha: str,
+    *, recorded_host: bool = False,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
-    replay = fixed.verify_fixed_pair_overlay_captured_v1(
-        overlay_pin, receipt_pin, host_pin,
-        view["objects"], Path(view["stage_root"]),
-    )
+    if recorded_host:
+        checkpoint_pin = _exact(view.get("checkpoint_pin"), {
+            "path", "raw_sha256", "semantic_sha256",
+        }, "SourceA-authenticated fixed checkpoint pin")
+        checkpoint_raw = view.get("checkpoint_raw")
+        _require(type(checkpoint_raw) is bytes and
+                 _sha256(checkpoint_raw) == checkpoint_pin["raw_sha256"],
+                 "SourceA-authenticated checkpoint bytes differ from their exact raw pin")
+        replay = fixed.verify_fixed_pair_overlay_recorded_captured_v1(
+            overlay_pin, receipt_pin, host_pin,
+            view["objects"], Path(view["stage_root"]),
+            checkpoint_pin=checkpoint_pin, checkpoint_raw=checkpoint_raw,
+        )
+        expected_schema = fixed.RECORDED_HOST_CAPTURED_REPLAY_CONTEXT_SCHEMA_V1
+    else:
+        replay = fixed.verify_fixed_pair_overlay_captured_v1(
+            overlay_pin, receipt_pin, host_pin,
+            view["objects"], Path(view["stage_root"]),
+        )
+        expected_schema = fixed.CAPTURED_REPLAY_CONTEXT_SCHEMA_V1
     _exact(replay, {
         "schema", "verification", "overlay", "execution_receipt",
         "host_verification_pin", "full_replay_verified", "qualification_eligible",
@@ -1685,7 +1702,7 @@ def _verify_capacity_pilot_captured_pair(
         "schema", "verified", "status", "qualification_eligible",
         "receipt_sha256", "overlay_sha256", "run_id",
     }, "captured capacity-pilot component projection")
-    _require(replay["schema"] == fixed.CAPTURED_REPLAY_CONTEXT_SCHEMA_V1 and
+    _require(replay["schema"] == expected_schema and
              replay["full_replay_verified"] is True and
              replay["qualification_eligible"] is False and
              replay["overlay"] == overlay and
@@ -1702,9 +1719,10 @@ def _verify_capacity_pilot_captured_pair(
             replay["execution_receipt"])
 
 
-def export_capacity_pilot(
+def _export_capacity_pilot_impl(
     preparation_final_pins: dict[str, Any], verified_fixed_records: list[dict[str, Any]], host_id: str,
     *, captured_read_provider: Any = None, before_publication: Any = None,
+    recorded_host: bool,
 ) -> dict[str, Any]:
     """Replay six original fixed-pair receipts per context/allocator and export the rate pilot.
 
@@ -1764,6 +1782,8 @@ def export_capacity_pilot(
              "original PlanV3 does not contain the complete 15-context, four-allocator, six-pair capacity pilot")
     _require(type(verified_fixed_records) is list and len(verified_fixed_records) == len(expected_jobs),
              "fixed-pair receipt set does not contain every original capacity-pilot job")
+    _require(not recorded_host or captured_read_provider is not None,
+             "recorded-host capacity-pilot replay requires SourceA's signed read provider")
 
     expected_fixed_sha = preparation["source_pins"][host_id]["modules"]["fixed_pair"]["sha256"]
     fixed_raw, fixed_path, fixed_record = _capture_typed_source_file(
@@ -1788,6 +1808,8 @@ def export_capacity_pilot(
             "path", "raw_sha256", "host_verification_sha256",
         }, f"fixed-pair strict host-verification receipt pin[{index}]")
         with _capacity_pilot_read_window(captured_read_provider, expected_jobs[index]) as captured_view:
+            _require(not recorded_host or captured_view is not None,
+                     "recorded-host capacity-pilot replay lost its SourceA-authenticated view")
             envelope_reader = _capacity_pilot_envelope_reader(
                 fixed, captured_view, overlay_pin, receipt_pin, host_verification_pin,
             )
@@ -1819,6 +1841,7 @@ def export_capacity_pilot(
                     verified, captured_receipt = _verify_capacity_pilot_captured_pair(
                         fixed, captured_view, overlay_pin, receipt_pin,
                         host_verification_pin, overlay, overlay_raw_sha,
+                        recorded_host=recorded_host,
                     )
             except Exception as error:
                 raise PreparationError(f"original fixed-pair receipt[{index}] failed generation-bound offline replay: {error}") from error
@@ -1937,6 +1960,35 @@ def export_capacity_pilot(
     if output is not None:
         _write_private_json_new(output, pilot, source_root, allow_existing_identical=True)
     return prospective_result
+
+
+def export_capacity_pilot(
+    preparation_final_pins: dict[str, Any], verified_fixed_records: list[dict[str, Any]], host_id: str,
+    *, captured_read_provider: Any = None, before_publication: Any = None,
+) -> dict[str, Any]:
+    """Replay captured capacity pairs through the original strict owner route."""
+    return _export_capacity_pilot_impl(
+        preparation_final_pins, verified_fixed_records, host_id,
+        captured_read_provider=captured_read_provider,
+        before_publication=before_publication, recorded_host=False,
+    )
+
+
+def export_capacity_pilot_recorded_host(
+    preparation_final_pins: dict[str, Any], verified_fixed_records: list[dict[str, Any]], host_id: str,
+    *, captured_read_provider: Any, before_publication: Any = None,
+) -> dict[str, Any]:
+    """Replay after SourceA has verified each retained signed ACK and lineage.
+
+    This explicit owner entrypoint consumes SourceA's exact checkpoint bytes;
+    the generic IO provider cannot select this route. Only the SourceA lineage
+    wrapper may call it after its per-window GPG and retained-journal checks.
+    """
+    return _export_capacity_pilot_impl(
+        preparation_final_pins, verified_fixed_records, host_id,
+        captured_read_provider=captured_read_provider,
+        before_publication=before_publication, recorded_host=True,
+    )
 
 
 def _replay_prepared_capacity_inputs(

@@ -44,6 +44,11 @@ FEEDBACK_FIXTURES = importlib.util.module_from_spec(FEEDBACK_FIXTURE_SPEC)
 sys.modules[FEEDBACK_FIXTURE_SPEC.name] = FEEDBACK_FIXTURES
 FEEDBACK_FIXTURE_SPEC.loader.exec_module(FEEDBACK_FIXTURES)
 
+ARCHIVE = _load_source_module(
+    "fixed_pair_source5_archive_under_test",
+    SCRIPT.with_name("application-source5-evidence-archive.py"),
+)
+
 
 def _real_binding_case(root: Path, *, write_expectations: bool) -> tuple[dict[str, object], list[dict[str, object]]]:
     source_root = root / "source"
@@ -272,6 +277,277 @@ def _verify_fixture_probe_offline(
 
 
 class FixedPairPureContractTests(unittest.TestCase):
+    def test_recorded_roots_allow_absent_origins_while_strict_offline_root_requires_presence(self) -> None:
+        """Recorded path checks are lexical; the old offline root check stays physical."""
+        with tempfile.TemporaryDirectory(prefix="fixed-recorded-roots-") as temporary:
+            root = Path(temporary)
+            source_root = root / "shared-source"
+            source_root.mkdir()
+            absent_parent = root / "retired-origin-host"
+            output_root = absent_parent / "private-output"
+            artifact_root = absent_parent / "campaign-artifacts"
+
+            actual_output, actual_artifacts = FIXED._recorded_origin_roots(
+                str(output_root), str(artifact_root), source_root,
+            )
+            self.assertEqual(actual_output, output_root)
+            self.assertEqual(actual_artifacts, artifact_root)
+            self.assertFalse(output_root.exists())
+            self.assertFalse(artifact_root.exists())
+            with self.assertRaises(FIXED.FixedPairError):
+                FIXED._private_output_root_offline(str(output_root), source_root)
+
+            with self.assertRaisesRegex(FIXED.FixedPairError, "outside the selected source tree"):
+                FIXED._recorded_origin_roots(
+                    str(source_root / "retired-output"), str(artifact_root), source_root,
+                )
+            with self.assertRaisesRegex(FIXED.FixedPairError, "normalized absolute origin"):
+                FIXED._recorded_origin_roots(
+                    str(root / ".." / "aliased-output"), str(artifact_root), source_root,
+                )
+
+    def test_recorded_archive_loader_binds_typed_two_kvm_and_legacy_cohorts(self) -> None:
+        """Load only actual typed archive bytes for each exact SpecV3 cohort."""
+        source_root = SCRIPT.parent.parent
+        controller = _load_source_module(
+            "fixed_pair_recorded_profile_controller",
+            SCRIPT.with_name("application-campaign.py"),
+        )
+        relative = "scripts/application-source5-evidence-archive.py"
+        archive_path = source_root / relative
+        archive_raw, archive_sha, archive_info = FIXED.read_stable(
+            archive_path, "recorded archive-loader fixture source", FIXED.MAX_SOURCE_BYTES,
+        )
+        archive_mode = f"{stat.S_IFMT(archive_info.st_mode) | stat.S_IMODE(archive_info.st_mode):06o}"
+        archive_record = {
+            "path": relative, "kind": "file", "mode": archive_mode,
+            "sha256": archive_sha, "size": len(archive_raw),
+        }
+
+        def make_context(host_ids, *, profile=None, source_host_ids=None,
+                         venues=None, record_mutator=None):
+            selected_venues = venues or ["kvm_guest"] * len(host_ids)
+            spec = {
+                "schema": controller.SPEC_SCHEMA_V3,
+                "hosts": [
+                    {"host_id": host_id, "venue": venue,
+                     "host_fingerprint_sha256": "a" * 64, "controls": {}}
+                    for host_id, venue in zip(host_ids, selected_venues)
+                ],
+            }
+            if profile is not None:
+                spec["qualification_profile"] = profile
+            source_ids = host_ids if source_host_ids is None else source_host_ids
+            sources = {
+                host_id: {"source": {"files": [dict(archive_record)]}}
+                for host_id in source_ids
+            }
+            if record_mutator is not None:
+                record_mutator(sources)
+            return {"source_root": source_root, "sources": sources,
+                    "spec": spec, "controller": controller}
+
+        two_host_ids = ["agent-8845HS-dev", "agent-EPYC-4585PX-dev"]
+        two_host_context = make_context(
+            two_host_ids, profile=controller.TWO_KVM_QUALIFICATION_PROFILE,
+        )
+        with patch.object(FIXED, "_load_pinned_module",
+                          wraps=FIXED._load_pinned_module) as load_module:
+            archive = FIXED._load_recorded_checkpoint_archive(two_host_context)
+        self.assertEqual(archive.CHECKPOINT_SCHEMA_V2,
+                         "allocatbelt.application-source5-evidence-job-checkpoint.v2")
+        load_module.assert_called_once()
+        self.assertEqual(load_module.call_args.args[0], archive_raw)
+        self.assertEqual(load_module.call_args.args[1], archive_path)
+
+        legacy_ids = ["agent-bare-metal", "agent-kvm-a", "agent-kvm-b"]
+        legacy_context = make_context(
+            legacy_ids, venues=["bare_metal", "kvm_guest", "kvm_guest"],
+        )
+        self.assertEqual(
+            FIXED._load_recorded_checkpoint_archive(legacy_context).CHECKPOINT_SCHEMA_V2,
+            archive.CHECKPOINT_SCHEMA_V2,
+        )
+
+        rejected = [
+            (make_context(two_host_ids), "SpecV3 host list differs"),
+            (make_context(two_host_ids, profile="unknown"), "qualification profile"),
+            (make_context(two_host_ids, profile=controller.TWO_KVM_QUALIFICATION_PROFILE,
+                          source_host_ids=two_host_ids[:1]), "exact SpecV3 host cohort"),
+            (make_context(two_host_ids, profile=controller.TWO_KVM_QUALIFICATION_PROFILE,
+                          source_host_ids=two_host_ids + ["extra-host"]), "exact SpecV3 host cohort"),
+            (make_context([two_host_ids[0], two_host_ids[0]],
+                          profile=controller.TWO_KVM_QUALIFICATION_PROFILE), "identities are duplicated"),
+            (make_context(two_host_ids, profile=controller.TWO_KVM_QUALIFICATION_PROFILE,
+                          venues=["bare_metal", "kvm_guest"]), "exactly two KVM guests"),
+        ]
+        for context, message in rejected:
+            with self.subTest(message=message), self.assertRaisesRegex(FIXED.FixedPairError, message):
+                FIXED._load_recorded_checkpoint_archive(context)
+
+        def mismatched_sha(sources):
+            sources[two_host_ids[1]]["source"]["files"][0]["sha256"] = "0" * 64
+
+        with self.assertRaisesRegex(FIXED.FixedPairError, "different transitive"):
+            FIXED._load_recorded_checkpoint_archive(make_context(
+                two_host_ids, profile=controller.TWO_KVM_QUALIFICATION_PROFILE,
+                record_mutator=mismatched_sha,
+            ))
+
+        def duplicate_archive_entry(sources):
+            sources[two_host_ids[1]]["source"]["files"].append(dict(archive_record))
+
+        with self.assertRaisesRegex(FIXED.FixedPairError, "no unique"):
+            FIXED._load_recorded_checkpoint_archive(make_context(
+                two_host_ids, profile=controller.TWO_KVM_QUALIFICATION_PROFILE,
+                record_mutator=duplicate_archive_entry,
+            ))
+
+        def wrong_all_hashes(sources):
+            for source in sources.values():
+                source["source"]["files"][0]["sha256"] = "0" * 64
+
+        with self.assertRaisesRegex(FIXED.FixedPairError, "differs from its typed transitive pin"):
+            FIXED._load_recorded_checkpoint_archive(make_context(
+                two_host_ids, profile=controller.TWO_KVM_QUALIFICATION_PROFILE,
+                record_mutator=wrong_all_hashes,
+            ))
+
+        def wrong_all_modes(sources):
+            wrong_mode = "100755" if archive_mode == "100644" else "100644"
+            for source in sources.values():
+                source["source"]["files"][0]["mode"] = wrong_mode
+
+        with self.assertRaisesRegex(FIXED.FixedPairError, "differs from its typed transitive pin"):
+            FIXED._load_recorded_checkpoint_archive(make_context(
+                two_host_ids, profile=controller.TWO_KVM_QUALIFICATION_PROFILE,
+                record_mutator=wrong_all_modes,
+            ))
+
+    def test_recorded_zero_tmp_gate_uses_exact_proofs_and_never_opens_absent_origins(self) -> None:
+        """Exercise storage projection only; this does not prove GPG authority or APP execution."""
+        with tempfile.TemporaryDirectory(prefix="fixed-recorded-tmp-proof-") as temporary:
+            root = Path(temporary)
+            output_root = root / "private-output"
+            output_root.mkdir(mode=0o700)
+            output_root.chmod(0o700)
+            root_mount = FIXED._mount_identity(output_root)
+            if root_mount["filesystem_type"] in {"tmpfs", "ramfs", "devtmpfs"}:
+                self.skipTest("recorded fixed proof requires the strict non-memory output mount contract")
+            budgets = {"tmpdir_bytes": 1024, "tmpdir_inodes": 8}
+            rows = []
+            attempts = []
+            probes = []
+            for ordinal in range(2):
+                app_path = output_root / f"member-{ordinal}-tmp"
+                app_initial = FIXED._prepare_member_tmpdir(app_path, output_root, budgets)
+                app_final = FIXED._tmpdir_usage(app_path, {
+                    "bytes_limit": budgets["tmpdir_bytes"],
+                    "inode_limit": budgets["tmpdir_inodes"],
+                })
+                attempts.append({"ordinal": ordinal, "tmpdir_final": app_final})
+                rows.append((app_initial, app_final, app_path, None, ordinal))
+
+                probe_path = output_root / f"probe-{ordinal}-tmp"
+                probe_initial = FIXED._prepare_member_tmpdir(probe_path, output_root, budgets)
+                probe_final = FIXED._tmpdir_usage(probe_path, {
+                    "bytes_limit": budgets["tmpdir_bytes"],
+                    "inode_limit": budgets["tmpdir_inodes"],
+                })
+                probes.append({"member_ordinal": ordinal, "tmpdir_final": probe_final})
+                rows.append((probe_initial, probe_final, probe_path, "probe_tmpdir", ordinal))
+
+            receipt_body = {
+                "schema": FIXED.RECEIPT_SCHEMA, "status": "valid_pair",
+                "member_attempts": attempts, "construction_probes": probes,
+            }
+            receipt_semantic_sha = FIXED.sha256_bytes(
+                FIXED.canonical_bytes(receipt_body),
+            )
+            receipt = {**receipt_body, "receipt_sha256": receipt_semantic_sha}
+            receipt_raw = FIXED.canonical_bytes(receipt)
+            receipt_path = output_root / "fixed-pair-execution-receipt.json"
+            receipt_path.write_bytes(receipt_raw)
+            receipt_path.chmod(0o600)
+            receipt_pin = {
+                "path": str(receipt_path),
+                "raw_sha256": FIXED.sha256_bytes(receipt_raw),
+                "semantic_sha256": receipt_semantic_sha,
+            }
+            receipt_proofs = ARCHIVE._zero_fixed_tmp_proofs(
+                receipt, receipt_pin, "component_receipt",
+                include_probe_tmp_proofs=True,
+            )
+            key = lambda proof: (proof["role"], proof["member_ordinal"],
+                                 proof.get("domain", ""))
+            checkpoint_proofs = sorted(receipt_proofs, key=key)
+            self.assertEqual(len(checkpoint_proofs), 4)
+            FIXED._require_recorded_fixed_checkpoint_zero_proofs(
+                checkpoint_proofs, checkpoint_proofs,
+            )
+
+            for _initial, _final, path, _domain, _ordinal in rows:
+                path.rmdir()
+            self.assertTrue(all(not path.exists() for _initial, _final, path, _domain, _ordinal in rows))
+            for initial, final, path, domain, ordinal in rows:
+                proof = FIXED._recorded_tmp_proof_for_member(
+                    checkpoint_proofs, ordinal, domain, f"TMP member {ordinal}",
+                )
+                FIXED._verify_tmpdir_storage_recorded_offline(
+                    initial, final, str(path), budgets["tmpdir_bytes"],
+                    budgets["tmpdir_inodes"], root_mount,
+                    f"TMP member {ordinal}", proof=proof,
+                    expected_domain=domain, expected_ordinal=ordinal,
+                )
+                with self.assertRaises(FIXED.FixedPairError):
+                    FIXED._verify_tmpdir_storage_offline(
+                        initial, final, str(path), budgets["tmpdir_bytes"],
+                        budgets["tmpdir_inodes"], root_mount,
+                        f"strict TMP member {ordinal}",
+                    )
+
+            with self.assertRaisesRegex(FIXED.FixedPairError, "receipt-derived"):
+                FIXED._require_recorded_fixed_checkpoint_zero_proofs(
+                    checkpoint_proofs[:-1], checkpoint_proofs,
+                )
+            altered = [dict(proof) for proof in checkpoint_proofs]
+            altered[0]["inode"] += 1
+            with self.assertRaisesRegex(FIXED.FixedPairError, "receipt-derived"):
+                FIXED._require_recorded_fixed_checkpoint_zero_proofs(
+                    altered, checkpoint_proofs,
+                )
+            member_swapped = [dict(proof) for proof in checkpoint_proofs]
+            member_swapped[0]["member_ordinal"] = 1
+            member_swapped[1]["member_ordinal"] = 0
+            with self.assertRaisesRegex(FIXED.FixedPairError, "receipt-derived"):
+                FIXED._require_recorded_fixed_checkpoint_zero_proofs(
+                    member_swapped, checkpoint_proofs,
+                )
+            wrong_domain = dict(checkpoint_proofs[0], domain="probe_tmpdir")
+            with self.assertRaises(FIXED.FixedPairError):
+                FIXED._verify_tmpdir_storage_recorded_offline(
+                    rows[0][0], rows[0][1], str(rows[0][2]),
+                    budgets["tmpdir_bytes"], budgets["tmpdir_inodes"],
+                    root_mount, "wrong-domain TMP member", proof=wrong_domain,
+                    expected_domain=None, expected_ordinal=0,
+                )
+            wrong_member = dict(checkpoint_proofs[0], member_ordinal=1)
+            with self.assertRaisesRegex(FIXED.FixedPairError, "differ from its signed checkpoint"):
+                FIXED._verify_tmpdir_storage_recorded_offline(
+                    rows[0][0], rows[0][1], str(rows[0][2]),
+                    budgets["tmpdir_bytes"], budgets["tmpdir_inodes"],
+                    root_mount, "wrong-member TMP proof", proof=wrong_member,
+                    expected_domain=None, expected_ordinal=0,
+                )
+            nonzero = dict(rows[0][1], bytes_used=1)
+            with self.assertRaisesRegex(FIXED.FixedPairError, "not exactly zero"):
+                FIXED._verify_tmpdir_storage_recorded_offline(
+                    rows[0][0], nonzero, str(rows[0][2]),
+                    budgets["tmpdir_bytes"], budgets["tmpdir_inodes"],
+                    root_mount, "nonzero TMP member", proof=checkpoint_proofs[0],
+                    expected_domain=None, expected_ordinal=0,
+                )
+
     def test_overlay_top_level_schema_is_closed(self) -> None:
         expected = {
             "schema", "campaign_id", "host_id", "spec", "plan", "sources", "execution_source",
@@ -1430,6 +1706,10 @@ class FixedPairPureContractTests(unittest.TestCase):
             controller_path = source_root / "scripts" / "application-campaign.py"
             controller_path.write_bytes((SCRIPT.parent / "application-campaign.py").read_bytes())
             controller_path.chmod(0o644)
+            archive_source = SCRIPT.with_name("application-source5-evidence-archive.py")
+            archive_path = source_root / "scripts" / archive_source.name
+            archive_path.write_bytes(archive_source.read_bytes())
+            archive_path.chmod(stat.S_IMODE(archive_source.stat(follow_symlinks=False).st_mode))
 
             spec, sources = fixture_module.spec_v3_fixture()
             allowed_cpus = sorted(os.sched_getaffinity(0))
@@ -1486,9 +1766,15 @@ class FixedPairPureContractTests(unittest.TestCase):
                 SCRIPT.with_name("application-source-inventory.py"),
             )
 
+            # This failed-pair integration fixture keeps these exact boundaries
+            # synthetic: the campaign validator, inventory/module pins,
+            # runtime bindings, member construction, and source snapshot are
+            # mocked. It uses real captured envelopes and a real strict-host
+            # receipt, dispatches no APP, and has no SourceA/GPG checkpoint.
             controller = types.SimpleNamespace(
                 PAIR_PROCESS_HEADER=FIXED.PAIR_PROCESS_HEADER_FALLBACK,
                 SOURCE_SCHEMA_V5="allocatbelt.application-source-manifest.v5",
+                qualification_host_count=campaign.qualification_host_count,
                 verify_source_manifest=lambda *_args, **_kwargs: None,
                 validate_spec=lambda *_args, **_kwargs: {"campaign_id": spec["campaign_id"]},
                 campaign_inputs_source_sha256=lambda _sources: "c" * 64,
@@ -1504,10 +1790,12 @@ class FixedPairPureContractTests(unittest.TestCase):
                 "launch_identity_helper": launch_helper,
             }
 
+            original_pinned_module_loader = FIXED._load_pinned_module
+
             def load_controller(_raw, _path, label):
                 if label == "campaign_controller":
                     return controller
-                return FIXED._load_pinned_module(_raw, _path, label)
+                return original_pinned_module_loader(_raw, _path, label)
 
             def captured_module_pins(_source, _source_root, _execution):
                 return module_pins, execution_records, inventory_module, loaded_modules
@@ -1682,6 +1970,198 @@ class FixedPairPureContractTests(unittest.TestCase):
                     overlay_pin, execution_receipt_pin, host_verification_pin,
                     references, stage_root,
                 )
+                malformed_checkpoint = FIXED.canonical_bytes({"schema": "unsupported"})
+                malformed_checkpoint_pin = {
+                    "path": str(root / "archived-checkpoint.json"),
+                    "raw_sha256": FIXED.sha256_bytes(malformed_checkpoint),
+                    "semantic_sha256": "f" * 64,
+                }
+                with patch.object(
+                    FIXED, "_verify_fixed_pair_overlay_replay",
+                    side_effect=AssertionError("malformed checkpoint reached numeric replay"),
+                ):
+                    with self.assertRaisesRegex(
+                        FIXED.FixedPairError,
+                        "SourceV5 archive rejected the recorded fixed checkpoint",
+                    ):
+                        FIXED.verify_fixed_pair_overlay_recorded_captured_v1(
+                            overlay_pin, execution_receipt_pin, host_verification_pin,
+                            references, stage_root,
+                            checkpoint_pin=malformed_checkpoint_pin,
+                            checkpoint_raw=malformed_checkpoint,
+                        )
+
+                # This canonical, structurally valid v2 checkpoint exercises
+                # the real Source5 archive parser and the owner/host/job joins.
+                # Its component receipt is deliberately failed, so no APP
+                # start/PID is fabricated and the owner must reject its absent
+                # four zero proofs before entering numeric replay.
+                archive_test_path = SCRIPT.with_name(
+                    "test-application-source5-evidence-archive.py",
+                )
+                archive_test_spec = importlib.util.spec_from_file_location(
+                    "fixed_pair_recorded_archive_fixtures", archive_test_path,
+                )
+                assert archive_test_spec is not None and archive_test_spec.loader is not None
+                archive_test_fixtures = importlib.util.module_from_spec(archive_test_spec)
+                sys.modules[archive_test_spec.name] = archive_test_fixtures
+                archive_test_spec.loader.exec_module(archive_test_fixtures)
+                probe_sample = archive_test_fixtures.probe_tree_fixture(
+                    root / "recorded-checkpoint-probe-tree",
+                )
+                recorded_receipt = captured["execution_receipt"]
+                recorded_receipt_raw = FIXED.canonical_bytes(recorded_receipt)
+                recorded_host_raw = Path(
+                    references[host_verification_pin["path"]]["path"],
+                ).read_bytes()
+                recorded_host = json.loads(recorded_host_raw)
+                owner_pins = {
+                    "component_receipt": {
+                        "path": execution_receipt_pin["path"],
+                        "raw_sha256": FIXED.sha256_bytes(recorded_receipt_raw),
+                        "semantic_sha256": recorded_receipt["receipt_sha256"],
+                    },
+                    "fixed_pair_host_receipt": {
+                        "path": host_verification_pin["path"],
+                        "raw_sha256": host_verification_pin["raw_sha256"],
+                        "semantic_sha256": recorded_host["receipt_sha256"],
+                    },
+                    "probe_capture_receipt_member0": probe_sample["owner_pins"][
+                        "probe_capture_receipt_member0"
+                    ],
+                }
+                component_row = {
+                    "origin_path": execution_receipt_pin["path"],
+                    "role": "component_receipt",
+                    "byte_count": len(recorded_receipt_raw),
+                    "raw_sha256": FIXED.sha256_bytes(recorded_receipt_raw),
+                    "semantic_sha256": recorded_receipt["receipt_sha256"],
+                }
+                host_row = {
+                    "origin_path": host_verification_pin["path"],
+                    "role": "fixed_pair_host_receipt",
+                    "byte_count": len(recorded_host_raw),
+                    "raw_sha256": FIXED.sha256_bytes(recorded_host_raw),
+                    "semantic_sha256": recorded_host["receipt_sha256"],
+                }
+                checkpoint_entries = [
+                    component_row, host_row,
+                    *(row for row in probe_sample["rows"]
+                      if row["role"] != "component_receipt"),
+                ]
+                checkpoint_entries.sort(key=lambda row: row["origin_path"])
+                plan_binding = overlay["plan"]
+                source_binding = overlay["sources"]["manifests"][selected_host]
+                plan_rows = [job for job in plan["jobs"][overlay["job"]["value"]["phase"]]
+                             if job["host_id"] == selected_host]
+                checkpoint_body = {
+                    "schema": ARCHIVE.CHECKPOINT_SCHEMA_V2,
+                    "request_pin": {
+                        "path": str(root / "recorded-checkpoint-request.json"),
+                        "raw_sha256": "1" * 64,
+                        "semantic_sha256": "2" * 64,
+                    },
+                    "context": {
+                        "schema": ARCHIVE.CONTEXT_SCHEMA_V1,
+                        "campaign_id": overlay["campaign_id"],
+                        "host_id": selected_host,
+                        "phase": overlay["job"]["value"]["phase"],
+                        "job_index": plan_rows.index(overlay["job"]["value"]),
+                        "source_manifest_pin": {
+                            "path": source_binding["pin"]["path"],
+                            "raw_sha256": source_binding["pin"]["sha256"],
+                            "semantic_sha256": source_binding["manifest_sha256"],
+                        },
+                        "execution_manifest_pin": {
+                            "path": str(root / "recorded-execution-manifest.json"),
+                            "raw_sha256": "3" * 64,
+                            "semantic_sha256": "4" * 64,
+                        },
+                        "plan_pin": {
+                            "path": plan_binding["pin"]["path"],
+                            "raw_sha256": plan_binding["pin"]["sha256"],
+                            "semantic_sha256": plan_binding["semantic_sha256"],
+                        },
+                        "resource_budget_pin": {
+                            "path": str(root / "recorded-resource-budget.json"),
+                            "raw_sha256": "5" * 64,
+                            "semantic_sha256": "6" * 64,
+                        },
+                        "predecessor_ack_pin": None,
+                        "authorized_signer_fingerprint": "A" * 40,
+                    },
+                    "job_record_pin": {
+                        "path": str(root / "job-records" /
+                                    f"{overlay['job']['value']['run_id']}.json"),
+                        "raw_sha256": "7" * 64,
+                    },
+                    "authorization": {"authorization_id": "structural-fixture"},
+                    "predecessor_ack_pin": None,
+                    "owner_receipt_pins": owner_pins,
+                    "empty_tmp_proofs": [],
+                    "object_manifest_pin": {
+                        "path": str(root / "recorded-object-manifest.json"),
+                        "raw_sha256": "8" * 64,
+                        "semantic_sha256": "9" * 64,
+                    },
+                    "entries": checkpoint_entries,
+                    "tree_inventories": [probe_sample["tree"]],
+                }
+                checkpoint = {
+                    **checkpoint_body,
+                    "checkpoint_sha256": FIXED.sha256_bytes(
+                        FIXED.canonical_bytes(checkpoint_body),
+                    ),
+                }
+                checkpoint_raw = FIXED.canonical_bytes(checkpoint)
+                checkpoint_pin = {
+                    "path": str(root / "recorded-checkpoint.json"),
+                    "raw_sha256": FIXED.sha256_bytes(checkpoint_raw),
+                    "semantic_sha256": checkpoint["checkpoint_sha256"],
+                }
+                with patch.object(
+                    FIXED, "_verify_fixed_pair_overlay_replay",
+                    side_effect=AssertionError("failed receipt reached numeric replay"),
+                ):
+                    with self.assertRaisesRegex(
+                        FIXED.FixedPairError,
+                        "requires exactly four receipt-derived zero TMP proofs",
+                    ):
+                        FIXED.verify_fixed_pair_overlay_recorded_captured_v1(
+                            overlay_pin, execution_receipt_pin,
+                            host_verification_pin, references, stage_root,
+                            checkpoint_pin=checkpoint_pin,
+                            checkpoint_raw=checkpoint_raw,
+                        )
+                wrong_host_checkpoint = copy.deepcopy(checkpoint)
+                wrong_host_checkpoint["context"]["host_id"] = "different-host"
+                wrong_host_body = {
+                    key: value for key, value in wrong_host_checkpoint.items()
+                    if key != "checkpoint_sha256"
+                }
+                wrong_host_checkpoint["checkpoint_sha256"] = FIXED.sha256_bytes(
+                    FIXED.canonical_bytes(wrong_host_body),
+                )
+                wrong_host_raw = FIXED.canonical_bytes(wrong_host_checkpoint)
+                wrong_host_pin = {
+                    "path": str(root / "wrong-host-checkpoint.json"),
+                    "raw_sha256": FIXED.sha256_bytes(wrong_host_raw),
+                    "semantic_sha256": wrong_host_checkpoint["checkpoint_sha256"],
+                }
+                with patch.object(
+                    FIXED, "_verify_fixed_pair_overlay_replay",
+                    side_effect=AssertionError("wrong-host checkpoint reached numeric replay"),
+                ):
+                    with self.assertRaisesRegex(
+                        FIXED.FixedPairError,
+                        "differs from the original SourceV5 host/job/Plan generation",
+                    ):
+                        FIXED.verify_fixed_pair_overlay_recorded_captured_v1(
+                            overlay_pin, execution_receipt_pin,
+                            host_verification_pin, references, stage_root,
+                            checkpoint_pin=wrong_host_pin,
+                            checkpoint_raw=wrong_host_raw,
+                        )
             original_verification = {key: value for key, value in result.items()
                                      if key != "host_verification_sha256"}
             self.assertEqual(captured["verification"], original_verification)
