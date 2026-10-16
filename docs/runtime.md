@@ -1681,9 +1681,11 @@ baseline still requires these implementation and qualification steps:
    comparisons. The CPU, memory, limited TCP/HTTP and disk ports cover bounded
    rejection recovery, cancellation, retained storage and driver/process
    cleanup; these functional checks do not establish application performance.
-4. Finish complete isolated core Miri and supported platform, feature, package
-   and security-tool qualification, preserving failures and model-coverage
-   limits. Complete per-host retained-memory, allocator, executor and application
+4. Retain the [source-specific correctness evidence](research/runtime-capability-status.md#signed-runtime-correctness-qualification)
+   and the completed isolated core Miri campaign recorded in the same ledger.
+   Rerun the relevant platform, feature, package, security and model checks when
+   their covered inputs change, preserving failures and model-coverage limits.
+   Complete per-host retained-memory, allocator, executor and application
    gates against both mimalloc baselines and matched-allocator Tokio, separating
    saturated capacity from open-loop tail-latency workloads.
 5. Qualify adaptive controls under real resource pressure, overload and

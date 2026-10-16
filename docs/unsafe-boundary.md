@@ -229,13 +229,19 @@ Current verification:
 - **Batched purges.** The core's `Purger` interface keeps the ring's asynchronous interval inside the existing page-claim protocol: pages are claimed (`proto::claim_dirty`, under the owning shard's lock) before submission and released (`proto::finish_purge`, under it again) only after every completion, and only a completion with result 0 clears a dirty mark. The checking model's `MockPurger` completes batches out of order, fails some runs and lets other "threads" allocate and free while a batch is in flight (`tests.rs`, and fuzz op 31); loom checks the interval with a delayed, partly failed completion (`async_purge_with_failure`).
 - **Integration tests.** Multi-threaded cross-thread frees, thread exit returning caches, the maintenance thread returning RSS, taking budget passes off freeing threads and running as `SCHED_BATCH`, a real overflow faulting in the guard page, and `fork` from a busy process.
 - **Mutation testing.** The mewt campaign over `bits`/`class` (see CONTRIBUTING.md) passes: 87 mutants caught, 5 listed as equivalent.
-- **Miri.** Only a partial run on the core tests (below).
+- **Miri.** The complete isolated core campaign at signed revision
+  `c3ed95db4f9ba9b6ffd9d84d7651a3b5963de2c5` passed 135 tests and retained
+  one intentional ignored contention benchmark. All 136 test-process and
+  log-writer exits were zero, with no timeout or cancellation. The current
+  core/checker sources match that campaign's source bridge. See the
+  [qualification ledger](research/runtime-capability-status.md) for scope and
+  separate runtime/platform requirements.
 
-Miri result (**run on commit 0271678**, i.e. before the later follow-up commits, nightly 2026-09-26, `-Zmiri-disable-isolation`, 90-minute limit): **8/17 tests passed with no UB detected**:
+Historical Miri result (**run on commit 0271678**, i.e. before the later follow-up commits, nightly 2026-09-26, `-Zmiri-disable-isolation`, 90-minute limit): **8/17 tests passed with no UB detected**:
 `bits::{masks, run_matches_naive}`, `class::{table_shape, class_of_is_tight}`, `tests::{alignments, cross_thread_frees, double_free_small, double_free_large}`.
-The other 9 (proptest-based ones, `every_size_round_trips`, `random_sequences`, etc.) **did not finish** within the limit. Miri has not been run on the current head. To run all of them under Miri, the mock's `MAX_SEGMENTS`-sized tables and the iteration counts need to shrink under `cfg(miri)`.
+The other 9 (proptest-based ones, `every_size_round_trips`, `random_sequences`, etc.) **did not finish** within that limit. Those outcomes remain incomplete for that historical run; the later complete campaign above supersedes its current-status claim.
 Since the core has no `unsafe`, Miri mainly checks panics/overflow and data races in the atomic logic here, not memory safety.
-Before production, add loom models and fuzzing (cargo-fuzz against `Heap<MockOs>`).
+Keep the loom models and fuzzing (cargo-fuzz against `Heap<MockOs>`) current when their covered code changes.
 
 Other caveats:
 - **fork:** the adapter registers `pthread_atfork` handlers that take every heap lock before `fork` and release them on both sides (`Heap::fork_prepare/parent/child`), so no lock is held by a thread missing in the child; the child also reseeds its placement secret and falls back to allocation-driven purging. Blocks cached by the parent's other threads stay allocated in the child. `posix_spawn` and `vfork` do not run the handlers, and do not need to. Covered by `tests/fork.rs`, which deadlocked before the handlers existed.
